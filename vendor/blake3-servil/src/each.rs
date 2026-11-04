@@ -10,7 +10,10 @@
 
 use crate::performance::Block;
 use crate::platform::Platform;
-use crate::{CHUNK_END, CHUNK_LEN, CHUNK_START, CVBytes, CVWords, ChunkState, Hash, Hasher, IncrementCounter, Mode, OUT_LEN};
+use crate::{
+    CHUNK_END, CHUNK_LEN, CHUNK_START, CVBytes, CVWords, ChunkState, Hash, Hasher,
+    IncrementCounter, Mode, OUT_LEN,
+};
 
 /// [`hash_each`], using other CPU cores where that is faster: the
 /// same hashes, never slower. Collections of 512 KiB and more in all use
@@ -36,9 +39,12 @@ pub fn hash_each_multithreaded(mode: Mode, items: &[(&[Block], usize)], out: &mu
     let alone = |item: &[u8]| item.len() >= crate::lanes::MIN_SPLIT_LEN;
     // The collection with each item that hashes alone set aside (an empty
     // stand-in, its digest written after).
-    let small: Vec<&[u8]> = items.iter().map(|i| if alone(i.bytes()) { &[][..] } else { i.bytes() }).collect();
+    let small: Vec<&[u8]> =
+        items.iter().map(|i| if alone(i.bytes()) { &[][..] } else { i.bytes() }).collect();
     if small.iter().map(|i| i.len()).sum::<usize>() < crate::lanes::MIN_SPLIT_LEN {
-        hash_each_on(key, flags, &small, out, Platform::detect(), |item| crate::hash_serial(item, key, flags));
+        hash_each_on(key, flags, &small, out, Platform::detect(), |item| {
+            crate::hash_serial(item, key, flags)
+        });
     } else {
         crate::lanes::hash_each(key, flags, &small, out);
     }
@@ -126,8 +132,12 @@ fn update_turn(hashers: &mut [Hasher], pieces: &[(usize, &[u8])], pooled: bool) 
         // piece gathers on the next pass, and the bytes in play shrink on
         // every pass (a change that kept them would spin here forever;
         // the assert makes it a failure a test sees).
-        assert!(held.iter().all(|&i| hashers[i].held_group().is_none()), "a held group outlived its turn");
-        let (before, after): (usize, usize) = (turn.iter().map(|p| p.1.len()).sum(), waiting.iter().map(|p| p.1.len()).sum());
+        assert!(
+            held.iter().all(|&i| hashers[i].held_group().is_none()),
+            "a held group outlived its turn"
+        );
+        let (before, after): (usize, usize) =
+            (turn.iter().map(|p| p.1.len()).sum(), waiting.iter().map(|p| p.1.len()).sum());
         assert!(
             after < before || (after == before && waiting.len() < turn.len()),
             "a turn's pass gathered nothing ({} pieces of {before} bytes before, {} of {after} after)",
@@ -148,15 +158,20 @@ fn hash_held(hashers: &mut [Hasher], held: &[usize]) {
     use crate::{BLOCK_LEN, PARENT};
     let Some(&first) = held.first() else { return };
     let (key, flags) = (hashers[first].core.key, hashers[first].core.chunk_state.flags);
-    let (alike, others): (Vec<usize>, Vec<usize>) = held.iter().partition(|&&i| hashers[i].core.key == key && hashers[i].core.chunk_state.flags == flags);
+    let (alike, others): (Vec<usize>, Vec<usize>) = held
+        .iter()
+        .partition(|&&i| hashers[i].core.key == key && hashers[i].core.chunk_state.flags == flags);
     let turn = crate::platform::Sme2Turn::take(hashers[first].core.chunk_state.platform, true);
     let platform = turn.platform();
     let n = alike.len();
     let per = crate::STAGE_LEN / CHUNK_LEN;
     let chunks = n * per;
     let mut level = vec![0u8; chunks * OUT_LEN];
-    let refs: Vec<&[u8; CHUNK_LEN]> =
-        alike.iter().flat_map(|&i| hashers[i].held_group().expect("a held group").1.chunks_exact(CHUNK_LEN)).map(|c| c.try_into().unwrap()).collect();
+    let refs: Vec<&[u8; CHUNK_LEN]> = alike
+        .iter()
+        .flat_map(|&i| hashers[i].held_group().expect("a held group").1.chunks_exact(CHUNK_LEN))
+        .map(|c| c.try_into().unwrap())
+        .collect();
     let counters: Vec<u64> = alike.iter().map(|&i| hashers[i].held_group().unwrap().0).collect();
     // On SME2, every group in one kernel call, each at its own counter;
     // elsewhere a call per group.
@@ -168,7 +183,15 @@ fn hash_held(hashers: &mut [Hasher], held: &[usize]) {
         // Sound: the turn's platform is SME2 only where detect() found it.
         #[cfg(blake3_sme2)]
         unsafe {
-            crate::sme2::hash_groups_at(&refs, &counters, &key, flags, CHUNK_START, CHUNK_END, &mut level)
+            crate::sme2::hash_groups_at(
+                &refs,
+                &counters,
+                &key,
+                flags,
+                CHUNK_START,
+                CHUNK_END,
+                &mut level,
+            )
         };
     } else {
         for (k, &counter) in counters.iter().enumerate() {
@@ -193,8 +216,20 @@ fn hash_held(hashers: &mut [Hasher], held: &[usize]) {
         if depth == 3 {
             halves.copy_from_slice(&level[..2 * n * OUT_LEN]);
         }
-        let blocks: Vec<&[u8; BLOCK_LEN]> = level[..values * OUT_LEN].chunks_exact(BLOCK_LEN).map(|b| b.try_into().unwrap()).collect();
-        platform.hash_many(&blocks, &key, 0, IncrementCounter::No, flags | PARENT, 0, 0, &mut next[..values / 2 * OUT_LEN]);
+        let blocks: Vec<&[u8; BLOCK_LEN]> = level[..values * OUT_LEN]
+            .chunks_exact(BLOCK_LEN)
+            .map(|b| b.try_into().unwrap())
+            .collect();
+        platform.hash_many(
+            &blocks,
+            &key,
+            0,
+            IncrementCounter::No,
+            flags | PARENT,
+            0,
+            0,
+            &mut next[..values / 2 * OUT_LEN],
+        );
         values /= 2;
         level[..values * OUT_LEN].copy_from_slice(&next[..values * OUT_LEN]);
     }
@@ -241,7 +276,9 @@ pub fn hash_each(mode: Mode, items: &[(&[Block], usize)], out: &mut [[u8; OUT_LE
     assert_eq!(items.len(), out.len(), "one digest per item");
     let mut room = core::mem::MaybeUninit::uninit();
     let (key, flags) = mode.key(&mut room);
-    hash_each_on(key, flags, items, out, Platform::detect(), |item| crate::hash_serial(item, key, flags));
+    hash_each_on(key, flags, items, out, Platform::detect(), |item| {
+        crate::hash_serial(item, key, flags)
+    });
 }
 
 /// An item of a collection, as hash_each_on reads it: its bytes. The
@@ -267,7 +304,14 @@ impl Item for (&[Block], usize) {
 /// [`hash_each`] in the mode of `key` and `flags`, the lanes on
 /// `platform`, each message that fills the lanes alone (or is a chunk or
 /// less) through `alone`.
-pub(crate) fn hash_each_on<I: Item>(key: &CVWords, flags: u8, items: &[I], out: &mut [[u8; OUT_LEN]], platform: Platform, alone: impl Fn(&[u8]) -> Hash) {
+pub(crate) fn hash_each_on<I: Item>(
+    key: &CVWords,
+    flags: u8,
+    items: &[I],
+    out: &mut [[u8; OUT_LEN]],
+    platform: Platform,
+    alone: impl Fn(&[u8]) -> Hash,
+) {
     let key = *key;
     // The messages whose full chunks share the lanes: each one's index, and
     // where its chunk values start in `cvs`.
@@ -298,7 +342,16 @@ pub(crate) fn hash_each_on<I: Item>(key: &CVWords, flags: u8, items: &[I], out: 
             }
         }
         let lanes = &mut lane_out[..refs.len() * OUT_LEN];
-        platform.hash_many(&refs, &key, k as u64, IncrementCounter::No, flags, CHUNK_START, CHUNK_END, lanes);
+        platform.hash_many(
+            &refs,
+            &key,
+            k as u64,
+            IncrementCounter::No,
+            flags,
+            CHUNK_START,
+            CHUNK_END,
+            lanes,
+        );
         for (j, &slot) in owners.iter().enumerate() {
             cvs[slot].copy_from_slice(&lanes[j * OUT_LEN..(j + 1) * OUT_LEN]);
         }
@@ -308,7 +361,10 @@ pub(crate) fn hash_each_on<I: Item>(key: &CVWords, flags: u8, items: &[I], out: 
         let chunks = item.len().div_ceil(CHUNK_LEN);
         let full = item.len() / CHUNK_LEN;
         if full < chunks {
-            cvs[at + full] = ChunkState::new(&key, full as u64, flags, platform).update(&item[full * CHUNK_LEN..]).output().chaining_value();
+            cvs[at + full] = ChunkState::new(&key, full as u64, flags, platform)
+                .update(&item[full * CHUNK_LEN..])
+                .output()
+                .chaining_value();
         }
         out[i] = *root(&cvs[at..at + chunks], &key, flags, platform).as_bytes();
     }
@@ -353,9 +409,17 @@ mod test {
         let items: Vec<&[u8]> = input.chunks(crate::lanes::MIN_SPLIT_LEN / 40 + 7).collect();
         let (mut a, mut b) = (vec![[0u8; OUT_LEN]; items.len()], vec![[0u8; OUT_LEN]; items.len()]);
         crate::RAN.with(|r| r.set(0));
-        crate::performance::hash_each_multithreaded(Mode::Plain, &crate::test::items(&crate::test::messages(&items), &items), &mut a);
+        crate::performance::hash_each_multithreaded(
+            Mode::Plain,
+            &crate::test::items(&crate::test::messages(&items), &items),
+            &mut a,
+        );
         crate::lanes::assert_past_the_split("the items");
-        crate::performance::hash_each(Mode::Plain, &crate::test::items(&crate::test::messages(&items), &items), &mut b);
+        crate::performance::hash_each(
+            Mode::Plain,
+            &crate::test::items(&crate::test::messages(&items), &items),
+            &mut b,
+        );
         assert_eq!(a, b);
     }
 
@@ -368,7 +432,19 @@ mod test {
     fn test_hash_each_multithreaded() {
         let mut input = vec![0u8; 3 << 20];
         crate::test::paint_test_input(&mut input);
-        let lens = [0, 1, 1024, 1025, 3000, 15 * 1024, 16 * 1024, 100_000, 511 * 1024, 512 * 1024, 700_000];
+        let lens = [
+            0,
+            1,
+            1024,
+            1025,
+            3000,
+            15 * 1024,
+            16 * 1024,
+            100_000,
+            511 * 1024,
+            512 * 1024,
+            700_000,
+        ];
         let items: Vec<&[u8]> = (0..400)
             .map(|k| {
                 let n = lens[k * 7 % lens.len()].min(input.len() - k);
@@ -377,17 +453,33 @@ mod test {
             .collect();
         let key = [9u8; 32];
         for mode in [Mode::Plain, Mode::Keyed(&key), Mode::DeriveKey("each mt")] {
-            let (mut a, mut b) = (vec![[0u8; OUT_LEN]; items.len()], vec![[0u8; OUT_LEN]; items.len()]);
-            crate::performance::hash_each_multithreaded(mode, &crate::test::items(&crate::test::messages(&items), &items), &mut a);
-            crate::performance::hash_each(mode, &crate::test::items(&crate::test::messages(&items), &items), &mut b);
+            let (mut a, mut b) =
+                (vec![[0u8; OUT_LEN]; items.len()], vec![[0u8; OUT_LEN]; items.len()]);
+            crate::performance::hash_each_multithreaded(
+                mode,
+                &crate::test::items(&crate::test::messages(&items), &items),
+                &mut a,
+            );
+            crate::performance::hash_each(
+                mode,
+                &crate::test::items(&crate::test::messages(&items), &items),
+                &mut b,
+            );
             assert_eq!(a, b);
             // Below the split, on the calling thread: the items of 16 KiB
             // or less, which sum to less than the split's length.
-            let small: Vec<usize> = (0..items.len()).filter(|&k| items[k].len() <= 16 * 1024).take(30).collect();
-            assert!(small.iter().map(|&k| items[k].len()).sum::<usize>() < crate::lanes::MIN_SPLIT_LEN);
+            let small: Vec<usize> =
+                (0..items.len()).filter(|&k| items[k].len() <= 16 * 1024).take(30).collect();
+            assert!(
+                small.iter().map(|&k| items[k].len()).sum::<usize>() < crate::lanes::MIN_SPLIT_LEN
+            );
             let small_items: Vec<&[u8]> = small.iter().map(|&k| items[k]).collect();
             let mut c = vec![[0u8; OUT_LEN]; small.len()];
-            crate::performance::hash_each_multithreaded(mode, &crate::test::items(&crate::test::messages(&small_items), &small_items), &mut c);
+            crate::performance::hash_each_multithreaded(
+                mode,
+                &crate::test::items(&crate::test::messages(&small_items), &small_items),
+                &mut c,
+            );
             assert!(small.iter().zip(&c).all(|(&k, d)| *d == b[k]));
         }
     }
@@ -415,7 +507,12 @@ mod test {
         let mut input = vec![0u8; 1 << 20];
         crate::test::paint_test_input(&mut input);
         // (offset, length): subtrees within what their offsets allow.
-        let subtrees = [(64 * CHUNK_LEN, 64 * CHUNK_LEN), (16 * CHUNK_LEN, 16 * CHUNK_LEN), (CHUNK_LEN, CHUNK_LEN), (128 * CHUNK_LEN, 100_000)];
+        let subtrees = [
+            (64 * CHUNK_LEN, 64 * CHUNK_LEN),
+            (16 * CHUNK_LEN, 16 * CHUNK_LEN),
+            (CHUNK_LEN, CHUNK_LEN),
+            (128 * CHUNK_LEN, 100_000),
+        ];
         let whole = [70_000usize, 300_000];
         let mut hashers: Vec<Hasher> = subtrees
             .iter()
@@ -444,10 +541,18 @@ mod test {
         for (i, &(offset, len)) in subtrees.iter().enumerate() {
             let mut one = Hasher::new(crate::Mode::Plain);
             one.set_input_offset(offset as u64).update(&input[..len]);
-            assert_eq!(hashers[i].finalize_non_root(), one.finalize_non_root(), "subtree at {offset}, {len} bytes");
+            assert_eq!(
+                hashers[i].finalize_non_root(),
+                one.finalize_non_root(),
+                "subtree at {offset}, {len} bytes"
+            );
         }
         for (j, &len) in whole.iter().enumerate() {
-            assert_eq!(hashers[subtrees.len() + j].finalize(), crate::convenience::hash(&input[..len]), "whole message of {len} bytes");
+            assert_eq!(
+                hashers[subtrees.len() + j].finalize(),
+                crate::convenience::hash(&input[..len]),
+                "whole message of {len} bytes"
+            );
         }
     }
 
@@ -459,7 +564,8 @@ mod test {
             h.core.chunk_state.platform = platform;
             h
         };
-        let mut hashers: Vec<Hasher> = (0..6).map(|i| on(Hasher::new(crate::Mode::Keyed(&keys[i % 2])))).collect();
+        let mut hashers: Vec<Hasher> =
+            (0..6).map(|i| on(Hasher::new(crate::Mode::Keyed(&keys[i % 2])))).collect();
         // Each hasher a group in, its message at a different offset into the
         // input; then one turn of two pieces each, which stage its second
         // group from its start and fill it (held), and 7 bytes more.
@@ -469,24 +575,43 @@ mod test {
             h.update(&input[start(i)..start(i) + group]);
         }
         let turn: Vec<(usize, &[u8])> = (0..6)
-            .flat_map(|i| [(i, &input[start(i) + group..start(i) + group + 100]), (i, &input[start(i) + group + 100..start(i) + 2 * group + 7])])
+            .flat_map(|i| {
+                [
+                    (i, &input[start(i) + group..start(i) + group + 100]),
+                    (i, &input[start(i) + group + 100..start(i) + 2 * group + 7]),
+                ]
+            })
             .collect();
         crate::performance::update_each(&mut hashers, &turn);
         for (i, h) in hashers.iter().enumerate() {
             let message = &input[start(i)..start(i) + 2 * crate::STAGE_LEN + 7];
-            assert_eq!(h.finalize(), crate::convenience::hash_with(crate::Mode::Keyed(&keys[i % 2]), message), "hasher {i}, {platform:?}");
+            assert_eq!(
+                h.finalize(),
+                crate::convenience::hash_with(crate::Mode::Keyed(&keys[i % 2]), message),
+                "hasher {i}, {platform:?}"
+            );
         }
         // And each hasher's first group (chunk counter zero, which hands
         // its core the group's two halves), six at once: a first piece
         // longer than a chunk, so it is staged from offset zero.
-        let mut fresh: Vec<Hasher> = (0..6).map(|i| on(Hasher::new(crate::Mode::Keyed(&keys[i % 2])))).collect();
-        let turn: Vec<(usize, &[u8])> =
-            (0..6).flat_map(|i| [(i, &input[start(i)..start(i) + 1100]), (i, &input[start(i) + 1100..start(i) + group + 7])]).collect();
+        let mut fresh: Vec<Hasher> =
+            (0..6).map(|i| on(Hasher::new(crate::Mode::Keyed(&keys[i % 2])))).collect();
+        let turn: Vec<(usize, &[u8])> = (0..6)
+            .flat_map(|i| {
+                [
+                    (i, &input[start(i)..start(i) + 1100]),
+                    (i, &input[start(i) + 1100..start(i) + group + 7]),
+                ]
+            })
+            .collect();
         crate::performance::update_each(&mut fresh, &turn);
         for (i, h) in fresh.iter().enumerate() {
             assert_eq!(
                 h.finalize(),
-                crate::convenience::hash_with(crate::Mode::Keyed(&keys[i % 2]), &input[start(i)..start(i) + group + 7]),
+                crate::convenience::hash_with(
+                    crate::Mode::Keyed(&keys[i % 2]),
+                    &input[start(i)..start(i) + group + 7]
+                ),
                 "fresh hasher {i}, {platform:?}"
             );
         }
@@ -496,13 +621,22 @@ mod test {
     fn test_update_each() {
         let mut input = vec![0u8; 1 << 20];
         crate::test::paint_test_input(&mut input);
-        let lens = [0, 1, 63, 64, 1023, 1024, 1025, 2048, 4470, 8191, 16384, 16385, 65536, 100_000, 300_000];
+        let lens = [
+            0, 1, 63, 64, 1023, 1024, 1025, 2048, 4470, 8191, 16384, 16385, 65536, 100_000, 300_000,
+        ];
         let piece_lens = [1, 1448, 4096, 1448, 16384, 31, 65536];
         for multithreaded in [false, true] {
             let key = [5u8; 32];
             // Every third hasher keyed: a turn's held groups in two kinds.
-            let mut hashers: Vec<Hasher> =
-                (0..lens.len()).map(|i| if i % 3 == 1 { Hasher::new(crate::Mode::Keyed(&key)) } else { Hasher::new(crate::Mode::Plain) }).collect();
+            let mut hashers: Vec<Hasher> = (0..lens.len())
+                .map(|i| {
+                    if i % 3 == 1 {
+                        Hasher::new(crate::Mode::Keyed(&key))
+                    } else {
+                        Hasher::new(crate::Mode::Plain)
+                    }
+                })
+                .collect();
             let mut done = vec![0usize; lens.len()];
             let mut k = 0;
             while done.iter().zip(&lens).any(|(d, l)| d < l) {
@@ -529,7 +663,12 @@ mod test {
                 } else {
                     crate::convenience::hash(&input[..lens[i]])
                 };
-                assert_eq!(&out[k], want.as_bytes(), "len {} multithreaded {multithreaded}", lens[i]);
+                assert_eq!(
+                    &out[k],
+                    want.as_bytes(),
+                    "len {} multithreaded {multithreaded}",
+                    lens[i]
+                );
             }
         }
     }
@@ -568,13 +707,26 @@ mod test {
             lens.push(n * CHUNK_LEN);
             lens.push(n * CHUNK_LEN - 7);
         }
-        let items: Vec<&[u8]> = lens.iter().enumerate().map(|(j, &l)| &input[j % 3..j % 3 + l.min(input.len() - 2)]).collect();
+        let items: Vec<&[u8]> = lens
+            .iter()
+            .enumerate()
+            .map(|(j, &l)| &input[j % 3..j % 3 + l.min(input.len() - 2)])
+            .collect();
         let key = [9u8; 32];
         for mode in [Mode::Plain, Mode::Keyed(&key), Mode::DeriveKey("hash_each test")] {
             let mut out = vec![[0u8; OUT_LEN]; items.len()];
-            crate::performance::hash_each(mode, &crate::test::items(&crate::test::messages(&items), &items), &mut out);
+            crate::performance::hash_each(
+                mode,
+                &crate::test::items(&crate::test::messages(&items), &items),
+                &mut out,
+            );
             for (item, digest) in items.iter().zip(&out) {
-                assert_eq!(digest, crate::convenience::hash_with(mode, item).as_bytes(), "length {}", item.len());
+                assert_eq!(
+                    digest,
+                    crate::convenience::hash_with(mode, item).as_bytes(),
+                    "length {}",
+                    item.len()
+                );
             }
         }
     }

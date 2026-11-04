@@ -47,7 +47,8 @@ pub fn function_digest(code: CodeHash, inlined: &[CodeHash]) -> ContentId {
 /// section and wasm imports. Destructured, so a field added to [`Static`] is a compile error
 /// here until it is hashed.
 pub fn static_definition(value: &Static) -> ContentId {
-    let Static { item, instance, align, init, data, mutable, thread_local, section, imports } = value;
+    let Static { item, instance, align, init, data, mutable, thread_local, section, imports } =
+        value;
     let mut hasher = Hasher::new(STATIC_DIGEST_DOMAIN);
     hasher.id(&item.0).id(instance).update(&align.to_le_bytes());
     match init {

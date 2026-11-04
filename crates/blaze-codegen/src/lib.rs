@@ -43,8 +43,8 @@ pub mod relocs;
 pub mod settings;
 pub mod summary;
 pub mod template;
-pub mod wasm;
 pub mod unwind;
+pub mod wasm;
 
 pub use driver::Owner;
 pub use exec::ExecTable;
@@ -86,8 +86,12 @@ pub struct Settings(pub ContentId);
 pub enum Backend {
     /// `speed`: Cranelift's `opt_level=speed`, for code no edit reaches (std's, dependencies',
     /// build-time code), which is compiled once; else `opt_level=none`.
-    Cranelift { speed: bool },
-    Llvm { opt: u8 },
+    Cranelift {
+        speed: bool,
+    },
+    Llvm {
+        opt: u8,
+    },
     /// Copy-and-patch (`blaze-stencil`): tier 0 of a tiered dev or test run
     /// (docs/v2/plan/lanes/fastcompile/stencil.md).
     Stencil,
@@ -493,9 +497,5 @@ pub struct FrontItem {
 pub trait Compile: Sync {
     /// The front end's MIR of an instance, as the codegen lane reads it (`hir-ty-mir`).
     type Mir<'a>;
-    fn compile(
-        &self,
-        unit: &Unit,
-        mir: Self::Mir<'_>,
-    ) -> Result<CompiledFunction, CodegenError>;
+    fn compile(&self, unit: &Unit, mir: Self::Mir<'_>) -> Result<CompiledFunction, CodegenError>;
 }

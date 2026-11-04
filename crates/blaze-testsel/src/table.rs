@@ -64,16 +64,31 @@ impl fmt::Display for TableError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TableError::NoFunction { slot, function } => {
-                write!(f, "slot {slot} names function {function}, which the binary's table does not have")
+                write!(
+                    f,
+                    "slot {slot} names function {function}, which the binary's table does not have"
+                )
             }
-            TableError::TwoSlots { function } => write!(f, "function {function} of the binary's table has two slots"),
-            TableError::Twice(id) => write!(f, "two functions of the binary's table are function {}", id.0),
-            TableError::NotInTable(at) => write!(f, "a test reaches function {at}, which the binary's table does not have"),
+            TableError::TwoSlots { function } => {
+                write!(f, "function {function} of the binary's table has two slots")
+            }
+            TableError::Twice(id) => {
+                write!(f, "two functions of the binary's table are function {}", id.0)
+            }
+            TableError::NotInTable(at) => {
+                write!(f, "a test reaches function {at}, which the binary's table does not have")
+            }
             TableError::OtherBinary { record, table } => {
-                write!(f, "the execution record has {record} slots and the binary {table}: it is of another binary")
+                write!(
+                    f,
+                    "the execution record has {record} slots and the binary {table}: it is of another binary"
+                )
             }
             TableError::EmptySlot { slot } => {
-                write!(f, "the execution record hits slot {slot}, which names no function in the binary")
+                write!(
+                    f,
+                    "the execution record hits slot {slot}, which names no function in the binary"
+                )
             }
         }
     }
@@ -107,7 +122,9 @@ impl Lookup {
                         lookup.places[place] = at as u32;
                         break;
                     }
-                    other if fns[other as usize].id == version.id => return Err(TableError::Twice(version.id)),
+                    other if fns[other as usize].id == version.id => {
+                        return Err(TableError::Twice(version.id));
+                    }
                     _ => place = (place + 1) & lookup.mask,
                 }
             }
@@ -165,7 +182,8 @@ fn by_identity(fns: &[Version]) -> Vec<u32> {
         return (0..fns.len() as u32).collect();
     }
     // alloc: once per binary, the sort's keys
-    let mut keyed: Vec<(u64, u32)> = fns.iter().enumerate().map(|(at, it)| (prefix(&it.id), at as u32)).collect();
+    let mut keyed: Vec<(u64, u32)> =
+        fns.iter().enumerate().map(|(at, it)| (prefix(&it.id), at as u32)).collect();
     blaze_ids::radix::sort_pairs(&mut keyed);
     let mut start = 0;
     while start < keyed.len() {
@@ -174,7 +192,8 @@ fn by_identity(fns: &[Version]) -> Vec<u32> {
             end += 1;
         }
         if end - start > 1 {
-            keyed[start..end].sort_unstable_by(|a, b| fns[a.1 as usize].id.cmp(&fns[b.1 as usize].id));
+            keyed[start..end]
+                .sort_unstable_by(|a, b| fns[a.1 as usize].id.cmp(&fns[b.1 as usize].id));
         }
         start = end;
     }
@@ -185,7 +204,11 @@ fn by_identity(fns: &[Version]) -> Vec<u32> {
 impl Image {
     /// The table of a binary: its functions, each slot's function, and `beside`, the content
     /// of the code it runs that is in no table (the premapped dependency image; zero for none).
-    pub fn new(fns: Vec<Version>, slot_fn: Vec<u32>, beside: ContentId) -> Result<Image, TableError> {
+    pub fn new(
+        fns: Vec<Version>,
+        slot_fn: Vec<u32>,
+        beside: ContentId,
+    ) -> Result<Image, TableError> {
         // alloc: once per binary
         let mut logged = vec![false; fns.len()];
         for (slot, &function) in slot_fn.iter().enumerate() {

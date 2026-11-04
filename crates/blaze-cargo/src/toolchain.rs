@@ -135,7 +135,12 @@ pub fn sysroot() -> Option<&'static Path> {
 /// `file` under `base` (an address ending in `/`) from byte `offset` on, through blaze-registry's
 /// HTTP client; `None` when the server has no such file. A server that ignores the range sends
 /// the whole file, of which what is had is left out.
-async fn read_from(http: &HyperHttp, base: &url::Url, file: &str, offset: u64) -> anyhow::Result<Option<Vec<u8>>> {
+async fn read_from(
+    http: &HyperHttp,
+    base: &url::Url,
+    file: &str,
+    offset: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let url = base.join(file)?;
     let range = format!("bytes={offset}-");
     let headers: &[(&str, &str)] = if offset == 0 { &[] } else { &[("range", &range)] };
@@ -176,7 +181,11 @@ struct NotUtf8Var(&'static str);
 
 impl std::fmt::Display for NotUtf8Var {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`{}` is not UTF-8, and blaze reads the address or directory it names as text", self.0)
+        write!(
+            f,
+            "`{}` is not UTF-8, and blaze reads the address or directory it names as text",
+            self.0
+        )
     }
 }
 
@@ -208,7 +217,12 @@ pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
 /// nothing about the build depends on it.
 pub fn say_toolchain_file(dir: &Path, verbose: bool) {
     if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
-        eprintln!("blaze: {} is ignored: blaze builds with its own Rust, {} ({})", file.display(), ours_release(), name());
+        eprintln!(
+            "blaze: {} is ignored: blaze builds with its own Rust, {} ({})",
+            file.display(),
+            ours_release(),
+            name()
+        );
     }
 }
 
@@ -222,7 +236,11 @@ mod tests {
         let inner = root.path().join("a/b");
         std::fs::create_dir_all(&inner).unwrap();
         assert_eq!(toolchain_file(&inner).filter(|it| it.starts_with(root.path())), None);
-        std::fs::write(root.path().join("a/rust-toolchain.toml"), "[toolchain]\nchannel = \"1.70\"\n").unwrap();
+        std::fs::write(
+            root.path().join("a/rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.70\"\n",
+        )
+        .unwrap();
         assert_eq!(toolchain_file(&inner), Some(root.path().join("a/rust-toolchain.toml")));
         std::fs::write(root.path().join("a/b/rust-toolchain"), "1.70\n").unwrap();
         assert_eq!(toolchain_file(&inner), Some(inner.join("rust-toolchain")), "the nearest");
@@ -238,8 +256,12 @@ mod tests {
 
     #[test]
     fn a_download_that_gave_up_says_how_often_it_tried_and_why() {
-        let error = anyhow::anyhow!("connection reset").context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
-        assert_eq!(format!("{error:#}"), "library-ab.tar.xz: the download gave up after 4 tries: connection reset");
+        let error = anyhow::anyhow!("connection reset")
+            .context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
+        assert_eq!(
+            format!("{error:#}"),
+            "library-ab.tar.xz: the download gave up after 4 tries: connection reset"
+        );
         assert!(error.downcast_ref::<GaveUp>().is_some_and(|it| it.tries == 4));
         assert_eq!(
             NotUtf8Var("BLAZE_RUST_DIST").to_string(),

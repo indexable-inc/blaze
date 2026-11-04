@@ -112,8 +112,8 @@ impl Names {
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashMap;
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
+    use std::alloc::Global;
 
     use super::*;
 
@@ -165,7 +165,10 @@ mod tests {
         for n in 0..100 {
             names.intern(&format!("/lib/{n}"));
         }
-        assert_eq!((names.text.capacity(), names.index.capacity(), names.len()), (text, index, 100));
+        assert_eq!(
+            (names.text.capacity(), names.index.capacity(), names.len()),
+            (text, index, 100)
+        );
         assert_eq!(names.intern(""), Some(100));
         assert_eq!(names.get(100), "");
     }

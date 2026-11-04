@@ -189,10 +189,12 @@ impl<T> Writer<'_, T> {
         // Only the writer changes `len`, and the flag's acquire ordered this after the last
         // writer's store.
         let len = column.len.load(Ordering::Relaxed);
-        let end = len.checked_add(count).filter(|&end| end <= column.max).ok_or_else(|| MemError::Exhausted {
-            tag: column.tag(),
-            reserved: column.region.reserved(),
-            wanted: len.saturating_add(count).saturating_mul(AppendVec::<T>::SIZE),
+        let end = len.checked_add(count).filter(|&end| end <= column.max).ok_or_else(|| {
+            MemError::Exhausted {
+                tag: column.tag(),
+                reserved: column.region.reserved(),
+                wanted: len.saturating_add(count).saturating_mul(AppendVec::<T>::SIZE),
+            }
         })?;
         column.region.ensure(end * AppendVec::<T>::SIZE)?;
         Ok(len)
@@ -267,7 +269,11 @@ impl<T> Writer<'_, T> {
     /// Appends `make(0)`, `make(1)`, ... `make(count - 1)` with one publish; the first one's
     /// index. If `make` panics, none is published and those made so far are leaked (the next
     /// append writes over them).
-    pub fn try_extend_with(&mut self, count: usize, mut make: impl FnMut(usize) -> T) -> Result<u32, MemError> {
+    pub fn try_extend_with(
+        &mut self,
+        count: usize,
+        mut make: impl FnMut(usize) -> T,
+    ) -> Result<u32, MemError> {
         let len = self.room(count)?;
         for at in 0..count {
             // SAFETY: as in `try_append`, for each slot of the room `room` committed.

@@ -114,7 +114,9 @@ impl<'a> Cursor<'a> {
             return None;
         }
         let tree = self.origin.tree;
-        if self.at + 1 >= self.origin.end || tree.is_subtree(self.at) || tree.is_subtree(self.at + 1)
+        if self.at + 1 >= self.origin.end
+            || tree.is_subtree(self.at)
+            || tree.is_subtree(self.at + 1)
         {
             return None;
         }

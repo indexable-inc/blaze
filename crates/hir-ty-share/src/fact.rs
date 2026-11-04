@@ -33,6 +33,7 @@
 //!
 //! Each fact ends with whether the type needs drop and whether it is `Freeze`.
 
+use crate::{FACT_DOMAIN, Unshared, identity, layout};
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{AdtId, VariantId, attrs::AttrFlags};
@@ -41,7 +42,7 @@ use hir_ty::{
     db::HirDatabase,
     drop::{DropGlue, has_drop_glue, is_freeze},
     layout::Layout,
-        next_solver::{
+    next_solver::{
         DbInterner, ParamEnv, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
@@ -49,7 +50,6 @@ use hir_ty::{
 };
 use rustc_abi::{IntegerType, ReprFlags, ReprOptions, ScalableElt};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
-use crate::{FACT_DOMAIN, Unshared, identity, layout};
 
 /// What a fact or a pointee summary is of: its first byte.
 mod tag {
@@ -144,10 +144,7 @@ pub struct Cx<'db> {
 }
 
 impl<'db> Cx<'db> {
-    pub fn new(
-        db: &'db Db,
-        stored: StoredParamEnvAndCrate,
-    ) -> Cx<'db> {
+    pub fn new(db: &'db Db, stored: StoredParamEnvAndCrate) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
@@ -181,7 +178,8 @@ impl<'db> Cx<'db> {
     pub fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
         stdx::ensure_sufficient_stack(|| {
             let ty = self.deeply_normalize(ty)?;
-            match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
+            match fact(self.db, ty.store(), self.stored.clone()) {
+                // clone: the query's key, a reference count
                 Ok(id) => Ok(*id),
                 Err(why) => Err(why.clone()), // clone: error path
             }
@@ -234,8 +232,9 @@ impl<'db> Cx<'db> {
             TyKind::Slice(element) => Some(element),
             _ => Some(pointee),
         };
-        let plain = element
-            .is_none_or(|it| is_plain_data(self.db, self.interner, &self.infcx, self.env.param_env, it));
+        let plain = element.is_none_or(|it| {
+            is_plain_data(self.db, self.interner, &self.infcx, self.env.param_env, it)
+        });
         let freeze = is_freeze(&self.infcx, pointee, self.env.param_env);
         let unpin = self.is_unpin(pointee);
         out.update(&[u8::from(plain) | u8::from(freeze) << 1 | u8::from(unpin) << 2]);
@@ -280,9 +279,12 @@ impl<'db> Cx<'db> {
                 for variant in adt.variants(db) {
                     variants += 1;
                     if let VariantId::EnumVariantId(variant) = variant {
-                        let discriminant = db.const_eval_discriminant(variant).map_err(|error| {
-                            Unshared::ConstEval(format!("a discriminant of `{ty:?}`: {error:?}")) // alloc: error path
-                        })?;
+                        let discriminant =
+                            db.const_eval_discriminant(variant).map_err(|error| {
+                                Unshared::ConstEval(format!(
+                                    "a discriminant of `{ty:?}`: {error:?}"
+                                )) // alloc: error path
+                            })?;
                         out.update(&discriminant.to_le_bytes());
                     }
                     let fields = db.field_types(variant);
@@ -400,11 +402,7 @@ fn write_shape(db: &Db, adt: AdtId, out: &mut Hasher) {
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = fact_cycle)]
-fn fact(
-    db: &Db,
-    ty: StoredTy,
-    env: StoredParamEnvAndCrate,
-) -> Result<ContentId, Unshared> {
+fn fact(db: &Db, ty: StoredTy, env: StoredParamEnvAndCrate) -> Result<ContentId, Unshared> {
     let cx = Cx::new(db, env);
     let mut out = Hasher::new(FACT_DOMAIN);
     cx.write(ty.as_ref(), &mut out)?;

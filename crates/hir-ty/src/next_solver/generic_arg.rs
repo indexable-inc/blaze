@@ -25,8 +25,8 @@ use crate::next_solver::{
 };
 
 use super::{
-    Const, ConstExt, DbInterner, EarlyParamRegion, ErrorGuaranteed, InternedConst,
-    InternedRegion, ParamConst, Region, RegionExt, SolverDefId, Ty, generics::Generics,
+    Const, ConstExt, DbInterner, EarlyParamRegion, ErrorGuaranteed, InternedConst, InternedRegion,
+    ParamConst, Region, RegionExt, SolverDefId, Ty, generics::Generics,
 };
 
 pub type GenericArgKind<'db> = rustc_type_ir::GenericArgKind<DbInterner<'db>>;
@@ -607,9 +607,7 @@ impl<'db> rustc_type_ir::inherent::GenericArgs<DbInterner<'db>> for GenericArgs<
         })
     }
     fn type_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Ty {
-        self.get(i)
-            .and_then(|g| g.as_type())
-            .unwrap_or_else(|| super::default_types().types.error)
+        self.get(i).and_then(|g| g.as_type()).unwrap_or_else(|| super::default_types().types.error)
     }
 
     fn region_at(self, i: usize) -> Region<'db> {
@@ -800,7 +798,8 @@ mod tests {
     fn every_kind_of_term_reads_back_as_itself_and_converts_for_free() {
         let ty = u8_ty();
         let konst = fresh_const();
-        let terms = [(Term::from(ty), TermKind::Ty(ty)), (Term::from(konst), TermKind::Const(konst))];
+        let terms =
+            [(Term::from(ty), TermKind::Ty(ty)), (Term::from(konst), TermKind::Const(konst))];
         for (term, kind) in terms {
             assert!(term.kind() == kind);
             assert!(GenericArg::from(term).as_term() == Some(term));

@@ -19,35 +19,96 @@ fn refused(words: &[&str]) -> String {
 
 #[test]
 fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
-    let asked = cargo(&["check", "--workspace", "--target", "x86_64-unknown-linux-gnu", "--baselines", "b"]);
+    let asked = cargo(&[
+        "check",
+        "--workspace",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--baselines",
+        "b",
+    ]);
     assert_eq!(asked.command, Some(Command::Check));
     assert!(asked.flags.workspace);
     assert_eq!(asked.flags.baselines.as_deref(), Some("b"));
-    assert_eq!(asked.args, ["--workspace", "--target", "x86_64-unknown-linux-gnu"], "blaze's own flags stay with the client");
-    assert!(refused(&["check", "--no-deps"]).starts_with("error: unexpected argument '--no-deps' found"));
-    assert!(refused(&["check", "--allow-dirty"]).starts_with("error: unexpected argument '--allow-dirty' found"));
-    assert!(refused(&["check", "--", "-D", "warnings"]).starts_with("error: unexpected argument '-D' found"));
+    assert_eq!(
+        asked.args,
+        ["--workspace", "--target", "x86_64-unknown-linux-gnu"],
+        "blaze's own flags stay with the client"
+    );
+    assert!(
+        refused(&["check", "--no-deps"])
+            .starts_with("error: unexpected argument '--no-deps' found")
+    );
+    assert!(
+        refused(&["check", "--allow-dirty"])
+            .starts_with("error: unexpected argument '--allow-dirty' found")
+    );
+    assert!(
+        refused(&["check", "--", "-D", "warnings"])
+            .starts_with("error: unexpected argument '-D' found")
+    );
     let unhonored = |words: &[&str]| super::refused(&cargo(words));
     assert_eq!(unhonored(&["check", "--fix"]), None);
-    assert!(unhonored(&["check", "--fix", "--baselines", "b"]).is_some(), "a fix changes what the baselines count");
+    assert!(
+        unhonored(&["check", "--fix", "--baselines", "b"]).is_some(),
+        "a fix changes what the baselines count"
+    );
     let t = "--target=x86_64-unknown-linux-gnu";
     assert_eq!(unhonored(&["check", "--workspace", t, "--baselines", "b"]), None);
-    assert!(unhonored(&["check", "--workspace", "--baselines", "b"]).is_some(), "counts are of one named target");
-    assert!(unhonored(&["check", "--workspace", t, "--tests", "--baselines", "b"]).is_some(), "the default targets only");
-    assert!(unhonored(&["check", "-p", "a", t, "--baselines", "b"]).is_some(), "another crate reads as at zero");
-    let fix = cargo(&["check", "--fix", "--lint", "clippy::disallowed_types", "--lint=unused_imports", "-p", "a"]);
+    assert!(
+        unhonored(&["check", "--workspace", "--baselines", "b"]).is_some(),
+        "counts are of one named target"
+    );
+    assert!(
+        unhonored(&["check", "--workspace", t, "--tests", "--baselines", "b"]).is_some(),
+        "the default targets only"
+    );
+    assert!(
+        unhonored(&["check", "-p", "a", t, "--baselines", "b"]).is_some(),
+        "another crate reads as at zero"
+    );
+    let fix = cargo(&[
+        "check",
+        "--fix",
+        "--lint",
+        "clippy::disallowed_types",
+        "--lint=unused_imports",
+        "-p",
+        "a",
+    ]);
     assert!(fix.flags.fix);
     assert_eq!(fix.flags.lints, ["clippy::disallowed_types", "unused_imports"]);
     assert_eq!(fix.args, ["-p", "a"], "`--fix` and its `--lint`s stay with the client");
-    assert!(unhonored(&["check", "--lint", "unused_imports"]).is_some(), "`--lint` narrows `--fix` alone");
-    let replace = cargo(&["check", "--replace", "std::sync::Mutex=parking_lot::Mutex", "--replace=a::B=c::D"]);
+    assert!(
+        unhonored(&["check", "--lint", "unused_imports"]).is_some(),
+        "`--lint` narrows `--fix` alone"
+    );
+    let replace = cargo(&[
+        "check",
+        "--replace",
+        "std::sync::Mutex=parking_lot::Mutex",
+        "--replace=a::B=c::D",
+    ]);
     assert_eq!(replace.flags.replace, ["std::sync::Mutex=parking_lot::Mutex", "a::B=c::D"]);
     assert!(replace.args.is_empty(), "`--replace` stays with the client");
-    assert!(unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(), "a replace checks nothing");
+    assert!(
+        unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(),
+        "a replace checks nothing"
+    );
     assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
     let whole = |words: &[&str]| unhonored(&[&["check", "--workspace", t], words].concat());
-    assert_eq!(whole(&["--baselines", "b", "--bless-baselines", "--new-baseline", "clippy::x"]), None);
-    let many = cargo(&["check", "--baselines", "b", "--new-baseline", "clippy::a,blaze::b", "--new-baseline=clippy::c"]);
+    assert_eq!(
+        whole(&["--baselines", "b", "--bless-baselines", "--new-baseline", "clippy::x"]),
+        None
+    );
+    let many = cargo(&[
+        "check",
+        "--baselines",
+        "b",
+        "--new-baseline",
+        "clippy::a,blaze::b",
+        "--new-baseline=clippy::c",
+    ]);
     assert_eq!(many.flags.new_baselines, ["clippy::a", "blaze::b", "clippy::c"]);
 }
 
@@ -60,10 +121,15 @@ fn clippy_and_fix_are_no_commands() {
 
 #[test]
 fn doc_reads_cargo_docs_flags_and_refuses_what_it_does_not_take() {
-    let asked = cargo(&["doc", "--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"]);
+    let asked =
+        cargo(&["doc", "--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"]);
     assert!(asked.flags.open && asked.flags.no_deps && asked.flags.private && asked.flags.targeted);
     assert_eq!(asked.flags.packages, ["a"]);
-    assert_eq!(asked.args, ["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"], "cargo's to read too");
+    assert_eq!(
+        asked.args,
+        ["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"],
+        "cargo's to read too"
+    );
     assert!(refused(&["doc", "--tests"]).starts_with("error: unexpected argument '--tests' found"));
     assert!(refused(&["doc", "stray"]).starts_with("error: unexpected argument 'stray' found"));
     assert!(refused(&["check", "--open"]).starts_with("error: unexpected argument '--open' found"));
@@ -71,10 +137,17 @@ fn doc_reads_cargo_docs_flags_and_refuses_what_it_does_not_take() {
     let unhonored = |words: &[&str]| super::refused(&cargo(words));
     assert_eq!(unhonored(&["doc"]), None);
     assert_eq!(unhonored(&["doc", "--message-format", "short"]), None);
-    assert_eq!(unhonored(&["doc", "--unit-graph"]).unwrap(), "`blaze doc` does not write what `--unit-graph` asks for yet");
-    assert_eq!(unhonored(&["doc", "--timings"]).unwrap(), "`blaze doc` does not write what `--timings` asks for yet");
     assert_eq!(
-        unhonored(&["doc", "--message-format=json-render-diagnostics,json-diagnostic-short"]).unwrap(),
+        unhonored(&["doc", "--unit-graph"]).unwrap(),
+        "`blaze doc` does not write what `--unit-graph` asks for yet"
+    );
+    assert_eq!(
+        unhonored(&["doc", "--timings"]).unwrap(),
+        "`blaze doc` does not write what `--timings` asks for yet"
+    );
+    assert_eq!(
+        unhonored(&["doc", "--message-format=json-render-diagnostics,json-diagnostic-short"])
+            .unwrap(),
         "`blaze doc` writes no JSON messages for the pages yet (`--message-format json-render-diagnostics`)"
     );
     assert_eq!(super::refused(&cargo(&["check", "--timings"])), None, "not doc's");
@@ -114,7 +187,10 @@ fn commands_and_their_aliases() {
         parse(os(&["codegen-inputs", "--format=json", "-p", "foo"])),
         Ok(Asked::Inspect(Inspected::CodegenInputs, os(&["--format=json", "-p", "foo"])))
     );
-    assert_eq!(parse(os(&["trace", "--out", "t"])), Ok(Asked::Inspect(Inspected::Trace, os(&["--out", "t"]))));
+    assert_eq!(
+        parse(os(&["trace", "--out", "t"])),
+        Ok(Asked::Inspect(Inspected::Trace, os(&["--out", "t"])))
+    );
     assert_eq!(parse(os(&["tables"])), Ok(Asked::Inspect(Inspected::Tables, Vec::new())));
     assert_eq!(
         parse(os(&["pack", "-p", "app", "--out", "a.pack"])),
@@ -136,7 +212,20 @@ fn flags_before_the_command_are_cargos_too() {
 
 #[test]
 fn values_as_clap_takes_them() {
-    let asked = cargo(&["build", "-p", "a", "--package=b", "-pc", "-F", "x y,z", "--features=w", "-j8", "--bin", "--target", "aarch64-apple-darwin"]);
+    let asked = cargo(&[
+        "build",
+        "-p",
+        "a",
+        "--package=b",
+        "-pc",
+        "-F",
+        "x y,z",
+        "--features=w",
+        "-j8",
+        "--bin",
+        "--target",
+        "aarch64-apple-darwin",
+    ]);
     assert_eq!(asked.flags.packages, ["a", "b", "c"]);
     assert_eq!(asked.flags.features, ["x", "y", "z", "w"]);
     assert_eq!(asked.flags.bins, [None::<String>]);
@@ -209,7 +298,10 @@ fn refused_is_blazes_a_count_or_all() {
     assert_eq!(all.args, ["--release"], "cargo never sees `--refused`");
     assert_eq!(cargo(&["test", "--refused=100000"]).flags.refused, Some(Some(100_000)));
     assert_eq!(cargo(&["run", "--refused", "0"]).flags.refused, Some(Some(0)));
-    assert!(refused(&["check", "--refused", "every"]).starts_with("error: invalid value 'every' for '--refused <N|all>': "));
+    assert!(
+        refused(&["check", "--refused", "every"])
+            .starts_with("error: invalid value 'every' for '--refused <N|all>': ")
+    );
     assert!(parse(os(&["doc", "--refused", "all"])).is_err(), "doc compiles no program");
     assert!(parse(os(&["build", "--refused"])).is_err());
 }
@@ -283,7 +375,12 @@ fn hidden_flags_that_point_elsewhere() {
     tip(&["run", "--silent"], "--silent", &similar("--quiet"), "cargo run [OPTIONS] [ARGS]...");
     tip(&["build", "-t", "x"], "-t", &similar("--target"), "cargo build [OPTIONS]");
     tip(&["build", "--path", "x"], "--path", &similar("--manifest-path"), "cargo build [OPTIONS]");
-    tip(&["build", "--out-dir", "x"], "--out-dir", &similar("--artifact-dir"), "cargo build [OPTIONS]");
+    tip(
+        &["build", "--out-dir", "x"],
+        "--out-dir",
+        &similar("--artifact-dir"),
+        "cargo build [OPTIONS]",
+    );
     tip(&["build", "-O"], "-O", &similar("--artifact-dir"), "cargo build [OPTIONS]");
     tip(&["build", "-c", "x"], "-c", &similar("--config"), "cargo build [OPTIONS]");
     tip(&["check", "-z", "x"], "-z", &similar("-Z"), "cargo check [OPTIONS]");
@@ -299,14 +396,18 @@ fn hidden_flags_that_point_elsewhere() {
         assert!(!asked.flags.fail_fast && asked.args == ["--keep-going"], "{command}");
     }
     // `test`'s `-q` is its own, and it has no `-s`; `check` has no `--debug`.
-    assert!(refused(&["test", "-s"]).starts_with("error: unexpected argument '-s' found\n\n  tip: to pass '-s'"));
+    assert!(
+        refused(&["test", "-s"])
+            .starts_with("error: unexpected argument '-s' found\n\n  tip: to pass '-s'")
+    );
     assert!(parse(os(&["check", "--debug"])).is_err());
     assert!(cargo(&["build", "--keep-going"]).args == ["--keep-going"]);
 }
 
 #[test]
 fn flags_as_cargos_prelude_has_them() {
-    let asked = cargo(&["build", "-m", "a/Cargo.toml", "-j", "-1", "--timings", "--compile-time-deps"]);
+    let asked =
+        cargo(&["build", "-m", "a/Cargo.toml", "-j", "-1", "--timings", "--compile-time-deps"]);
     assert_eq!(asked.flags.manifest_path.as_deref(), Some("a/Cargo.toml"));
     assert_eq!(asked.args, ["-m", "a/Cargo.toml", "-j", "-1", "--timings", "--compile-time-deps"]);
     assert!(cargo(&["check", "--compile-time-deps"]).args == ["--compile-time-deps"]);
@@ -316,7 +417,11 @@ fn flags_as_cargos_prelude_has_them() {
          [OPTIONS]\n\nFor more information, try '--help'.\n"
     );
     for gone in ["--lockfile-path", "--build-plan"] {
-        assert!(refused(&["build", gone]).starts_with(&format!("error: unexpected argument '{gone}' found")), "{gone}");
+        assert!(
+            refused(&["build", gone])
+                .starts_with(&format!("error: unexpected argument '{gone}' found")),
+            "{gone}"
+        );
     }
     // `bench` has no `--release` and no `--future-incompat-report`; `test` has the report.
     assert!(parse(os(&["bench", "--release"])).is_err());
@@ -325,7 +430,11 @@ fn flags_as_cargos_prelude_has_them() {
     assert!(parse(os(&["check", "--artifact-dir", "x"])).is_err());
     assert_eq!(cargo(&["build", "--color", "ALWAYS"]).flags.color.as_deref(), Some("ALWAYS"));
     let help = help(Command::Build);
-    assert!(help.contains("Usage: cargo build [OPTIONS]\n") && help.contains("  -m, --manifest-path <PATH>\n"), "{help}");
+    assert!(
+        help.contains("Usage: cargo build [OPTIONS]\n")
+            && help.contains("  -m, --manifest-path <PATH>\n"),
+        "{help}"
+    );
     assert!(!help.contains("--silent") && !help.contains("compile-time-deps"), "{help}");
 }
 
@@ -336,13 +445,25 @@ fn a_flag_given_twice() {
         "error: the argument '--release' cannot be used multiple times\n\nUsage: cargo build [OPTIONS]\n\nFor more \
          information, try '--help'.\n"
     );
-    assert!(refused(&["run", "-p", "a", "-p", "b"]).starts_with("error: the argument '--package [<SPEC>]' cannot be used multiple times"));
-    assert!(refused(&["build", "--profile", "a", "--profile=b"]).contains("'--profile <PROFILE-NAME>' cannot be used multiple times"));
+    assert!(
+        refused(&["run", "-p", "a", "-p", "b"])
+            .starts_with("error: the argument '--package [<SPEC>]' cannot be used multiple times")
+    );
+    assert!(
+        refused(&["build", "--profile", "a", "--profile=b"])
+            .contains("'--profile <PROFILE-NAME>' cannot be used multiple times")
+    );
     // Appended, counted, or once before the command and once after it (clap's parent and child).
-    assert_eq!(cargo(&["build", "-p", "a", "-p", "b", "-F", "x", "-F", "y"]).flags.packages, ["a", "b"]);
+    assert_eq!(
+        cargo(&["build", "-p", "a", "-p", "b", "-F", "x", "-F", "y"]).flags.packages,
+        ["a", "b"]
+    );
     assert_eq!(cargo(&["build", "-v", "--verbose", "-v"]).flags.verbose, 3);
     assert!(cargo(&["-q", "build", "-q"]).flags.quiet);
-    assert_eq!(cargo(&["--color", "never", "build", "--color", "always"]).flags.color.as_deref(), Some("always"));
+    assert_eq!(
+        cargo(&["--color", "never", "build", "--color", "always"]).flags.color.as_deref(),
+        Some("always")
+    );
 }
 
 #[test]
@@ -358,7 +479,10 @@ fn release_and_profile_conflict() {
          --profile <PROFILE-NAME> <TESTNAME> [-- [ARGS]...]\n\nFor more information, try '--help'.\n"
     );
     // A refusal while reading comes first.
-    assert!(refused(&["build", "--release", "--profile", "dev", "--frobnicate"]).contains("'--frobnicate'"));
+    assert!(
+        refused(&["build", "--release", "--profile", "dev", "--frobnicate"])
+            .contains("'--frobnicate'")
+    );
 }
 
 #[test]
@@ -366,7 +490,11 @@ fn change_directory_before_the_command() {
     let asked = cargo(&["-C", "sub", "-Zunstable-options", "build", "--release"]);
     assert_eq!(asked.directory, Some(OsString::from("sub")));
     assert!(asked.unstable_options);
-    assert_eq!(asked.args, ["-Zunstable-options", "--release"], "`-C` is the client's, not the load's");
+    assert_eq!(
+        asked.args,
+        ["-Zunstable-options", "--release"],
+        "`-C` is the client's, not the load's"
+    );
     let asked = cargo(&["-Csub", "-Z", "unstable-options", "check"]);
     assert_eq!((asked.directory, asked.unstable_options), (Some(OsString::from("sub")), true));
     let asked = cargo(&["-C=sub", "build", "-Zunstable-options"]);
@@ -380,9 +508,18 @@ fn change_directory_before_the_command() {
 #[test]
 fn what_cargos_commands_refuse_before_building() {
     let refused_of = |words: &[&str]| super::refused(&cargo(words));
-    assert_eq!(refused_of(&["test", "--doc", "--lib"]).as_deref(), Some("can't mix --doc with other target selecting options"));
-    assert_eq!(refused_of(&["test", "--doc", "--test", "x"]).as_deref(), Some("can't mix --doc with other target selecting options"));
-    assert_eq!(refused_of(&["test", "--doc", "--no-run"]).as_deref(), Some("can't skip running doc tests with --no-run"));
+    assert_eq!(
+        refused_of(&["test", "--doc", "--lib"]).as_deref(),
+        Some("can't mix --doc with other target selecting options")
+    );
+    assert_eq!(
+        refused_of(&["test", "--doc", "--test", "x"]).as_deref(),
+        Some("can't mix --doc with other target selecting options")
+    );
+    assert_eq!(
+        refused_of(&["test", "--doc", "--no-run"]).as_deref(),
+        Some("can't skip running doc tests with --no-run")
+    );
     assert_eq!(refused_of(&["test", "--doc", "-p", "foo"]), None);
     assert_eq!(
         refused_of(&["run", "-p", "foo*"]).as_deref(),
@@ -438,7 +575,9 @@ fn refusals_in_cargos_colors() {
         colored.starts_with("\x1b[1m\x1b[91merror:\x1b[0m unexpected argument '\x1b[1m\x1b[93m--frobnicate\x1b[0m' found\n"),
         "{colored:?}"
     );
-    assert!(colored.contains("\x1b[1m\x1b[92mUsage:\x1b[0m \x1b[1m\x1b[96mcargo build\x1b[0m \x1b[36m[OPTIONS]\x1b[0m"));
+    assert!(colored.contains(
+        "\x1b[1m\x1b[92mUsage:\x1b[0m \x1b[1m\x1b[96mcargo build\x1b[0m \x1b[36m[OPTIONS]\x1b[0m"
+    ));
     // `Arg::stylized` and clap's `[-- ...]`: literal brackets and dashes, placeholder values.
     let colored = refusal(&parse(os(&["test", "-y"])).unwrap_err(), true);
     assert!(colored.contains(
@@ -446,7 +585,12 @@ fn refusals_in_cargos_colors() {
     ), "{colored:?}");
     assert!(colored.contains("to pass '\x1b[1m\x1b[93m-y\x1b[0m' as a value"), "{colored:?}");
     let colored = refusal(&parse(os(&["build", "-v", "-r", "--profile", "a"])).unwrap_err(), true);
-    assert!(colored.contains("\x1b[1m\x1b[96m--verbose\x1b[0m\x1b[36m...\x1b[0m \x1b[1m\x1b[96m--release\x1b[0m"), "{colored:?}");
+    assert!(
+        colored.contains(
+            "\x1b[1m\x1b[96m--verbose\x1b[0m\x1b[36m...\x1b[0m \x1b[1m\x1b[96m--release\x1b[0m"
+        ),
+        "{colored:?}"
+    );
 }
 
 #[test]

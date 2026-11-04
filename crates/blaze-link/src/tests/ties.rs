@@ -3,13 +3,18 @@
 //! the two tables stay one entry each per kept function, in the order of the functions.
 
 use blaze_codegen::Target;
-use object::write::{Comdat, Object as Builder, Relocation, SectionId, Symbol as Def, SymbolSection};
+use object::write::{
+    Comdat, Object as Builder, Relocation, SectionId, Symbol as Def, SymbolSection,
+};
 use object::{
-    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags, SectionKind, SymbolFlags,
-    SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags, SectionKind,
+    SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
-use super::{Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name, output, rel32, returns};
+use super::{
+    Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name, output, rel32,
+    returns,
+};
 use crate::state::What;
 
 /// A function of the object: its name, what it returns, its counters' bytes (one per block),
@@ -22,9 +27,16 @@ struct Covered {
     comdat: bool,
 }
 
-const A: Covered = Covered { name: "a", value: 1, counters: &[0xa1, 0xa2], blocks: &[0, 4], comdat: false };
+const A: Covered =
+    Covered { name: "a", value: 1, counters: &[0xa1, 0xa2], blocks: &[0, 4], comdat: false };
 const B: Covered = Covered { name: "b", value: 2, counters: &[0xb1], blocks: &[0], comdat: true };
-const C: Covered = Covered { name: "c", value: 3, counters: &[0xc1, 0xc2, 0xc3], blocks: &[0, 1, 5], comdat: true };
+const C: Covered = Covered {
+    name: "c",
+    value: 3,
+    counters: &[0xc1, 0xc2, 0xc3],
+    blocks: &[0, 1, 5],
+    comdat: true,
+};
 
 /// The ELF section header table of `bytes`: each header's offset and name.
 fn headers(bytes: &[u8]) -> Vec<(usize, String)> {
@@ -52,7 +64,8 @@ fn link(bytes: &mut [u8], section: &str, nth: usize, to: &str) {
 }
 
 fn flags(b: &mut Builder<'_>, section: SectionId, flags: elf::SectionFlags) {
-    b.section_mut(section).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: flags };
+    b.section_mut(section).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: flags };
 }
 
 /// An x86-64 object: each function in its own `.text.<name>`, returning its value; its
@@ -63,7 +76,8 @@ fn object(functions: &[Covered], counters: &[usize], pcs: &[usize]) -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let mut texts = Vec::new();
     for it in functions {
-        let text = b.add_section(Vec::new(), format!(".text.{}", it.name).into_bytes(), SectionKind::Text);
+        let text =
+            b.add_section(Vec::new(), format!(".text.{}", it.name).into_bytes(), SectionKind::Text);
         let at = b.append_section_data(text, &returns(it.value), 16);
         let symbol = b.add_symbol(Def {
             name: it.name.as_bytes().to_vec(),
@@ -88,13 +102,20 @@ fn object(functions: &[Covered], counters: &[usize], pcs: &[usize]) -> Vec<u8> {
         flags(&mut b, section, elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_LINK_ORDER);
         for (k, block) in functions[f].blocks.iter().enumerate() {
             let entry = u64::from(k == 0);
-            let at = b.append_section_data(section, &[0u64.to_le_bytes(), entry.to_le_bytes()].concat(), 8);
-            b.add_relocation(section, Relocation {
-                offset: at,
-                symbol: texts[f].1,
-                addend: *block as i64,
-                flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-            })
+            let at = b.append_section_data(
+                section,
+                &[0u64.to_le_bytes(), entry.to_le_bytes()].concat(),
+                8,
+            );
+            b.add_relocation(
+                section,
+                Relocation {
+                    offset: at,
+                    symbol: texts[f].1,
+                    addend: *block as i64,
+                    flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+                },
+            )
             .unwrap();
         }
         texts[f].2.push(section);
@@ -123,7 +144,12 @@ fn start(calls: &[&str]) -> blaze_codegen::CompiledFunction {
         relocs.push(rel32(code.len() as u32 + 1, Target::Extern((*it).into())));
         code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
     }
-    for it in ["__start___sancov_cntrs", "__stop___sancov_cntrs", "__start___sancov_pcs", "__stop___sancov_pcs"] {
+    for it in [
+        "__start___sancov_cntrs",
+        "__stop___sancov_cntrs",
+        "__start___sancov_pcs",
+        "__stop___sancov_pcs",
+    ] {
         relocs.push(rel32(code.len() as u32 + 3, Target::Extern(it.into())));
         code.extend_from_slice(&[0x48, 0x8d, 0x05, 0, 0, 0, 0]);
     }
@@ -134,7 +160,10 @@ fn start(calls: &[&str]) -> blaze_codegen::CompiledFunction {
 /// What a full link of `object` and a `_start` calling `calls` gives: the counters' bytes, the
 /// PC table's `(pc, flags)` entries, each called function's address, and how many native
 /// sections the image has.
-fn linked(object: &std::sync::Arc<[u8]>, calls: &[&str]) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>, usize) {
+fn linked(
+    object: &std::sync::Arc<[u8]>,
+    calls: &[&str],
+) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>, usize) {
     let start = start(calls);
     let mut image = Image::new(name(TO), output(false)).unwrap();
     let mut disk = Disk::default();
@@ -142,11 +171,18 @@ fn linked(object: &std::sync::Arc<[u8]>, calls: &[&str]) -> (Vec<u8>, Vec<(u64, 
         added: vec![&start],
         names: vec![("_start".into(), Target::Direct(key(1)))],
         debug_names: vec![(key(1), "start".into())],
-        natives: vec![Native { id: id(80), name: "covered.o", bytes: object, kind: NativeKind::Object, order: 0 }],
+        natives: vec![Native {
+            id: id(80),
+            name: "covered.o",
+            bytes: object,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         ..Change::default()
     };
     disk.link(&mut image, change).unwrap();
-    let natives = image.state.live_pieces().filter(|it| matches!(it.what(), What::Native { .. })).count();
+    let natives =
+        image.state.live_pieces().filter(|it| matches!(it.what(), What::Native { .. })).count();
     let out = Linked::of(disk.file(TO));
     let s = out.symbol("start");
     let called: Vec<u64> = (0..calls.len() as u64).map(|it| out.rel32(s + 5 * it + 1)).collect();
@@ -154,7 +190,8 @@ fn linked(object: &std::sync::Arc<[u8]>, calls: &[&str]) -> (Vec<u8>, Vec<(u64, 
     let field = |k: u64| out.rel32(bounds + 7 * k);
     let (counters, counters_end, pcs, pcs_end) = (field(0), field(1), field(2), field(3));
     let counter_bytes = out.at(counters, (counters_end - counters) as usize).to_vec();
-    let entries = (pcs..pcs_end).step_by(16).map(|at| (out.u64_at(at), out.u64_at(at + 8))).collect();
+    let entries =
+        (pcs..pcs_end).step_by(16).map(|at| (out.u64_at(at), out.u64_at(at + 8))).collect();
     (counter_bytes, entries, called, natives)
 }
 
@@ -162,7 +199,9 @@ fn linked(object: &std::sync::Arc<[u8]>, calls: &[&str]) -> (Vec<u8>, Vec<(u64, 
 fn entries(functions: &[(&Covered, u64)]) -> Vec<(u64, u64)> {
     functions
         .iter()
-        .flat_map(|(it, at)| it.blocks.iter().enumerate().map(move |(k, block)| (at + block, u64::from(k == 0))))
+        .flat_map(|(it, at)| {
+            it.blocks.iter().enumerate().map(move |(k, block)| (at + block, u64::from(k == 0)))
+        })
         .collect()
 }
 
@@ -174,9 +213,16 @@ fn a_dropped_function_s_counters_and_pcs_go_with_it_and_the_rest_keep_its_order(
     let (counters, pcs, called, natives) = linked(&object, &["a", "c"]);
     let (a, c) = (called[0], called[1]);
     assert_eq!(counters, [A.counters, C.counters].concat(), "b's counter is gone; a's come first");
-    assert_eq!(pcs, entries(&[(&A, a), (&C, c)]), "b's PC entry is gone; one per counter, in the counters' order");
+    assert_eq!(
+        pcs,
+        entries(&[(&A, a), (&C, c)]),
+        "b's PC entry is gone; one per counter, in the counters' order"
+    );
     assert_eq!(pcs.len(), counters.len());
-    assert_eq!(natives, 6, "a and c with their tables: `__start_` keeps no tied section, and b's PCs keep no b");
+    assert_eq!(
+        natives, 6,
+        "a and c with their tables: `__start_` keeps no tied section, and b's PCs keep no b"
+    );
 }
 
 #[test]
@@ -216,7 +262,13 @@ fn link_order_to_a_section_the_link_leaves_out_is_an_error() {
     let change = Change {
         added: vec![&start],
         names: vec![("_start".into(), Target::Direct(key(1)))],
-        natives: vec![Native { id: id(81), name: "bad.o", bytes: &bytes, kind: NativeKind::Object, order: 0 }],
+        natives: vec![Native {
+            id: id(81),
+            name: "bad.o",
+            bytes: &bytes,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         ..Change::default()
     };
     let error = image.stage(change).unwrap_err();

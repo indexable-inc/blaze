@@ -123,11 +123,7 @@ pub(crate) fn has_builtin_derive_impl(derive: BuiltinDeriveExpander) -> bool {
 }
 
 impl BuiltinDeriveImplMethod {
-    pub fn trait_method(
-        self,
-        db: &Db,
-        impl_: BuiltinDeriveImplId,
-    ) -> Option<FunctionId> {
+    pub fn trait_method(self, db: &Db, impl_: BuiltinDeriveImplId) -> Option<FunctionId> {
         let loc = impl_.loc(db);
         let lang_items = crate::lang_item::lang_items(db, loc.krate(db));
         let trait_ = loc.trait_.get_id(lang_items)?;

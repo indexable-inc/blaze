@@ -26,10 +26,10 @@ pub(in crate::nameres) mod macros;
 pub(in crate::nameres) mod ops;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::nameres) mod queries;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::nameres) mod unit;
 #[cfg(test)]
 pub(in crate::nameres) mod tests;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::nameres) mod unit;
 
 use base_db::{Crate, Db};
 use blaze_hash::FixedState;

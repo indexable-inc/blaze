@@ -31,7 +31,9 @@ fn walk(tokens: &Tokens<'_>, tts: Ids, out: &mut Vec<TextRange>) {
                 }
                 if let Kind::Ident { .. } = token.kind {
                     if dollar && ident && colon {
-                        if token.edition < Edition::Edition2024 && tokens.name(token.range) == "expr" {
+                        if token.edition < Edition::Edition2024
+                            && tokens.name(token.range) == "expr"
+                        {
                             out.push(token.range);
                         }
                     } else if dollar {
@@ -79,7 +81,12 @@ mod tests {
 
     #[test]
     fn only_dollar_ident_colon_expr() {
-        assert!(linted("macro_rules! m { ($e: $f:ty) => { e:expr }; }", Edition::Edition2021).is_empty());
-        assert!(linted("macro_rules! m { ($e:expr_2021) => {}; }", Edition::Edition2021).is_empty());
+        assert!(
+            linted("macro_rules! m { ($e: $f:ty) => { e:expr }; }", Edition::Edition2021)
+                .is_empty()
+        );
+        assert!(
+            linted("macro_rules! m { ($e:expr_2021) => {}; }", Edition::Edition2021).is_empty()
+        );
     }
 }

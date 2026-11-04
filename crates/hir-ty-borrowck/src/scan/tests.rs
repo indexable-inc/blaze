@@ -6,7 +6,6 @@ pub(crate) mod db;
 
 use base_db::all_crates;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, HasModule as _, ModuleDefId,
     expr_store::ExpressionStore,
@@ -18,6 +17,7 @@ use hir_ty::{
     InferBodyId, InferenceResult,
     next_solver::{DbInterner, Region, RegionExt as _, Ty},
 };
+use std::alloc::Global;
 
 use super::{Scan, irrefutable};
 use crate::regions::{Annotation, spells_generics};
@@ -182,12 +182,7 @@ fn lets(store: &ExpressionStore) -> Vec<Annotation> {
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
             if let Statement::Let { pat, type_ref: Some(type_ref), initializer, .. } = statement {
-                found.push(Annotation {
-                    pat,
-                    type_ref,
-                    initializer,
-                    block,
-                });
+                found.push(Annotation { pat, type_ref, initializer, block });
             }
         }
     }

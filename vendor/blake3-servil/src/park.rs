@@ -74,7 +74,10 @@ impl Park {
 
     /// Worker `me` records its thread, once, as it starts.
     pub(crate) fn register(&self, me: usize) {
-        assert!(self.handles[me].set(thread::current()).is_ok(), "each worker sets its thread once");
+        assert!(
+            self.handles[me].set(thread::current()).is_ok(),
+            "each worker sets its thread once"
+        );
     }
 
     /// Worker `me`'s word and its bit in it.
@@ -96,7 +99,10 @@ impl Park {
                 let bit = 1u64 << bits.trailing_zeros();
                 let before = word.fetch_and(!bit, Ordering::SeqCst);
                 if before & bit != 0 {
-                    handles[bit.trailing_zeros() as usize].get().expect("a parked worker has set its thread").unpark();
+                    handles[bit.trailing_zeros() as usize]
+                        .get()
+                        .expect("a parked worker has set its thread")
+                        .unpark();
                     return true;
                 }
                 bits = before & !bit;
@@ -159,7 +165,11 @@ impl Park {
             if owed == 0 {
                 break;
             }
-            if self.owed.compare_exchange(owed, owed - 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            if self
+                .owed
+                .compare_exchange(owed, owed - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
                 continue;
             }
             if !self.wake_one() {

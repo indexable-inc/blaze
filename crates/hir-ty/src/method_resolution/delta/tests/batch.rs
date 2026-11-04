@@ -66,8 +66,11 @@ fn listed_under(order: RunOrder) -> (Vec<ModuleId>, Vec<ModuleId>, String) {
     set_run_order(previous);
     let db = &loaded.db;
     let root = crate_def_map(db, krate).root_module_id();
-    let mut batch: Vec<ModuleId> =
-        crate_def_map(db, krate).modules(db).map(|(module, _)| module).filter(|&it| it != root).collect();
+    let mut batch: Vec<ModuleId> = crate_def_map(db, krate)
+        .modules(db)
+        .map(|(module, _)| module)
+        .filter(|&it| it != root)
+        .collect();
     batch.sort_unstable();
     let read = parts_read(db, &events, &batch);
     let mut failures = String::new();
@@ -83,7 +86,8 @@ fn swept_under(order: RunOrder) -> (Vec<ModuleId>, Vec<ModuleId>, String) {
     let mut fixture = String::new();
     for at in (0..CRATES).rev() {
         let deps: Vec<String> = (at + 1..CRATES).map(|it| format!("c{it}")).collect();
-        let deps = if deps.is_empty() { String::new() } else { format!(" deps:{}", deps.join(",")) };
+        let deps =
+            if deps.is_empty() { String::new() } else { format!(" deps:{}", deps.join(",")) };
         write!(fixture, "//- /c{at}.rs crate:c{at}{deps}\n{BODY}").unwrap();
     }
     let previous = set_run_order(order);
@@ -130,11 +134,16 @@ fn a_write_reads_its_crates_body_parts_as_one_batch() {
 /// first: the crates' parts are first read in graph order under every run order.
 #[test]
 fn a_workspace_sweep_reads_each_crates_body_parts_after_its_dependencies() {
-    for order in [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(3), RunOrder::LeftToReaders] {
+    for order in
+        [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(3), RunOrder::LeftToReaders]
+    {
         let (read, batch, failures) = swept_under(order);
         assert!(failures.is_empty(), "{order:?}:\n{failures}");
         assert!(read.len() >= CRATES, "{order:?}: every crate's part is read: {read:?}");
-        assert_eq!(read, batch, "{order:?}: each crate's parts are first read after its dependencies'");
+        assert_eq!(
+            read, batch,
+            "{order:?}: each crate's parts are first read after its dependencies'"
+        );
     }
 }
 
@@ -157,7 +166,9 @@ fn graph() -> String {
 /// right.
 #[test]
 fn a_sweep_of_a_diamond_reads_each_crate_after_all_it_depends_on() {
-    for order in [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2), RunOrder::LeftToReaders] {
+    for order in
+        [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2), RunOrder::LeftToReaders]
+    {
         let previous = set_run_order(order);
         let mut loaded = Loaded::new(&graph());
         let file = loaded.files[0];
@@ -170,16 +181,23 @@ fn a_sweep_of_a_diamond_reads_each_crate_after_all_it_depends_on() {
         set_run_order(previous);
         let db = &loaded.db;
         let crates = all_crates(db);
-        let roots: Vec<ModuleId> = crates.iter().map(|&krate| crate_def_map(db, krate).root_module_id()).collect();
+        let roots: Vec<ModuleId> =
+            crates.iter().map(|&krate| crate_def_map(db, krate).root_module_id()).collect();
         let read = parts_read(db, &events, &roots);
-        let first = |krate| read.iter().position(|&it| it == crate_def_map(db, krate).root_module_id());
+        let first =
+            |krate| read.iter().position(|&it| it == crate_def_map(db, krate).root_module_id());
         let mut failures = String::new();
         for &krate in crates.iter() {
             let name = krate.named(db);
-            let Some(at) = first(krate) else { panic!("{order:?}: crate {name}'s parts are never read: {read:?}") };
+            let Some(at) = first(krate) else {
+                panic!("{order:?}: crate {name}'s parts are never read: {read:?}")
+            };
             for dep in &krate.data(db).dependencies {
                 let dep_at = first(dep.crate_id).unwrap_or(usize::MAX);
-                assert!(dep_at < at, "{order:?}: crate {name} is first read at {at}, before its dependency at {dep_at}");
+                assert!(
+                    dep_at < at,
+                    "{order:?}: crate {name} is first read at {at}, before its dependency at {dep_at}"
+                );
             }
             check(db, krate, &format!("{order:?}, crate {name}"), &mut failures);
         }
@@ -190,7 +208,11 @@ fn a_sweep_of_a_diamond_reads_each_crate_after_all_it_depends_on() {
 /// [`GRAPH`] loaded (its cold pass, which claims and fills each crate's directory slot in its
 /// node) with crate `name`'s node made to give way once, `at`, under `order`: the database, or
 /// the load's panic.
-fn loaded_giving_way(name: &'static str, at: GiveWayIn, order: RunOrder) -> std::thread::Result<Loaded> {
+fn loaded_giving_way(
+    name: &'static str,
+    at: GiveWayIn,
+    order: RunOrder,
+) -> std::thread::Result<Loaded> {
     let previous = set_run_order(order);
     GIVE_WAY.with(|it| it.set(Some((name, at))));
     let loaded = std::panic::catch_unwind(|| Loaded::new(&graph()));
@@ -209,8 +231,9 @@ fn loaded_giving_way(name: &'static str, at: GiveWayIn, order: RunOrder) -> std:
 fn a_node_that_gives_way_before_changing_anything_runs_again() {
     for order in [RunOrder::InOrder, RunOrder::Reversed] {
         for name in ["base", "left", "top"] {
-            let loaded = loaded_giving_way(name, GiveWayIn::Warm, order)
-                .unwrap_or_else(|_| panic!("{order:?}: the pass failed after crate {name}'s node gave way"));
+            let loaded = loaded_giving_way(name, GiveWayIn::Warm, order).unwrap_or_else(|_| {
+                panic!("{order:?}: the pass failed after crate {name}'s node gave way")
+            });
             let db = &loaded.db;
             let mut failures = String::new();
             for &krate in all_crates(db).iter() {
@@ -247,14 +270,18 @@ fn a_node_that_gives_way_while_changing_its_state_fails_the_pass_naming_the_crat
 #[test]
 fn a_node_that_gives_way_on_the_loops_own_thread_runs_again_after_the_loop() {
     for name in ["base", "left", "top"] {
-        let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+        let pool =
+            blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
         let outcome: Result<String, String> = pool.install(|| {
             let previous = set_run_order(RunOrder::OnPool);
             GIVE_WAY.with(|it| it.set(Some((name, GiveWayIn::Warm))));
             let loaded = std::panic::catch_unwind(|| Loaded::new(&graph()));
             let unused = GIVE_WAY.with(|it| it.take());
             set_run_order(previous);
-            assert_eq!(unused, None, "crate {name}'s node never ran on the loop's thread to give way");
+            assert_eq!(
+                unused, None,
+                "crate {name}'s node never ran on the loop's thread to give way"
+            );
             let loaded = loaded.map_err(|panic| panic_text(&*panic).to_owned())?;
             let db = &loaded.db;
             let mut failures = String::new();
@@ -264,8 +291,12 @@ fn a_node_that_gives_way_on_the_loops_own_thread_runs_again_after_the_loop() {
             Ok(failures)
         });
         match outcome {
-            Ok(failures) => assert!(failures.is_empty(), "on the pool, {name} gave way:\n{failures}"),
-            Err(panic) => panic!("on the pool, the pass failed after crate {name}'s node gave way on the loop's thread: {panic}"),
+            Ok(failures) => {
+                assert!(failures.is_empty(), "on the pool, {name} gave way:\n{failures}")
+            }
+            Err(panic) => panic!(
+                "on the pool, the pass failed after crate {name}'s node gave way on the loop's thread: {panic}"
+            ),
         }
     }
 }
@@ -281,21 +312,37 @@ fn a_node_that_panics_in_its_warm_abandons_its_slots_and_gives_none_back() {
             panic!("{order:?}: the pass went on after crate left's node panicked");
         };
         let text = panic_text(&*panic);
-        assert!(text.contains("crate `left`'s node panics"), "{order:?}: the pass fails with the node's own panic: {text}");
+        assert!(
+            text.contains("crate `left`'s node panics"),
+            "{order:?}: the pass fails with the node's own panic: {text}"
+        );
         let reads = FAILED_PASS.with(|it| it.take());
         assert!(!reads.is_empty(), "{order:?}: the failed pass recorded no slot");
         for (krate, before, after) in &reads {
-            assert_ne!(*before, SlotRead::GaveWay, "{order:?}: crate {krate}'s slot was given back for a rerun that never comes");
+            assert_ne!(
+                *before,
+                SlotRead::GaveWay,
+                "{order:?}: crate {krate}'s slot was given back for a rerun that never comes"
+            );
             match after {
                 SlotRead::Full => assert_eq!(before, after, "{order:?}: crate {krate}'s slot"),
                 SlotRead::Error(blaze_query::db::SlotError::Abandoned { slot }) => {
-                    assert!(slot.of.contains(&**krate), "{order:?}: the error names crate {krate}'s slot: {slot}");
+                    assert!(
+                        slot.of.contains(&**krate),
+                        "{order:?}: the error names crate {krate}'s slot: {slot}"
+                    );
                 }
-                other => panic!("{order:?}: crate {krate}'s unfilled slot reads {other:?} once the pass failed, not Abandoned"),
+                other => panic!(
+                    "{order:?}: crate {krate}'s unfilled slot reads {other:?} once the pass failed, not Abandoned"
+                ),
             }
         }
-        let left = reads.iter().find(|(krate, ..)| &**krate == "left").expect("crate left has a slot");
-        assert!(matches!(left.2, SlotRead::Error(_)), "{order:?}: crate left's slot, never filled, is abandoned: {left:?}");
+        let left =
+            reads.iter().find(|(krate, ..)| &**krate == "left").expect("crate left has a slot");
+        assert!(
+            matches!(left.2, SlotRead::Error(_)),
+            "{order:?}: crate left's slot, never filled, is abandoned: {left:?}"
+        );
     }
 }
 
@@ -360,20 +407,31 @@ fn a_batched_crates_elided_header_lifetimes_lower_once_a_write() {
     let edited = format!("{ELIDED}impl T for &mut u32 {{}}\n");
     let events = loaded.db.log_mut(|db: &mut Db| db.set_file_text(dep, &edited));
     for batch in ["crate_impl_self_tys", "crate_impl_traits"] {
-        assert_eq!(executed(&loaded.db, &events, batch), 1, "{batch} runs once for the library's write");
+        assert_eq!(
+            executed(&loaded.db, &events, batch),
+            1,
+            "{batch} runs once for the library's write"
+        );
     }
-    let events = loaded.db.log_mut(|db: &mut Db| db.set_file_text(main, "pub fn f() { let _x = 1; }\n"));
+    let events =
+        loaded.db.log_mut(|db: &mut Db| db.set_file_text(main, "pub fn f() { let _x = 1; }\n"));
     for batch in ["crate_impl_self_tys", "crate_impl_traits"] {
-        assert_eq!(executed(&loaded.db, &events, batch), 0, "{batch} runs again for another crate's write");
+        assert_eq!(
+            executed(&loaded.db, &events, batch),
+            0,
+            "{batch} runs again for another crate's write"
+        );
     }
     let db = &loaded.db;
-    let krate = *all_crates(db).iter().find(|it| it.data(db).root_file_id == dep).expect("the library");
+    let krate =
+        *all_crates(db).iter().find(|it| it.data(db).root_file_id == dep).expect("the library");
     let mut failures = String::new();
     blaze_query::db::attach(db, || {
         let interner = crate::next_solver::DbInterner::new_no_crate(db);
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for imp in module.scope(db).impls() {
-                let self_ty = crate::lower::impl_self_ty_with_diagnostics(db, imp).value.get().skip_binder();
+                let self_ty =
+                    crate::lower::impl_self_ty_with_diagnostics(db, imp).value.get().skip_binder();
                 let trait_ref = crate::lower::impl_trait_with_diagnostics(db, imp)
                     .map(|it| it.value.get(interner).skip_binder());
                 if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {

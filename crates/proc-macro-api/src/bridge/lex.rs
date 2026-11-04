@@ -220,9 +220,7 @@ pub fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
                 stream.push(punct(bytes[start + 1] as char, joint, span));
             }
             TokenKind::Ident => stream.push(ident(text, span, IdentIsRaw::No)),
-            TokenKind::RawIdent => {
-                stream.push(ident(&s[start + 2..end], span, IdentIsRaw::Yes))
-            }
+            TokenKind::RawIdent => stream.push(ident(&s[start + 2..end], span, IdentIsRaw::Yes)),
             TokenKind::Literal { kind, suffix_start } => {
                 let it = literal(text, span, kind, suffix_start)?;
                 stream.push(Tree::Leaf(Leaf::Literal(it)))

@@ -8,11 +8,11 @@ use std::mem;
 
 use base_db::{ConstEvalBudget, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{FunctionId, StaticId, attrs::AttrFlags};
 use la_arena::ArenaMap;
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     CallableDefId,
@@ -112,11 +112,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         generic_args: GenericArgs<'db>,
         args: &[&[u8]],
     ) -> Result<'db, Vec<u8>> {
-        let callee = Ty::new_fn_def(
-            self.interner(),
-            CallableDefId::FunctionId(func).into(),
-            generic_args,
-        );
+        let callee =
+            Ty::new_fn_def(self.interner(), CallableDefId::FunctionId(func).into(), generic_args);
         self.call_value(callee, None, args)
     }
 
@@ -133,11 +130,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         func: FunctionId,
         generic_args: GenericArgs<'db>,
     ) -> Result<'db, Vec<u8>> {
-        let ty = Ty::new_fn_def(
-            self.interner(),
-            CallableDefId::FunctionId(func).into(),
-            generic_args,
-        );
+        let ty =
+            Ty::new_fn_def(self.interner(), CallableDefId::FunctionId(func).into(), generic_args);
         let id = self.vtable_map.id(ty);
         // alloc: one per pointer an embedder asks for
         Ok(id.to_le_bytes()[..self.ptr_size()].to_vec())
@@ -211,7 +205,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let Some(&location) = self.thread_statics.get(&st) else {
                     continue;
                 };
-                if from_bytes!(usize, self.cached_ptr_size, self.peek_memory(location, ptr_size)?) != start {
+                if from_bytes!(usize, self.cached_ptr_size, self.peek_memory(location, ptr_size)?)
+                    != start
+                {
                     continue;
                 }
             }
@@ -225,7 +221,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 .any(|word| {
                     let mut bytes = [0; 8];
                     bytes[..ptr_size].copy_from_slice(&now[word - start..][..ptr_size]);
-                    let addr = Address::from_usize(u64::from_le_bytes(bytes) as usize, self.cached_ptr_size);
+                    let addr = Address::from_usize(
+                        u64::from_le_bytes(bytes) as usize,
+                        self.cached_ptr_size,
+                    );
                     matches!(addr.at(), At::Stack(_) | At::Heap(_))
                 });
             // alloc: one per changed static, kept by the embedder
@@ -319,8 +318,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let Some(bytes) = self.embedder.preset_statics.remove(&st) else {
             return Ok(None);
         };
-        let thread_local =
-            AttrFlags::query(self.db, st.into()).contains(AttrFlags::THREAD_LOCAL);
+        let thread_local = AttrFlags::query(self.db, st.into()).contains(AttrFlags::THREAD_LOCAL);
         let ty = self.db.type_for_static(st).instantiate_identity().skip_norm_wip();
         let layout = self.layout(ty)?;
         let (size, align) = (layout.size.bytes_usize(), layout.align.bytes() as usize);

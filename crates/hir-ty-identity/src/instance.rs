@@ -62,7 +62,6 @@
 
 use base_db::Db;
 use blaze_hash::{Blake3Hasher, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key, key};
 use blaze_query::db::{AsId, FromId};
@@ -77,20 +76,19 @@ use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::{is_dyn_method, lookup_impl_const},
     mir::{InlinedBody, MirLowerError, MirOptions, MirOwner, MirStage},
+    next_solver::DbInterner,
     next_solver::{
         AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId, GenericArg,
         GenericArgs, InherentAssocConstId, Region, RegionExt as _, RegionKind, StoredGenericArgs,
         TraitAssocConstId, Ty, TyKind,
     },
-    next_solver::DbInterner,
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    dispatch::Body,
     AggregateKind, AsmOperand, BasicBlock, CastKind, InlineAsm, MirBody, Operand, OperandKind,
     PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace,
-    TerminatorKind, monomorphized_args, monomorphized_promoted_mir_body_query, owner_of,
-    location::mentions_location, runtime_promoted_mir_body_query,
+    TerminatorKind, dispatch::Body, location::mentions_location, monomorphized_args,
+    monomorphized_promoted_mir_body_query, owner_of, runtime_promoted_mir_body_query,
 };
 use rustc_type_ir::{
     GenericArgKind, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
@@ -98,6 +96,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use hir_ty_share::{Class, Cx, Through, Unshared, classify, code, drop, identity};
 
@@ -168,7 +167,8 @@ fn value<'db>(cx: &Cx<'db>, konst: Const<'db>) -> Result<ContentId, Unshared> {
         }
         AliasConstKind::Anon { def_id } => db.anon_const_eval(def_id.0, args, Some(cx.env)),
         AliasConstKind::InherentSelf { .. } => {
-            return Err(Unshared::ConstEval(format!( // alloc: error path
+            return Err(Unshared::ConstEval(format!(
+                // alloc: error path
                 "`{konst:?}`: an inherent const in Self form after type check"
             )));
         }
@@ -192,7 +192,8 @@ fn allocation_value(db: &Db, allocation: &AllocationData<'_>) -> Result<ContentI
         // A static is named by the database's own id, which is no content; the rest of the
         // map is bytes, addresses and types.
         MemoryMap::Complex(map) if !map.statics.is_empty() => {
-            return Err(Unshared::NoContent(format!( // alloc: error path
+            return Err(Unshared::NoContent(format!(
+                // alloc: error path
                 "a constant of `{:?}` that points to a static",
                 allocation.ty
             )));
@@ -248,7 +249,10 @@ pub fn instance_identity<'db>(
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = identity_cycle)]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn identity_of(
     db: &Db,
     instance: Instance,
@@ -314,7 +318,10 @@ fn nesting(args: GenericArgs<'_>) -> u32 {
     args.iter().map(|arg| depth(arg, &mut memo)).max().unwrap_or(0)
 }
 
-fn depth<'db>(arg: GenericArg<'db>, memo: &mut blaze_hash::HashMap<GenericArg<'db>, u32, Global>) -> u32 {
+fn depth<'db>(
+    arg: GenericArg<'db>,
+    memo: &mut blaze_hash::HashMap<GenericArg<'db>, u32, Global>,
+) -> u32 {
     if let Some(&known) = memo.get(&arg) {
         return known;
     }
@@ -325,7 +332,8 @@ fn depth<'db>(arg: GenericArg<'db>, memo: &mut blaze_hash::HashMap<GenericArg<'d
         GenericArgKind::Lifetime(_) => return 0,
     }
     // A part is as deep as the type was built, which only a chain of instances makes deep.
-    let below = parts.0.into_iter().map(|part| stdx::ensure_sufficient_stack(|| depth(part, memo))).max();
+    let below =
+        parts.0.into_iter().map(|part| stdx::ensure_sufficient_stack(|| depth(part, memo))).max();
     let depth = 1 + below.unwrap_or(0);
     memo.insert(arg, depth);
     depth
@@ -374,7 +382,10 @@ fn bodies<'db>(
         Body::Fn(func) => {
             let item = ItemId::Function(func);
             let code = code_hash(db, item).map_err(unhashable_body(db))?.ok_or_else(|| {
-                Unshared::NoMir(format!("`{}` has no body", FunctionSignature::of(db, func).name.as_str())) // alloc: error path
+                Unshared::NoMir(format!(
+                    "`{}` has no body",
+                    FunctionSignature::of(db, func).name.as_str()
+                )) // alloc: error path
             })?;
             key.update(&[tag::DEF_FN]).id(&item_key(db, item).0).id(&code.0);
             InferBodyId::DefWithBodyId(func.into())
@@ -382,14 +393,16 @@ fn bodies<'db>(
         Body::Closure(id) => {
             let closure = InternedClosureId::from_id(id);
             let lowered = || db.mir_body_for_closure(closure).err();
-            let code = closure_code(db, closure).map_err(unhashable_nested(db, subject, lowered))?;
+            let code =
+                closure_code(db, closure).map_err(unhashable_nested(db, subject, lowered))?;
             key.update(&[tag::DEF_CLOSURE]).id(&code.0);
             closure.loc(db).owner
         }
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
             let coroutine = InternedCoroutineId::from_id(id);
             let lowered = || db.mir_body_for_coroutine(coroutine).err();
-            let code = coroutine_code(db, coroutine).map_err(unhashable_nested(db, subject, lowered))?;
+            let code =
+                coroutine_code(db, coroutine).map_err(unhashable_nested(db, subject, lowered))?;
             let what = match body {
                 Body::CoroutineByMove(_) => tag::DEF_COROUTINE_BY_MOVE,
                 _ => tag::DEF_COROUTINE,
@@ -398,7 +411,8 @@ fn bodies<'db>(
             coroutine.loc(db).owner
         }
     };
-    let set = if owner.krate(db).data(db).origin.is_lang() { compiled.lang } else { compiled.other };
+    let set =
+        if owner.krate(db).data(db).origin.is_lang() { compiled.lang } else { compiled.other };
     if set.is_empty() {
         return Err(Unshared::NoOptions);
     }
@@ -456,7 +470,10 @@ fn unhashable_nested<'db>(
         },
         Some(error) => {
             // alloc: error path
-            let mut said = format!("blaze-items: the code of {} has no hash: MIR that failed to lower (", name_of(db, subject));
+            let mut said = format!(
+                "blaze-items: the code of {} has no hash: MIR that failed to lower (",
+                name_of(db, subject)
+            );
             blaze_items::lowering::write(db, &error, &mut said);
             said.push(')');
             Unshared::Unhashable(said)
@@ -521,24 +538,47 @@ enum Op {
     /// The tag, then the value of the constant at the site.
     Value(u8, At),
     /// An ADT aggregate's arguments: `len` filled values from `start`.
-    AggregateArgs { start: u32, len: u32 },
+    AggregateArgs {
+        start: u32,
+        len: u32,
+    },
     /// A promoted constant held by `local`, whose body names a parameter.
-    Promoted { local: u32, expr: ExprId },
+    Promoted {
+        local: u32,
+        expr: ExprId,
+    },
     /// A promoted constant held by `local` of the body MIR inlining built in as `callee`
     /// (`Inlined::promoted`), whose body names the callee's parameters where the callee's
     /// arguments name this body's: evaluated, as the code generator does, in the callee's
     /// owner with the callee's arguments, `len` filled values from `start`.
-    InlinedPromoted { local: u32, callee: u32, expr: ExprId, start: u32, len: u32 },
+    InlinedPromoted {
+        local: u32,
+        callee: u32,
+        expr: ExprId,
+        start: u32,
+        len: u32,
+    },
     /// A promoted constant held by `local` (of the body MIR inlined as `callee`, or its own)
     /// whose MIR does not build: the code generator skips it where `local` is zero-sized in the
     /// instance, and refuses it elsewhere, as this identity does.
-    UnbuiltPromoted { local: u32, callee: Option<u32>, expr: ExprId },
-    Cast { kind: CastKind, from: TyOf, to: At },
+    UnbuiltPromoted {
+        local: u32,
+        callee: Option<u32>,
+        expr: ExprId,
+    },
+    Cast {
+        kind: CastKind,
+        from: TyOf,
+        to: At,
+    },
     /// The fact at each `Deref` of a place whose local's type names a parameter.
     Derefs(StoredPlace),
     Drop(StoredPlace),
     Sym(TyOf),
-    Call { func: TyOf, intrinsic: Option<Intrinsic> },
+    Call {
+        func: TyOf,
+        intrinsic: Option<Intrinsic>,
+    },
 }
 
 /// The sites of `subject`'s generic body under `options`. It reads no argument, so every
@@ -563,7 +603,7 @@ pub(crate) fn sites(db: &Db, subject: Subject, options: MirOptions) -> Result<Si
         // alloc: once per generic body and options, this query's miss
         filled: Vec::with_capacity(body.locals.len() + 16),
         kept: Vec::new(), // alloc: once per generic body and options, this query's miss
-        ops: Vec::new(), // alloc: once per generic body and options, this query's miss
+        ops: Vec::new(),  // alloc: once per generic body and options, this query's miss
         derefs: HashSet::new_in(Global),
     };
     collect.body()?;
@@ -647,7 +687,9 @@ impl<'a, 'db> Collect<'a, 'db> {
             match mir(body.owner, expr) {
                 None => {}
                 Some(None) => self.ops.push(Op::UnbuiltPromoted { local, callee: None, expr }),
-                Some(Some(promoted)) if mentions_params(promoted) => self.ops.push(Op::Promoted { local, expr }),
+                Some(Some(promoted)) if mentions_params(promoted) => {
+                    self.ops.push(Op::Promoted { local, expr })
+                }
                 Some(Some(_)) => {}
             }
         }
@@ -657,9 +699,11 @@ impl<'a, 'db> Collect<'a, 'db> {
             let args = callee.args.as_ref();
             match mir(owner_of(self.db, callee.body), expr) {
                 None => {}
-                Some(None) => {
-                    self.ops.push(Op::UnbuiltPromoted { local, callee: Some(promoted.callee), expr })
-                }
+                Some(None) => self.ops.push(Op::UnbuiltPromoted {
+                    local,
+                    callee: Some(promoted.callee),
+                    expr,
+                }),
                 // The same arguments for every instance: the value is the body's alone.
                 Some(Some(mir)) if args.has_type_flags(PARAMS) && mentions_params(mir) => {
                     let start = self.filled.len() as u32;
@@ -962,7 +1006,11 @@ pub fn erased<'db, T: TypeFoldable<DbInterner<'db>>>(interner: DbInterner<'db>, 
         return value;
     }
     // alloc: per erasure that has a region to erase; one entry per distinct part
-    let mut folder = EraseFree { interner, tys: blaze_hash::HashMap::new_in(Global), consts: blaze_hash::HashMap::new_in(Global) };
+    let mut folder = EraseFree {
+        interner,
+        tys: blaze_hash::HashMap::new_in(Global),
+        consts: blaze_hash::HashMap::new_in(Global),
+    };
     value.fold_with(&mut folder)
 }
 
@@ -1109,7 +1157,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 self.record(tag::AGGREGATE, facts);
             }
             // The code generator promotes no zero-sized constant (`promoted_constant`).
-            Op::Promoted { local, .. } | Op::InlinedPromoted { local, .. } | Op::UnbuiltPromoted { local, .. }
+            Op::Promoted { local, .. }
+            | Op::InlinedPromoted { local, .. }
+            | Op::UnbuiltPromoted { local, .. }
                 if self.zero_sized(*local)? =>
             {
                 self.record(tag::PROMOTED_NONE, ContentId::default());
@@ -1126,7 +1176,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Op::UnbuiltPromoted { callee, expr, .. } => {
                 let owner = match callee {
-                    Some(callee) => owner_of(self.db(), self.sites_body.inlined.callees[*callee as usize].body),
+                    Some(callee) => {
+                        owner_of(self.db(), self.sites_body.inlined.callees[*callee as usize].body)
+                    }
                     None => self.owner,
                 };
                 let error = runtime_promoted_mir_body_query(self.db(), owner, *expr).err();
@@ -1206,7 +1258,8 @@ impl<'a, 'db> Walk<'a, 'db> {
         if depth > self.nesting {
             return false;
         }
-        let not_lifetime = |arg: &GenericArg<'db>| !matches!(arg.kind(), GenericArgKind::Lifetime(_));
+        let not_lifetime =
+            |arg: &GenericArg<'db>| !matches!(arg.kind(), GenericArgKind::Lifetime(_));
         let mut own = self.instance.args.as_ref().iter().filter(not_lifetime);
         args.iter().filter(not_lifetime).all(|arg| own.any(|it| it == arg))
     }
@@ -1222,9 +1275,10 @@ impl<'a, 'db> Walk<'a, 'db> {
     ) -> Result<(), Unshared> {
         let db = self.db();
         // clone: the query's key, a reference count
-        let body = monomorphized_promoted_mir_body_query(db, owner, expr, args, self.cx.stored.clone())
-            // The code generator refuses it too (`no_promoted_mir`).
-            .map_err(|error| no_promoted_mir(db, owner, expr, Some(&error)))?;
+        let body =
+            monomorphized_promoted_mir_body_query(db, owner, expr, args, self.cx.stored.clone())
+                // The code generator refuses it too (`no_promoted_mir`).
+                .map_err(|error| no_promoted_mir(db, owner, expr, Some(&error)))?;
         let evaluated = db.interpret_mir(body, Some(self.cx.env)).ok();
         match evaluated {
             Some(allocation) => {
@@ -1450,7 +1504,8 @@ impl<'a, 'db> Walk<'a, 'db> {
         h.update(&[what]);
         if let Some(func) = func {
             let item = ItemId::Function(func);
-            h.id(&item_key(db, item).0).id(&interface_hash(db, item).map_err(identity::unhashable(db))?.0);
+            h.id(&item_key(db, item).0)
+                .id(&interface_hash(db, item).map_err(identity::unhashable(db))?.0);
         }
         // Which closure, as its parent's arguments are all a closure of a body with no
         // generics has: two closures of one signature are two callees.
@@ -1488,14 +1543,16 @@ impl<'a, 'db> Walk<'a, 'db> {
             // its cycle, whichever was asked first (`CycleKind::Result`), and `TooDeep` reads
             // only its key, so neither depends on who asks. Any other reason is something its
             // identity could not read, which is this identity's too.
-            Err(why) if why.is_per_instance() => h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?),
+            Err(why) if why.is_per_instance() => {
+                h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?)
+            }
             // Rule 16: the caller's error names the callee it went through, not only the body
             // that calls the intrinsic. The callee calls it itself only where the body is the
             // callee's own; one in a closure of the callee, or further on, is reached.
             Err(Unshared::UnknownIntrinsic { name, body: at, through }) => {
                 return Err(Unshared::UnknownIntrinsic {
                     name: name.clone(), // alloc: error path
-                    body: at.clone(), // alloc: error path
+                    body: at.clone(),   // alloc: error path
                     through: match through {
                         Through::Own => Through::Calls,
                         Through::Nested | Through::Calls | Through::Reaches(_) => {
@@ -1525,7 +1582,12 @@ impl<'a, 'db> Walk<'a, 'db> {
                 h.id(&self.args_facts(args.iter())?);
                 // An intrinsic the code generator does not make inline calls its fallback body.
                 if FunctionSignature::of(db, func).has_body() {
-                    h.id(&self.instance_callee(Body::Fn(func), args, tag::CALLEE_FN, Some(func))?);
+                    h.id(&self.instance_callee(
+                        Body::Fn(func),
+                        args,
+                        tag::CALLEE_FN,
+                        Some(func),
+                    )?);
                 }
                 Ok(h.finish())
             }
@@ -1622,14 +1684,17 @@ pub(crate) fn body_tag(body: Body) -> u8 {
     }
 }
 
-/// A body's own code, anonymous: its code hash (each callee by interface), its bindings'
-/// names and its span-table indices ([`hir_ty_share::code`]); never its key or a position.
+/// A body's own code, anonymous: its code hash (each callee by interface) and its span-table
+/// indices ([`hir_ty_share::code`]); never its key, a position or a binding's name (a
+/// debugger reads those from the database at link).
 pub(crate) fn own_code(db: &Db, body: Body) -> Result<ContentId, String> {
     let code = match body {
         Body::Fn(f) => code::of_item(db, f.into()),
         Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
         Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
-        Body::CoroutineByMove(id) => code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id)),
+        Body::CoroutineByMove(id) => {
+            code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+        }
     };
     code.as_ref().copied().map_err(|it| format!("its code has no hash: {it}")) // alloc: error path
 }
@@ -1645,11 +1710,18 @@ pub(crate) fn mir_owner<'db>(_: &'db Db, body: Body) -> MirOwner<'db> {
 
 /// The error of a promoted constant whose MIR does not build, naming it and the body it is of,
 /// as the code generator's `no_promoted_mir` does.
-fn no_promoted_mir<E: std::fmt::Debug>(db: &Db, owner: InferBodyId<'_>, expr: ExprId, error: Option<&E>) -> Unshared {
+fn no_promoted_mir<E: std::fmt::Debug>(
+    db: &Db,
+    owner: InferBodyId<'_>,
+    expr: ExprId,
+    error: Option<&E>,
+) -> Unshared {
     let owner = match owner {
         InferBodyId::DefWithBodyId(def) => format!("`{}`", key::path(db, ItemId::of_body(db, def))), // alloc: error path
         InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: error path
     };
     // alloc: error path
-    Unshared::NoMir(blaze_query::db::attach(db, || format!("the promoted constant {expr:?} of {owner} has no MIR: {error:?}")))
+    Unshared::NoMir(blaze_query::db::attach(db, || {
+        format!("the promoted constant {expr:?} of {owner} has no MIR: {error:?}")
+    }))
 }

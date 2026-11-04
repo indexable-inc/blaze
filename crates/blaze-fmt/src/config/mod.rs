@@ -420,7 +420,9 @@ fn refused_options(table: &::toml::Table) -> Vec<String> {
             ));
         }
     }
-    let ignores = table.get("ignore").is_some_and(|it| it.as_array().is_none_or(|it| !it.is_empty()));
+    let ignores = table
+        .get("ignore")
+        .is_some_and(|it| it.as_array().is_none_or(|it| !it.is_empty()));
     if ignores {
         refused.push(String::from(
             "  `ignore`: rustfmt's gitignore matching of it is not ported to blaze fmt",

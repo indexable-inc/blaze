@@ -98,21 +98,21 @@ pub(super) const CLASS: [u8; 256] = {
 /// nibble's entry and its high nibble's. Fifteen rectangles: (low nibbles, high nibbles, table,
 /// bit).
 const RECTANGLES: [(u16, u16, usize, u8); 15] = [
-    (0x03FF, 1 << 3, 0, 0),                 // 0-9
-    (0xFFFE, 1 << 4 | 1 << 6, 0, 1),        // A-O, a-o
-    (0x07FF, 1 << 5 | 1 << 7, 0, 2),        // P-Z, p-z
-    (1 << 0xF, 1 << 5, 0, 3),               // _
-    (0x3E00, 1 << 0, 0, 4),                 // \t \n \x0B \x0C \r
-    (1 << 0, 1 << 2, 0, 5),                 // space
-    (1 << 0xA, 1 << 0, 0, 6),               // \n
-    (1 << 2, 1 << 2, 0, 7),                 // "
-    (1 << 0xC, 1 << 5, 1, 0),               // \
-    (1 << 0xA | 1 << 0xF, 1 << 2, 1, 1),    // * /
-    (0xC1FF, 1 << 0, 1, 2),                 // 0x00-0x08, 0x0E, 0x0F
-    (0xFFFF, 0xFF02, 1, 3),                 // 0x10-0x1F, 0x80-0xFF
+    (0x03FF, 1 << 3, 0, 0),                              // 0-9
+    (0xFFFE, 1 << 4 | 1 << 6, 0, 1),                     // A-O, a-o
+    (0x07FF, 1 << 5 | 1 << 7, 0, 2),                     // P-Z, p-z
+    (1 << 0xF, 1 << 5, 0, 3),                            // _
+    (0x3E00, 1 << 0, 0, 4),                              // \t \n \x0B \x0C \r
+    (1 << 0, 1 << 2, 0, 5),                              // space
+    (1 << 0xA, 1 << 0, 0, 6),                            // \n
+    (1 << 2, 1 << 2, 0, 7),                              // "
+    (1 << 0xC, 1 << 5, 1, 0),                            // \
+    (1 << 0xA | 1 << 0xF, 1 << 2, 1, 1),                 // * /
+    (0xC1FF, 1 << 0, 1, 2),                              // 0x00-0x08, 0x0E, 0x0F
+    (0xFFFF, 0xFF02, 1, 3),                              // 0x10-0x1F, 0x80-0xFF
     (1 << 2 | 1 << 3 | 1 << 7 | 1 << 0xF, 1 << 2, 1, 4), // " # ' /
-    (1 << 0, 1 << 6, 1, 5),                 // `
-    (1 << 0xF, 1 << 7, 1, 6),               // DEL
+    (1 << 0, 1 << 6, 1, 5),                              // `
+    (1 << 0xF, 1 << 7, 1, 6),                            // DEL
 ];
 
 /// The tables: A by low nibble, A by high nibble, B by low nibble, B by high nibble.
@@ -139,7 +139,8 @@ const NIBBLES: [[u8; 16]; 4] = {
 
 /// The bits of tables A and B that make each class, in [`Raw`] order.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-const NIBBLE_CLASSES: [(u8, u8); 6] = [(0x0F, 0), (0x30, 0), (0x40, 0), (0x80, 0x01), (0, 0x02), (0x01, 0x7D)];
+const NIBBLE_CLASSES: [(u8, u8); 6] =
+    [(0x0F, 0), (0x30, 0), (0x40, 0), (0x80, 0x01), (0, 0x02), (0x01, 0x7D)];
 
 const _: () = {
     let mut b = 0;
@@ -337,8 +338,8 @@ mod x86 {
     use std::arch::x86_64::*;
 
     use super::{
-        CLASS, NIBBLE_CLASSES, NIBBLES, R_IDENT, R_NEWLINE, R_QUOTE, R_SLASH_STAR, R_SPACE, R_SPECIAL, Raw,
-        SPECIAL_BIT,
+        CLASS, NIBBLE_CLASSES, NIBBLES, R_IDENT, R_NEWLINE, R_QUOTE, R_SLASH_STAR, R_SPACE,
+        R_SPECIAL, Raw, SPECIAL_BIT,
     };
 
     /// `x <= k` per unsigned byte, as 0xFF or 0.
@@ -358,10 +359,14 @@ mod x86 {
     #[target_feature(enable = "sse2")]
     #[inline]
     fn quarter_sse2(v: __m128i) -> [u32; 6] {
-        let alpha = le_sse2(_mm_sub_epi8(_mm_or_si128(v, _mm_set1_epi8(0x20)), _mm_set1_epi8(b'a' as i8)), 25);
+        let alpha = le_sse2(
+            _mm_sub_epi8(_mm_or_si128(v, _mm_set1_epi8(0x20)), _mm_set1_epi8(b'a' as i8)),
+            25,
+        );
         let digit = le_sse2(_mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8)), 9);
         let ident = _mm_or_si128(_mm_or_si128(alpha, digit), eq_sse2(v, b'_'));
-        let blank = _mm_or_si128(le_sse2(_mm_sub_epi8(v, _mm_set1_epi8(b'\t' as i8)), 4), eq_sse2(v, b' '));
+        let blank =
+            _mm_or_si128(le_sse2(_mm_sub_epi8(v, _mm_set1_epi8(b'\t' as i8)), 4), eq_sse2(v, b' '));
         let (dquote, backslash, slash) = (eq_sse2(v, b'"'), eq_sse2(v, b'\\'), eq_sse2(v, b'/'));
         let quote = _mm_or_si128(dquote, backslash);
         let slash_star = _mm_or_si128(slash, eq_sse2(v, b'*'));
@@ -428,8 +433,14 @@ mod x86 {
         let nibble = _mm256_set1_epi8(0x0F);
         let low = _mm256_and_si256(v, nibble);
         let high = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibble);
-        let a = _mm256_and_si256(_mm256_shuffle_epi8(tables[0], low), _mm256_shuffle_epi8(tables[1], high));
-        let b = _mm256_and_si256(_mm256_shuffle_epi8(tables[2], low), _mm256_shuffle_epi8(tables[3], high));
+        let a = _mm256_and_si256(
+            _mm256_shuffle_epi8(tables[0], low),
+            _mm256_shuffle_epi8(tables[1], high),
+        );
+        let b = _mm256_and_si256(
+            _mm256_shuffle_epi8(tables[2], low),
+            _mm256_shuffle_epi8(tables[3], high),
+        );
         let mut out = [0u32; 6];
         for (word, &class) in out.iter_mut().zip(&NIBBLE_CLASSES) {
             *word = any_avx2(a, b, class);
@@ -454,7 +465,10 @@ mod x86 {
         // SAFETY: `halves[0]` and `halves[1]` are 32 readable bytes each, the load's width, and
         // `loadu` has no alignment requirement.
         let (low, high) = unsafe {
-            (_mm256_loadu_si256(halves[0].as_ptr().cast()), _mm256_loadu_si256(halves[1].as_ptr().cast()))
+            (
+                _mm256_loadu_si256(halves[0].as_ptr().cast()),
+                _mm256_loadu_si256(halves[1].as_ptr().cast()),
+            )
         };
         let (lo, hi) = (half_avx2(low, &tables), half_avx2(high, &tables));
         std::array::from_fn(|k| lo[k] as u64 | (hi[k] as u64) << 32)
@@ -474,12 +488,19 @@ mod x86 {
         // SAFETY: `table[0]` and `table[1]` are 64 readable bytes each, the load's width, and
         // `loadu` has no alignment requirement.
         let (low, high) = unsafe {
-            (_mm512_loadu_si512(table[0].as_ptr().cast()), _mm512_loadu_si512(table[1].as_ptr().cast()))
+            (
+                _mm512_loadu_si512(table[0].as_ptr().cast()),
+                _mm512_loadu_si512(table[1].as_ptr().cast()),
+            )
         };
         // SAFETY: `chunk` is 64 readable bytes, as above.
         let v = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
         let class = _mm512_permutex2var_epi8(low, v, high);
-        let class = _mm512_mask_mov_epi8(class, _mm512_movepi8_mask(v), _mm512_set1_epi8(SPECIAL_BIT as i8));
+        let class = _mm512_mask_mov_epi8(
+            class,
+            _mm512_movepi8_mask(v),
+            _mm512_set1_epi8(SPECIAL_BIT as i8),
+        );
         [
             test_avx512(class, R_IDENT),
             test_avx512(class, R_SPACE),
@@ -511,7 +532,12 @@ mod arm {
     /// first class in the low 64 bits and the second in the high.
     #[target_feature(enable = "neon")]
     #[inline]
-    fn movemask_pair(class: &[uint8x16_t; 4], bit_a: u8, bit_b: u8, weights: uint8x16_t) -> (u64, u64) {
+    fn movemask_pair(
+        class: &[uint8x16_t; 4],
+        bit_a: u8,
+        bit_b: u8,
+        weights: uint8x16_t,
+    ) -> (u64, u64) {
         let a = vpaddq_u8(
             vpaddq_u8(weigh(class[0], bit_a, weights), weigh(class[1], bit_a, weights)),
             vpaddq_u8(weigh(class[2], bit_a, weights), weigh(class[3], bit_a, weights)),
@@ -553,7 +579,11 @@ mod arm {
         // SAFETY: `table[0]` and `table[1]` are 64 readable bytes each and `WEIGHTS` 16, the
         // loads' widths, and the loads have no alignment requirement.
         let (low, high, weights) = unsafe {
-            (vld1q_u8_x4(table[0].as_ptr()), vld1q_u8_x4(table[1].as_ptr()), vld1q_u8(WEIGHTS.as_ptr()))
+            (
+                vld1q_u8_x4(table[0].as_ptr()),
+                vld1q_u8_x4(table[1].as_ptr()),
+                vld1q_u8(WEIGHTS.as_ptr()),
+            )
         };
         let mut class = [vdupq_n_u8(0); 4];
         for (c, quarter) in class.iter_mut().zip(chunk.as_chunks::<16>().0) {
@@ -572,7 +602,10 @@ mod arm {
 mod tests {
     use blaze_ids::rng::SplitMix64;
 
-    use super::{CLASS, Classes, NEWLINE, QUOTE, SIMPLE_PUNCT, SLASH_STAR, SPECIAL, START, kernels, raw_scalar};
+    use super::{
+        CLASS, Classes, NEWLINE, QUOTE, SIMPLE_PUNCT, SLASH_STAR, SPECIAL, START, kernels,
+        raw_scalar,
+    };
 
     fn texts() -> Vec<Vec<u8>> {
         let mut rng = SplitMix64::new(7);
@@ -580,7 +613,9 @@ mod tests {
             (0..300).map(|len| (0..len).map(|_| rng.index(256) as u8).collect()).collect();
         // Every byte value at every position of a block.
         texts.push((0..=255u8).cycle().take(64 * 257).collect());
-        texts.extend(super::super::differential::parser_files().into_iter().take(50).map(String::into_bytes));
+        texts.extend(
+            super::super::differential::parser_files().into_iter().take(50).map(String::into_bytes),
+        );
         texts
     }
 
@@ -648,10 +683,20 @@ mod tests {
                         || !(ident(b) && ident(text[at - 1]) || space(b) && space(text[at - 1]));
                     let bit = |class: usize| classes.blocks[at / 64][class] >> (at % 64) & 1 != 0;
                     assert_eq!(bit(START), first_of_run, "a start at {at}");
-                    assert_eq!(bit(SPECIAL), first_of_run && CLASS[b as usize] & 32 != 0, "special at {at}");
+                    assert_eq!(
+                        bit(SPECIAL),
+                        first_of_run && CLASS[b as usize] & 32 != 0,
+                        "special at {at}"
+                    );
                     assert_eq!(classes.next_bit(NEWLINE, at), find(text, at, |b| b == b'\n'));
-                    assert_eq!(classes.next_bit(QUOTE, at), find(text, at, |b| b == b'"' || b == b'\\'));
-                    assert_eq!(classes.next_bit(SLASH_STAR, at), find(text, at, |b| b == b'/' || b == b'*'));
+                    assert_eq!(
+                        classes.next_bit(QUOTE, at),
+                        find(text, at, |b| b == b'"' || b == b'\\')
+                    );
+                    assert_eq!(
+                        classes.next_bit(SLASH_STAR, at),
+                        find(text, at, |b| b == b'/' || b == b'*')
+                    );
                 }
                 let end = text.len();
                 for class in [START, SPECIAL, NEWLINE, QUOTE, SLASH_STAR] {

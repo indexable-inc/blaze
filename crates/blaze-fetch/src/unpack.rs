@@ -132,7 +132,9 @@ fn whole(why: impl Into<String>) -> UnpackRefused {
 pub fn unpack(from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacked, UnpackRefused> {
     match fs::symlink_metadata(into) {
         Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Err(whole(format!("{} is not a directory to unpack into", into.display()))),
+        Ok(_) => {
+            return Err(whole(format!("{} is not a directory to unpack into", into.display())));
+        }
         Err(error) => return Err(whole(format!("reading {}: {error}", into.display()))),
     }
     let mut state = State {
@@ -207,7 +209,10 @@ impl<'a> Names<'a> {
     pub fn under_top(&mut self, name: &[u8]) -> Result<Option<String>, UnpackRefused> {
         let shown = || String::from_utf8_lossy(name).into_owned();
         if name.len() > self.rules.most_path {
-            return Err(at(&shown(), format!("is {} bytes, more than {}", name.len(), self.rules.most_path)));
+            return Err(at(
+                &shown(),
+                format!("is {} bytes, more than {}", name.len(), self.rules.most_path),
+            ));
         }
         if name.contains(&b'\\') || name.contains(&0) {
             return Err(at(&shown(), "has a `\\` or a NUL in it"));
@@ -222,18 +227,26 @@ impl<'a> Names<'a> {
                 Component::RootDir | Component::Prefix(_) => return Err(at(text, "is absolute")),
             }
         }
-        let Some((first, rest)) = parts.split_first() else { return Err(at(text, "names nothing")) };
+        let Some((first, rest)) = parts.split_first() else {
+            return Err(at(text, "names nothing"));
+        };
         let expected: Option<&str> = self.rules.top.or(self.top.as_deref());
         match expected {
             Some(top) if top != *first => {
-                return Err(at(text, format!("is not under `{top}`, the top directory of the archive")));
+                return Err(at(
+                    text,
+                    format!("is not under `{top}`, the top directory of the archive"),
+                ));
             }
             Some(_) => {}
             None => self.top = Some((*first).to_owned()), // alloc: once an archive
         }
         let Some(head) = rest.first() else { return Ok(None) };
         if let Some(reserved) = self.rules.reserved.iter().find(|it| fold(it) == fold(head)) {
-            return Err(at(text, format!("is named as `{reserved}`, which the archive may not hold")));
+            return Err(at(
+                text,
+                format!("is named as `{reserved}`, which the archive may not hold"),
+            ));
         }
         Ok(Some(rest.join("/")))
     }
@@ -254,13 +267,21 @@ impl<'a> Names<'a> {
             return Ok(false);
         };
         if was != spelled {
-            return Err(at(spelled, format!("and `{was}` are one name to a case-insensitive disk, and the archive has both")));
+            return Err(at(
+                spelled,
+                format!(
+                    "and `{was}` are one name to a case-insensitive disk, and the archive has both"
+                ),
+            ));
         }
         match (*was_dir, dir) {
             (true, true) => Ok(false),
             (false, false) if self.rules.twice == Twice::Replace => Ok(true),
             (false, false) => Err(at(spelled, "is in the archive twice")),
-            _ => Err(at(spelled, "is in the archive as a directory and as a file or link (something is under a file or link)")),
+            _ => Err(at(
+                spelled,
+                "is in the archive as a directory and as a file or link (something is under a file or link)",
+            )),
         }
     }
 }
@@ -269,7 +290,11 @@ impl<'a> Names<'a> {
 /// GNU header, its name ends in `/` and it is no link.
 pub fn is_dir_entry(header: &tar::Header, name: &[u8]) -> bool {
     let kind = header.entry_type();
-    kind.is_dir() || (!kind.is_hard_link() && !kind.is_symlink() && header.as_ustar().is_none() && name.ends_with(b"/"))
+    kind.is_dir()
+        || (!kind.is_hard_link()
+            && !kind.is_symlink()
+            && header.as_ustar().is_none()
+            && name.ends_with(b"/"))
 }
 
 impl State<'_, '_> {
@@ -287,7 +312,12 @@ impl State<'_, '_> {
             let path = self.into.join(part);
             match fs::symlink_metadata(&path) {
                 Ok(meta) if meta.is_dir() => {}
-                Ok(_) => return Err(at(part, "has something not a directory in its place, and nothing is written through it")),
+                Ok(_) => {
+                    return Err(at(
+                        part,
+                        "has something not a directory in its place, and nothing is written through it",
+                    ));
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     fs::create_dir(&path).map_err(|e| at(part, format!("can't be made: {e}")))?;
                 }
@@ -310,14 +340,20 @@ impl State<'_, '_> {
         let is_dir = is_dir_entry(entry.header(), &entry.path_bytes());
         self.entries += 1;
         if self.entries > self.rules.most_entries {
-            return Err(whole(format!("the archive has more than {} entries", self.rules.most_entries)));
+            return Err(whole(format!(
+                "the archive has more than {} entries",
+                self.rules.most_entries
+            )));
         }
         let name = entry.path_bytes().into_owned(); // alloc: an entry's name, once an entry
         let Some(path) = self.names.under_top(&name)? else {
             if is_dir {
                 return Ok(());
             }
-            return Err(at(&String::from_utf8_lossy(&name), "is the top of the archive, and no directory"));
+            return Err(at(
+                &String::from_utf8_lossy(&name),
+                "is the top of the archive, and no directory",
+            ));
         };
         if !(self.rules.include)(Path::new(&path)) {
             return Ok(());
@@ -325,7 +361,8 @@ impl State<'_, '_> {
         if path.rsplit('/').next().is_some_and(|it| self.rules.skip.contains(&it)) {
             return Ok(());
         }
-        let header_mode = entry.header().mode().map_err(|e| at(&path, format!("has no mode: {e}")))?;
+        let header_mode =
+            entry.header().mode().map_err(|e| at(&path, format!("has no mode: {e}")))?;
         if is_dir {
             self.names.claim(&path, true)?;
             self.make_dirs(&path)?;
@@ -342,7 +379,9 @@ impl State<'_, '_> {
         self.make_dirs(Self::parent(&path))?;
         let dest = self.into.join(&path);
         if replaces {
-            fs::remove_file(&dest).map_err(|e| at(&path, format!("is listed again, and the first can't be removed: {e}")))?;
+            fs::remove_file(&dest).map_err(|e| {
+                at(&path, format!("is listed again, and the first can't be removed: {e}"))
+            })?;
             self.out.remove(&path);
         }
         if is_file {
@@ -350,31 +389,47 @@ impl State<'_, '_> {
             self.add_bytes(size)?;
             let exec = header_mode & 0o111 != 0;
             let mtime = entry.header().mtime().ok();
-            let (blake3, len) = self.write_new(&dest, &mut (&mut entry).take(size), exec, header_mode, mtime).map_err(|e| at(&path, e))?;
+            let (blake3, len) = self
+                .write_new(&dest, &mut (&mut entry).take(size), exec, header_mode, mtime)
+                .map_err(|e| at(&path, e))?;
             if len != size {
                 return Err(at(&path, format!("ends after {len} of its {size} bytes")));
             }
             let kind = if exec { Kind::Exec } else { Kind::File };
             self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
         } else if kind.is_hard_link() {
-            let target = entry.link_name_bytes().ok_or_else(|| at(&path, "is a hard link to nothing"))?;
-            let Some(from) = self.names.under_top(&target)? else { return Err(at(&path, "is a hard link to the top directory")) };
+            let target =
+                entry.link_name_bytes().ok_or_else(|| at(&path, "is a hard link to nothing"))?;
+            let Some(from) = self.names.under_top(&target)? else {
+                return Err(at(&path, "is a hard link to the top directory"));
+            };
             let source = self.names.spelled(&from).and_then(|it| self.out.get(it));
             let Some(source) = source.filter(|it| it.kind != Kind::Link) else {
-                return Err(at(&path, format!("is a hard link to `{from}`, which is no file the archive wrote before it")));
+                return Err(at(
+                    &path,
+                    format!(
+                        "is a hard link to `{from}`, which is no file the archive wrote before it"
+                    ),
+                ));
             };
-            let (len, exec, source) = (source.len, source.kind == Kind::Exec, self.into.join(&source.path));
+            let (len, exec, source) =
+                (source.len, source.kind == Kind::Exec, self.into.join(&source.path));
             self.add_bytes(len)?;
-            let mut file = File::open(&source).map_err(|e| at(&path, format!("can't read its source: {e}")))?;
-            let (blake3, copied) = self.write_new(&dest, &mut file, exec, header_mode, None).map_err(|e| at(&path, e))?;
+            let mut file = File::open(&source)
+                .map_err(|e| at(&path, format!("can't read its source: {e}")))?;
+            let (blake3, copied) = self
+                .write_new(&dest, &mut file, exec, header_mode, None)
+                .map_err(|e| at(&path, e))?;
             if copied != len {
                 return Err(at(&path, format!("copied {copied} of its source's {len} bytes")));
             }
             let kind = if exec { Kind::Exec } else { Kind::File };
             self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
         } else {
-            let target = entry.link_name_bytes().ok_or_else(|| at(&path, "is a link to nothing"))?;
-            let target = String::from_utf8(target.into_owned()).map_err(|_| at(&path, "is a link whose target is not UTF-8"))?;
+            let target =
+                entry.link_name_bytes().ok_or_else(|| at(&path, "is a link to nothing"))?;
+            let target = String::from_utf8(target.into_owned())
+                .map_err(|_| at(&path, "is a link whose target is not UTF-8"))?;
             self.link_keys.insert(self.names.key(&path));
             self.links.push((path, target));
         }
@@ -384,21 +439,36 @@ impl State<'_, '_> {
     fn add_bytes(&mut self, len: u64) -> Result<(), UnpackRefused> {
         self.bytes = self.bytes.saturating_add(len);
         match self.bytes > self.rules.most_bytes {
-            true => Err(whole(format!("the archive's files are more than {} bytes", self.rules.most_bytes))),
+            true => Err(whole(format!(
+                "the archive's files are more than {} bytes",
+                self.rules.most_bytes
+            ))),
             false => Ok(()),
         }
     }
 
     /// `from` written to `dest`, a new file, hashed as it goes; its mode (and time) set as
     /// [`Rules::modes`] says, and synced when [`Rules::sync`]: its BLAKE3 and length.
-    fn write_new(&mut self, dest: &Path, from: &mut impl Read, exec: bool, mode: u32, mtime: Option<u64>) -> Result<(Blake3, u64), String> {
+    fn write_new(
+        &mut self,
+        dest: &Path,
+        from: &mut impl Read,
+        exec: bool,
+        mode: u32,
+        mtime: Option<u64>,
+    ) -> Result<(Blake3, u64), String> {
         let open = || OpenOptions::new().write(true).create_new(true).open(dest);
         let mut out = match open() {
             // Another spelling of one name on a case-insensitive disk (`README` and `readme` on
             // APFS), which names alone don't fold under these rules: the later replaces it, as
             // tar writes it.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && self.rules.names.twice == Twice::Replace => {
-                fs::remove_file(dest).and_then(|()| open()).map_err(|e| format!("is another spelling of a file before it, which can't be replaced: {e}"))?
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    && self.rules.names.twice == Twice::Replace =>
+            {
+                fs::remove_file(dest).and_then(|()| open()).map_err(|e| {
+                    format!("is another spelling of a file before it, which can't be replaced: {e}")
+                })?
             }
             opened => opened.map_err(|e| format!("can't be made: {e}"))?,
         };
@@ -416,11 +486,17 @@ impl State<'_, '_> {
             len += read as u64;
         }
         match self.rules.modes {
-            Modes::ReadOnly => out.set_permissions(read_only(&out, exec).map_err(|e| format!("has no mode: {e}"))?),
+            Modes::ReadOnly => {
+                out.set_permissions(read_only(&out, exec).map_err(|e| format!("has no mode: {e}"))?)
+            }
             Modes::Cargo { mask } => {
                 if let Some(mtime) = mtime {
-                    let time = filetime::FileTime::from_unix_time(i64::try_from(mtime.max(1)).unwrap_or(i64::MAX), 0);
-                    filetime::set_file_handle_times(&out, Some(time), Some(time)).map_err(|e| format!("can't be given its time: {e}"))?;
+                    let time = filetime::FileTime::from_unix_time(
+                        i64::try_from(mtime.max(1)).unwrap_or(i64::MAX),
+                        0,
+                    );
+                    filetime::set_file_handle_times(&out, Some(time), Some(time))
+                        .map_err(|e| format!("can't be given its time: {e}"))?;
                 }
                 masked(&out, mode, mask)
             }
@@ -437,12 +513,17 @@ impl State<'_, '_> {
     /// out, or passes through another link of the archive on the way (names compared as
     /// [`Names::key`] does), as a link through a link could climb out by a `..` the first hides.
     fn stays_in(&self, path: &str, target: &str) -> Option<String> {
-        if target.is_empty() || target.len() > self.rules.names.most_path || target.contains(['\\', '\0']) || target.starts_with('/') {
+        if target.is_empty()
+            || target.len() > self.rules.names.most_path
+            || target.contains(['\\', '\0'])
+            || target.starts_with('/')
+        {
             return None;
         }
         let mut now: Vec<&str> = path.split('/').collect(); // alloc: once a link
         now.pop();
-        let parts: Vec<&str> = target.split('/').filter(|it| !it.is_empty() && *it != ".").collect(); // alloc: as above
+        let parts: Vec<&str> =
+            target.split('/').filter(|it| !it.is_empty() && *it != ".").collect(); // alloc: as above
         for (i, part) in parts.iter().enumerate() {
             if *part == ".." {
                 now.pop()?;
@@ -461,16 +542,23 @@ impl State<'_, '_> {
         let mut lands: Vec<String> = Vec::with_capacity(links.len()); // alloc: once an archive
         for (path, target) in &links {
             let Some(land) = self.stays_in(path, target) else {
-                return Err(at(path, format!("is a link to `{target}`, which is not inside the archive or goes through another link")));
+                return Err(at(
+                    path,
+                    format!(
+                        "is a link to `{target}`, which is not inside the archive or goes through another link"
+                    ),
+                ));
             };
-            symlink(target, &self.into.join(path)).map_err(|e| at(path, format!("can't be linked to `{target}`: {e}")))?;
+            symlink(target, &self.into.join(path))
+                .map_err(|e| at(path, format!("can't be linked to `{target}`: {e}")))?;
             lands.push(land);
         }
         // Each link resolved by the system, which must land where its text says: the root
         // joined with that, or, when that is itself a link of the archive (checked as its own),
         // somewhere under the root.
         if !links.is_empty() {
-            let root = fs::canonicalize(self.into).map_err(|e| whole(format!("resolving {}: {e}", self.into.display())))?;
+            let root = fs::canonicalize(self.into)
+                .map_err(|e| whole(format!("resolving {}: {e}", self.into.display())))?;
             for ((path, target), land) in links.iter().zip(&lands) {
                 let to_link = self.link_keys.contains(&self.names.key(land));
                 match fs::canonicalize(self.into.join(path)) {
@@ -479,13 +567,28 @@ impl State<'_, '_> {
                     Ok(real) => {
                         return Err(at(
                             path,
-                            format!("is a link to `{target}`, which the disk resolves to {}, not `{land}` under the archive", real.display()),
+                            format!(
+                                "is a link to `{target}`, which the disk resolves to {}, not `{land}` under the archive",
+                                real.display()
+                            ),
                         ));
                     }
-                    Err(e) => return Err(at(path, format!("is a link to `{target}`, which resolves to nothing in the archive: {e}"))),
+                    Err(e) => {
+                        return Err(at(
+                            path,
+                            format!(
+                                "is a link to `{target}`, which resolves to nothing in the archive: {e}"
+                            ),
+                        ));
+                    }
                 }
                 let blake3 = Blake3::of(target.as_bytes());
-                let entry = Entry { path: path.clone(), kind: Kind::Link, blake3, len: target.len() as u64 }; // clone: its entry
+                let entry = Entry {
+                    path: path.clone(),
+                    kind: Kind::Link,
+                    blake3,
+                    len: target.len() as u64,
+                }; // clone: its entry
                 self.out.insert(path.clone(), entry); // clone: its key
             }
         }
@@ -503,11 +606,13 @@ impl State<'_, '_> {
         }
         if let Modes::Cargo { mask } = self.rules.modes {
             for (dir, mode) in &self.modes {
-                set_dir_mode(&self.into.join(dir), *mode, mask).map_err(|e| at(dir, format!("can't be given its mode: {e}")))?;
+                set_dir_mode(&self.into.join(dir), *mode, mask)
+                    .map_err(|e| at(dir, format!("can't be given its mode: {e}")))?;
             }
         }
         if self.rules.sync {
-            sync_dir(self.into).map_err(|e| whole(format!("syncing {}: {e}", self.into.display())))?;
+            sync_dir(self.into)
+                .map_err(|e| whole(format!("syncing {}: {e}", self.into.display())))?;
         }
         Ok(Unpacked { entries: self.out.into_values().collect(), bytes: self.bytes })
     }
@@ -526,23 +631,36 @@ pub fn walk(root: &Path, skip: &[&str], read_only: bool) -> Result<Vec<Entry>, U
         for item in fs::read_dir(&path).map_err(fail)? {
             let item = item.map_err(fail)?;
             let name = item.file_name();
-            let name = name.to_str().ok_or_else(|| at(&dir, format!("holds {name:?}, which is not UTF-8")))?;
+            let name = name
+                .to_str()
+                .ok_or_else(|| at(&dir, format!("holds {name:?}, which is not UTF-8")))?;
             if dir.is_empty() && skip.contains(&name) {
                 continue;
             }
             let rel = if dir.is_empty() { name.to_owned() } else { format!("{dir}/{name}") }; // alloc: once an entry
-            let meta = fs::symlink_metadata(item.path()).map_err(|e| at(&rel, format!("can't be read: {e}")))?;
+            let meta = fs::symlink_metadata(item.path())
+                .map_err(|e| at(&rel, format!("can't be read: {e}")))?;
             if meta.is_dir() {
                 dirs.push(rel);
             } else if meta.file_type().is_symlink() {
-                let target = fs::read_link(item.path()).map_err(|e| at(&rel, format!("can't be read: {e}")))?;
-                let target = target.to_str().ok_or_else(|| at(&rel, "is a link whose target is not UTF-8"))?.replace('\\', "/");
-                out.push(Entry { path: rel, kind: Kind::Link, blake3: Blake3::of(target.as_bytes()), len: target.len() as u64 });
+                let target = fs::read_link(item.path())
+                    .map_err(|e| at(&rel, format!("can't be read: {e}")))?;
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| at(&rel, "is a link whose target is not UTF-8"))?
+                    .replace('\\', "/");
+                out.push(Entry {
+                    path: rel,
+                    kind: Kind::Link,
+                    blake3: Blake3::of(target.as_bytes()),
+                    len: target.len() as u64,
+                });
             } else if meta.is_file() {
                 if read_only && writable(&meta) {
                     return Err(at(&rel, "can be written, and was made read-only"));
                 }
-                let mut file = File::open(item.path()).map_err(|e| at(&rel, format!("can't be read: {e}")))?;
+                let mut file =
+                    File::open(item.path()).map_err(|e| at(&rel, format!("can't be read: {e}")))?;
                 let mut hasher = blaze_ids::b3::Hasher::new();
                 let mut len = 0u64;
                 loop {
@@ -576,10 +694,18 @@ pub fn first_difference(got: &[Entry], want: &[Entry]) -> Option<(String, &'stat
             (Some(it), None) => return Some((it.path.clone(), "is there, and was not unpacked")), // clone: an error's path
             (None, Some(it)) => return Some((it.path.clone(), "was unpacked, and is gone")), // clone: as above
             (Some(a), Some(b)) => match a.path.cmp(&b.path) {
-                std::cmp::Ordering::Less => return Some((a.path.clone(), "is there, and was not unpacked")), // clone: as above
-                std::cmp::Ordering::Greater => return Some((b.path.clone(), "was unpacked, and is gone")), // clone: as above
-                std::cmp::Ordering::Equal if a.kind != b.kind => return Some((a.path.clone(), "is of another kind than was unpacked")), // clone: as above
-                std::cmp::Ordering::Equal if a != b => return Some((a.path.clone(), "holds other bytes than were unpacked")), // clone: as above
+                std::cmp::Ordering::Less => {
+                    return Some((a.path.clone(), "is there, and was not unpacked"));
+                } // clone: as above
+                std::cmp::Ordering::Greater => {
+                    return Some((b.path.clone(), "was unpacked, and is gone"));
+                } // clone: as above
+                std::cmp::Ordering::Equal if a.kind != b.kind => {
+                    return Some((a.path.clone(), "is of another kind than was unpacked"));
+                } // clone: as above
+                std::cmp::Ordering::Equal if a != b => {
+                    return Some((a.path.clone(), "holds other bytes than were unpacked"));
+                } // clone: as above
                 std::cmp::Ordering::Equal => {
                     g.next();
                     w.next();
@@ -596,7 +722,10 @@ fn symlink(target: &str, at: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn symlink(target: &str, at: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, format!("no symbolic link is made here (to `{target}` at {})", at.display())))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("no symbolic link is made here (to `{target}` at {})", at.display()),
+    ))
 }
 
 fn read_only(file: &File, exec: bool) -> io::Result<fs::Permissions> {
@@ -713,7 +842,10 @@ fn make_writable(dir: &Path) -> io::Result<()> {
         } else if !kind.is_symlink() && cfg!(not(unix)) {
             // Windows refuses to remove a read-only file.
             let mut perms = entry.metadata()?.permissions();
-            #[allow(clippy::permissions_set_readonly_false, reason = "removing a tree blaze unpacked")]
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "removing a tree blaze unpacked"
+            )]
             perms.set_readonly(false);
             fs::set_permissions(entry.path(), perms)?;
         }
@@ -752,7 +884,13 @@ mod tests {
 
     fn layout_rules() -> Rules<'static> {
         Rules {
-            names: NameRules { top: None, fold: true, twice: Twice::Refuse, reserved: &[".blaze-native"], most_path: 4096 },
+            names: NameRules {
+                top: None,
+                fold: true,
+                twice: Twice::Refuse,
+                reserved: &[".blaze-native"],
+                most_path: 4096,
+            },
             links: true,
             modes: Modes::ReadOnly,
             skip: &[],
@@ -774,10 +912,20 @@ mod tests {
         use tar::EntryType::{Directory, Regular, Symlink};
         let ok = || raw(Regular, "top/bin/tool", "", b"ok");
         let hostile: [(&str, Vec<(tar::Header, Vec<u8>)>); 11] = [
-            ("`..`", vec![raw(Directory, "top/", "", b""), raw(Regular, "top/../escaped", "", b"x")]),
+            (
+                "`..`",
+                vec![raw(Directory, "top/", "", b""), raw(Regular, "top/../escaped", "", b"x")],
+            ),
             ("absolute", vec![raw(Regular, "/tmp/escaped", "", b"x")]),
             ("link out", vec![ok(), raw(Symlink, "top/lib/out", "../../..", b"")]),
-            ("link through a link", vec![ok(), raw(Symlink, "top/a/up", "..", b""), raw(Symlink, "top/b", "a/up/..", b"")]),
+            (
+                "link through a link",
+                vec![
+                    ok(),
+                    raw(Symlink, "top/a/up", "..", b""),
+                    raw(Symlink, "top/b", "a/up/..", b""),
+                ],
+            ),
             (
                 "link through a link in another case",
                 vec![
@@ -786,12 +934,30 @@ mod tests {
                     raw(Symlink, "top/A", "D/up/D/up/../../../escaped", b""),
                 ],
             ),
-            ("under a link", vec![raw(Symlink, "top/l", ".", b""), raw(Regular, "top/l/x", "", b"x")]),
-            ("one name in two cases", vec![raw(Regular, "top/d/x", "", b"x"), raw(Symlink, "top/D", "..", b"")]),
-            ("the mark in another case", vec![ok(), raw(Symlink, "top/.Blaze-Native", "bin/tool", b"")]),
-            ("`ſ` as `s`", vec![raw(Regular, "top/s/x", "", b"x"), raw(Symlink, "top/\u{17f}", "..", b"")]),
-            ("`ß` as `ss`", vec![raw(Regular, "top/ss", "", b"x"), raw(Regular, "top/\u{df}", "", b"y")]),
-            ("`ﬀ` as `ff`", vec![raw(Regular, "top/ff", "", b"x"), raw(Regular, "top/\u{fb00}", "", b"y")]),
+            (
+                "under a link",
+                vec![raw(Symlink, "top/l", ".", b""), raw(Regular, "top/l/x", "", b"x")],
+            ),
+            (
+                "one name in two cases",
+                vec![raw(Regular, "top/d/x", "", b"x"), raw(Symlink, "top/D", "..", b"")],
+            ),
+            (
+                "the mark in another case",
+                vec![ok(), raw(Symlink, "top/.Blaze-Native", "bin/tool", b"")],
+            ),
+            (
+                "`ſ` as `s`",
+                vec![raw(Regular, "top/s/x", "", b"x"), raw(Symlink, "top/\u{17f}", "..", b"")],
+            ),
+            (
+                "`ß` as `ss`",
+                vec![raw(Regular, "top/ss", "", b"x"), raw(Regular, "top/\u{df}", "", b"y")],
+            ),
+            (
+                "`ﬀ` as `ff`",
+                vec![raw(Regular, "top/ff", "", b"x"), raw(Regular, "top/\u{fb00}", "", b"y")],
+            ),
         ];
         for (what, entries) in hostile {
             let scratch = tempfile::tempdir().unwrap();

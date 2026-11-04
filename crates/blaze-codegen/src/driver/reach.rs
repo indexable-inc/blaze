@@ -163,7 +163,8 @@ impl Reach {
         let mut marks = Vec::new();
         while let Some(at) = stack.pop() {
             marks.extend(self.marks[at as usize].map(CodeHash));
-            let edges = &self.edges[self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
+            let edges = &self.edges
+                [self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
             for &next in edges {
                 let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
                 if seen[word] & bit == 0 {
@@ -190,7 +191,8 @@ impl Reach {
         walk.stack.push(root);
         walk.visited.push(root);
         while let Some(at) = walk.stack.pop() {
-            let edges = &self.edges[self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
+            let edges = &self.edges
+                [self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
             for &next in edges {
                 let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
                 if walk.seen[word] & bit == 0 {
@@ -297,8 +299,9 @@ mod tests {
         let to_four = [Target::Function(numbered(4))];
         // 300 functions: a root that reaches one lists it by a sort, one that reaches more by
         // its bits. 0 reaches 2, the static and through it 4; 299 reaches every function.
-        let mut functions: Vec<(InstanceKey, Node<'_>)> =
-            (0..300).map(|n| (numbered(n), Node { marks: [mark(1), mark(0)], refs: &none[..] })).collect();
+        let mut functions: Vec<(InstanceKey, Node<'_>)> = (0..300)
+            .map(|n| (numbered(n), Node { marks: [mark(1), mark(0)], refs: &none[..] }))
+            .collect();
         functions[0].1.refs = &calls[..];
         let all: Vec<Target> = (0..300).map(|n| Target::Direct(numbered(n))).collect();
         functions[299].1.refs = &all[..];
@@ -307,7 +310,10 @@ mod tests {
         let mut walk = Walk::default();
         for _ in 0..2 {
             assert_eq!(reach.functions_of(&numbered(0), &mut walk).unwrap(), [0, 2, 4]);
-            assert_eq!(reach.functions_of(&numbered(299), &mut walk).unwrap(), (0..300).collect::<Vec<u32>>());
+            assert_eq!(
+                reach.functions_of(&numbered(299), &mut walk).unwrap(),
+                (0..300).collect::<Vec<u32>>()
+            );
             assert_eq!(reach.functions_of(&numbered(1), &mut walk).unwrap(), [1]);
         }
         assert_eq!(reach.functions_of(&numbered(300), &mut walk), None);

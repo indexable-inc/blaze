@@ -365,7 +365,8 @@ fn every_impl_trait_of_a_return_type_outlives_its_bound_and_captures_only_its_ow
 
 #[test]
 fn an_async_fns_elided_and_nested_impl_traits_are_checked() {
-    for name in ["bad_async_elided", "bad_async_elided_direct", "bad_async_nested", "bad_async_two"] {
+    for name in ["bad_async_elided", "bad_async_elided_direct", "bad_async_nested", "bad_async_two"]
+    {
         borrowck_rejects(ASYNC_MULTI, name);
     }
     for name in ["ok_async_elided", "ok_async_elided_static", "ok_async_nested", "ok_async_two"] {

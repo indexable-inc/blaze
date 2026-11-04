@@ -204,7 +204,9 @@ mod tests {
         let kinds = [
             FnSigKind::dummy(),
             FnSigKind::dummy().set_c_variadic(true),
-            FnSigKind::dummy().set_splatted(Some(0), 1).expect("one input, so index 0 is in bounds"),
+            FnSigKind::dummy()
+                .set_splatted(Some(0), 1)
+                .expect("one input, so index 0 is in bounds"),
         ];
         for fn_sig_kind in kinds {
             let sig = FnSig { inputs_and_output, fn_sig_kind };

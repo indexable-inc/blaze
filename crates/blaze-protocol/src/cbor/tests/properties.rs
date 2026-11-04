@@ -2,8 +2,8 @@
 //! every shape writes the reference's bytes, which check and read as the reference reads them,
 //! and so do those bytes cut, flipped, grown and swapped.
 
-use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
 
 use super::{NAMES, Shape, same_reading};
 use crate::cbor::{check, reference, to_vec};
@@ -32,7 +32,8 @@ fn fields(tc: &TestCase, depth: u32) -> Vec<(usize, Shape)> {
 
 fn shape(tc: &TestCase, depth: u32) -> Shape {
     let leaf = depth == 0 || tc.draw(gs::weighted_booleans(1.0 / 3.0));
-    let kinds = if leaf { gs::integers().max_value(7) } else { gs::integers().min_value(8).max_value(13) };
+    let kinds =
+        if leaf { gs::integers().max_value(7) } else { gs::integers().min_value(8).max_value(13) };
     let kind: u8 = tc.draw(kinds);
     match kind {
         0 => Shape::Unsigned(tc.draw(gs::integers())),
@@ -110,7 +111,8 @@ fn writes_and_reads_as_the_reference_does(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 

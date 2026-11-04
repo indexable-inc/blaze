@@ -157,7 +157,10 @@ pub struct Root {
 /// generator, and the code installed into the front end or the code generator through `dyn`
 /// hooks from past it (`blaze-items`' `GoalFacts` is in the code generator's closure already).
 pub const ROOTS: &[Root] = &[
-    Root { package: CODE_GENERATOR, why: "the code generator, the front end it reads and the backends it drives" },
+    Root {
+        package: CODE_GENERATOR,
+        why: "the code generator, the front end it reads and the backends it drives",
+    },
     Root {
         package: "blaze-item-hash",
         why: "`Bodies` is installed as `hir_ty::body_store::BodyFacts` (blaze-cargo \
@@ -333,7 +336,11 @@ pub const FRONT_END_REVIEWED: &[Hook] = &[
               and works out again what a kept expansion read (`reads_now`) for hir-def to check an \
               image still holds: a store, which makes no value",
     },
-    Hook { package: "blaze-cargo", hook: "Held", why: "`InStore` holds the bytes of an image read from the store" },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Held",
+        why: "`InStore` holds the bytes of an image read from the store",
+    },
     Hook {
         package: "blaze-cargo",
         hook: "Builder",
@@ -588,7 +595,11 @@ pub const REVIEWED_HOOKS: &[Hook] = &[
         why: "`Images` gets and puts the dependency images hir-def writes and reads, by key: a \
               store, which makes no bytes",
     },
-    Hook { package: "blaze-cargo", hook: "Held", why: "`InStore` holds the bytes of an image read from the store" },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Held",
+        why: "`InStore` holds the bytes of an image read from the store",
+    },
     Hook {
         package: "blaze-cargo",
         hook: "BodyChecks",
@@ -612,7 +623,11 @@ pub const REVIEWED_HOOKS: &[Hook] = &[
         why: "`Recorder` and `Replay` record and replay proc-macro expansions as tokens: source \
               the instance key hashes",
     },
-    Hook { package: "blaze-wasm", hook: "Lookup", why: "`Stored` reads templates by key from its own store" },
+    Hook {
+        package: "blaze-wasm",
+        hook: "Lookup",
+        why: "`Stored` reads templates by key from its own store",
+    },
     Hook {
         package: "blaze-macro-eval",
         hook: "Foreign",
@@ -676,7 +691,10 @@ pub const BLAZE_IDENTITY: &str = "blaze-identity: ";
 
 /// The one LLVM blaze links (crates/hir-ty-codegen/llvm.json), checked as llvm-sys checks it:
 /// pin.rs is its one home, of the pin, the check of a prefix and the message refusing one.
-#[allow(dead_code, reason = "`pinned_llvm_config` is llvm-sys's build script's; this crate uses the check alone")]
+#[allow(
+    dead_code,
+    reason = "`pinned_llvm_config` is llvm-sys's build script's; this crate uses the check alone"
+)]
 mod pin {
     include!("../../../vendor/llvm-sys/pin.rs");
 }
@@ -688,7 +706,10 @@ const LLVM_PACKAGE: &str = "llvm-sys";
 
 /// The pin of the stencil libraries and its reader (crates/blaze-stencil/pin.rs), as
 /// blaze-stencil's build script reads it: one reader, one pin.
-#[allow(dead_code, reason = "the pin's writer and hex are blaze-stencil's build script's; this crate reads the pin")]
+#[allow(
+    dead_code,
+    reason = "the pin's writer and hex are blaze-stencil's build script's; this crate reads the pin"
+)]
 mod stencil_pin {
     include!("../../blaze-stencil/pin.rs");
 }
@@ -704,12 +725,16 @@ pub const SEED_FEATURE: &str = "CARGO_FEATURE_SEED";
 /// be one: the C compiler, its flags, archiver and SDK, which build the C of the closure's
 /// packages (cc's variables, per target and per host), as the module doc says.
 pub fn unkeyed_env(name: &str) -> Option<&'static str> {
-    const C: &str = "the C compiler, its flags and SDK are no input (crates/blaze-codegen-code/src/lib.rs)";
-    const TOOLS: [&str; 8] = ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "ARFLAGS", "RANLIB", "RANLIBFLAGS"];
+    const C: &str =
+        "the C compiler, its flags and SDK are no input (crates/blaze-codegen-code/src/lib.rs)";
+    const TOOLS: [&str; 8] =
+        ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "ARFLAGS", "RANLIB", "RANLIBFLAGS"];
     let base = name.strip_prefix("HOST_").or_else(|| name.strip_prefix("TARGET_")).unwrap_or(name);
     // `CC_aarch64-apple-darwin`, `CFLAGS_aarch64_apple_darwin`: a tool's variable for one target.
     let per_target = |tool: &str| {
-        base.strip_prefix(tool).and_then(|it| it.strip_prefix('_')).is_some_and(|triple| triple.contains(['-', '_']))
+        base.strip_prefix(tool)
+            .and_then(|it| it.strip_prefix('_'))
+            .is_some_and(|triple| triple.contains(['-', '_']))
     };
     let c = TOOLS.iter().any(|tool| base == *tool || per_target(tool))
         || matches!(
@@ -801,7 +826,11 @@ impl Worked {
 
 /// The paths of `stamps` that are not now what they were (or are gone).
 fn changed(stamps: &BTreeMap<PathBuf, Stamp>) -> Vec<PathBuf> {
-    stamps.iter().filter(|(path, was)| stamp(path).ok() != Some(**was)).map(|(path, _)| path.clone()).collect()
+    stamps
+        .iter()
+        .filter(|(path, was)| stamp(path).ok() != Some(**was))
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 /// The hex of `bytes`, lowercase.
@@ -833,7 +862,8 @@ pub fn emit_of(identity: &Identity) {
 /// once, after the last identity, to be what it was when read.
 pub fn emit_all(identities: &[&Identity]) {
     if let Err(why) = emitted(identities) {
-        let named: Vec<String> = identities.iter().map(|it| format!("{} ({})", it.what, it.env)).collect();
+        let named: Vec<String> =
+            identities.iter().map(|it| format!("{} ({})", it.what, it.env)).collect();
         println!("cargo::error={}: {}", named.join(" and "), why.replace('\n', " "));
     }
 }
@@ -859,7 +889,8 @@ fn emitted(identities: &[&Identity]) -> Result<(), String> {
     }
     let changed = changed(&stamps);
     if !changed.is_empty() {
-        let named: Vec<String> = changed.iter().take(8).map(|it| it.display().to_string()).collect();
+        let named: Vec<String> =
+            changed.iter().take(8).map(|it| it.display().to_string()).collect();
         return Err(format!(
             "{} file(s) changed while it was worked out, so it is of no one tree: {}; build again once \
              nothing writes to the tree",
@@ -884,7 +915,8 @@ fn emitted(identities: &[&Identity]) -> Result<(), String> {
     }
     for (identity, worked) in identities.iter().zip(&all) {
         let out = Path::new(&var("OUT_DIR")?).join(identity.listing);
-        std::fs::write(&out, worked.listing()).map_err(|why| format!("writing {}: {why}", out.display()))?;
+        std::fs::write(&out, worked.listing())
+            .map_err(|why| format!("writing {}: {why}", out.display()))?;
         println!("cargo:rustc-env={}={}", identity.env, hex(&worked.code));
     }
     Ok(())
@@ -944,12 +976,16 @@ fn var(name: &str) -> Result<String, String> {
 /// and for blaze as `rustc`, which blaze it is.
 fn compiler(rustc: &str) -> Result<String, String> {
     // asks blaze: `rustc` is the build script's `$RUSTC`, blaze's stand-in, so blaze answers.
-    let out = Command::new(rustc).arg("-vV").output().map_err(|why| format!("running `{rustc} -vV`: {why}"))?;
+    let out = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .map_err(|why| format!("running `{rustc} -vV`: {why}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("`{rustc} -vV` exited with {}: {}", out.status, stderr.trim()));
     }
-    let said = String::from_utf8(out.stdout).map_err(|_| format!("`{rustc} -vV` printed no UTF-8"))?;
+    let said =
+        String::from_utf8(out.stdout).map_err(|_| format!("`{rustc} -vV` printed no UTF-8"))?;
     check_compiler(rustc, said)
 }
 
@@ -996,11 +1032,12 @@ impl BuildEnv {
     pub fn of(env: &BTreeMap<String, String>) -> BuildEnv {
         let mut vars = BTreeMap::new();
         for (name, value) in env {
-            let keyed = matches!(name.as_str(), "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "DEBUG")
-                || name == "CARGO_ENCODED_RUSTFLAGS"
-                || name.starts_with("CARGO_CFG_")
-                || name.starts_with("CARGO_PROFILE_")
-                || name.starts_with("CARGO_FEATURE_");
+            let keyed =
+                matches!(name.as_str(), "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "DEBUG")
+                    || name == "CARGO_ENCODED_RUSTFLAGS"
+                    || name.starts_with("CARGO_CFG_")
+                    || name.starts_with("CARGO_PROFILE_")
+                    || name.starts_with("CARGO_FEATURE_");
             if keyed {
                 vars.insert(name.clone(), Some(value.clone()));
             }
@@ -1011,7 +1048,9 @@ impl BuildEnv {
         let llvm_prefix = env.get(LLVM_PREFIX).filter(|it| !it.is_empty()).cloned();
         let cargo_home = match env.get("CARGO_HOME").filter(|it| !it.is_empty()) {
             Some(home) => Some(PathBuf::from(home)),
-            None => env.get("HOME").filter(|it| !it.is_empty()).map(|it| Path::new(it).join(".cargo")),
+            None => {
+                env.get("HOME").filter(|it| !it.is_empty()).map(|it| Path::new(it).join(".cargo"))
+            }
         };
         BuildEnv { vars, llvm_prefix, compiler: None, cargo_home }
     }
@@ -1068,7 +1107,8 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
 fn read_toml(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<toml::Table, String> {
     let bytes = read_stamped(path, stamps)?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-    text.parse::<toml::Table>().map_err(|why| format!("{} is no TOML: {}", path.display(), why.to_string().trim()))
+    text.parse::<toml::Table>()
+        .map_err(|why| format!("{} is no TOML: {}", path.display(), why.to_string().trim()))
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {
@@ -1104,7 +1144,10 @@ fn dependency_tables(manifest: &toml::Table) -> Vec<(bool, &toml::Table)> {
 }
 
 /// The workspace's `[workspace.dependencies]` entry `key` names, if any.
-fn workspace_dependency<'a>(workspace: Option<&'a toml::Table>, key: &str) -> Option<&'a toml::Value> {
+fn workspace_dependency<'a>(
+    workspace: Option<&'a toml::Table>,
+    key: &str,
+) -> Option<&'a toml::Value> {
     workspace?.get("workspace")?.get("dependencies")?.get(key)
 }
 
@@ -1120,7 +1163,9 @@ fn dependency_name(key: &str, value: &toml::Value, workspace: Option<&toml::Tabl
         return package.to_owned();
     }
     if inherits(value)
-        && let Some(package) = workspace_dependency(workspace, key).and_then(|it| it.get("package")).and_then(toml::Value::as_str)
+        && let Some(package) = workspace_dependency(workspace, key)
+            .and_then(|it| it.get("package"))
+            .and_then(toml::Value::as_str)
     {
         return package.to_owned();
     }
@@ -1129,7 +1174,12 @@ fn dependency_name(key: &str, value: &toml::Value, workspace: Option<&toml::Tabl
 
 /// The directory a dependency entry's `path` names, relative to the manifest at `dir` (or the
 /// workspace's directory when it inherits), if it names one.
-fn dependency_path(dir: &Path, key: &str, value: &toml::Value, workspace: Option<(&Path, &toml::Table)>) -> Option<PathBuf> {
+fn dependency_path(
+    dir: &Path,
+    key: &str,
+    value: &toml::Value,
+    workspace: Option<(&Path, &toml::Table)>,
+) -> Option<PathBuf> {
     if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
         return Some(dir.join(path));
     }
@@ -1153,18 +1203,27 @@ impl Workspace {
             .get("package")
             .and_then(|it| it.get("name"))
             .and_then(toml::Value::as_str)
-            .ok_or_else(|| format!("{} names no package", program_dir.join("Cargo.toml").display()))?
+            .ok_or_else(|| {
+                format!("{} names no package", program_dir.join("Cargo.toml").display())
+            })?
             .to_owned();
         let mut workspaces = BTreeMap::new();
-        let root_manifest = workspace_of(&program_dir, &mut workspaces, &mut stamps)?
-            .ok_or_else(|| format!("no manifest at or above {} has a `[workspace]` table", program_dir.display()))?;
-        let root = root_manifest.parent().map(Path::to_path_buf).ok_or("a manifest has no directory")?;
+        let root_manifest =
+            workspace_of(&program_dir, &mut workspaces, &mut stamps)?.ok_or_else(|| {
+                format!(
+                    "no manifest at or above {} has a `[workspace]` table",
+                    program_dir.display()
+                )
+            })?;
+        let root =
+            root_manifest.parent().map(Path::to_path_buf).ok_or("a manifest has no directory")?;
         let lock_path = root.join("Cargo.lock");
         let lock = locked(&lock_path, &mut stamps)?;
 
         // The members: `members` globs, less `exclude`.
         let table = workspaces[&root_manifest].clone();
-        let section = table.get("workspace").and_then(toml::Value::as_table).cloned().unwrap_or_default();
+        let section =
+            table.get("workspace").and_then(toml::Value::as_table).cloned().unwrap_or_default();
         let excluded: Vec<PathBuf> = section
             .get("exclude")
             .and_then(toml::Value::as_array)
@@ -1179,13 +1238,23 @@ impl Workspace {
             queue.push(root.clone());
             members.insert(root_manifest.clone());
         }
-        for pattern in section.get("members").and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str) {
+        for pattern in section
+            .get("members")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
             let full = root.join(pattern);
             let full = full.to_str().ok_or_else(|| format!("{} is not UTF-8", full.display()))?;
-            let paths = glob::glob(full).map_err(|why| format!("member pattern `{pattern}` of {}: {why}", root_manifest.display()))?;
+            let paths = glob::glob(full).map_err(|why| {
+                format!("member pattern `{pattern}` of {}: {why}", root_manifest.display())
+            })?;
             for path in paths {
                 let path = path.map_err(|why| format!("member pattern `{pattern}`: {why}"))?;
-                if !path.join("Cargo.toml").is_file() || excluded.iter().any(|it| path.starts_with(it)) {
+                if !path.join("Cargo.toml").is_file()
+                    || excluded.iter().any(|it| path.starts_with(it))
+                {
                     continue;
                 }
                 let path = canonical(&path)?;
@@ -1198,7 +1267,12 @@ impl Workspace {
         if let Some(deps) = section.get("dependencies").and_then(toml::Value::as_table) {
             tables.push(deps);
         }
-        for patches in table.get("patch").and_then(toml::Value::as_table).into_iter().flat_map(|it| it.values()) {
+        for patches in table
+            .get("patch")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|it| it.values())
+        {
             if let Some(patches) = patches.as_table() {
                 tables.push(patches);
             }
@@ -1224,7 +1298,9 @@ impl Workspace {
             let manifest_path = dir.join("Cargo.toml");
             let manifest = read_toml(&manifest_path, &mut stamps)?;
             let workspace = workspace_of(&dir, &mut workspaces, &mut stamps)?;
-            let inherited = workspace.as_ref().map(|path| (path.parent().unwrap_or(Path::new("")), &workspaces[path]));
+            let inherited = workspace
+                .as_ref()
+                .map(|path| (path.parent().unwrap_or(Path::new("")), &workspaces[path]));
             for (_, deps) in dependency_tables(&manifest) {
                 for (key, value) in deps {
                     if let Some(path) = dependency_path(&dir, key, value, inherited) {
@@ -1232,7 +1308,9 @@ impl Workspace {
                     }
                 }
             }
-            let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else { continue };
+            let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
+                continue;
+            };
             let name = package
                 .get("name")
                 .and_then(toml::Value::as_str)
@@ -1241,14 +1319,21 @@ impl Workspace {
             let version = match package.get("version") {
                 None => "0.0.0".to_owned(),
                 Some(version) if inherits(version) => inherited
-                    .and_then(|(_, table)| table.get("workspace")?.get("package")?.get("version")?.as_str())
+                    .and_then(|(_, table)| {
+                        table.get("workspace")?.get("package")?.get("version")?.as_str()
+                    })
                     .ok_or_else(|| {
-                        format!("{} inherits its version from a workspace that sets none", manifest_path.display())
+                        format!(
+                            "{} inherits its version from a workspace that sets none",
+                            manifest_path.display()
+                        )
                     })?
                     .to_owned(),
                 Some(version) => version
                     .as_str()
-                    .ok_or_else(|| format!("the version in {} is no string", manifest_path.display()))?
+                    .ok_or_else(|| {
+                        format!("the version in {} is no string", manifest_path.display())
+                    })?
                     .to_owned(),
             };
             locals.push(Local { name, version, dir, manifest, workspace });
@@ -1259,8 +1344,11 @@ impl Workspace {
 
     /// The package of the checkout the lock's path package `locked` is.
     fn local(&self, locked: &Locked) -> Result<&Local, String> {
-        let found: Vec<&Local> =
-            self.locals.iter().filter(|it| it.name == locked.name && it.version == locked.version).collect();
+        let found: Vec<&Local> = self
+            .locals
+            .iter()
+            .filter(|it| it.name == locked.name && it.version == locked.version)
+            .collect();
         match found[..] {
             [one] => Ok(one),
             [] => Err(format!(
@@ -1285,7 +1373,8 @@ impl Workspace {
         let mut parts = entry.split_whitespace();
         let name = parts.next().unwrap_or("");
         let version = parts.next();
-        let source = parts.next().and_then(|it| it.strip_prefix('(')).and_then(|it| it.strip_suffix(')'));
+        let source =
+            parts.next().and_then(|it| it.strip_prefix('(')).and_then(|it| it.strip_suffix(')'));
         let found: Vec<usize> = (0..self.lock.len())
             .filter(|at| {
                 let it = &self.lock[*at];
@@ -1318,7 +1407,9 @@ impl Workspace {
                 let mut names = BTreeSet::new();
                 for (built, deps) in dependency_tables(&local.manifest) {
                     if built {
-                        names.extend(deps.iter().map(|(key, value)| dependency_name(key, value, workspace)));
+                        names.extend(
+                            deps.iter().map(|(key, value)| dependency_name(key, value, workspace)),
+                        );
                     }
                 }
                 Some(names)
@@ -1363,16 +1454,27 @@ impl Workspace {
 
     /// The packages the program is built from, itself among them, by name.
     pub fn linked_names(&self) -> Result<BTreeSet<String>, String> {
-        Ok(self.reach(&[self.program_at()?])?.into_iter().map(|at| self.lock[at].name.clone()).collect())
+        Ok(self
+            .reach(&[self.program_at()?])?
+            .into_iter()
+            .map(|at| self.lock[at].name.clone())
+            .collect())
     }
 
     /// The packages the package of the checkout `name` is built from, itself among them, by name.
     pub fn built_from_names(&self, name: &str) -> Result<BTreeSet<String>, String> {
-        let found: Vec<usize> =
-            (0..self.lock.len()).filter(|at| self.lock[*at].source.is_none() && self.lock[*at].name == name).collect();
+        let found: Vec<usize> = (0..self.lock.len())
+            .filter(|at| self.lock[*at].source.is_none() && self.lock[*at].name == name)
+            .collect();
         match found[..] {
-            [one] => Ok(self.reach(&[one])?.into_iter().map(|at| self.lock[at].name.clone()).collect()),
-            _ => Err(format!("{} packages of the checkout in {} are named `{name}`, not one", found.len(), self.lock_path.display())),
+            [one] => {
+                Ok(self.reach(&[one])?.into_iter().map(|at| self.lock[at].name.clone()).collect())
+            }
+            _ => Err(format!(
+                "{} packages of the checkout in {} are named `{name}`, not one",
+                found.len(),
+                self.lock_path.display()
+            )),
         }
     }
 
@@ -1380,7 +1482,13 @@ impl Workspace {
     fn program_at(&self) -> Result<usize, String> {
         (0..self.lock.len())
             .find(|at| self.lock[*at].source.is_none() && self.lock[*at].name == self.program)
-            .ok_or_else(|| format!("the program `{}` is no package of {}", self.program, self.lock_path.display()))
+            .ok_or_else(|| {
+                format!(
+                    "the program `{}` is no package of {}",
+                    self.program,
+                    self.lock_path.display()
+                )
+            })
     }
 
     /// The packages of the checkout, by name, with their directories.
@@ -1420,13 +1528,16 @@ impl Workspace {
             name == package || name.strip_prefix("blaze-") == Some(package)
         };
         // Two names of one package: `ui` and `blaze-ui`, as `named` reads a lock's.
-        let same = |a: &str, b: &str| a == b || a.strip_prefix("blaze-") == Some(b) || b.strip_prefix("blaze-") == Some(a);
+        let same = |a: &str, b: &str| {
+            a == b || a.strip_prefix("blaze-") == Some(b) || b.strip_prefix("blaze-") == Some(a)
+        };
         let mut cut = BTreeSet::new();
         for it in identity.cut {
             if identity.roots.iter().any(|root| same(root.package, it.package)) {
                 return Err(format!("{} both roots and cuts `{}`", identity.what, it.package));
             }
-            let found: Vec<usize> = linked.iter().copied().filter(|at| named(*at, it.package)).collect();
+            let found: Vec<usize> =
+                linked.iter().copied().filter(|at| named(*at, it.package)).collect();
             if found.is_empty() {
                 return Err(format!(
                     "{} cuts `{}` from its closure, and the program `{}` does not link it: drop the cut",
@@ -1437,7 +1548,8 @@ impl Workspace {
         }
         let mut roots = Vec::new();
         for root in identity.roots {
-            let found: Vec<usize> = linked.iter().copied().filter(|at| named(*at, root.package)).collect();
+            let found: Vec<usize> =
+                linked.iter().copied().filter(|at| named(*at, root.package)).collect();
             match found[..] {
                 [] if root.package == identity.required => {
                     return Err(format!(
@@ -1447,7 +1559,14 @@ impl Workspace {
                 }
                 [] => {}
                 [one] => roots.push(one),
-                _ => return Err(format!("the program `{}` links {} packages named `{}`", self.program, found.len(), root.package)),
+                _ => {
+                    return Err(format!(
+                        "the program `{}` links {} packages named `{}`",
+                        self.program,
+                        found.len(),
+                        root.package
+                    ));
+                }
             }
         }
         let closure = self.reach_past(&roots, &cut)?;
@@ -1458,7 +1577,10 @@ impl Workspace {
         for &at in closure.iter().filter(|at| !roots.contains(at)) {
             for dep in self.built_from(at)? {
                 if cut.contains(&dep) {
-                    reached.entry(self.lock[dep].name.as_str()).or_default().insert(self.lock[at].name.as_str());
+                    reached
+                        .entry(self.lock[dep].name.as_str())
+                        .or_default()
+                        .insert(self.lock[at].name.as_str());
                 }
             }
         }
@@ -1504,10 +1626,16 @@ fn workspace_of(
 fn locked(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec<Locked>, String> {
     let table = read_toml(path, stamps)?;
     let mut out = Vec::new();
-    for package in table.get("package").and_then(toml::Value::as_array).ok_or_else(|| format!("{} lists no `[[package]]`", path.display()))? {
+    for package in table
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("{} lists no `[[package]]`", path.display()))?
+    {
         let field = |name: &str| package.get(name).and_then(toml::Value::as_str).map(str::to_owned);
-        let name = field("name").ok_or_else(|| format!("a package of {} has no name", path.display()))?;
-        let version = field("version").ok_or_else(|| format!("{name} in {} has no version", path.display()))?;
+        let name =
+            field("name").ok_or_else(|| format!("a package of {} has no name", path.display()))?;
+        let version = field("version")
+            .ok_or_else(|| format!("{name} in {} has no version", path.display()))?;
         let dependencies = package
             .get("dependencies")
             .and_then(toml::Value::as_array)
@@ -1516,7 +1644,13 @@ fn locked(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec<Lock
             .filter_map(toml::Value::as_str)
             .map(str::to_owned)
             .collect();
-        out.push(Locked { name, version, source: field("source"), checksum: field("checksum"), dependencies });
+        out.push(Locked {
+            name,
+            version,
+            source: field("source"),
+            checksum: field("checksum"),
+            dependencies,
+        });
     }
     Ok(out)
 }
@@ -1543,7 +1677,11 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
 
 /// `identity` of `workspace`'s program, built in `env` (which is read only when
 /// `identity.how_built`).
-pub fn work_out_of(workspace: &Workspace, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+pub fn work_out_of(
+    workspace: &Workspace,
+    identity: &Identity,
+    env: &BuildEnv,
+) -> Result<Worked, String> {
     Walk::default().work_out(workspace, identity, env)
 }
 
@@ -1580,14 +1718,24 @@ impl Walk {
                 hasher.update(&(bytes.len() as u64).to_le_bytes()).update(&bytes);
                 files.push(path);
             }
-            let hashed = Hashed { digest: *hasher.finalize().as_bytes(), files, watch: listed.watch, stamps };
+            let hashed = Hashed {
+                digest: *hasher.finalize().as_bytes(),
+                files,
+                watch: listed.watch,
+                stamps,
+            };
             self.hashed.insert(local.dir.clone(), hashed);
         }
         Ok(&self.hashed[&local.dir])
     }
 
     /// [`work_out_of`], reading each package of the checkout this walk has not yet.
-    pub fn work_out(&mut self, workspace: &Workspace, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+    pub fn work_out(
+        &mut self,
+        workspace: &Workspace,
+        identity: &Identity,
+        env: &BuildEnv,
+    ) -> Result<Worked, String> {
         let (tree, seen) = self.tree(workspace, identity)?;
         finish(identity, &tree, env, seen)
     }
@@ -1604,7 +1752,9 @@ impl Walk {
 
         // 1. The packages, by name, version and source.
         let mut chosen: Vec<&Locked> = closure.iter().map(|at| &workspace.lock[*at]).collect();
-        chosen.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
+        chosen.sort_by(|a, b| {
+            (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source))
+        });
         for package in chosen {
             links_llvm |= package.name == LLVM_PACKAGE;
             seen.packages.insert(package.name.clone());
@@ -1660,7 +1810,11 @@ impl Walk {
                 match package.source {
                     Some(_) => {
                         let digest = registry_digest(workspace, package)?;
-                        inputs.push(Input { kind: "dependent", name: locked_name(package), digest });
+                        inputs.push(Input {
+                            kind: "dependent",
+                            name: locked_name(package),
+                            digest,
+                        });
                     }
                     None => {
                         let local = workspace.local(package)?;
@@ -1679,7 +1833,11 @@ impl Walk {
             }
             for path in manifests {
                 let bytes = read_stamped(&path, &mut seen.stamps)?;
-                inputs.push(Input { kind: "manifest", name: relative_name(&path, root), digest: digest_of("manifest", &[&bytes]) });
+                inputs.push(Input {
+                    kind: "manifest",
+                    name: relative_name(&path, root),
+                    digest: digest_of("manifest", &[&bytes]),
+                });
                 seen.files.insert(path);
             }
         }
@@ -1697,10 +1855,15 @@ impl Walk {
                 .transpose()?
                 .ok_or_else(|| format!("`{reader}`, which reads {extra}, is no package of the checkout in the closure"))?;
             let path = local.dir.join(extra);
-            let path = canonical(&path).map_err(|why| format!("{extra}, which `{reader}` reads: {why}"))?;
+            let path = canonical(&path)
+                .map_err(|why| format!("{extra}, which `{reader}` reads: {why}"))?;
             for file in extra_files(&path, &mut seen.stamps)? {
                 let bytes = read_stamped(&file, &mut seen.stamps)?;
-                inputs.push(Input { kind: "file", name: relative_name(&file, root), digest: digest_of("file", &[&bytes]) });
+                inputs.push(Input {
+                    kind: "file",
+                    name: relative_name(&file, root),
+                    digest: digest_of("file", &[&bytes]),
+                });
                 seen.files.insert(file);
             }
             if path.is_dir() {
@@ -1715,9 +1878,10 @@ impl Walk {
             .find(|it| identity.how_built && it.source.is_none() && it.name == STENCIL_PACKAGE);
         if let Some(stencils) = stencils {
             let path = workspace.local(stencils)?.dir.join(stencil_pin::PIN_FILE);
-            let text =
-                String::from_utf8(read_stamped(&path, &mut seen.stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-            let pinned = stencil_pin::pin_parse(&text).map_err(|why| format!("the stencil libraries' pin {}: {why}", path.display()))?;
+            let text = String::from_utf8(read_stamped(&path, &mut seen.stamps)?)
+                .map_err(|_| format!("{} is not UTF-8", path.display()))?;
+            let pinned = stencil_pin::pin_parse(&text)
+                .map_err(|why| format!("the stencil libraries' pin {}: {why}", path.display()))?;
             for (name, id) in pinned {
                 inputs.push(Input { kind: "stencils", name, digest: id });
             }
@@ -1766,7 +1930,10 @@ impl Tree {
         let mut out = format!("{SHIPPED_HEADER}\ndomain\t{}\n", self.domain);
         for input in &self.inputs {
             if input.name.contains(['\t', '\n']) {
-                return Err(format!("the input `{}` has a tab or a line break in its name, which a shipped tree can't hold", input.name));
+                return Err(format!(
+                    "the input `{}` has a tab or a line break in its name, which a shipped tree can't hold",
+                    input.name
+                ));
             }
             out.push_str(&format!("{}\t{}\t{}\n", input.kind, input.name, hex(&input.digest)));
         }
@@ -1778,20 +1945,29 @@ impl Tree {
 
     /// A shipped tree of `identity`, read from `from` (named in every error).
     pub fn parse(text: &str, identity: &Identity, from: &Path) -> Result<Tree, String> {
-        let refused = |line: usize, why: String| format!("{}, line {}: {why}", from.display(), line + 1);
+        let refused =
+            |line: usize, why: String| format!("{}, line {}: {why}", from.display(), line + 1);
         let mut lines = text.lines().enumerate();
         match lines.next() {
             Some((_, SHIPPED_HEADER)) => {}
             other => {
-                return Err(refused(0, format!("starts `{}`, not `{SHIPPED_HEADER}`", other.map_or("", |(_, it)| it))));
+                return Err(refused(
+                    0,
+                    format!("starts `{}`, not `{SHIPPED_HEADER}`", other.map_or("", |(_, it)| it)),
+                ));
             }
         }
         let domain = match lines.next() {
-            Some((_, line)) if line.strip_prefix("domain\t") == Some(identity.domain) => identity.domain.to_owned(),
+            Some((_, line)) if line.strip_prefix("domain\t") == Some(identity.domain) => {
+                identity.domain.to_owned()
+            }
             Some((at, line)) => {
                 return Err(refused(
                     at,
-                    format!("`{line}` names another identity or formula than {}'s `{}`", identity.what, identity.domain),
+                    format!(
+                        "`{line}` names another identity or formula than {}'s `{}`",
+                        identity.what, identity.domain
+                    ),
                 ));
             }
             None => return Err(refused(1, "it ends before its domain".to_owned())),
@@ -1802,17 +1978,21 @@ impl Tree {
             let fields: Vec<&str> = line.split('\t').collect();
             match fields[..] {
                 ["llvm-pin", text] if llvm_pin.is_none() => {
-                    let bytes = unhex(text).ok_or_else(|| refused(at, "the LLVM pin is not hex".to_owned()))?;
-                    llvm_pin = Some(String::from_utf8(bytes).map_err(|_| refused(at, "the LLVM pin is not UTF-8".to_owned()))?);
+                    let bytes = unhex(text)
+                        .ok_or_else(|| refused(at, "the LLVM pin is not hex".to_owned()))?;
+                    llvm_pin = Some(
+                        String::from_utf8(bytes)
+                            .map_err(|_| refused(at, "the LLVM pin is not UTF-8".to_owned()))?,
+                    );
                 }
                 [kind, name, digest] => {
-                    let kind = TREE_KINDS
-                        .into_iter()
-                        .find(|it| *it == kind)
-                        .ok_or_else(|| refused(at, format!("`{kind}` is no kind of input a tree holds")))?;
-                    let digest: [u8; 32] = unhex(digest)
-                        .and_then(|it| it.try_into().ok())
-                        .ok_or_else(|| refused(at, format!("the digest of `{name}` is not 64 hex digits")))?;
+                    let kind = TREE_KINDS.into_iter().find(|it| *it == kind).ok_or_else(|| {
+                        refused(at, format!("`{kind}` is no kind of input a tree holds"))
+                    })?;
+                    let digest: [u8; 32] =
+                        unhex(digest).and_then(|it| it.try_into().ok()).ok_or_else(|| {
+                            refused(at, format!("the digest of `{name}` is not 64 hex digits"))
+                        })?;
                     inputs.push(Input { kind, name: name.to_owned(), digest });
                 }
                 _ => return Err(refused(at, format!("`{line}` is no input of a shipped tree"))),
@@ -1851,10 +2031,15 @@ struct Seen {
 
 /// `identity` of a package cut from a checkout, from the tree the checkout shipped with it
 /// (`shipped`, [`Identity::shipped`]), built in `env`.
-pub fn work_out_shipped(shipped: &Path, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+pub fn work_out_shipped(
+    shipped: &Path,
+    identity: &Identity,
+    env: &BuildEnv,
+) -> Result<Worked, String> {
     let mut seen = Seen::default();
     let bytes = read_stamped(shipped, &mut seen.stamps)?;
-    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", shipped.display()))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", shipped.display()))?;
     let tree = Tree::parse(&text, identity, shipped)?;
     seen.files.insert(shipped.to_path_buf());
     finish(identity, &tree, env, seen)
@@ -1883,7 +2068,10 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
     // 2. `$CARGO_HOME`'s configuration, after the checkout's (one already read as the checkout's
     // is not read twice).
     if identity.how_built {
-        let at = inputs.iter().position(|it| matches!(it.kind, "file" | "stencils")).unwrap_or(inputs.len());
+        let at = inputs
+            .iter()
+            .position(|it| matches!(it.kind, "file" | "stencils"))
+            .unwrap_or(inputs.len());
         let mut configs = Vec::new();
         for config in ["config.toml", "config"] {
             if let Some(path) = env.cargo_home.as_ref().map(|it| it.join(config))
@@ -1891,7 +2079,11 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
                 && !files.contains(&path)
             {
                 let bytes = read_stamped(&path, &mut stamps)?;
-                configs.push(Input { kind: "manifest", name: format!("$CARGO_HOME/{config}"), digest: digest_of("manifest", &[&bytes]) });
+                configs.push(Input {
+                    kind: "manifest",
+                    name: format!("$CARGO_HOME/{config}"),
+                    digest: digest_of("manifest", &[&bytes]),
+                });
                 files.insert(path);
             }
         }
@@ -1901,13 +2093,19 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
 
     // 5. LLVM: the pin, and the prefix checked to be it; none in the seed, which links no LLVM
     // and makes no stencils with it.
-    let mut rerun_env: Vec<String> =
-        if identity.how_built { READ_ENV.iter().map(|it| (*it).to_owned()).collect() } else { Vec::new() };
+    let mut rerun_env: Vec<String> = if identity.how_built {
+        READ_ENV.iter().map(|it| (*it).to_owned()).collect()
+    } else {
+        Vec::new()
+    };
     let mut llvm_prefix = None;
     if let Some(json) = tree.llvm_pin.as_deref().filter(|_| identity.how_built && !seed) {
         rerun_env.push(LLVM_PREFIX.to_owned());
-        let from = llvm_pin_path.as_ref().map_or_else(|| "the shipped tree's".to_owned(), |it| it.display().to_string());
-        let pinned = pin::Pin::parse(json).map_err(|why| format!("blaze's LLVM pin `{from}` can't be read: {why}"))?;
+        let from = llvm_pin_path
+            .as_ref()
+            .map_or_else(|| "the shipped tree's".to_owned(), |it| it.display().to_string());
+        let pinned = pin::Pin::parse(json)
+            .map_err(|why| format!("blaze's LLVM pin `{from}` can't be read: {why}"))?;
         if let Some(path) = llvm_pin_path {
             files.insert(path);
         }
@@ -1919,18 +2117,31 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
             built_for.insert(tuple);
         }
         for tuple in built_for {
-            let sha = pin::pin_sha256(json, &tuple).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
+            let sha =
+                pin::pin_sha256(json, &tuple).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
             let released = sha.as_deref().map_or(&b"none"[..], str::as_bytes);
-            let digest = digest_of("llvm pin", &[pinned.version.as_bytes(), pinned.commit.as_bytes(), tuple.as_bytes(), released]);
+            let digest = digest_of(
+                "llvm pin",
+                &[pinned.version.as_bytes(), pinned.commit.as_bytes(), tuple.as_bytes(), released],
+            );
             inputs.push(Input { kind: "llvm", name: format!("pin {tuple}"), digest });
         }
         if let Some(prefix) = env.llvm_prefix.as_deref() {
-            pin::pin_check(&pinned, Some(std::ffi::OsStr::new(prefix)), std::env::consts::EXE_SUFFIX)
-                .map_err(|found| pinned.refusal(&found))?;
-            let prefix = canonical(Path::new(prefix)).map_err(|why| format!("${LLVM_PREFIX}: {why}"))?;
+            pin::pin_check(
+                &pinned,
+                Some(std::ffi::OsStr::new(prefix)),
+                std::env::consts::EXE_SUFFIX,
+            )
+            .map_err(|found| pinned.refusal(&found))?;
+            let prefix =
+                canonical(Path::new(prefix)).map_err(|why| format!("${LLVM_PREFIX}: {why}"))?;
             let marker = prefix.join(pin::PIN_MARKER);
             let bytes = read_stamped(&marker, &mut stamps)?;
-            inputs.push(Input { kind: "llvm", name: pin::PIN_MARKER.to_owned(), digest: digest_of("llvm marker", &[&bytes]) });
+            inputs.push(Input {
+                kind: "llvm",
+                name: pin::PIN_MARKER.to_owned(),
+                digest: digest_of("llvm marker", &[&bytes]),
+            });
             files.insert(marker);
             llvm_prefix = Some(prefix);
         }
@@ -1954,11 +2165,17 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
         rerun_env.push(name.clone());
     }
     if let Some(compiler) = &env.compiler {
-        inputs.push(Input { kind: "compiler", name: "rustc -vV".to_owned(), digest: digest_of("compiler", &[compiler.as_bytes()]) });
+        inputs.push(Input {
+            kind: "compiler",
+            name: "rustc -vV".to_owned(),
+            digest: digest_of("compiler", &[compiler.as_bytes()]),
+        });
     }
 
     let past_packages = files.difference(&package_files);
-    watched.extend(past_packages.filter(|file| !extra_dirs.iter().any(|dir| file.starts_with(dir))).cloned());
+    watched.extend(
+        past_packages.filter(|file| !extra_dirs.iter().any(|dir| file.starts_with(dir))).cloned(),
+    );
     watched.extend(extra_dirs);
     watched.sort();
     watched.dedup();
@@ -2005,7 +2222,12 @@ pub fn ship(workspace: &Workspace, identity: &Identity) -> Result<String, String
 
 /// A package of the lock as an input names it: name, version and source.
 fn locked_name(package: &Locked) -> String {
-    format!("{} {} {}", package.name, package.version, package.source.as_deref().unwrap_or("checkout"))
+    format!(
+        "{} {} {}",
+        package.name,
+        package.version,
+        package.source.as_deref().unwrap_or("checkout")
+    )
 }
 
 /// The digest of `package`, a package of the lock from outside the checkout: a registry package
@@ -2015,7 +2237,10 @@ fn registry_digest(workspace: &Workspace, package: &Locked) -> Result<[u8; 32], 
     match package.source.as_deref() {
         Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
             let checksum = package.checksum.as_deref().ok_or_else(|| {
-                format!("{name} has no checksum in {}: a registry package is an input by its checksum", workspace.lock_path.display())
+                format!(
+                    "{name} has no checksum in {}: a registry package is an input by its checksum",
+                    workspace.lock_path.display()
+                )
             })?;
             Ok(digest_of("package registry", &[checksum.as_bytes()]))
         }
@@ -2032,7 +2257,11 @@ fn registry_digest(workspace: &Workspace, package: &Locked) -> Result<[u8; 32], 
 
 /// Where the pin llvm-sys checks LLVM against is, as pin.rs reads it from llvm-sys's directory,
 /// and its text, checked to be a pin.
-fn llvm_pin(workspace: &Workspace, closure: &BTreeSet<usize>, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<(PathBuf, String), String> {
+fn llvm_pin(
+    workspace: &Workspace,
+    closure: &BTreeSet<usize>,
+    stamps: &mut BTreeMap<PathBuf, Stamp>,
+) -> Result<(PathBuf, String), String> {
     let sys = closure
         .iter()
         .map(|at| &workspace.lock[*at])
@@ -2046,8 +2275,10 @@ fn llvm_pin(workspace: &Workspace, closure: &BTreeSet<usize>, stamps: &mut BTree
     }
     let path = workspace.local(sys)?.dir.join(pin::PIN_JSON);
     let path = canonical(&path).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
-    let json = String::from_utf8(read_stamped(&path, stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-    pin::Pin::parse(&json).map_err(|why| format!("blaze's LLVM pin `{}` can't be read: {why}", path.display()))?;
+    let json = String::from_utf8(read_stamped(&path, stamps)?)
+        .map_err(|_| format!("{} is not UTF-8", path.display()))?;
+    pin::Pin::parse(&json)
+        .map_err(|why| format!("blaze's LLVM pin `{}` can't be read: {why}", path.display()))?;
     Ok((path, json))
 }
 
@@ -2066,7 +2297,9 @@ fn lib_name(local: &Local) -> String {
 /// them; the default ones (`src/`, `build.rs`) are never below `tests`, `benches` or `examples`.
 fn built_dirs(local: &Local) -> Vec<PathBuf> {
     let mut paths: Vec<&str> = Vec::new();
-    if let Some(path) = local.manifest.get("lib").and_then(|it| it.get("path")).and_then(toml::Value::as_str) {
+    if let Some(path) =
+        local.manifest.get("lib").and_then(|it| it.get("path")).and_then(toml::Value::as_str)
+    {
         paths.push(path);
     }
     for bin in local.manifest.get("bin").and_then(toml::Value::as_array).into_iter().flatten() {
@@ -2074,7 +2307,9 @@ fn built_dirs(local: &Local) -> Vec<PathBuf> {
             paths.push(path);
         }
     }
-    if let Some(path) = local.manifest.get("package").and_then(|it| it.get("build")).and_then(toml::Value::as_str) {
+    if let Some(path) =
+        local.manifest.get("package").and_then(|it| it.get("build")).and_then(toml::Value::as_str)
+    {
         paths.push(path);
     }
     paths.into_iter().filter_map(|it| local.dir.join(it).parent().map(Path::to_path_buf)).collect()
@@ -2129,7 +2364,8 @@ fn extra_files(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         stamps.entry(dir.clone()).or_insert(stamp(&dir)?);
-        let entries = std::fs::read_dir(&dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
         for entry in entries {
             let entry = entry.map_err(|why| format!("listing {}: {why}", dir.display()))?;
             if entry.file_name().to_string_lossy().starts_with('.') {
@@ -2138,9 +2374,13 @@ fn extra_files(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec
             let path = entry.path();
             let kind = entry.file_type().map_err(|why| format!("{}: {why}", path.display()))?;
             if kind.is_symlink() {
-                let meta = std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
+                let meta =
+                    std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
                 if meta.is_dir() {
-                    return Err(format!("{} is a link to a directory: its files are not hashed", path.display()));
+                    return Err(format!(
+                        "{} is a link to a directory: its files are not hashed",
+                        path.display()
+                    ));
                 }
                 out.push(path);
             } else if kind.is_dir() {
@@ -2197,7 +2437,8 @@ fn walk(
     files: &mut Vec<(String, PathBuf)>,
 ) -> Result<Walked, String> {
     stamps.entry(dir.to_path_buf()).or_insert(stamp(dir)?);
-    let entries = std::fs::read_dir(dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
     let at_root = dir == local.dir;
     let mut whole = true;
     let mut parts = Vec::new();
@@ -2212,7 +2453,8 @@ fn walk(
         let path = entry.path();
         let kind = entry.file_type().map_err(|why| format!("{}: {why}", path.display()))?;
         if kind.is_symlink() {
-            let meta = std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
+            let meta =
+                std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
             if meta.is_dir() {
                 return Err(format!(
                     "{} of package {} is a link to a directory: its files are not hashed",
@@ -2223,7 +2465,8 @@ fn walk(
         } else if kind.is_dir() {
             let skipped = at_root
                 && (name == "target"
-                    || (matches!(&*name, "tests" | "benches" | "examples") && !built.iter().any(|it| it.starts_with(&path))));
+                    || (matches!(&*name, "tests" | "benches" | "examples")
+                        && !built.iter().any(|it| it.starts_with(&path))));
             if skipped {
                 whole = false;
                 continue;
@@ -2237,7 +2480,9 @@ fn walk(
             }
             continue;
         }
-        let relative = path.strip_prefix(&local.dir).map_err(|_| format!("{} is outside its package", path.display()))?;
+        let relative = path
+            .strip_prefix(&local.dir)
+            .map_err(|_| format!("{} is outside its package", path.display()))?;
         files.push((slashed(relative), path.clone()));
         parts.push(path);
     }

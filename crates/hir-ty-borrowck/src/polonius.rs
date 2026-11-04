@@ -4,8 +4,8 @@
 //! live, forwards for a covariant one, backwards for a contravariant one and both ways for an
 //! invariant one. A loan is in scope until the first point it is not live at.
 
-use hir_ty::db::HirDatabase;
 use blaze_ids::radix;
+use hir_ty::db::HirDatabase;
 use rustc_type_ir::{Variance, inherent::IntoKind};
 
 use hir_ty::{

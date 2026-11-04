@@ -273,7 +273,8 @@ fn pass_two<'t, 'u>(t: &Tab2<'t, 'u>) {
 }
 "#;
 
-const CVE_RS: &str = concat!("//- minicore: sized, copy, option\n", include_str!("cve_rs_fixture.rs"));
+const CVE_RS: &str =
+    concat!("//- minicore: sized, copy, option\n", include_str!("cve_rs_fixture.rs"));
 
 fn function(db: &Db, name: &str) -> FunctionId {
     for &krate in all_crates(db).iter() {
@@ -351,12 +352,10 @@ fn the_error_names_the_function_the_target_the_bound_and_the_rustc_issue() {
         let messages: Vec<&str> = result.diagnostics.iter().map(|it| it.message.as_str()).collect(); // alloc: a test's list
         assert_eq!(
             messages,
-            [
-                "`helper` coerced to `for<'x> fn(&&(), &T) -> &'b T` loses the bound `'b: 'a` its \
+            ["`helper` coerced to `for<'x> fn(&&(), &T) -> &'b T` loses the bound `'b: 'a` its \
                  signature implies, which no call of the fn pointer proves: rustc accepts this \
                  through its soundness hole rust-lang/rust#25860 \
-                 (https://github.com/rust-lang/rust/issues/25860), blaze refuses it"
-            ]
+                 (https://github.com/rust-lang/rust/issues/25860), blaze refuses it"]
         );
     }
 }

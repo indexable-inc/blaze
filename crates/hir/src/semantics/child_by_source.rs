@@ -164,12 +164,7 @@ impl ChildBySource for ItemScope {
                 res[keys::MACRO_CALL].insert(ast, call);
             },
         );
-        fn add_module_def(
-            db: &Db,
-            map: &mut DynMap,
-            file_id: HirFileId,
-            item: ModuleDefId,
-        ) {
+        fn add_module_def(db: &Db, map: &mut DynMap, file_id: HirFileId, item: ModuleDefId) {
             match item {
                 ModuleDefId::FunctionId(id) => {
                     insert_item_loc(db, map, file_id, id, keys::FUNCTION)
@@ -342,12 +337,7 @@ fn insert_item_loc<ID, N, Data>(
     }
 }
 
-fn add_assoc_item(
-    db: &Db,
-    res: &mut DynMap,
-    file_id: HirFileId,
-    item: AssocItemId,
-) {
+fn add_assoc_item(db: &Db, res: &mut DynMap, file_id: HirFileId, item: AssocItemId) {
     match item {
         AssocItemId::FunctionId(func) => insert_item_loc(db, res, file_id, func, keys::FUNCTION),
         AssocItemId::ConstId(konst) => insert_item_loc(db, res, file_id, konst, keys::CONST),

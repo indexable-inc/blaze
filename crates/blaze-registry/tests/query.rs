@@ -7,7 +7,6 @@
 use std::{path::PathBuf, pin::pin, sync::Arc, task::Poll};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_registry::{
     Context, IndexRegistry, SourceConfig, SourceDef, Sources,
     http::{Http, Response},
@@ -17,6 +16,7 @@ use blaze_resolve::{
     block_on,
 };
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 

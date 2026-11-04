@@ -47,7 +47,8 @@ fn run(pieces: usize, polls: usize) {
             // caller reads every output as soon as `wait` returns (Sam
             // Shackleton's control, October 24: a return before the
             // outputs are visible is the bug a weaker ordering allows).
-            let outputs: Arc<Vec<AtomicUsize>> = Arc::new((0..pieces).map(|_| AtomicUsize::new(0)).collect());
+            let outputs: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..pieces).map(|_| AtomicUsize::new(0)).collect());
             let workers: Vec<_> = (0..pieces)
                 .map(|i| {
                     let (f, out) = (finish.clone(), outputs.clone());
@@ -64,7 +65,11 @@ fn run(pieces: usize, polls: usize) {
                 left > 0
             });
             for (i, out) in outputs.iter().enumerate() {
-                assert_eq!(out.load(Ordering::Relaxed), 1, "wait returned without worker {i}'s output published");
+                assert_eq!(
+                    out.load(Ordering::Relaxed),
+                    1,
+                    "wait returned without worker {i}'s output published"
+                );
             }
             assert_eq!(finish.finished_count(), pieces);
             for w in workers {

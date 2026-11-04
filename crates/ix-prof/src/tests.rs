@@ -90,13 +90,28 @@ fn recorded(tc: &TestCase) -> (Recorder, u64) {
             2 | 3 => {
                 samples += 1;
                 let span_id = r.innermost(thread);
-                r.cpu_sample(RawSample { thread, t_ns: t, pcs: pcs(tc), span_id, on_cpu: true, weight_ns: 1000 });
+                r.cpu_sample(RawSample {
+                    thread,
+                    t_ns: t,
+                    pcs: pcs(tc),
+                    span_id,
+                    on_cpu: true,
+                    weight_ns: 1000,
+                });
             }
             4 => {
                 let address = 0x1000 + next * 64;
                 next += 1;
                 addresses.push(address);
-                r.alloc(RawAlloc { thread, t_ns: t, address, bytes: 64, count: 1, pcs: pcs(tc), span_id: None });
+                r.alloc(RawAlloc {
+                    thread,
+                    t_ns: t,
+                    address,
+                    bytes: 64,
+                    count: 1,
+                    pcs: pcs(tc),
+                    span_id: None,
+                });
             }
             _ => {
                 if let Some(a) = addresses.pop() {
@@ -119,7 +134,11 @@ fn an_ixprof_reads_back_as_the_profile_written_and_writes_the_same_bytes(tc: Tes
     let mut want = p.clone();
     want.canonicalize();
     assert_eq!(back, want);
-    assert_eq!(back.to_ixprof().expect("rewrites"), bytes, "read and written again, the same bytes");
+    assert_eq!(
+        back.to_ixprof().expect("rewrites"),
+        bytes,
+        "read and written again, the same bytes"
+    );
     // Aggregation: every sample is counted once, and top's flat column adds up to the total.
     let cpu = View::of(&back, Kind::Cpu);
     let count = cpu.type_index(Some("samples")).expect("a samples type");
@@ -157,7 +176,8 @@ fn a_view_reads_back_from_pprof_as_written(tc: TestCase) {
         duration_nanos: 1_000,
     };
     for _ in 0..samples {
-        let stack: Vec<u32> = tc.draw(gs::vecs(gs::integers::<u32>().max_value(n as u32 - 1)).min_size(1).max_size(6));
+        let stack: Vec<u32> = tc
+            .draw(gs::vecs(gs::integers::<u32>().max_value(n as u32 - 1)).min_size(1).max_size(6));
         let v = i64::from(tc.draw(gs::integers::<u32>().max_value(1 << 20)));
         let labels = if tc.draw(gs::booleans()) {
             vec![("thread".to_owned(), crate::view::LabelValue::Str("main".to_owned()))]
@@ -181,7 +201,11 @@ fn a_stack_that_repeats_a_frame_reads_back_from_pprof_with_both() {
         default_type: 0,
         period: None,
         frames: vec![Frame::named("fn_0".to_owned(), FrameKind::Span)],
-        samples: vec![crate::view::Sample { stack: vec![0, 0], values: vec![1], labels: Vec::new() }],
+        samples: vec![crate::view::Sample {
+            stack: vec![0, 0],
+            values: vec![1],
+            labels: Vec::new(),
+        }],
         time_nanos: 5,
         duration_nanos: 1_000,
     };
@@ -196,11 +220,16 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new(what: &str) -> TempDir {
-        let dir = std::env::temp_dir().join(format!("ix-prof-{what}-{}-{}", std::process::id(), crate::nonce()));
+        let dir = std::env::temp_dir().join(format!(
+            "ix-prof-{what}-{}-{}",
+            std::process::id(),
+            crate::nonce()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         // ix-prof refuses a directory open to group or other.
         #[cfg(unix)]
-        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
         TempDir(dir)
     }
 }
@@ -232,9 +261,16 @@ fn a_start_that_fails_leaves_nothing_running_and_the_next_start_works() {
         let dir = TempDir::new("start-fails");
         std::fs::create_dir_all(dir.0.join(crate::endpoint::FILE).join("in-the-way")).unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let failed = crate::start(crate::Config { http: Some(port.to_string()), dir: Some(dir.0.clone()), ..quiet_config() });
+        let failed = crate::start(crate::Config {
+            http: Some(port.to_string()),
+            dir: Some(dir.0.clone()),
+            ..quiet_config()
+        });
         assert!(matches!(failed, Err(crate::Error::Write { .. })), "{:?}", failed.err());
-        assert!(!crate::recording() && crate::session().is_none(), "a failed start leaves no session");
+        assert!(
+            !crate::recording() && crate::session().is_none(),
+            "a failed start leaves no session"
+        );
         std::net::TcpListener::bind(port).expect("the failed start's server let its port go");
     }
     let guard = crate::start(quiet_config()).expect("a start after a failed one");
@@ -247,7 +283,11 @@ fn a_start_that_fails_leaves_nothing_running_and_the_next_start_works() {
 fn two_runs_with_the_same_program_and_pid_write_two_profiles() {
     let _globals = crate::TEST_GLOBALS.lock();
     let dir = TempDir::new("names");
-    let config = crate::Config { dir: Some(dir.0.clone()), program: Some("same".to_owned()), ..quiet_config() };
+    let config = crate::Config {
+        dir: Some(dir.0.clone()),
+        program: Some("same".to_owned()),
+        ..quiet_config()
+    };
     let first = crate::start(config.clone()).unwrap().finish().unwrap().expect("a path");
     let second = crate::start(config).unwrap().finish().unwrap().expect("a path");
     assert_ne!(first, second);
@@ -273,7 +313,10 @@ fn the_samplers_last_batch_is_in_the_profile() {
     }
     let path = guard.finish().unwrap().expect("a path");
     let profile = Profile::from_ixprof(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(!profile.cpu_samples.is_empty(), "the samples of a 40 ms run, all in the sampler's last batch");
+    assert!(
+        !profile.cpu_samples.is_empty(),
+        "the samples of a 40 ms run, all in the sampler's last batch"
+    );
 }
 
 /// The profile holds the program's function names and span fields: another local user must

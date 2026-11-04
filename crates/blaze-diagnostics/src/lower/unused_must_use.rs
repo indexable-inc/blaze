@@ -42,15 +42,23 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnusedMustUse<'db>) -> Vec<F
     {
         let def = ModuleDef::Adt(adt);
         let reason = AttrFlags::must_use_message(cx.db, hir_def::AdtId::from(adt).into()).flatten();
-        let diag = unused_def(cx, "", &post, def, reason, &span, post.is_empty().then_some(from_block));
+        let diag =
+            unused_def(cx, "", &post, def, reason, &span, post.is_empty().then_some(from_block));
         found.push(lint(cx, diag, at));
     }
     if let Some(function) = callee(cx, expr)
         && let Ok(id) = hir_def::FunctionId::try_from(function)
         && let Some(reason) = AttrFlags::must_use_message(cx.db, id.into())
     {
-        let diag =
-            unused_def(cx, "return value of ", "", ModuleDef::Function(function), reason, &span, Some(from_block));
+        let diag = unused_def(
+            cx,
+            "return value of ",
+            "",
+            ModuleDef::Function(function),
+            reason,
+            &span,
+            Some(from_block),
+        );
         found.push(lint(cx, diag, at));
     }
     found
@@ -75,7 +83,11 @@ fn unused_def(
 ) -> Diag {
     let path = cx.def_path(def);
     // alloc: clone: the lint's parts, for a value hir found unused
-    let mut diag = Diag::lint("unused_must_use", format!("unused {pre}`{path}`{post} that must be used"), span.clone());
+    let mut diag = Diag::lint(
+        "unused_must_use",
+        format!("unused {pre}`{path}`{post} that must be used"),
+        span.clone(),
+    );
     if let Some(reason) = reason {
         diag.note(reason);
     }
@@ -85,12 +97,20 @@ fn unused_def(
             diag.multipart_suggestion(
                 message,
                 // alloc: the lint's text, for a value hir found unused
-                vec![(span.shrink_to_lo(), "let _ = ".to_owned()), (span.shrink_to_hi(), ";".to_owned())],
+                vec![
+                    (span.shrink_to_lo(), "let _ = ".to_owned()),
+                    (span.shrink_to_hi(), ";".to_owned()),
+                ],
                 Applicability::MaybeIncorrect,
             );
         }
         Some(false) => {
-            diag.suggestion_verbose(span.shrink_to_lo(), message, "let _ = ", Applicability::MaybeIncorrect);
+            diag.suggestion_verbose(
+                span.shrink_to_lo(),
+                message,
+                "let _ = ",
+                Applicability::MaybeIncorrect,
+            );
         }
         None => {}
     }
@@ -115,7 +135,11 @@ fn unused_def(
 /// The `#[must_use]` ADT a value of `ty` is one to use for, and what rustc says after its
 /// name: `Result<T, E>` with `E` uninhabited is what `T` is, " in a `Result` with an
 /// uninhabited error".
-fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Option<(hir::Adt, String)> {
+fn must_use_adt<'db>(
+    cx: &Cx<'_, 'db>,
+    ty: &hir::Type<'db>,
+    post: &str,
+) -> Option<(hir::Adt, String)> {
     let adt = ty.as_adt()?;
     let two = |ty: &hir::Type<'db>| {
         let mut args = ty.type_arguments();
@@ -143,7 +167,11 @@ fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Optio
         && brk.is_never()
     {
         // alloc: the lint's text, for a value hir found unused
-        return must_use_adt(cx, &cont, &format!(" in a `ControlFlow` with an uninhabited break {post}"));
+        return must_use_adt(
+            cx,
+            &cont,
+            &format!(" in a `ControlFlow` with an uninhabited break {post}"),
+        );
     }
     AttrFlags::must_use_message(cx.db, hir_def::AdtId::from(adt).into())?;
     // alloc: the lint's text, for a value hir found unused

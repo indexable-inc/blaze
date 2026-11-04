@@ -47,11 +47,13 @@ pub fn manifest(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result
         return Ok(path);
     }
     // One stat per directory on the way up; `cargo.toml` is looked for only once nothing was found.
-    if let Some(dir) = cwd.ancestors().find(|dir| std::fs::metadata(dir.join("Cargo.toml")).is_ok()) {
+    if let Some(dir) = cwd.ancestors().find(|dir| std::fs::metadata(dir.join("Cargo.toml")).is_ok())
+    {
         return Ok(dir.join("Cargo.toml"));
     }
     let lowercase = cwd.ancestors().any(|dir| std::fs::metadata(dir.join("cargo.toml")).is_ok());
-    let said = format!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display());
+    let said =
+        format!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display());
     match lowercase {
         true => Err(format!("{said}, but found cargo.toml please try to rename it to Cargo.toml")),
         false => Err(said),
@@ -61,7 +63,8 @@ pub fn manifest(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result
 /// cargo's `toml::is_embedded`: a single-file package.
 fn is_embedded(path: &Path) -> bool {
     let ext = path.extension();
-    (ext.is_none() || ext.is_some_and(|it| it == "rs")) && std::fs::metadata(path).is_ok_and(|it| it.is_file())
+    (ext.is_none() || ext.is_some_and(|it| it == "rs"))
+        && std::fs::metadata(path).is_ok_and(|it| it.is_file())
 }
 
 /// Whether `-Zscript` is among the arguments.
@@ -109,7 +112,11 @@ pub fn find(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result<Pla
 ///
 /// A directory without `.cargo` costs one stat; a file is read without one, its absence being the
 /// read's `NotFound`.
-pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>, String> {
+pub fn config_files(
+    place: &Place,
+    configs: &[String],
+    cargo_home: Option<&Path>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut add = |path: PathBuf| -> Result<(), String> {
         if path.starts_with(&place.root) {
@@ -120,7 +127,13 @@ pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>
         }
         match std::fs::read(&path) {
             Ok(bytes) => files.push((utf8(&path)?, bytes)),
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::IsADirectory
+                        | io::ErrorKind::NotADirectory
+                ) => {}
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         }
         Ok(())
@@ -151,7 +164,13 @@ pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
             let path = dir.join(name);
             match std::fs::read(&path) {
                 Ok(bytes) => files.push((utf8(&path)?, bytes)),
-                Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::IsADirectory
+                            | io::ErrorKind::NotADirectory
+                    ) => {}
                 Err(error) => return Err(format!("reading {}: {error}", path.display())),
             }
         }
@@ -161,17 +180,24 @@ pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// A path as the API carries it.
 pub fn utf8(path: &Path) -> Result<String, String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("the path {} is not UTF-8, which a request to the daemon can't carry", path.display()))
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "the path {} is not UTF-8, which a request to the daemon can't carry",
+            path.display()
+        )
+    })
 }
 
 /// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its
 /// name alone: its value is never shown.
-pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(String, String)>, String> {
+pub fn env(
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::with_capacity(vars.size_hint().0);
     let refused = |named: &str| {
-        format!("the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry")
+        format!(
+            "the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry"
+        )
     };
     for (name, value) in vars {
         match (name.into_string(), value.into_string()) {
@@ -187,7 +213,11 @@ pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(Stri
 /// Whether what cargo writes to stderr is colored: `--color` (the last one), else
 /// `CARGO_TERM_COLOR`, else `auto`, which is anstream's choice for a stream that is a
 /// `terminal` or not (`NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR`, `TERM`, `CI`).
-pub fn color(flag: Option<&str>, var: impl Fn(&str) -> Option<String>, terminal: bool) -> Result<bool, String> {
+pub fn color(
+    flag: Option<&str>,
+    var: impl Fn(&str) -> Option<String>,
+    terminal: bool,
+) -> Result<bool, String> {
     let when = match flag {
         Some(flag) => Some(flag.to_owned()),
         None => var("CARGO_TERM_COLOR"),
@@ -198,7 +228,9 @@ pub fn color(flag: Option<&str>, var: impl Fn(&str) -> Option<String>, terminal:
         Some("auto") | None => Ok(auto(&var, terminal)),
         // cargo's `ColorChoice::from_str`, of `--color` (which clap took in any case) or
         // `term.color`.
-        Some(other) => Err(format!("argument for --color must be auto, always, or never, but found `{other}`")),
+        Some(other) => {
+            Err(format!("argument for --color must be auto, always, or never, but found `{other}`"))
+        }
     }
 }
 
@@ -222,7 +254,11 @@ fn auto(var: &impl Fn(&str) -> Option<String>, terminal: bool) -> bool {
 /// cargo's own test override `__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS` first, then the width of
 /// the terminal stderr is (`columns`, asked only when stderr is a `terminal`), else `None`, which
 /// is rustc's own default. A terminal whose width is unknown is `None` too, as cargo's `NoTty`.
-pub fn width(var: impl Fn(&str) -> Option<String>, terminal: bool, columns: impl FnOnce() -> Option<u16>) -> Result<Option<u32>, String> {
+pub fn width(
+    var: impl Fn(&str) -> Option<String>,
+    terminal: bool,
+    columns: impl FnOnce() -> Option<u16>,
+) -> Result<Option<u32>, String> {
     const TEST: &str = "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS";
     if let Some(width) = var(TEST) {
         return match width.parse::<u32>() {
@@ -293,7 +329,11 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::Targets(given) => {
-                write!(f, "blaze builds for one `--target` a command, and was given {}:", given.len())?;
+                write!(
+                    f,
+                    "blaze builds for one `--target` a command, and was given {}:",
+                    given.len()
+                )?;
                 given.iter().try_for_each(|it| write!(f, " `{it}`"))
             }
         }
@@ -332,9 +372,11 @@ mod refusals {
     #[test]
     fn a_second_target_is_refused_not_dropped() {
         let place = Place { cwd: "/w".into(), manifest: "/w/Cargo.toml".into(), root: "/w".into() };
-        let made = |asked: &Invocation| cargo(asked, &place, Vec::new(), Vec::new(), false, None).unwrap();
+        let made =
+            |asked: &Invocation| cargo(asked, &place, Vec::new(), Vec::new(), false, None).unwrap();
         let mut asked = Invocation::default();
-        asked.flags.targets = vec!["aarch64-apple-darwin".to_owned(), "x86_64-unknown-linux-gnu".to_owned()];
+        asked.flags.targets =
+            vec!["aarch64-apple-darwin".to_owned(), "x86_64-unknown-linux-gnu".to_owned()];
         let refused = targets(&asked, made(&asked)).unwrap_err();
         assert_eq!(refused, Refused::Targets(asked.flags.targets.clone()));
         assert_eq!(
@@ -342,7 +384,10 @@ mod refusals {
             "blaze builds for one `--target` a command, and was given 2: `aarch64-apple-darwin` `x86_64-unknown-linux-gnu`"
         );
         asked.flags.targets.pop();
-        assert_eq!(targets(&asked, made(&asked)).unwrap().target.as_deref(), Some("aarch64-apple-darwin"));
+        assert_eq!(
+            targets(&asked, made(&asked)).unwrap().target.as_deref(),
+            Some("aarch64-apple-darwin")
+        );
         asked.flags.targets.clear();
         assert_eq!(targets(&asked, made(&asked)).unwrap().target, None);
     }

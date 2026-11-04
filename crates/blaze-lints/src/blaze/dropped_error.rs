@@ -13,7 +13,6 @@
 //! closure whose parameter is exactly `_` is `map_err_ignore`'s.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::HirDisplay as _;
 use hir_def::{
     DefWithBodyId, HasModule as _, ItemContainerId,
@@ -23,6 +22,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_ty::InferenceResult;
+use std::alloc::Global;
 
 use super::{Finding, Lint, facts};
 use crate::{check::Cx, lints::Implemented};
@@ -49,9 +49,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let db = cx.db();
     let lang = lang_items(db, def.krate(db));
     let Some(err) = lang.ResultErr else { return found };
-    let Some(hir::ModuleDef::Adt(result)) = cx.std_def(&["core", "result", "Result"]) else { return found };
-    let shared =
-        Shared { unused_result_ok: cx.on(Implemented::UnusedResultOk), map_err_ignore: cx.on(Implemented::MapErrIgnore) };
+    let Some(hir::ModuleDef::Adt(result)) = cx.std_def(&["core", "result", "Result"]) else {
+        return found;
+    };
+    let shared = Shared {
+        unused_result_ok: cx.on(Implemented::UnusedResultOk),
+        map_err_ignore: cx.on(Implemented::MapErrIgnore),
+    };
     let body = analysis.body();
     let infer = analysis.infer();
     let target = cx.krate().to_display_target(db);
@@ -83,7 +87,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     );
                     let note = "the value can't say what failed: hand the error on with `?` or keep it as the new \
                                 error's source";
-                    facts::push(&mut found, Lint::DroppedError, range, message, Some(note.to_owned()));
+                    facts::push(
+                        &mut found,
+                        Lint::DroppedError,
+                        range,
+                        message,
+                        Some(note.to_owned()),
+                    );
                 }
             }
             Expr::MethodCall { receiver, args, .. } => {
@@ -107,11 +117,18 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     continue;
                 }
                 let Some(range) = analysis.expr_range(id) else { continue };
-                let message = format!("`.{name}(..)` throws away the {} of this `Result`", error_of(receiver));
+                let message = format!(
+                    "`.{name}(..)` throws away the {} of this `Result`",
+                    error_of(receiver)
+                );
                 let note = match name {
-                    "map_err" => "the new error can't say what failed: keep the original as its source",
-                    _ => "the value in its place can't say what failed: hand the error on with `?`, or say why \
-                          dropping it is right with `#[expect(blaze::dropped_error, reason = \"..\")]`",
+                    "map_err" => {
+                        "the new error can't say what failed: keep the original as its source"
+                    }
+                    _ => {
+                        "the value in its place can't say what failed: hand the error on with `?`, or say why \
+                          dropping it is right with `#[expect(blaze::dropped_error, reason = \"..\")]`"
+                    }
                 };
                 facts::push(&mut found, Lint::DroppedError, range, message, Some(note.to_owned()));
             }
@@ -123,7 +140,12 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// Whether `pat` is `Err(_)`, `Err(..)` or `Err(_name)`: the `Err` of a `Result` whose error is
 /// never bound to a name that is read.
-fn drops_err(body: &Body, infer: &InferenceResult<'_>, err: hir_def::EnumVariantId, pat: PatId) -> bool {
+fn drops_err(
+    body: &Body,
+    infer: &InferenceResult<'_>,
+    err: hir_def::EnumVariantId,
+    pat: PatId,
+) -> bool {
     let Pat::TupleStruct { args, ellipsis, .. } = body.pat(pat) else { return false };
     if infer.variant_resolution_for_pat(pat) != Some(err.into()) {
         return false;

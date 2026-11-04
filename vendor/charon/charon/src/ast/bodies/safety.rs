@@ -7,8 +7,7 @@ use crate::pretty::FmtWithCtx;
 use crate::{llbc_ast, ullbc_ast};
 
 /// Whether an operation requires `unsafe`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
 pub enum Safety {
     Safe,
     Unsafe,
@@ -32,11 +31,7 @@ impl Safety {
 
 impl From<bool> for Safety {
     fn from(is_unsafe: bool) -> Self {
-        if is_unsafe {
-            Safety::Unsafe
-        } else {
-            Safety::Safe
-        }
+        if is_unsafe { Safety::Unsafe } else { Safety::Safe }
     }
 }
 
@@ -99,9 +94,7 @@ impl Place {
     /// - it accesses a union field (safety.unsafe-union-access)
     /// - it accesses an index or slice, as these are unchecked in MIR.
     pub fn read_safety(&self, krate: &TranslatedCrate) -> Safety {
-        self.subplaces()
-            .map(|place| place.shallow_safety(krate))
-            .collect()
+        self.subplaces().map(|place| place.shallow_safety(krate)).collect()
     }
 
     /// The safety of accessing this place, ignoring subplaces.
@@ -172,11 +165,7 @@ impl HasSafety for Operand {
 impl HasSafety for Rvalue {
     fn safety(&self, krate: &TranslatedCrate) -> Safety {
         match self {
-            Rvalue::RawPtr {
-                place,
-                ptr_metadata,
-                ..
-            } => {
+            Rvalue::RawPtr { place, ptr_metadata, .. } => {
                 // A raw borrow doesn't access the borrowed place itself. Like rustc, we only skip its
                 // outermost accesses: `&raw const *ptr` is ok, but `&raw const (*ptr).field` isn't.
                 let accessed = match &place.kind {
@@ -191,19 +180,15 @@ impl HasSafety for Rvalue {
                     .map_or(Safety::Safe, |place| place.read_safety(krate))
                     .or_else(|| ptr_metadata.safety(krate))
             }
-            Rvalue::Ref {
-                place,
-                ptr_metadata,
-                ..
-            } => place
-                .read_safety(krate)
-                .or_else(|| ptr_metadata.safety(krate)),
+            Rvalue::Ref { place, ptr_metadata, .. } => {
+                place.read_safety(krate).or_else(|| ptr_metadata.safety(krate))
+            }
             Rvalue::Discriminant(place) => place.read_safety(krate),
             Rvalue::UnaryOp(unop, op) => unop.safety(krate).or_else(|| op.safety(krate)),
             Rvalue::Use(op, _) | Rvalue::Repeat { operand: op, .. } => op.safety(krate),
-            Rvalue::BinaryOp(binop, op1, op2) => binop
-                .safety(krate)
-                .or_else(|| op1.safety(krate).or_else(|| op2.safety(krate))),
+            Rvalue::BinaryOp(binop, op1, op2) => {
+                binop.safety(krate).or_else(|| op1.safety(krate).or_else(|| op2.safety(krate)))
+            }
             Rvalue::Aggregate(_, ops) => ops.safety(krate),
             Rvalue::NullaryOp(_) => Safety::Safe,
         }
@@ -342,12 +327,9 @@ impl HasSafety for llbc_ast::Statement {
             | StatementKind::Drop { place, .. }
             | StatementKind::DropEmptyBox { place, .. } => place.read_safety(krate),
             StatementKind::Borrowck(st) => st.safety(krate),
-            StatementKind::Assert {
-                assert, on_failure, ..
-            } => assert
-                .cond
-                .safety(krate)
-                .or_else(|| on_failure.safety(krate)),
+            StatementKind::Assert { assert, on_failure, .. } => {
+                assert.cond.safety(krate).or_else(|| on_failure.safety(krate))
+            }
             StatementKind::Call { call, dest, .. } => {
                 call.safety(krate).or_else(|| dest.write_safety(krate))
             }
@@ -379,10 +361,9 @@ impl HasSafety for ullbc_ast::Statement {
             StatementKind::SetDiscriminant(place, _) => place.write_safety(krate),
             StatementKind::PlaceMention(place) => place.read_safety(krate),
             StatementKind::Borrowck(st) => st.safety(krate),
-            StatementKind::Assert { assert, on_failure } => assert
-                .cond
-                .safety(krate)
-                .or_else(|| on_failure.safety(krate)),
+            StatementKind::Assert { assert, on_failure } => {
+                assert.cond.safety(krate).or_else(|| on_failure.safety(krate))
+            }
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
                 Safety::Safe
             }

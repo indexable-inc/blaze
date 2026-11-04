@@ -78,7 +78,11 @@ pub(super) fn run(plan: &mut Plan<'_>, func: &ir::Function) -> Result<(), Error>
 }
 
 /// Clears `column` and sizes it to `len` entries of `fill`, keeping its allocation.
-pub(super) fn reset<T: Clone, A: std::alloc::Allocator>(column: &mut Vec<T, A>, len: usize, fill: T) {
+pub(super) fn reset<T: Clone, A: std::alloc::Allocator>(
+    column: &mut Vec<T, A>,
+    len: usize,
+    fill: T,
+) {
     column.clear();
     column.resize(len, fill);
 }

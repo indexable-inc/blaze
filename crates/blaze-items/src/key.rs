@@ -34,7 +34,7 @@
 
 use std::{fmt, mem};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
@@ -79,15 +79,25 @@ pub enum Resolved {
     /// A closure, coroutine or coroutine closure: the `Expr::Closure` at `expr` of the
     /// expression store of `store`. A coroutine closure has two keys, one as the closure
     /// whose type it has and one as itself; both resolve here.
-    Closure { store: ExpressionStoreOwnerId, expr: ExprId, kind: ClosureKind },
+    Closure {
+        store: ExpressionStoreOwnerId,
+        expr: ExprId,
+        kind: ClosureKind,
+    },
     /// The `index`th `impl Trait` of the return type of a function or of a type alias.
-    Opaque { owner: ItemId, index: u32 },
+    Opaque {
+        owner: ItemId,
+        index: u32,
+    },
     BuiltinDerive(BuiltinDeriveImplId),
     /// The constructor of a tuple or unit struct or variant ([`ctor_key`]).
     Ctor(Ctor),
     /// An anonymous constant: the root expression `expr` of the expression store of `store`
     /// ([`anon_const_key`]). What it is interned as is made by the lowering of its store.
-    AnonConst { store: ExpressionStoreOwnerId, expr: ExprId },
+    AnonConst {
+        store: ExpressionStoreOwnerId,
+        expr: ExprId,
+    },
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
@@ -126,7 +136,11 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     h.update(&(data.dependencies.len() as u64).to_le_bytes());
     for dep in &data.dependencies {
         h.part(dep.name.symbol().as_str().as_bytes())
-            .update(&[u8::from(dep.is_prelude()), u8::from(dep.is_sysroot()), u8::from(dep.is_private())])
+            .update(&[
+                u8::from(dep.is_prelude()),
+                u8::from(dep.is_sysroot()),
+                u8::from(dep.is_private()),
+            ])
             .id(&crate_key(db, dep.crate_id));
     }
     // Every atom's bytes in one buffer, sorted as byte strings; an atom is its start and end
@@ -147,7 +161,8 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
                         bytes.put_bytes_u64(value.as_str().as_bytes());
                     }
                 }
-                let end = u32::try_from(bytes.len()).expect("blaze-items: a crate's cfg under 4 GiB");
+                let end =
+                    u32::try_from(bytes.len()).expect("blaze-items: a crate's cfg under 4 GiB");
                 atoms.push(u64::from(start as u32) << 32 | u64::from(end));
             }
             atoms.sort_unstable_by(|&a, &b| bytes[range(a)].cmp(&bytes[range(b)]));
@@ -421,10 +436,7 @@ pub(crate) fn item_key_alone(db: &Db, id: ItemId) -> ItemKey {
 /// The keys of the items a module's scope declares, sorted by id: 40 bytes per item, found by
 /// binary search.
 #[blaze_query::tracked(returns(ref))]
-fn module_item_keys<'db>(
-    db: &'db Db,
-    module: ModuleIdLt<'db>,
-) -> Vec<(ItemId, ItemKey)> {
+fn module_item_keys<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> Vec<(ItemId, ItemKey)> {
     let scope = module.def_map(db).module(db, module).scope(db);
     // alloc: the memo's own list, its length known only once the scope is walked.
     let mut ids = Vec::new();
@@ -437,7 +449,9 @@ fn module_item_keys<'db>(
             ModuleDefId::TraitId(it) => ids.push(ItemId::Trait(it)),
             ModuleDefId::TypeAliasId(it) => ids.push(ItemId::Alias(it)),
             ModuleDefId::MacroId(it) => ids.push(ItemId::Macro(it)),
-            ModuleDefId::EnumVariantId(_) | ModuleDefId::ModuleId(_) | ModuleDefId::BuiltinType(_) => {}
+            ModuleDefId::EnumVariantId(_)
+            | ModuleDefId::ModuleId(_)
+            | ModuleDefId::BuiltinType(_) => {}
         }
     }
     ids.extend(scope.impls().map(ItemId::Impl));
@@ -572,13 +586,20 @@ pub fn variant_key(db: &Db, variant: EnumVariantId) -> ItemKey {
     match find(enum_variant_keys(db, loc.parent), variant) {
         Some(key) => key,
         None => {
-            let (parent, hash) = hashed(|b| variant_preimage(db, loc.parent, &loc.name, variant, b));
+            let (parent, hash) =
+                hashed(|b| variant_preimage(db, loc.parent, &loc.name, variant, b));
             under(&parent, false, hash)
         }
     }
 }
 
-fn variant_preimage(db: &Db, parent: EnumId, name: &Name, variant: EnumVariantId, b: &mut Bytes) -> ItemKey {
+fn variant_preimage(
+    db: &Db,
+    parent: EnumId,
+    name: &Name,
+    variant: EnumVariantId,
+    b: &mut Bytes,
+) -> ItemKey {
     let parent = item_key(db, ItemId::Adt(parent.into()));
     b.id(&parent.0).part(b"variant").part(name.as_str().as_bytes());
     // A variant a `macro` names is keyed by its context (`hir_def::nameres::def_site::
@@ -625,7 +646,9 @@ pub(crate) fn generic_def_item(def: GenericDefId) -> ItemId {
 /// The key of an expression store: of a signature, a body or the fields of a variant.
 pub fn store_key(db: &Db, store: ExpressionStoreOwnerId) -> ItemKey {
     let (parent, tag): (_, &[u8]) = match store {
-        ExpressionStoreOwnerId::Signature(def) => (item_key(db, generic_def_item(def)), b"signature"),
+        ExpressionStoreOwnerId::Signature(def) => {
+            (item_key(db, generic_def_item(def)), b"signature")
+        }
         ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(it)) => {
             (variant_key(db, it), b"discriminant")
         }
@@ -663,12 +686,7 @@ pub fn ctor_key(db: &Db, ctor: Ctor) -> ItemKey {
     under(&of, false, h.finish())
 }
 
-fn closure_key_of(
-    db: &Db,
-    store: ExpressionStoreOwnerId,
-    tag: &'static [u8],
-    nth: u32,
-) -> ItemKey {
+fn closure_key_of(db: &Db, store: ExpressionStoreOwnerId, tag: &'static [u8], nth: u32) -> ItemKey {
     let parent = store_key(db, store);
     let mut h = Hasher::new(KEY_DOMAIN);
     h.id(&parent.0).part(tag).update(&nth.to_le_bytes());
@@ -877,10 +895,7 @@ fn path_segments(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
 }
 
 /// The module an associated item's path goes through, and its trait or impl if it has one.
-fn assoc_container(
-    db: &Db,
-    container: ItemContainerId,
-) -> (ModuleId, Option<ItemContainerId>) {
+fn assoc_container(db: &Db, container: ItemContainerId) -> (ModuleId, Option<ItemContainerId>) {
     match container {
         ItemContainerId::ModuleId(it) => (it, None),
         ItemContainerId::ExternBlockId(it) => (it.lookup(db).container, None),
@@ -889,11 +904,7 @@ fn assoc_container(
     }
 }
 
-fn module_path<'db>(
-    db: &'db Db,
-    module: ModuleIdLt<'db>,
-    write: &mut impl FnMut(&str),
-) {
+fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut impl FnMut(&str)) {
     match module.containing_module(db) {
         Some(parent) => {
             module_path(db, parent, write);
@@ -931,7 +942,9 @@ fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
             macro_name(it.lookup(db).id.to_view(db).name(), write)
         }
-        ItemId::Macro(MacroId::Macro2Id(it)) => macro_name(it.lookup(db).id.to_view(db).name(), write),
+        ItemId::Macro(MacroId::Macro2Id(it)) => {
+            macro_name(it.lookup(db).id.to_view(db).name(), write)
+        }
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
             macro_name(it.lookup(db).id.to_view(db).name(), write)
         }
@@ -1115,7 +1128,8 @@ impl std::hash::Hasher for KeyHasher {
         // A key's: its first 9 bytes are its crate's and one bit, the same for a whole index,
         // and its last 8 are as random as BLAKE3 makes them.
         if let Ok(key) = <&[u8; 32]>::try_from(bytes) {
-            self.0 = self.0.rotate_left(29) ^ u64::from_le_bytes(*key.last_chunk::<8>().expect("32 bytes"));
+            self.0 = self.0.rotate_left(29)
+                ^ u64::from_le_bytes(*key.last_chunk::<8>().expect("32 bytes"));
             return;
         }
         for chunk in bytes.chunks(8) {
@@ -1152,14 +1166,18 @@ impl ClashingCrate {
         let extra = krate.extra_data(db);
         let data = krate.data(db);
         ClashingCrate {
-            name: krate.named(db).to_string(), // alloc: an error's, once
-            version: extra.version.clone(), // clone: an error's, once
+            name: krate.named(db).to_string(),    // alloc: an error's, once
+            version: extra.version.clone(),       // clone: an error's, once
             origin: format!("{:?}", data.origin), // alloc: an error's, once
             kind: if data.target_kind == data.manifest_kind {
                 cargo_kind(data.target_kind).to_owned() // alloc: an error's, once
             } else {
                 // alloc: as above
-                format!("{} of the {} target", cargo_kind(data.target_kind), cargo_kind(data.manifest_kind))
+                format!(
+                    "{} of the {} target",
+                    cargo_kind(data.target_kind),
+                    cargo_kind(data.manifest_kind)
+                )
             },
             built_for: extra.built_for.to_string(), // alloc: an error's, once
         }
@@ -1194,7 +1212,10 @@ impl fmt::Display for CrateKeyClash {
                 "crates {a} and {b} have one key: the same name, version, origin, platform, kind of \
                  target, edition, crate attributes, dependencies and cfg, so the crate graph holds one crate twice"
             ),
-            false => write!(f, "crates {a} and {b} have keys with equal first 8 bytes (a 64-bit collision)"),
+            false => write!(
+                f,
+                "crates {a} and {b} have keys with equal first 8 bytes (a 64-bit collision)"
+            ),
         }
     }
 }
@@ -1237,7 +1258,9 @@ fn crates_by_prefix(db: &Db) -> Result<Vec<(u64, Crate)>, CrateKeyClash> {
 fn checked_crates(db: &Db) -> &[(u64, Crate)] {
     match crates_by_prefix(db) {
         Ok(it) => it,
-        Err(clash) => panic!("blaze-items: a key resolved in a build check_crate_keys stops: {clash}"),
+        Err(clash) => {
+            panic!("blaze-items: a key resolved in a build check_crate_keys stops: {clash}")
+        }
     }
 }
 

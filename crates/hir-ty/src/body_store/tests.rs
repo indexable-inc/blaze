@@ -11,10 +11,9 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
-use blaze_query::db::Setter;
+use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId,
@@ -26,6 +25,7 @@ use hir_def::{
 use hir_expand::fixture;
 use hir_expand::name::Name;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::{
     BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install,
@@ -65,7 +65,8 @@ pub(super) const BUILD: ContentId = ContentId([7; 32]);
 
 /// The fact every read of an impl table stands for: [`TestFacts::value`] hashes how many impls
 /// `main` has.
-const IMPLS: FactRef = FactRef { kind: QueryKind(0x1800), subject: ContentId([4; 32]), object: FactObject::None };
+const IMPLS: FactRef =
+    FactRef { kind: QueryKind(0x1800), subject: ContentId([4; 32]), object: FactObject::None };
 
 pub(super) fn db_of(fixture: &str) -> Db {
     let db = fixture::db(fixture).into_db();
@@ -84,7 +85,9 @@ pub(super) fn function(db: &Db, name: &str) -> DefWithBodyId {
     crate_body_owners(db, main)
         .into_iter()
         .find(|def| match def {
-            DefWithBodyId::FunctionId(it) => FunctionSignature::of(db, *it).name == Name::new_root(name),
+            DefWithBodyId::FunctionId(it) => {
+                FunctionSignature::of(db, *it).name == Name::new_root(name)
+            }
             _ => false,
         })
         .unwrap_or_else(|| panic!("no function `{name}`"))
@@ -177,7 +180,10 @@ impl TestFacts {
 }
 
 fn is_impl_table(name: &str) -> bool {
-    name.contains("Impls") || name.contains("impls") || name.contains("value_item") || name.contains("lookup_impl_method")
+    name.contains("Impls")
+        || name.contains("impls")
+        || name.contains("value_item")
+        || name.contains("lookup_impl_method")
 }
 
 fn portable(def: SolverDefId<'_>) -> (u8, PortableIds) {
@@ -205,7 +211,10 @@ impl BodyFacts for TestFacts {
         }
         let identity = body_key(db, def).map(|key| {
             let printed = Body::of(db, def).pretty_print(db, def, span::Edition::CURRENT);
-            Hasher::new("blaze v2 item store test identity").id(&key).part(printed.as_bytes()).finish()
+            Hasher::new("blaze v2 item store test identity")
+                .id(&key)
+                .part(printed.as_bytes())
+                .finish()
         });
         self.identities.lock().insert(def, identity);
         identity
@@ -235,8 +244,13 @@ impl BodyFacts for TestFacts {
             return None;
         }
         let def_map = crate_def_map(db, self.main);
-        let impls: usize = def_map.modules(db).map(|(_, module)| module.scope(db).impls().len()).sum();
-        Some(Hasher::new("blaze v2 item store test impls").update(&(impls as u64).to_le_bytes()).finish())
+        let impls: usize =
+            def_map.modules(db).map(|(_, module)| module.scope(db).impls().len()).sum();
+        Some(
+            Hasher::new("blaze v2 item store test impls")
+                .update(&(impls as u64).to_le_bytes())
+                .finish(),
+        )
     }
 
     fn def_key<'db>(&self, db: &'db Db, _: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
@@ -247,7 +261,12 @@ impl BodyFacts for TestFacts {
         key
     }
 
-    fn def_of<'db>(&self, db: &'db Db, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        _: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>> {
         let (tag, bytes) = self.defs.lock().get(&key)?.clone();
         let ids = PortableIds::decode(db, self.main, &bytes).ok()?;
         match tag {
@@ -274,7 +293,13 @@ pub(super) struct Session {
     pub(super) db: Db,
 }
 
-pub(super) fn session(db: Db, memory: &Arc<Memory>, defs: &Defs, refuse: Option<&'static str>, mode: Mode) -> Session {
+pub(super) fn session(
+    db: Db,
+    memory: &Arc<Memory>,
+    defs: &Defs,
+    refuse: Option<&'static str>,
+    mode: Mode,
+) -> Session {
     let facts = Arc::new(TestFacts::new(&db, defs, refuse));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD, mode).unwrap();
     Session { installed, facts, db }
@@ -303,7 +328,8 @@ fn reset_ran() {
 /// `def`'s inference result in stable form: its answer's bytes, every id by its key.
 fn stable(db: &Db, facts: &TestFacts, def: DefWithBodyId) -> Vec<u8> {
     let mut out = Vec::new();
-    infer::encode(db, facts, def, InferenceResult::of(db, def), &mut out).expect("the fixture's bodies encode");
+    infer::encode(db, facts, def, InferenceResult::of(db, def), &mut out)
+        .expect("the fixture's bodies encode");
     out
 }
 
@@ -322,7 +348,11 @@ fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>, Glob
     let ran = StepCounts { ran: BODIES.len() as u64, ..StepCounts::default() };
     assert_eq!(flushed.steps, only(Step::Infer, ran), "each body missed and ran");
     assert_eq!(memory.len(), 2 * BODIES.len(), "a shape and an answer each");
-    assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "a flush writes each offer once");
+    assert_eq!(
+        first.installed.flush().unwrap(),
+        Flushed::default(),
+        "a flush writes each offer once"
+    );
     (memory, defs, forms)
 }
 
@@ -332,7 +362,8 @@ fn answer_of(memory: &Memory, s: &Session, def: DefWithBodyId) -> (ContentId, Co
     let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
     let base = record::base_key(&identity, Step::Infer, &infer::SCHEMA, &solver_version(&BUILD));
     let shape_key = record::shape_key(&base, 0);
-    let shape = memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
+    let shape =
+        memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
     let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
     let mut key = AnswerKey::new(&shape_key);
     for fact in shape.facts() {
@@ -350,7 +381,8 @@ fn shape_facts(memory: &Memory, s: &Session, def: DefWithBodyId) -> Vec<FactRef>
     let identity = s.facts.identity(&s.db, def).unwrap();
     let base = record::base_key(&identity, Step::Infer, &infer::SCHEMA, &solver_version(&BUILD));
     let shape_key = record::shape_key(&base, 0);
-    let shape = memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
+    let shape =
+        memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
     let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
     let facts: Vec<FactRef> = shape.facts().collect();
     assert_eq!(facts.len(), shape.len());
@@ -362,8 +394,16 @@ fn records_read_back_as_written_and_only_under_their_key() {
     let base = ContentId([1; 32]);
     let facts = [
         FactRef { kind: QueryKind(0x1000), subject: ContentId([2; 32]), object: FactObject::None },
-        FactRef { kind: QueryKind(0x1001), subject: ContentId([2; 32]), object: FactObject::Field(3) },
-        FactRef { kind: QueryKind(0x1002), subject: ContentId([2; 32]), object: FactObject::Id(ContentId([5; 32])) },
+        FactRef {
+            kind: QueryKind(0x1001),
+            subject: ContentId([2; 32]),
+            object: FactObject::Field(3),
+        },
+        FactRef {
+            kind: QueryKind(0x1002),
+            subject: ContentId([2; 32]),
+            object: FactObject::Id(ContentId([5; 32])),
+        },
     ];
     for listed in [&facts[..0], &facts[..]] {
         let mut shape = Vec::new();
@@ -373,7 +413,10 @@ fn records_read_back_as_written_and_only_under_their_key() {
         assert_eq!(opened.facts().collect::<Vec<_>>(), listed);
         assert!(ShapeRef::open(&shape, &ContentId([9; 32])).is_err(), "a shape of another base");
         for len in 0..shape.len() {
-            assert!(ShapeRef::open(&Aligned::copy_from(&shape[..len]), &base).is_err(), "cut to {len}");
+            assert!(
+                ShapeRef::open(&Aligned::copy_from(&shape[..len]), &base).is_err(),
+                "cut to {len}"
+            );
         }
     }
     let mut reversed = facts;
@@ -386,12 +429,18 @@ fn records_read_back_as_written_and_only_under_their_key() {
     for body in [&b""[..], b"the step's bytes"] {
         let answer = Aligned::copy_from(&record::write_answer(&key, body));
         assert_eq!(record::open_answer(&answer, &key).unwrap(), body);
-        assert!(record::open_answer(&answer, &ContentId([8; 32])).is_err(), "an answer of another key");
+        assert!(
+            record::open_answer(&answer, &ContentId([8; 32])).is_err(),
+            "an answer of another key"
+        );
     }
     for step in Step::ALL {
         let shape_key = record::shape_key(&base, 0);
         assert_ne!(record::shape_at(step, &shape_key), record::answer_at(step, &shape_key));
-        assert_ne!(record::base_key(&base, step, &infer::SCHEMA, &BUILD), record::base_key(&base, step, &infer::SCHEMA, &key));
+        assert_ne!(
+            record::base_key(&base, step, &infer::SCHEMA, &BUILD),
+            record::base_key(&base, step, &infer::SCHEMA, &key)
+        );
     }
     assert_ne!(record::shape_key(&base, 0), record::shape_key(&base, 1));
 }
@@ -410,7 +459,11 @@ fn a_stored_inference_is_read_in_a_fresh_database_without_inferring() {
         let def = function(&fresh.db, name);
         let _ = InferenceResult::of(&fresh.db, def);
         assert_eq!(ran(), 0, "`{name}` is read, not inferred");
-        assert_eq!(stable(&fresh.db, &fresh.facts, def), forms[name], "`{name}` reads back as it was stored");
+        assert_eq!(
+            stable(&fresh.db, &fresh.facts, def),
+            forms[name],
+            "`{name}` reads back as it was stored"
+        );
     }
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
     assert_eq!(fresh.installed.steps(), hits, "this build's counts, before the flush");
@@ -445,7 +498,10 @@ fn an_added_impl_misses_only_where_the_shape_lists_the_impls() {
             first.facts.names.lock().clone()
         };
         let show = names(function(&first.db, "uses_show"));
-        assert!(show.iter().any(|it| is_impl_table(it)), "a method call reads an impl table: {show:?}");
+        assert!(
+            show.iter().any(|it| is_impl_table(it)),
+            "a method call reads an impl table: {show:?}"
+        );
         let plain = names(function(&first.db, "plain"));
         assert!(!plain.iter().any(|it| is_impl_table(it)), "an empty body reads none: {plain:?}");
         assert_eq!(shape_facts(&memory, &first, function(&first.db, "uses_show")), [IMPLS]);
@@ -489,7 +545,10 @@ fn a_corrupt_record_is_an_error_naming_the_body() {
     drop(probe);
 
     for (bad, why) in [
-        (record::write_answer(&answer_key, b"not an inference answer"), "a body that does not decode"),
+        (
+            record::write_answer(&answer_key, b"not an inference answer"),
+            "a body that does not decode",
+        ),
         (record::write_answer(&ContentId([9; 32]), b""), "an answer under another key"),
     ] {
         memory.set(at, &bad);
@@ -500,7 +559,10 @@ fn a_corrupt_record_is_an_error_naming_the_body() {
         assert_eq!(ran(), 1, "{why}: the body is inferred, which gives the same result");
         assert_eq!(stable(&fresh.db, &fresh.facts, seven), forms["seven"], "{why}");
         let error = fresh.installed.flush().expect_err(why);
-        assert!(error.contains(&format!("{seven:?}")) && error.contains("inference"), "{why}: {error}");
+        assert!(
+            error.contains(&format!("{seven:?}")) && error.contains("inference"),
+            "{why}: {error}"
+        );
     }
 }
 
@@ -514,7 +576,11 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
     }
     assert_eq!(ran(), BODIES.len() as u32, "every hit is inferred as well");
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
-    assert_eq!(same.installed.flush().unwrap(), Flushed { steps: hits, ..Flushed::default() }, "each stored result is the one inferred");
+    assert_eq!(
+        same.installed.flush().unwrap(),
+        Flushed { steps: hits, ..Flushed::default() },
+        "each stored result is the one inferred"
+    );
     drop(same);
 
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
@@ -525,7 +591,8 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
     let wrong = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
     let plain = function(&wrong.db, "plain");
     let _ = InferenceResult::of(&wrong.db, plain);
-    let error = wrong.installed.flush().expect_err("a stored result that differs from inferring it");
+    let error =
+        wrong.installed.flush().expect_err("a stored result that differs from inferring it");
     assert!(error.contains(&format!("{plain:?}")) && error.contains("differs"), "{error}");
 }
 
@@ -558,11 +625,18 @@ fn only_a_passing_borrow_check_is_stored() {
     let defs = Defs::default();
     let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
     let seven = function(&first.db, "seven");
-    let verdict = Verdict::new(&first.db, seven, false);
+    let verdict = Verdict::new(&first.db, Durability::LOW, seven, false);
     assert!(!borrow_checked(&first.db, verdict));
-    assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "a failing verdict is never offered");
+    assert_eq!(
+        first.installed.flush().unwrap(),
+        Flushed::default(),
+        "a failing verdict is never offered"
+    );
     assert!(!lookup_passed(&first.db, seven, CHECKER, || panic!("not verifying")));
-    assert_eq!(first.installed.steps(), only(Step::Borrowck, StepCounts { ran: 1, ..StepCounts::default() }));
+    assert_eq!(
+        first.installed.steps(),
+        only(Step::Borrowck, StepCounts { ran: 1, ..StepCounts::default() })
+    );
 
     verdict.set_passes(&mut first.db).to(true);
     assert!(borrow_checked(&first.db, verdict));
@@ -571,9 +645,17 @@ fn only_a_passing_borrow_check_is_stored() {
 
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     let seven = function(&fresh.db, "seven");
-    assert!(lookup_passed(&fresh.db, seven, CHECKER, || panic!("not verifying")), "a stored pass skips the check");
-    assert!(!lookup_passed(&fresh.db, seven, "nll", || panic!("not stored")), "another checker's pass is not this one's");
-    assert!(!lookup_passed(&fresh.db, function(&fresh.db, "plain"), CHECKER, || panic!("not stored")));
+    assert!(
+        lookup_passed(&fresh.db, seven, CHECKER, || panic!("not verifying")),
+        "a stored pass skips the check"
+    );
+    assert!(
+        !lookup_passed(&fresh.db, seven, "nll", || panic!("not stored")),
+        "another checker's pass is not this one's"
+    );
+    assert!(!lookup_passed(&fresh.db, function(&fresh.db, "plain"), CHECKER, || panic!(
+        "not stored"
+    )));
     drop(fresh);
 
     let verify = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
@@ -590,7 +672,11 @@ fn only_a_passing_borrow_check_is_stored() {
 fn a_step_value_is_the_same_in_every_database_and_changes_with_a_type() {
     let defs = Defs::default();
     let without = db_of(FIXTURE);
-    assert_eq!(step_value(&without, function(&without, "seven"), Step::Infer), None, "no store, no value");
+    assert_eq!(
+        step_value(&without, function(&without, "seven"), Step::Infer),
+        None,
+        "no store, no value"
+    );
 
     let first = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
     let fresh = session(second(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
@@ -602,8 +688,18 @@ fn a_step_value_is_the_same_in_every_database_and_changes_with_a_type() {
     }
     assert_eq!(step_value(&first.db, function(&first.db, "seven"), Step::Borrowck), None);
 
-    let edited = session(second(&FIXTURE.replace("{ 7 }", "{ 7u8 as u32 }")), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    assert_ne!(value(&edited, "seven"), value(&first, "seven"), "an edit that changes a type changes the value");
+    let edited = session(
+        second(&FIXTURE.replace("{ 7 }", "{ 7u8 as u32 }")),
+        &Arc::new(Memory::default()),
+        &defs,
+        None,
+        Mode::Serve,
+    );
+    assert_ne!(
+        value(&edited, "seven"),
+        value(&first, "seven"),
+        "an edit that changes a type changes the value"
+    );
     assert_eq!(value(&edited, "plain"), value(&first, "plain"), "the other bodies keep theirs");
 }
 
@@ -612,10 +708,16 @@ fn a_database_finds_only_its_own_store() {
     let (memory, defs, _) = stored(Mode::Serve);
     let with = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     let facts: Arc<dyn BodyFacts> = with.facts.clone();
-    assert!(install(&with.db, memory.clone(), facts, BUILD, Mode::Serve).is_err(), "one store per database");
+    assert!(
+        install(&with.db, memory.clone(), facts, BUILD, Mode::Serve).is_err(),
+        "one store per database"
+    );
     let without = second(FIXTURE);
     assert!(matches!(lookup_inference(&without, function(&without, "seven")), Lookup::Off));
-    assert!(matches!(lookup_inference(&with.db, function(&with.db, "seven")), Lookup::Hit { verify: false, .. }));
+    assert!(matches!(
+        lookup_inference(&with.db, function(&with.db, "seven")),
+        Lookup::Hit { verify: false, .. }
+    ));
 }
 
 #[test]
@@ -628,7 +730,8 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
         // the result interns.
         assert!(matches!(lookup_inference(&fresh.db, def), Lookup::Hit { .. }));
         let (_, _, body) = answer_of(&memory, &fresh, def);
-        let (decoded, decoding) = measure(|| infer::decode(&fresh.db, &*fresh.facts, def, &Aligned::copy_from(&body)));
+        let (decoded, decoding) =
+            measure(|| infer::decode(&fresh.db, &*fresh.facts, def, &Aligned::copy_from(&body)));
         drop(decoded.unwrap());
         let copying = measure(|| drop(Aligned::copy_from(&body))).1;
         let (found, hit) = measure(|| lookup_inference(&fresh.db, def));
@@ -646,7 +749,9 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
     let def = function(&without, "seven");
     assert!(matches!(lookup_inference(&without, def), Lookup::Off));
     assert!(matches!(
-        assert_at_most(0, "an item store lookup with no store for the database", || lookup_inference(&without, def)),
+        assert_at_most(0, "an item store lookup with no store for the database", || {
+            lookup_inference(&without, def)
+        }),
         Lookup::Off
     ));
     assert!(!assert_at_most(0, "a borrow check lookup with no store for the database", || {
@@ -674,9 +779,16 @@ fn an_item_kept_by_one_solver_misses_after_a_solver_source_edit() {
     for name in BODIES {
         let _ = InferenceResult::of(&first.db, function(&first.db, name));
     }
-    assert_eq!(first.installed.flush().unwrap().written, BODIES.len(), "each body's inference is kept");
+    assert_eq!(
+        first.installed.flush().unwrap().written,
+        BODIES.len(),
+        "each body's inference is kept"
+    );
     drop(first);
-    for (build, hits, what) in [(after, 0, "the edited solver finds none"), (before, BODIES.len(), "the solver that kept them finds each")] {
+    for (build, hits, what) in [
+        (after, 0, "the edited solver finds none"),
+        (before, BODIES.len(), "the solver that kept them finds each"),
+    ] {
         let s = with(second(FIXTURE), build);
         for name in BODIES {
             let _ = InferenceResult::of(&s.db, function(&s.db, name));

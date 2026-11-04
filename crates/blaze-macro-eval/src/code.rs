@@ -44,7 +44,10 @@ pub(crate) fn of(db: &Db, krate: Crate) -> ContentId {
         files.clear();
         files.extend(root.iter().map(|file| {
             // alloc: as above.
-            let path = root.path_for_file(&file).expect("a source root lists only files it has paths of").to_string();
+            let path = root
+                .path_for_file(&file)
+                .expect("a source root lists only files it has paths of")
+                .to_string();
             let content = db.file_content(file);
             (path, content)
         }));

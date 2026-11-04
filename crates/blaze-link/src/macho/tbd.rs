@@ -97,7 +97,11 @@ const PARALLEL: usize = 64 << 10;
 /// are joined in document order, each node's subtree end and scratch offset and each doc's
 /// and target's nodes moved by where its tape lands. The tape, docs, targets and first error
 /// are those of parsing the documents one after another.
-fn parse_all(text: &str, raw: &[RawDoc<'_>], parallel: bool) -> Result<(Tape, Vec<Doc>, Vec<Target>), String> {
+fn parse_all(
+    text: &str,
+    raw: &[RawDoc<'_>],
+    parallel: bool,
+) -> Result<(Tape, Vec<Doc>, Vec<Target>), String> {
     // A document's logical lines and their pieces are at most its physical lines: sized once
     // for the longest, and reused by every document a thread parses.
     let most = raw.iter().map(|it| it.count).max().unwrap_or(0);
@@ -154,15 +158,18 @@ fn parse_all(text: &str, raw: &[RawDoc<'_>], parallel: bool) -> Result<(Tape, Ve
             chunks.push(chunk);
             rest = tail;
         }
-        par::for_each(par::zip(par::zip(chunks, &parts), &bases), |((chunk, part), &(base, offset, _))| {
-            for (out, node) in chunk.iter_mut().zip(&part.0.nodes) {
-                *out = match node.kind {
-                    Kind::Seq | Kind::Map => Node { at: node.at + base, ..*node },
-                    Kind::Scratch => Node { at: node.at + offset, ..*node },
-                    Kind::Text => *node,
-                };
-            }
-        });
+        par::for_each(
+            par::zip(par::zip(chunks, &parts), &bases),
+            |((chunk, part), &(base, offset, _))| {
+                for (out, node) in chunk.iter_mut().zip(&part.0.nodes) {
+                    *out = match node.kind {
+                        Kind::Seq | Kind::Map => Node { at: node.at + base, ..*node },
+                        Kind::Scratch => Node { at: node.at + offset, ..*node },
+                        Kind::Text => *node,
+                    };
+                }
+            },
+        );
     }
     let mut targets = Vec::with_capacity(listed);
     let mut docs = Vec::with_capacity(parts.len());
@@ -210,10 +217,16 @@ struct List {
 
 #[derive(Clone, Copy)]
 enum What {
-    Symbols { kind: SymbolKind, weak: bool },
+    Symbols {
+        kind: SymbolKind,
+        weak: bool,
+    },
     /// Each name under each prefix (`OBJC_CLASS_$_`), its leading `_` dropped first when
     /// `strip` (versions 1 and 2 write Objective-C classes and ivars with one).
-    Objc { prefixes: &'static [&'static str], strip: bool },
+    Objc {
+        prefixes: &'static [&'static str],
+        strip: bool,
+    },
 }
 
 impl<'s> Stream<'s, '_> {
@@ -357,7 +370,9 @@ impl<'s> Stream<'s, '_> {
                 "weak-symbols" if v4 => What::Symbols { kind: SymbolKind::Other, weak: true },
                 "weak-def-symbols" if !v4 => What::Symbols { kind: SymbolKind::Other, weak: true },
                 "thread-local-symbols" => What::Symbols { kind: SymbolKind::Tls, weak: false },
-                "objc-classes" => What::Objc { prefixes: &["OBJC_CLASS_$_", "OBJC_METACLASS_$_"], strip },
+                "objc-classes" => {
+                    What::Objc { prefixes: &["OBJC_CLASS_$_", "OBJC_METACLASS_$_"], strip }
+                }
                 "objc-eh-types" => What::Objc { prefixes: &["OBJC_EHTYPE_$_"], strip: false },
                 "objc-ivars" => What::Objc { prefixes: &["OBJC_IVAR_$_"], strip },
                 other => return Err(self.unknown(doc, list, other)),
@@ -372,7 +387,8 @@ impl<'s> Stream<'s, '_> {
                 }
                 What::Objc { prefixes, .. } => {
                     plan.names += names.len() * prefixes.len();
-                    plan.bytes += prefixes.iter().map(|it| it.len() * names.len() + text).sum::<usize>();
+                    plan.bytes +=
+                        prefixes.iter().map(|it| it.len() * names.len() + text).sum::<usize>();
                 }
             }
             plan.lists.push(List { what, names });
@@ -390,7 +406,10 @@ impl<'s> Stream<'s, '_> {
             Kind::Seq => {
                 if view.children(value).any(|it| view.kind(it) != Kind::Map) {
                     // alloc: error path
-                    return Err(format!("`{}`: an entry of `{key}` is not a mapping", self.name(doc)));
+                    return Err(format!(
+                        "`{}`: an entry of `{key}` is not a mapping",
+                        self.name(doc)
+                    ));
                 }
                 Ok(view.children(value))
             }
@@ -572,7 +591,12 @@ struct Doc {
 }
 
 impl Doc {
-    fn new(view: &View<'_>, raw: &RawDoc<'_>, root: u32, targets: &mut Vec<Target>) -> Result<Doc, String> {
+    fn new(
+        view: &View<'_>,
+        raw: &RawDoc<'_>,
+        root: u32,
+        targets: &mut Vec<Target>,
+    ) -> Result<Doc, String> {
         let first = if raw.lines.is_empty() { 0 } else { raw.number };
         let map = match view.kind(root) {
             Kind::Map => Some(root),
@@ -1006,7 +1030,10 @@ fn documents(text: &str) -> Result<Vec<RawDoc<'_>>, String> {
                 doc.count = number - doc.number;
                 docs.push(doc);
             }
-        } else if open.is_none() && !line.starts_with('%') && !strip_comment(line)?.trim().is_empty() {
+        } else if open.is_none()
+            && !line.starts_with('%')
+            && !strip_comment(line)?.trim().is_empty()
+        {
             open = Some(RawDoc { tag: None, lines: at..at, number, count: 0 });
         }
         at = next;
@@ -1118,7 +1145,11 @@ fn logical_lines(
             match quote {
                 0 => match byte {
                     b'\'' | b'"' if opens_quote(&text[start..hit]) => quote = byte,
-                    b'#' if text[start..hit].chars().next_back().is_none_or(char::is_whitespace) => {
+                    b'#' if text[start..hit]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace) =>
+                    {
                         cut = Some(hit);
                         break find(bytes, hit, [b'\n']);
                     }
@@ -1148,7 +1179,9 @@ fn logical_lines(
         }
         let end = match cut {
             Some(cut) => cut,
-            None if newline < bytes.len() && newline > start && bytes[newline - 1] == b'\r' => newline - 1,
+            None if newline < bytes.len() && newline > start && bytes[newline - 1] == b'\r' => {
+                newline - 1
+            }
             None => newline,
         };
         let content = &text[start..end];
@@ -1167,7 +1200,12 @@ fn logical_lines(
                     return Err(format!("line {number}: a tab in the indentation"));
                 }
                 let first = pieces.len() as u32;
-                lines.push(Line { number: number as u32, indent: indent as u32, first, end: first + 1 });
+                lines.push(Line {
+                    number: number as u32,
+                    indent: indent as u32,
+                    first,
+                    end: first + 1,
+                });
                 pieces.push(piece);
             }
             depth += delta;
@@ -1345,7 +1383,9 @@ impl Parser<'_> {
             let last = line.end as usize - 1;
             if value.piece == last && value.at == self.pieces[last].end as usize {
                 match self.lines.get(self.at) {
-                    Some(&next) if next.indent == indent && self.is_item(next) => self.sequence(indent)?,
+                    Some(&next) if next.indent == indent && self.is_item(next) => {
+                        self.sequence(indent)?
+                    }
                     _ => self.nested(indent)?,
                 }
             } else {
@@ -1665,11 +1705,17 @@ impl Flow<'_> {
             self.at = self.pieces[self.piece].start as usize;
         }
         let first_end = self.pieces[first].end as usize;
-        if self.piece == first || (self.piece == first + 1 && self.at == self.pieces[self.piece].start as usize) {
+        if self.piece == first
+            || (self.piece == first + 1 && self.at == self.pieces[self.piece].start as usize)
+        {
             let end = if self.piece == first { self.at } else { first_end };
             let span = &text[start..end];
             let rest = span.trim_start();
-            return Scalar { kind: Kind::Text, at: start + span.len() - rest.len(), len: rest.trim_end().len() };
+            return Scalar {
+                kind: Kind::Text,
+                at: start + span.len() - rest.len(),
+                len: rest.trim_end().len(),
+            };
         }
         let scratch = &mut self.tape.scratch;
         let base = scratch.len();
@@ -1682,7 +1728,11 @@ impl Flow<'_> {
         }
         let span = &scratch[base..];
         let rest = span.trim_start();
-        Scalar { kind: Kind::Scratch, at: base + span.len() - rest.len(), len: rest.trim_end().len() }
+        Scalar {
+            kind: Kind::Scratch,
+            at: base + span.len() - rest.len(),
+            len: rest.trim_end().len(),
+        }
     }
 
     /// A quoted scalar at the cursor: a span of the text unless it has an escape or wraps a
@@ -1699,7 +1749,10 @@ impl Flow<'_> {
         let start = self.at;
         let end = self.end();
         let stop = search(&bytes[..end], start);
-        if stop < end && bytes[stop] == quote && (!single || stop + 1 == end || bytes[stop + 1] != b'\'') {
+        if stop < end
+            && bytes[stop] == quote
+            && (!single || stop + 1 == end || bytes[stop + 1] != b'\'')
+        {
             self.at = stop + 1;
             return Ok(Scalar { kind: Kind::Text, at: start, len: stop - start });
         }
@@ -1724,7 +1777,11 @@ impl Flow<'_> {
                     self.tape.scratch.push('\'');
                 }
                 b'\'' | b'"' => {
-                    return Ok(Scalar { kind: Kind::Scratch, at: base, len: self.tape.scratch.len() - base });
+                    return Ok(Scalar {
+                        kind: Kind::Scratch,
+                        at: base,
+                        len: self.tape.scratch.len() - base,
+                    });
                 }
                 _ => {
                     let c = self.escape()?;
@@ -1785,7 +1842,8 @@ pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool
     if matches!(&new, Err(what) if what.contains(&nested)) {
         return Ok(false);
     }
-    let old = reference::read("t.tbd", text, arch, platform).map(|it| (it.symbols, it.name, it.inputs));
+    let old =
+        reference::read("t.tbd", text, arch, platform).map(|it| (it.symbols, it.name, it.inputs));
     let new = match new {
         Ok(shared) => {
             if let Err(what) = arena_exact(&shared) {
@@ -1814,7 +1872,10 @@ fn arena_exact(shared: &Shared) -> Result<(), String> {
     let mut bytes = 0;
     for symbol in &shared.symbols {
         // alloc: the fuzz differential's failure message
-        let name = shared.names.get(symbol.name).ok_or_else(|| format!("{:?} is not a name of the arena", symbol.name))?;
+        let name = shared
+            .names
+            .get(symbol.name)
+            .ok_or_else(|| format!("{:?} is not a name of the arena", symbol.name))?;
         if symbol.version.is_some() {
             // alloc: the fuzz differential's failure message
             return Err(format!("`{name}` has a version"));
@@ -1823,7 +1884,10 @@ fn arena_exact(shared: &Shared) -> Result<(), String> {
     }
     if shared.names.bytes() != bytes {
         // alloc: the fuzz differential's failure message
-        return Err(format!("the arena holds {} bytes and its names {bytes}", shared.names.bytes()));
+        return Err(format!(
+            "the arena holds {} bytes and its names {bytes}",
+            shared.names.bytes()
+        ));
     }
     if !shared.versions.is_empty() {
         // alloc: the fuzz differential's failure message
@@ -2050,7 +2114,10 @@ exports:
         let (mut lines, mut pieces) = (Vec::new(), Vec::new());
         let mut roots = Vec::new();
         for doc in documents(text)? {
-            roots.push((doc.tag.map(str::to_owned), parse(text, &doc, &mut tape, &mut lines, &mut pieces)?));
+            roots.push((
+                doc.tag.map(str::to_owned),
+                parse(text, &doc, &mut tape, &mut lines, &mut pieces)?,
+            ));
         }
         let view = tape.view(text);
         Ok(roots.into_iter().map(|(tag, root)| (tag, tree(&view, root))).collect())
@@ -2067,8 +2134,10 @@ exports:
                 Value::Seq(items)
             }
             Kind::Map => {
-                let entries: Vec<(String, Value)> =
-                    view.entries(node).map(|(key, value)| (view.str(key).to_owned(), tree(view, value))).collect();
+                let entries: Vec<(String, Value)> = view
+                    .entries(node)
+                    .map(|(key, value)| (view.str(key).to_owned(), tree(view, value)))
+                    .collect();
                 assert_eq!(entries.len(), it.len as usize);
                 Value::Map(entries)
             }
@@ -2174,8 +2243,8 @@ e:
                     arena_is_exact(shared);
                 }
                 let new = new.map(|it| (owned(&it), it.name, it.inputs));
-                let old =
-                    reference::read("t.tbd", text, arch, platform).map(|it| (it.symbols, it.name, it.inputs));
+                let old = reference::read("t.tbd", text, arch, platform)
+                    .map(|it| (it.symbols, it.name, it.inputs));
                 assert_eq!(new, old, "{arch:?} platform {platform}:\n{text}");
             }
         }
@@ -2245,7 +2314,8 @@ e:
     /// `name` as a scalar: plain when it can be, else quoted one way or the other, with
     /// escapes now and then.
     fn render(rng: &mut Rng, name: &str) -> String {
-        let plain = !name.is_empty() && !name.contains([',', '[', ']', '{', '}', '#', '\'', '"', ':', ' ', '\\']);
+        let plain = !name.is_empty()
+            && !name.contains([',', '[', ']', '{', '}', '#', '\'', '"', ':', ' ', '\\']);
         match rng.below(if plain { 4 } else { 2 }) {
             0 => format!("'{}'", name.replace('\'', "''")),
             1 => {
@@ -2339,7 +2409,10 @@ e:
         }
         if rng.one_in(2) {
             out.push_str(&format!("reexported-libraries:{nl}"));
-            out.push_str(&format!("  - targets:         [ {} ]{nl}", rng.subset(&targets).join(", ")));
+            out.push_str(&format!(
+                "  - targets:         [ {} ]{nl}",
+                rng.subset(&targets).join(", ")
+            ));
             let libraries = libraries_for(rng, 3, count);
             list(rng, out, nl, 4, "libraries", &libraries);
         }
@@ -2349,10 +2422,18 @@ e:
             }
             out.push_str(&format!("{key}:{nl}"));
             for _ in 0..1 + rng.below(3) {
-                out.push_str(&format!("  - targets:         [ {} ]{nl}", rng.subset(&targets).join(", ")));
-                for list_key in
-                    ["symbols", "weak-symbols", "thread-local-symbols", "objc-classes", "objc-eh-types", "objc-ivars"]
-                {
+                out.push_str(&format!(
+                    "  - targets:         [ {} ]{nl}",
+                    rng.subset(&targets).join(", ")
+                ));
+                for list_key in [
+                    "symbols",
+                    "weak-symbols",
+                    "thread-local-symbols",
+                    "objc-classes",
+                    "objc-eh-types",
+                    "objc-ivars",
+                ] {
                     if rng.one_in(2) {
                         let items = names_for(rng);
                         list(rng, out, nl, 4, list_key, &items);
@@ -2373,18 +2454,29 @@ e:
             let uuids: Vec<String> = archs.iter().map(|it| format!("'{it}: 0000-1111'")).collect();
             list(rng, out, nl, 0, "uuids", &uuids);
         }
-        out.push_str(&format!("platform:        {}{nl}", rng.pick(&["macosx", "ios", "iosmac", "zippered"])));
+        out.push_str(&format!(
+            "platform:        {}{nl}",
+            rng.pick(&["macosx", "ios", "iosmac", "zippered"])
+        ));
         out.push_str(&format!("install-name:    {}{nl}", render(rng, &library(index))));
         out.push_str(&format!("exports:{nl}"));
         for _ in 0..1 + rng.below(3) {
-            out.push_str(&format!("  - archs:           [ {} ]{nl}", rng.subset(&archs).join(", ")));
+            out.push_str(&format!(
+                "  - archs:           [ {} ]{nl}",
+                rng.subset(&archs).join(", ")
+            ));
             if rng.one_in(2) {
                 let libraries = libraries_for(rng, 2, count);
                 list(rng, out, nl, 4, "re-exports", &libraries);
             }
-            for list_key in
-                ["symbols", "weak-def-symbols", "thread-local-symbols", "objc-classes", "objc-eh-types", "objc-ivars"]
-            {
+            for list_key in [
+                "symbols",
+                "weak-def-symbols",
+                "thread-local-symbols",
+                "objc-classes",
+                "objc-eh-types",
+                "objc-ivars",
+            ] {
                 if rng.one_in(2) {
                     let items = names_for(rng);
                     list(rng, out, nl, 4, list_key, &items);
@@ -2415,7 +2507,8 @@ e:
         }
         if rng.one_in(2) {
             for _ in 0..1 + rng.below(3) {
-                let boundaries: Vec<usize> = (0..=out.len()).filter(|&it| out.is_char_boundary(it)).collect();
+                let boundaries: Vec<usize> =
+                    (0..=out.len()).filter(|&it| out.is_char_boundary(it)).collect();
                 let at = boundaries[rng.below(boundaries.len())];
                 if rng.one_in(2) {
                     const BYTES: &[u8] = b"[]{}'\",:#- \n\tx";
@@ -2444,7 +2537,12 @@ e:
         same(V3);
     }
 
-    type Shape = (Vec<(Kind, u32, u32)>, String, Vec<(u8, Option<u32>, u32, u32, u32, Range<u32>)>, Vec<(u32, u32, u32)>);
+    type Shape = (
+        Vec<(Kind, u32, u32)>,
+        String,
+        Vec<(u8, Option<u32>, u32, u32, u32, Range<u32>)>,
+        Vec<(u32, u32, u32)>,
+    );
 
     /// What a parse of every document gave, as plain values.
     fn shape(parsed: Result<(Tape, Vec<Doc>, Vec<Target>), String>) -> Result<Shape, String> {
@@ -2452,7 +2550,11 @@ e:
         Ok((
             tape.nodes.iter().map(|it| (it.kind, it.at, it.len)).collect(),
             tape.scratch,
-            docs.iter().map(|it| (it.version, it.map, it.install_name, it.list, it.platform, it.targets.clone())).collect(),
+            docs.iter()
+                .map(|it| {
+                    (it.version, it.map, it.install_name, it.list, it.platform, it.targets.clone())
+                })
+                .collect(),
             targets.iter().map(|it| (it.node, it.len, it.platform)).collect(),
         ))
     }
@@ -2470,7 +2572,8 @@ e:
                 text.push_str(&generate(&mut rng));
             }
             let Ok(raw) = documents(&text) else { continue };
-            let (serial, parallel) = (shape(parse_all(&text, &raw, false)), shape(parse_all(&text, &raw, true)));
+            let (serial, parallel) =
+                (shape(parse_all(&text, &raw, false)), shape(parse_all(&text, &raw, true)));
             assert_eq!(serial, parallel, "{text}");
             joined += usize::from(raw.len() > 1 && serial.is_ok());
         }
@@ -2526,13 +2629,18 @@ e:
                     unique.push(name);
                 }
             }
-            assert_eq!(names(&shared), unique.iter().map(String::as_str).collect::<Vec<_>>(), "{text}");
+            assert_eq!(
+                names(&shared),
+                unique.iter().map(String::as_str).collect::<Vec<_>>(),
+                "{text}"
+            );
         }
     }
 
     #[test]
     fn seen_grows_and_dedups() {
-        let mut out = Exports { symbols: Vec::new(), names: Names::default(), seen: Seen::with_capacity(0) };
+        let mut out =
+            Exports { symbols: Vec::new(), names: Names::default(), seen: Seen::with_capacity(0) };
         for round in 0..2 {
             for index in 0..5000 {
                 let name = format!("name{index}");
@@ -2604,13 +2712,28 @@ e:
             }
             let out = decode(view, &plan).unwrap();
             assert!(out.symbols.len() <= plan.names);
-            assert!(out.names.bytes() <= plan.bytes, "{} > {}: {text}", out.names.bytes(), plan.bytes);
+            assert!(
+                out.names.bytes() <= plan.bytes,
+                "{} > {}: {text}",
+                out.names.bytes(),
+                plan.bytes
+            );
         }
     }
 
     fn noise(rng: &mut Rng, len: usize) -> Vec<u8> {
         const ALPHABET: &[u8] = b"_abcxyz019 ,:[]{}'\"#\\*\n\r\t\x02\x03\x07\x0a\x80\xff";
-        (0..len).map(|_| if rng.one_in(3) { ALPHABET[rng.below(ALPHABET.len())] } else { rng.next() as u8 }).collect()
+        (0..len)
+            .map(
+                |_| {
+                    if rng.one_in(3) {
+                        ALPHABET[rng.below(ALPHABET.len())]
+                    } else {
+                        rng.next() as u8
+                    }
+                },
+            )
+            .collect()
     }
 
     /// The word-at-a-time searches against a byte loop, from every offset.
@@ -2621,12 +2744,15 @@ e:
             let len = rng.below(80);
             let bytes = noise(&mut rng, len);
             for at in 0..=bytes.len() {
-                let scalar = |set: &[u8]| (at..bytes.len()).find(|&it| set.contains(&bytes[it])).unwrap_or(bytes.len());
+                let scalar = |set: &[u8]| {
+                    (at..bytes.len()).find(|&it| set.contains(&bytes[it])).unwrap_or(bytes.len())
+                };
                 assert_eq!(find(&bytes, at, [b'\n']), scalar(b"\n"));
                 assert_eq!(find(&bytes, at, [b'\'', b'\n']), scalar(b"'\n"));
                 assert_eq!(find(&bytes, at, [b'"', b'\\', b'\n']), scalar(b"\"\\\n"));
                 assert_eq!(find(&bytes, at, [b',', b']', b'}', b':']), scalar(b",]}:"));
-                let candidates = (at..bytes.len()).find(|&it| candidate(bytes[it])).unwrap_or(bytes.len());
+                let candidates =
+                    (at..bytes.len()).find(|&it| candidate(bytes[it])).unwrap_or(bytes.len());
                 assert_eq!(candidate_at(&bytes, at), candidates, "{bytes:?} from {at}");
             }
         }
@@ -2694,7 +2820,8 @@ e:
         };
         let read_counting = |count: usize| {
             let text = text(count);
-            let (shared, used) = blaze_alloc_count::measure(|| read("x.tbd", &text, Arch::Aarch64, 1));
+            let (shared, used) =
+                blaze_alloc_count::measure(|| read("x.tbd", &text, Arch::Aarch64, 1));
             assert_eq!(shared.unwrap().symbols.len(), count);
             used.allocations
         };

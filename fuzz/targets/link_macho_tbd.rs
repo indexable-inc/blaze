@@ -90,8 +90,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -129,7 +130,8 @@ fn copy_at(data: &[u8], shift: usize) -> (Vec<u8>, usize) {
 /// The named texts, `tbd::tests::edges_match_reference`'s, and texts made as
 /// `differential_seeded` makes them (its generator and seed).
 fn seeds() -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = named().into_iter().map(|(_, _, text)| text.as_bytes().to_vec()).collect();
+    let mut out: Vec<Vec<u8>> =
+        named().into_iter().map(|(_, _, text)| text.as_bytes().to_vec()).collect();
     out.extend(EDGES.iter().map(|text| text.as_bytes().to_vec()));
     let mut rng = Rng(0x7bd5_eed);
     for _ in 0..64 {
@@ -241,7 +243,8 @@ const NAMES: &[&str] = &[
 /// `name` as a scalar: plain when it can be, else quoted one way or the other, with escapes
 /// now and then.
 fn render(rng: &mut Rng, name: &str) -> String {
-    let plain = !name.is_empty() && !name.contains([',', '[', ']', '{', '}', '#', '\'', '"', ':', ' ', '\\']);
+    let plain = !name.is_empty()
+        && !name.contains([',', '[', ']', '{', '}', '#', '\'', '"', ':', ' ', '\\']);
     match rng.below(if plain { 4 } else { 2 }) {
         0 => format!("'{}'", name.replace('\'', "''")),
         1 => {
@@ -345,10 +348,18 @@ fn doc_v4(rng: &mut Rng, out: &mut String, nl: &str, index: usize, count: usize)
         }
         out.push_str(&format!("{key}:{nl}"));
         for _ in 0..1 + rng.below(3) {
-            out.push_str(&format!("  - targets:         [ {} ]{nl}", rng.subset(&targets).join(", ")));
-            for list_key in
-                ["symbols", "weak-symbols", "thread-local-symbols", "objc-classes", "objc-eh-types", "objc-ivars"]
-            {
+            out.push_str(&format!(
+                "  - targets:         [ {} ]{nl}",
+                rng.subset(&targets).join(", ")
+            ));
+            for list_key in [
+                "symbols",
+                "weak-symbols",
+                "thread-local-symbols",
+                "objc-classes",
+                "objc-eh-types",
+                "objc-ivars",
+            ] {
                 if rng.one_in(2) {
                     let items = names_for(rng);
                     list(rng, out, nl, 4, list_key, &items);
@@ -369,7 +380,10 @@ fn doc_v3(rng: &mut Rng, out: &mut String, nl: &str, index: usize, count: usize)
         let uuids: Vec<String> = archs.iter().map(|it| format!("'{it}: 0000-1111'")).collect();
         list(rng, out, nl, 0, "uuids", &uuids);
     }
-    out.push_str(&format!("platform:        {}{nl}", rng.pick(&["macosx", "ios", "iosmac", "zippered"])));
+    out.push_str(&format!(
+        "platform:        {}{nl}",
+        rng.pick(&["macosx", "ios", "iosmac", "zippered"])
+    ));
     out.push_str(&format!("install-name:    {}{nl}", render(rng, &library(index))));
     out.push_str(&format!("exports:{nl}"));
     for _ in 0..1 + rng.below(3) {
@@ -378,8 +392,14 @@ fn doc_v3(rng: &mut Rng, out: &mut String, nl: &str, index: usize, count: usize)
             let libraries = libraries_for(rng, 2, count);
             list(rng, out, nl, 4, "re-exports", &libraries);
         }
-        for list_key in ["symbols", "weak-def-symbols", "thread-local-symbols", "objc-classes", "objc-eh-types", "objc-ivars"]
-        {
+        for list_key in [
+            "symbols",
+            "weak-def-symbols",
+            "thread-local-symbols",
+            "objc-classes",
+            "objc-eh-types",
+            "objc-ivars",
+        ] {
             if rng.one_in(2) {
                 let items = names_for(rng);
                 list(rng, out, nl, 4, list_key, &items);
@@ -413,7 +433,8 @@ fn generate(rng: &mut Rng) -> String {
     }
     if rng.one_in(2) {
         for _ in 0..1 + rng.below(3) {
-            let boundaries: Vec<usize> = (0..=out.len()).filter(|&it| out.is_char_boundary(it)).collect();
+            let boundaries: Vec<usize> =
+                (0..=out.len()).filter(|&it| out.is_char_boundary(it)).collect();
             let at = boundaries[rng.below(boundaries.len())];
             if rng.one_in(2) {
                 const BYTES: &[u8] = b"[]{}'\",:#- \n\tx";
@@ -573,7 +594,11 @@ mod tests {
                 blaze_link::fuzz_read(Format::MachO, arch, SHARED, text.as_bytes()),
                 "seed `{what}` is refused"
             );
-            assert_eq!(blaze_link::fuzz_tbd_differential(text, arch, 1), Ok(true), "seed `{what}`, differential");
+            assert_eq!(
+                blaze_link::fuzz_tbd_differential(text, arch, 1),
+                Ok(true),
+                "seed `{what}`, differential"
+            );
         }
     }
 }

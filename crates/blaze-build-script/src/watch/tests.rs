@@ -9,11 +9,10 @@ use super::*;
 #[test]
 fn nothing_printed_watches_the_whole_package() {
     let watched = watched(&Output::default(), Path::new("/p/foo"));
-    assert_eq!(watched, Watched {
-        paths: vec!["/p/foo".into()],
-        whole_package: true,
-        env: Vec::new()
-    });
+    assert_eq!(
+        watched,
+        Watched { paths: vec!["/p/foo".into()], whole_package: true, env: Vec::new() }
+    );
     // Other directives don't name what the script read.
     let output = Output { cfgs: vec!["foo".into()], ..Output::default() };
     assert!(super::watched(&output, Path::new("/p/foo")).whole_package);
@@ -35,12 +34,15 @@ fn printed_paths_are_made_whole_against_the_package() {
     };
     let watched = watched(&output, Path::new("/p/foo"));
     assert!(!watched.whole_package);
-    assert_eq!(watched.paths, [
-        PathBuf::from("/p/foo/build.rs"),
-        PathBuf::from("/abs/file"),
-        PathBuf::from("/p/foo/src/dir"),
-        PathBuf::from("/p/foo/../shared/x"),
-    ]);
+    assert_eq!(
+        watched.paths,
+        [
+            PathBuf::from("/p/foo/build.rs"),
+            PathBuf::from("/abs/file"),
+            PathBuf::from("/p/foo/src/dir"),
+            PathBuf::from("/p/foo/../shared/x"),
+        ]
+    );
     assert!(watched.env.is_empty());
 }
 
@@ -53,10 +55,10 @@ fn variables_alone() {
         ..Output::default()
     };
     let watched = watched(&output, Path::new("/p/foo"));
-    assert_eq!(watched, Watched { paths: Vec::new(), whole_package: false, env: vec![
-        "FOO".into(),
-        "BAR".into()
-    ] });
+    assert_eq!(
+        watched,
+        Watched { paths: Vec::new(), whole_package: false, env: vec!["FOO".into(), "BAR".into()] }
+    );
 }
 
 #[test]

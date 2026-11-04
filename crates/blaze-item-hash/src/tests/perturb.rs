@@ -95,10 +95,7 @@ pub(super) fn with_dep(main: &str) -> String {
 fn a_change_to_each_crate_input_changes_it() {
     let body = "pub fn f() -> u8 { dep::g() }";
     let base = with_dep(body);
-    differ(
-        &base,
-        &format!("//- /main.rs crate:main deps:dep edition:2018\n{body}\n{DEP}"),
-    );
+    differ(&base, &format!("//- /main.rs crate:main deps:dep edition:2018\n{body}\n{DEP}"));
     differ(&base, &format!("//- /main.rs crate:main deps:dep cfg:x\n{body}\n{DEP}"));
     differ(&base, &with_dep(&format!("#![feature(never_type)]\n{body}")));
     differ(&base, &with_dep(&format!("#![recursion_limit = \"64\"]\n{body}")));

@@ -84,7 +84,10 @@ impl Group {
     /// Whether `clippy::all` (`clippy::default`) has its lints: the groups clippy itself turns
     /// on, which is what a crate's `clippy::all` means.
     pub fn in_all(self) -> bool {
-        matches!(self, Group::Correctness | Group::Complexity | Group::Perf | Group::Style | Group::Suspicious)
+        matches!(
+            self,
+            Group::Correctness | Group::Complexity | Group::Perf | Group::Style | Group::Suspicious
+        )
     }
 }
 

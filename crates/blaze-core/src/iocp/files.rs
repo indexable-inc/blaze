@@ -11,14 +11,16 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_END_OF_FILE_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-        FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo, GetFileAttributesW, GetFileInformationByHandleEx,
-        GetFileSizeEx, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
-        OPEN_EXISTING, ReadFile, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
+        CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_BASIC_INFO, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo,
+        GetFileAttributesW, GetFileInformationByHandleEx, GetFileSizeEx,
+        GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
+        SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
     System::{
         IO::DeviceIoControl,
@@ -106,7 +108,13 @@ pub(super) fn read_whole(wide: &[u16]) -> io::Result<Vec<u8>> {
         // written at most `room` bytes into the `Vec`'s spare room, which is that long, and
         // their count into `got`.
         sys::check(unsafe {
-            ReadFile(raw, bytes.spare_capacity_mut().as_mut_ptr().cast(), room as u32, &mut got, std::ptr::null_mut())
+            ReadFile(
+                raw,
+                bytes.spare_capacity_mut().as_mut_ptr().cast(),
+                room as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            )
         })?;
         // SAFETY: the call wrote `got` bytes, at most `room`, from the start of the spare room.
         unsafe { bytes.set_len(bytes.len() + (got as usize).min(room)) };
@@ -199,8 +207,10 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 fn read_only_of(path: &Path, mode: u32) -> io::Result<bool> {
     let owner = (mode >> 6) & 0o7;
     let shared = owner & 0o5;
-    let keepable =
-        mode & !0o777 == 0 && owner & 0o4 != 0 && (mode >> 3) & 0o7 == shared && mode & 0o7 == shared;
+    let keepable = mode & !0o777 == 0
+        && owner & 0o4 != 0
+        && (mode >> 3) & 0o7 == shared
+        && mode & 0o7 == shared;
     if !keepable {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -278,7 +288,8 @@ fn plain(path: &Path, rights: u32, disposition: u32) -> io::Result<OwnedHandle> 
         )
     };
     // alloc: an error path.
-    sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+    sys::owned(handle)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
 /// The source of a clone opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`), never through a
@@ -301,7 +312,8 @@ fn clone_source(from: &Path) -> io::Result<OwnedHandle> {
         )
     };
     // alloc: an error path.
-    let source = sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", from.display())))?;
+    let source = sys::owned(handle)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", from.display())))?;
     let info = attribute_tag(&source)
         // alloc: an error path.
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", from.display())))?;
@@ -314,7 +326,11 @@ fn clone_source(from: &Path) -> io::Result<OwnedHandle> {
         // alloc: an error path.
         match name_surrogate(tag) {
             true => format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK),
-            false => format!("{} (a reparse point of tag {tag:#x}, no link) {}", from.display(), crate::CLONE_OF_NO_FILE),
+            false => format!(
+                "{} (a reparse point of tag {tag:#x}, no link) {}",
+                from.display(),
+                crate::CLONE_OF_NO_FILE
+            ),
         },
     ))
 }
@@ -367,20 +383,26 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
         )
     };
     // alloc: an error path.
-    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()));
+    let named = |error: io::Error| {
+        io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()))
+    };
     let handle = sys::owned(handle).map_err(named)?;
     let info = attribute_tag(&handle).map_err(named)?;
     let attributes = info.FileAttributes;
     let refused = match () {
         // alloc: an error path.
-        () if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && name_surrogate(info.ReparseTag) => Some(format!(
-            "{} (a symbolic link or junction, tag {:#x}) {}",
-            path.display(),
-            info.ReparseTag,
-            crate::SEAL_THROUGH_A_LINK
-        )),
+        () if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && name_surrogate(info.ReparseTag) => {
+            Some(format!(
+                "{} (a symbolic link or junction, tag {:#x}) {}",
+                path.display(),
+                info.ReparseTag,
+                crate::SEAL_THROUGH_A_LINK
+            ))
+        }
         // alloc: an error path.
-        () if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 => Some(format!("{} (a directory) {}", path.display(), crate::SEAL_OF_NO_FILE)),
+        () if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 => {
+            Some(format!("{} (a directory) {}", path.display(), crate::SEAL_OF_NO_FILE))
+        }
         () => None,
     };
     if let Some(refused) = refused {
@@ -442,8 +464,14 @@ fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
     Ok((String::from_utf16_lossy(&name[..len]), flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0))
 }
 
-fn control<T, U>(handle: &OwnedHandle, code: u32, input: Option<&T>, output: Option<&mut U>) -> io::Result<()> {
-    let (in_ptr, in_len) = input.map_or((std::ptr::null(), 0), |it| ((it as *const T).cast(), size_of::<T>()));
+fn control<T, U>(
+    handle: &OwnedHandle,
+    code: u32,
+    input: Option<&T>,
+    output: Option<&mut U>,
+) -> io::Result<()> {
+    let (in_ptr, in_len) =
+        input.map_or((std::ptr::null(), 0), |it| ((it as *const T).cast(), size_of::<T>()));
     let (out_ptr, out_len) =
         output.map_or((std::ptr::null_mut(), 0), |it| ((it as *mut U).cast(), size_of::<U>()));
     let mut returned = 0;
@@ -532,11 +560,13 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     }
     cloned.map_err(|error: io::Error| {
         // alloc: an error path.
-        io::Error::new(error.kind(), format!("cloning {} to {}: {error}", from.display(), to.display()))
+        io::Error::new(
+            error.kind(),
+            format!("cloning {} to {}: {error}", from.display(), to.display()),
+        )
     })
 }
 
 // The whole file mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix. Windows
 // refuses to replace or cut a file a view of which is open.
 pub(crate) use crate::fs::map;
-

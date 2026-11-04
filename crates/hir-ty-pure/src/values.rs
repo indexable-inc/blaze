@@ -18,7 +18,6 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_ty::{
     MemoryMap, PointerCast,
     db::HirDatabase,
@@ -37,6 +36,7 @@ use hir_ty_mir::mir::{
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     Abs,

@@ -96,7 +96,12 @@ impl History {
     /// As [`History::new`].
     pub fn with_estimates(config: Config, mut estimates: Estimates) -> History {
         estimates.unseen = config.unseen_bytes;
-        History { estimates, times: Times::default(), keys: Writer::new(config.slots), unseen_ns: config.unseen_ns }
+        History {
+            estimates,
+            times: Times::default(),
+            keys: Writer::new(config.slots),
+            unseen_ns: config.unseen_ns,
+        }
     }
 
     /// What a task of `kind` with `key` is predicted to take: its key's record where there is
@@ -104,7 +109,10 @@ impl History {
     /// are of one unit.
     pub fn predict(&self, kind: TaskKind, key: Option<&Key>) -> Prediction {
         if let Some(record) = key.and_then(|key| self.keys.get(kind, key)) {
-            return Prediction { cost: Some(record.ran_us().saturating_mul(1000)), peak: record.peak };
+            return Prediction {
+                cost: Some(record.ran_us().saturating_mul(1000)),
+                peak: record.peak,
+            };
         }
         let cost = self.times.get(kind).map_or(self.unseen_ns, |it| it.mean_ns);
         Prediction { cost: Some(cost), peak: self.estimates.predict(kind) }

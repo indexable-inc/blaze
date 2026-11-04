@@ -23,10 +23,8 @@ const IANA_TLDS_TXT: &str = include_str!("tlds-alpha-by-domain.txt");
 /// front so the shrink target is `.com`. Mirrors
 /// `hypothesis.provisional.get_top_level_domains`.
 static TOP_LEVEL_DOMAINS: Lazy<Vec<&'static str>> = Lazy::new(|| {
-    let mut sorted: Vec<&'static str> = IANA_TLDS_TXT
-        .lines()
-        .filter(|line| !line.starts_with('#') && *line != "ARPA")
-        .collect();
+    let mut sorted: Vec<&'static str> =
+        IANA_TLDS_TXT.lines().filter(|line| !line.starts_with('#') && *line != "ARPA").collect();
     sorted.sort_by_key(|s| s.len());
     let mut result = Vec::with_capacity(sorted.len() + 1);
     result.push("COM");
@@ -91,20 +89,14 @@ impl DomainSpec {
                 "domain max_length={max_length} exceeds the RFC 1035 limit of 255"
             )));
         }
-        let eligible_tlds: Vec<&'static str> = TOP_LEVEL_DOMAINS
-            .iter()
-            .copied()
-            .filter(|tld| tld.len() + 2 <= max_length)
-            .collect();
+        let eligible_tlds: Vec<&'static str> =
+            TOP_LEVEL_DOMAINS.iter().copied().filter(|tld| tld.len() + 2 <= max_length).collect();
         if eligible_tlds.is_empty() {
             return Err(EngineError::InvalidArgument(format!(
                 "domain max_length={max_length} leaves no eligible TLDs"
             )));
         }
-        Ok(DomainSpec {
-            max_length,
-            eligible_tlds,
-        })
+        Ok(DomainSpec { max_length, eligible_tlds })
     }
 }
 
@@ -113,10 +105,7 @@ impl DomainSpec {
 /// deferred to the first draw that reads the spec.
 static FULL_LENGTH_DOMAIN: Lazy<Result<DomainSpec, InternalError>> = Lazy::new(|| {
     let spec = DomainSpec::new(255).ok();
-    Ok(hegel_internal_unwrap!(
-        spec,
-        "the full-length domain spec failed to build"
-    ))
+    Ok(hegel_internal_unwrap!(spec, "the full-length domain spec failed to build"))
 });
 
 /// Draw an RFC 1035 fully-qualified domain name.
@@ -185,11 +174,7 @@ fn draw_dns_label<D: Draws>(d: &mut D, max_len: usize) -> Result<String, EngineE
     if len > 1 {
         for i in 1..(len - 1) {
             let avoid_dash = i == 3 && s.as_bytes()[2] == b'-';
-            s.push(if avoid_dash {
-                draw_ascii_alnum(d)?
-            } else {
-                draw_ascii_alnum_or_hyphen(d)?
-            });
+            s.push(if avoid_dash { draw_ascii_alnum(d)? } else { draw_ascii_alnum_or_hyphen(d)? });
         }
         s.push(draw_ascii_alnum(d)?);
     }
@@ -259,11 +244,7 @@ pub(crate) fn generate_email<D: Draws>(d: &mut D) -> Result<String, EngineError>
 ///     `text(string.printable)` value.
 ///   - `fragment` is empty or `#…` of url-encoded chars in `0..=255`.
 pub(crate) fn generate_url<D: Draws>(d: &mut D) -> Result<String, EngineError> {
-    let scheme = if d.weighted(0.5, None)? {
-        "https"
-    } else {
-        "http"
-    };
+    let scheme = if d.weighted(0.5, None)? { "https" } else { "http" };
 
     let domain_spec = FULL_LENGTH_DOMAIN.as_ref().map_err(Clone::clone)?;
     let domain = generate_domain(d, domain_spec)?;
@@ -302,10 +283,7 @@ pub(crate) fn generate_url<D: Draws>(d: &mut D) -> Result<String, EngineError> {
 /// `%XX` where `XX` is the codepoint in uppercase hex.
 fn is_url_safe(c: char) -> bool {
     c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '$' | '-' | '_' | '.' | '+' | '!' | '*' | '\'' | '(' | ')' | ',' | '~'
-        )
+        || matches!(c, '$' | '-' | '_' | '.' | '+' | '!' | '*' | '\'' | '(' | ')' | ',' | '~')
 }
 
 /// `FRAGMENT_SAFE_CHARACTERS = URL_SAFE_CHARACTERS | {"?", "/"}`.

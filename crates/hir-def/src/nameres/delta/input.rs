@@ -88,7 +88,9 @@ fn key_is_current(db: &Db, state: &CrateState, group: ModuleId) -> bool {
         at = parent;
     }
     chain.iter().rev().all(|&(parent, child)| {
-        queries::module_decls(db, state.groups[&parent].key).children.contains(&state.groups[&child].key)
+        queries::module_decls(db, state.groups[&parent].key)
+            .children
+            .contains(&state.groups[&child].key)
     })
 }
 
@@ -110,7 +112,9 @@ fn incremental(
     // A written file no module is defined in may be one an `include!` read (`include_readers`).
     let unknown = |file: &FileId| !state.files.contains_key(file);
     if written.set.iter().any(unknown) || !written.included.is_empty() {
-        checked.extend(state.groups.iter().filter(|(_, g)| g.out.uses_include).map(|(&group, _)| group));
+        checked.extend(
+            state.groups.iter().filter(|(_, g)| g.out.uses_include).map(|(&group, _)| group),
+        );
     }
     for file in written.set {
         if let Some(groups) = state.other_files.get(file) {
@@ -144,7 +148,9 @@ fn incremental(
         }
         for child in &decls.children {
             let decl = child.decl(db);
-            if matches!(decl.tree.file_id(), HirFileId::MacroFile(_)) && !checked.contains(&decl.module) {
+            if matches!(decl.tree.file_id(), HirFileId::MacroFile(_))
+                && !checked.contains(&decl.module)
+            {
                 checked.push(decl.module);
             }
         }
@@ -168,7 +174,14 @@ fn incremental(
 }
 
 /// The whole round-0 tree from `root_key`, in DFS preorder: the new group order.
-fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_>, cold: bool, delta: &mut Delta) {
+fn walk(
+    db: &Db,
+    state: &mut CrateState,
+    root_key: DeclKey,
+    written: &Written<'_>,
+    cold: bool,
+    delta: &mut Delta,
+) {
     delta.tree = true;
     decls_ahead(db, root_key);
     let mut old = std::mem::take(&mut state.groups);
@@ -244,7 +257,10 @@ fn decls_ahead(db: &Db, root_key: DeclKey) {
         let keys = &depth[..];
         db.run_all(Tag::Nameres, keys.len(), |db, at| _ = queries::module_decls(db, keys[at]));
         // alloc: the next depth, once per depth of a walk
-        depth = keys.iter().flat_map(|&key| queries::module_decls(db, key).children.iter().copied()).collect();
+        depth = keys
+            .iter()
+            .flat_map(|&key| queries::module_decls(db, key).children.iter().copied())
+            .collect();
     }
 }
 
@@ -286,7 +302,9 @@ fn writes_root(root: ModuleId, log: &[DeclOp]) -> bool {
 /// A run that makes what was published sets nothing, so the crate's readers stay as they were.
 fn expansion_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delta) {
     for (&group, g) in &state.groups {
-        if g.out.expansion_files.iter().any(|it| written.set.contains(it)) && !delta.seeds.contains(&group) {
+        if g.out.expansion_files.iter().any(|it| written.set.contains(it))
+            && !delta.seeds.contains(&group)
+        {
             delta.seeds.push(group);
             delta.removing.push(group);
         }

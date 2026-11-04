@@ -16,7 +16,9 @@ use syntax::{
     view::{self as ast, AstNode as _, HasArgList as _},
 };
 
-use super::missing_match_arms::{DefinedHere, adt_fact, all_chars, const_like_binding, joined, plural};
+use super::missing_match_arms::{
+    DefinedHere, adt_fact, all_chars, const_like_binding, joined, plural,
+};
 use crate::{
     cx::Cx,
     lints::code_fact,
@@ -37,16 +39,23 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::NonExhaustiveLet<'db>) -> Ve
     let in_statement = matches!(d.origin, BindingOrigin::Let | BindingOrigin::Assignment);
 
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(Some("E0005"), format!("refutable pattern in {origin}"), span.clone());
+    let mut diag =
+        Diag::error(Some("E0005"), format!("refutable pattern in {origin}"), span.clone());
     let count = d.witnesses.len();
     // alloc: clone: the error's parts, for an error hir found
-    diag.span_label(span.clone(), format!("pattern{} {} not covered", plural(count), joined(&d.witnesses)));
+    diag.span_label(
+        span.clone(),
+        format!("pattern{} {} not covered", plural(count), joined(&d.witnesses)),
+    );
     if in_statement {
         diag.note("`let` bindings require an \"irrefutable pattern\", like a `struct` or an `enum` with only one variant");
-        diag.note("for more information, visit https://doc.rust-lang.org/book/ch19-02-refutability.html");
+        diag.note(
+            "for more information, visit https://doc.rust-lang.org/book/ch19-02-refutability.html",
+        );
     }
 
-    let constant = d.interpreted_as_const.and_then(|konst| const_like_binding(cx, pat.value, konst));
+    let constant =
+        d.interpreted_as_const.and_then(|konst| const_like_binding(cx, pat.value, konst));
     if let Some((name, def)) = &constant {
         diag.span_label(
             // clone: the error's parts, for an error hir found
@@ -132,13 +141,17 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::NonExhaustiveLet<'db>) -> Ve
 /// rustc's span of the statement the pattern is of, and whether the pattern binds anything
 /// (`each_binding`). A `let`'s runs from `let` (or `super`) to the end of its initializer; an
 /// assignment's is the whole assignment, which rustc lowers to a `let`.
-fn statement<'db>(cx: &Cx<'_, 'db>, pat: Either<ast::Expr<'db>, ast::Pat<'db>>) -> Option<(TextRange, bool)> {
+fn statement<'db>(
+    cx: &Cx<'_, 'db>,
+    pat: Either<ast::Expr<'db>, ast::Pat<'db>>,
+) -> Option<(TextRange, bool)> {
     match pat {
         Either::Right(pat) => {
             let stmt = pat.syntax().parent().and_then(ast::LetStmt::cast)?;
             let init = stmt.initializer()?;
             let keyword = stmt.super_token().or_else(|| stmt.let_token());
-            let lo = keyword.map_or(stmt.syntax().text_range().start(), |it| it.text_range().start());
+            let lo =
+                keyword.map_or(stmt.syntax().text_range().start(), |it| it.text_range().start());
             let hi = init.syntax().text_range().end();
             let binds = pat
                 .syntax()
@@ -162,7 +175,9 @@ fn assignee_binds<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> bool {
         ast::Expr::ParenExpr(it) => it.expr().is_some_and(|it| assignee_binds(cx, it)),
         ast::Expr::TupleExpr(it) => it.fields().any(|it| assignee_binds(cx, it)),
         ast::Expr::ArrayExpr(it) => it.exprs().any(|it| assignee_binds(cx, it)),
-        ast::Expr::CallExpr(it) => it.arg_list().is_some_and(|args| args.args().any(|it| assignee_binds(cx, it))),
+        ast::Expr::CallExpr(it) => {
+            it.arg_list().is_some_and(|args| args.args().any(|it| assignee_binds(cx, it)))
+        }
         ast::Expr::RecordExpr(it) => it.record_expr_field_list().is_some_and(|list| {
             list.fields().any(|field| field.expr().is_none_or(|it| assignee_binds(cx, it)))
         }),
@@ -175,7 +190,9 @@ fn assignee_binds<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> bool {
 fn is_unit_ctor<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> bool {
     match cx.vsema.resolve_path(path) {
         Some(PathResolution::Def(ModuleDef::EnumVariant(it))) => it.kind(cx.db) == StructKind::Unit,
-        Some(PathResolution::Def(ModuleDef::Adt(Adt::Struct(it)))) => it.kind(cx.db) == StructKind::Unit,
+        Some(PathResolution::Def(ModuleDef::Adt(Adt::Struct(it)))) => {
+            it.kind(cx.db) == StructKind::Unit
+        }
         _ => false,
     }
 }

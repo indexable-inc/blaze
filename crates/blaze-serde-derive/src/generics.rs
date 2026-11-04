@@ -33,18 +33,31 @@ pub(crate) fn parse(item: &str, tokens: Vec<TokenTree>) -> Result<Generics, Erro
                 if name == "'de" {
                     return Err(Error::new(
                         quote.span(),
-                        format!("`{item}` ({}): a lifetime named `'de` is the one the derived `Deserialize<'de>` takes", at(quote.span())),
+                        format!(
+                            "`{item}` ({}): a lifetime named `'de` is the one the derived `Deserialize<'de>` takes",
+                            at(quote.span())
+                        ),
                     ));
                 }
                 Param::Lifetime { name, decl: piece.iter().cloned().collect() }
             }
-            [TokenTree::Ident(keyword), TokenTree::Ident(ident), ..] if keyword.to_string() == "const" => {
+            [TokenTree::Ident(keyword), TokenTree::Ident(ident), ..]
+                if keyword.to_string() == "const" =>
+            {
                 Param::Const { ident: ident.clone(), decl: before_default(&piece) }
             }
-            [TokenTree::Ident(ident), ..] => Param::Type { ident: ident.clone(), decl: before_default(&piece) },
+            [TokenTree::Ident(ident), ..] => {
+                Param::Type { ident: ident.clone(), decl: before_default(&piece) }
+            }
             _ => {
                 let span = piece.first().map_or_else(proc_macro::Span::call_site, TokenTree::span);
-                return Err(Error::new(span, format!("`{item}` ({}): a generic parameter blaze-serde-derive does not read", at(span))));
+                return Err(Error::new(
+                    span,
+                    format!(
+                        "`{item}` ({}): a generic parameter blaze-serde-derive does not read",
+                        at(span)
+                    ),
+                ));
             }
         };
         params.push(param);
@@ -90,7 +103,9 @@ impl Generics {
         }
         for param in &self.params {
             match param {
-                Param::Lifetime { decl, .. } | Param::Type { decl, .. } | Param::Const { decl, .. } => {
+                Param::Lifetime { decl, .. }
+                | Param::Type { decl, .. }
+                | Param::Const { decl, .. } => {
                     out.tokens(decl).s(",");
                 }
             }
@@ -157,7 +172,9 @@ fn collect_lifetimes(ty: &TokenStream, out: &mut Vec<String>) {
 /// input without `#[serde(borrow)]`.
 pub(crate) fn implicit_borrow(ty: &TokenStream) -> Option<String> {
     let tokens: Vec<TokenTree> = ty.clone().into_iter().collect();
-    let [TokenTree::Punct(amp), TokenTree::Punct(quote), TokenTree::Ident(lifetime), inner] = tokens.as_slice() else {
+    let [TokenTree::Punct(amp), TokenTree::Punct(quote), TokenTree::Ident(lifetime), inner] =
+        tokens.as_slice()
+    else {
         return None;
     };
     if amp.as_char() != '&' || quote.as_char() != '\'' {
@@ -165,7 +182,10 @@ pub(crate) fn implicit_borrow(ty: &TokenStream) -> Option<String> {
     }
     let borrows = match inner {
         TokenTree::Ident(ident) => ident.to_string() == "str",
-        TokenTree::Group(group) => group.delimiter() == Delimiter::Bracket && group.stream().to_string().replace(' ', "") == "u8",
+        TokenTree::Group(group) => {
+            group.delimiter() == Delimiter::Bracket
+                && group.stream().to_string().replace(' ', "") == "u8"
+        }
         _ => false,
     };
     let name = format!("'{lifetime}");

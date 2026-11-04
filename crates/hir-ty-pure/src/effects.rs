@@ -219,8 +219,12 @@ pub const PURE: EffectDef = EffectDef {
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
 /// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`).
-pub const EFFECTS: &[&EffectDef] =
-    &[&PURE, &crate::effect_attrs::NOPANIC, &crate::effect_attrs::NOALLOC, &crate::effect_attrs::NONBLOCKING];
+pub const EFFECTS: &[&EffectDef] = &[
+    &PURE,
+    &crate::effect_attrs::NOPANIC,
+    &crate::effect_attrs::NOALLOC,
+    &crate::effect_attrs::NONBLOCKING,
+];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's
 /// `nopanic` without overflow checks) is the same effect.
@@ -231,7 +235,11 @@ pub fn effect_index(effect: &EffectDef) -> Option<usize> {
 /// Why `func` is trusted for `effect`, if it is: its own `trusted = ".."`, or the one of the
 /// trait whose method it is or implements (a door: every impl's method of the trait, and every
 /// call of it through `dyn`). The trait it came through, for the latter.
-pub(crate) fn trusted(db: &Db, func: FunctionId, effect: &EffectDef) -> Option<(Symbol, Option<TraitId>)> {
+pub(crate) fn trusted(
+    db: &Db,
+    func: FunctionId,
+    effect: &EffectDef,
+) -> Option<(Symbol, Option<TraitId>)> {
     if let Some(PureAttr::Trusted(why)) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some((why, None));
     }
@@ -262,16 +270,77 @@ pub(crate) fn deterministic_foreign(symbol: &str) -> bool {
     const PREFIXES: &[&str] = &["__rust_", "__rdl_", "__rg_"];
     const MEMORY: &[&str] = &["memcpy", "memmove", "memset", "memcmp", "bcmp", "strlen"];
     const LIBM: &[&str] = &[
-        "acos", "asin", "atan", "atan2", "cbrt", "ceil", "cos", "cosh", "exp", "exp2", "expm1",
-        "fabs", "fdim", "floor", "fma", "fmax", "fmin", "fmod", "hypot", "log", "log10", "log1p",
-        "log2", "pow", "round", "sin", "sinh", "sqrt", "tan", "tanh", "tgamma", "lgamma_r", "trunc",
-        "erf", "erfc", "ldexp", "frexp", "nextafter", "remainder",
+        "acos",
+        "asin",
+        "atan",
+        "atan2",
+        "cbrt",
+        "ceil",
+        "cos",
+        "cosh",
+        "exp",
+        "exp2",
+        "expm1",
+        "fabs",
+        "fdim",
+        "floor",
+        "fma",
+        "fmax",
+        "fmin",
+        "fmod",
+        "hypot",
+        "log",
+        "log10",
+        "log1p",
+        "log2",
+        "pow",
+        "round",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+        "tgamma",
+        "lgamma_r",
+        "trunc",
+        "erf",
+        "erfc",
+        "ldexp",
+        "frexp",
+        "nextafter",
+        "remainder",
     ];
     const MACHINE: &[&str] = &[
-        "rdtsc", "rdpmc", "rdpid", "rdpru", "rdrand", "rdseed", "rndr", "irg", "readcyclecounter",
-        "readsteadycounter", "xgetbv", "xsave", "xrstor", "mxcsr", "fpcr", "fpsr", "fpenv",
-        "rounding", "flags.read", "flags.write", "read_register", "write_register", "fsbase",
-        "gsbase", "pkru", "rdssp", "address", "thread.pointer", "stacksave", "sponentry",
+        "rdtsc",
+        "rdpmc",
+        "rdpid",
+        "rdpru",
+        "rdrand",
+        "rdseed",
+        "rndr",
+        "irg",
+        "readcyclecounter",
+        "readsteadycounter",
+        "xgetbv",
+        "xsave",
+        "xrstor",
+        "mxcsr",
+        "fpcr",
+        "fpsr",
+        "fpenv",
+        "rounding",
+        "flags.read",
+        "flags.write",
+        "read_register",
+        "write_register",
+        "fsbase",
+        "gsbase",
+        "pkru",
+        "rdssp",
+        "address",
+        "thread.pointer",
+        "stacksave",
+        "sponentry",
     ];
     if PREFIXES.iter().any(|it| symbol.starts_with(it)) || MEMORY.contains(&symbol) {
         return true;
@@ -302,22 +371,57 @@ pub(crate) struct Modeled {
     pub(crate) from_workspace: bool,
 }
 
-const fn row(home: Home, what: &'static str, site: Site, kinds: EffectSet, does: &'static str) -> Modeled {
-    Modeled { home, what, site, kinds, covers: PURE_REFUSES.union(kinds), does, only: Only::All, from_workspace: false }
+const fn row(
+    home: Home,
+    what: &'static str,
+    site: Site,
+    kinds: EffectSet,
+    does: &'static str,
+) -> Modeled {
+    Modeled {
+        home,
+        what,
+        site,
+        kinds,
+        covers: PURE_REFUSES.union(kinds),
+        does,
+        only: Only::All,
+        from_workspace: false,
+    }
 }
 
 const fn std_fn(what: &'static str, path: Path, rule: Rule, does: &'static str) -> Modeled {
     row(Home::Std, what, Site::Fn(path), EffectSet::one(rule), does)
 }
 
-const fn std_method(what: &'static str, ty: Path, name: &'static str, rule: Rule, does: &'static str) -> Modeled {
+const fn std_method(
+    what: &'static str,
+    ty: Path,
+    name: &'static str,
+    rule: Rule,
+    does: &'static str,
+) -> Modeled {
     row(Home::Std, what, Site::Inherent { ty, name }, EffectSet::one(rule), does)
 }
 
 /// The effects lane's row of a toolchain function that may block: it adds `kinds` at the call
 /// and covers only them, so what else its body does is followed as any call's.
-const fn block_row(what: &'static str, site: Site, kinds: EffectSet, does: &'static str) -> Modeled {
-    Modeled { home: Home::Std, what, site, kinds, covers: kinds, does, only: Only::All, from_workspace: false }
+const fn block_row(
+    what: &'static str,
+    site: Site,
+    kinds: EffectSet,
+    does: &'static str,
+) -> Modeled {
+    Modeled {
+        home: Home::Std,
+        what,
+        site,
+        kinds,
+        covers: kinds,
+        does,
+        only: Only::All,
+        from_workspace: false,
+    }
 }
 
 /// A std lock, condvar, channel or sleep: [`Rule::Thread`] (what purity says of std::sync's
@@ -330,7 +434,13 @@ const INIT: EffectSet = EffectSet::one(Rule::Block);
 const IO_WAIT: EffectSet = EffectSet::of(&[Rule::Io, Rule::Block]);
 const SLEEPS: EffectSet = WAITS;
 
-const fn wait_method(what: &'static str, ty: Path, name: &'static str, kinds: EffectSet, does: &'static str) -> Modeled {
+const fn wait_method(
+    what: &'static str,
+    ty: Path,
+    name: &'static str,
+    kinds: EffectSet,
+    does: &'static str,
+) -> Modeled {
     block_row(what, Site::Inherent { ty, name }, kinds, does)
 }
 
@@ -353,41 +463,109 @@ pub(crate) const MODELS: &[Modeled] = &[
     std_fn("std::env::args", &["env", "args"], ENV, "reads the program's arguments"),
     std_fn("std::env::args_os", &["env", "args_os"], ENV, "reads the program's arguments"),
     std_fn("std::env::current_dir", &["env", "current_dir"], ENV, "reads the working directory"),
-    std_fn("std::env::set_current_dir", &["env", "set_current_dir"], ENV, "changes the working directory"),
+    std_fn(
+        "std::env::set_current_dir",
+        &["env", "set_current_dir"],
+        ENV,
+        "changes the working directory",
+    ),
     std_fn("std::env::current_exe", &["env", "current_exe"], ENV, "reads the program's path"),
     std_fn("std::env::home_dir", &["env", "home_dir"], ENV, "reads the environment"),
     std_fn("std::env::temp_dir", &["env", "temp_dir"], ENV, "reads the environment"),
     std_fn("std::env::set_var", &["env", "set_var"], ENV, "changes the environment"),
     std_fn("std::env::remove_var", &["env", "remove_var"], ENV, "changes the environment"),
     std_fn("std::process::id", &["process", "id"], ENV, "reads the process id"),
-    std_method("std::time::Instant::now", &["time", "Instant"], "now", Rule::Clock, "reads the clock"),
-    std_method("std::time::SystemTime::now", &["time", "SystemTime"], "now", Rule::Clock, "reads the clock"),
+    std_method(
+        "std::time::Instant::now",
+        &["time", "Instant"],
+        "now",
+        Rule::Clock,
+        "reads the clock",
+    ),
+    std_method(
+        "std::time::SystemTime::now",
+        &["time", "SystemTime"],
+        "now",
+        Rule::Clock,
+        "reads the clock",
+    ),
     std_fn("std::thread::spawn", &["thread", "spawn"], THREAD, "starts a thread"),
-    row(Home::Std, "std::thread::scope", Site::Fn(&["thread", "scope"]), SLEEPS, "starts threads and waits for them"),
-    std_method("std::thread::Builder::spawn", &["thread", "Builder"], "spawn", THREAD, "starts a thread"),
-    std_method("std::thread::Builder::spawn_scoped", &["thread", "Builder"], "spawn_scoped", THREAD, "starts a thread"),
-    row(Home::Std, "std::thread::JoinHandle::join", Site::Inherent { ty: &["thread", "JoinHandle"], name: "join" }, SLEEPS, "waits for a thread"),
+    row(
+        Home::Std,
+        "std::thread::scope",
+        Site::Fn(&["thread", "scope"]),
+        SLEEPS,
+        "starts threads and waits for them",
+    ),
+    std_method(
+        "std::thread::Builder::spawn",
+        &["thread", "Builder"],
+        "spawn",
+        THREAD,
+        "starts a thread",
+    ),
+    std_method(
+        "std::thread::Builder::spawn_scoped",
+        &["thread", "Builder"],
+        "spawn_scoped",
+        THREAD,
+        "starts a thread",
+    ),
+    row(
+        Home::Std,
+        "std::thread::JoinHandle::join",
+        Site::Inherent { ty: &["thread", "JoinHandle"], name: "join" },
+        SLEEPS,
+        "waits for a thread",
+    ),
     row(Home::Std, "std::thread::sleep", Site::Fn(&["thread", "sleep"]), SLEEPS, "sleeps"),
     row(Home::Std, "std::thread::park", Site::Fn(&["thread", "park"]), SLEEPS, "parks the thread"),
-    row(Home::Std, "std::thread::park_timeout", Site::Fn(&["thread", "park_timeout"]), SLEEPS, "parks the thread"),
+    row(
+        Home::Std,
+        "std::thread::park_timeout",
+        Site::Fn(&["thread", "park_timeout"]),
+        SLEEPS,
+        "parks the thread",
+    ),
     std_fn("std::thread::yield_now", &["thread", "yield_now"], THREAD, "yields the thread"),
     std_fn("std::thread::current", &["thread", "current"], THREAD, "reads the current thread"),
-    std_fn("std::thread::panicking", &["thread", "panicking"], THREAD, "reads whether the thread is panicking"),
+    std_fn(
+        "std::thread::panicking",
+        &["thread", "panicking"],
+        THREAD,
+        "reads whether the thread is panicking",
+    ),
     std_fn(
         "std::thread::available_parallelism",
         &["thread", "available_parallelism"],
         ENV,
         "reads how many threads the machine runs",
     ),
-    std_method("std::hash::RandomState::new", &["hash", "RandomState"], "new", Rule::Random, "makes a random seed"),
+    std_method(
+        "std::hash::RandomState::new",
+        &["hash", "RandomState"],
+        "new",
+        Rule::Random,
+        "makes a random seed",
+    ),
     row(
         Home::Std,
         "<std::hash::RandomState as Default>",
-        Site::Impls { trait_: (Home::Core, &["default", "Default"]), ty: SelfTy::Adt(Home::Std, &["hash", "RandomState"]), methods: &[] },
+        Site::Impls {
+            trait_: (Home::Core, &["default", "Default"]),
+            ty: SelfTy::Adt(Home::Std, &["hash", "RandomState"]),
+            methods: &[],
+        },
         EffectSet::one(Rule::Random),
         "makes a random seed",
     ),
-    row(Home::Core, "core::fmt::pointer_fmt_inner", Site::Fn(&["fmt", "pointer_fmt_inner"]), ADDRESS, "formats an address"),
+    row(
+        Home::Core,
+        "core::fmt::pointer_fmt_inner",
+        Site::Fn(&["fmt", "pointer_fmt_inner"]),
+        ADDRESS,
+        "formats an address",
+    ),
     row(
         Home::Core,
         "core::fmt::wide_pointer_fmt_inner",
@@ -405,7 +583,11 @@ pub(crate) const MODELS: &[Modeled] = &[
     row(
         Home::Core,
         "<*const T as PartialOrd>",
-        Site::Impls { trait_: (Home::Core, &["cmp", "PartialOrd"]), ty: SelfTy::RawPtr, methods: &[] },
+        Site::Impls {
+            trait_: (Home::Core, &["cmp", "PartialOrd"]),
+            ty: SelfTy::RawPtr,
+            methods: &[],
+        },
         ADDRESS,
         "orders pointers by their addresses",
     ),
@@ -416,7 +598,13 @@ pub(crate) const MODELS: &[Modeled] = &[
         ADDRESS,
         "orders pointers by their addresses",
     ),
-    own(row(Home::Core, "<*const T>::addr", Site::Prim { prim: Prim::RawPtr, name: "addr" }, ADDRESS, GIVES_ADDRESS)),
+    own(row(
+        Home::Core,
+        "<*const T>::addr",
+        Site::Prim { prim: Prim::RawPtr, name: "addr" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
     own(row(
         Home::Core,
         "<*const T>::expose_provenance",
@@ -424,10 +612,34 @@ pub(crate) const MODELS: &[Modeled] = &[
         ADDRESS,
         GIVES_ADDRESS,
     )),
-    own(row(Home::Core, "<*const T>::align_offset", Site::Prim { prim: Prim::RawPtr, name: "align_offset" }, ADDRESS, GIVES_ADDRESS)),
-    own(row(Home::Core, "<*const T>::is_aligned", Site::Prim { prim: Prim::RawPtr, name: "is_aligned" }, ADDRESS, GIVES_ADDRESS)),
-    own(row(Home::Core, "<*const T>::is_aligned_to", Site::Prim { prim: Prim::RawPtr, name: "is_aligned_to" }, ADDRESS, GIVES_ADDRESS)),
-    own(row(Home::Core, "core::ptr::NonNull::addr", Site::Inherent { ty: &["ptr", "NonNull"], name: "addr" }, ADDRESS, GIVES_ADDRESS)),
+    own(row(
+        Home::Core,
+        "<*const T>::align_offset",
+        Site::Prim { prim: Prim::RawPtr, name: "align_offset" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
+    own(row(
+        Home::Core,
+        "<*const T>::is_aligned",
+        Site::Prim { prim: Prim::RawPtr, name: "is_aligned" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
+    own(row(
+        Home::Core,
+        "<*const T>::is_aligned_to",
+        Site::Prim { prim: Prim::RawPtr, name: "is_aligned_to" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
+    own(row(
+        Home::Core,
+        "core::ptr::NonNull::addr",
+        Site::Inherent { ty: &["ptr", "NonNull"], name: "addr" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
     own(row(
         Home::Core,
         "core::ptr::NonNull::expose_provenance",
@@ -442,8 +654,20 @@ pub(crate) const MODELS: &[Modeled] = &[
         ADDRESS,
         GIVES_ADDRESS,
     )),
-    own(row(Home::Core, "core::ptr::NonNull::is_aligned", Site::Inherent { ty: &["ptr", "NonNull"], name: "is_aligned" }, ADDRESS, GIVES_ADDRESS)),
-    own(row(Home::Core, "<[T]>::align_to", Site::Prim { prim: Prim::Slice, name: "align_to" }, ADDRESS, "splits a slice where its address is aligned")),
+    own(row(
+        Home::Core,
+        "core::ptr::NonNull::is_aligned",
+        Site::Inherent { ty: &["ptr", "NonNull"], name: "is_aligned" },
+        ADDRESS,
+        GIVES_ADDRESS,
+    )),
+    own(row(
+        Home::Core,
+        "<[T]>::align_to",
+        Site::Prim { prim: Prim::Slice, name: "align_to" },
+        ADDRESS,
+        "splits a slice where its address is aligned",
+    )),
     own(row(
         Home::Core,
         "<[T]>::align_to_mut",
@@ -454,39 +678,230 @@ pub(crate) const MODELS: &[Modeled] = &[
     // The effects lane's rows: what blocks (docs/v2/plan/lanes/effects.md).
     block_row("std::thread::sleep_ms", Site::Fn(&["thread", "sleep_ms"]), SLEEPS, "sleeps"),
     block_row("std::thread::sleep_until", Site::Fn(&["thread", "sleep_until"]), SLEEPS, "sleeps"),
-    block_row("std::thread::park_timeout_ms", Site::Fn(&["thread", "park_timeout_ms"]), SLEEPS, "parks the thread"),
+    block_row(
+        "std::thread::park_timeout_ms",
+        Site::Fn(&["thread", "park_timeout_ms"]),
+        SLEEPS,
+        "parks the thread",
+    ),
     wait_method("std::sync::Mutex::lock", &["sync", "Mutex"], "lock", WAITS, "waits for the lock"),
-    wait_method("std::sync::RwLock::read", &["sync", "RwLock"], "read", WAITS, "waits for the lock"),
-    wait_method("std::sync::RwLock::write", &["sync", "RwLock"], "write", WAITS, "waits for the lock"),
-    wait_method("std::sync::ReentrantLock::lock", &["sync", "ReentrantLock"], "lock", WAITS, "waits for the lock"),
-    wait_method("std::sync::Condvar::wait", &["sync", "Condvar"], "wait", WAITS, "waits on a condition variable"),
-    wait_method("std::sync::Condvar::wait_while", &["sync", "Condvar"], "wait_while", WAITS, "waits on a condition variable"),
-    wait_method("std::sync::Condvar::wait_timeout", &["sync", "Condvar"], "wait_timeout", WAITS, "waits on a condition variable"),
-    wait_method("std::sync::Condvar::wait_timeout_ms", &["sync", "Condvar"], "wait_timeout_ms", WAITS, "waits on a condition variable"),
-    wait_method("std::sync::Condvar::wait_timeout_while", &["sync", "Condvar"], "wait_timeout_while", WAITS, "waits on a condition variable"),
-    wait_method("std::sync::Barrier::wait", &["sync", "Barrier"], "wait", WAITS, "waits at a barrier"),
-    wait_method("std::sync::mpsc::Receiver::recv", &["sync", "mpsc", "Receiver"], "recv", WAITS, "waits for a message"),
-    wait_method("std::sync::mpsc::Receiver::recv_timeout", &["sync", "mpsc", "Receiver"], "recv_timeout", WAITS, "waits for a message"),
-    wait_method("std::sync::mpsc::Receiver::recv_deadline", &["sync", "mpsc", "Receiver"], "recv_deadline", WAITS, "waits for a message"),
-    wait_method("std::sync::mpsc::SyncSender::send", &["sync", "mpsc", "SyncSender"], "send", WAITS, "waits for room in the channel"),
-    wait_method("std::sync::Once::call_once", &["sync", "Once"], "call_once", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::Once::call_once_force", &["sync", "Once"], "call_once_force", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::Once::wait", &["sync", "Once"], "wait", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::Once::wait_force", &["sync", "Once"], "wait_force", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::OnceLock::get_or_init", &["sync", "OnceLock"], "get_or_init", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::OnceLock::get_or_try_init", &["sync", "OnceLock"], "get_or_try_init", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::OnceLock::wait", &["sync", "OnceLock"], "wait", INIT, "waits for another thread's initialization"),
-    wait_method("std::sync::LazyLock::force", &["sync", "LazyLock"], "force", INIT, "waits for another thread's initialization"),
-    wait_method("std::process::Child::wait", &["process", "Child"], "wait", IO_WAIT, "waits for the child process"),
-    wait_method("std::process::Child::wait_with_output", &["process", "Child"], "wait_with_output", IO_WAIT, "waits for the child process"),
-    wait_method("std::process::Command::output", &["process", "Command"], "output", IO_WAIT, "runs a process"),
-    wait_method("std::process::Command::status", &["process", "Command"], "status", IO_WAIT, "runs a process"),
-    wait_method("std::process::Command::spawn", &["process", "Command"], "spawn", IO_WAIT, "runs a process"),
-    wait_method("std::net::TcpStream::connect", &["net", "TcpStream"], "connect", IO_WAIT, "waits for a connection"),
-    wait_method("std::net::TcpStream::connect_timeout", &["net", "TcpStream"], "connect_timeout", IO_WAIT, "waits for a connection"),
-    wait_method("std::net::TcpListener::accept", &["net", "TcpListener"], "accept", IO_WAIT, "waits for a connection"),
-    wait_method("std::io::Stdin::read_line", &["io", "Stdin"], "read_line", IO_WAIT, "waits for standard input"),
-    wait_method("std::io::Stdin::lock", &["io", "Stdin"], "lock", IO_WAIT, "waits for standard input"),
+    wait_method(
+        "std::sync::RwLock::read",
+        &["sync", "RwLock"],
+        "read",
+        WAITS,
+        "waits for the lock",
+    ),
+    wait_method(
+        "std::sync::RwLock::write",
+        &["sync", "RwLock"],
+        "write",
+        WAITS,
+        "waits for the lock",
+    ),
+    wait_method(
+        "std::sync::ReentrantLock::lock",
+        &["sync", "ReentrantLock"],
+        "lock",
+        WAITS,
+        "waits for the lock",
+    ),
+    wait_method(
+        "std::sync::Condvar::wait",
+        &["sync", "Condvar"],
+        "wait",
+        WAITS,
+        "waits on a condition variable",
+    ),
+    wait_method(
+        "std::sync::Condvar::wait_while",
+        &["sync", "Condvar"],
+        "wait_while",
+        WAITS,
+        "waits on a condition variable",
+    ),
+    wait_method(
+        "std::sync::Condvar::wait_timeout",
+        &["sync", "Condvar"],
+        "wait_timeout",
+        WAITS,
+        "waits on a condition variable",
+    ),
+    wait_method(
+        "std::sync::Condvar::wait_timeout_ms",
+        &["sync", "Condvar"],
+        "wait_timeout_ms",
+        WAITS,
+        "waits on a condition variable",
+    ),
+    wait_method(
+        "std::sync::Condvar::wait_timeout_while",
+        &["sync", "Condvar"],
+        "wait_timeout_while",
+        WAITS,
+        "waits on a condition variable",
+    ),
+    wait_method(
+        "std::sync::Barrier::wait",
+        &["sync", "Barrier"],
+        "wait",
+        WAITS,
+        "waits at a barrier",
+    ),
+    wait_method(
+        "std::sync::mpsc::Receiver::recv",
+        &["sync", "mpsc", "Receiver"],
+        "recv",
+        WAITS,
+        "waits for a message",
+    ),
+    wait_method(
+        "std::sync::mpsc::Receiver::recv_timeout",
+        &["sync", "mpsc", "Receiver"],
+        "recv_timeout",
+        WAITS,
+        "waits for a message",
+    ),
+    wait_method(
+        "std::sync::mpsc::Receiver::recv_deadline",
+        &["sync", "mpsc", "Receiver"],
+        "recv_deadline",
+        WAITS,
+        "waits for a message",
+    ),
+    wait_method(
+        "std::sync::mpsc::SyncSender::send",
+        &["sync", "mpsc", "SyncSender"],
+        "send",
+        WAITS,
+        "waits for room in the channel",
+    ),
+    wait_method(
+        "std::sync::Once::call_once",
+        &["sync", "Once"],
+        "call_once",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::Once::call_once_force",
+        &["sync", "Once"],
+        "call_once_force",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::Once::wait",
+        &["sync", "Once"],
+        "wait",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::Once::wait_force",
+        &["sync", "Once"],
+        "wait_force",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::OnceLock::get_or_init",
+        &["sync", "OnceLock"],
+        "get_or_init",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::OnceLock::get_or_try_init",
+        &["sync", "OnceLock"],
+        "get_or_try_init",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::OnceLock::wait",
+        &["sync", "OnceLock"],
+        "wait",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::sync::LazyLock::force",
+        &["sync", "LazyLock"],
+        "force",
+        INIT,
+        "waits for another thread's initialization",
+    ),
+    wait_method(
+        "std::process::Child::wait",
+        &["process", "Child"],
+        "wait",
+        IO_WAIT,
+        "waits for the child process",
+    ),
+    wait_method(
+        "std::process::Child::wait_with_output",
+        &["process", "Child"],
+        "wait_with_output",
+        IO_WAIT,
+        "waits for the child process",
+    ),
+    wait_method(
+        "std::process::Command::output",
+        &["process", "Command"],
+        "output",
+        IO_WAIT,
+        "runs a process",
+    ),
+    wait_method(
+        "std::process::Command::status",
+        &["process", "Command"],
+        "status",
+        IO_WAIT,
+        "runs a process",
+    ),
+    wait_method(
+        "std::process::Command::spawn",
+        &["process", "Command"],
+        "spawn",
+        IO_WAIT,
+        "runs a process",
+    ),
+    wait_method(
+        "std::net::TcpStream::connect",
+        &["net", "TcpStream"],
+        "connect",
+        IO_WAIT,
+        "waits for a connection",
+    ),
+    wait_method(
+        "std::net::TcpStream::connect_timeout",
+        &["net", "TcpStream"],
+        "connect_timeout",
+        IO_WAIT,
+        "waits for a connection",
+    ),
+    wait_method(
+        "std::net::TcpListener::accept",
+        &["net", "TcpListener"],
+        "accept",
+        IO_WAIT,
+        "waits for a connection",
+    ),
+    wait_method(
+        "std::io::Stdin::read_line",
+        &["io", "Stdin"],
+        "read_line",
+        IO_WAIT,
+        "waits for standard input",
+    ),
+    wait_method(
+        "std::io::Stdin::lock",
+        &["io", "Stdin"],
+        "lock",
+        IO_WAIT,
+        "waits for standard input",
+    ),
 ];
 
 /// What a leaf of the models does, as kinds.
@@ -497,14 +912,21 @@ pub(crate) fn leaf_kinds(leaf: crate::models::Leaf) -> (EffectSet, &'static str)
     // wait, allocates its buffers and paths, and panics where it fails (`_print`).
     let io = EffectSet::of(&[Rule::Io, Rule::Block, Rule::Alloc, Rule::Panic]);
     match leaf {
-        Leaf::EnvVar => (EffectSet::of(&[Rule::Env, Rule::Block, Rule::Alloc, Rule::Panic]), "reads the environment"),
+        Leaf::EnvVar => (
+            EffectSet::of(&[Rule::Env, Rule::Block, Rule::Alloc, Rule::Panic]),
+            "reads the environment",
+        ),
         Leaf::Print => (io, "prints"),
         Leaf::ReadFile => (io, "reads a file"),
         Leaf::WriteFile => (io, "writes a file"),
         Leaf::Copy => (io, "copies a file"),
         Leaf::Probe => (io, "tests whether a path exists"),
-        Leaf::Handle => (EffectSet::of(&[Rule::Io, Rule::Block, Rule::Panic]), "reads or writes a file"),
-        Leaf::RawHandle => (EffectSet::of(&[Rule::Io, Rule::Panic]), "makes a file handle of a number"),
+        Leaf::Handle => {
+            (EffectSet::of(&[Rule::Io, Rule::Block, Rule::Panic]), "reads or writes a file")
+        }
+        Leaf::RawHandle => {
+            (EffectSet::of(&[Rule::Io, Rule::Panic]), "makes a file handle of a number")
+        }
         Leaf::Exit => (io, "ends the process"),
         // The panic machinery and the allocator's body are never counted (by design): what is
         // under them runs only while the job fails, or is the heap the call itself refuses.

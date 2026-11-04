@@ -62,10 +62,7 @@ impl<T> core::panic::RefUnwindSafe for Mutex<T> {}
 impl<T> Mutex<T> {
     /// A new unlocked mutex holding `value`.
     pub const fn new(value: T) -> Mutex<T> {
-        Mutex {
-            state: AtomicU32::new(UNLOCKED),
-            value: UnsafeCell::new(value),
-        }
+        Mutex { state: AtomicU32::new(UNLOCKED), value: UnsafeCell::new(value) }
     }
 
     /// Acquire the lock, blocking until it is free.
@@ -77,10 +74,7 @@ impl<T> Mutex<T> {
         {
             self.lock_contended();
         }
-        MutexGuard {
-            mutex: self,
-            not_send: PhantomData,
-        }
+        MutexGuard { mutex: self, not_send: PhantomData }
     }
 
     /// Acquire the lock if it is free right now, returning `None` rather
@@ -89,10 +83,7 @@ impl<T> Mutex<T> {
         self.state
             .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| MutexGuard {
-                mutex: self,
-                not_send: PhantomData,
-            })
+            .map(|_| MutexGuard { mutex: self, not_send: PhantomData })
     }
 
     #[cold]
@@ -168,10 +159,7 @@ pub struct Lazy<T, F = fn() -> T> {
 impl<T, F> Lazy<T, F> {
     /// A lazy value that will call `init` on first access.
     pub const fn new(init: F) -> Lazy<T, F> {
-        Lazy {
-            cell: OnceBox::new(),
-            init,
-        }
+        Lazy { cell: OnceBox::new(), init }
     }
 }
 

@@ -26,9 +26,9 @@ mod table;
 pub(crate) use cfg::{cfg_entry, target_compact, try_gate, try_gate_target};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
+use std::alloc::Global;
 use syntax::{
     SyntaxNodePtr, TextRange, WalkEvent,
     view::{self as ast, AstNode as _},
@@ -72,7 +72,8 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr<'_>) -> Opt
     }
     let segments = [segment_text(names[0]), segment_text(names[1])];
     let gate = stability(&segments[..len])??;
-    if features.enabled(gate.feature) || allows_unstable(cx, attr.file, attr.range(), gate.feature) {
+    if features.enabled(gate.feature) || allows_unstable(cx, attr.file, attr.range(), gate.feature)
+    {
         return None;
     }
     let name = segments[..len].join("::");
@@ -83,7 +84,9 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr<'_>) -> Opt
     }
     if gate.feature == "rustc_attrs" {
         // alloc: the error's note
-        diag.note(format!("the `{name}` attribute is an internal implementation detail that will never be stable"));
+        diag.note(format!(
+            "the `{name}` attribute is an internal implementation detail that will never be stable"
+        ));
     }
     for note in gate.notes {
         diag.note(*note);
@@ -106,7 +109,9 @@ fn explain(feature: &str, name: &str) -> String {
         "rustc_attrs" => "use of an internal attribute",
         "staged_api" => "stability attributes may not be used outside of the standard library",
         "custom_mir" => "the `custom_mir` attribute is just used for the Rust test suite",
-        "allow_internal_unsafe" => "the `allow_internal_unsafe` attribute side-steps the `unsafe_code` lint",
+        "allow_internal_unsafe" => {
+            "the `allow_internal_unsafe` attribute side-steps the `unsafe_code` lint"
+        }
         "allow_internal_unstable" => {
             "the `allow_internal_unstable` attribute side-steps feature gating and stability checks"
         }
@@ -115,8 +120,12 @@ fn explain(feature: &str, name: &str) -> String {
         }
         "custom_test_frameworks" => "custom test frameworks are an unstable feature",
         "linkage" => "the `linkage` attribute is experimental and not portable across platforms",
-        "dropck_eyepatch" => "the `may_dangle` attribute has unstable semantics and may be removed in the future",
-        "intrinsics" => "the `rustc_intrinsic` attribute is used to declare intrinsics as function items",
+        "dropck_eyepatch" => {
+            "the `may_dangle` attribute has unstable semantics and may be removed in the future"
+        }
+        "intrinsics" => {
+            "the `rustc_intrinsic` attribute is used to declare intrinsics as function items"
+        }
         "lang_items" => "lang items are subject to change",
         "prelude_import" => "the `prelude_import` attribute is for use by rustc only",
         "profiler_runtime" => {
@@ -137,7 +146,12 @@ fn explain(feature: &str, name: &str) -> String {
 /// `#[cfg]`s and `#[cfg_attr]`s in order (a `cfg_attr`'s attributes when its predicate holds;
 /// nothing after a `cfg` that does not, nor in the node), the predicate of each `cfg!`, and the
 /// [`gate`]s of a macro call's attributes.
-pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
+pub(super) fn expansion(
+    cx: &Cx<'_, '_>,
+    walk: &Walk<'_>,
+    owners: &[Owner<'_>],
+    features: &Features,
+) -> Vec<Found> {
     let calls: HashMap<InFile<SyntaxNodePtr>, &Owner<'_>, Global> =
         // alloc: setup, the macro calls' owners, once per check
         owners.iter().filter(|it| it.target == Target::MacroCall).map(|it| (it.at(), it)).collect();
@@ -221,7 +235,8 @@ fn configure_meta(
         ast::Meta::CfgAttrMeta(cfg_attr) => {
             let Some(predicate) = cfg_attr.cfg_predicate() else { return true };
             cfg::predicate(cx, features, file, predicate, diags);
-            !holds(walk, predicate) || cfg_attr.metas().all(|it| configure_meta(cx, walk, features, file, it, diags))
+            !holds(walk, predicate)
+                || cfg_attr.metas().all(|it| configure_meta(cx, walk, features, file, it, diags))
         }
         _ => true,
     }
@@ -235,7 +250,13 @@ fn holds(walk: &Walk<'_>, predicate: ast::CfgPredicate<'_>) -> bool {
 
 /// The E0658 of `feature` where the parser checks the feature itself, not the expansion's
 /// `allow_internal_unstable`.
-fn gated(cx: &Cx<'_, '_>, features: &Features, feature: &str, at: InFile<TextRange>, explain: &str) -> Option<Diag> {
+fn gated(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    feature: &str,
+    at: InFile<TextRange>,
+    explain: &str,
+) -> Option<Diag> {
     if features.enabled(feature) {
         return None;
     }
@@ -246,13 +267,27 @@ fn gated(cx: &Cx<'_, '_>, features: &Features, feature: &str, at: InFile<TextRan
 
 /// `#[doc(rust_logo)]` without `rustdoc_internals`, at the `rust_logo` path (rustc's
 /// `DocParser`, once the argument is checked to be a word at the crate level).
-pub(crate) fn doc_rust_logo(cx: &Cx<'_, '_>, features: &Features, path: InFile<TextRange>) -> Option<Diag> {
-    gated(cx, features, "rustdoc_internals", path, "the `#[doc(rust_logo)]` attribute is used for Rust branding")
+pub(crate) fn doc_rust_logo(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    path: InFile<TextRange>,
+) -> Option<Diag> {
+    gated(
+        cx,
+        features,
+        "rustdoc_internals",
+        path,
+        "the `#[doc(rust_logo)]` attribute is used for Rust branding",
+    )
 }
 
 /// `#[repr(simd)]` without `repr_simd`, at the `simd` item (rustc's `parse_repr`, before it
 /// checks the target).
-pub(crate) fn repr_simd(cx: &Cx<'_, '_>, features: &Features, item: InFile<TextRange>) -> Option<Diag> {
+pub(crate) fn repr_simd(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    item: InFile<TextRange>,
+) -> Option<Diag> {
     gated(cx, features, "repr_simd", item, "SIMD types are experimental and possibly buggy")
 }
 
@@ -277,32 +312,59 @@ pub(crate) fn link_modifier(
 /// `kind = "raw-dylib"` on an ELF target that is not Windows, without `raw_dylib_elf`, at the
 /// kind's value. rustc gives it on a nightly (`features.nightly`) and `RawDylibOnlyWindows`
 /// otherwise; `None` when the feature is enabled, where neither is given.
-pub(crate) fn link_kind_raw_dylib_elf(cx: &Cx<'_, '_>, features: &Features, value: InFile<TextRange>) -> Option<Diag> {
-    gated(cx, features, "raw_dylib_elf", value, "link kind `raw-dylib` is unstable on ELF platforms")
+pub(crate) fn link_kind_raw_dylib_elf(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    value: InFile<TextRange>,
+) -> Option<Diag> {
+    gated(
+        cx,
+        features,
+        "raw_dylib_elf",
+        value,
+        "link kind `raw-dylib` is unstable on ELF platforms",
+    )
 }
 
 /// `kind = "link-arg"` without `link_arg_attribute`, at the kind's value.
-pub(crate) fn link_kind_link_arg(cx: &Cx<'_, '_>, features: &Features, value: InFile<TextRange>) -> Option<Diag> {
+pub(crate) fn link_kind_link_arg(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    value: InFile<TextRange>,
+) -> Option<Diag> {
     gated(cx, features, "link_arg_attribute", value, "link kind `link-arg` is unstable")
 }
 
 /// `#[link(.., cfg(..))]` without `link_cfg`, at the `cfg(..)` item, before its predicate is
 /// parsed (whose gates are [`cfg_entry`]'s).
-pub(crate) fn link_cfg(cx: &Cx<'_, '_>, features: &Features, item: InFile<TextRange>) -> Option<Diag> {
+pub(crate) fn link_cfg(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    item: InFile<TextRange>,
+) -> Option<Diag> {
     gated(cx, features, "link_cfg", item, "link cfg is unstable")
 }
 
 /// `#[target_feature(..)]` on a `#[naked]` function without `naked_functions_target_feature`,
 /// at the `target_feature` attribute (rustc's `NakedParser` check of the function's other
 /// attributes).
-pub(crate) fn naked_target_feature(cx: &Cx<'_, '_>, features: &Features, attr: InFile<TextRange>) -> Option<Diag> {
+pub(crate) fn naked_target_feature(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    attr: InFile<TextRange>,
+) -> Option<Diag> {
     let explain = "`#[target_feature(/* ... */)]` is currently unstable on `#[naked]` functions";
     gated(cx, features, "naked_functions_target_feature", attr, explain)
 }
 
 /// `#[used(compiler)]` or `#[used(linker)]` (`which`) without `used_with_arg`, at the
 /// attribute (`attr_span`).
-pub(crate) fn used_with_arg(cx: &Cx<'_, '_>, features: &Features, which: &str, attr: InFile<TextRange>) -> Option<Diag> {
+pub(crate) fn used_with_arg(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    which: &str,
+    attr: InFile<TextRange>,
+) -> Option<Diag> {
     if features.enabled("used_with_arg") {
         return None;
     }
@@ -341,7 +403,8 @@ mod tests {
             let at = table::STABILITY.binary_search_by(|(it, _)| (*it).cmp(path)).ok()?;
             Some(table::STABILITY[at].1)
         };
-        let misses: [&[&str]; 5] = [&[], &["diagnostic"], &["no_such_attribute"], &["inline", "x"], &["Inline"]];
+        let misses: [&[&str]; 5] =
+            [&[], &["diagnostic"], &["no_such_attribute"], &["inline", "x"], &["Inline"]];
         for path in table::STABILITY.iter().map(|(path, _)| *path).chain(misses) {
             assert_eq!(stability(path), by_search(path), "{path:?}");
         }
@@ -352,8 +415,14 @@ mod tests {
         assert_eq!(stability(&["inline"]), Some(None));
         assert_eq!(stability(&["diagnostic", "on_unimplemented"]), Some(None));
         assert_eq!(stability(&["no_such_attribute"]), None);
-        assert_eq!(stability(&["thread_local"]), Some(Some(Gate { feature: "thread_local", notes: &[] })));
-        assert_eq!(stability(&["may_dangle"]).flatten().map(|it| it.feature), Some("dropck_eyepatch"));
+        assert_eq!(
+            stability(&["thread_local"]),
+            Some(Some(Gate { feature: "thread_local", notes: &[] }))
+        );
+        assert_eq!(
+            stability(&["may_dangle"]).flatten().map(|it| it.feature),
+            Some("dropck_eyepatch")
+        );
         assert_eq!(stability(&["stable"]).flatten().map(|it| it.feature), Some("staged_api"));
         assert_eq!(stability(&["lang"]).flatten().map(|it| it.feature), Some("lang_items"));
         let dummy = stability(&["rustc_dummy"]).flatten().unwrap();
@@ -366,8 +435,17 @@ mod tests {
     #[test]
     fn the_special_explanations_are_rustcs() {
         assert_eq!(explain("rustc_attrs", "rustc_dummy"), "use of an internal attribute");
-        assert_eq!(explain("ffi_const", "ffi_const"), "the `ffi_const` attribute is an experimental feature");
-        assert_eq!(explain("dropck_eyepatch", "may_dangle"), "the `may_dangle` attribute has unstable semantics and may be removed in the future");
-        assert_eq!(explain("splat", "rustc_splat"), "the `rustc_splat` attribute is an experimental feature");
+        assert_eq!(
+            explain("ffi_const", "ffi_const"),
+            "the `ffi_const` attribute is an experimental feature"
+        );
+        assert_eq!(
+            explain("dropck_eyepatch", "may_dangle"),
+            "the `may_dangle` attribute has unstable semantics and may be removed in the future"
+        );
+        assert_eq!(
+            explain("splat", "rustc_splat"),
+            "the `rustc_splat` attribute is an experimental feature"
+        );
     }
 }

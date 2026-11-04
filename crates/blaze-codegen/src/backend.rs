@@ -45,7 +45,20 @@ pub enum FrontRef<I, S> {
 #[derive(Debug)]
 pub struct Described<I, S> {
     pub item: ItemKey,
+    /// Its code, with the key of the store its body is written in: what its instance key
+    /// ([`crate::Instance::key`]) and so the link name it by, so two bodies written alike in
+    /// two places are two functions, each reporting its own positions.
     pub code: CodeHash,
+    /// What its template is kept under in place of `code` ([`crate::driver::dev_template_key`],
+    /// [`crate::driver::release_template_key`]): with `anchors`, its code without its own item's
+    /// or store's key, its callees' names or where it is written, so renaming or moving it,
+    /// or renaming a local, keeps its template (docs/v2/plan/design/name-free-identity.md).
+    /// `code` itself where `anchors` is `None`.
+    pub template_code: CodeHash,
+    /// The anchors of its own span tables, which its template holds by table
+    /// ([`crate::template::own_anchor`]) and its instance is given back, when its template is
+    /// kept under `template_code`; `None` when every position of its template is as compiled.
+    pub anchors: Option<[ContentId; crate::template::OWN_TABLES]>,
     /// The code a caller that builds its body in has of it, which a
     /// [`CompiledFunction::inlined`] names it by: a copy built in is built under the copy's
     /// options (`MirOptions::built_in`), which read no dyn facts, so for one whose own unit is
@@ -260,7 +273,24 @@ impl Shape {
     pub fn key(&self) -> ContentId {
         self.0
     }
+
+    /// This shape as compiled to a template relative to its function's own anchors
+    /// ([`Described::anchors`]) when `relative`, else itself. A relative and an absolute
+    /// template of one IR are two memo entries: a template's places at its own code hold
+    /// anchors or store keys, and the memo is kept across builds, so a function whose
+    /// template key turns name-free (or back, when a report or profiling starts or stops
+    /// naming it) never takes the other form.
+    pub fn relative(self, relative: bool) -> Shape {
+        if !relative {
+            return self;
+        }
+        let mut hasher = blaze_ids::Hasher::new(RELATIVE_SHAPE_DOMAIN);
+        hasher.id(&self.0);
+        Shape(hasher.finish())
+    }
 }
+
+pub const RELATIVE_SHAPE_DOMAIN: &str = "blaze v2 relative shape 1";
 
 /// What a compile gives.
 #[derive(PartialEq, Eq, Debug)]
@@ -387,7 +417,12 @@ pub trait Prepare: Sync {
 
     /// #1292: the prepared IR with its constants masked, for [`crate::fold::groups`]; `None`
     /// for one that can't be folded (a backend or a function that has no thunk).
-    fn masked(&self, unit: &Unit, prepared: &Self::Prepared, refs: &Refs) -> Option<crate::fold::Masked>;
+    fn masked(
+        &self,
+        unit: &Unit,
+        prepared: &Self::Prepared,
+        refs: &Refs,
+    ) -> Option<crate::fold::Masked>;
 
     /// Compiles a group's one body, taking the constants that differ as parameters, and a
     /// thunk for each member, which calls it with the member's constants. `members` are in

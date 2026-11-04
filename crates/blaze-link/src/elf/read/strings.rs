@@ -86,7 +86,8 @@ impl<'data> Table<'data> {
             ));
         };
         // alloc: error path, called only for an error
-        let not_utf8 = || format!("{file}: {what} {} is not UTF-8", String::from_utf8_lossy(&bytes[at..end]));
+        let not_utf8 =
+            || format!("{file}: {what} {} is not UTF-8", String::from_utf8_lossy(&bytes[at..end]));
         let rank = self.rank(end);
         let slot = self.strings[rank];
         let (from, name) = match slot {
@@ -182,7 +183,11 @@ mod tests {
                         chunk[at - 1] = 0;
                     }
                     let chunk = &chunk[..len];
-                    assert_eq!(nul_mask(chunk), reference(chunk), "{value:#x} at {at}, {len} bytes");
+                    assert_eq!(
+                        nul_mask(chunk),
+                        reference(chunk),
+                        "{value:#x} at {at}, {len} bytes"
+                    );
                 }
             }
         }

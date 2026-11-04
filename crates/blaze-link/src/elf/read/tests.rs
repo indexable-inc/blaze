@@ -1,12 +1,12 @@
 use blaze_codegen::Arch;
+use object::read::elf::{FileHeader as _, Rela as _, SectionHeader as _, Sym as _};
 use object::write::{
     Comdat, Object as Builder, Relocation, SectionId, StandardSection, Symbol as Def, SymbolId,
     SymbolSection,
 };
-use object::read::elf::{FileHeader as _, Rela as _, SectionHeader as _, Sym as _};
 use object::{
-    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags, SectionIndex,
-    SectionKind as Kind, SymbolFlags, SymbolKind as Type, SymbolScope, elf,
+    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags,
+    SectionIndex, SectionKind as Kind, SymbolFlags, SymbolKind as Type, SymbolScope, elf,
 };
 
 use super::strings::Table;
@@ -88,12 +88,10 @@ fn relocate(
     r_type: elf::RelocationType,
 ) {
     builder
-        .add_relocation(section, Relocation {
-            offset: at,
-            symbol,
-            addend,
-            flags: RelocationFlags::Elf { r_type },
-        })
+        .add_relocation(
+            section,
+            Relocation { offset: at, symbol, addend, flags: RelocationFlags::Elf { r_type } },
+        )
         .unwrap();
 }
 
@@ -189,7 +187,8 @@ fn x86_64() -> Vec<u8> {
     flags(&mut b, keep, elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_GNU_RETAIN);
     let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 24], 8);
-    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
+    b.section_mut(eh_frame).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
     let debug = b.add_section(Vec::new(), b".debug_info".to_vec(), Kind::Debug);
     b.append_section_data(debug, &[0; 16], 1);
 
@@ -264,13 +263,16 @@ fn reads_an_x86_64_object() {
     let (_, eh_frame_section) = section(&object, ".eh_frame");
 
     let at = |symbol: u32| named(&object, &object.symbols[symbol as usize]);
-    assert_eq!(at(0), Named {
-        name: "",
-        def: SymbolDef::Absolute(0),
-        binding: Binding::Local,
-        kind: SymbolKind::Other,
-        hidden: false,
-    });
+    assert_eq!(
+        at(0),
+        Named {
+            name: "",
+            def: SymbolDef::Absolute(0),
+            binding: Binding::Local,
+            kind: SymbolKind::Other,
+            hidden: false,
+        }
+    );
     let f = symbol(&object, "f");
     let g = symbol(&object, "g");
     let local = symbol(&object, "local");
@@ -283,31 +285,48 @@ fn reads_an_x86_64_object() {
         at(f),
         global("f", SymbolDef::Section { section: text, value: 0, size: 16 }, SymbolKind::Function)
     );
-    assert_eq!(at(g), Named {
-        hidden: true,
-        ..global("g", SymbolDef::Section { section: text, value: 16, size: 8 }, SymbolKind::Function)
-    });
-    assert_eq!(at(local), Named {
-        binding: Binding::Local,
-        ..global(
-            "local",
-            SymbolDef::Section { section: text, value: 24, size: 4 },
-            SymbolKind::Function,
-        )
-    });
+    assert_eq!(
+        at(g),
+        Named {
+            hidden: true,
+            ..global(
+                "g",
+                SymbolDef::Section { section: text, value: 16, size: 8 },
+                SymbolKind::Function
+            )
+        }
+    );
+    assert_eq!(
+        at(local),
+        Named {
+            binding: Binding::Local,
+            ..global(
+                "local",
+                SymbolDef::Section { section: text, value: 24, size: 4 },
+                SymbolKind::Function,
+            )
+        }
+    );
     assert_eq!(at(ext), global("ext", SymbolDef::Undefined, SymbolKind::Other));
-    assert_eq!(at(weak), Named {
-        binding: Binding::Weak,
-        ..global("wk", SymbolDef::Undefined, SymbolKind::Other)
-    });
+    assert_eq!(
+        at(weak),
+        Named { binding: Binding::Weak, ..global("wk", SymbolDef::Undefined, SymbolKind::Other) }
+    );
     assert_eq!(
         at(tvar),
         global("tvar", SymbolDef::Section { section: tbss, value: 0, size: 8 }, SymbolKind::Tls)
     );
-    assert_eq!(at(comm), global("comm", SymbolDef::Common { size: 16, align: 8 }, SymbolKind::Data));
+    assert_eq!(
+        at(comm),
+        global("comm", SymbolDef::Common { size: 16, align: 8 }, SymbolKind::Data)
+    );
     assert_eq!(
         at(inl),
-        global("inl", SymbolDef::Section { section: inline, value: 0, size: 1 }, SymbolKind::Function)
+        global(
+            "inl",
+            SymbolDef::Section { section: inline, value: 0, size: 1 },
+            SymbolKind::Function
+        )
     );
     let text_symbol = object
         .symbols
@@ -317,33 +336,42 @@ fn reads_an_x86_64_object() {
                 && it.def == SymbolDef::Section { section: text, value: 0, size: 0 }
         })
         .expect("the section symbol of .text") as u32;
-    assert_eq!(at(text_symbol), Named {
-        name: "",
-        def: SymbolDef::Section { section: text, value: 0, size: 0 },
-        binding: Binding::Local,
-        kind: SymbolKind::Section,
-        hidden: false,
-    });
+    assert_eq!(
+        at(text_symbol),
+        Named {
+            name: "",
+            def: SymbolDef::Section { section: text, value: 0, size: 0 },
+            binding: Binding::Local,
+            kind: SymbolKind::Section,
+            hidden: false,
+        }
+    );
 
     // The module symbol (TLSLD), _GLOBAL_OFFSET_TABLE_ (GOTPC32, GOTOFF64) and f's size
     // (SIZE32) follow the ELF symbols, in the order the relocations ask for them.
     let added = object.symbols.len() as u32 - 3;
     let (module, got, size) = (added, added + 1, added + 2);
-    assert_eq!(at(module), Named {
-        name: "",
-        def: SymbolDef::Absolute(0),
-        binding: Binding::Local,
-        kind: SymbolKind::Tls,
-        hidden: true,
-    });
+    assert_eq!(
+        at(module),
+        Named {
+            name: "",
+            def: SymbolDef::Absolute(0),
+            binding: Binding::Local,
+            kind: SymbolKind::Tls,
+            hidden: true,
+        }
+    );
     assert_eq!(at(got), global("_GLOBAL_OFFSET_TABLE_", SymbolDef::Undefined, SymbolKind::Other));
-    assert_eq!(at(size), Named {
-        name: "",
-        def: SymbolDef::Absolute(16),
-        binding: Binding::Local,
-        kind: SymbolKind::Other,
-        hidden: true,
-    });
+    assert_eq!(
+        at(size),
+        Named {
+            name: "",
+            def: SymbolDef::Absolute(16),
+            binding: Binding::Local,
+            kind: SymbolKind::Other,
+            hidden: true,
+        }
+    );
 
     check(
         &object,
@@ -376,13 +404,10 @@ fn reads_an_x86_64_object() {
         &alloc(".data", true, false, false),
         8,
         &Data::Bytes(vec![0; 16]),
-        &[fixup(0, Apply::Abs64, f, 8), NativeFixup {
-            at: 8,
-            apply: Apply::Delta64,
-            symbol: g,
-            addend: 0,
-            minus: Some(got),
-        }],
+        &[
+            fixup(0, Apply::Abs64, f, 8),
+            NativeFixup { at: 8, apply: Apply::Delta64, symbol: g, addend: 0, minus: Some(got) },
+        ],
         false,
     );
     check(
@@ -446,7 +471,9 @@ fn reads_an_x86_64_object() {
     assert_eq!(object.name(group.name), "inl");
     assert_eq!(object.group_sections(group), [inline]);
     assert!(!group.largest);
-    assert!(object.libraries.is_empty() && object.directives.is_empty() && object.imports.is_empty());
+    assert!(
+        object.libraries.is_empty() && object.directives.is_empty() && object.imports.is_empty()
+    );
 }
 
 #[test]
@@ -471,7 +498,8 @@ fn reads_an_aarch64_object() {
     let tbss = b.section_id(StandardSection::UninitializedTls);
     let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 16], 8);
-    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
+    b.section_mut(eh_frame).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
     let f = define(&mut b, "f", text, 0, 80, Type::Text, SymbolScope::Dynamic, false);
     let ext = undefined(&mut b, "ext", false);
     let var = define(&mut b, "var", data, 0, 8, Type::Data, SymbolScope::Dynamic, false);
@@ -565,10 +593,9 @@ fn reads_an_aarch64_object() {
     let text_symbol = object
         .symbols
         .iter()
-        .position(|it| it.kind == SymbolKind::Section && it.def == SymbolDef::Section {
-            section: text,
-            value: 0,
-            size: 0,
+        .position(|it| {
+            it.kind == SymbolKind::Section
+                && it.def == SymbolDef::Section { section: text, value: 0, size: 0 }
         })
         .unwrap() as u32;
     check(
@@ -622,7 +649,8 @@ fn an_ifunc_is_an_error() {
     let mut b = builder(Architecture::X86_64);
     let text = b.section_id(StandardSection::Text);
     b.append_section_data(text, &[0; 16], 16);
-    let resolver = define(&mut b, "resolve_me", text, 0, 16, Type::Text, SymbolScope::Dynamic, false);
+    let resolver =
+        define(&mut b, "resolve_me", text, 0, 16, Type::Text, SymbolScope::Dynamic, false);
     b.symbol_mut(resolver).flags = SymbolFlags::Elf {
         st_info: elf::SymbolInfo::new(elf::STB_GLOBAL, elf::STT_GNU_IFUNC),
         st_other: elf::STV_DEFAULT.into(),
@@ -838,10 +866,16 @@ fn reads_a_linker_script() {
 #[test]
 fn a_linker_scripts_libraries_are_kept_as_written() {
     let debian = b"/* GNU ld script\n   Use the shared library, but some functions are only in\n   the static library.  */\nGROUP ( libgcc_s.so.1 -lgcc )\n";
-    let gcc_s = shared(read(Arch::X86_64, "/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_s.so", debian, &SHARED));
+    let gcc_s =
+        shared(read(Arch::X86_64, "/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_s.so", debian, &SHARED));
     assert_eq!(gcc_s.name, "libgcc_s.so");
     assert_eq!(gcc_s.inputs, ["libgcc_s.so.1", "-lgcc"]);
-    let other = shared(read(Arch::X86_64, "libx.so", b"INPUT ( -l:libfoo.so.2 AS_NEEDED ( -lbar ) )", &SHARED));
+    let other = shared(read(
+        Arch::X86_64,
+        "libx.so",
+        b"INPUT ( -l:libfoo.so.2 AS_NEEDED ( -lbar ) )",
+        &SHARED,
+    ));
     assert_eq!(other.inputs, ["-l:libfoo.so.2", "-lbar"]);
 }
 
@@ -908,9 +942,17 @@ fn reads_the_system_libc() {
         // Each version once, and the arena no bigger than `.dynstr`.
         for (at, version) in shared.versions.iter().enumerate() {
             let version = shared.names.at(*version);
-            assert!(!shared.versions[..at].iter().any(|it| shared.names.at(*it) == version), "{version} twice");
+            assert!(
+                !shared.versions[..at].iter().any(|it| shared.names.at(*it) == version),
+                "{version} twice"
+            );
         }
-        assert!(shared.symbols.iter().all(|it| it.version.is_none_or(|it| usize::from(it) < shared.versions.len())));
+        assert!(
+            shared
+                .symbols
+                .iter()
+                .all(|it| it.version.is_none_or(|it| usize::from(it) < shared.versions.len()))
+        );
         let file = object::read::elf::ElfFile64::<object::Endianness>::parse(&bytes[..]).unwrap();
         let dynstr = object::Object::section_by_name(&file, ".dynstr").unwrap();
         assert!(shared.names.bytes() as u64 <= object::ObjectSection::size(&dynstr));
@@ -937,7 +979,9 @@ fn agrees(input: &[u8], object: &Object) {
         assert_eq!(name.as_bytes(), sections.section_name(ENDIAN, section).unwrap());
         match (&read.what, section.sh_type(ENDIAN)) {
             (SectionKind::Dropped, _) => assert_eq!(read.data, Data::Zero(0), "{name}"),
-            (_, elf::SHT_NOBITS) => assert_eq!(read.data, Data::Zero(section.sh_size(ENDIAN)), "{name}"),
+            (_, elf::SHT_NOBITS) => {
+                assert_eq!(read.data, Data::Zero(section.sh_size(ENDIAN)), "{name}")
+            }
             _ => {
                 assert!(matches!(read.data, Data::Input(_)), "{name}: {:?} is a copy", read.data);
                 let copied = section.data(ENDIAN, input).unwrap();
@@ -947,7 +991,8 @@ fn agrees(input: &[u8], object: &Object) {
         if let Some((relas, _)) = section.rela(ENDIAN, input).unwrap() {
             let target = section.sh_info(ENDIAN) as usize;
             if object.sections[target].what != SectionKind::Dropped {
-                relocations[target] += relas.iter().filter(|it| it.r_type(ENDIAN, false).0 != 0).count();
+                relocations[target] +=
+                    relas.iter().filter(|it| it.r_type(ENDIAN, false).0 != 0).count();
             }
         }
     }
@@ -1112,7 +1157,8 @@ fn a_string_table_pushes_each_string_once() {
 #[test]
 fn a_string_table_past_a_word_finds_its_strings() {
     // Strings across the 64-byte words of the NUL bitset, named from their middles first.
-    let strings: Vec<String> = (0..40).map(|it| format!("name_{it}_{}", "x".repeat(it % 7))).collect();
+    let strings: Vec<String> =
+        (0..40).map(|it| format!("name_{it}_{}", "x".repeat(it % 7))).collect();
     let mut bytes = vec![0];
     let mut offsets = Vec::new();
     for string in &strings {
@@ -1142,9 +1188,11 @@ fn relocation_sections_of_one_section_extend_its_run() {
     retarget(&mut both, ".rela.data", ".text");
     let merged = object(read(Arch::X86_64, "t.o", &both, &NativeKind::Object));
     agrees(&both, &merged);
-    let expected =
-        [plain.section_fixups(section(&plain, ".text").1), plain.section_fixups(section(&plain, ".data").1)]
-            .concat();
+    let expected = [
+        plain.section_fixups(section(&plain, ".text").1),
+        plain.section_fixups(section(&plain, ".data").1),
+    ]
+    .concat();
     assert_eq!(merged.section_fixups(section(&merged, ".text").1), &expected[..]);
     assert!(merged.section_fixups(section(&merged, ".data").1).is_empty());
     assert_eq!(merged.fixups.len(), plain.fixups.len());
@@ -1189,9 +1237,14 @@ fn reading_allocates_nothing_per_symbol_section_or_fixup() {
         let symbols: Vec<(&str, usize)> =
             names.iter().enumerate().map(|(at, it)| (it.as_str(), at * 2 / n)).collect();
         let bytes = ar(Some(&symbols[..]), &[("a.o", &a[..]), ("b.o", &b[..])]);
-        let (found, used) = blaze_alloc_count::measure(|| read(Arch::X86_64, "libab.a", &bytes, &ARCHIVE));
+        let (found, used) =
+            blaze_alloc_count::measure(|| read(Arch::X86_64, "libab.a", &bytes, &ARCHIVE));
         assert_eq!(archive(found).index.len(), n);
         used.allocations
     };
-    assert_eq!(archive_allocations(3), archive_allocations(600), "an index of 3 symbols, then of 600");
+    assert_eq!(
+        archive_allocations(3),
+        archive_allocations(600),
+        "an index of 3 symbols, then of 600"
+    );
 }

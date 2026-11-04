@@ -585,7 +585,8 @@ fn rust_files(dir: &FsPath, out: &mut Vec<PathBuf>) {
 fn corpus() -> Vec<PathBuf> {
     let root = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for dir in ["library/core/src", "library/alloc/src", "crates/blaze-query/src", "crates/const-ast/src"]
+    for dir in
+        ["library/core/src", "library/alloc/src", "crates/blaze-query/src", "crates/const-ast/src"]
     {
         rust_files(&root.join(dir), &mut files);
     }

@@ -107,7 +107,8 @@ impl TopEntryPoint {
     }
 
     fn parse_with(&self, input: Tokens<'_>, outline: bool) -> Output {
-        let _p = tracing::info_span!(target: "blaze", "TopEntryPoint::parse", ?self, outline).entered();
+        let _p =
+            tracing::info_span!(target: "blaze", "TopEntryPoint::parse", ?self, outline).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
             TopEntryPoint::MacroStmts => grammar::entry::top::macro_stmts,

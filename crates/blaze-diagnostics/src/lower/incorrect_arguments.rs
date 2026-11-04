@@ -23,12 +23,17 @@ use crate::{
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::IncorrectArguments) -> Vec<Found> {
     let at = d.call_expr.map(|it| it.syntax_node_ptr());
     let node = cx.node_view(d.call_expr);
-    let mut diag = match node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, Inputs::Fit)) {
-        // alloc: empty, allocates nothing
-        Some(call) if call.single_mismatch() => return Vec::new(),
-        Some(call) => call.report(),
-        None => Diag::error(Some("E0308"), "arguments to this function are incorrect", cx.span_of(at)),
-    };
+    let mut diag =
+        match node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, Inputs::Fit)) {
+            // alloc: empty, allocates nothing
+            Some(call) if call.single_mismatch() => return Vec::new(),
+            Some(call) => call.report(),
+            None => Diag::error(
+                Some("E0308"),
+                "arguments to this function are incorrect",
+                cx.span_of(at),
+            ),
+        };
     code_fact(cx, &mut diag, at);
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
@@ -36,6 +41,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::IncorrectArguments) -> Vec<F
 
 /// Whether rustc reports the argument of `call` that does not fit as its own "mismatched
 /// types": the call's one error. Otherwise the call's `IncorrectArguments` reports all of them.
-pub(super) fn single_mismatch<'db>(cx: &Cx<'_, 'db>, file: HirFileId, call: ast::Expr<'db>) -> bool {
+pub(super) fn single_mismatch<'db>(
+    cx: &Cx<'_, 'db>,
+    file: HirFileId,
+    call: ast::Expr<'db>,
+) -> bool {
     CallCx::new(cx, file, call, Inputs::Fit).is_some_and(|it| it.single_mismatch())
 }

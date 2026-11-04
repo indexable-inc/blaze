@@ -310,7 +310,8 @@ fn of_builds_no_source_map() {
                 _ = std::hint::black_box(VariantFields::of(&db, id));
             }
         });
-        let builds_a_map = |it: &&String| it.contains("::relative") || it.contains("::with_source_map");
+        let builds_a_map =
+            |it: &&String| it.contains("::relative") || it.contains("::with_source_map");
         let built: Vec<_> = log.iter().filter(builds_a_map).collect();
         assert!(built.is_empty(), "{fixture}\n{built:#?}");
         assert!(log.iter().any(|it| it.contains("::kept")), "{fixture}\n{log:#?}");

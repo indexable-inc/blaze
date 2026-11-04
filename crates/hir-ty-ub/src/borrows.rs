@@ -105,9 +105,25 @@ impl NewPermission {
     /// from the pointee's start, in increasing order, not overlapping). The caller computes
     /// `cells` as Miri's `visit_freeze_sensitive`: an `UnsafeCell` field, and a whole union or
     /// multi-variant enum that is not `Freeze`, are cells. Miri: `NewPermission::new`.
-    pub fn new(kind: PtrKind, mode: RetagMode, freeze: bool, unpin: bool, cells: &[Span]) -> NewPermission {
-        debug_assert!(cells.windows(2).all(|w| w[0].end() <= w[1].start), "cells overlap or are unsorted");
-        NewPermission { kind, mode, freeze, unpin, implicit_writes: false, cells: SmallVec::from_slice(cells) }
+    pub fn new(
+        kind: PtrKind,
+        mode: RetagMode,
+        freeze: bool,
+        unpin: bool,
+        cells: &[Span],
+    ) -> NewPermission {
+        debug_assert!(
+            cells.windows(2).all(|w| w[0].end() <= w[1].start),
+            "cells overlap or are unsorted"
+        );
+        NewPermission {
+            kind,
+            mode,
+            freeze,
+            unpin,
+            implicit_writes: false,
+            cells: SmallVec::from_slice(cells),
+        }
     }
 
     /// `-Zmiri-tree-borrows-implicit-writes`: a protected `&mut` or `Box` is `Unique` at once,
@@ -242,7 +258,13 @@ impl Borrows {
             thread: ThreadId::MAIN.index(),
             retags_since_gc: 0,
             live: BitSet::default(),
-            inside: RangeMap::new(0, LocationState::new_accessed(Permission::new_disabled(), IdempotentForeignAccess::None)),
+            inside: RangeMap::new(
+                0,
+                LocationState::new_accessed(
+                    Permission::new_disabled(),
+                    IdempotentForeignAccess::None,
+                ),
+            ),
             retag_accesses: Vec::new(),
         }
     }
@@ -305,7 +327,14 @@ impl Borrows {
         site: SiteId,
     ) -> Result<(), AliasError> {
         let source = Borrows::source(alloc, prov);
-        self.tree_mut(alloc).perform_access(source, range, kind, AccessCause::Explicit(kind), alloc, site)
+        self.tree_mut(alloc).perform_access(
+            source,
+            range,
+            kind,
+            AccessCause::Explicit(kind),
+            alloc,
+            site,
+        )
     }
 
     /// A reference or `Box` made from a pointer with provenance `parent` to `range` of
@@ -343,7 +372,11 @@ impl Borrows {
             }
         };
         let Some(tree) = trees.get_mut(alloc.index()).and_then(Option::as_mut) else {
-            assert!(range.is_empty(), "Tree Borrows: a retag of {} bytes of dead {alloc:?}", range.len);
+            assert!(
+                range.is_empty(),
+                "Tree Borrows: a retag of {} bytes of dead {alloc:?}",
+                range.len
+            );
             protect(threads);
             return Ok(Some(new_tag));
         };
@@ -374,7 +407,10 @@ impl Borrows {
             if cell.is_empty() {
                 continue;
             }
-            assert!(cell.start >= cur && cell.end() <= range.len, "cell {cell:?} out of order or bounds");
+            assert!(
+                cell.start >= cur && cell.end() <= range.len,
+                "cell {cell:?} out of order or bounds"
+            );
             if cell.start > cur {
                 set(cur, cell.start, true);
             }
@@ -386,12 +422,28 @@ impl Borrows {
         }
         for (perm_range, loc_state) in inside.iter_all() {
             if let Some(access) = loc_state.permission().associated_access() {
-                let range_in_alloc = Span::new(range.start + perm_range.start, perm_range.end - perm_range.start);
-                tree.perform_access(parent_tag, range_in_alloc, access, AccessCause::Reborrow(access), alloc, site)?;
+                let range_in_alloc =
+                    Span::new(range.start + perm_range.start, perm_range.end - perm_range.start);
+                tree.perform_access(
+                    parent_tag,
+                    range_in_alloc,
+                    access,
+                    AccessCause::Reborrow(access),
+                    alloc,
+                    site,
+                )?;
                 retag_accesses.push((range_in_alloc, access));
             }
         }
-        tree.new_child(range.start, parent_tag, new_tag, inside, perms.outside_perm, perms.protector, site);
+        tree.new_child(
+            range.start,
+            parent_tag,
+            new_tag,
+            inside,
+            perms.outside_perm,
+            perms.protector,
+            site,
+        );
         protect(threads);
         Ok(Some(new_tag))
     }
@@ -405,7 +457,13 @@ impl Borrows {
     /// The free of `alloc` (`size` bytes) through `prov`: a write to all of it, refused if a
     /// strong protector covers an accessed byte. Then the tree is gone. Miri:
     /// `Tree::before_memory_deallocation`, `Tree::dealloc`.
-    pub fn free(&mut self, alloc: AllocId, prov: Prov, size: u64, site: SiteId) -> Result<(), AliasError> {
+    pub fn free(
+        &mut self,
+        alloc: AllocId,
+        prov: Prov,
+        size: u64,
+        site: SiteId,
+    ) -> Result<(), AliasError> {
         let source = Borrows::source(alloc, prov);
         self.tree_mut(alloc).dealloc(source, Span::new(0, size), alloc, site)?;
         self.trees[alloc.index()] = None;
@@ -507,7 +565,10 @@ impl Borrows {
     /// The tree of a live allocation as Miri's `miri_print_borrow_state` prints it, only the
     /// named tags unless `show_unnamed`.
     pub fn print_tree(&self, alloc: AllocId, show_unnamed: bool) -> Option<String> {
-        self.trees.get(alloc.index()).and_then(Option::as_ref).map(|tree| tree.print_tree(show_unnamed))
+        self.trees
+            .get(alloc.index())
+            .and_then(Option::as_ref)
+            .map(|tree| tree.print_tree(show_unnamed))
     }
 
     /// How many tags the tree of a live allocation holds (for tests of the GC).

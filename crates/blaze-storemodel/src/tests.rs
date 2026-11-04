@@ -16,23 +16,41 @@ use crate::kernel::{Asker, Dials, KernelScenario, Which, run_kernel};
 use crate::properties;
 use crate::store::{Model, Op, Script, Wait, damaged, key, must_survive, open, run_store};
 
-const ORDERED: Model = Model { persist: Persist::Ordered, failures: 0, reorder_io: false, wait: Wait::Everything };
+const ORDERED: Model =
+    Model { persist: Persist::Ordered, failures: 0, reorder_io: false, wait: Wait::Everything };
 
-fn store(name: &str, model: Model, search: Search, scripts: &[Script]) -> Result<Explored, Box<Report>> {
+fn store(
+    name: &str,
+    model: Model,
+    search: Search,
+    scripts: &[Script],
+) -> Result<Explored, Box<Report>> {
     let bounds = Bounds::from_env(&Bounds::default());
-    explore(name, &Search::from_env(search), &bounds, &|chooser, memo| run_store(scripts, &model, &bounds, chooser, memo))
+    explore(name, &Search::from_env(search), &bounds, &|chooser, memo| {
+        run_store(scripts, &model, &bounds, chooser, memo)
+    })
 }
 
-fn kernel(name: &str, model: Model, search: Search, scenario: &KernelScenario) -> Result<Explored, Box<Report>> {
+fn kernel(
+    name: &str,
+    model: Model,
+    search: Search,
+    scenario: &KernelScenario,
+) -> Result<Explored, Box<Report>> {
     let bounds = Bounds::from_env(&Bounds::default());
-    explore(name, &Search::from_env(search), &bounds, &|chooser, memo| run_kernel(scenario, &model, &bounds, chooser, memo))
+    explore(name, &Search::from_env(search), &bounds, &|chooser, memo| {
+        run_kernel(scenario, &model, &bounds, chooser, memo)
+    })
 }
 
 fn passes(result: Result<Explored, Box<Report>>) {
     match result {
         // The test's one line of output: how much it covered.
         #[expect(clippy::print_stderr, reason = "a model test says how much it covered")]
-        Ok(explored) => eprintln!("{} executions, {} crash states checked", explored.executions, explored.crash_checks),
+        Ok(explored) => eprintln!(
+            "{} executions, {} crash states checked",
+            explored.executions, explored.crash_checks
+        ),
         Err(report) => panic!("{report}"),
     }
 }
@@ -51,7 +69,8 @@ fn build(name: &'static str, puts: &[Op]) -> Script {
     script(name, &[puts, &BUILD_ENDS].concat())
 }
 
-const WORLDS: [Dials; 2] = [Dials { dial: 0, facts: [10, 11, 12, 13] }, Dials { dial: 1, facts: [10, 11, 12, 13] }];
+const WORLDS: [Dials; 2] =
+    [Dials { dial: 0, facts: [10, 11, 12, 13] }, Dials { dial: 1, facts: [10, 11, 12, 13] }];
 
 fn asker(name: &'static str, world: usize, salt: u8) -> Asker {
     Asker { name, input: 7, world, salt, finds: false }
@@ -73,7 +92,12 @@ fn a_restore_never_serves_a_value_no_writer_fully_wrote() {
 /// refused naming why, never opened empty.
 #[test]
 fn a_restore_never_silently_starts_empty() {
-    passes(store("a build, then a second", ORDERED, Search::Exhaustive, &[build("w0", &[put(1, 1), put(2, 2)])]));
+    passes(store(
+        "a build, then a second",
+        ORDERED,
+        Search::Exhaustive,
+        &[build("w0", &[put(1, 1), put(2, 2)])],
+    ));
     let (disk, survive, ledger) = stopped_cleanly();
     let damages: [(&str, Box<dyn Fn(&mut Disk)>); 3] = [
         ("the pack cut short", Box::new(|disk: &mut Disk| cut(disk, "store/pack-000000"))),
@@ -114,7 +138,8 @@ fn stopped_cleanly() -> (Disk, BTreeSet<blaze_cas::Key>, crate::store::Ledger) {
     }
     let mut effects = Vec::new();
     store.flush(&mut effects);
-    crate::store::drive(&mut fs, &mut store, &mut effects, bounds.steps, "the flush").expect("it ends");
+    crate::store::drive(&mut fs, &mut store, &mut effects, bounds.steps, "the flush")
+        .expect("it ends");
     let survive = must_survive(&store, &ledger);
     assert_eq!(survive.len(), 2, "both puts are durable");
     (fs.synced_disk(), survive, ledger)
@@ -144,7 +169,11 @@ fn two_values_under_one_identity_are_refused_never_overwritten() {
         "two salted gets, one identity",
         ORDERED,
         Search::Exhaustive,
-        &KernelScenario { which: Which::Salted, worlds: WORLDS.to_vec(), askers: vec![asker("k0", 0, 1), asker("k1", 0, 2)] },
+        &KernelScenario {
+            which: Which::Salted,
+            worlds: WORLDS.to_vec(),
+            askers: vec![asker("k0", 0, 1), asker("k1", 0, 2)],
+        },
     ));
 }
 
@@ -157,7 +186,11 @@ fn after_a_build_answers_its_results_survive_any_crash() {
         "two gets race for one shape slot",
         Model { failures: 1, reorder_io: true, ..ORDERED },
         Search::Exhaustive,
-        &KernelScenario { which: Which::Dialed, worlds: WORLDS.to_vec(), askers: vec![asker("k0", 0, 0), asker("k1", 1, 0)] },
+        &KernelScenario {
+            which: Which::Dialed,
+            worlds: WORLDS.to_vec(),
+            askers: vec![asker("k0", 0, 0), asker("k1", 1, 0)],
+        },
     ));
 }
 
@@ -171,7 +204,11 @@ fn a_build_that_waits_on_its_own_puts_alone_keeps_what_it_answered() {
         "two gets of one identity, each waiting on its own puts",
         Model { wait: Wait::Own, ..ORDERED },
         Search::Exhaustive,
-        &KernelScenario { which: Which::Dialed, worlds: WORLDS.to_vec(), askers: vec![asker("k0", 0, 0), asker("k1", 0, 0)] },
+        &KernelScenario {
+            which: Which::Dialed,
+            worlds: WORLDS.to_vec(),
+            askers: vec![asker("k0", 0, 0), asker("k1", 0, 0)],
+        },
     ));
 }
 
@@ -186,7 +223,11 @@ fn the_restore_after_any_crash_equals_a_fresh_build() {
         &KernelScenario {
             which: Which::Dialed,
             worlds: WORLDS.to_vec(),
-            askers: vec![asker("k0", 0, 0), asker("k1", 1, 0), Asker { finds: true, ..asker("f", 0, 0) }],
+            askers: vec![
+                asker("k0", 0, 0),
+                asker("k1", 1, 0),
+                Asker { finds: true, ..asker("f", 0, 0) },
+            ],
         },
     ));
 }
@@ -199,7 +240,10 @@ fn every_wait_ends() {
         "a build that flushes twice, and another",
         Model { failures: 2, ..ORDERED },
         Search::Exhaustive,
-        &[script("w0", &[put(1, 1), Op::Flush, put(2, 2), Op::Flush, Op::AwaitAndAnswer]), build("w1", &[put(3, 3)])],
+        &[
+            script("w0", &[put(1, 1), Op::Flush, put(2, 2), Op::Flush, Op::AwaitAndAnswer]),
+            build("w1", &[put(3, 3)]),
+        ],
     ));
 }
 
@@ -242,14 +286,24 @@ fn larger_scenarios_sampled_keep_every_property() {
 #[test]
 #[ignore = "finding 2 of the storemodel lane: a new pack's directory entry is never synced before the head names it"]
 fn a_restore_on_a_posix_file_system_opens() {
-    passes(store("one build, POSIX entries", Model { persist: Persist::Posix, ..ORDERED }, Search::Exhaustive, &[build("w0", &[put(1, 1)])]));
+    passes(store(
+        "one build, POSIX entries",
+        Model { persist: Persist::Posix, ..ORDERED },
+        Search::Exhaustive,
+        &[build("w0", &[put(1, 1)])],
+    ));
 }
 
 /// The model's own check (rule 20): a build that answers before its store is durable is
 /// caught, at the crash that loses it, with a schedule that says so.
 #[test]
 fn the_model_catches_an_answer_given_before_its_store_is_durable() {
-    let result = store("an answer before the store", ORDERED, Search::Exhaustive, &[script("w0", &[put(1, 1), Op::AnswerUnwaited, Op::Flush])]);
+    let result = store(
+        "an answer before the store",
+        ORDERED,
+        Search::Exhaustive,
+        &[script("w0", &[put(1, 1), Op::AnswerUnwaited, Op::Flush])],
+    );
     let report = result.expect_err("the model finds the answer that a crash loses");
     assert_eq!(report.property, properties::ANSWERED_SURVIVES, "{report}");
     assert!(report.crash.is_some(), "{report}");
@@ -265,15 +319,28 @@ fn a_crash_keeps_what_the_file_system_model_says() {
     fs.submit(&mut vec![Effect::Append { file: file.clone(), bytes: vec![7; 10], tag: Tag(0) }]);
     fs.complete(0);
     let states = fs.crash_states(64).expect("few states");
-    let kept: BTreeSet<Option<usize>> = states.iter().map(|it| it.disk.get("d/f").map(Vec::len)).collect();
+    let kept: BTreeSet<Option<usize>> =
+        states.iter().map(|it| it.disk.get("d/f").map(Vec::len)).collect();
     // Gone (its entry lost), empty, torn at 1, 5 and 9 bytes, or whole.
-    assert_eq!(kept, BTreeSet::from([None, Some(0), Some(1), Some(5), Some(9), Some(10)]), "{states:?}");
+    assert_eq!(
+        kept,
+        BTreeSet::from([None, Some(0), Some(1), Some(5), Some(9), Some(10)]),
+        "{states:?}"
+    );
     fs.submit(&mut vec![Effect::Sync { file, tag: Tag(1) }]);
     fs.complete(0);
-    let kept: BTreeSet<Option<usize>> =
-        fs.crash_states(64).expect("few states").iter().map(|it| it.disk.get("d/f").map(Vec::len)).collect();
+    let kept: BTreeSet<Option<usize>> = fs
+        .crash_states(64)
+        .expect("few states")
+        .iter()
+        .map(|it| it.disk.get("d/f").map(Vec::len))
+        .collect();
     assert_eq!(kept, BTreeSet::from([None, Some(10)]), "synced data, its entry not yet");
-    fs.submit(&mut vec![Effect::Write { file: FileName::new("d/g").expect("a name"), bytes: vec![1], tag: Tag(2) }]);
+    fs.submit(&mut vec![Effect::Write {
+        file: FileName::new("d/g").expect("a name"),
+        bytes: vec![1],
+        tag: Tag(2),
+    }]);
     fs.complete(0);
     let states = fs.crash_states(64).expect("few states");
     assert_eq!(states.len(), 1, "a write syncs its directory: {states:?}");

@@ -87,7 +87,11 @@ pub(crate) const PATHS: &[&[&str]] = &[
 #[derive(Default)]
 pub(crate) struct State {}
 
-pub(crate) fn accept(_state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Accepted {
+pub(crate) fn accept(
+    _state: &mut State,
+    cx: &mut Accept<'_, '_, '_>,
+    args: &ArgParser,
+) -> Accepted {
     let other = |name| Parsed::Other(name);
     match cx.builtin.path {
         ["lang"] => Accepted::Single(lang(cx, args)),
@@ -113,14 +117,20 @@ pub(crate) fn accept(_state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &Arg
             cgu_fields(cx, args, false);
             Accepted::Group("rustc_cgu_test")
         }
-        ["rustc_has_incoherent_inherent_impls"] => no_args(cx, args, other("RustcHasIncoherentInherentImpls")),
+        ["rustc_has_incoherent_inherent_impls"] => {
+            no_args(cx, args, other("RustcHasIncoherentInherentImpls"))
+        }
         ["rustc_if_this_changed"] => Accepted::Single(if_this_changed(cx, args)),
         ["rustc_inherit_overflow_checks"] => no_args(cx, args, other("RustcInheritOverflowChecks")),
         ["rustc_insignificant_dtor"] => no_args(cx, args, other("RustcInsignificantDtor")),
         ["rustc_intrinsic"] => no_args(cx, args, other("RustcIntrinsic")),
-        ["rustc_intrinsic_const_stable_indirect"] => no_args(cx, args, other("RustcIntrinsicConstStableIndirect")),
+        ["rustc_intrinsic_const_stable_indirect"] => {
+            no_args(cx, args, other("RustcIntrinsicConstStableIndirect"))
+        }
         ["rustc_legacy_const_generics"] => Accepted::Single(legacy_const_generics(cx, args)),
-        ["rustc_lint_opt_deny_field_access"] => Accepted::Single(lint_opt_deny_field_access(cx, args)),
+        ["rustc_lint_opt_deny_field_access"] => {
+            Accepted::Single(lint_opt_deny_field_access(cx, args))
+        }
         ["rustc_lint_opt_ty"] => no_args(cx, args, other("RustcLintOptTy")),
         ["rustc_lint_query_instability"] => no_args(cx, args, other("RustcLintQueryInstability")),
         ["rustc_lint_untracked_query_information"] => {
@@ -159,7 +169,11 @@ pub(crate) fn accept(_state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &Arg
     }
 }
 
-pub(crate) fn finalize(_state: &mut State, group: &'static str, _fx: &mut Finalize<'_, '_, '_>) -> Option<Parsed> {
+pub(crate) fn finalize(
+    _state: &mut State,
+    group: &'static str,
+    _fx: &mut Finalize<'_, '_, '_>,
+) -> Option<Parsed> {
     match group {
         "rustc_clean" => Some(Parsed::Other("RustcClean")),
         "rustc_mir" => Some(Parsed::Other("RustcMir")),
@@ -170,7 +184,13 @@ pub(crate) fn finalize(_state: &mut State, group: &'static str, _fx: &mut Finali
 }
 
 /// None of `rustc_internal.rs`' parsers has a `finalize_check`.
-pub(crate) fn check(_group: GroupId, _first: usize, _fx: &mut Finalize<'_, '_, '_>, _parsed: &[ParsedAttr]) {}
+pub(crate) fn check(
+    _group: GroupId,
+    _first: usize,
+    _fx: &mut Finalize<'_, '_, '_>,
+    _parsed: &[ParsedAttr],
+) {
+}
 
 /// `LangParser::convert`.
 fn lang(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
@@ -178,16 +198,24 @@ fn lang(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     let name = cx.expect_str(nv)?;
     let Some((name, targets)) = lang_item(name) else {
         // alloc: the error's message
-        let mut diag = cx.err(Some("E0522"), format!("definition of an unknown lang item: `{name}`"), cx.attr_range());
+        let mut diag = cx.err(
+            Some("E0522"),
+            format!("definition of an unknown lang item: `{name}`"),
+            cx.attr_range(),
+        );
         // alloc: the error's label
         diag.span_label(cx.attr_span(), format!("definition of unknown lang item `{name}`"));
         cx.emit_err(diag);
         return None;
     };
-    let foreign = matches!(cx.target(), Target::ForeignFn | Target::ForeignStatic | Target::ForeignTy | Target::ForeignMod);
+    let foreign = matches!(
+        cx.target(),
+        Target::ForeignFn | Target::ForeignStatic | Target::ForeignTy | Target::ForeignMod
+    );
     if foreign && !is_weak(name) {
         // alloc: the error's message
-        let diag = cx.err(Some("E0264"), format!("unknown external lang item: `{name}`"), cx.attr_range());
+        let diag =
+            cx.err(Some("E0264"), format!("unknown external lang item: `{name}`"), cx.attr_range());
         cx.emit_err(diag);
         return None;
     }
@@ -216,7 +244,8 @@ const FOREIGN_FN: &[Policy] = &[Policy::Allow(Target::ForeignFn)];
 const ASSOC_CONST: &[Policy] = &[Policy::Allow(Target::AssocConst)];
 const ASSOC_TY: &[Policy] = &[Policy::Allow(Target::AssocTy)];
 const INHERENT_METHOD: &[Policy] = &[Policy::Allow(Target::Method(MethodKind::Inherent))];
-const REQUIRED_METHOD: &[Policy] = &[Policy::Allow(Target::Method(MethodKind::Trait { body: false }))];
+const REQUIRED_METHOD: &[Policy] =
+    &[Policy::Allow(Target::Method(MethodKind::Trait { body: false }))];
 
 /// rustc's lang items by name, sorted by its bytes, with the target each must be applied to.
 const LANG_ITEMS: &[(&str, &[Policy])] = &[
@@ -539,14 +568,18 @@ fn cgu_fields(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, accepts_kind: bool)
             "module" => &mut module,
             "kind" if accepts_kind => &mut kind,
             _ => {
-                let possibilities: &[&str] = if accepts_kind { &["cfg", "module", "kind"] } else { &["cfg", "module"] };
+                let possibilities: &[&str] =
+                    if accepts_kind { &["cfg", "module", "kind"] } else { &["cfg", "module"] };
                 cx.expected_specific_argument(ident.range, possibilities);
                 continue;
             }
         };
         let Some(value) = cx.expect_string_literal(nv) else { return };
         if slot.is_some() {
-            cx.duplicate_key(TextRange::new(ident.range.start(), nv.args_range().end()), &ident.name);
+            cx.duplicate_key(
+                TextRange::new(ident.range.start(), nv.args_range().end()),
+                &ident.name,
+            );
             continue;
         }
         *slot = Some((value, nv.value_range()));
@@ -627,7 +660,11 @@ fn mir(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
         let Some(ident) = item.ident() else { continue };
         match ident.name.as_str() {
             "borrowck_graphviz_postflow" => {
-                let Some(nv) = cx.expect_name_value(&item.args, item.range(), Some("borrowck_graphviz_postflow")) else {
+                let Some(nv) = cx.expect_name_value(
+                    &item.args,
+                    item.range(),
+                    Some("borrowck_graphviz_postflow"),
+                ) else {
                     continue;
                 };
                 let Some(path) = cx.expect_string_literal(nv) else { continue };
@@ -636,7 +673,11 @@ fn mir(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
                 }
             }
             "borrowck_graphviz_format" => {
-                let Some(nv) = cx.expect_name_value(&item.args, item.range(), Some("borrowck_graphviz_format")) else {
+                let Some(nv) = cx.expect_name_value(
+                    &item.args,
+                    item.range(),
+                    Some("borrowck_graphviz_format"),
+                ) else {
                     continue;
                 };
                 match nv.value_as_str() {
@@ -690,7 +731,10 @@ fn never_type_options(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<P
             "fallback" => &mut fallback,
             "diverging_block_default" => &mut diverging_block_default,
             _ => {
-                cx.expected_specific_argument(ident.range, &["fallback", "diverging_block_default"]);
+                cx.expected_specific_argument(
+                    ident.range,
+                    &["fallback", "diverging_block_default"],
+                );
                 continue;
             }
         };
@@ -758,10 +802,16 @@ mod tests {
 
     #[test]
     fn a_lang_item_names_its_target() {
-        assert_eq!(lang_item("owned_box").map(|it| it.1), Some(&[Policy::Allow(Target::Struct)][..]));
+        assert_eq!(
+            lang_item("owned_box").map(|it| it.1),
+            Some(&[Policy::Allow(Target::Struct)][..])
+        );
         assert_eq!(lang_item("fn").map(|it| it.1), Some(&[Policy::Allow(Target::Trait)][..]));
         assert_eq!(lang_item("Some").map(|it| it.1), Some(&[Policy::Allow(Target::Variant)][..]));
-        assert_eq!(lang_item("panic_impl").map(|it| it.1), Some(&[Policy::Allow(Target::ForeignFn)][..]));
+        assert_eq!(
+            lang_item("panic_impl").map(|it| it.1),
+            Some(&[Policy::Allow(Target::ForeignFn)][..])
+        );
         assert_eq!(lang_item("cookie").map(|it| it.1), None);
         assert_eq!(lang_item("Fn").map(|it| it.1), None);
     }

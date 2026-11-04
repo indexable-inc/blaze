@@ -6,7 +6,9 @@
 use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_expand::fixture;
 
-use crate::{InferBodyId, InferenceDiagnostic, InferenceResult, solver_errors::TypeAnnotationNeeded};
+use crate::{
+    InferBodyId, InferenceDiagnostic, InferenceResult, solver_errors::TypeAnnotationNeeded,
+};
 
 /// The inference diagnostics of the function `f` of `fixture`.
 fn diagnostics(fixture: &str) -> Vec<InferenceDiagnostic> {
@@ -16,11 +18,18 @@ fn diagnostics(fixture: &str) -> Vec<InferenceDiagnostic> {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == "f" => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == "f" =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .expect("the fixture's `f`");
-        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)));
+        let infer = InferenceResult::of(
+            &db,
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)),
+        );
         infer.diagnostics().to_vec()
     })
 }
@@ -41,7 +50,9 @@ fn a_method_on_a_type_that_derefs_to_itself_is_e0055() {
     let limits: Vec<u32> = found
         .iter()
         .filter_map(|it| match it {
-            InferenceDiagnostic::AutoderefRecursionLimit { suggested_limit, .. } => Some(*suggested_limit),
+            InferenceDiagnostic::AutoderefRecursionLimit { suggested_limit, .. } => {
+                Some(*suggested_limit)
+            }
             _ => None,
         })
         .collect();
@@ -90,7 +101,8 @@ fn pointer<T>() -> *const T { loop {} }
 
 #[test]
 fn a_method_on_a_reference_to_an_unknown_type_is_e0282() {
-    let found = diagnostics(&format!("{UNKNOWN}fn f() {{ let r = reference(); r.m(); let _: &u8 = r; }}"));
+    let found =
+        diagnostics(&format!("{UNKNOWN}fn f() {{ let r = reference(); r.m(); let _: &u8 = r; }}"));
     assert!(
         found.iter().any(|it| matches!(
             it,
@@ -137,7 +149,9 @@ fn mut_matching_an_inherited_shared_reference_is_e0308() {
         "//- minicore: sized\n//- /main.rs edition:2024\n#![feature(ref_pat_eat_one_layer_2024)]\nfn f() { let [&mut x] = &[0u8]; }",
     );
     assert!(
-        found.iter().any(|it| matches!(it, InferenceDiagnostic::InheritedRefMutabilityMismatch { .. })),
+        found
+            .iter()
+            .any(|it| matches!(it, InferenceDiagnostic::InheritedRefMutabilityMismatch { .. })),
         "{found:?}",
     );
 }
@@ -147,5 +161,8 @@ fn a_call_through_fn_of_a_non_tuple_is_e0059() {
     let found = diagnostics(
         "//- minicore: fn\n#![feature(unboxed_closures)]\nfn f<F: Fn<u8>>(g: F) { g(1u8); }",
     );
-    assert!(found.iter().any(|it| matches!(it, InferenceDiagnostic::FnTraitArgsNotTuple { .. })), "{found:?}");
+    assert!(
+        found.iter().any(|it| matches!(it, InferenceDiagnostic::FnTraitArgsNotTuple { .. })),
+        "{found:?}"
+    );
 }

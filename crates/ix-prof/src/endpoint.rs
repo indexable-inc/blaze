@@ -63,7 +63,8 @@ impl Endpoint {
     /// (the token would go to another host) and a token that is not one header-safe word.
     pub fn parse(bytes: &[u8], path: &Path) -> Result<Endpoint, String> {
         let shown = path.display();
-        let text = std::str::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8: refused"))?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8: refused"))?;
         let mut lines = text.lines();
         let (Some(addr), Some(token), None) = (lines.next(), lines.next(), lines.next()) else {
             return Err(format!("{shown} is not an address line and a token line: refused"));
@@ -123,8 +124,11 @@ pub fn read_token_file(file: &Path) -> Result<String, String> {
     };
     let parent = parent.filter(|it| !it.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = name.to_str().ok_or_else(|| format!("{} is not UTF-8", file.display()))?;
-    let bytes = PrivateDir::open(parent)?.read_small(name)?.ok_or_else(|| format!("{}: no such file", file.display()))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8: refused", file.display()))?;
+    let bytes = PrivateDir::open(parent)?
+        .read_small(name)?
+        .ok_or_else(|| format!("{}: no such file", file.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{} is not UTF-8: refused", file.display()))?;
     header_word(text, file)
 }
 
@@ -296,10 +300,14 @@ mod unix {
         let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is the caller's open descriptor and `sf` a valid `statfs` to write.
         if unsafe { libc::fstatfs(fd, &mut sf) } != 0 {
-            return Err(format!("checking the volume of {shown}: {}: refused", std::io::Error::last_os_error()));
+            return Err(format!(
+                "checking the volume of {shown}: {}: refused",
+                std::io::Error::last_os_error()
+            ));
         }
         let text = |chars: &[libc::c_char]| {
-            let bytes: Vec<u8> = chars.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: an error's text
+            let bytes: Vec<u8> =
+                chars.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: an error's text
             String::from_utf8_lossy(&bytes).into_owned()
         };
         let on = || text(&sf.f_mntonname);
@@ -354,10 +362,16 @@ mod unix {
         let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is the caller's open descriptor and `sf` a valid `statfs` to write.
         if unsafe { libc::fstatfs(fd, &mut sf) } != 0 {
-            return Err(format!("checking the file system of {shown}: {}: refused", std::io::Error::last_os_error()));
+            return Err(format!(
+                "checking the file system of {shown}: {}: refused",
+                std::io::Error::last_os_error()
+            ));
         }
         // `f_type`'s width and sign differ by target; the magic is its low 32 bits.
-        #[allow(clippy::unnecessary_cast, reason = "f_type is c_long on some targets, c_uint on others")]
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "f_type is c_long on some targets, c_uint on others"
+        )]
         let magic = sf.f_type as u64 & 0xffff_ffff;
         if let Some((_, name)) = NETWORK.iter().find(|(m, _)| *m == magic) {
             return Err(format!(
@@ -371,7 +385,10 @@ mod unix {
         let mut stx: libc::statx = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is the caller's open descriptor, the path empty and NUL-terminated (with
         // AT_EMPTY_PATH, `fd` itself), and `stx` a valid `statx` to write.
-        if unsafe { libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH, libc::STATX_MNT_ID, &mut stx) } != 0 {
+        if unsafe {
+            libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH, libc::STATX_MNT_ID, &mut stx)
+        } != 0
+        {
             return Err(format!(
                 "finding the FUSE mount of {shown} (statx STATX_MNT_ID): {}: refused (ix-prof trusts a FUSE mount only once it has checked who mounted it)",
                 std::io::Error::last_os_error()
@@ -383,7 +400,11 @@ mod unix {
             ));
         }
         let table = std::fs::read_to_string("/proc/self/mountinfo") // alloc: once per FUSE directory opened
-            .map_err(|why| format!("reading /proc/self/mountinfo for the FUSE mount of {shown}: {why}: refused"))?;
+            .map_err(|why| {
+                format!(
+                    "reading /proc/self/mountinfo for the FUSE mount of {shown}: {why}: refused"
+                )
+            })?;
         let mount = super::mountinfo::find(&table, stx.stx_mnt_id)
             .map_err(|why| format!("finding the FUSE mount of {shown}: {why}: refused"))?
             .ok_or_else(|| {
@@ -395,16 +416,22 @@ mod unix {
         if mount.dev != (stx.stx_dev_major, stx.stx_dev_minor) {
             return Err(format!(
                 "{shown} is on device {}:{}, but mount {} in /proc/self/mountinfo ({}) is on {}:{}: refused (the mount changed while it was checked)",
-                stx.stx_dev_major, stx.stx_dev_minor, mount.id, mount.point, mount.dev.0, mount.dev.1
+                stx.stx_dev_major,
+                stx.stx_dev_minor,
+                mount.id,
+                mount.point,
+                mount.dev.0,
+                mount.dev.1
             ));
         }
         // `user_id` is shown in the mounter's user namespace, so it is comparable with this
         // process's uid only in the initial one (or as root, see `fuse_verdict`).
-        let initial = me() == 0 || {
-            let map = std::fs::read_to_string("/proc/self/uid_map") // alloc: once per FUSE directory opened
+        let initial = me() == 0
+            || {
+                let map = std::fs::read_to_string("/proc/self/uid_map") // alloc: once per FUSE directory opened
                 .map_err(|why| format!("reading /proc/self/uid_map for the FUSE mount of {shown}: {why}: refused (ix-prof compares a FUSE mount's user_id with this user only in the initial user namespace)"))?;
-            super::mountinfo::initial_userns(&map)
-        };
+                super::mountinfo::initial_userns(&map)
+            };
         super::mountinfo::fuse_verdict(mount.fstype, mount.super_options, me(), initial).map_err(|why| {
             format!(
                 "{shown} is on the FUSE mount {} ({}, options {}): refused ({why}; use a directory on a local disk, or a FUSE mount of your own without allow_other)",
@@ -421,14 +448,21 @@ mod unix {
 
     /// Refuses the object open at `fd` (shown as `shown`) if it has an ACL, naming it and the
     /// rule. ix-prof never removes an ACL: the user does, or picks another directory.
-    fn refuse_acl(fd: RawFd, dir: bool, shown: &std::path::Display<'_>, mode: u32) -> Result<(), String> {
+    fn refuse_acl(
+        fd: RawFd,
+        dir: bool,
+        shown: &std::path::Display<'_>,
+        mode: u32,
+    ) -> Result<(), String> {
         match acl(fd, dir) {
             Ok(None) => Ok(()),
             Ok(Some(what)) => Err(format!(
                 "{shown} has {what} (access control list): refused (a profile and the endpoint's token must have owner-only mode and no ACL, and an ACL can let other users in where its mode {:04o} shows none; ix-prof never removes one: see it with `ls -le` on macOS or `getfacl` on Linux, remove it with `chmod -N` or `setfacl -b`, or use a directory whose parent has no inheritable ACL)",
                 mode & 0o7777
             )),
-            Err(why) => Err(format!("checking {shown} for an ACL (access control list): {why}: refused (a profile and the endpoint's token must have no ACL)")),
+            Err(why) => Err(format!(
+                "checking {shown} for an ACL (access control list): {why}: refused (a profile and the endpoint's token must have no ACL)"
+            )),
         }
     }
 
@@ -447,15 +481,24 @@ mod unix {
             let last: PathBuf = path.components().collect(); // alloc: once per directory opened
             let link = std::fs::symlink_metadata(&last).map_err(|why| format!("{shown}: {why}"))?;
             if link.file_type().is_symlink() {
-                return Err(format!("{shown} is a symbolic link: refused ({rule}, and a link can point into another user's)"));
+                return Err(format!(
+                    "{shown} is a symbolic link: refused ({rule}, and a link can point into another user's)"
+                ));
             }
             let cpath = c(last.as_os_str().as_bytes(), path)?;
             // SAFETY: a NUL-terminated path; the descriptor, if any, is owned below.
-            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+            let fd = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
             if fd < 0 {
                 let why = std::io::Error::last_os_error();
                 if why.raw_os_error() == Some(libc::ELOOP) {
-                    return Err(format!("{shown} is a symbolic link: refused ({rule}, and a link can point into another user's)"));
+                    return Err(format!(
+                        "{shown} is a symbolic link: refused ({rule}, and a link can point into another user's)"
+                    ));
                 }
                 return Err(format!("opening the directory {shown}: {why}"));
             }
@@ -517,14 +560,20 @@ mod unix {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+                    libc::O_RDONLY
+                        | libc::O_NOFOLLOW
+                        | libc::O_NONBLOCK
+                        | libc::O_NOCTTY
+                        | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 let why = std::io::Error::last_os_error();
                 return match why.raw_os_error() {
                     Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) => Err(format!("{shown} is a symbolic link: refused (it is read only as this user's own regular file)")),
+                    Some(libc::ELOOP) => Err(format!(
+                        "{shown} is a symbolic link: refused (it is read only as this user's own regular file)"
+                    )),
                     _ => Err(format!("opening {shown}: {why}")),
                 };
             }
@@ -533,20 +582,33 @@ mod unix {
             let st = fstat(file.as_raw_fd()).map_err(|why| format!("{shown}: {why}"))?;
             let mode = st.st_mode as u32;
             if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
-                return Err(format!("{shown} is {}: refused (it is read only as a regular file)", kind(mode)));
+                return Err(format!(
+                    "{shown} is {}: refused (it is read only as a regular file)",
+                    kind(mode)
+                ));
             }
             if st.st_uid != me() {
-                return Err(format!("{shown} belongs to uid {}, not this user (uid {}): refused", st.st_uid, me()));
+                return Err(format!(
+                    "{shown} belongs to uid {}, not this user (uid {}): refused",
+                    st.st_uid,
+                    me()
+                ));
             }
             if mode & 0o777 != 0o600 {
-                return Err(format!("{shown} has mode {:04o}, not 0600: refused (a token must be readable by this user only)", mode & 0o7777));
+                return Err(format!(
+                    "{shown} has mode {:04o}, not 0600: refused (a token must be readable by this user only)",
+                    mode & 0o7777
+                ));
             }
             refuse_acl(file.as_raw_fd(), false, &shown, mode)?;
             if st.st_size as u64 > MAX_FILE as u64 {
                 return Err(format!("{shown} is {} bytes, over {MAX_FILE}: refused", st.st_size));
             }
             let mut bytes = Vec::with_capacity(MAX_FILE);
-            (&file).take(MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(|why| format!("reading {shown}: {why}"))?;
+            (&file)
+                .take(MAX_FILE as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|why| format!("reading {shown}: {why}"))?;
             if bytes.len() > MAX_FILE {
                 return Err(format!("{shown} grew past {MAX_FILE} bytes while read: refused"));
             }
@@ -564,12 +626,20 @@ mod unix {
                 libc::openat(
                     dir,
                     cpart.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
                     0o600 as libc::c_uint,
                 )
             };
             if fd < 0 {
-                return Err(format!("making {}: {}", self.at(part).display(), std::io::Error::last_os_error()));
+                return Err(format!(
+                    "making {}: {}",
+                    self.at(part).display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             // SAFETY: `fd` was just opened and nothing else owns it.
             let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -583,7 +653,9 @@ mod unix {
                 // file is checked too before any byte goes in, so a token is never written
                 // where another user could read it.
                 if acl(file.as_raw_fd(), false)?.is_some() {
-                    return Err(std::io::Error::other("it was made with an ACL (access control list): refused (the token must have no ACL)"));
+                    return Err(std::io::Error::other(
+                        "it was made with an ACL (access control list): refused (the token must have no ACL)",
+                    ));
                 }
                 file.write_all(bytes)?;
                 // SAFETY: an open directory and NUL-terminated names.
@@ -605,7 +677,11 @@ mod unix {
             let cname = c(name.as_bytes(), &path)?;
             // SAFETY: an open directory and a NUL-terminated name.
             if unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), 0) } != 0 {
-                return Err(format!("removing {}: {}", path.display(), std::io::Error::last_os_error()));
+                return Err(format!(
+                    "removing {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -660,7 +736,8 @@ pub(crate) mod mountinfo {
     pub(crate) fn find(table: &str, id: u64) -> Result<Option<Mount<'_>>, String> {
         for (n, line) in table.lines().enumerate() {
             let bad = || format!("/proc/self/mountinfo line {} does not parse: {line:?}", n + 1);
-            let first = line.split(' ').next().and_then(|it| it.parse::<u64>().ok()).ok_or_else(bad)?;
+            let first =
+                line.split(' ').next().and_then(|it| it.parse::<u64>().ok()).ok_or_else(bad)?;
             if first == id {
                 return parse(line, id).map(Some).ok_or_else(bad);
             }
@@ -680,7 +757,13 @@ pub(crate) mod mountinfo {
         if tail.next().is_some() {
             return None;
         }
-        Some(Mount { id, dev: (major.parse().ok()?, minor.parse().ok()?), point: unescape(point)?, fstype, super_options })
+        Some(Mount {
+            id,
+            dev: (major.parse().ok()?, minor.parse().ok()?),
+            point: unescape(point)?,
+            fstype,
+            super_options,
+        })
     }
 
     /// `\ooo` octal escapes (space, tab, newline, backslash) undone.
@@ -704,8 +787,15 @@ pub(crate) mod mountinfo {
     /// FUSE types whose daemon stores the bytes on a server (SSH, S3, GCS, WebDAV, ...), which
     /// then decides who can read them, as an NFS server does. One root mounted is refused; one
     /// this user mounted is their own choice of where the token goes.
-    pub(crate) const NETWORK_FUSE: [&str; 7] =
-        ["fuse.sshfs", "fuse.s3fs", "fuse.rclone", "fuse.gcsfuse", "fuse.goofys", "fuse.juicefs", "fuse.davfs"];
+    pub(crate) const NETWORK_FUSE: [&str; 7] = [
+        "fuse.sshfs",
+        "fuse.s3fs",
+        "fuse.rclone",
+        "fuse.gcsfuse",
+        "fuse.goofys",
+        "fuse.juicefs",
+        "fuse.davfs",
+    ];
 
     /// Whether `/proc/self/uid_map` (`uid_map`) is the initial user namespace's: exactly one
     /// line mapping every uid to itself, `0 0 4294967295` (the kernel pads the fields with
@@ -738,7 +828,12 @@ pub(crate) mod mountinfo {
     /// namespace (the `initial_userns` argument, read by [`initial_userns`]). `user_id=0` is safe in any
     /// namespace: it is the root of the mounter's namespace, which is this one or an ancestor
     /// that already controls this process.
-    pub(crate) fn fuse_verdict(fstype: &str, super_options: &str, me: u32, initial_userns: bool) -> Result<(), String> {
+    pub(crate) fn fuse_verdict(
+        fstype: &str,
+        super_options: &str,
+        me: u32,
+        initial_userns: bool,
+    ) -> Result<(), String> {
         if fstype == "virtiofs" {
             return Ok(());
         }
@@ -750,7 +845,11 @@ pub(crate) mod mountinfo {
         for option in super_options.split(',') {
             match option.split_once('=') {
                 Some(("user_id", value)) => {
-                    user = Some(value.parse::<u32>().map_err(|_| format!("its user_id {value:?} is not a uid"))?);
+                    user = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| format!("its user_id {value:?} is not a uid"))?,
+                    );
                 }
                 _ if option == "allow_other" => allow_other = true,
                 _ if option == "default_permissions" => default_permissions = true,
@@ -792,7 +891,11 @@ mod tests {
 
     impl Tmp {
         fn new(what: &str, mode: u32) -> Tmp {
-            let dir = std::env::temp_dir().join(format!("ix-prof-endpoint-{what}-{}-{}", std::process::id(), crate::nonce()));
+            let dir = std::env::temp_dir().join(format!(
+                "ix-prof-endpoint-{what}-{}-{}",
+                std::process::id(),
+                crate::nonce()
+            ));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
             Tmp(dir)
@@ -877,7 +980,10 @@ mod tests {
         write(&token, b"abc\n", 0o600);
         std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o711)).unwrap();
         let why = super::read_token_file(&token).unwrap_err();
-        assert!(why.contains("open to group or other") && why.contains(&dir.0.display().to_string()), "{why}");
+        assert!(
+            why.contains("open to group or other") && why.contains(&dir.0.display().to_string()),
+            "{why}"
+        );
     }
 
     /// What ix-prof writes it can read back, mode 0600, and a writer never leaves its part file.
@@ -888,7 +994,8 @@ mod tests {
         let d = PrivateDir::open(&dir.0).unwrap();
         d.write_whole(FILE, "x.part", e.encode().as_bytes()).unwrap();
         assert_eq!(super::read(&dir.0), Ok(Some(e.clone())));
-        let names: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|it| it.unwrap().file_name()).collect();
+        let names: Vec<_> =
+            std::fs::read_dir(&dir.0).unwrap().map(|it| it.unwrap().file_name()).collect();
         assert_eq!(names, [FILE]);
         // M1: the token never shows in `{:?}`, which an error or a log may print.
         let shown = format!("{e:?}");
@@ -898,7 +1005,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn chmod_acl(op: &str, entry: &str, path: &std::path::Path) {
         // /bin/chmod: a GNU chmod earlier on PATH has no `+a`.
-        let ok = std::process::Command::new("/bin/chmod").arg(op).args((!entry.is_empty()).then_some(entry)).arg(path).status().unwrap();
+        let ok = std::process::Command::new("/bin/chmod")
+            .arg(op)
+            .args((!entry.is_empty()).then_some(entry))
+            .arg(path)
+            .status()
+            .unwrap();
         assert!(ok.success(), "/bin/chmod {op} {entry:?} {}", path.display());
     }
 
@@ -910,7 +1022,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_directory_or_file_with_an_acl_is_refused() {
-        let inherit = "everyone allow list,search,read,readattr,readsecurity,file_inherit,directory_inherit";
+        let inherit =
+            "everyone allow list,search,read,readattr,readsecurity,file_inherit,directory_inherit";
         let parent = Tmp::new("acl", 0o700);
         chmod_acl("+a", inherit, &parent.0);
         let run = parent.0.join("run");
@@ -918,12 +1031,18 @@ mod tests {
 
         // ix-prof makes `run` 0700, and it inherits the parent's entries: refused at start.
         let made = crate::private_dir(&run).map(drop);
-        assert!(made.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("has an ACL")), "the server: {made:?}");
+        assert!(
+            made.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("has an ACL")),
+            "the server: {made:?}"
+        );
         let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "the modes show nothing");
         // The client refuses the same directory.
         let read = super::read(&run);
-        assert!(read.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("has an ACL")), "the client: {read:?}");
+        assert!(
+            read.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("has an ACL")),
+            "the client: {read:?}"
+        );
         // ix-prof did not strip it.
         assert!(PrivateDir::open(&run).is_err(), "the ACL is still there");
 
@@ -933,9 +1052,15 @@ mod tests {
         chmod_acl("+a", "everyone allow read", &run.join(FILE));
         let file_s = run.join(FILE).display().to_string();
         let read = super::read(&run);
-        assert!(read.as_ref().is_err_and(|why| why.contains(&file_s) && why.contains("has an ACL")), "the file: {read:?}");
+        assert!(
+            read.as_ref().is_err_and(|why| why.contains(&file_s) && why.contains("has an ACL")),
+            "the file: {read:?}"
+        );
         let token = super::read_token_file(&run.join(FILE));
-        assert!(token.as_ref().is_err_and(|why| why.contains(&file_s) && why.contains("has an ACL")), "--token-file: {token:?}");
+        assert!(
+            token.as_ref().is_err_and(|why| why.contains(&file_s) && why.contains("has an ACL")),
+            "--token-file: {token:?}"
+        );
 
         // The ACL removed, both are accepted: it was the ACL that was refused.
         chmod_acl("-N", "", &run.join(FILE));
@@ -960,7 +1085,10 @@ mod tests {
             .collect();
         let _ = std::fs::remove_file(&link);
         for (tail, got) in got {
-            assert!(got.as_ref().is_err_and(|why| why.contains("is a symbolic link")), "link{tail}: {got:?}");
+            assert!(
+                got.as_ref().is_err_and(|why| why.contains("is a symbolic link")),
+                "link{tail}: {got:?}"
+            );
         }
         // The directory itself, with a trailing slash, is still fine.
         let mut p = dir.0.clone().into_os_string();
@@ -978,7 +1106,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Image {
         fn attach(what: &str, attach: &[&str]) -> Image {
-            let base = std::env::temp_dir().join(format!("ix-prof-endpoint-{what}-{}-{}", std::process::id(), crate::nonce()));
+            let base = std::env::temp_dir().join(format!(
+                "ix-prof-endpoint-{what}-{}-{}",
+                std::process::id(),
+                crate::nonce()
+            ));
             std::fs::create_dir_all(&base).unwrap();
             let (dmg, mnt) = (base.join("v.dmg"), base.join("mnt"));
             let made = std::process::Command::new("/usr/bin/hdiutil")
@@ -1002,7 +1134,11 @@ mod tests {
 
         /// Detaches the image and attaches it again with `attach`, at the same mount point.
         fn reattach(&self, attach: &[&str]) {
-            let detached = std::process::Command::new("/usr/bin/hdiutil").args(["detach", "-quiet"]).arg(&self.mnt).status().unwrap();
+            let detached = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-quiet"])
+                .arg(&self.mnt)
+                .status()
+                .unwrap();
             assert!(detached.success(), "hdiutil detach {}", self.mnt.display());
             let attached = std::process::Command::new("/usr/bin/hdiutil")
                 .args(["attach", "-quiet", "-nobrowse"])
@@ -1012,14 +1148,21 @@ mod tests {
                 .arg(self.base.join("v.dmg"))
                 .status()
                 .unwrap();
-            assert!(attached.success(), "hdiutil attach {attach:?} {}", self.base.join("v.dmg").display());
+            assert!(
+                attached.success(),
+                "hdiutil attach {attach:?} {}",
+                self.base.join("v.dmg").display()
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     impl Drop for Image {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/hdiutil").args(["detach", "-quiet", "-force"]).arg(&self.mnt).status();
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-quiet", "-force"])
+                .arg(&self.mnt)
+                .status();
             let _ = std::fs::remove_dir_all(&self.base);
         }
     }
@@ -1036,18 +1179,38 @@ mod tests {
         let run = image.mnt.join("prof");
         let run_s = run.display().to_string();
         let made = crate::private_dir(&run).map(drop);
-        assert!(made.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("ignores ownership")), "the server: {made:?}");
+        assert!(
+            made.as_ref()
+                .is_err_and(|why| why.contains(&run_s) && why.contains("ignores ownership")),
+            "the server: {made:?}"
+        );
         // S6: the fix it names includes making a new directory, since one made now keeps uid 99.
-        assert!(made.as_ref().is_err_and(|why| why.contains("enableOwnership") && why.contains("make a new directory")), "the hint: {made:?}");
+        assert!(
+            made.as_ref().is_err_and(
+                |why| why.contains("enableOwnership") && why.contains("make a new directory")
+            ),
+            "the hint: {made:?}"
+        );
         let st = std::fs::metadata(&run).unwrap();
         // SAFETY: geteuid cannot fail.
         let me = unsafe { libc::geteuid() };
-        assert_eq!((std::os::unix::fs::MetadataExt::uid(&st), st.permissions().mode() & 0o777), (me, 0o700), "what fstat shows passes the owner and mode checks");
+        assert_eq!(
+            (std::os::unix::fs::MetadataExt::uid(&st), st.permissions().mode() & 0o777),
+            (me, 0o700),
+            "what fstat shows passes the owner and mode checks"
+        );
         write(&run.join(FILE), GOOD, 0o600);
         let read = super::read(&run);
-        assert!(read.as_ref().is_err_and(|why| why.contains(&run_s) && why.contains("ignores ownership")), "the client: {read:?}");
+        assert!(
+            read.as_ref()
+                .is_err_and(|why| why.contains(&run_s) && why.contains("ignores ownership")),
+            "the client: {read:?}"
+        );
         let token = super::read_token_file(&run.join(FILE));
-        assert!(token.as_ref().is_err_and(|why| why.contains("ignores ownership")), "--token-file: {token:?}");
+        assert!(
+            token.as_ref().is_err_and(|why| why.contains("ignores ownership")),
+            "--token-file: {token:?}"
+        );
         drop(image);
 
         let kept = Image::attach("owners", &["-owners", "on"]);
@@ -1072,7 +1235,9 @@ mod tests {
         std::fs::create_dir(&run).unwrap();
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
         image.reattach(&["-owners", "on"]);
-        let d = PrivateDir::open(&run).unwrap_or_else(|why| panic!("a uid-99 directory on a volume that keeps ownership: {why}"));
+        let d = PrivateDir::open(&run).unwrap_or_else(|why| {
+            panic!("a uid-99 directory on a volume that keeps ownership: {why}")
+        });
         let e = Endpoint { addr: "127.0.0.1:6060".parse().unwrap(), token: "t0k".to_owned() };
         d.write_whole(FILE, "x.part", e.encode().as_bytes()).unwrap();
         assert_eq!(super::read(&run), Ok(Some(e)));
@@ -1093,9 +1258,16 @@ mod tests {
         let local = libc::MNT_LOCAL as u32;
         assert_eq!(volume_verdict(local, 501, 501), Volume::Trusted, "mounted by this user");
         assert_eq!(volume_verdict(local, 0, 501), Volume::Trusted, "mounted by root");
-        assert_eq!(volume_verdict(local, 502, 501), Volume::MountedBy(502), "mounted by another user");
+        assert_eq!(
+            volume_verdict(local, 502, 501),
+            Volume::MountedBy(502),
+            "mounted by another user"
+        );
         assert_eq!(volume_verdict(local, 0, 0), Volume::Trusted, "root's own");
-        assert_eq!(volume_verdict(local | libc::MNT_IGNORE_OWNERSHIP as u32, 501, 501), Volume::IgnoresOwnership);
+        assert_eq!(
+            volume_verdict(local | libc::MNT_IGNORE_OWNERSHIP as u32, 501, 501),
+            Volume::IgnoresOwnership
+        );
         assert_eq!(volume_verdict(0, 501, 501), Volume::Network, "not local");
         let dir = Tmp::new("owner", 0o700);
         assert!(PrivateDir::open(&dir.0).is_ok(), "a volume this user or root mounted");
@@ -1133,8 +1305,15 @@ mod tests {
         };
         // The attack: another user's FUSE with allow_other, faking this user's 0700 directory.
         let evil = find(table, 101).unwrap().unwrap();
-        assert_eq!((evil.dev, evil.point.as_str(), evil.fstype), ((0, 61), "/tmp/prof", "fuse.evil"));
-        assert!(verdict(101).is_err_and(|why| why.contains("uid 1001 mounted it")), "{:?}", verdict(101));
+        assert_eq!(
+            (evil.dev, evil.point.as_str(), evil.fstype),
+            ((0, 61), "/tmp/prof", "fuse.evil")
+        );
+        assert!(
+            verdict(101).is_err_and(|why| why.contains("uid 1001 mounted it")),
+            "{:?}",
+            verdict(101)
+        );
         // This user's own, private or checked by the kernel: accepted. The point is unescaped.
         assert_eq!(find(table, 102).unwrap().unwrap().point, "/home/me/remote dir");
         assert_eq!(verdict(102), Ok(()));
@@ -1144,7 +1323,11 @@ mod tests {
         // Root's, with default_permissions (fuse-overlayfs, a fuseblk disk): accepted; without: refused.
         assert_eq!(verdict(105), Ok(()));
         assert_eq!(verdict(109), Ok(()));
-        assert!(verdict(106).is_err_and(|why| why.contains("root mounted it")), "{:?}", verdict(106));
+        assert!(
+            verdict(106).is_err_and(|why| why.contains("root mounted it")),
+            "{:?}",
+            verdict(106)
+        );
         // virtiofs: only root mounts it.
         assert_eq!(verdict(107), Ok(()));
         // No user_id shown, or not FUSE at all: refused.
@@ -1174,13 +1357,21 @@ mod tests {
         assert!(initial_userns("         0          0 4294967295\n"));
         assert!(initial_userns("0 0 4294967295"));
         assert!(!initial_userns("         0     166536      65536\n"), "a rootless container");
-        assert!(!initial_userns("         0       1000          1\n         1     100000      65536\n"), "two lines");
+        assert!(
+            !initial_userns("         0       1000          1\n         1     100000      65536\n"),
+            "two lines"
+        );
         assert!(!initial_userns("         0          0 4294967294\n"), "not the whole range");
         assert!(!initial_userns("         0          0 4294967295 7\n"), "an extra field");
         assert!(!initial_userns(""), "no map");
 
-        let (fstype, options) = ("fuse.sshfs", "rw,user_id=1000,group_id=1000,default_permissions,allow_other");
-        assert_eq!(fuse_verdict(fstype, options, 1000, true), Ok(()), "the initial namespace: this user's own");
+        let (fstype, options) =
+            ("fuse.sshfs", "rw,user_id=1000,group_id=1000,default_permissions,allow_other");
+        assert_eq!(
+            fuse_verdict(fstype, options, 1000, true),
+            Ok(()),
+            "the initial namespace: this user's own"
+        );
         let why = fuse_verdict(fstype, options, 1000, false).unwrap_err();
         assert!(why.contains("user namespace") && why.contains("uid_map"), "{why}");
         // Private (no allow_other) is refused too: the rule is about who user_id names.
@@ -1219,7 +1410,13 @@ mod tests {
         // tag: USER_OBJ, USER, GROUP_OBJ, MASK, OTHER.
         fn acl(owner: u16, named: u16, other: u16) -> Vec<u8> {
             let mut b = 2u32.to_le_bytes().to_vec();
-            for (tag, perm, id) in [(0x01u16, owner, u32::MAX), (0x02, named, 65534), (0x04, 0, u32::MAX), (0x10, 0, u32::MAX), (0x20, other, u32::MAX)] {
+            for (tag, perm, id) in [
+                (0x01u16, owner, u32::MAX),
+                (0x02, named, 65534),
+                (0x04, 0, u32::MAX),
+                (0x10, 0, u32::MAX),
+                (0x20, other, u32::MAX),
+            ] {
                 b.extend_from_slice(&tag.to_le_bytes());
                 b.extend_from_slice(&perm.to_le_bytes());
                 b.extend_from_slice(&id.to_le_bytes());
@@ -1231,28 +1428,47 @@ mod tests {
             // SAFETY: NUL-terminated path and name; the value, if any, is a live slice.
             let rc = unsafe {
                 match value {
-                    Some(v) => libc::setxattr(c.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0),
+                    Some(v) => {
+                        libc::setxattr(c.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0)
+                    }
                     None => libc::removexattr(c.as_ptr(), name.as_ptr()),
                 }
             };
-            assert_eq!(rc, 0, "{name:?} on {}: {} (does this file system hold POSIX ACLs?)", path.display(), std::io::Error::last_os_error());
+            assert_eq!(
+                rc,
+                0,
+                "{name:?} on {}: {} (does this file system hold POSIX ACLs?)",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
         }
         let (access, default) = (c"system.posix_acl_access", c"system.posix_acl_default");
         let dir = Tmp::new("posixacl", 0o700);
         let dir_s = dir.0.display().to_string();
-        let refused = |what: &str, got: Result<Option<Endpoint>, String>, names: &str, says: &str| {
-            assert!(got.as_ref().is_err_and(|why| why.contains(names) && why.contains(says)), "{what}: {got:?}");
-        };
+        let refused =
+            |what: &str, got: Result<Option<Endpoint>, String>, names: &str, says: &str| {
+                assert!(
+                    got.as_ref().is_err_and(|why| why.contains(names) && why.contains(says)),
+                    "{what}: {got:?}"
+                );
+            };
 
         set(&dir.0, access, Some(&acl(7, 7, 0)));
-        assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700, "the mask hides the entry");
+        assert_eq!(
+            std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the mask hides the entry"
+        );
         refused("an access ACL on the directory", super::read(&dir.0), &dir_s, "has an ACL");
         set(&dir.0, access, None);
 
         set(&dir.0, default, Some(&acl(7, 7, 0)));
         refused("a default ACL on the directory", super::read(&dir.0), &dir_s, "has a default ACL");
         let made = crate::private_dir(&dir.0).map(drop);
-        assert!(made.as_ref().is_err_and(|why| why.contains("has a default ACL")), "the server: {made:?}");
+        assert!(
+            made.as_ref().is_err_and(|why| why.contains("has a default ACL")),
+            "the server: {made:?}"
+        );
         set(&dir.0, default, None);
 
         write(&dir.0.join(FILE), GOOD, 0o600);
@@ -1261,6 +1477,10 @@ mod tests {
         refused("an access ACL on the file", super::read(&dir.0), &file_s, "has an ACL");
         set(&dir.0.join(FILE), access, None);
 
-        assert!(matches!(super::read(&dir.0), Ok(Some(_))), "without them: {:?}", super::read(&dir.0));
+        assert!(
+            matches!(super::read(&dir.0), Ok(Some(_))),
+            "without them: {:?}",
+            super::read(&dir.0)
+        );
     }
 }

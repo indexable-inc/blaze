@@ -24,14 +24,14 @@ use crate::{
     name::{self, AsName, Name},
     tt,
 };
+use syntax::view;
 use syntax::{
     Parse, TextRange, TextSize,
     view::{
-        self as ast, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams,
-        HasModuleItem, HasName, HasTypeBounds,
+        self as ast, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
+        HasName, HasTypeBounds,
     },
 };
-use syntax::view;
 
 #[cfg(test)]
 mod editor;
@@ -247,9 +247,7 @@ fn with_automatically_derived<'f>(
     span: Span,
     expanded: &tt::TopSubtree<&'f Frame>,
 ) -> tt::TopSubtree<&'f Frame> {
-    let is_impl = |element: Option<tt::TtElement<'_>>| {
-        matches!(element, Some(tt::TtElement::Leaf(tt::Leaf::Ident(it))) if it.sym == sym::kw_impl)
-    };
+    let is_impl = |element: Option<tt::TtElement<'_>>| matches!(element, Some(tt::TtElement::Leaf(tt::Leaf::Ident(it))) if it.sym == sym::kw_impl);
     let write_attr = |b: &mut tt::TopSubtreeBuilder| {
         b.push(tt::Leaf::Punct(punct('#', tt::Spacing::Alone, span)));
         b.open(tt::DelimiterKind::Bracket, span);
@@ -308,8 +306,10 @@ fn is_copied_to_derived_impls(mut inner: tt::TtIter<'_>) -> bool {
         }
     }
     let Some(tt::TtElement::Leaf(tt::Leaf::Ident(name))) = inner.next() else { return false };
-    let one_segment =
-        !matches!(inner.peek(), Some(tt::TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ':', .. }))));
+    let one_segment = !matches!(
+        inner.peek(),
+        Some(tt::TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ':', .. })))
+    );
     one_segment
         && [sym::allow, sym::warn, sym::deny, sym::forbid, sym::stable, sym::unstable]
             .contains(&name.sym)
@@ -706,11 +706,7 @@ impl BasicAdtInfo {
 }
 
 // FIXME: This whole thing needs a refactor. Each derive requires its special values, and the result is a mess.
-fn parse_adt(
-    db: &Db,
-    tt: &tt::TopSubtree,
-    call_site: Span,
-) -> Result<BasicAdtInfo, ExpandError> {
+fn parse_adt(db: &Db, tt: &tt::TopSubtree, call_site: Span) -> Result<BasicAdtInfo, ExpandError> {
     let (parsed, tm) = parse_item(db, tt);
     parse_adt_from_syntax(adt_of(&parsed, call_site)?, &tm, call_site)
 }
@@ -774,7 +770,8 @@ fn parse_adt_from_syntax(
         }
         ast::Adt::Enum(it) => {
             let mut default_variant = None;
-            for (i, variant) in it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
+            for (i, variant) in
+                it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
             {
                 if default_variant.is_none()
                     && variant.attrs().any(|it| it.simple_name() == Some("default"))
@@ -819,10 +816,14 @@ fn parse_adt_from_syntax(
                     }
                     to_tt(it.syntax())
                 }
-                None => tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site }),
+                None => {
+                    tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
+                }
             };
             let bounds = match &param {
-                ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| to_tt(it.syntax())),
+                ast::TypeOrConstParam::Type(it) => {
+                    it.type_bound_list().map(|it| to_tt(it.syntax()))
+                }
                 ast::TypeOrConstParam::Const(_) => None,
             };
             let const_ty = if let ast::TypeOrConstParam::Const(param) = param {
@@ -875,7 +876,12 @@ fn parse_adt_from_syntax(
     };
     let name_token = name_to_token(call_site, tm, name)?;
     if let Some(kind) = struct_fields {
-        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
+        variants.push(Variant {
+            name: name_token.clone(),
+            kind,
+            start: 0,
+            end: len_u32(fields.len()),
+        }); // clone: a copy (symbol and span)
     }
     // A `#[blaze::bits]` struct's fields have no address either, so its derives copy them
     // out the way a packed struct's do (they must be `Copy`).
@@ -937,11 +943,8 @@ fn write_derive<'f>(
     span: Span,
     f: impl FnOnce(&mut Builder),
 ) -> tt::TopSubtree<&'f Frame> {
-    let mut b = Builder::new(tt::Delimiter {
-        kind: tt::DelimiterKind::Invisible,
-        open: span,
-        close: span,
-    });
+    let mut b =
+        Builder::new(tt::Delimiter { kind: tt::DelimiterKind::Invisible, open: span, close: span });
     f(&mut b);
     b.build_skip_top_subtree_in(frame)
 }
@@ -1263,8 +1266,7 @@ fn coerce_shared_expand<'f>(
 
     let krate = &dollar_crate(span);
     let target = &target;
-    let trait_path =
-        group(span, |b| quote_into!(b, span => #krate::marker::CoerceShared<#target>));
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::CoerceShared<#target>));
     let no_extra_params = group(span, |_| {});
     ExpandResult::ok(write_derive(frame, span, |b| {
         write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| empty_group(b, span))
@@ -1467,9 +1469,11 @@ fn default_derive<'f>(
                 quote_into!(b, span => fn default() -> Self);
                 delimited(b, tt::DelimiterKind::Brace, span, |b| {
                     adt.write_variant(b, span, variant, |b, _| {
-                        in_group(b, span, |b| {
-                            quote_into!(b, span => #krate::default::Default::default())
-                        })
+                        in_group(
+                            b,
+                            span,
+                            |b| quote_into!(b, span => #krate::default::Default::default()),
+                        )
                     })
                 });
             })
@@ -1552,9 +1556,11 @@ fn debug_derive<'f>(
                         #krate::fmt::DebugTuple::finish(&mut ra_expand_builder)
                     );
                 }),
-                FieldsKind::Unit => in_group(b, span, |b| {
-                    quote_into!(b, span => #krate::fmt::Formatter::write_str(f, #name))
-                }),
+                FieldsKind::Unit => in_group(
+                    b,
+                    span,
+                    |b| quote_into!(b, span => #krate::fmt::Formatter::write_str(f, #name)),
+                ),
             }
         };
         in_group(b, span, |b| {
@@ -1672,8 +1678,7 @@ fn partial_eq_derive<'f>(
     };
     let union = matches!(info.shape.kind, AdtKind::Union);
     let krate = &dollar_crate(span);
-    let structural =
-        group(span, |b| quote_into!(b, span => #krate::marker::StructuralPartialEq));
+    let structural = group(span, |b| quote_into!(b, span => #krate::marker::StructuralPartialEq));
     let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::PartialEq));
     let no_extra_params = group(span, |_| {});
     // As rustc's `expand_deriving_partial_eq`: `StructuralPartialEq` first, which bounds no
@@ -1818,7 +1823,13 @@ fn write_compare_close(b: &mut Builder, span: Span) {
 
 /// `Ordering::Equal`, or `Option::Some(Ordering::Equal)` for `partial`, in a group of its own
 /// when `grouped`.
-fn write_ordering_equal(b: &mut Builder, span: Span, krate: &tt::Ident, partial: bool, grouped: bool) {
+fn write_ordering_equal(
+    b: &mut Builder,
+    span: Span,
+    krate: &tt::Ident,
+    partial: bool,
+    grouped: bool,
+) {
     let write = |b: &mut Builder| {
         if partial {
             quote_into!(b, span => #krate::option::Option::Some(#krate::cmp::Ordering::Equal))
@@ -1833,7 +1844,13 @@ fn write_ordering_equal(b: &mut Builder, span: Span, krate: &tt::Ident, partial:
 /// several variants the discriminants first, then the fields of the variants that have any,
 /// each in turn. As rustc's: a struct or an enum of one variant compares its fields alone, so
 /// a struct's `Self` need not be `Sized` as `discriminant_value` requires.
-fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdtInfo, partial: bool) {
+fn write_ordering(
+    b: &mut Builder,
+    span: Span,
+    krate: &tt::Ident,
+    adt: &BasicAdtInfo,
+    partial: bool,
+) {
     let selfs = adt.bindings("_self");
     let others = adt.bindings("_other");
     let discriminants = adt.is_enum() && adt.shape.variants.len() > 1;
@@ -1866,9 +1883,14 @@ fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdt
         })
     };
     if discriminants {
-        write_compare_open(b, span, krate, partial, |b| discriminant(b, true), |b| {
-            discriminant(b, false)
-        });
+        write_compare_open(
+            b,
+            span,
+            krate,
+            partial,
+            |b| discriminant(b, true),
+            |b| discriminant(b, false),
+        );
     }
     adt.write_match_both(b, span, (&selfs[..], &others[..]), arms, arm, |b| {
         write_ordering_equal(b, span, krate, partial, true)
@@ -2054,9 +2076,8 @@ fn coerce_pointee_derive<'f>(
             None => first,
         }
     };
-    let refuse = |error: BuiltinError, at: Span| {
-        ExpandResult::new(empty(frame, span), error.at(at))
-    };
+    let refuse =
+        |error: BuiltinError, at: Span| ExpandResult::new(empty(frame, span), error.at(at));
     let ast::Adt::Struct(strukt) = adt else {
         return refuse(
             pointee_error(
@@ -2136,8 +2157,7 @@ fn coerce_pointee_derive<'f>(
         || strukt.where_clause().is_some_and(|where_clause| {
             where_clause.predicates().any(|pred| {
                 let Some(ast::Type::PathType(ty)) = pred.ty() else { return false };
-                let is_pointee =
-                    ty.path().and_then(simple_path_name) == Some(unraw(pointee_text));
+                let is_pointee = ty.path().and_then(simple_path_name) == Some(unraw(pointee_text));
                 is_pointee
                     && pred
                         .type_bound_list()
@@ -2458,8 +2478,7 @@ fn params_pointee_paths(
         found |= match param {
             ast::GenericParam::TypeParam(param) => {
                 let bounds = bounds_pointee_paths(param.type_bound_list(), pointee, paths);
-                bounds
-                    | param.default_type().is_some_and(|ty| pointee_paths(ty, pointee, paths))
+                bounds | param.default_type().is_some_and(|ty| pointee_paths(ty, pointee, paths))
             }
             ast::GenericParam::ConstParam(param) => {
                 param.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths))
@@ -2541,8 +2560,10 @@ impl Copied<'_> {
                     self.b.push(tt::Leaf::Literal(tt::Literal { span, ..it }));
                 }
                 tt::TtElement::Subtree(subtree, inner) => {
-                    let (open, close) =
-                        (self.in_item(subtree.delimiter.open), self.in_item(subtree.delimiter.close));
+                    let (open, close) = (
+                        self.in_item(subtree.delimiter.open),
+                        self.in_item(subtree.delimiter.close),
+                    );
                     self.b.open(subtree.delimiter.kind, open);
                     self.walk(inner);
                     self.flush();

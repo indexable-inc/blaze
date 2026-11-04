@@ -68,14 +68,18 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Shared, String> {
         symbols: Vec::new(), // alloc: empty, allocates nothing
         names: Names::default(),
         versions: Vec::new(), // alloc: empty, allocates nothing
-        more: Vec::new(), // alloc: empty, allocates nothing
+        more: Vec::new(),     // alloc: empty, allocates nothing
         inputs,
     })
 }
 
 /// Reads the file names of a `GROUP`, `INPUT` or `AS_NEEDED`, from just past its `(` through
 /// its `)`, into `inputs`.
-fn list(lexer: &mut Lexer<'_, '_>, as_needed: bool, inputs: &mut Vec<String>) -> Result<(), String> {
+fn list(
+    lexer: &mut Lexer<'_, '_>,
+    as_needed: bool,
+    inputs: &mut Vec<String>,
+) -> Result<(), String> {
     let name = lexer.name;
     loop {
         let Some(token) = lexer.next()? else {
@@ -148,13 +152,17 @@ impl<'a> Lexer<'_, 'a> {
                     let end = quoted
                         .find('"')
                         // alloc: error path
-                        .ok_or_else(|| format!("{name}: linker script: a quoted name is not closed"))?;
+                        .ok_or_else(|| {
+                            format!("{name}: linker script: a quoted name is not closed")
+                        })?;
                     self.rest = &quoted[end + 1..];
                     return Ok(Some(Token::Word(&quoted[..end])));
                 }
                 _ => {
                     let end = rest
-                        .find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"'))
+                        .find(|c: char| {
+                            c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"')
+                        })
                         .unwrap_or(rest.len());
                     let end = rest[..end].find("/*").unwrap_or(end);
                     self.rest = &rest[end..];

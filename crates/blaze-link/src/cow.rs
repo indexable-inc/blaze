@@ -93,7 +93,9 @@ impl<A: Send + 'static> LazyPool<A> {
             let slots = (self.bytes / size_of::<Counted<A>>()).clamp(1, u32::MAX as usize) as u32;
             match Pool::new(slots, Tag::Link) {
                 Ok(pool) => pool,
-                Err(error) => panic!("the image state's pool of {} B slots: {error}", size_of::<Counted<A>>()),
+                Err(error) => {
+                    panic!("the image state's pool of {} B slots: {error}", size_of::<Counted<A>>())
+                }
             }
         })
     }
@@ -108,7 +110,11 @@ impl<A: Send + 'static> Local<A> {
     }
 
     #[inline]
-    pub(crate) fn with<R>(&self, pool: &'static LazyPool<A>, f: impl FnOnce(&mut Cache<'static, Counted<A>>) -> R) -> R {
+    pub(crate) fn with<R>(
+        &self,
+        pool: &'static LazyPool<A>,
+        f: impl FnOnce(&mut Cache<'static, Counted<A>>) -> R,
+    ) -> R {
         let mut cache = self.0.borrow_mut();
         f(cache.get_or_insert_with(|| pool.pool().cache()))
     }
@@ -351,7 +357,9 @@ where
         let later_top = top[t + 1..].iter().any(Option::is_some);
         let mid = top[t].as_ref();
         let later_mid = mid.is_some_and(|it| it[m + 1..].iter().any(Option::is_some));
-        let later_leaf = mid.and_then(|it| it[m].as_ref()).is_some_and(|it| it[l + 1..].iter().any(Option::is_some));
+        let later_leaf = mid
+            .and_then(|it| it[m].as_ref())
+            .is_some_and(|it| it[l + 1..].iter().any(Option::is_some));
         if !(later_top || later_mid || later_leaf) {
             return;
         }
@@ -609,7 +617,8 @@ impl<T: Chunked> CowList<T> {
             return &[];
         }
         let start = list.start as usize;
-        &self.chunks.get(list.chunk as usize).expect("a list's chunk").items()[start..start + list.len as usize]
+        &self.chunks.get(list.chunk as usize).expect("a list's chunk").items()
+            [start..start + list.len as usize]
     }
 
     /// The list's elements to write in place; its chunk is copied first when shared.
@@ -642,7 +651,10 @@ impl<T: Chunked> CowList<T> {
     /// Puts a list of `len`, `head` and then clones of `fill`, at the end of the last chunk when
     /// it fits, else in a new chunk.
     fn place(&mut self, len: usize, head: &[T], fill: &T) -> ListRef {
-        assert!(len <= LONGEST_LIST, "a list of {len} elements: a list arena holds at most 2^24 in one slice");
+        assert!(
+            len <= LONGEST_LIST,
+            "a list of {len} elements: a list arena holds at most 2^24 in one slice"
+        );
         if self.open && self.fill + len <= CHUNK {
             let (chunk, start) = (self.count - 1, self.fill);
             let last = self.chunks.entry_mut(chunk).as_mut().expect("the arena's last chunk");
@@ -860,7 +872,8 @@ pub(crate) struct CowBytes {
 
 impl fmt::Debug for CowBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let written = (0..self.len.div_ceil(PAGE)).filter(|it| self.pages.get(*it).is_some()).count();
+        let written =
+            (0..self.len.div_ceil(PAGE)).filter(|it| self.pages.get(*it).is_some()).count();
         f.debug_struct("CowBytes")
             .field("len", &self.len)
             .field("base_len", &self.base_len)
@@ -934,7 +947,8 @@ impl CowBytes {
 
     /// `at..at + len` if it can be borrowed (see [`CowBytes::read`]).
     pub fn slice(&self, at: usize, len: usize) -> Option<&[u8]> {
-        let end = at.checked_add(len).filter(|it| *it <= self.len).expect("a read past the bytes' end");
+        let end =
+            at.checked_add(len).filter(|it| *it <= self.len).expect("a read past the bytes' end");
         if len == 0 {
             return Some(&[]);
         }
@@ -1137,7 +1151,8 @@ impl CowBytes {
         }
         // An unwritten page reaching past the buffer: its bytes, then zeros.
         let have = self.base_len.saturating_sub(at).min(bytes.len());
-        bytes[..have] == *base_at(&self.base, self.base_len, at, have) && bytes[have..].iter().all(|it| *it == 0)
+        bytes[..have] == *base_at(&self.base, self.base_len, at, have)
+            && bytes[have..].iter().all(|it| *it == 0)
     }
 
     /// Calls `out(start, len)` for each `block` of `self` (the last one shorter) whose bytes may
@@ -1151,7 +1166,10 @@ impl CowBytes {
         scratch: &mut Vec<Range<usize>>,
         mut out: impl FnMut(usize, usize),
     ) {
-        assert!(block > 0 && PAGE.is_multiple_of(block), "a block of {block} bytes, which doesn't divide a page");
+        assert!(
+            block > 0 && PAGE.is_multiple_of(block),
+            "a block of {block} bytes, which doesn't divide a page"
+        );
         self.changed_since(old, scratch);
         for range in scratch.iter() {
             for start in (range.start..range.end).step_by(block) {
@@ -1266,7 +1284,9 @@ mod tests {
                 syms.remove(Symbols::join(n as usize % Symbols::SHARDS, (n / 3) as usize));
             }
         }
-        fn sets_in(frame: &blaze_mem::Frame) -> (IdSet<&blaze_mem::Frame>, SymSet<&blaze_mem::Frame>) {
+        fn sets_in(
+            frame: &blaze_mem::Frame,
+        ) -> (IdSet<&blaze_mem::Frame>, SymSet<&blaze_mem::Frame>) {
             let (mut ids, mut syms) = (IdSet::new_in(frame), SymSet::new_in(frame));
             fill(&mut ids, &mut syms);
             (ids, syms)
@@ -1283,7 +1303,11 @@ mod tests {
         let mut frame = crate::arena::stage_frame().unwrap();
         same(&sets_in(&frame), &ids, &syms);
         frame.reset();
-        same(&blaze_alloc_count::assert_at_most(0, "a warm stage's sets", || sets_in(&frame)), &ids, &syms);
+        same(
+            &blaze_alloc_count::assert_at_most(0, "a warm stage's sets", || sets_in(&frame)),
+            &ids,
+            &syms,
+        );
     }
 
     /// The pages against a plain vector given the same writes.
@@ -1313,7 +1337,10 @@ mod tests {
         assert_eq!(changed, vec![0..2 * PAGE, 3 * PAGE..b.len()]);
         assert!(b.same(PAGE + 3, &a, PAGE + 3, 20), "an unwritten range is the same");
         assert!(!b.same(PAGE - 5, &a, PAGE - 5, 10), "a written range differs");
-        assert!(b.same(PAGE - 5, &b.clone(), PAGE - 5, PAGE + 10), "a range across pages, copied in parts");
+        assert!(
+            b.same(PAGE - 5, &b.clone(), PAGE - 5, PAGE + 10),
+            "a range across pages, copied in parts"
+        );
         assert!(b.same(0, &a, 0, PAGE - 3));
         b.resize(PAGE + 10);
         reference.truncate(PAGE + 10);
@@ -1338,7 +1365,8 @@ mod tests {
         let mut bytes = CowBytes::from_vec(vec![1; 5 * PAGE]);
         bytes.write(PAGE + 7, &[2; 3]);
         let list = ListRef { chunk: 0, start: 2, len: 2 };
-        let (copies, used) = blaze_alloc_count::measure(|| (column.clone(), lists.clone(), bytes.clone()));
+        let (copies, used) =
+            blaze_alloc_count::measure(|| (column.clone(), lists.clone(), bytes.clone()));
         assert_eq!(used.allocations, 0, "a clone is reference counts");
         let (mut column2, mut lists2, mut bytes2) = copies;
         assert!(column.chunks.ptr_eq(&column2.chunks), "an unwritten clone shares the table");
@@ -1357,12 +1385,23 @@ mod tests {
         bytes2.write(3 * PAGE, &[3; 5]);
         // Once warm, the first write after a clone copies the table nodes on its path and the
         // chunk or page into slots from those caches: no allocation, whatever the length.
-        let (mut column3, mut lists3, mut bytes3) = (column2.clone(), lists2.clone(), bytes2.clone());
-        blaze_alloc_count::assert_at_most(0, "a warm first write after a clone", || *column3.get_mut(3000).unwrap() = 0);
-        blaze_alloc_count::assert_at_most(0, "a second write to the same chunk", || *column3.get_mut(3001).unwrap() = 0);
-        blaze_alloc_count::assert_at_most(0, "a warm list push after a clone", || lists3.push(&[9, 10]));
-        blaze_alloc_count::assert_at_most(0, "a warm write of a shared page", || bytes3.write(PAGE + 8, &[4; 9]));
-        blaze_alloc_count::assert_at_most(0, "a warm write of an unwritten page", || bytes3.write(4 * PAGE + 1, &[5; 9]));
+        let (mut column3, mut lists3, mut bytes3) =
+            (column2.clone(), lists2.clone(), bytes2.clone());
+        blaze_alloc_count::assert_at_most(0, "a warm first write after a clone", || {
+            *column3.get_mut(3000).unwrap() = 0
+        });
+        blaze_alloc_count::assert_at_most(0, "a second write to the same chunk", || {
+            *column3.get_mut(3001).unwrap() = 0
+        });
+        blaze_alloc_count::assert_at_most(0, "a warm list push after a clone", || {
+            lists3.push(&[9, 10])
+        });
+        blaze_alloc_count::assert_at_most(0, "a warm write of a shared page", || {
+            bytes3.write(PAGE + 8, &[4; 9])
+        });
+        blaze_alloc_count::assert_at_most(0, "a warm write of an unwritten page", || {
+            bytes3.write(4 * PAGE + 1, &[5; 9])
+        });
         assert_eq!(column.get(3), Some(&3));
         assert_eq!(column2.get(3000), Some(&3000));
         assert_eq!(column3.get(3000), Some(&0));
@@ -1446,7 +1485,8 @@ mod tests {
         let mut states: Vec<(CowList<u32>, Model)> = vec![(CowList::default(), (Vec::new(), 0, 0))];
         for _ in 0..300 {
             let from = rng.index(states.len());
-            let (mut arena, (mut lists, mut live, mut garbage)) = (states[from].0.clone(), states[from].1.clone());
+            let (mut arena, (mut lists, mut live, mut garbage)) =
+                (states[from].0.clone(), states[from].1.clone());
             for _ in 0..rng.index(16) + 1 {
                 match rng.below(6) {
                     0 | 1 => {
@@ -1552,7 +1592,10 @@ mod tests {
             bytes.changed_since(old, &mut changed);
             for (at, byte) in model.iter().enumerate() {
                 if old_model.get(at) != Some(byte) {
-                    assert!(changed.iter().any(|it| it.contains(&at)), "byte {at} differs and is not in {changed:?}");
+                    assert!(
+                        changed.iter().any(|it| it.contains(&at)),
+                        "byte {at} differs and is not in {changed:?}"
+                    );
                 }
             }
             assert!(changed.iter().all(|it| it.start % PAGE == 0 && it.end <= model.len()));
@@ -1591,10 +1634,12 @@ mod tests {
             let (mut next, mut next_lists) = (column.clone(), lists.clone());
             for k in 0..4 {
                 let chunk = (n * 4 + k) % CHUNKS;
-                *next.get_mut((chunk * CHUNK as u64 + n % CHUNK as u64) as usize).unwrap() = Probe(n);
+                *next.get_mut((chunk * CHUNK as u64 + n % CHUNK as u64) as usize).unwrap() =
+                    Probe(n);
             }
             next_lists.get_mut(list)[(n % 3) as usize] = Probe(n);
-            history.push_back((std::mem::replace(column, next), std::mem::replace(lists, next_lists)));
+            history
+                .push_back((std::mem::replace(column, next), std::mem::replace(lists, next_lists)));
             if history.len() > 16 {
                 history.pop_front();
             }
@@ -1665,7 +1710,8 @@ mod tests {
         assert_eq!(runs, [(0, 2 * PAGE), (2 * PAGE, PAGE), (3 * PAGE, PAGE), (4 * PAGE, PAGE)]);
         let mut blocks = Vec::new();
         new.changed_blocks(&old, 4096, &mut changed, |at, len| blocks.push((at, len)));
-        let past_old: Vec<(usize, usize)> = (4 * PAGE..5 * PAGE).step_by(4096).map(|it| (it, 4096)).collect();
+        let past_old: Vec<(usize, usize)> =
+            (4 * PAGE..5 * PAGE).step_by(4096).map(|it| (it, 4096)).collect();
         assert_eq!(blocks[0], (2 * PAGE, 4096), "the one block of page 2 written");
         assert_eq!(blocks[1..5], past_old[..], "page 4 reaches past the old bytes' end");
         assert_eq!(blocks[5..], [(5 * PAGE, 64)]);

@@ -20,7 +20,6 @@
 
 #![forbid(unsafe_code)]
 
-use hir_ty::db::HirDatabase;
 use cranelift_codegen::ir::{
     self, AbiParam, Endianness, InstBuilder, MemFlagsData, Type, Value,
     condcodes::{FloatCC, IntCC},
@@ -31,6 +30,7 @@ use hir_def::{
     CallableDefId,
     layout::{BackendRepr, Primitive},
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::{
     TargetFeature, TargetFeatures, crate_target_features,
     intrinsic::{Intrinsic, SimdOp},
@@ -809,7 +809,9 @@ impl<'db> FunctionCx<'_, 'db> {
         }
         let indices = &bytes[..count * 4];
         let index = |at: usize| {
-            u64::from(u32::from_le_bytes(indices[at * 4..at * 4 + 4].try_into().expect("four bytes")))
+            u64::from(u32::from_le_bytes(
+                indices[at * 4..at * 4 + 4].try_into().expect("four bytes"),
+            ))
         };
         // The operands in pieces a vector each: 16 bytes, or 8 that are the low half of one.
         let piece = match lanes.bytes() {

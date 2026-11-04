@@ -55,7 +55,11 @@ impl Inputs for Calling<'_> {
         // alloc: a run that read the whole environment: made once per call, as its key needs.
         self.made
             .get_or_insert_with(|| {
-                inputs::Env::new(env.iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()) // alloc: as above
+                inputs::Env::new(
+                    env.iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                        .collect(),
+                ) // alloc: as above
             })
             .vars()
     }

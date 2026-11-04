@@ -49,7 +49,9 @@ pub fn random_inputs(seed: u64, family: &Family, count: usize) -> Vec<Vec<In>> {
     let mut rng = Rng::new(seed);
     let params = &family.funcs[0].signature.params;
     (0..count)
-        .map(|_| params.iter().map(|param| In::V(super::random(&mut rng, param.value_type))).collect())
+        .map(|_| {
+            params.iter().map(|param| In::V(super::random(&mut rng, param.value_type))).collect()
+        })
         .collect()
 }
 
@@ -157,7 +159,9 @@ impl<'a> Built<'a> {
 
     pub fn mix_name(&self, mix: u32) -> String {
         let names: Vec<String> = (0..self.units())
-            .map(|i| format!("u0:{i} {}", if Self::stencil(mix, i) { "stencil" } else { "cranelift" }))
+            .map(|i| {
+                format!("u0:{i} {}", if Self::stencil(mix, i) { "stencil" } else { "cranelift" })
+            })
             .collect();
         names.join(", ")
     }
@@ -173,7 +177,11 @@ fn run(exec: &Exec, args: &[DataValue], forked: bool) -> Outcome<Vec<DataValue>>
 }
 
 /// Whether two runs of machine code are the same result: equal bits, or both a trap.
-pub fn same_outcome(tys: &[ir::Type], a: &Outcome<Vec<DataValue>>, b: &Outcome<Vec<DataValue>>) -> bool {
+pub fn same_outcome(
+    tys: &[ir::Type],
+    a: &Outcome<Vec<DataValue>>,
+    b: &Outcome<Vec<DataValue>>,
+) -> bool {
     match (a, b) {
         (Outcome::Returned(a), Outcome::Returned(b)) => interp::same_all(tys, a, b, Nans::Exact),
         (Outcome::Trapped(_), Outcome::Trapped(_)) => true,
@@ -224,7 +232,11 @@ pub fn check_counted(
         for (input, (want_out, want_data)) in inputs.iter().zip(&want) {
             let args = resolve(&exec, input);
             let expected = counts(input);
-            assert!(expected.is_empty() || !opts.forked, "{}: counts of a forked call", family.name);
+            assert!(
+                expected.is_empty() || !opts.forked,
+                "{}: counts of a forked call",
+                family.name
+            );
             let before: Vec<[u64; 2]> = (0..built.units()).map(|u| exec.counts(u)).collect();
             let got = run(&exec, &args, opts.forked);
             if !same_outcome(&tys, want_out, &got) {

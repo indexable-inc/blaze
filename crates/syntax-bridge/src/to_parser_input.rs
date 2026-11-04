@@ -11,9 +11,9 @@
 use std::sync::LazyLock;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
+use std::alloc::Global;
 use syntax::{SyntaxKind, SyntaxKind::*, T};
 use tt::FlatToken;
 

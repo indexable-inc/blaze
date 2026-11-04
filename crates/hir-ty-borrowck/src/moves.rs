@@ -276,15 +276,13 @@ impl<'f> MoveData<'f> {
             None => Lookup::Exact(self.locals[place as usize] as Mpi),
             Some(parent) => match self.find_place(ctx, parent) {
                 Lookup::Parent(path) => Lookup::Parent(path),
-                Lookup::Exact(path) => {
-                    match step_of(ctx, parent, place) {
-                        Some(step) => match self.steps.get(&(path as u32, step)) {
-                            Some(&child) => Lookup::Exact(child as Mpi),
-                            None => Lookup::Parent(path),
-                        },
+                Lookup::Exact(path) => match step_of(ctx, parent, place) {
+                    Some(step) => match self.steps.get(&(path as u32, step)) {
+                        Some(&child) => Lookup::Exact(child as Mpi),
                         None => Lookup::Parent(path),
-                    }
-                }
+                    },
+                    None => Lookup::Parent(path),
+                },
             },
         };
         let mut lookups = self.lookups.borrow_mut();

@@ -25,7 +25,9 @@ fn ui_fixture(fixture: &str) -> String {
 /// [`ui_fixture`] of one file with minicore's items for `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}"))
+    ui_fixture(&format!(
+        "//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}"
+    ))
 }
 
 #[test]
@@ -70,7 +72,9 @@ fn main() {
     //~^ ERROR missing fields `a`, `b`, `c` and 2 other fields in initializer of `TruncatedPluralFoo`
 }
 "#;
-    assert_eq!(ui("E0063.rs", "2015", source), r#"error[E0063]: missing field `x` in initializer of `SingleFoo`
+    assert_eq!(
+        ui("E0063.rs", "2015", source),
+        r#"error[E0063]: missing field `x` in initializer of `SingleFoo`
   --> $DIR/E0063.rs:30:13
    |
 LL |     let w = SingleFoo { };
@@ -97,7 +101,8 @@ LL |     let z = TruncatedPluralFoo{x:1};
 error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0063`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -115,7 +120,9 @@ fn main() {
 }
 struct Box<T>(T);
 "#;
-    assert_eq!(ui("struct-fields-missing.rs", "2015", source), r#"error[E0063]: missing field `bar` in initializer of `BuildData`
+    assert_eq!(
+        ui("struct-fields-missing.rs", "2015", source),
+        r#"error[E0063]: missing field `bar` in initializer of `BuildData`
   --> $DIR/struct-fields-missing.rs:7:15
    |
 LL |     let foo = BuildData {
@@ -124,7 +131,8 @@ LL |     let foo = BuildData {
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0063`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -142,7 +150,9 @@ fn main() {
     //~^ ERROR cannot construct `Foo` with struct literal syntax due to private fields
 }
 "#;
-    assert_eq!(ui("private-field-struct-construction-76077.rs", "2015", source), r#"error: cannot construct `Foo` with struct literal syntax due to private fields
+    assert_eq!(
+        ui("private-field-struct-construction-76077.rs", "2015", source),
+        r#"error: cannot construct `Foo` with struct literal syntax due to private fields
   --> $DIR/private-field-struct-construction-76077.rs:9:5
    |
 LL |     foo::Foo {};
@@ -152,7 +162,8 @@ LL |     foo::Foo {};
 
 error: aborting due to 1 previous error
 
-"#);
+"#
+    );
 }
 
 #[test]
@@ -170,7 +181,9 @@ fn main() {
     //~^ ERROR cannot construct `Foo` with struct literal syntax due to private fields
 }
 "#;
-    assert_eq!(ui("issue-87872-missing-inaccessible-field-literal.rs", "2015", source), r#"error: cannot construct `Foo` with struct literal syntax due to private fields
+    assert_eq!(
+        ui("issue-87872-missing-inaccessible-field-literal.rs", "2015", source),
+        r#"error: cannot construct `Foo` with struct literal syntax due to private fields
   --> $DIR/issue-87872-missing-inaccessible-field-literal.rs:9:5
    |
 LL |     foo::Foo {};
@@ -180,7 +193,8 @@ LL |     foo::Foo {};
 
 error: aborting due to 1 previous error
 
-"#);
+"#
+    );
 }
 
 #[test]
@@ -205,7 +219,9 @@ fn main() {
     };
 }
 "#;
-    assert_eq!(ui("missing-private-fields-in-struct-literal.rs", "2015", source), r#"error: cannot construct `S` with struct literal syntax due to private fields
+    assert_eq!(
+        ui("missing-private-fields-in-struct-literal.rs", "2015", source),
+        r#"error: cannot construct `S` with struct literal syntax due to private fields
   --> $DIR/missing-private-fields-in-struct-literal.rs:13:13
    |
 LL |     let _ = m::S {
@@ -220,7 +236,8 @@ LL |         b: (),
 
 error: aborting due to 1 previous error
 
-"#);
+"#
+    );
 }
 
 /// rustc gives no E0063 of a literal with a field its struct lacks (`error_happened`).
@@ -266,7 +283,9 @@ fn main () {
     };
 }
 "#;
-    assert_eq!(ui_fixture(fixture), r#"error[E0560]: struct `B` has no field named `aa`
+    assert_eq!(
+        ui_fixture(fixture),
+        r#"error[E0560]: struct `B` has no field named `aa`
   --> $DIR/suggest-private-fields.rs:15:9
    |
 LL |         aa: 20,
@@ -313,7 +332,8 @@ LL +         b: 20,
 error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0560`.
-"#);
+"#
+    );
 }
 
 /// A struct of another crate marked `#[non_exhaustive]` gives E0639, not the fields it lacks.
@@ -353,7 +373,9 @@ fn main() {
     };
 }
 "#;
-    assert_eq!(ui_fixture(fixture), r#"error[E0639]: cannot create non-exhaustive struct using struct expression
+    assert_eq!(
+        ui_fixture(fixture),
+        r#"error[E0639]: cannot create non-exhaustive struct using struct expression
   --> $DIR/non-exhaustive-with-private-fields-147513.rs:8:15
    |
 LL |       let foo = Foo {
@@ -376,7 +398,8 @@ LL | |     };
 error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0639`.
-"#);
+"#
+    );
 }
 
 /// The parser's recovery in a struct literal or pattern leaves out its missing fields.
@@ -490,7 +513,9 @@ struct String;
 trait ToString { fn to_string(&self) -> String; }
 impl ToString for str { fn to_string(&self) -> String { String } }
 "#;
-    assert_eq!(ui_core("E0027.rs", "copy", source), r#"error[E0027]: pattern does not mention field `name`
+    assert_eq!(
+        ui_core("E0027.rs", "copy", source),
+        r#"error[E0027]: pattern does not mention field `name`
   --> $DIR/E0027.rs:11:9
    |
 LL |         Dog { age: x } => {}
@@ -569,7 +594,8 @@ LL |         Dog { .. } => {}
 error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0027`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -587,7 +613,9 @@ fn main() {
     let E::V { 0: _ } = E::V(1, 2.2); //~ ERROR: pattern does not mention field `1`
 }
 "#;
-    assert_eq!(ui("struct-pat-unmentioned-tuple-indices.rs", "2015", source), r#"error[E0027]: pattern does not mention field `1`
+    assert_eq!(
+        ui("struct-pat-unmentioned-tuple-indices.rs", "2015", source),
+        r#"error[E0027]: pattern does not mention field `1`
   --> $DIR/struct-pat-unmentioned-tuple-indices.rs:9:9
    |
 LL |     let S { 0: _ } = S(1, 2.2);
@@ -628,7 +656,8 @@ LL |     let E::V { 0: _, .. } = E::V(1, 2.2);
 error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0027`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -654,7 +683,9 @@ fn main() {
     //~^ ERROR pattern requires `..` due to inaccessible fields
 }
 "#;
-    assert_eq!(ui_core("inaccessible-private-fields-76077.rs", "default, derive", source), r#"error: pattern requires `..` due to inaccessible fields
+    assert_eq!(
+        ui_core("inaccessible-private-fields-76077.rs", "default, derive", source),
+        r#"error: pattern requires `..` due to inaccessible fields
   --> $DIR/inaccessible-private-fields-76077.rs:14:9
    |
 LL |     let foo::Foo {} = foo::Foo::default();
@@ -678,7 +709,8 @@ LL |     let foo::Bar { visible, .. } = foo::Bar::default();
 
 error: aborting due to 2 previous errors
 
-"#);
+"#
+    );
 }
 
 #[test]
@@ -708,7 +740,9 @@ fn main() {
     } = m::S::new();
 }
 "#;
-    assert_eq!(ui("inaccessible-private-fields-trailing-comma-149787.rs", "2015", source), r#"error: pattern requires `..` due to inaccessible fields
+    assert_eq!(
+        ui("inaccessible-private-fields-trailing-comma-149787.rs", "2015", source),
+        r#"error: pattern requires `..` due to inaccessible fields
   --> $DIR/inaccessible-private-fields-trailing-comma-149787.rs:19:9
    |
 LL |       let m::S {
@@ -725,7 +759,8 @@ LL |         visible, ..
 
 error: aborting due to 1 previous error
 
-"#);
+"#
+    );
 }
 
 /// A destructuring assignment is a pattern: E0026 and E0027 of it, its `..base` refused, and
@@ -777,7 +812,9 @@ fn main() {
     };
 }
 "#;
-    assert_eq!(ui("E0062.rs", "2015", source), r#"error[E0062]: field `x` specified more than once
+    assert_eq!(
+        ui("E0062.rs", "2015", source),
+        r#"error[E0062]: field `x` specified more than once
   --> $DIR/E0062.rs:8:9
    |
 LL |         x: 0,
@@ -788,7 +825,8 @@ LL |         x: 0,
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0062`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -820,7 +858,9 @@ fn main() {
     //~^ ERROR E0560
 }
 "#;
-    assert_eq!(ui("E0560.rs", "2015", source), r#"error[E0560]: struct `Simba` has no field named `father`
+    assert_eq!(
+        ui("E0560.rs", "2015", source),
+        r#"error[E0560]: struct `Simba` has no field named `father`
   --> $DIR/E0560.rs:6:32
    |
 LL |     let s = Simba { mother: 1, father: 0 };
@@ -831,7 +871,8 @@ LL |     let s = Simba { mother: 1, father: 0 };
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0560`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -846,7 +887,9 @@ fn main() {
     //~^ ERROR E0559
 }
 "#;
-    assert_eq!(ui("E0559.rs", "2015", source), r#"error[E0559]: variant `Field::Fool` has no field named `joke`
+    assert_eq!(
+        ui("E0559.rs", "2015", source),
+        r#"error[E0559]: variant `Field::Fool` has no field named `joke`
   --> $DIR/E0559.rs:6:27
    |
 LL |     let s = Field::Fool { joke: 0 };
@@ -857,7 +900,8 @@ LL |     let s = Field::Fool { joke: 0 };
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0559`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -876,7 +920,9 @@ fn main() {
     }
 }
 "#;
-    assert_eq!(ui("E0026.rs", "2015", source), r#"error[E0026]: struct `Thing` does not have a field named `z`
+    assert_eq!(
+        ui("E0026.rs", "2015", source),
+        r#"error[E0026]: struct `Thing` does not have a field named `z`
   --> $DIR/E0026.rs:9:23
    |
 LL |         Thing { x, y, z } => {}
@@ -885,7 +931,8 @@ LL |         Thing { x, y, z } => {}
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0026`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -911,7 +958,9 @@ fn main() {
     let f = bar::Foo{ a: 0, b: 0 }; //~ ERROR E0451
 }
 "#;
-    assert_eq!(ui("E0451.rs", "2015", source), r#"error[E0451]: field `b` of struct `Foo` is private
+    assert_eq!(
+        ui("E0451.rs", "2015", source),
+        r#"error[E0451]: field `b` of struct `Foo` is private
   --> $DIR/E0451.rs:14:21
    |
 LL |     let bar::Foo{a, b} = foo;
@@ -926,7 +975,8 @@ LL |     let f = bar::Foo{ a: 0, b: 0 };
 error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0451`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -941,7 +991,9 @@ fn main() {
     //~^ ERROR functional record update syntax requires a struct
 }
 "#;
-    assert_eq!(ui("fru-on-enum-variant.rs", "2015", source), r#"error[E0436]: functional record update syntax requires a struct
+    assert_eq!(
+        ui("fru-on-enum-variant.rs", "2015", source),
+        r#"error[E0436]: functional record update syntax requires a struct
   --> $DIR/fru-on-enum-variant.rs:6:22
    |
 LL |     Foo::A { x: 6, ..orig };
@@ -950,7 +1002,8 @@ LL |     Foo::A { x: 6, ..orig };
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0436`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -972,7 +1025,9 @@ fn main() {
     };
 }
 "#;
-    assert_eq!(ui("ice-with-expr-not-struct-127332.rs", "2015", source), r#"error[E0436]: functional record update syntax requires a struct
+    assert_eq!(
+        ui("ice-with-expr-not-struct-127332.rs", "2015", source),
+        r#"error[E0436]: functional record update syntax requires a struct
   --> $DIR/ice-with-expr-not-struct-127332.rs:12:26
    |
 LL |         Foo::A { x: 6, ..orig };
@@ -981,7 +1036,8 @@ LL |         Foo::A { x: 6, ..orig };
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0436`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -993,7 +1049,9 @@ fn main() {
     || if let Foo::NotEvenReal() = Foo {}; //~ ERROR E0599
 }
 "#;
-    assert_eq!(ui("E0599.rs", "2015", source), r#"error[E0599]: no associated function or constant named `NotEvenReal` found for struct `Foo` in the current scope
+    assert_eq!(
+        ui("E0599.rs", "2015", source),
+        r#"error[E0599]: no associated function or constant named `NotEvenReal` found for struct `Foo` in the current scope
   --> $DIR/E0599.rs:4:20
    |
 LL | struct Foo;
@@ -1005,7 +1063,8 @@ LL |     || if let Foo::NotEvenReal() = Foo {};
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0599`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1024,7 +1083,9 @@ fn main() {
     y.1; //~ ERROR E0609
 }
 "#;
-    assert_eq!(ui("E0609.rs", "2015", source), r#"error[E0609]: no field `foo` on type `Foo`
+    assert_eq!(
+        ui("E0609.rs", "2015", source),
+        r#"error[E0609]: no field `foo` on type `Foo`
   --> $DIR/E0609.rs:8:15
    |
 LL |     let _ = x.foo;
@@ -1041,7 +1102,8 @@ LL |     y.1;
 error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0609`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1071,7 +1133,9 @@ fn main() {
     f.method; //~ ERROR E0615
 }
 "#;
-    assert_eq!(ui("E0615.rs", "2015", source), r#"error[E0615]: attempted to take value of method `method` on type `Foo`
+    assert_eq!(
+        ui("E0615.rs", "2015", source),
+        r#"error[E0615]: attempted to take value of method `method` on type `Foo`
   --> $DIR/E0615.rs:11:7
    |
 LL |     f.method;
@@ -1085,7 +1149,8 @@ LL |     f.method();
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0615`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1106,7 +1171,9 @@ fn main() {
     f.x; //~ ERROR E0616
 }
 "#;
-    assert_eq!(ui("E0616.rs", "2015", source), r#"error[E0616]: field `x` of struct `Foo` is private
+    assert_eq!(
+        ui("E0616.rs", "2015", source),
+        r#"error[E0616]: field `x` of struct `Foo` is private
   --> $DIR/E0616.rs:13:7
    |
 LL |     f.x;
@@ -1115,7 +1182,8 @@ LL |     f.x;
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0616`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1134,7 +1202,9 @@ fn main() {
     foo.method(); //~ ERROR method `method` is private [E0624]
 }
 "#;
-    assert_eq!(ui("E0624.rs", "2015", source), r#"error[E0624]: method `method` is private
+    assert_eq!(
+        ui("E0624.rs", "2015", source),
+        r#"error[E0624]: method `method` is private
   --> $DIR/E0624.rs:11:9
    |
 LL |         fn method(&self) {}
@@ -1146,7 +1216,8 @@ LL |     foo.method();
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0624`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1161,7 +1232,9 @@ fn a_value_resolve_cannot_find() {
 fn main () {
 }
 "#;
-    assert_eq!(ui("E0425.rs", "2015", source), r#"error[E0425]: cannot find value `elf` in this scope
+    assert_eq!(
+        ui("E0425.rs", "2015", source),
+        r#"error[E0425]: cannot find value `elf` in this scope
   --> $DIR/E0425.rs:3:9
    |
 LL |         elf;
@@ -1170,7 +1243,8 @@ LL |         elf;
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0425`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1198,7 +1272,9 @@ fn main () {
     let self = "self"; //~ ERROR E0424
 }
 "#;
-    assert_eq!(ui("E0424.rs", "2015", source), r#"error[E0424]: cannot find value `self` in this scope
+    assert_eq!(
+        ui("E0424.rs", "2015", source),
+        r#"error[E0424]: cannot find value `self` in this scope
   --> $DIR/E0424.rs:7:9
    |
 LL |     fn foo() {
@@ -1251,7 +1327,8 @@ LL |     let self = "self";
 error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0424`.
-"#);
+"#
+    );
 }
 
 #[test]
@@ -1272,7 +1349,9 @@ use Unknown as _;
 fn foo<T: A>(x: T) {} // Shouldn't suggest underscore
 //~^ ERROR: cannot find trait `A` in this scope
 "#;
-    assert_eq!(ui("typo-suggestion-named-underscore.rs", "2015", source), r#"error[E0425]: cannot find value `a` in this scope
+    assert_eq!(
+        ui("typo-suggestion-named-underscore.rs", "2015", source),
+        r#"error[E0425]: cannot find value `a` in this scope
   --> $DIR/typo-suggestion-named-underscore.rs:4:5
    |
 LL |     a // Shouldn't suggest underscore
@@ -1288,7 +1367,8 @@ error: aborting due to 2 previous errors
 
 Some errors have detailed explanations: E0405, E0425.
 For more information about an error, try `rustc --explain E0405`.
-"#);
+"#
+    );
 }
 
 /// A name a format string captures is reported at its place in the string.
@@ -1338,9 +1418,7 @@ fn a_value_a_format_string_captures() {
     );
 }
 
-const E0063_ONLY: [&str; 1] = [
-    "E0063: missing field `dir` in initializer of `WorkerConfig`",
-];
+const E0063_ONLY: [&str; 1] = ["E0063: missing field `dir` in initializer of `WorkerConfig`"];
 
 /// #1522: the case it was found in, a literal inside another in a closure of a
 /// `#[cfg(test)]` module, is an error of the crate built for tests.

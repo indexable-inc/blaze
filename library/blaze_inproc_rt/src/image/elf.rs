@@ -54,15 +54,29 @@ pub(super) fn read(bytes: &[u8]) -> Result<Found, Error> {
     }
     let table = range(phoff, u64::from(count) * PHENT, "the program headers")?;
     if table.end > bytes.len() as u64 {
-        return Err(bad(&format!("program headers at {:#x}..{:#x} past the {:#x} bytes read", table.start, table.end, bytes.len())));
+        return Err(bad(&format!(
+            "program headers at {:#x}..{:#x} past the {:#x} bytes read",
+            table.start,
+            table.end,
+            bytes.len()
+        )));
     }
-    #[allow(clippy::reversed_empty_ranges, reason = "the span starts empty, widened to each segment's start and end")]
-    let mut found =
-        Found { header: 0, span: u64::MAX..0, code: Vec::new(), reserved: Vec::new(), other: Vec::new() };
+    #[allow(
+        clippy::reversed_empty_ranges,
+        reason = "the span starts empty, widened to each segment's start and end"
+    )]
+    let mut found = Found {
+        header: 0,
+        span: u64::MAX..0,
+        code: Vec::new(),
+        reserved: Vec::new(),
+        other: Vec::new(),
+    };
     let mut header = None;
     for index in 0..u64::from(count) {
         let at = phoff + index * PHENT;
-        let field = |offset: u64| u64_at(bytes, at + offset).ok_or_else(|| bad("a short program header"));
+        let field =
+            |offset: u64| u64_at(bytes, at + offset).ok_or_else(|| bad("a short program header"));
         if u32_at(bytes, at) != Some(PT_LOAD) {
             continue;
         }

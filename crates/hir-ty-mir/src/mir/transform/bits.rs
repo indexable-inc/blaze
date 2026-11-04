@@ -139,9 +139,9 @@ fn uses_bits<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>) -> Result<'db, bool> 
                     }
                     found
                 }
-                StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
-                    false
-                }
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => false,
             };
             if found {
                 return Ok(true);
@@ -149,20 +149,19 @@ fn uses_bits<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>) -> Result<'db, bool> 
         }
         let Some(terminator) = &block.terminator else { continue };
         let found = match &terminator.kind {
-            TerminatorKind::SwitchInt { discr: it, .. } | TerminatorKind::Assert { cond: it, .. } => {
-                operand(it)?
-            }
-            TerminatorKind::TailCall { func, args, .. } => {
-                operand(func)? || operands(&args[..])?
-            }
+            TerminatorKind::SwitchInt { discr: it, .. }
+            | TerminatorKind::Assert { cond: it, .. } => operand(it)?,
+            TerminatorKind::TailCall { func, args, .. } => operand(func)? || operands(&args[..])?,
             TerminatorKind::Call { func, args, destination, .. } => {
-                operand(func)?
-                    || place(destination)?
-                    || operands(&args[..])?
+                operand(func)? || place(destination)? || operands(&args[..])?
             }
-            TerminatorKind::Yield { value, resume_arg, .. } => operand(value)? || place(resume_arg)?,
+            TerminatorKind::Yield { value, resume_arg, .. } => {
+                operand(value)? || place(resume_arg)?
+            }
             TerminatorKind::Drop { place: it, .. } => place(it)?,
-            TerminatorKind::DropAndReplace { place: it, value, .. } => place(it)? || operand(value)?,
+            TerminatorKind::DropAndReplace { place: it, value, .. } => {
+                place(it)? || operand(value)?
+            }
             TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
             | TerminatorKind::Abort
@@ -200,11 +199,18 @@ enum Leaf<'db> {
     Bool,
     Int,
     /// An enum of one variant: its value is that variant, and it takes no bits it reads.
-    SingleEnum { variant: VariantId, args: StoredGenericArgs },
+    SingleEnum {
+        variant: VariantId,
+        args: StoredGenericArgs,
+    },
     /// An enum of more variants, its tag a `tag`.
-    Enum { tag: Ty<'db> },
+    Enum {
+        tag: Ty<'db>,
+    },
     /// A bits struct, its backing integer `backing`.
-    Nested { backing: Integer },
+    Nested {
+        backing: Integer,
+    },
 }
 
 /// The bits of a bits struct `place` is, if it is in one. A place that goes on past such a
@@ -314,7 +320,9 @@ fn leaf<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Result<'db, Leaf<'db>> {
 fn not_packable<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> MirLowerError<'db> {
     // alloc: error path
     MirLowerError::ImplementationError(blaze_query::db::attach(ctx.db, || {
-        format!("a field of a `#[blaze::bits]` struct has type `{ty:?}`, which `bits_layout` refuses")
+        format!(
+            "a field of a `#[blaze::bits]` struct has type `{ty:?}`, which `bits_layout` refuses"
+        )
     }))
 }
 
@@ -409,11 +417,7 @@ fn with_const<'db>(
     constant: u128,
 ) -> LocalId {
     let ty = int_ty(ctx, integer, signed);
-    emit.assign(
-        body,
-        ty,
-        Rvalue::BinaryOp(op, moved(value), konst(ctx, integer, signed, constant)),
-    )
+    emit.assign(body, ty, Rvalue::BinaryOp(op, moved(value), konst(ctx, integer, signed, constant)))
 }
 
 /// The backing integer of the bits struct at `carrier`, as a `uN`.
@@ -544,18 +548,27 @@ fn bits_of<'db>(
             // The discriminant, through a place, as `Discriminant` reads one.
             let held = emit.assign(body, ty, Rvalue::Use(value));
             let discr_ty = ty.discriminant_ty(ctx.infcx.interner);
-            let discr = emit.assign(body, discr_ty, Rvalue::Discriminant(Place::from(held).store()));
+            let discr =
+                emit.assign(body, discr_ty, Rvalue::Discriminant(Place::from(held).store()));
             as_uint(emit, body, moved(discr))
         }
         Leaf::Nested { backing: inner } => {
             let inner_ty = int_ty(ctx, inner, false);
-            let raw = emit.assign(body, inner_ty, Rvalue::Cast(CastKind::Transmute, value, inner_ty.store()));
+            let raw = emit.assign(
+                body,
+                inner_ty,
+                Rvalue::Cast(CastKind::Transmute, value, inner_ty.store()),
+            );
             // An inner padding bit (set by a transmute into it) must not spill into the next
             // field: the mask below cuts it.
             as_uint(emit, body, moved(raw))
         }
     };
-    Ok(Some(if w < n { with_const(ctx, body, emit, BinOp::BitAnd, bits, unsigned, mask(w)) } else { bits }))
+    Ok(Some(if w < n {
+        with_const(ctx, body, emit, BinOp::BitAnd, bits, unsigned, mask(w))
+    } else {
+        bits
+    }))
 }
 
 /// `access = value`: the backing integer with the field's bits replaced.
@@ -580,7 +593,8 @@ fn write<'db>(
         let kept = !(mask(w) << access.offset);
         let old = with_const(ctx, body, emit, BinOp::BitAnd, old, unsigned, kept);
         if access.offset != 0 {
-            bits = with_const(ctx, body, emit, BinOp::Shl, bits, unsigned, u128::from(access.offset));
+            bits =
+                with_const(ctx, body, emit, BinOp::Shl, bits, unsigned, u128::from(access.offset));
         }
         bits = emit.assign(body, uint, Rvalue::BinaryOp(BinOp::BitOr, moved(old), moved(bits)));
     }
@@ -706,7 +720,8 @@ fn pack<'db>(
             continue;
         };
         if field.offset != 0 {
-            bits = with_const(ctx, body, emit, BinOp::Shl, bits, unsigned, u128::from(field.offset));
+            bits =
+                with_const(ctx, body, emit, BinOp::Shl, bits, unsigned, u128::from(field.offset));
         }
         packed = Some(match packed {
             None => bits,
@@ -739,7 +754,8 @@ fn lower_eq<'db>(
     let n = layout.backing_bits();
     for side in [l, r] {
         let value = std::mem::replace(side, konst(ctx, layout.backing, false, 0));
-        let mut bits = emit.assign(body, uint, Rvalue::Cast(CastKind::Transmute, value, uint.store()));
+        let mut bits =
+            emit.assign(body, uint, Rvalue::Cast(CastKind::Transmute, value, uint.store()));
         if layout.used < n {
             bits = with_const(ctx, body, emit, BinOp::BitAnd, bits, unsigned, mask(layout.used));
         }

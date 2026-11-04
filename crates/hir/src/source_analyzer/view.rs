@@ -348,8 +348,7 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         field: ast::RecordExprField<'_>,
     ) -> Option<(Field, Option<Local<'db>>, Type<'db>, GenericSubstitution<'db>)> {
-        let record_expr =
-            ast::RecordExpr::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
+        let record_expr = ast::RecordExpr::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
         let expr_id = self
             .store_sm()?
             .node_expr_view(InFile::new(self.file_id, ast::Expr::RecordExpr(record_expr)))?;
@@ -551,7 +550,8 @@ impl<'db> SourceAnalyzer<'db> {
         &self,
         db: &'db Db,
         path: ast::Path<'_>,
-    ) -> Result<Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)>, NotInAstIdMap> {
+    ) -> Result<Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)>, NotInAstIdMap>
+    {
         let mut missed = None;
         let resolved = self.resolve_path_view_noting(db, path, &mut missed);
         match missed {
@@ -714,8 +714,14 @@ impl<'db> SourceAnalyzer<'db> {
             && use_tree.coloncolon_token().is_some()
         {
             // A use tree names no generic parameter, and its own hygiene is the use tree's.
-            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, HygieneId::ROOT, store)
-                .map(|it| (it, None));
+            return resolve_hir_path_qualifier(
+                db,
+                &self.resolver,
+                hir_path,
+                HygieneId::ROOT,
+                store,
+            )
+            .map(|it| (it, None));
         }
 
         let meta_path = path
@@ -797,7 +803,8 @@ impl<'db> SourceAnalyzer<'db> {
                                 ast::Adt::Enum(it) => ("enum", it.name()),
                                 ast::Adt::Union(it) => ("union", it.name()),
                             };
-                            let name = name.map_or_else(|| "_".to_owned(), |it| it.text().to_string());
+                            let name =
+                                name.map_or_else(|| "_".to_owned(), |it| it.text().to_string());
                             *missed = Some(NotInAstIdMap {
                                 // alloc: error path
                                 item: format!("{kind} {name}"),
@@ -877,8 +884,7 @@ impl<'db> SourceAnalyzer<'db> {
                         AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. },
                     ) => {
                         // A trait method's `impl Trait` is no path's resolution.
-                        let hir_ty::next_solver::AssocTyId::TypeAliasId(assoc_id) = def_id.0
-                        else {
+                        let hir_ty::next_solver::AssocTyId::TypeAliasId(assoc_id) = def_id.0 else {
                             return None;
                         };
                         (
@@ -938,7 +944,10 @@ impl<'db> SourceAnalyzer<'db> {
         ))
     }
 
-    pub(crate) fn resolve_variant_view(&self, record_lit: ast::RecordExpr<'_>) -> Option<VariantId> {
+    pub(crate) fn resolve_variant_view(
+        &self,
+        record_lit: ast::RecordExpr<'_>,
+    ) -> Option<VariantId> {
         let infer = self.infer()?;
         let expr_id = self.expr_id_view(ast::Expr::RecordExpr(record_lit))?;
         infer.variant_resolution_for_expr_or_pat(expr_id)

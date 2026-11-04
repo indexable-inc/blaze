@@ -14,8 +14,8 @@ use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule,
     expr_store::Body,
     hir::{
-        Array, BinaryOp, Expr, ExprId, ExprOrPatId, LogicOp, LoopSource, MatchArm,
-        Pat as HirPat, PatId, RangeOp, Statement, UnaryOp,
+        Array, BinaryOp, Expr, ExprId, ExprOrPatId, LogicOp, LoopSource, MatchArm, Pat as HirPat,
+        PatId, RangeOp, Statement, UnaryOp,
     },
     item_tree::FieldsShape,
     resolver::ValueNs,
@@ -33,8 +33,7 @@ use hir_ty::{
     db::HirDatabase,
     inhabitedness::{is_enum_variant_privately_uninhabited, is_enum_variant_uninhabited_from},
     next_solver::{
-        CallableIdWrapper, DbInterner, Ty, TyKind, TypingMode,
-        infer::DbInternerInferExt,
+        CallableIdWrapper, DbInterner, Ty, TyKind, TypingMode, infer::DbInternerInferExt,
     },
 };
 
@@ -89,7 +88,8 @@ pub(crate) fn check_body<'db>(
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::typeck_for_body(interner, def.into()));
     // With what the body's `for const` loops assume of their binders, as inference had it.
-    let env = hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
+    let env =
+        hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
     let features = UnstableFeatures::query(db, krate);
     let cx = Cx {
         db,
@@ -192,9 +192,11 @@ pub(crate) fn may_name_a_variant(db: &Db, body: &Body, infer: &InferenceResult<'
 /// compares the symbols, not the hygienic keys a variant a `macro` writes is defined under.
 fn has_unit_variant_named(db: &Db, enum_: EnumId, name: hir_expand::name::Name) -> bool {
     let name = name.unkeyed();
-    enum_.enum_variants(db).variants.iter().any(|(it, &(_, shape))| {
-        shape == FieldsShape::Unit && it.unkeyed() == name
-    })
+    enum_
+        .enum_variants(db)
+        .variants
+        .iter()
+        .any(|(it, &(_, shape))| shape == FieldsShape::Unit && it.unkeyed() == name)
 }
 
 struct Visitor<'c, 'a, 'db> {
@@ -235,9 +237,9 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
             for_match: None,
             // alloc: these allocate only once something is pushed, once per body.
             blocks: Vec::new(),
-            lints: Vec::new(), // alloc: as above.
+            lints: Vec::new(),          // alloc: as above.
             pattern_errors: Vec::new(), // alloc: as above.
-            errors: Vec::new(), // alloc: as above.
+            errors: Vec::new(),         // alloc: as above.
             failed: false,
         }
     }
@@ -371,7 +373,12 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
                 self.with_let_source(Source::None, |v| v.visit_expr(closure_body));
                 self.set_scope(closure_body);
                 for &arg in args {
-                    self.check_binding_is_irrefutable(arg, BindingOrigin::ClosureParam, None, false);
+                    self.check_binding_is_irrefutable(
+                        arg,
+                        BindingOrigin::ClosureParam,
+                        None,
+                        false,
+                    );
                 }
                 return;
             }
@@ -395,7 +402,9 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
             }
             _ => {}
         }
-        self.with_let_source(Source::None, |v| body.walk_child_exprs(expr, |child| v.visit_expr(child)));
+        self.with_let_source(Source::None, |v| {
+            body.walk_child_exprs(expr, |child| v.visit_expr(child))
+        });
     }
 
     fn visit_arm(&mut self, arm: &MatchArm) {
@@ -726,7 +735,12 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
     }
 
     /// `report_arm_reachability`.
-    fn report_arm_reachability(&mut self, cx: &Cx<'a, 'db>, report: &Report<'_, 'a, 'db>, whole_arm: bool) {
+    fn report_arm_reachability(
+        &mut self,
+        cx: &Cx<'a, 'db>,
+        report: &Report<'_, 'a, 'db>,
+        whole_arm: bool,
+    ) {
         for (arm, usefulness) in &report.arm_usefulness {
             if let Usefulness::Redundant(explanation) = usefulness {
                 self.report_unreachable_pattern(cx, arm.pat, explanation, whole_arm);
@@ -757,7 +771,13 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
         let (catchall, typo) = match explanation.covered_by[..] {
             [covering] if pat_is_catchall(covering) => (
                 true,
-                find_fallback_pattern_typo(cx, self.body, self.infer, &self.blocks, *covering.data()),
+                find_fallback_pattern_typo(
+                    cx,
+                    self.body,
+                    self.infer,
+                    &self.blocks,
+                    *covering.data(),
+                ),
             ),
             _ => (false, None),
         };
@@ -783,8 +803,10 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
         let cx = self.cx()?;
         cx.has_deref_pat.set(false);
         let lowered = self.lower_pattern(pat, refutable)?;
-        let arms = [rustc_pattern_analysis::MatchArm { pat: &lowered, has_guard: false, arm_data: 0 }];
-        let known_valid = scrutinee.is_none_or(|scrutinee| self.is_known_valid_scrutinee(scrutinee));
+        let arms =
+            [rustc_pattern_analysis::MatchArm { pat: &lowered, has_guard: false, arm_data: 0 }];
+        let known_valid =
+            scrutinee.is_none_or(|scrutinee| self.is_known_valid_scrutinee(scrutinee));
         let report =
             self.analyze(cx, &arms, *lowered.ty(), known_valid, ExprOrPatId::PatId(pat))?;
         Some(then(self, cx, &report))
@@ -864,9 +886,7 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
                 // alloc: the special types of one error.
                 let mut tys = Vec::new();
                 collect_special_tys(cx, first, &mut tys);
-                tys.into_iter()
-                    .filter_map(|ty| Some((ty.store(), special_ty(cx, ty)?)))
-                    .collect() // alloc: as above.
+                tys.into_iter().filter_map(|ty| Some((ty.store(), special_ty(cx, ty)?))).collect() // alloc: as above.
             }
             _ => Box::default(),
         };
@@ -880,7 +900,8 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
 
     /// `witness_1_is_privately_uninhabited`.
     fn privately_uninhabited(&self, cx: &Cx<'a, 'db>, witness: &Witness<'a, 'db>) -> bool {
-        let (TyKind::Adt(def, args), Constructor::Variant(idx)) = (witness.ty().kind(), witness.ctor())
+        let (TyKind::Adt(def, args), Constructor::Variant(idx)) =
+            (witness.ty().kind(), witness.ctor())
         else {
             return false;
         };

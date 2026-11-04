@@ -77,7 +77,8 @@ fn a_recycled_block_comes_back_zeroed_when_asked(tc: TestCase) {
     drop(blocks);
     for _ in 0..count {
         let zeroed = tc.draw(gs::booleans());
-        let block = class.take(if zeroed { Fill::Zeroed } else { Fill::Any }, Tag::Other).expect("a block");
+        let block =
+            class.take(if zeroed { Fill::Zeroed } else { Fill::Any }, Tag::Other).expect("a block");
         let want = if zeroed { 0 } else { 0xAB };
         assert!(bytes_of(&block).iter().all(|&byte| byte == want), "recycled, zeroed: {zeroed}");
         fill(&block, 0xAB);
@@ -99,7 +100,10 @@ fn a_class_used_up_is_an_error_not_another_place() {
 #[test]
 fn sizes_and_alignments_past_the_limits_are_errors() {
     assert!(matches!(take(LARGEST + 1, 8, Fill::Any, Tag::Other), Err(MemError::TooLarge { .. })));
-    assert!(matches!(take(64, MAX_ALIGN * 2, Fill::Any, Tag::Other), Err(MemError::TooLarge { .. })));
+    assert!(matches!(
+        take(64, MAX_ALIGN * 2, Fill::Any, Tag::Other),
+        Err(MemError::TooLarge { .. })
+    ));
     assert!(matches!(take(64, 3, Fill::Any, Tag::Other), Err(MemError::TooLarge { .. })));
     let size = |bytes, align| class_of(bytes, align, Tag::Other).map(class_size).ok();
     assert_eq!(size(0, 1), Some(64));
@@ -130,7 +134,8 @@ fn warm_blocks_and_slices_allocate_nothing() {
     blaze_alloc_count::assert_at_most(0, "warm blocks and slices", || {
         for round in 0..100 {
             drop(take(1000, 8, Fill::Zeroed, Tag::Other).expect("a block"));
-            let slice = Slice::new_with(300, Tag::Other, |at| (at + round) as u32).expect("a slice");
+            let slice =
+                Slice::new_with(300, Tag::Other, |at| (at + round) as u32).expect("a slice");
             assert_eq!(slice[299], (299 + round) as u32);
         }
     });
@@ -205,16 +210,25 @@ fn kept_values_keep_their_bytes_count_to_their_tag_and_skip_the_global_heap() {
         for at in 0..10_000u32 {
             grown.push(at as u8);
         }
-        assert!(grown.iter().enumerate().all(|(at, &byte)| byte == at as u8), "kept across every grow");
+        assert!(
+            grown.iter().enumerate().all(|(at, &byte)| byte == at as u8),
+            "kept across every grow"
+        );
         assert!(live() >= before + 10_000, "the block's bytes, counted to the tag");
         grown.truncate(100);
         grown.shrink_to_fit();
-        assert!(grown.iter().enumerate().all(|(at, &byte)| byte == at as u8), "kept across the shrink");
-        let zeroed = kept.allocate_zeroed(std::alloc::Layout::from_size_align(3000, 8).unwrap()).unwrap();
+        assert!(
+            grown.iter().enumerate().all(|(at, &byte)| byte == at as u8),
+            "kept across the shrink"
+        );
+        let zeroed =
+            kept.allocate_zeroed(std::alloc::Layout::from_size_align(3000, 8).unwrap()).unwrap();
         // SAFETY: a block of at least 3000 bytes, just made.
         assert!(unsafe { zeroed.as_ref() }.iter().all(|&byte| byte == 0));
         // SAFETY: the block of that layout, given back once.
-        unsafe { kept.deallocate(zeroed.cast(), std::alloc::Layout::from_size_align(3000, 8).unwrap()) };
+        unsafe {
+            kept.deallocate(zeroed.cast(), std::alloc::Layout::from_size_align(3000, 8).unwrap())
+        };
         drop(grown);
         let empty: Vec<u64, Kept> = Vec::with_capacity_in(0, kept);
         drop(empty);
@@ -229,7 +243,9 @@ fn kept_values_keep_their_bytes_count_to_their_tag_and_skip_the_global_heap() {
         before
     })
     .join()
-    .map(|before| assert_eq!(live(), before, "every block freed, the thread's frees folded as it ended"))
+    .map(|before| {
+        assert_eq!(live(), before, "every block freed, the thread's frees folded as it ended")
+    })
     .expect("the thread ran");
 }
 
@@ -256,7 +272,11 @@ fn a_large_block_gives_its_pages_back_as_it_is_given() {
     fill(&block, 0x5A);
     let at = block.as_ptr();
     #[cfg(target_os = "linux")]
-    assert_eq!(resident_pages(at, AT_ONCE), AT_ONCE / crate::os::page_size(), "written, so resident");
+    assert_eq!(
+        resident_pages(at, AT_ONCE),
+        AT_ONCE / crate::os::page_size(),
+        "written, so resident"
+    );
     drop(block);
     let counters = class.counters();
     assert_eq!((counters.warm, counters.cold), (0, AT_ONCE as u64), "{counters:?}");
@@ -280,7 +300,8 @@ fn a_small_class_past_its_keep_gives_whole_pages_back() {
     let size = 96;
     let count = 3 * KEEP / size;
     let class = own_class(size, 2 * count * size);
-    let blocks: Vec<Owned> = (0..count).map(|_| class.take(Fill::Any, Tag::Other).expect("a block")).collect();
+    let blocks: Vec<Owned> =
+        (0..count).map(|_| class.take(Fill::Any, Tag::Other).expect("a block")).collect();
     for block in &blocks {
         fill(block, 0xC3);
     }
@@ -291,12 +312,20 @@ fn a_small_class_past_its_keep_gives_whole_pages_back() {
         drop(block);
     }
     let kept = class.counters();
-    assert_eq!((kept.warm, kept.cold, kept.given_back, kept.trims), ((below * size) as u64, 0, 0, 0), "{kept:?}");
+    assert_eq!(
+        (kept.warm, kept.cold, kept.given_back, kept.trims),
+        ((below * size) as u64, 0, 0, 0),
+        "{kept:?}"
+    );
     drop(blocks);
     let trimmed = class.counters();
     assert!(trimmed.trims >= 1, "{trimmed:?}");
     assert!(trimmed.warm <= KEEP as u64, "the class keeps at most its keep warm: {trimmed:?}");
-    assert_eq!(trimmed.warm + trimmed.cold, (count * size) as u64, "every block is free: {trimmed:?}");
+    assert_eq!(
+        trimmed.warm + trimmed.cold,
+        (count * size) as u64,
+        "every block is free: {trimmed:?}"
+    );
     let page = crate::os::page_size() as u64;
     assert_eq!(trimmed.given_back % page, 0, "whole pages");
     // A run's blocks go cold whole but only the pages it covers whole go back: at most two
@@ -308,14 +337,22 @@ fn a_small_class_past_its_keep_gives_whole_pages_back() {
     {
         let len = count * size / page as usize * page as usize;
         let resident = resident_pages(first, len) as u64 * page;
-        assert!(resident <= len as u64 - trimmed.given_back + 2 * page, "resident {resident} of {trimmed:?}");
+        assert!(
+            resident <= len as u64 - trimmed.given_back + 2 * page,
+            "resident {resident} of {trimmed:?}"
+        );
     }
     let _ = first;
     let again: Vec<Owned> = (0..count)
-        .map(|at| class.take(if at % 2 == 0 { Fill::Zeroed } else { Fill::Any }, Tag::Other).expect("a block"))
+        .map(|at| {
+            class
+                .take(if at % 2 == 0 { Fill::Zeroed } else { Fill::Any }, Tag::Other)
+                .expect("a block")
+        })
         .collect();
     assert_eq!(class.carved() as usize, count, "every take was a block given back");
-    let mut starts: Vec<usize> = again.iter().map(|block| block.as_ptr().as_ptr() as usize).collect();
+    let mut starts: Vec<usize> =
+        again.iter().map(|block| block.as_ptr().as_ptr() as usize).collect();
     starts.sort_unstable();
     starts.dedup();
     assert_eq!(starts.len(), count, "each block once");
@@ -339,7 +376,8 @@ fn blocks_that_cover_no_whole_page_stay_warm_and_trim_rarely() {
     let size = 64;
     let count = 4 * KEEP / size;
     let class = own_class(size, 2 * count * size);
-    let blocks: Vec<Owned> = (0..count).map(|_| class.take(Fill::Any, Tag::Other).expect("a block")).collect();
+    let blocks: Vec<Owned> =
+        (0..count).map(|_| class.take(Fill::Any, Tag::Other).expect("a block")).collect();
     let (odd, even): (Vec<(usize, Owned)>, Vec<(usize, Owned)>) =
         blocks.into_iter().enumerate().partition(|(at, _)| at % 2 == 1);
     drop(odd);
@@ -375,14 +413,20 @@ fn threads_taking_and_giving_through_trims_keep_their_blocks() {
                     } else {
                         let at = (seed >> 8) as usize % held.len();
                         let (block, byte) = held.swap_remove(at);
-                        assert!(bytes_of(&block).iter().all(|&it| it == byte), "a block lost its bytes");
+                        assert!(
+                            bytes_of(&block).iter().all(|&it| it == byte),
+                            "a block lost its bytes"
+                        );
                         drop(block);
                     }
                     if step % 50_000 == 0 {
                         // Give back nearly everything, so the class trims.
                         while held.len() > 10 {
                             let (block, byte) = held.pop().expect("held");
-                            assert!(bytes_of(&block).iter().all(|&it| it == byte), "a block lost its bytes");
+                            assert!(
+                                bytes_of(&block).iter().all(|&it| it == byte),
+                                "a block lost its bytes"
+                            );
                         }
                     }
                 }
@@ -408,7 +452,8 @@ fn the_snapshot_counts_a_class_by_its_blocks() {
     let bytes = 200_000;
     let index = class_of(bytes, 8, Tag::Other).expect("a class");
     std::thread::spawn(move || {
-        let blocks: Vec<Owned> = (0..64).map(|_| take(bytes, 8, Fill::Any, Tag::Other).expect("a block")).collect();
+        let blocks: Vec<Owned> =
+            (0..64).map(|_| take(bytes, 8, Fill::Any, Tag::Other).expect("a block")).collect();
         let size = blocks[0].len() as u64;
         let held = snapshot().classes[index];
         assert_eq!(held.size, size);
@@ -435,21 +480,36 @@ fn a_block_counts_to_its_owner_while_it_lives_and_to_the_free_tag_after_never_bo
     let size = 4096;
     let (free, owner) = (Tag::Usercode, Tag::Profile);
     let live = |tag: Tag| crate::tag::snapshot().get(tag).live as i64;
-    let class: &'static Class = Box::leak(Box::new(Class::new(size, 1 << 20, None, free).expect("a test's class")));
+    let class: &'static Class =
+        Box::leak(Box::new(Class::new(size, 1 << 20, None, free).expect("a test's class")));
     // What the class committed for its blocks and their links, both counted to `free`.
     let committed = || (class.region.committed() + class.links.committed()) as i64;
     let (free_at, owner_at, committed_at) = (live(free), live(owner), committed());
     let owned = 8 * size as i64;
-    let taken: Vec<Owned> = (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
+    let taken: Vec<Owned> =
+        (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
     let made = committed() - committed_at;
     assert!(made >= owned, "the class committed {made} bytes for {owned} carved");
     assert_eq!(live(owner) - owner_at, owned, "the owner counts what it took");
-    assert_eq!(live(free) - free_at, made - owned, "the free tag counts what was committed past the blocks taken");
+    assert_eq!(
+        live(free) - free_at,
+        made - owned,
+        "the free tag counts what was committed past the blocks taken"
+    );
     drop(taken);
-    assert_eq!(live(owner) - owner_at, 0, "the owner counts nothing once its blocks are given back");
+    assert_eq!(
+        live(owner) - owner_at,
+        0,
+        "the owner counts nothing once its blocks are given back"
+    );
     assert_eq!(live(free) - free_at, made, "the free tag counts every block given back");
-    let again: Vec<Owned> = (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
-    assert_eq!(committed() - committed_at, made, "the blocks given back are taken again, nothing more committed");
+    let again: Vec<Owned> =
+        (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
+    assert_eq!(
+        committed() - committed_at,
+        made,
+        "the blocks given back are taken again, nothing more committed"
+    );
     assert_eq!(live(owner) - owner_at, owned);
     assert_eq!(live(free) - free_at, made - owned, "a block taken again counts to its owner alone");
     drop(again);

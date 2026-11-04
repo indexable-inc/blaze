@@ -2,10 +2,10 @@
 //! (docs/v2/plan/lanes/db/speed-of-light.md, "base-db: inputs and views"): a read allocates
 //! nothing, a view's unchanged file allocates nothing, and a changed file costs a constant.
 
+use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 use blaze_query::db::Durability;
 use span::Edition;
 use triomphe::Arc;
-use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     ContentId, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
@@ -140,9 +140,12 @@ fn read_all(db: &Db, files: &[FileId]) -> usize {
         seen += db.file_text(file).text(db).len();
         seen += usize::from(db.has_file_text(file));
         let root = db.file_source_root(file).source_root_id(db);
-        seen += usize::from(db.source_root(root).source_root_ref(db).path_for_file(&file).is_some());
+        seen +=
+            usize::from(db.source_root(root).source_root_ref(db).path_for_file(&file).is_some());
         seen += relevant_crates(db, file).len();
-        seen += usize::from(EditionedFileId::new(db, file, Edition::Edition2021).parse(db).is_outline());
+        seen += usize::from(
+            EditionedFileId::new(db, file, Edition::Edition2021).parse(db).is_outline(),
+        );
     }
     seen
 }
@@ -220,7 +223,8 @@ fn an_unchanged_view_allocates_nothing() {
             let (again, used) = set_view(&mut db, &base, built, &partition, &view);
             assert_eq!(again, ViewChange::default());
             assert_eq!(
-                used.allocations, 0,
+                used.allocations,
+                0,
                 "a view of {n} unchanged files, {} built: {used:?}",
                 built.len()
             );

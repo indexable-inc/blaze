@@ -930,7 +930,10 @@ fn const_heap_made_global() {
         err(mem.make_global((0x1000, ph))),
         "attempting to call `const_make_global` twice on the same allocation alloc1"
     );
-    assert_eq!(err(mem.access(0x1000, ph, 8, 8, AccessKind::Write)), "writing to alloc1 which is read-only");
+    assert_eq!(
+        err(mem.access(0x1000, ph, 8, 8, AccessKind::Write)),
+        "writing to alloc1 which is read-only"
+    );
     assert_eq!(
         err(mem.free((0x1000, ph), None, None, Kind::ConstHeap)),
         "deallocating immutable allocation alloc1"
@@ -1110,7 +1113,8 @@ fn leaks_reachable_from_globals_and_roots() {
     mem.write(rooted, 0, &ptr(8, Prov::Wildcard));
     mem.free((0xb000, Some(prov(freed, 8))), None, None, Kind::Rust).unwrap();
 
-    let leak = |alloc: AllocId, kind: Kind, size: u64, align: u64| Leak { alloc, kind, size, align };
+    let leak =
+        |alloc: AllocId, kind: Kind, size: u64, align: u64| Leak { alloc, kind, size, align };
     let found = mem.leaks().unwrap_err();
     assert_eq!(
         found,
@@ -1149,10 +1153,7 @@ fn no_leaks() {
     mem.write(g, 0, &ptr(8, prov(h, 1)));
     assert_eq!(mem.leaks(), Ok(()));
     mem.uninit(g, Span::new(0, 8));
-    assert_eq!(
-        mem.leaks().unwrap_err().to_string(),
-        "alloc1 (C heap, size: 4, align: 4)"
-    );
+    assert_eq!(mem.leaks().unwrap_err().to_string(), "alloc1 (C heap, size: 4, align: 4)");
 }
 
 #[test]

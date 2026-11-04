@@ -5,11 +5,10 @@
 
 use base_db::{Db, all_crates};
 use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
-use hir_ty::{MissingLifetimeKind, TyLoweringDiagnostic, db::HirDatabase as _};
 use hir_expand::fixture;
+use hir_ty::{MissingLifetimeKind, TyLoweringDiagnostic, db::HirDatabase as _};
 
 use crate::{BorrowckResult, Mode, borrowck_in_mode};
-
 
 const FIXTURE: &str = r#"
 //- minicore: sized, copy
@@ -86,8 +85,8 @@ fn checked(name: &str) -> (bool, [BorrowckResult; 2]) {
                     }
                 )
             });
-        let results = [Mode::Nll, Mode::Polonius]
-            .map(|mode| borrowck_in_mode(&db, function.into(), mode));
+        let results =
+            [Mode::Nll, Mode::Polonius].map(|mode| borrowck_in_mode(&db, function.into(), mode));
         (elision_failure, results)
     })
 }

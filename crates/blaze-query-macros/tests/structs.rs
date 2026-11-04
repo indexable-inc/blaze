@@ -32,8 +32,7 @@ fn deeper(db: &TestDb) -> u32 {
 fn a_singleton_input_is_made_once_found_and_set() {
     let mut db = TestDb::new();
     assert_eq!(Settings::try_get(&db), None);
-    let settings = Settings::builder(3)
-        .durability(Durability::MEDIUM)
+    let settings = Settings::builder(Durability::MEDIUM, 3)
         .depth_durability(Durability::HIGH)
         .label("x".to_owned())
         .new(&mut db);
@@ -52,7 +51,7 @@ fn a_singleton_input_is_made_once_found_and_set() {
 #[test]
 fn a_default_field_starts_at_its_default() {
     let mut db = TestDb::new();
-    let settings = Settings::new(&mut db, 1);
+    let settings = Settings::new(&mut db, Durability::LOW, 1);
     assert_eq!(settings.label(&db), "");
     assert_eq!(settings.note(&db), None);
     assert_eq!(settings.set_note(&mut db).to(Some("n")), None);
@@ -63,8 +62,8 @@ fn a_default_field_starts_at_its_default() {
 #[should_panic(expected = "Settings is a singleton")]
 fn a_second_singleton_panics() {
     let mut db = TestDb::new();
-    Settings::new(&mut db, 1);
-    Settings::new(&mut db, 2);
+    Settings::new(&mut db, Durability::LOW, 1);
+    Settings::new(&mut db, Durability::LOW, 2);
 }
 
 #[blaze_query_macros::tracked(returns(copy))]
@@ -77,7 +76,7 @@ fn level_or_zero(db: &TestDb) -> u32 {
 fn making_a_singleton_reruns_what_saw_it_absent() {
     let mut db = TestDb::new();
     assert_eq!(level_or_zero(&db), 0);
-    Settings::new(&mut db, 7);
+    Settings::new(&mut db, Durability::LOW, 7);
     assert_eq!(level_or_zero(&db), 7);
     assert_eq!(runs(), ["level_or_zero", "level_or_zero"]);
 }
@@ -145,7 +144,7 @@ struct Group<'db> {
 fn an_interned_row_names_the_ids_of_its_fields() {
     let db = TestDb::new();
     let lead = Path::make(&db, "lead", 0u32);
-    let file = File::new(&db, String::new());
+    let file = File::new(&db, Durability::LOW, String::new());
     let symbol = Symbol::new(&db, "x");
     let group = Group::new(&db, lead, Members(vec![file.as_id(), symbol.as_id()]), 2u32);
     assert_eq!(group.lead(&db), lead);
@@ -199,7 +198,7 @@ fn stamp_reader(db: &TestDb, file: File) -> u32 {
 #[test]
 fn a_tracked_struct_keeps_its_id_and_each_field_changes_alone() {
     let mut db = TestDb::new();
-    let file = File::new(&db, "a b".to_owned());
+    let file = File::new(&db, Durability::LOW, "a b".to_owned());
     let parsed = parse(&db, file);
     assert_eq!(parsed.origin(&db).text(&db), "parsed");
     assert_eq!(
@@ -233,8 +232,8 @@ fn a_tracked_struct_keeps_its_id_and_each_field_changes_alone() {
 #[test]
 fn a_field_is_named_by_its_ident_and_a_tracked_struct_names_its_tracked_fields() {
     let mut db = TestDb::new();
-    let settings = Settings::builder(3).new(&mut db);
-    let file = File::new(&db, "a b".to_owned());
+    let settings = Settings::builder(Durability::LOW, 3).new(&mut db);
+    let file = File::new(&db, Durability::LOW, "a b".to_owned());
     let parsed = parse(&db, file);
     let storage = db.storage();
     let names = |id: Id, count| {
@@ -291,7 +290,7 @@ impl File {
 #[test]
 fn a_tracked_impl_makes_queries_of_its_methods() {
     let db = TestDb::new();
-    let file = File::new(&db, "ab cd".to_owned());
+    let file = File::new(&db, Durability::LOW, "ab cd".to_owned());
     let parsed = parse(&db, file);
     assert_eq!(parsed.word(&db, 1).map(String::as_str), Some("cd"));
     assert_eq!(parsed.word(&db, 2), None);
@@ -324,7 +323,7 @@ fn node_size<'db>(db: &'db TestDb, node: Node<'db>) -> usize {
 fn a_supertype_is_an_id_whose_variant_its_page_owner_picks() {
     let db = TestDb::new();
     let path = Path::make(&db, "p", 0u32);
-    let file = File::new(&db, "file".to_owned());
+    let file = File::new(&db, Durability::LOW, "file".to_owned());
     let symbol = Symbol::new(&db, "s");
     let storage = db.storage();
     assert_eq!(Node::from_id_in(storage, path.as_id()), Some(Node::Path(path)));
@@ -394,8 +393,8 @@ fn wrapped<'db>(db: &'db TestDb, file: File) -> Wrapped<Path<'db>> {
 #[test]
 fn derived_values_name_the_database_lifetime() {
     let db = TestDb::new();
-    let file = File::new(&db, "x y".to_owned());
-    let empty = File::new(&db, String::new());
+    let file = File::new(&db, Durability::LOW, "x y".to_owned());
+    let empty = File::new(&db, Durability::LOW, String::new());
     let x = Path::make(&db, "x", 1u32);
     assert_eq!(listing(&db, file).total, 2);
     assert_eq!(listing(&db, file).paths[0], x);

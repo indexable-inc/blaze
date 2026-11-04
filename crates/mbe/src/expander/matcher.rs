@@ -70,8 +70,8 @@
 //! is built. The trees the transcriber reads are built from the cells once, when the match is
 //! over ([`Buffers::build`]).
 
-use base_db::Db;
 use arrayvec::ArrayVec;
+use base_db::Db;
 use blaze_mem::frame::Frame;
 use intern::sym;
 use tt::{
@@ -81,8 +81,8 @@ use tt::{
 
 mod failure;
 
-pub(super) use self::failure::match_failure;
 use self::failure::Tracker;
+pub(super) use self::failure::match_failure;
 use super::{Binding, Bindings, Fragment, NONE, TokensOrigin};
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate, ValueResult, expect_fragment,
@@ -234,7 +234,11 @@ impl MatcherBuilder {
                     }
                     self.flatten(tokens);
                     if visible {
-                        let group = failure::Group { open, close: self.locs.len() as u32, delimiter: *delimiter };
+                        let group = failure::Group {
+                            open,
+                            close: self.locs.len() as u32,
+                            delimiter: *delimiter,
+                        };
                         self.groups.push(group);
                         self.locs.push(Loc::Close);
                     }
@@ -340,7 +344,10 @@ impl<'t> Match<'t> {
 pub(super) enum MatchError {
     Built(ExpandError),
     /// A fragment's binding error, `what` the fragment it expected.
-    Expected { span: span::Span, what: &'static str },
+    Expected {
+        span: span::Span,
+        what: &'static str,
+    },
     /// A fragment whose parse took tokens and then failed: the parser's error, where it was,
     /// which says more than the token the fragment started at.
     Fragment(ExpandError),
@@ -429,7 +436,10 @@ enum EntryKind {
     Fragment(u32),
     Missing(MetaVarKind),
     /// What a repetition bound: its finished iterations (`Buffers::iterations`) and the last.
-    Nested { iterations: u32, last: u32 },
+    Nested {
+        iterations: u32,
+        last: u32,
+    },
 }
 
 const _: () = assert!(size_of::<Entry>() == 20);
@@ -1150,12 +1160,22 @@ fn match_meta_var<'t>(
 ) -> ValueResult<Fragment<'t>, MatchError> {
     let fragment = match kind {
         MetaVarKind::Path => {
-            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span))
-                .map(Fragment::Path);
+            return fragment_parsed(expect_fragment(
+                db,
+                input,
+                parser::PrefixEntryPoint::Path,
+                delim_span,
+            ))
+            .map(Fragment::Path);
         }
         MetaVarKind::Ty => {
-            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span))
-                .map(Fragment::Ty);
+            return fragment_parsed(expect_fragment(
+                db,
+                input,
+                parser::PrefixEntryPoint::Ty,
+                delim_span,
+            ))
+            .map(Fragment::Ty);
         }
         MetaVarKind::Expr(expr) => {
             // `expr_2021` should not match underscores, let expressions, or inline const.
@@ -1182,8 +1202,13 @@ fn match_meta_var<'t>(
                 }
                 _ => {}
             };
-            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Expr, delim_span))
-                .map(Fragment::Expr);
+            return fragment_parsed(expect_fragment(
+                db,
+                input,
+                parser::PrefixEntryPoint::Expr,
+                delim_span,
+            ))
+            .map(Fragment::Expr);
         }
         MetaVarKind::Ident | MetaVarKind::Tt | MetaVarKind::Lifetime | MetaVarKind::Literal => {
             let span = input.next_span();

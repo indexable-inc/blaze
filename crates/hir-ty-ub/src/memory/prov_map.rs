@@ -249,7 +249,9 @@ impl ProvMap {
         if size >= ptr_size {
             let adjusted_end = range.end - (ptr_size - 1);
             ptrs.extend(
-                range_of(&self.ptrs, range.start..adjusted_end).iter().map(|&(o, p)| (o - shift, p)),
+                range_of(&self.ptrs, range.start..adjusted_end)
+                    .iter()
+                    .map(|&(o, p)| (o - shift, p)),
             );
         }
         let begin_overlap = self.range_ptrs(range.start..range.start, ptr_size).first().copied();

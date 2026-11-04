@@ -264,8 +264,8 @@ mod tests {
         let other = crate::registry_source("sparse+https://other.example.com/").unwrap();
         assert_eq!(map.replacement(other).unwrap(), other);
 
-        let git = source_map(&SourceConfig { crates_io_git: true, ..SourceConfig::default() })
-            .unwrap();
+        let git =
+            source_map(&SourceConfig { crates_io_git: true, ..SourceConfig::default() }).unwrap();
         assert_eq!(git.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io());
     }
 

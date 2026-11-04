@@ -247,7 +247,8 @@ impl Symbols {
         let found = match self.list.last_chunk::<SYMBOL_WINDOW>() {
             Some(window) => {
                 let hits = Simd::from_array(*window).simd_eq(Simd::splat(id)).to_bitmask();
-                (hits != 0).then(|| len - SYMBOL_WINDOW + (u64::BITS - 1 - hits.leading_zeros()) as usize)
+                (hits != 0)
+                    .then(|| len - SYMBOL_WINDOW + (u64::BITS - 1 - hits.leading_zeros()) as usize)
             }
             None => self.list.iter().rposition(|&it| it == id),
         };
@@ -332,7 +333,8 @@ struct Layout {
 impl Layout {
     /// The layout of columns of these many rows.
     fn new(nodes: usize, spans: usize, wide: usize, parts: usize, symbols: usize) -> Layout {
-        let at = |words: usize| u32::try_from(words).expect("a token tree of fewer than 2^32 words");
+        let at =
+            |words: usize| u32::try_from(words).expect("a token tree of fewer than 2^32 words");
         let spans_at = HEADER + 2 * nodes;
         let wide_at = spans_at + 2 * spans;
         let parts_at = wide_at + 3 * wide;
@@ -781,7 +783,10 @@ impl Tree {
             0 => (self.top_open, self.top_close),
             _ => (self.unpack(self.packed_span(at as usize)), self.close_span(node)),
         };
-        Subtree { delimiter: Delimiter { open, close, kind: node.delimiter_kind() }, len: node.data }
+        Subtree {
+            delimiter: Delimiter { open, close, kind: node.delimiter_kind() },
+            len: node.data,
+        }
     }
 
     #[inline]
@@ -800,7 +805,9 @@ impl Tree {
                 spacing: node.spacing(),
                 span,
             }),
-            IDENT => Leaf::Ident(Ident { sym: self.symbol(node.data), span, is_raw: node.is_raw() }),
+            IDENT => {
+                Leaf::Ident(Ident { sym: self.symbol(node.data), span, is_raw: node.is_raw() })
+            }
             LITERAL => Leaf::Literal(Literal {
                 text_and_suffix: self.symbol(node.data),
                 span,
@@ -1090,7 +1097,10 @@ impl TopSubtreeBuilder {
         }
     }
 
-    #[expect(clippy::needless_pass_by_value, reason = "the builder takes the leaf it appends, as `Vec::push` does: its symbol and span move into the tree's columns (both `Copy`, so clippy sees no move)")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the builder takes the leaf it appends, as `Vec::push` does: its symbol and span move into the tree's columns (both `Copy`, so clippy sees no move)"
+    )]
     pub fn push(&mut self, leaf: Leaf) {
         let (node, span) = match leaf {
             Leaf::Punct(Punct { char, spacing, span }) => (Node::punct(char, spacing), span),

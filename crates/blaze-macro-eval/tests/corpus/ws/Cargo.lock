@@ -18,12 +18,28 @@ name = "corpus-macros"
 version = "0.1.0"
 
 [[package]]
+name = "corpus-once"
+version = "0.1.0"
+
+[[package]]
 name = "corpus-panics"
 version = "0.1.0"
 dependencies = [
  "corpus-macros",
  "tokio-macros",
 ]
+
+[[package]]
+name = "corpus-sessions"
+version = "0.1.0"
+dependencies = [
+ "corpus-once",
+ "corpus-settles",
+]
+
+[[package]]
+name = "corpus-settles"
+version = "0.1.0"
 
 [[package]]
 name = "corpus-state"

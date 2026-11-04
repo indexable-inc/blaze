@@ -15,8 +15,8 @@ pub(crate) mod invalid_from_utf8;
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::FunctionId;
+use std::alloc::Global;
 
 use crate::lints::bodies::types::util;
 

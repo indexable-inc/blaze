@@ -42,7 +42,8 @@ pub(crate) fn stub_size(arch: Arch) -> u64 {
         Arch::Aarch64 => ARCH_AARCH64,
         Arch::Wasm32 | Arch::Wasm64 => return 0,
     };
-    slot_stub_bytes(live).unwrap_or_else(|| unreachable!("the dev runtime sizes the stubs of {arch:?}"))
+    slot_stub_bytes(live)
+        .unwrap_or_else(|| unreachable!("the dev runtime sizes the stubs of {arch:?}"))
 }
 
 /// `mov r11, [rip + cell]; jmp [r11 + disp32]; int3; int3`, the displacement at 10.
@@ -51,7 +52,8 @@ const X86_STUB_FIXUPS: [StubFixup; 1] = [StubFixup { at: 3, apply: Apply::Rel32,
 
 /// adrp x16, cell; ldr x16, [x16, :lo12:cell]; movz x17, #low; movk x17, #high, lsl #16;
 /// ldr x16, [x16, x17]; br x16: a slot from 2^21.
-const A64_STUB: [u32; 6] = [0x9000_0010, 0xf940_0210, 0xd280_0011, 0xf2a0_0011, 0xf871_6a10, 0xd61f_0200];
+const A64_STUB: [u32; 6] =
+    [0x9000_0010, 0xf940_0210, 0xd280_0011, 0xf2a0_0011, 0xf871_6a10, 0xd61f_0200];
 /// `ldr x16, [x16, #imm12 * 8]`, the slot's entry loaded at an unsigned scaled offset.
 const A64_LDR_X16: u32 = 0xf940_0210;
 /// `add x16, x16, #imm12, lsl #12`.
@@ -169,9 +171,9 @@ pub(crate) const A64_LOG_SLOTS: u64 = ((1 << 27) - 64) / 16;
 /// 42  jmp r11
 /// ```
 const X86_LOG: [u8; 48] = [
-    0x50, 0x51, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x42, 0xc6, 0x44, 0x18, 0x10, 0x01, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x4a, 0x8b,
-    0x04, 0xd8, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0x4a, 0x89, 0x04, 0xd9, 0x49, 0x89, 0xc3, 0x59, 0x58, 0x41, 0xff, 0xe3, 0xcc,
-    0xcc, 0xcc,
+    0x50, 0x51, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x42, 0xc6, 0x44, 0x18, 0x10, 0x01, 0x48, 0x8b, 0x05,
+    0, 0, 0, 0, 0x4a, 0x8b, 0x04, 0xd8, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0x4a, 0x89, 0x04, 0xd9, 0x49,
+    0x89, 0xc3, 0x59, 0x58, 0x41, 0xff, 0xe3, 0xcc, 0xcc, 0xcc,
 ];
 const X86_LOG_FIXUPS: [StubFixup; 3] = [
     StubFixup { at: 5, apply: Apply::Rel32, addend: exec::MAP as i64 - 4 },
@@ -251,7 +253,9 @@ pub(crate) fn write_log_stub(arch: Arch, slot: u32, to: u64, out: &mut [u8]) {
     match arch {
         Arch::X86_64 => {
             let rel = i32::try_from(to as i64 - 11).expect("a log routine within 2 GiB");
-            out[..16].copy_from_slice(&[0x41, 0xbb, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+            out[..16].copy_from_slice(&[
+                0x41, 0xbb, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+            ]);
             out[2..6].copy_from_slice(&slot.to_le_bytes());
             out[7..11].copy_from_slice(&rel.to_le_bytes());
         }
@@ -303,7 +307,8 @@ pub(crate) fn plt_size(arch: Arch) -> u64 {
 }
 
 /// `jmp [rip + cell]`, padded with `int3`.
-const X86_PLT: [u8; 16] = [0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc];
+const X86_PLT: [u8; 16] =
+    [0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc];
 const X86_PLT_FIXUPS: [StubFixup; 1] = [StubFixup { at: 2, apply: Apply::Rel32, addend: -4 }];
 /// adrp x16, cell; ldr x17, [x16, :lo12:cell]; br x17; brk #0.
 const A64_PLT: [u8; 16] = words_le([0x9000_0010, 0xf940_0211, 0xd61f_0220, 0xd420_0000]);
@@ -358,8 +363,11 @@ pub(crate) mod linked {
 
     /// Function 1 calls function 2 through its slot; function 2 returns.
     fn function(arch: Arch, n: u8) -> CompiledFunction {
-        let words = |words: [u32; 2]| words.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>();
-        let call = |kind, at, addend| vec![Relocation { at, kind, target: Target::Function(key(2)), addend }];
+        let words =
+            |words: [u32; 2]| words.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>();
+        let call = |kind, at, addend| {
+            vec![Relocation { at, kind, target: Target::Function(key(2)), addend }]
+        };
         let (code, relocs) = match (arch, n) {
             (Arch::X86_64, 1) => (vec![0xe8, 0, 0, 0, 0, 0xc3], call(RelocKind::PcRel32, 1, -4)),
             (Arch::X86_64, _) => (vec![0xb8, 1, 0, 0, 0, 0xc3], Vec::new()),
@@ -389,7 +397,9 @@ pub(crate) mod linked {
         let space = state
             .spaces
             .iter()
-            .find(|it| it.region.addr <= addr && addr + len as u64 <= it.region.addr + it.region.size)
+            .find(|it| {
+                it.region.addr <= addr && addr + len as u64 <= it.region.addr + it.region.size
+            })
             .unwrap_or_else(|| panic!("no region has {addr:#x}"));
         let mut out = vec![0; len];
         space.bytes.copy_to((addr - space.region.addr) as usize, &mut out);
@@ -441,7 +451,8 @@ pub(crate) mod linked {
             let sym = image.symbols.find(key).expect("the table's symbol");
             staged.state.addr_of(sym).expect("placed")
         };
-        let (header, cells, stubs) = (find(SymKey::Generation), find(SymKey::Cells), find(SymKey::Stubs));
+        let (header, cells, stubs) =
+            (find(SymKey::Generation), find(SymKey::Cells), find(SymKey::Stubs));
         let g_slot = image.symbols.find_slot(&key(2)).expect("g's slot");
         let g_slot = (staged.state.addr_of(g_slot).expect("placed") - stubs) / stub_size(arch);
         let state = staged.state;
@@ -458,7 +469,8 @@ pub(crate) mod linked {
         for slot in [0, 1, slots - 1] {
             assert_eq!(at(exec::log_word(slot)), log_stubs + slot * stride, "slot {slot}");
         }
-        let map = read(&state, header + exec::private_map(slots), (exec::REGION_HEADER + slots) as usize);
+        let map =
+            read(&state, header + exec::private_map(slots), (exec::REGION_HEADER + slots) as usize);
         assert!(map.iter().all(|it| *it == 0), "nothing is marked before the program runs");
         assert!(g_slot < slots);
         assert_eq!(log_routine(arch, slots) % 16, 0);
@@ -482,27 +494,45 @@ pub(crate) mod linked {
         let (header, slots) = (logged.header, logged.slots);
         let log_stubs = logged.stubs + slots * stub_size(arch);
         let routine = log_stubs + log_routine(arch, slots);
-        let le32 = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let le32 =
+            |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         for slot in [0, 1, slots - 1] {
             let at = log_stubs + slot * log_stub_size(arch);
             let stub = logged.bytes(at, 16);
             match arch {
                 Arch::X86_64 => {
-                    assert_eq!((&stub[..2], stub[6]), (&[0x41, 0xbb][..], 0xe9), "mov r11d, slot; jmp");
+                    assert_eq!(
+                        (&stub[..2], stub[6]),
+                        (&[0x41, 0xbb][..], 0xe9),
+                        "mov r11d, slot; jmp"
+                    );
                     assert_eq!(u64::from(le32(&stub, 2)), slot);
-                    assert_eq!((at + 11).wrapping_add(le32(&stub, 7) as i32 as i64 as u64), routine, "slot {slot}");
+                    assert_eq!(
+                        (at + 11).wrapping_add(le32(&stub, 7) as i32 as i64 as u64),
+                        routine,
+                        "slot {slot}"
+                    );
                 }
                 _ => {
-                    let (low, high) = (u64::from((le32(&stub, 0) >> 5) & 0xffff), u64::from((le32(&stub, 4) >> 5) & 0xffff));
+                    let (low, high) = (
+                        u64::from((le32(&stub, 0) >> 5) & 0xffff),
+                        u64::from((le32(&stub, 4) >> 5) & 0xffff),
+                    );
                     assert_eq!(low | high << 16, slot);
-                    assert_eq!(at + 8 + u64::from(le32(&stub, 8) & 0x03ff_ffff) * 4, routine, "slot {slot}");
+                    assert_eq!(
+                        at + 8 + u64::from(le32(&stub, 8) & 0x03ff_ffff) * 4,
+                        routine,
+                        "slot {slot}"
+                    );
                 }
             }
         }
         match arch {
             Arch::X86_64 => {
                 let code = logged.bytes(routine, super::X86_LOG.len());
-                let rip = |disp: usize| (routine + disp as u64 + 4).wrapping_add(le32(&code, disp) as i32 as i64 as u64);
+                let rip = |disp: usize| {
+                    (routine + disp as u64 + 4).wrapping_add(le32(&code, disp) as i32 as i64 as u64)
+                };
                 assert_eq!(rip(5), header + exec::MAP);
                 assert_eq!(rip(18), header + exec::CURRENT);
                 assert_eq!(rip(29), header + exec::log_word(0));
@@ -569,7 +599,11 @@ mod tests {
                 let (code, _) = stub(arch, slot);
                 assert_eq!(stub_slot(live, &code), Some(slot), "{arch:?} slot {slot}");
             }
-            assert_eq!(stub_slot(live, &vec![0; stub_size(arch) as usize]), None, "{arch:?}: zeros are no stub");
+            assert_eq!(
+                stub_slot(live, &vec![0; stub_size(arch) as usize]),
+                None,
+                "{arch:?}: zeros are no stub"
+            );
         }
     }
 
@@ -638,7 +672,10 @@ mod tests {
             }
         }
         let (x86, fixups) = plt(Arch::X86_64);
-        assert_eq!((x86.len() as u64, &x86[..2], fixups[0].at), (plt_size(Arch::X86_64), &[0xff, 0x25][..], 2));
+        assert_eq!(
+            (x86.len() as u64, &x86[..2], fixups[0].at),
+            (plt_size(Arch::X86_64), &[0xff, 0x25][..], 2)
+        );
         let (a64, _) = plt(Arch::Aarch64);
         assert_eq!(u32::from_le_bytes(a64[8..12].try_into().unwrap()), 0xd61f_0220);
     }
@@ -683,7 +720,9 @@ mod tests {
         let at = log_routine(Arch::X86_64, slots) as usize;
         let routine = &code[at..];
         let p = p + at as u64;
-        let rip = |disp: usize, end: u64| (p + end).wrapping_add(le32(routine, disp) as i32 as i64 as u64);
+        let rip = |disp: usize, end: u64| {
+            (p + end).wrapping_add(le32(routine, disp) as i32 as i64 as u64)
+        };
         // push rax; push rcx.
         assert_eq!(&routine[..2], [0x50, 0x51]);
         // mov rax, [rip + map].
@@ -714,9 +753,16 @@ mod tests {
             let word = |n: usize| le32(&code, at + n * 4);
             assert_eq!(word(0) & !(0xffff << 5), 0xd280_0010, "movz x16");
             assert_eq!(word(1) & !(0xffff << 5), 0xf2a0_0010, "movk x16, lsl #16");
-            assert_eq!(((word(0) >> 5) & 0xffff) as u64 | (((word(1) >> 5) & 0xffff) as u64) << 16, slot);
+            assert_eq!(
+                ((word(0) >> 5) & 0xffff) as u64 | (((word(1) >> 5) & 0xffff) as u64) << 16,
+                slot
+            );
             assert_eq!(word(2) >> 26, 0b000101, "b");
-            assert_eq!(at as u64 + 8 + u64::from(word(2) & 0x03ff_ffff) * 4, routine, "slot {slot}");
+            assert_eq!(
+                at as u64 + 8 + u64::from(word(2) & 0x03ff_ffff) * 4,
+                routine,
+                "slot {slot}"
+            );
             assert_eq!(word(3), 0xd420_0000);
         }
     }
@@ -755,8 +801,17 @@ mod tests {
             let size = log_stub_size(arch);
             for slot in [0u32, 1, 4095, 4096, 8191, 8999] {
                 let mut one = vec![0; size as usize];
-                write_log_stub(arch, slot, log_routine(arch, slots) - u64::from(slot) * size, &mut one);
-                assert_eq!(&all[(u64::from(slot) * size) as usize..][..size as usize], &one[..], "{arch:?} slot {slot}");
+                write_log_stub(
+                    arch,
+                    slot,
+                    log_routine(arch, slots) - u64::from(slot) * size,
+                    &mut one,
+                );
+                assert_eq!(
+                    &all[(u64::from(slot) * size) as usize..][..size as usize],
+                    &one[..],
+                    "{arch:?} slot {slot}"
+                );
             }
         }
     }

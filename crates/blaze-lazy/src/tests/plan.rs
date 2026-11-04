@@ -12,7 +12,12 @@ use crate::{
 };
 
 fn starts(section: &str, names: &[u32], in_data: &[u32]) -> Static {
-    let reloc = |n: &u32| Relocation { at: 8 * *n, kind: RelocKind::Abs64, target: Target::Function(key(*n)), addend: 0 };
+    let reloc = |n: &u32| Relocation {
+        at: 8 * *n,
+        kind: RelocKind::Abs64,
+        target: Target::Function(key(*n)),
+        addend: 0,
+    };
     Static {
         item: ItemKey(id("blaze-lazy test static", names.first().copied().unwrap_or(0))),
         instance: id("blaze-lazy test static instance", 0),
@@ -46,16 +51,23 @@ fn the_entry_and_what_runs_at_start_are_compiled_ahead() {
     ];
     let plan = Plan::new(&functions(10), &[key(0), key(1)], &statics).unwrap();
     let ahead: Vec<(InstanceKey, Ahead)> = plan.ahead().to_vec();
-    assert_eq!(ahead, vec![
-        (key(0), Ahead::Entry),
-        (key(1), Ahead::Entry),
-        (key(3), Ahead::Start),
-        (key(4), Ahead::Start),
-        (key(5), Ahead::Start),
-        (key(7), Ahead::Start),
-    ]);
+    assert_eq!(
+        ahead,
+        vec![
+            (key(0), Ahead::Entry),
+            (key(1), Ahead::Entry),
+            (key(3), Ahead::Start),
+            (key(4), Ahead::Start),
+            (key(5), Ahead::Start),
+            (key(7), Ahead::Start),
+        ]
+    );
     let lazy: Vec<InstanceKey> = plan.lazy().to_vec();
-    assert_eq!(lazy, vec![key(2), key(6), key(8), key(9)], "in the walk's order, a static elsewhere names a lazy one");
+    assert_eq!(
+        lazy,
+        vec![key(2), key(6), key(8), key(9)],
+        "in the walk's order, a static elsewhere names a lazy one"
+    );
     for (n, key) in lazy.iter().enumerate() {
         assert_eq!(plan.id(key), Some(LazyId(n as u32)));
         assert_eq!(plan.key(LazyId(n as u32)), *key);
@@ -132,8 +144,18 @@ fn callees_are_calls_and_tail_calls_not_addresses_taken() {
     let mut caller = compiled(0, &[1, 2, 1], &[3]);
     let jump = caller.code.len() as u32;
     caller.code.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
-    caller.relocs.push(Relocation { at: jump + 1, kind: RelocKind::PcRel32, target: Target::Direct(key(4)), addend: -4 });
-    caller.relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Function(key(5)), addend: 0 });
+    caller.relocs.push(Relocation {
+        at: jump + 1,
+        kind: RelocKind::PcRel32,
+        target: Target::Direct(key(4)),
+        addend: -4,
+    });
+    caller.relocs.push(Relocation {
+        at: 0,
+        kind: RelocKind::Abs64,
+        target: Target::Function(key(5)),
+        addend: 0,
+    });
     let (mut out, mut seen) = (Vec::new(), plan.scratch());
     plan.callees(&caller, &mut seen, &mut out);
     let ids = |ns: &[u32]| ns.iter().map(|n| plan.id(&key(*n)).unwrap()).collect::<Vec<_>>();

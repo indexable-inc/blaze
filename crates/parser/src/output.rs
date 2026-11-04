@@ -54,7 +54,10 @@ pub enum Step<'a> {
 pub enum OutlineStep<'a> {
     Step(Step<'a>),
     /// A node of `kind` over the next `n_input_tokens` input tokens, not parsed.
-    Lazy { kind: SyntaxKind, n_input_tokens: u32 },
+    Lazy {
+        kind: SyntaxKind,
+        n_input_tokens: u32,
+    },
 }
 
 impl Output {
@@ -107,8 +110,9 @@ impl Output {
                 }));
             }
             let tag = ((event & Self::TAG_MASK) >> Self::TAG_SHIFT) as u8;
-            let kind =
-                || -> SyntaxKind { (((event & Self::KIND_MASK) >> Self::KIND_SHIFT) as u16).into() };
+            let kind = || -> SyntaxKind {
+                (((event & Self::KIND_MASK) >> Self::KIND_SHIFT) as u16).into()
+            };
             let step = match tag {
                 Self::TOKEN_EVENT => {
                     let n_input_tokens =
@@ -153,8 +157,8 @@ impl Output {
                     if depth == 0 {
                         return None;
                     }
-                    tokens += ((event & Self::N_INPUT_TOKEN_MASK) >> Self::N_INPUT_TOKEN_SHIFT)
-                        as usize;
+                    tokens +=
+                        ((event & Self::N_INPUT_TOKEN_MASK) >> Self::N_INPUT_TOKEN_SHIFT) as usize;
                 }
                 Self::ENTER_EVENT => {
                     if depth == 0 {

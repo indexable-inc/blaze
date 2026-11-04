@@ -53,11 +53,11 @@ use windows_sys::Win32::{
             USN_REASON_COMPRESSION_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
             USN_REASON_DATA_TRUNCATION, USN_REASON_EA_CHANGE, USN_REASON_ENCRYPTION_CHANGE,
             USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE,
-            USN_REASON_INDEXABLE_CHANGE, USN_REASON_INTEGRITY_CHANGE,
-            USN_REASON_NAMED_DATA_EXTEND, USN_REASON_NAMED_DATA_OVERWRITE,
-            USN_REASON_NAMED_DATA_TRUNCATION, USN_REASON_RENAME_NEW_NAME,
-            USN_REASON_RENAME_OLD_NAME, USN_REASON_REPARSE_POINT_CHANGE,
-            USN_REASON_SECURITY_CHANGE, USN_REASON_STREAM_CHANGE, USN_RECORD_V2, USN_RECORD_V3,
+            USN_REASON_INDEXABLE_CHANGE, USN_REASON_INTEGRITY_CHANGE, USN_REASON_NAMED_DATA_EXTEND,
+            USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION,
+            USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+            USN_REASON_REPARSE_POINT_CHANGE, USN_REASON_SECURITY_CHANGE, USN_REASON_STREAM_CHANGE,
+            USN_RECORD_V2, USN_RECORD_V3,
         },
         SystemServices::FILE_SUPPORTS_USN_JOURNAL,
     },
@@ -151,8 +151,10 @@ pub(super) fn parse(bytes: &[u8], records: &mut Vec<Record>) -> Result<i64, Stri
         let rest = &bytes[at..];
         // alloc: an error path.
         let bad = |what: &str| format!("the record at byte {at} of the read {what}");
-        let len = word::<4>(rest, 0).map(u32::from_le_bytes).ok_or_else(|| bad("is cut short"))? as usize;
-        let major = word::<2>(rest, 4).map(u16::from_le_bytes).ok_or_else(|| bad("is cut short"))?;
+        let len =
+            word::<4>(rest, 0).map(u32::from_le_bytes).ok_or_else(|| bad("is cut short"))? as usize;
+        let major =
+            word::<2>(rest, 4).map(u16::from_le_bytes).ok_or_else(|| bad("is cut short"))?;
         let record = rest.get(..len).ok_or_else(|| bad("runs past its end"))?;
         let u64_at = |at| word::<8>(record, at).map(u64::from_le_bytes);
         let u128_at = |at| word::<16>(record, at).map(u128::from_le_bytes);
@@ -160,7 +162,11 @@ pub(super) fn parse(bytes: &[u8], records: &mut Vec<Record>) -> Result<i64, Stri
             2 => (u64_at(8).map(u128::from), u64_at(16).map(u128::from), 40),
             3 => (u128_at(8), u128_at(24), 56),
             // alloc: an error path.
-            _ => return Err(bad(&format!("is of version {major}; versions 2 and 3 were asked for"))),
+            _ => {
+                return Err(bad(&format!(
+                    "is of version {major}; versions 2 and 3 were asked for"
+                )));
+            }
         };
         let u32_at = |at| word::<4>(record, at).map(u32::from_le_bytes);
         let u16_at = |at| word::<2>(record, at).map(u16::from_le_bytes);
@@ -178,7 +184,13 @@ pub(super) fn parse(bytes: &[u8], records: &mut Vec<Record>) -> Result<i64, Stri
         if name_len % 2 != 0 || (name_len > 0 && name_at + name_len > len) {
             return Err(bad("has a name past its end"));
         }
-        records.push(Record { id, parent, reason, attributes, name: ((at + name_at) as u32, name_len as u32) });
+        records.push(Record {
+            id,
+            parent,
+            reason,
+            attributes,
+            name: ((at + name_at) as u32, name_len as u32),
+        });
         at += len;
     }
     Ok(next)
@@ -297,7 +309,8 @@ impl Names {
 
     /// What was gathered, each once, sorted, and the gathering begun again.
     pub(super) fn drain(&mut self) -> (Vec<FileName>, Vec<(FileName, Lost)>) {
-        let (mut files, mut lost) = (std::mem::take(&mut self.files), std::mem::take(&mut self.lost));
+        let (mut files, mut lost) =
+            (std::mem::take(&mut self.files), std::mem::take(&mut self.lost));
         files.sort_unstable();
         files.dedup();
         lost.sort_unstable_by(|a, b| a.0.cmp(&b.0).then((a.1 as u8).cmp(&(b.1 as u8))));
@@ -386,7 +399,9 @@ impl Names {
     fn forget_below(&mut self, path: &FileName) {
         let paths = &self.paths;
         self.dirs.retain(|_, place| match place {
-            Place::Under(at) | Place::Unnameable(at) => *at == 0 || !paths[*at as usize].is_under(path),
+            Place::Under(at) | Place::Unnameable(at) => {
+                *at == 0 || !paths[*at as usize].is_under(path)
+            }
             Place::Outside | Place::Gone => true,
         });
     }
@@ -399,7 +414,12 @@ impl Names {
     }
 
     /// One record, with its name's bytes where the read gave it one.
-    pub(super) fn record(&mut self, record: &Record, name: Option<&[u8]>, system: &mut impl System) {
+    pub(super) fn record(
+        &mut self,
+        record: &Record,
+        name: Option<&[u8]>,
+        system: &mut impl System,
+    ) {
         let is_dir = record.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         let how = How::of(record.reason);
         if record.id == self.root {
@@ -434,7 +454,10 @@ impl Names {
             Place::Unnameable(at) => self.lose(at, Lost::Rescan),
             Place::Under(at) => match named {
                 Some(named) => {
-                    if is_dir && !how.gone && (how.arrived || record.reason & USN_REASON_FILE_CREATE != 0) {
+                    if is_dir
+                        && !how.gone
+                        && (how.arrived || record.reason & USN_REASON_FILE_CREATE != 0)
+                    {
                         // clone: one for the map of directories, one for the batch.
                         let at = self.intern(named.clone());
                         self.dirs.insert(record.id, Place::Under(at));
@@ -482,7 +505,14 @@ impl Names {
     }
 
     /// A record with no name, in the directory at `at`.
-    fn unnamed(&mut self, record: &Record, at: u32, is_dir: bool, how: How, system: &mut impl System) {
+    fn unnamed(
+        &mut self,
+        record: &Record,
+        at: u32,
+        is_dir: bool,
+        how: How,
+        system: &mut impl System,
+    ) {
         if how.names {
             self.lose(at, Lost::Unnamed);
         }
@@ -493,7 +523,9 @@ impl Names {
         let found = match is_dir {
             true => match self.dirs.get(&record.id) {
                 // clone: a name the batch owns.
-                Some(&Place::Under(it)) if !how.arrived => Found::Under(self.paths[it as usize].clone()),
+                Some(&Place::Under(it)) if !how.arrived => {
+                    Found::Under(self.paths[it as usize].clone())
+                }
                 _ => system.find(record.id),
             },
             false if !self.seen.insert(record.id) => return,
@@ -566,7 +598,9 @@ impl System for Volume {
         let descriptor = FILE_ID_DESCRIPTOR {
             dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
             Type: ExtendedFileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 { ExtendedFileId: FILE_ID_128 { Identifier: id.to_le_bytes() } },
+            Anonymous: FILE_ID_DESCRIPTOR_0 {
+                ExtendedFileId: FILE_ID_128 { Identifier: id.to_le_bytes() },
+            },
         };
         // SAFETY: an open handle on the volume, a descriptor of the size it says, and no
         // security attributes. No access is asked: a name needs none.
@@ -584,9 +618,12 @@ impl System for Volume {
             Ok(handle) => handle,
             Err(error) => {
                 return match error.raw_os_error().map(|it| it as u32) {
-                    Some(ERROR_INVALID_PARAMETER | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_DELETE_PENDING) => {
-                        Found::Gone
-                    }
+                    Some(
+                        ERROR_INVALID_PARAMETER
+                        | ERROR_FILE_NOT_FOUND
+                        | ERROR_PATH_NOT_FOUND
+                        | ERROR_DELETE_PENDING,
+                    ) => Found::Gone,
                     Some(ERROR_ACCESS_DENIED | ERROR_CANT_ACCESS_FILE) => Found::Outside,
                     _ => Found::Unknown,
                 };
@@ -612,7 +649,9 @@ fn final_path(handle: &OwnedHandle, flags: u32, into: &mut Vec<u16>) -> io::Resu
         let room = into.capacity().max(260);
         into.resize(room, 0);
         // SAFETY: an open handle and a buffer of the length given.
-        let len = unsafe { GetFinalPathNameByHandleW(handle.as_raw_handle(), into.as_mut_ptr(), room as u32, flags) };
+        let len = unsafe {
+            GetFinalPathNameByHandleW(handle.as_raw_handle(), into.as_mut_ptr(), room as u32, flags)
+        };
         let len = len as usize;
         if len == 0 {
             return Err(io::Error::last_os_error());
@@ -632,7 +671,12 @@ fn file_id(handle: &OwnedHandle) -> io::Result<(u64, u128)> {
     // SAFETY: an open handle and room for the `FILE_ID_INFO` the class asks for; plain integers,
     // valid for any bytes written.
     sys::check(unsafe {
-        GetFileInformationByHandleEx(handle.as_raw_handle(), FileIdInfo, (&raw mut info).cast(), size_of::<FILE_ID_INFO>() as u32)
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
     })?;
     Ok((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
 }
@@ -664,7 +708,15 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
     debug_assert_eq!(wide.last(), Some(&0));
     // SAFETY: a NUL-terminated path; no security attributes or template.
     sys::owned(unsafe {
-        CreateFileW(wide.as_ptr(), rights, SHARE_ALL, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut())
+        CreateFileW(
+            wide.as_ptr(),
+            rights,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
     })
 }
 
@@ -748,46 +800,67 @@ pub(super) struct Journal {
 impl Journal {
     /// A watch of `dir`'s volume's journal from `since`, and the batch to tell at once where it
     /// starts now (none where it reads history first).
-    pub(super) fn open(root: &Path, dir: &FileName, since: Cursor) -> io::Result<(Box<Journal>, Option<Box<Journaled>>)> {
+    pub(super) fn open(
+        root: &Path,
+        dir: &FileName,
+        since: Cursor,
+    ) -> io::Result<(Box<Journal>, Option<Box<Journaled>>)> {
         // Setup, once per watch: what is allocated here is the watch's for its life, and every
         // error names the directory.
         let path = root.join(dir.as_str());
         let context = |what: &str, error: io::Error| {
             // alloc: an error path.
-            io::Error::new(error.kind(), format!("the USN journal of {}: {what}: {error}", path.display()))
+            io::Error::new(
+                error.kind(),
+                format!("the USN journal of {}: {what}: {error}", path.display()),
+            )
         };
         let refuse = |why: String| io::Error::new(io::ErrorKind::Unsupported, why);
         let wide = sys::path(&path)?;
-        let hint = open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS).map_err(|it| context("opening it", it))?;
+        let hint = open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS)
+            .map_err(|it| context("opening it", it))?;
         let (serial, root_id) = file_id(&hint).map_err(|it| context("its file ID", it))?;
         // alloc: setup, the watch's scratch for every path it asks for.
         let mut scratch = Vec::with_capacity(512);
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, &mut scratch).map_err(|it| context("its path", it))?;
+        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, &mut scratch)
+            .map_err(|it| context("its path", it))?;
         let shown = String::from_utf16_lossy(&scratch); // alloc: setup.
         // alloc: setup.
         let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_owned();
         let mut root_nt = Vec::with_capacity(scratch.len() + 16);
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut root_nt).map_err(|it| context("its path", it))?;
+        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut root_nt)
+            .map_err(|it| context("its path", it))?;
         let share = r"\Device\Mup\";
         if share.encode_utf16().eq(root_nt.iter().copied().take(share.len())) {
             // alloc: an error path.
-            return Err(refuse(format!("{shown} is on a network share, whose changes are in no journal blaze can read")));
+            return Err(refuse(format!(
+                "{shown} is on a network share, whose changes are in no journal blaze can read"
+            )));
         }
         let (system, flags) = volume_info(&hint).map_err(|it| context("its volume", it))?;
         if flags & FILE_SUPPORTS_USN_JOURNAL == 0 {
             // alloc: an error path.
-            return Err(refuse(format!("{shown} is on a {system} volume, which keeps no USN journal")));
+            return Err(refuse(format!(
+                "{shown} is on a {system} volume, which keeps no USN journal"
+            )));
         }
         // `\\?\Volume{GUID}\...`: the volume is its first component, opened as a device.
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &mut scratch).map_err(|it| context("its volume", it))?;
-        let end = scratch.iter().skip(4).position(|&it| it == BACKSLASH).map_or(scratch.len(), |it| it + 4);
+        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &mut scratch)
+            .map_err(|it| context("its volume", it))?;
+        let end = scratch
+            .iter()
+            .skip(4)
+            .position(|&it| it == BACKSLASH)
+            .map_or(scratch.len(), |it| it + 4);
         // alloc: setup.
         let mut device = scratch[..end].to_vec();
         device.push(0);
-        let querier = open(&device, FILE_TRAVERSE, 0).map_err(|it| context("opening its volume", it))?;
+        let querier =
+            open(&device, FILE_TRAVERSE, 0).map_err(|it| context("opening its volume", it))?;
         // alloc: setup, shared with the flushes' marks for the watch's life.
         let querier = Arc::new(querier);
-        let reader = open(&device, FILE_TRAVERSE, FILE_FLAG_OVERLAPPED).map_err(|it| context("opening its volume", it))?;
+        let reader = open(&device, FILE_TRAVERSE, FILE_FLAG_OVERLAPPED)
+            .map_err(|it| context("opening its volume", it))?;
         let data = query(&querier).map_err(|error| match error.raw_os_error().map(|it| it as u32) {
             // alloc: an error path.
             Some(ERROR_JOURNAL_NOT_ACTIVE) => refuse(format!(
@@ -800,7 +873,9 @@ impl Journal {
         })?;
         let now = data.NextUsn;
         let (next, lost) = match since {
-            Cursor::Usn { volume, journal, next } if volume == serial && journal == data.UsnJournalID => {
+            Cursor::Usn { volume, journal, next }
+                if volume == serial && journal == data.UsnJournalID =>
+            {
                 match next {
                     next if next < data.FirstUsn => (now, Some(Lost::Truncated)),
                     next if next > now => (now, Some(Lost::Reset)),
@@ -926,7 +1001,9 @@ impl Journal {
         };
         // SAFETY: the read's completion was taken, so the kernel holds the buffer no more; it
         // wrote `got` bytes of it, read here as bytes while nothing writes it.
-        let bytes = unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), got.min(BUFFER)) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), got.min(BUFFER))
+        };
         let mut records = std::mem::take(&mut self.records);
         records.clear();
         let parsed = parse(bytes, &mut records);
@@ -959,7 +1036,9 @@ impl Journal {
             false => self.names.gathered() >= GATHER,
         };
         if self.names.root_changed {
-            return self.end(format_args!("the watched directory was moved, replaced or removed: it is to be watched again"));
+            return self.end(format_args!(
+                "the watched directory was moved, replaced or removed: it is to be watched again"
+            ));
         }
         let batch = tell.then(|| self.batch());
         Taken { batch, end: None, read: Some(self.reached(stalled)) }
@@ -1008,19 +1087,21 @@ impl Journal {
             // Deleted, or made again with another ID, since the last read: made again is a
             // reset, read from its start now; deleted and not made again ends the watch, its
             // last batch saying the whole directory is lost.
-            Some(ERROR_JOURNAL_DELETE_IN_PROGRESS | ERROR_JOURNAL_NOT_ACTIVE | ERROR_INVALID_PARAMETER) => {
-                match query(&self.querier) {
-                    Ok(data) if data.UsnJournalID != self.journal => self.restart(&data, Lost::Reset),
-                    Ok(_) => self.end(format_args!("reading it: {error}")),
-                    Err(again) => match again.raw_os_error().map(|it| it as u32) {
-                        Some(ERROR_JOURNAL_NOT_ACTIVE | ERROR_JOURNAL_DELETE_IN_PROGRESS) => {
-                            self.names.lose_all(Lost::Reset);
-                            self.end(format_args!("it was deleted"))
-                        }
-                        _ => self.end(format_args!("querying it: {again}")),
-                    },
-                }
-            }
+            Some(
+                ERROR_JOURNAL_DELETE_IN_PROGRESS
+                | ERROR_JOURNAL_NOT_ACTIVE
+                | ERROR_INVALID_PARAMETER,
+            ) => match query(&self.querier) {
+                Ok(data) if data.UsnJournalID != self.journal => self.restart(&data, Lost::Reset),
+                Ok(_) => self.end(format_args!("reading it: {error}")),
+                Err(again) => match again.raw_os_error().map(|it| it as u32) {
+                    Some(ERROR_JOURNAL_NOT_ACTIVE | ERROR_JOURNAL_DELETE_IN_PROGRESS) => {
+                        self.names.lose_all(Lost::Reset);
+                        self.end(format_args!("it was deleted"))
+                    }
+                    _ => self.end(format_args!("querying it: {again}")),
+                },
+            },
             Some(ERROR_INVALID_FUNCTION) => {
                 self.end(format_args!("reading it unprivileged needs Windows 10 1709 or later"))
             }
@@ -1070,9 +1151,14 @@ mod tests {
         Record { id, parent, reason, attributes, name: (0, 0) }
     }
 
-    fn run(names: &mut Names, system: &mut Fake, records: &[(Record, Option<&str>)]) -> (Vec<FileName>, Vec<(FileName, Lost)>) {
+    fn run(
+        names: &mut Names,
+        system: &mut Fake,
+        records: &[(Record, Option<&str>)],
+    ) -> (Vec<FileName>, Vec<(FileName, Lost)>) {
         for (record, leaf) in records {
-            let bytes: Option<Vec<u8>> = leaf.map(|it| it.encode_utf16().flat_map(u16::to_le_bytes).collect());
+            let bytes: Option<Vec<u8>> =
+                leaf.map(|it| it.encode_utf16().flat_map(u16::to_le_bytes).collect());
             names.record(record, bytes.as_deref(), system);
         }
         names.read_done();
@@ -1101,12 +1187,24 @@ mod tests {
     fn a_removal_or_an_old_name_is_its_directorys_names_changed() {
         let mut names = Names::new(name("w"), ROOT);
         let mut system = Fake::default().at(2, "w/src").at(4, "w/src/new.rs");
-        let (files, lost) = run(&mut names, &mut system, &[
-            (record(3, ROOT, USN_REASON_FILE_DELETE | USN_REASON_CLOSE, 0), None),
-            (record(4, 2, USN_REASON_RENAME_OLD_NAME, 0), None),
-            (record(4, 2, USN_REASON_RENAME_NEW_NAME, 0), None),
-            (record(4, 2, USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, 0), None),
-        ]);
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[
+                (record(3, ROOT, USN_REASON_FILE_DELETE | USN_REASON_CLOSE, 0), None),
+                (record(4, 2, USN_REASON_RENAME_OLD_NAME, 0), None),
+                (record(4, 2, USN_REASON_RENAME_NEW_NAME, 0), None),
+                (
+                    record(
+                        4,
+                        2,
+                        USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE,
+                        0,
+                    ),
+                    None,
+                ),
+            ],
+        );
         assert_eq!(files, self::files(&["w/src/new.rs"]));
         assert_eq!(lost, [(name("w"), Lost::Unnamed), (name("w/src"), Lost::Unnamed)]);
     }
@@ -1118,7 +1216,11 @@ mod tests {
         system.now.insert(9, Found::Outside);
         let write = record(10, 9, USN_REASON_DATA_OVERWRITE, 0);
         for _ in 0..3 {
-            let (files, lost) = run(&mut names, &mut system, &[(write, None), (record(11, 9, USN_REASON_FILE_DELETE, 0), None)]);
+            let (files, lost) = run(
+                &mut names,
+                &mut system,
+                &[(write, None), (record(11, 9, USN_REASON_FILE_DELETE, 0), None)],
+            );
             assert!(files.is_empty() && lost.is_empty());
         }
         assert_eq!(system.asked, [9]);
@@ -1128,13 +1230,17 @@ mod tests {
     fn a_directory_made_and_renamed_unnamed_names_what_is_in_it_where_it_is_now() {
         let mut names = Names::new(name("w"), ROOT);
         let mut system = Fake::default().at(5, "w/moved").at(6, "w/moved/f.rs");
-        let (files, lost) = run(&mut names, &mut system, &[
-            (record(5, ROOT, USN_REASON_FILE_CREATE, DIR), None),
-            (record(6, 5, USN_REASON_FILE_CREATE, 0), None),
-            (record(6, 5, USN_REASON_DATA_EXTEND, 0), None),
-            (record(5, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), None),
-            (record(5, ROOT, USN_REASON_RENAME_NEW_NAME, DIR), None),
-        ]);
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[
+                (record(5, ROOT, USN_REASON_FILE_CREATE, DIR), None),
+                (record(6, 5, USN_REASON_FILE_CREATE, 0), None),
+                (record(6, 5, USN_REASON_DATA_EXTEND, 0), None),
+                (record(5, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), None),
+                (record(5, ROOT, USN_REASON_RENAME_NEW_NAME, DIR), None),
+            ],
+        );
         assert_eq!(files, self::files(&["w/moved", "w/moved/f.rs"]));
         assert_eq!(lost, [(name("w"), Lost::Unnamed)]);
     }
@@ -1143,15 +1249,22 @@ mod tests {
     fn named_records_are_named_from_their_parent_without_asking() {
         let mut names = Names::new(name("w"), ROOT);
         let mut system = Fake::default();
-        let (files, lost) = run(&mut names, &mut system, &[
-            (record(5, ROOT, USN_REASON_FILE_CREATE, DIR), Some("new")),
-            (record(6, 5, USN_REASON_FILE_CREATE, 0), Some("f.rs")),
-            (record(5, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), Some("new")),
-            (record(5, ROOT, USN_REASON_RENAME_NEW_NAME, DIR), Some("moved")),
-            (record(7, 5, USN_REASON_FILE_CREATE, 0), Some("g.rs")),
-            (record(8, ROOT, USN_REASON_DATA_EXTEND, 0), Some("n\u{e9}.rs")),
-        ]);
-        assert_eq!(files, self::files(&["w/moved", "w/moved/g.rs", "w/new", "w/new/f.rs", "w/n\u{e9}.rs"]));
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[
+                (record(5, ROOT, USN_REASON_FILE_CREATE, DIR), Some("new")),
+                (record(6, 5, USN_REASON_FILE_CREATE, 0), Some("f.rs")),
+                (record(5, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), Some("new")),
+                (record(5, ROOT, USN_REASON_RENAME_NEW_NAME, DIR), Some("moved")),
+                (record(7, 5, USN_REASON_FILE_CREATE, 0), Some("g.rs")),
+                (record(8, ROOT, USN_REASON_DATA_EXTEND, 0), Some("n\u{e9}.rs")),
+            ],
+        );
+        assert_eq!(
+            files,
+            self::files(&["w/moved", "w/moved/g.rs", "w/new", "w/new/f.rs", "w/n\u{e9}.rs"])
+        );
         assert!(lost.is_empty());
         assert!(system.asked.is_empty(), "{:?}", system.asked);
     }
@@ -1173,7 +1286,11 @@ mod tests {
     fn the_watched_directory_moving_ends_the_watch() {
         let mut names = Names::new(name("w"), ROOT);
         let mut system = Fake::default();
-        let (files, lost) = run(&mut names, &mut system, &[(record(ROOT, 99, USN_REASON_BASIC_INFO_CHANGE, DIR), None)]);
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[(record(ROOT, 99, USN_REASON_BASIC_INFO_CHANGE, DIR), None)],
+        );
         assert_eq!((files, lost), (self::files(&["w"]), vec![]));
         assert!(!names.root_changed);
         run(&mut names, &mut system, &[(record(ROOT, 99, USN_REASON_RENAME_OLD_NAME, DIR), None)]);
@@ -1182,7 +1299,11 @@ mod tests {
         let mut names = Names::new(name("w"), ROOT);
         let mut system = Fake { moved: true, ..Fake::default() };
         system.now.insert(50, Found::Outside);
-        let (_, lost) = run(&mut names, &mut system, &[(record(51, 50, USN_REASON_RENAME_OLD_NAME, DIR), None)]);
+        let (_, lost) = run(
+            &mut names,
+            &mut system,
+            &[(record(51, 50, USN_REASON_RENAME_OLD_NAME, DIR), None)],
+        );
         assert!(names.root_changed);
         assert_eq!(lost, [(name("w"), Lost::RootChanged)]);
     }
@@ -1193,23 +1314,32 @@ mod tests {
         let mut system = Fake::default().at(2, "w/a/b").at(3, "w/a/b/f.rs");
         system.now.insert(4, Found::Outside);
         let write = record(3, 2, USN_REASON_DATA_EXTEND, 0);
-        run(&mut names, &mut system, &[(write, None), (record(30, 4, USN_REASON_DATA_EXTEND, 0), None)]);
+        run(
+            &mut names,
+            &mut system,
+            &[(write, None), (record(30, 4, USN_REASON_DATA_EXTEND, 0), None)],
+        );
         assert_eq!(system.asked, [2, 3, 4]);
         // `w/a`, never met, moves to `w/c`: `w/a/b` is not where it was.
         system.now.insert(2, Found::Under(name("w/c/b")));
         system.now.insert(3, Found::Under(name("w/c/b/f.rs")));
-        let (files, lost) = run(&mut names, &mut system, &[
-            (record(20, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), None),
-            (write, None),
-        ]);
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[(record(20, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), None), (write, None)],
+        );
         assert_eq!(files, self::files(&["w/c/b/f.rs"]));
         assert_eq!(lost, [(name("w"), Lost::Unnamed)]);
         assert_eq!(&system.asked[3..], [2, 3]);
         // A directory known moving away forgets only what was under it; outside stays outside.
-        let (files, _) = run(&mut names, &mut system, &[
-            (record(2, 20, USN_REASON_RENAME_OLD_NAME, DIR), None),
-            (record(30, 4, USN_REASON_DATA_EXTEND, 0), None),
-        ]);
+        let (files, _) = run(
+            &mut names,
+            &mut system,
+            &[
+                (record(2, 20, USN_REASON_RENAME_OLD_NAME, DIR), None),
+                (record(30, 4, USN_REASON_DATA_EXTEND, 0), None),
+            ],
+        );
         assert_eq!(files, self::files(&["w/c/b"]));
         assert_eq!(&system.asked[5..], [20]);
     }
@@ -1218,7 +1348,11 @@ mod tests {
     fn what_is_gathered_is_told_each_once_sorted() {
         let mut names = Names::new(name("w"), ROOT);
         names.files.extend([name("w/b"), name("w/a"), name("w/b")]);
-        names.lost.extend([(name("w/x"), Lost::Unnamed), (name("w"), Lost::Reset), (name("w/x"), Lost::Unnamed)]);
+        names.lost.extend([
+            (name("w/x"), Lost::Unnamed),
+            (name("w"), Lost::Reset),
+            (name("w/x"), Lost::Unnamed),
+        ]);
         let (files, lost) = names.drain();
         assert_eq!(files, self::files(&["w/a", "w/b"]));
         assert_eq!(lost, [(name("w"), Lost::Reset), (name("w/x"), Lost::Unnamed)]);
@@ -1260,11 +1394,29 @@ mod tests {
         bytes.extend(v3(1 << 70, 5, USN_REASON_DATA_EXTEND));
         let mut records = Vec::new();
         assert_eq!(parse(&bytes, &mut records), Ok(777));
-        assert_eq!(records, [
-            Record { id: 5, parent: 1, reason: USN_REASON_FILE_CREATE, attributes: DIR, name: (8 + 60, 6) },
-            Record { id: 1 << 70, parent: 5, reason: USN_REASON_DATA_EXTEND, attributes: 0, name: (second as u32 + 76, 0) },
-        ]);
-        assert_eq!(&bytes[68..74], "src".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+        assert_eq!(
+            records,
+            [
+                Record {
+                    id: 5,
+                    parent: 1,
+                    reason: USN_REASON_FILE_CREATE,
+                    attributes: DIR,
+                    name: (8 + 60, 6)
+                },
+                Record {
+                    id: 1 << 70,
+                    parent: 5,
+                    reason: USN_REASON_DATA_EXTEND,
+                    attributes: 0,
+                    name: (second as u32 + 76, 0)
+                },
+            ]
+        );
+        assert_eq!(
+            &bytes[68..74],
+            "src".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1287,9 +1439,11 @@ mod tests {
 
     #[test]
     fn a_close_tells_only_a_removal_of_names() {
-        let close = How::of(USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE);
+        let close =
+            How::of(USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE);
         assert!(!close.gone && !close.arrived && !close.names);
-        let removed = How::of(USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE);
+        let removed =
+            How::of(USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE);
         assert!(removed.gone && !removed.arrived && removed.names);
         let link = How::of(USN_REASON_HARD_LINK_CHANGE);
         assert!(!link.gone && link.names);

@@ -18,7 +18,9 @@ fn counts(machine: &Machine) -> (usize, usize) {
 fn a_lazy_build_checks_every_function_and_compiles_only_its_entry() {
     let (program, policy) = (program(), live());
     let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
-    let built = Build::new(&machine, &program, &policy, &memo).run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let built = Build::new(&machine, &program, &policy, &memo)
+        .run_later(&[(1, member())], &[], &[0], &store)
+        .unwrap();
     assert_eq!(built.entry, built.roots);
     // The walk's order: a level at a time, each in the order its callers name it.
     let items: Vec<ItemKey> = built.walked.iter().map(|it| it.item).collect();
@@ -68,7 +70,9 @@ fn what_compile_kept_keeps_makes_the_next_lazy_build_compile_nothing() {
         }
     }
     let warm = Machine::default();
-    let built = Build::new(&warm, &program, &policy, &Memo::new()).run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let built = Build::new(&warm, &program, &policy, &Memo::new())
+        .run_later(&[(1, member())], &[], &[0], &store)
+        .unwrap();
     assert_eq!(counts(&warm), (0, 0));
     assert_eq!(built.stats.stored, 1);
     assert_eq!(built.walked.len(), 5);
@@ -176,7 +180,10 @@ fn memo_hit_is_compile_kept_from_the_memo_and_nothing_else() {
     let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
     let key = |id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
     let before = counts(&machine);
-    assert!(build.memo_hit(InstanceKey(ContentId([0xab; 32]))).is_none(), "no function of the walk");
+    assert!(
+        build.memo_hit(InstanceKey(ContentId([0xab; 32]))).is_none(),
+        "no function of the walk"
+    );
     assert!(build.memo_hit(built.entry[0]).is_none(), "compiled ahead, so its check kept no shape");
     assert!(build.memo_hit(key(4)).is_none(), "its shape, which the memo has nothing of yet");
     assert_eq!(counts(&machine), before, "a probe builds no IR and compiles nothing");
@@ -218,7 +225,8 @@ fn an_owned_walk_compiles_what_a_whole_build_compiles() {
     let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
     let later = build.into_later();
     for walked in &built.walked {
-        let (function, _) = later.compile_kept(&machine, &program, &memo, walked.key, &store).unwrap();
+        let (function, _) =
+            later.compile_kept(&machine, &program, &memo, walked.key, &store).unwrap();
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
         assert_eq!(&function, want);
     }
@@ -292,13 +300,19 @@ fn tier_up_compiles_a_function_alone_at_each_tier() {
     let (machine, memo, mut store) = (Machine::default(), Memo::new(), Store::default());
     let mut build = Build::new(&machine, &program, &policy, &memo);
     let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
-    let key = |built: &Built, id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
+    let key =
+        |built: &Built, id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
     let (four, five) = (key(&built, 4), key(&built, 5));
     let later = build.into_later();
-    let tiers = [(Backend::Stencil, true), (Backend::Cranelift { speed: false }, true), (Backend::Llvm { opt: 3 }, false)];
+    let tiers = [
+        (Backend::Stencil, true),
+        (Backend::Cranelift { speed: false }, true),
+        (Backend::Llvm { opt: 3 }, false),
+    ];
     let mut keys = vec![four];
     for (to, counted) in tiers {
-        let (function, puts) = later.tier_up(&machine, &program, &memo, four, to, counted, &store).unwrap();
+        let (function, puts) =
+            later.tier_up(&machine, &program, &memo, four, to, counted, &store).unwrap();
         assert!(!keys.contains(&function.key), "{to:?}: a tier is its own instance");
         assert_eq!(function.code[0], 0x44);
         keys.push(function.key);
@@ -314,13 +328,23 @@ fn tier_up_compiles_a_function_alone_at_each_tier() {
     let mut build = Build::new(&machine, &program, &without, &memo);
     let no_llvm = build.run_later(&[(1, member())], &[], &[0], &Store::default()).unwrap();
     let to_llvm = |later: &Later<u32, u32>| {
-        later.tier_up(&machine, &program, &memo, key(&no_llvm, 4), Backend::Llvm { opt: 3 }, false, &Store::default())
+        later.tier_up(
+            &machine,
+            &program,
+            &memo,
+            key(&no_llvm, 4),
+            Backend::Llvm { opt: 3 },
+            false,
+            &Store::default(),
+        )
     };
     assert!(to_llvm(&build.into_later()).unwrap_err().what.contains("without it"));
 
     // No build tiered 5 up, so its stencil tier would be built from its new body: refused.
     program.functions.get_mut(&5).unwrap().body = 0x56;
-    let error = later.tier_up(&machine, &program, &memo, five, Backend::Stencil, true, &Store::default()).unwrap_err();
+    let error = later
+        .tier_up(&machine, &program, &memo, five, Backend::Stencil, true, &Store::default())
+        .unwrap_err();
     assert!(error.what.starts_with("changed before its first call"), "{}", error.what);
 }
 

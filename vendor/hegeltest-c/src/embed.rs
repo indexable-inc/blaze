@@ -87,10 +87,9 @@ pub fn data_source_for_blob(
     let ntc = match crate::native::blob::decode_blob(blob)? {
         crate::native::blob::DecodedBlob::Choices(choices) => {
             if settings.verbosity == Verbosity::Debug {
-                settings.output.line(&format!(
-                    "replaying failure blob: choices = {}",
-                    choices.len()
-                ));
+                settings
+                    .output
+                    .line(&format!("replaying failure blob: choices = {}", choices.len()));
             }
             crate::native::core::NativeTestCase::for_choices(&choices, None, None)
         }

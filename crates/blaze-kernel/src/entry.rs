@@ -44,7 +44,10 @@ impl EntryKey {
 }
 
 /// The key of the entry of `identity` (its [`Identity::id`]) whose reads saw `reads`.
-pub fn entry_key<'a>(identity: &ContentId, reads: impl ExactSizeIterator<Item = (Read<'a>, Seen)>) -> Key {
+pub fn entry_key<'a>(
+    identity: &ContentId,
+    reads: impl ExactSizeIterator<Item = (Read<'a>, Seen)>,
+) -> Key {
     let mut key = EntryKey::new(identity, reads.len());
     for (read, seen) in reads {
         key.read(read, seen);
@@ -77,7 +80,8 @@ pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Vec<u8
         // alloc: the value, kept in the store
         return value.to_vec();
     }
-    let reads: usize = trace.iter().map(|(read, seen)| 2 + 1 + hash_len(seen) + 4 + read.key.len()).sum();
+    let reads: usize =
+        trace.iter().map(|(read, seen)| 2 + 1 + hash_len(seen) + 4 + read.key.len()).sum();
     // alloc: the entry, kept in the store: one allocation of its exact size
     let mut out = Vec::with_capacity(16 + 8 + 32 + reads + 8 + 15 + value.len());
     out.put_bytes(&ENTRY_MAGIC);
@@ -137,7 +141,13 @@ pub struct Entry<'s> {
 impl<'s> Entry<'s> {
     /// The entry with no reads of `identity`: its bytes are its value.
     pub fn whole(bytes: &'s [u8], identity: Identity) -> Entry<'s> {
-        Entry { key: whole::key(&identity), identity, value: bytes, reads: Reader::new(&[]), count: 0 }
+        Entry {
+            key: whole::key(&identity),
+            identity,
+            value: bytes,
+            reads: Reader::new(&[]),
+            count: 0,
+        }
     }
 
     /// The entry under `key`. It is refused when it is of another identity than `identity`, or
@@ -174,7 +184,8 @@ impl<'s> Entry<'s> {
             return Err("its reads name another key than the one it is filed under".to_owned());
         }
         // alloc: an error
-        let len = usize::try_from(input.u64()?).map_err(|_| "a value longer than memory".to_owned())?;
+        let len =
+            usize::try_from(input.u64()?).map_err(|_| "a value longer than memory".to_owned())?;
         let pad = input.at().next_multiple_of(16) - input.at();
         if input.take(pad)?.iter().any(|it| *it != 0) {
             // alloc: an error
@@ -197,7 +208,9 @@ fn next_read<'s>(input: &mut Reader<'s>) -> Result<(Read<'s>, Seen), String> {
         0 => Seen::Gone,
         1 => Seen::Is(ContentId(*input.array::<32>()?)),
         // alloc: an error
-        tag => return Err(format!("a read seen as {tag}, which is neither 0 (gone) nor 1 (a hash)")),
+        tag => {
+            return Err(format!("a read seen as {tag}, which is neither 0 (gone) nor 1 (a hash)"));
+        }
     };
     let key = input.bytes_u32()?;
     Ok((Read { kind, key }, seen))
@@ -243,7 +256,9 @@ impl<'s> Shape<'s> {
         let id = ContentId(*input.array::<32>()?);
         if id != *identity {
             // alloc: an error
-            return Err(format!("its shape is of identity {id:x}, not {identity:x}: it is filed under another key"));
+            return Err(format!(
+                "its shape is of identity {id:x}, not {identity:x}: it is filed under another key"
+            ));
         }
         let count = input.u32()? as usize;
         let reads = input;

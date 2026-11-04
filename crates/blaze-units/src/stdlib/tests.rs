@@ -5,8 +5,8 @@ use blaze_query::{Database, MemTree};
 use blaze_vfs::View;
 
 use super::target::{
-    CfgArgs, cargo_cfg_env, data_layout, file_name, split_debuginfo, target_cfg, target_cfg_told, target_facts,
-    target_spec_json,
+    CfgArgs, cargo_cfg_env, data_layout, file_name, split_debuginfo, target_cfg, target_cfg_told,
+    target_facts, target_spec_json,
 };
 use super::*;
 use crate::query::{StdGraph, StdKey, StdPlanned, StdUnits};
@@ -26,7 +26,8 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
 fn printed(triple: &str, on: &[&str]) -> Vec<String> {
     let data = recorded();
     let target = &data["targets"][triple];
-    let mut cfgs: Vec<String> = strings(&target["cfg"]).into_iter().chain(strings(&target["nightly_cfg"])).collect();
+    let mut cfgs: Vec<String> =
+        strings(&target["cfg"]).into_iter().chain(strings(&target["nightly_cfg"])).collect();
     let listed = |name: &str| {
         target["features"].get(name).is_some()
             || target["llvm_features"].get(name).is_some()
@@ -34,7 +35,11 @@ fn printed(triple: &str, on: &[&str]) -> Vec<String> {
             || strings(&target["other_features"]).iter().any(|it| it == name)
     };
     for feature in on.iter().filter(|it| listed(it)) {
-        cfgs.extend(strings(&target["features"][*feature]).iter().map(|it| format!("target_feature=\"{it}\"")));
+        cfgs.extend(
+            strings(&target["features"][*feature])
+                .iter()
+                .map(|it| format!("target_feature=\"{it}\"")),
+        );
         for (own, off) in target["features_off"].as_object().unwrap() {
             if strings(off).iter().any(|it| it == feature) {
                 cfgs.push(format!("target_feature=\"{own}\""));
@@ -48,14 +53,21 @@ fn printed(triple: &str, on: &[&str]) -> Vec<String> {
     cfgs
 }
 
-const TRIPLES: [&str; 4] = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc", "wasm32-wasip1"];
+const TRIPLES: [&str; 4] =
+    ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc", "wasm32-wasip1"];
 
 #[test]
 fn the_cfg_of_each_target_is_what_rustc_printed() {
     for triple in TRIPLES {
-        assert_eq!(target_cfg(triple, &CfgArgs::default()).unwrap(), printed(triple, &[]), "{triple}");
+        assert_eq!(
+            target_cfg(triple, &CfgArgs::default()).unwrap(),
+            printed(triple, &[]),
+            "{triple}"
+        );
     }
-    let has = |triple: &str, cfg: &str| target_cfg(triple, &CfgArgs::default()).unwrap().iter().any(|it| it == cfg);
+    let has = |triple: &str, cfg: &str| {
+        target_cfg(triple, &CfgArgs::default()).unwrap().iter().any(|it| it == cfg)
+    };
     assert!(has("x86_64-unknown-linux-gnu", "target_os=\"linux\""));
     assert!(has("x86_64-unknown-linux-gnu", "unix"));
     assert!(has("x86_64-pc-windows-msvc", "target_env=\"msvc\""));
@@ -78,7 +90,10 @@ fn a_target_feature_turns_on_what_rustc_says() {
     }
     // A feature the target does not have changes no cfg: rustc warns of it.
     for triple in ["aarch64-apple-darwin", "wasm32-wasip1"] {
-        assert_eq!(target_cfg(triple, &avx2).unwrap(), target_cfg(triple, &CfgArgs::default()).unwrap());
+        assert_eq!(
+            target_cfg(triple, &avx2).unwrap(),
+            target_cfg(triple, &CfgArgs::default()).unwrap()
+        );
     }
     let joined = CfgArgs::from_flags(&["-Ctarget-feature=+avx2".to_owned()]).unwrap();
     assert_eq!(joined, avx2);
@@ -89,7 +104,10 @@ fn a_feature_of_no_cfg_changes_none() {
     // LLVM's, which rustc warns of and passes on.
     let other = CfgArgs::from_flags(&["-Ctarget-feature=+64bit".to_owned()]).unwrap();
     let triple = "x86_64-unknown-linux-gnu";
-    assert_eq!(target_cfg(triple, &other).unwrap(), target_cfg(triple, &CfgArgs::default()).unwrap());
+    assert_eq!(
+        target_cfg(triple, &other).unwrap(),
+        target_cfg(triple, &CfgArgs::default()).unwrap()
+    );
     // Turning off what it turned on is the target's own again.
     let both = CfgArgs::from_flags(&["-Ctarget-feature=+avx2,-avx2".to_owned()]).unwrap();
     let cfgs = target_cfg(triple, &both).unwrap();
@@ -100,7 +118,8 @@ fn a_feature_of_no_cfg_changes_none() {
 #[test]
 fn the_features_that_change_no_cfg_are_told() {
     let triple = "x86_64-unknown-linux-gnu";
-    let args = CfgArgs::from_flags(&["-Ctarget-feature=+blazeunlisted,+64bit,+avx2".to_owned()]).unwrap();
+    let args =
+        CfgArgs::from_flags(&["-Ctarget-feature=+blazeunlisted,+64bit,+avx2".to_owned()]).unwrap();
     let (cfgs, skipped) = target_cfg_told(triple, &args).unwrap();
     let avx2 = CfgArgs::from_flags(&["-Ctarget-feature=+avx2".to_owned()]).unwrap();
     assert_eq!(cfgs, target_cfg(triple, &avx2).unwrap());
@@ -136,9 +155,16 @@ fn a_stable_rustc_prints_no_cfg_of_an_unstable_feature() {
 #[test]
 fn a_spec_the_hosts_agree_on_is_every_hosts() {
     let data = recorded();
-    let wasm = target_spec_json("wasm32-wasip1", "x86_64-pc-windows-msvc").unwrap().expect("wasm32-wasip1's spec");
+    let wasm = target_spec_json("wasm32-wasip1", "x86_64-pc-windows-msvc")
+        .unwrap()
+        .expect("wasm32-wasip1's spec");
     assert_eq!(Some(wasm), target_spec_json("wasm32-wasip1", "aarch64-apple-darwin").unwrap());
-    assert_eq!(wasm, data["targets"]["wasm32-wasip1"]["target_spec_json"]["aarch64-apple-darwin"].as_str().unwrap());
+    assert_eq!(
+        wasm,
+        data["targets"]["wasm32-wasip1"]["target_spec_json"]["aarch64-apple-darwin"]
+            .as_str()
+            .unwrap()
+    );
     let linux = "x86_64-unknown-linux-gnu";
     assert_eq!(target_spec_json(linux, "x86_64-pc-windows-msvc").unwrap(), None);
     assert_eq!(
@@ -167,11 +193,20 @@ fn a_targets_facts_are_read_without_allocating() {
 #[test]
 fn a_cfg_given_is_passed_on_when_plain() {
     let triple = "x86_64-unknown-linux-gnu";
-    let given = |cfg: &str| target_cfg(triple, &CfgArgs { cfgs: vec![cfg.to_owned()], ..CfgArgs::default() });
+    let given = |cfg: &str| {
+        target_cfg(triple, &CfgArgs { cfgs: vec![cfg.to_owned()], ..CfgArgs::default() })
+    };
     for plain in ["foo", "feature=\"serde derive\""] {
         assert!(given(plain).unwrap().iter().any(|it| it == plain), "{plain}");
     }
-    for refused in ["feature=serde", "feature=\"a\\\"b\"", "debug_assertions", "target_os=\"linux\"", "sanitizer_cfi_generalize_pointers", "9lives"] {
+    for refused in [
+        "feature=serde",
+        "feature=\"a\\\"b\"",
+        "debug_assertions",
+        "target_os=\"linux\"",
+        "sanitizer_cfi_generalize_pointers",
+        "9lives",
+    ] {
         assert!(given(refused).is_err(), "{refused}");
     }
 }
@@ -201,16 +236,26 @@ fn the_profile_decides_its_cfgs() {
 #[test]
 fn a_sanitizer_is_a_cfg() {
     let triple = "x86_64-unknown-linux-gnu";
-    let flags = |words: &[&str]| CfgArgs::from_flags(&words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>());
+    let flags = |words: &[&str]| {
+        CfgArgs::from_flags(&words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())
+    };
     let sanitized = |words: &[&str]| -> Vec<String> {
         let cfgs = target_cfg(triple, &flags(words).unwrap()).unwrap();
         cfgs.into_iter().filter(|it| it.starts_with("sanitize")).collect()
     };
     assert_eq!(sanitized(&[]), Vec::<String>::new());
     assert_eq!(sanitized(&["-Zsanitizer=address"]), ["sanitize=\"address\""]);
-    assert_eq!(sanitized(&["-Z", "sanitizer=thread", "-Zsanitizer=thread"]), ["sanitize=\"thread\""]);
     assert_eq!(
-        sanitized(&["-Zsanitizer=memory", "-Zsanitizer-memory-track-origins", "-Z", "sanitizer_recover=memory"]),
+        sanitized(&["-Z", "sanitizer=thread", "-Zsanitizer=thread"]),
+        ["sanitize=\"thread\""]
+    );
+    assert_eq!(
+        sanitized(&[
+            "-Zsanitizer=memory",
+            "-Zsanitizer-memory-track-origins",
+            "-Z",
+            "sanitizer_recover=memory"
+        ]),
         ["sanitize=\"memory\""]
     );
     assert_eq!(sanitized(&["-Zsanitizer-recover=address"]), Vec::<String>::new());
@@ -227,7 +272,11 @@ fn a_sanitizer_is_a_cfg() {
     assert!(flags(&["-Zsanitizer"]).unwrap_err().contains("comma-separated list"));
     // cargo-fuzz's flags beside the sanitizer decide no cfg.
     assert_eq!(
-        sanitized(&["-Zsanitizer=address", "-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=4"]),
+        sanitized(&[
+            "-Zsanitizer=address",
+            "-Cpasses=sancov-module",
+            "-Cllvm-args=-sanitizer-coverage-level=4"
+        ]),
         ["sanitize=\"address\""]
     );
     // A `--cfg` of it is rustc's to set, not the user's.
@@ -249,7 +298,9 @@ fn a_proc_macro_of_a_static_target_has_no_crt_static() {
 fn an_unknown_target_is_refused_naming_it() {
     let error = target_cfg("riscv64gc-unknown-plan9", &CfgArgs::default()).unwrap_err();
     assert!(error.contains("`riscv64gc-unknown-plan9`"), "{error}");
-    assert!(target_facts("riscv64gc-unknown-plan9").unwrap_err().contains("riscv64gc-unknown-plan9"));
+    assert!(
+        target_facts("riscv64gc-unknown-plan9").unwrap_err().contains("riscv64gc-unknown-plan9")
+    );
     assert!(file_name("riscv64gc-unknown-plan9", "bin", "a").is_err());
     let flag = CfgArgs::from_flags(&["-Cno-such-option=1".to_owned()]).unwrap_err();
     assert!(flag.contains("no-such-option"), "{flag}");
@@ -272,9 +323,15 @@ fn a_build_scripts_cfg_variables_are_cargos() {
 #[test]
 fn a_targets_facts_and_file_names() {
     let linux = target_facts("x86_64-unknown-linux-gnu").unwrap();
-    assert_eq!((linux.panic.as_str(), linux.has_std, linux.needs_builtins_mem), ("unwind", true, false));
+    assert_eq!(
+        (linux.panic.as_str(), linux.has_std, linux.needs_builtins_mem),
+        ("unwind", true, false)
+    );
     assert_eq!(target_facts("wasm32-wasip1").unwrap().panic, "abort");
-    assert_eq!(file_name("x86_64-unknown-linux-gnu", "lib", "core").unwrap().as_deref(), Some("libcore.rlib"));
+    assert_eq!(
+        file_name("x86_64-unknown-linux-gnu", "lib", "core").unwrap().as_deref(),
+        Some("libcore.rlib")
+    );
     assert_eq!(file_name("x86_64-pc-windows-msvc", "bin", "a").unwrap().as_deref(), Some("a.exe"));
     assert_eq!(file_name("wasm32-wasip1", "dylib", "a").unwrap(), None);
     assert!(target::triples().any(|it| it == "aarch64-unknown-linux-gnu"));
@@ -285,7 +342,10 @@ fn a_targets_facts_and_file_names() {
 #[test]
 fn a_targets_data_layout_is_its_specs() {
     let tier_one = [
-        ("aarch64-apple-darwin", "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"),
+        (
+            "aarch64-apple-darwin",
+            "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32",
+        ),
         (
             "aarch64-pc-windows-msvc",
             "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32",
@@ -294,14 +354,26 @@ fn a_targets_data_layout_is_its_specs() {
             "aarch64-unknown-linux-gnu",
             "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
         ),
-        ("x86_64-pc-windows-gnu", "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
-        ("x86_64-pc-windows-msvc", "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
-        ("x86_64-unknown-linux-gnu", "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
+        (
+            "x86_64-pc-windows-gnu",
+            "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
     ];
     for (triple, layout) in tier_one {
         assert_eq!(data_layout(triple).unwrap(), layout, "{triple}");
     }
-    assert_eq!(data_layout("wasm32-wasip1").unwrap(), "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20");
+    assert_eq!(
+        data_layout("wasm32-wasip1").unwrap(),
+        "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+    );
     let unknown = data_layout("riscv64gc-unknown-plan9").unwrap_err();
     assert!(unknown.contains("riscv64gc-unknown-plan9"), "{unknown}");
 }
@@ -328,7 +400,10 @@ fn std_brings_the_crates_cargo_builds_with_it() {
         std_crates(&names(&["std"])),
         names(&["alloc", "compiler_builtins", "core", "panic_unwind", "proc_macro", "std"])
     );
-    assert_eq!(std_crates(&names(&["core", "alloc"])), names(&["alloc", "compiler_builtins", "core"]));
+    assert_eq!(
+        std_crates(&names(&["core", "alloc"])),
+        names(&["alloc", "compiler_builtins", "core"])
+    );
     assert!(std_crates(&names(&["std", "test"])).contains(&"test".to_owned()));
     assert_eq!(default_crates("x86_64-unknown-linux-gnu").unwrap(), names(&["std"]));
 }
@@ -336,7 +411,9 @@ fn std_brings_the_crates_cargo_builds_with_it() {
 const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
 
 fn package(name: &str, extra: &str) -> String {
-    format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\nbench = false\n\n{extra}")
+    format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\nbench = false\n\n{extra}"
+    )
 }
 
 /// A standard library of eight crates, laid out and locked as library/ is.
@@ -355,21 +432,33 @@ fn library(tree: &MemTree) -> ContentId {
                 [[package]]\nname = \"std\"\nversion = \"0.0.0\"\ndependencies = [\n \"alloc\",\n \"core\",\n \"panic_abort\",\n \"panic_unwind\",\n]\n\n\
                 [[package]]\nname = \"sysroot\"\nversion = \"0.0.0\"\ndependencies = [\n \"proc_macro\",\n \"std\",\n]\n";
     let core = package("core", "");
-    let builtins = package("compiler_builtins", "[dependencies]\ncore = { path = \"../../core\" }\n\n[features]\nmem = []\n");
+    let builtins = package(
+        "compiler_builtins",
+        "[dependencies]\ncore = { path = \"../../core\" }\n\n[features]\nmem = []\n",
+    );
     let alloc = package(
         "alloc",
         "[dependencies]\ncore = { path = \"../core\" }\ncompiler_builtins = { path = \"../compiler-builtins/compiler-builtins\" }\n\n\
          [features]\ncompiler-builtins-mem = [\"compiler_builtins/mem\"]\n",
     );
-    let panic_abort = package("panic_abort", "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n");
-    let panic_unwind = package("panic_unwind", "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n");
+    let panic_abort = package(
+        "panic_abort",
+        "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n",
+    );
+    let panic_unwind = package(
+        "panic_unwind",
+        "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n",
+    );
     let std = package(
         "std",
         "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n\
          panic_abort = { path = \"../panic_abort\" }\npanic_unwind = { path = \"../panic_unwind\", optional = true }\n\n\
          [features]\npanic-unwind = [\"dep:panic_unwind\"]\nbacktrace = []\n",
     );
-    let proc_macro = package("proc_macro", "[dependencies]\nstd = { path = \"../std\" }\ncore = { path = \"../core\" }\n");
+    let proc_macro = package(
+        "proc_macro",
+        "[dependencies]\nstd = { path = \"../std\" }\ncore = { path = \"../core\" }\n",
+    );
     let sysroot = package(
         "sysroot",
         "[dependencies]\nproc_macro = { path = \"../proc_macro\" }\nstd = { path = \"../std\" }\n\n\
@@ -391,7 +480,10 @@ fn library(tree: &MemTree) -> ContentId {
         ("panic_unwind/Cargo.toml", panic_unwind.as_bytes()),
         ("panic_unwind/src/lib.rs", lib),
         ("std/Cargo.toml", std.as_bytes()),
-        ("std/build.rs", b"fn main() {\n    println!(\"cargo:rustc-cfg=backtrace_in_libstd\");\n}\n".as_slice()),
+        (
+            "std/build.rs",
+            b"fn main() {\n    println!(\"cargo:rustc-cfg=backtrace_in_libstd\");\n}\n".as_slice(),
+        ),
         ("std/src/lib.rs", b"".as_slice()),
         ("proc_macro/Cargo.toml", proc_macro.as_bytes()),
         ("proc_macro/src/lib.rs", lib),
@@ -425,14 +517,21 @@ fn setup() -> (Database, Arc<MemTree>, ContentId) {
     RUNS.with(|it| it.set(0));
     let tree = Arc::new(MemTree::default());
     let root = library(&tree);
-    let mut db = Database::new(blaze_query::Config { tree: Some(tree.clone()), dir: None, tags: 0 });
+    let mut db =
+        Database::new(blaze_query::Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     crate::query::register(&mut db);
     (db, tree, root)
 }
 
 fn project(db: &Database, tree: &MemTree, name: &str) -> blaze_vfs::ViewId {
-    let manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
-    db.open(View { root: tree.root(&[("Cargo.toml", manifest.as_bytes()), ("src/main.rs", b"fn main() {}\n".as_slice())]) })
+    let manifest =
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    db.open(View {
+        root: tree.root(&[
+            ("Cargo.toml", manifest.as_bytes()),
+            ("src/main.rs", b"fn main() {}\n".as_slice()),
+        ]),
+    })
 }
 
 fn planned(db: &Database, view: blaze_vfs::ViewId, key: &StdKey) -> StdPlanned {
@@ -447,12 +546,20 @@ fn ready(planned: StdPlanned) -> StdGraph {
 }
 
 fn units_of<'a>(graph: &'a StdGraph, name: &str) -> Vec<&'a Unit> {
-    let id = &graph.packages.iter().find(|it| it.name == name).unwrap_or_else(|| panic!("no package {name}")).id;
+    let id = &graph
+        .packages
+        .iter()
+        .find(|it| it.name == name)
+        .unwrap_or_else(|| panic!("no package {name}"))
+        .id;
     graph.units.iter().filter(|it| &it.pkg_id == id).collect()
 }
 
 fn lib_of<'a>(graph: &'a StdGraph, name: &str) -> &'a Unit {
-    units_of(graph, name).into_iter().find(|it| it.target.is_lib() && it.mode == Mode::Build).unwrap()
+    units_of(graph, name)
+        .into_iter()
+        .find(|it| it.target.is_lib() && it.mode == Mode::Build)
+        .unwrap()
 }
 
 #[test]
@@ -496,7 +603,13 @@ fn std_scripts_are_std_and_need_no_std() {
         assert!(unit.is_std, "{}", unit.target.name);
         for dep in &unit.dependencies {
             let it = &graph.units[dep.index];
-            assert!(it.target.is_custom_build(), "{} ({:?}) depends on {}", unit.target.name, unit.mode, it.target.name);
+            assert!(
+                it.target.is_custom_build(),
+                "{} ({:?}) depends on {}",
+                unit.target.name,
+                unit.mode,
+                it.target.name
+            );
         }
     }
 }
@@ -531,12 +644,16 @@ fn a_kept_standard_library_is_read_without_allocating() {
     let key = key(root);
     let graph = ready(planned(&db, view, &key));
     let pinned = db.pin();
-    let hit = blaze_alloc_count::assert_at_most(0, "a StdUnits hit", || pinned.get::<StdUnits>(view, &key).is_ok());
+    let hit = blaze_alloc_count::assert_at_most(0, "a StdUnits hit", || {
+        pinned.get::<StdUnits>(view, &key).is_ok()
+    });
     assert!(hit);
     assert_eq!(ready(pinned.get::<StdUnits>(view, &key).unwrap().get()), graph);
     assert_eq!(RUNS.with(|it| it.get()), 1);
     // Its key's ID is `StdKey::id`, made without the encoding's buffer once the thread has one.
-    let id = blaze_alloc_count::assert_at_most(0, "a std key's ID", || <StdUnits as blaze_query::Query>::input(&key));
+    let id = blaze_alloc_count::assert_at_most(0, "a std key's ID", || {
+        <StdUnits as blaze_query::Query>::input(&key)
+    });
     assert_eq!(id, key.id());
 }
 
@@ -545,9 +662,13 @@ fn a_standard_library_plan_says_what_the_daemon_runs_it_by() {
     let (db, tree, root) = setup();
     let view = project(&db, &tree, "a");
     let graph = ready(planned(&db, view, &key(root)));
-    assert!(graph.plans.iter().all(|it| !it.unsandboxed && it.runner.is_empty()), "nothing of library/ runs outside");
+    assert!(
+        graph.plans.iter().all(|it| !it.unsandboxed && it.runner.is_empty()),
+        "nothing of library/ runs outside"
+    );
     assert!(graph.packages.iter().all(|it| it.default_run.is_none()));
-    let std_lib = graph.units.iter().position(|it| std::ptr::eq(it, lib_of(&graph, "std"))).unwrap();
+    let std_lib =
+        graph.units.iter().position(|it| std::ptr::eq(it, lib_of(&graph, "std"))).unwrap();
     assert!(graph.plans[std_lib].harness);
 }
 
@@ -563,7 +684,8 @@ fn what_the_target_cannot_do_is_refused() {
     assert!(failed(&wasm).contains("panic=unwind"));
     let unknown = StdKey { triple: "riscv64gc-unknown-plan9".to_owned(), ..key(root) };
     assert!(failed(&unknown).contains("riscv64gc-unknown-plan9"));
-    let custom = StdKey { profile: "fast".to_owned(), profile_root: "fast".to_owned(), ..key(root) };
+    let custom =
+        StdKey { profile: "fast".to_owned(), profile_root: "fast".to_owned(), ..key(root) };
     assert!(failed(&custom).contains("fast"));
     let none = StdKey { crates: Vec::new(), ..key(root) };
     assert!(failed(&none).contains("no crate"));

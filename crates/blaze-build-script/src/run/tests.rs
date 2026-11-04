@@ -112,7 +112,8 @@ fn a_script_that_fails() {
 #[test]
 fn a_script_that_logs_an_error() {
     let unit = package("logs");
-    let failed = judged(&unit, exited(0), b"cargo::warning=foo\ncargo::error=bar\n", b"").unwrap_err();
+    let failed =
+        judged(&unit, exited(0), b"cargo::warning=foo\ncargo::error=bar\n", b"").unwrap_err();
     assert_eq!(failed.error.0, "build script logged errors");
     assert_eq!(
         failed.log_messages,
@@ -154,8 +155,16 @@ fn a_run_in_cargos_second_layout() {
 #[test]
 fn what_is_logged_is_read_as_the_lossy_lines_have_it() {
     let pieces: [&[u8]; 10] = [
-        b"cargo::error=", b"cargo:warning=", b"cargo::warning=", b"cargo:rustc-cfg=x", b"\n",
-        b"\r\n", b"\r", b"a b", b"\xff\xfe", "é".as_bytes(),
+        b"cargo::error=",
+        b"cargo:warning=",
+        b"cargo::warning=",
+        b"cargo:rustc-cfg=x",
+        b"\n",
+        b"\r\n",
+        b"\r",
+        b"a b",
+        b"\xff\xfe",
+        "é".as_bytes(),
     ];
     let model = |stdout: &[u8]| -> Vec<(Severity, String)> {
         String::from_utf8_lossy(stdout)
@@ -204,12 +213,14 @@ fn judged_from_the_bytes() {
             for stdout in outputs {
                 let cx = Context::of(&unit, &[]);
                 let judged = judge(&unit, &cx, status, stdout, b"err\n");
-                let logs_error = stdout.starts_with(b"cargo::error") || stdout.windows(14).any(|it| it == b"\ncargo::error=");
+                let logs_error = stdout.starts_with(b"cargo::error")
+                    || stdout.windows(14).any(|it| it == b"\ncargo::error=");
                 if !status.success() || logs_error {
                     let failed = judged.unwrap_err();
                     assert_eq!(failed.log_messages, logged(stdout), "{status} {stdout:?}");
                 } else {
-                    let parsed = output::parse(stdout, &cx).map_err(|error| Failed { error, log_messages: Vec::new() });
+                    let parsed = output::parse(stdout, &cx)
+                        .map_err(|error| Failed { error, log_messages: Vec::new() });
                     assert_eq!(judged, parsed, "{status} {stdout:?}");
                 }
             }

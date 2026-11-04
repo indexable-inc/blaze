@@ -141,7 +141,12 @@ pub(super) fn forces_unstable(db: &Db, krate: Crate) -> bool {
 /// the call's span; here it is that of the call's first token, or the macro whose expansion the
 /// call is in. A call in a macro's argument is allowed when either macro allows it, where rustc
 /// asks only the one whose tokens it is.
-pub(super) fn allows_unstable(db: &Db, owner: InferBodyId<'_>, at: MirSpan, feature: &Symbol) -> bool {
+pub(super) fn allows_unstable(
+    db: &Db,
+    owner: InferBodyId<'_>,
+    at: MirSpan,
+    feature: &Symbol,
+) -> bool {
     let source_map = ExpressionStore::with_source_map(db, owner.expression_store_owner(db)).1;
     let (file_id, range) = match at {
         MirSpan::ExprId(expr) => match source_map.expr_syntax(expr) {
@@ -190,9 +195,8 @@ fn lists<'t>(
             if meta.simple_name() == Some(name)
                 && let view::Meta::TokenTreeMeta(list) = meta
                 && let Some(tt) = list.token_tree()
-                && TokenTreeChildren::new(tt).any(|it| {
-                    matches!(it, NodeOrToken::Token(it) if it.text() == feature.as_str())
-                })
+                && TokenTreeChildren::new(tt)
+                    .any(|it| matches!(it, NodeOrToken::Token(it) if it.text() == feature.as_str()))
             {
                 return ControlFlow::Break(());
             }
@@ -214,7 +218,8 @@ struct FnConst {
 fn fn_const(db: &Db, func: FunctionId) -> FnConst {
     let krate = func.module(db).krate(db);
     let is_const = FunctionSignature::of(db, func).is_const();
-    let regular = || stability(db, AttrDefId::FunctionId(func).into()).filter(|it| it.is_unstable());
+    let regular =
+        || stability(db, AttrDefId::FunctionId(func).into()).filter(|it| it.is_unstable());
     let read = || {
         let source = func.lookup(db).source_view(db);
         read(source.value.attrs(), krate.cfg_options(db))

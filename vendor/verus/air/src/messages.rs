@@ -15,7 +15,7 @@ pub trait MessageInterface {
     }
     fn bare(&self, level: MessageLevel, notes: &str) -> ArcDynMessage;
     fn unexpected_solver_version(&self, solver: &str, expected: &str, found: &str)
-    -> ArcDynMessage;
+        -> ArcDynMessage;
     fn get_note<'b>(&self, message: &'b ArcDynMessage) -> &'b str;
     fn from_labels(&self, labels: &Vec<ArcDynMessageLabel>) -> ArcDynMessage;
     fn append_labels(

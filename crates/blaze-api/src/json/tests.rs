@@ -37,9 +37,10 @@ fn a_request_is_one_line_of_its_envelope() {
     let line = request(&Envelope::new(3, Request::Cancel { id: 2 }));
     let value: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(value, json!({ "schema": SCHEMA, "id": 3, "body": { "Cancel": { "id": 2 } } }));
-    assert_eq!(request(&Envelope::new(1, Request::Status)), format!(
-        r#"{{"schema":{SCHEMA},"id":1,"body":"Status"}}"#
-    ));
+    assert_eq!(
+        request(&Envelope::new(1, Request::Status)),
+        format!(r#"{{"schema":{SCHEMA},"id":1,"body":"Status"}}"#)
+    );
 }
 
 #[test]
@@ -54,7 +55,8 @@ fn done_renders_its_outcome() {
 /// across one step into the next.
 #[test]
 fn escapes_are_the_bytes_serde_json_wrote() {
-    let every: String = (0u8..0x80).map(char::from).chain(['\u{e9}', '\u{2028}', '\u{1f525}']).collect();
+    let every: String =
+        (0u8..0x80).map(char::from).chain(['\u{e9}', '\u{2028}', '\u{1f525}']).collect();
     let mut texts = vec![every.clone()];
     for c in every.chars() {
         for len in [1, 15, 16, 17, 31, 32, 33, 64] {

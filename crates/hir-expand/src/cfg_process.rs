@@ -2,7 +2,7 @@
 use std::ops::ControlFlow;
 
 use ::tt::TextRange;
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use cfg::CfgExpr;
 use parser::T;

@@ -40,7 +40,10 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Exp
             GenericDefId::AdtId(adt_id) => match adt_id {
                 crate::AdtId::StructId(struct_id) => {
                     let (signature, source_map) = StructSignature::with_source_map(&db, struct_id);
-                    crate::expr_store::persist::assert_store_round_trip(&signature.store, source_map);
+                    crate::expr_store::persist::assert_store_round_trip(
+                        &signature.store,
+                        source_map,
+                    );
                     out += &print_struct(
                         &db,
                         struct_id,

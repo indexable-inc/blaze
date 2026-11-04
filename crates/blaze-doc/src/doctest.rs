@@ -48,7 +48,8 @@ pub fn examples(db: &Db, krate: hir::Crate) -> Vec<Example> {
     // alloc: once a doctest crate, the target's features
     let features = krate.cfg(db).get_cfg_values("target_feature").cloned().collect();
     // alloc: once a doctest crate, the examples found and the attributes on the walk's path
-    let mut found = Found { db, examples: Vec::new(), seen: Vec::new(), attrs: Vec::new(), features };
+    let mut found =
+        Found { db, examples: Vec::new(), seen: Vec::new(), attrs: Vec::new(), features };
     found.module(krate.root_module(db), "");
     found.examples
 }
@@ -221,7 +222,9 @@ impl Found<'_> {
             let (file, line) = match place(db, docs, block.start) {
                 Some(it) => it,
                 None => match start {
-                    Some((file, first)) => (file, first + text[..block.start].matches('\n').count()),
+                    Some((file, first)) => {
+                        (file, first + text[..block.start].matches('\n').count())
+                    }
                     // alloc: an example with no file, once
                     None => (String::new(), 1 + text[..block.start].matches('\n').count()),
                 },
@@ -339,9 +342,14 @@ impl OfTheCrate {
         let parse = syntax::SourceFile::parse(root, Edition::CURRENT);
         let mut of_the_crate = OfTheCrate::default();
         // `test(..)` directly inside `doc(..)` of an inner attribute of the file itself.
-        let inner = parse.root().children().filter_map(ast::Attr::cast).filter(|it| it.excl_token().is_some());
+        let inner = parse
+            .root()
+            .children()
+            .filter_map(ast::Attr::cast)
+            .filter(|it| it.excl_token().is_some());
         for attr in inner {
-            let trees = attr.syntax().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+            let trees =
+                attr.syntax().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
             for tree in trees {
                 let outer = tree.parent().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
                 let in_doc = outer.is_some_and(|it| before(it) == Some("doc"));
@@ -397,7 +405,8 @@ impl Parts {
             .filter(|it| it.syntax().text_range().end() == whole)
             .and_then(|it| it.body())
             .and_then(|it| it.stmt_list());
-        let invalid = || Parts { everything_else: code.to_owned(), invalid: true, ..Parts::default() };
+        let invalid =
+            || Parts { everything_else: code.to_owned(), invalid: true, ..Parts::default() };
         let Some(body) = body.filter(|_| parse.errors().is_empty()) else { return invalid() };
         let mut parts = Parts::default();
         let mut taken = 0;
@@ -411,7 +420,9 @@ impl Parts {
                 syntax::NodeOrToken::Token(it) if it.kind() == SyntaxKind::SEMICOLON => {
                     non_items = true;
                     let (start, end) = (at(it.text_range().start()), at(it.text_range().end()));
-                    if parts.everything_else.is_empty() && (!parts.module_attrs.is_empty() || !parts.crate_attrs.is_empty()) {
+                    if parts.everything_else.is_empty()
+                        && (!parts.module_attrs.is_empty() || !parts.crate_attrs.is_empty())
+                    {
                         parts.crates.push_str(&code[taken..start]);
                         taken = start;
                     }
@@ -429,10 +440,15 @@ impl Parts {
                 let lint = path.is_some_and(|it| LINTS.contains(&it));
                 // `allow(internal_features)` is its crate's, as rustdoc has it.
                 let internal = path == Some("allow") && {
-                    let mut words = attr.syntax().descendants_with_tokens().filter_map(|it| it.into_token());
+                    let mut words =
+                        attr.syntax().descendants_with_tokens().filter_map(|it| it.into_token());
                     words.any(|it| matches!(it.text(), "internal_features" | "incomplete_features"))
                 };
-                let into = if lint && !internal { &mut parts.module_attrs } else { &mut parts.crate_attrs };
+                let into = if lint && !internal {
+                    &mut parts.module_attrs
+                } else {
+                    &mut parts.crate_attrs
+                };
                 into.push_str(&code[taken..end]);
                 taken = end;
                 continue;
@@ -442,12 +458,17 @@ impl Parts {
             }
             match statement(node) {
                 Statement::Item => {
-                    parts.has_main |= ast::Fn::cast(node).is_some_and(|it| it.name().is_some_and(|it| it.text() == "main"));
+                    parts.has_main |= ast::Fn::cast(node)
+                        .is_some_and(|it| it.name().is_some_and(|it| it.text() == "main"));
                 }
-                Statement::MacroCall(call) => parts.has_main |= !parts.has_main && writes_main(call),
+                Statement::MacroCall(call) => {
+                    parts.has_main |= !parts.has_main && writes_main(call)
+                }
                 Statement::Other => non_items = true,
             }
-            if parts.everything_else.is_empty() && (!parts.module_attrs.is_empty() || !parts.crate_attrs.is_empty()) {
+            if parts.everything_else.is_empty()
+                && (!parts.module_attrs.is_empty() || !parts.crate_attrs.is_empty())
+            {
                 parts.crates.push_str(&code[taken..start]);
                 taken = start;
             }
@@ -455,8 +476,9 @@ impl Parts {
             taken = end;
             match ast::ExternCrate::cast(node) {
                 Some(it) => {
-                    parts.has_extern_crate |=
-                        it.name_ref().is_some_and(|name| name.text().trim_start_matches("r#") == crate_name);
+                    parts.has_extern_crate |= it
+                        .name_ref()
+                        .is_some_and(|name| name.text().trim_start_matches("r#") == crate_name);
                     parts.crates.push_str(text);
                 }
                 None => {
@@ -514,7 +536,11 @@ fn statement(node: ast::Node<'_>) -> Statement<'_> {
 /// their outermost ones: rustdoc's guess at a `main` a macro writes (rust-lang/rust#56898).
 fn writes_main(call: ast::MacroCall<'_>) -> bool {
     let Some(tree) = call.token_tree() else { return false };
-    let mut children = tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect::<Vec<_>>();
+    let mut children = tree
+        .syntax()
+        .children_with_tokens()
+        .filter(|it| !it.kind().is_trivia())
+        .collect::<Vec<_>>();
     // The group's own delimiters.
     if children.len() >= 2 {
         children.remove(0);
@@ -523,7 +549,8 @@ fn writes_main(call: ast::MacroCall<'_>) -> bool {
     children.windows(3).any(|it| {
         let word = |at: usize| it[at].as_token().map(|it| it.text());
         let parens = it[2].as_node().is_some_and(|it| {
-            it.kind() == SyntaxKind::TOKEN_TREE && it.first_token().is_some_and(|it| it.kind() == SyntaxKind::L_PAREN)
+            it.kind() == SyntaxKind::TOKEN_TREE
+                && it.first_token().is_some_and(|it| it.kind() == SyntaxKind::L_PAREN)
         });
         word(0) == Some("fn") && word(1) == Some("main") && parens
     })
@@ -580,7 +607,12 @@ impl OfLibrary {
 
 /// The programs of `examples`, built for `triple`, the library being `of`, its package at
 /// `package_dir`, which the names of the files are from.
-pub fn programs(of: &OfLibrary, examples: &[Example], triple: &str, package_dir: &str) -> Vec<Program> {
+pub fn programs(
+    of: &OfLibrary,
+    examples: &[Example],
+    triple: &str,
+    package_dir: &str,
+) -> Vec<Program> {
     // alloc: once a library's doctests, the number of each file and line
     let mut seen: Vec<(String, usize, usize)> = Vec::new();
     examples
@@ -588,18 +620,20 @@ pub fn programs(of: &OfLibrary, examples: &[Example], triple: &str, package_dir:
         .map(|example| {
             // alloc: an example's file name, once per example
             let file = shown_file(&example.file, package_dir).to_owned();
-            let flat: String = file.chars().map(|it| if it.is_ascii_alphanumeric() { it } else { '_' }).collect();
-            let number = match seen.iter_mut().find(|(it, line, _)| *it == flat && *line == example.line) {
-                Some((_, _, number)) => {
-                    *number += 1;
-                    *number
-                }
-                None => {
-                    // clone: the key of a file and line, once each
-                    seen.push((flat.clone(), example.line, 0));
-                    0
-                }
-            };
+            let flat: String =
+                file.chars().map(|it| if it.is_ascii_alphanumeric() { it } else { '_' }).collect();
+            let number =
+                match seen.iter_mut().find(|(it, line, _)| *it == flat && *line == example.line) {
+                    Some((_, _, number)) => {
+                        *number += 1;
+                        *number
+                    }
+                    None => {
+                        // clone: the key of a file and line, once each
+                        seen.push((flat.clone(), example.line, 0));
+                        0
+                    }
+                };
             let id = format!("{flat}_{}_{number}", example.line);
             Program::of(of, example, test_name(example, package_dir), id, file, triple)
         })
@@ -635,7 +669,14 @@ fn edition_of(year: &str) -> Option<Edition> {
 }
 
 impl Program {
-    pub(crate) fn of(of: &OfLibrary, example: &Example, name: String, id: String, file: String, triple: &str) -> Program {
+    pub(crate) fn of(
+        of: &OfLibrary,
+        example: &Example,
+        name: String,
+        id: String,
+        file: String,
+        triple: &str,
+    ) -> Program {
         let lang = &example.lang;
         // rustdoc's `LangString::parse` reads an edition it does not know as none.
         let edition = lang.edition.as_deref().and_then(edition_of).unwrap_or(of.edition);
@@ -680,11 +721,25 @@ struct Pieces<'a> {
 }
 
 impl<'a> Pieces<'a> {
-    fn of(of: &OfLibrary, crate_attrs: &[String], parts: &'a Parts, code: &'a str, id: &str, test_harness: bool) -> Pieces<'a> {
+    fn of(
+        of: &OfLibrary,
+        crate_attrs: &[String],
+        parts: &'a Parts,
+        code: &'a str,
+        id: &str,
+        test_harness: bool,
+    ) -> Pieces<'a> {
         if parts.invalid {
             // alloc: none, an empty list
             let attrs = Vec::new();
-            return Pieces { attrs, prefix: String::new(), inject: None, wrap: None, rest: code, line_offset: 0 };
+            return Pieces {
+                attrs,
+                prefix: String::new(),
+                inject: None,
+                wrap: None,
+                rest: code,
+                line_offset: 0,
+            };
         }
         // alloc: an example's few attributes, once
         let attrs: Vec<String> = match crate_attrs.is_empty() {
@@ -702,11 +757,15 @@ impl<'a> Pieces<'a> {
             }
         }
         let name = of.name.as_str();
-        let inject = (!parts.has_extern_crate && !of.of_the_crate.no_crate_inject && name != "std" && code.contains(name))
-            .then(|| format!("#[allow(unused_extern_crates)]\nextern crate r#{name};\n"));
+        let inject = (!parts.has_extern_crate
+            && !of.of_the_crate.no_crate_inject
+            && name != "std"
+            && code.contains(name))
+        .then(|| format!("#[allow(unused_extern_crates)]\nextern crate r#{name};\n"));
         line_offset += usize::from(inject.is_some());
         let rest = parts.everything_else.trim();
-        let no_std = attrs.iter().any(|it| it.contains("![no_std]")) || prefix.contains("![no_std]");
+        let no_std =
+            attrs.iter().any(|it| it.contains("![no_std]")) || prefix.contains("![no_std]");
         let wrap = (!test_harness && !parts.has_main && !no_std).then(|| {
             let inner = format!("_doctest_main_{id}");
             match rest.ends_with("(())") {
@@ -731,7 +790,8 @@ impl<'a> Pieces<'a> {
         }
         out.push_str(&self.prefix);
         out.push_str(self.inject.as_deref().unwrap_or(""));
-        let (open, close) = self.wrap.as_ref().map_or(("", ""), |(open, close)| (open.as_str(), close.as_str()));
+        let (open, close) =
+            self.wrap.as_ref().map_or(("", ""), |(open, close)| (open.as_str(), close.as_str()));
         _ = write!(out, "{open}{}{close}", self.rest);
         out
     }
@@ -746,12 +806,19 @@ impl<'a> Pieces<'a> {
         let open = self.wrap.as_ref().map_or("", |(open, _)| open.as_str());
         let close = self.wrap.as_ref().map_or("", |(_, close)| close.as_str());
         let inject = self.inject.as_deref().unwrap_or("");
-        let rustdoc_before =
-            self.attrs.len() + self.prefix.matches('\n').count() + inject.matches('\n').count() + open.matches('\n').count();
+        let rustdoc_before = self.attrs.len()
+            + self.prefix.matches('\n').count()
+            + inject.matches('\n').count()
+            + open.matches('\n').count();
         // alloc: an example's program, once
         let mut before = self.attrs.join(" ");
         let between = [inject.trim_end().replace('\n', " "), open.trim_end().to_owned()];
-        let between = between.iter().filter(|it| !it.is_empty()).map(String::as_str).collect::<Vec<_>>().join(" ");
+        let between = between
+            .iter()
+            .filter(|it| !it.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
         match self.prefix.is_empty() {
             false => {
                 if !before.is_empty() {
@@ -776,7 +843,8 @@ impl<'a> Pieces<'a> {
         // `line` is at least 1, and of the lines rustdoc writes before the rest `line_offset`
         // takes back all but those of the example's own prefix and one of its `extern crate`'s,
         // while this writes at most one more than the prefix's: so this is not negative.
-        let pad = (rustdoc_before + line).saturating_sub(self.line_offset + before.matches('\n').count());
+        let pad =
+            (rustdoc_before + line).saturating_sub(self.line_offset + before.matches('\n').count());
         let mut out = "\n".repeat(pad);
         _ = write!(out, "{before}{}{close}", self.rest);
         out
@@ -787,7 +855,9 @@ impl<'a> Pieces<'a> {
 pub enum Built<'a> {
     Built,
     /// The compiler refused it, rendering `errors`, each with its code as `error[E0308]`.
-    Refused { errors: &'a str },
+    Refused {
+        errors: &'a str,
+    },
 }
 
 /// rustdoc's verdict on an example once it is built (`run_test`).
@@ -807,16 +877,25 @@ impl Program {
     pub fn after_build(&self, built: Built<'_>) -> Verdict {
         // alloc: a verdict's words, once per example
         match (built, self.compile_fail) {
-            (Built::Built, true) => Verdict::Failed("Test compiled successfully, but it's marked `compile_fail`.".to_owned()),
+            (Built::Built, true) => Verdict::Failed(
+                "Test compiled successfully, but it's marked `compile_fail`.".to_owned(),
+            ),
             (Built::Refused { errors }, true) => {
-                let missing: Vec<&String> =
-                    self.error_codes.iter().filter(|code| !errors.contains(&format!("error[{code}]"))).collect();
+                let missing: Vec<&String> = self
+                    .error_codes
+                    .iter()
+                    .filter(|code| !errors.contains(&format!("error[{code}]")))
+                    .collect();
                 match missing.is_empty() {
                     true => Verdict::Passed,
-                    false => Verdict::Failed(format!("{errors}\nSome expected error codes were not found: {missing:?}")),
+                    false => Verdict::Failed(format!(
+                        "{errors}\nSome expected error codes were not found: {missing:?}"
+                    )),
                 }
             }
-            (Built::Refused { errors }, false) => Verdict::Failed(format!("{errors}\nCouldn't compile the test.")),
+            (Built::Refused { errors }, false) => {
+                Verdict::Failed(format!("{errors}\nCouldn't compile the test."))
+            }
             (Built::Built, false) if self.no_run => Verdict::Passed,
             (Built::Built, false) => Verdict::Run,
         }
@@ -860,7 +939,9 @@ pub fn runner(programs: &[Program]) -> String {
             it.name, it.id, it.ignore, it.no_run, it.should_panic, it.compile_fail
         );
     }
-    format!("{RUNNER_HEAD}const TESTS: &[(&str, &str, bool, bool, bool, bool)] = &[\n{tests}];\n{RUNNER_BODY}")
+    format!(
+        "{RUNNER_HEAD}const TESTS: &[(&str, &str, bool, bool, bool, bool)] = &[\n{tests}];\n{RUNNER_BODY}"
+    )
 }
 
 const RUNNER_HEAD: &str = "\
@@ -986,9 +1067,13 @@ mod tests {
 
     #[test]
     fn blocks_fenced_and_indented() {
-        let found = blocks("Text.\n\n```no_run\nlet a = 1;\n```\n\n    let b = 2;\n\n~~~text\nc\n~~~\n");
+        let found =
+            blocks("Text.\n\n```no_run\nlet a = 1;\n```\n\n    let b = 2;\n\n~~~text\nc\n~~~\n");
         let found: Vec<_> = found.iter().map(|it| (it.lang.as_deref(), it.code.as_str())).collect();
-        assert_eq!(found, [(Some("no_run"), "let a = 1;\n"), (None, "let b = 2;\n"), (Some("text"), "c\n")]);
+        assert_eq!(
+            found,
+            [(Some("no_run"), "let a = 1;\n"), (None, "let b = 2;\n"), (Some("text"), "c\n")]
+        );
     }
 
     #[test]
@@ -1005,13 +1090,16 @@ mod tests {
 
     #[test]
     fn hidden_lines_are_code() {
-        let code: Vec<_> = "# let a = 1;\n  #\n##[derive(Debug)]\n#[x]\nb".lines().map(tested_line).collect();
+        let code: Vec<_> =
+            "# let a = 1;\n  #\n##[derive(Debug)]\n#[x]\nb".lines().map(tested_line).collect();
         assert_eq!(code.join("\n"), "let a = 1;\n\n#[derive(Debug)]\n#[x]\nb");
     }
 
     #[test]
     fn the_crates_test_attributes() {
-        let read = OfTheCrate::read("#![doc(test(attr(deny(warnings), allow(dead_code)), no_crate_inject))]\nfn f() {}");
+        let read = OfTheCrate::read(
+            "#![doc(test(attr(deny(warnings), allow(dead_code)), no_crate_inject))]\nfn f() {}",
+        );
         assert!(read.no_crate_inject);
         assert_eq!(OfTheCrate::read("#![doc = \"test\"]"), OfTheCrate::default());
     }
@@ -1022,7 +1110,9 @@ mod tests {
 
     #[test]
     fn parts_of_an_example() {
-        let it = parts("#![allow(dead_code)]\n#![feature(x)]\n\n#[macro_use] extern crate app;\nfn main() {}\n");
+        let it = parts(
+            "#![allow(dead_code)]\n#![feature(x)]\n\n#[macro_use] extern crate app;\nfn main() {}\n",
+        );
         assert_eq!(it.module_attrs, "#![allow(dead_code)]");
         assert_eq!(it.crate_attrs, "\n#![feature(x)]");
         // Until the first statement that is not an `extern crate`, the text between statements
@@ -1031,7 +1121,10 @@ mod tests {
         assert_eq!(it.everything_else, "fn main() {}");
         assert!(it.has_extern_crate && it.has_main);
         let it = parts("#![allow(internal_features)]");
-        assert_eq!((it.crate_attrs.as_str(), it.module_attrs.as_str()), ("#![allow(internal_features)]", ""));
+        assert_eq!(
+            (it.crate_attrs.as_str(), it.module_attrs.as_str()),
+            ("#![allow(internal_features)]", "")
+        );
         assert!(parts("fn main() {").invalid);
         assert!(parts("extern crate app as other;").has_extern_crate);
         assert!(!parts("extern crate other as app;").has_extern_crate);
@@ -1064,14 +1157,19 @@ mod tests {
     }
 
     fn library(no_crate_inject: bool) -> OfLibrary {
-        OfLibrary { name: "app".to_owned(), edition: Edition::Edition2021, of_the_crate: OfTheCrate { no_crate_inject } }
+        OfLibrary {
+            name: "app".to_owned(),
+            edition: Edition::Edition2021,
+            of_the_crate: OfTheCrate { no_crate_inject },
+        }
     }
 
     /// The program rustdoc writes for `example`, with the id `id`.
     fn rustdoc(of: &OfLibrary, example: &Example, id: &str) -> String {
         let edition = example.lang.edition.as_deref().and_then(edition_of).unwrap_or(of.edition);
         let parts = Parts::of(&example.code, &of.name, edition);
-        Pieces::of(of, &example.attrs, &parts, &example.code, id, example.lang.test_harness).rustdoc()
+        Pieces::of(of, &example.attrs, &parts, &example.code, id, example.lang.test_harness)
+            .rustdoc()
     }
 
     /// The line `needle` is first on in `text`, from 1.
@@ -1083,14 +1181,28 @@ mod tests {
     fn programs_as_rustdoc_writes_them() {
         let examples = [
             example("", 1, "", "assert_eq!(app::double(2), 4);"),
-            example("double", 5, "no_run", "let n: u32 = \"7\".parse()?;\nOk::<(), std::num::ParseIntError>(())"),
+            example(
+                "double",
+                5,
+                "no_run",
+                "let n: u32 = \"7\".parse()?;\nOk::<(), std::num::ParseIntError>(())",
+            ),
             example("double", 5, "should_panic,edition2018", "fn main() { panic!() }"),
-            example("Counter<T> :: bump", 12, "ignore-x86_64,compile_fail,E0308", "#![no_std]\nlet x: u8 = \"\";"),
+            example(
+                "Counter<T> :: bump",
+                12,
+                "ignore-x86_64,compile_fail,E0308",
+                "#![no_std]\nlet x: u8 = \"\";",
+            ),
             example("Counter", 20, "test_harness", "#[test]\nfn t() {}"),
         ];
         let lib = library(false);
         let programs = programs(&lib, &examples, "x86_64-unknown-linux-gnu", "/w/app/");
-        let rustdoc: Vec<_> = examples.iter().zip(&programs).map(|(it, program)| rustdoc(&lib, it, &program.id)).collect();
+        let rustdoc: Vec<_> = examples
+            .iter()
+            .zip(&programs)
+            .map(|(it, program)| rustdoc(&lib, it, &program.id))
+            .collect();
         let names: Vec<_> = programs.iter().map(|it| (it.name.as_str(), it.id.as_str())).collect();
         assert_eq!(
             names,
@@ -1125,21 +1237,39 @@ mod tests {
         assert_eq!(rustdoc[2], "#![allow(unused)]\nfn main() { panic!() }");
         assert!(programs[2].should_panic && programs[2].edition == Edition::Edition2018);
         let failing = &programs[3];
-        assert!(failing.ignore && failing.compile_fail && failing.no_run && failing.error_codes == ["E0308"]);
+        assert!(
+            failing.ignore
+                && failing.compile_fail
+                && failing.no_run
+                && failing.error_codes == ["E0308"]
+        );
         assert_eq!(rustdoc[3], "#![allow(unused)]\n#![no_std]\n\nlet x: u8 = \"\";");
         // rustdoc's verdicts once built.
         let refused = |errors| Built::Refused { errors };
         assert_eq!(programs[0].after_build(Built::Built), Verdict::Run);
         assert_eq!(programs[1].after_build(Built::Built), Verdict::Passed);
-        assert!(matches!(programs[0].after_build(refused("error[E0425]")), Verdict::Failed(it) if it.ends_with("Couldn't compile the test.")));
+        assert!(
+            matches!(programs[0].after_build(refused("error[E0425]")), Verdict::Failed(it) if it.ends_with("Couldn't compile the test."))
+        );
         assert_eq!(failing.after_build(refused("error[E0308]: mismatched types")), Verdict::Passed);
-        assert!(matches!(failing.after_build(refused("error[E0425]")), Verdict::Failed(it) if it.ends_with("[\"E0308\"]")));
+        assert!(
+            matches!(failing.after_build(refused("error[E0425]")), Verdict::Failed(it) if it.ends_with("[\"E0308\"]"))
+        );
         assert!(matches!(failing.after_build(Built::Built), Verdict::Failed(_)));
-        assert_eq!(verdict_line(failing, &Verdict::Failed("a\tb\nc\\".to_owned())), "src_lib_rs_12_0\tfail\ta\\tb\\nc\\\\\n");
+        assert_eq!(
+            verdict_line(failing, &Verdict::Failed("a\tb\nc\\".to_owned())),
+            "src_lib_rs_12_0\tfail\ta\\tb\\nc\\\\\n"
+        );
         let runner = runner(&programs);
-        assert!(runner.find("src/lib.rs - (line 1)").unwrap() < runner.find("src/lib.rs - Counter (line 20)").unwrap());
+        assert!(
+            runner.find("src/lib.rs - (line 1)").unwrap()
+                < runner.find("src/lib.rs - Counter (line 20)").unwrap()
+        );
         // Where the daemon puts the examples is where the runner looks.
-        assert!(runner.contains(&format!("dir.push({DIR_SUFFIX:?})")) && runner.contains(&format!("{VERDICTS:?}")));
+        assert!(
+            runner.contains(&format!("dir.push({DIR_SUFFIX:?})"))
+                && runner.contains(&format!("{VERDICTS:?}"))
+        );
         assert!(programs[4].test_harness);
         assert_eq!(rustdoc[4], "#![allow(unused)]\n#[test]\nfn t() {}");
         // Each example's rest is on the line rustdoc has rustc show it at, its own line moved
@@ -1204,10 +1334,15 @@ pub mod inner {
 }
 "#;
         let db = hir_expand::fixture::db(text).into_db();
-        let krate = hir::Crate::all(&db).into_iter().find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app")).unwrap();
+        let krate = hir::Crate::all(&db)
+            .into_iter()
+            .find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app"))
+            .unwrap();
         let found = examples(&db, krate);
-        let found: Vec<_> =
-            found.iter().map(|it| (it.item.as_str(), it.line, it.code.as_str(), it.lang.no_run, it.lang.ignore)).collect();
+        let found: Vec<_> = found
+            .iter()
+            .map(|it| (it.item.as_str(), it.line, it.code.as_str(), it.lang.no_run, it.lang.ignore))
+            .collect();
         assert_eq!(
             found,
             [
@@ -1259,7 +1394,10 @@ pub fn wide() {}
 pub fn narrow() {}
 "#;
         let db = hir_expand::fixture::db(text).into_db();
-        let krate = hir::Crate::all(&db).into_iter().find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app")).unwrap();
+        let krate = hir::Crate::all(&db)
+            .into_iter()
+            .find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app"))
+            .unwrap();
         let found = examples(&db, krate);
         let found: Vec<_> = found.iter().map(|it| (it.code.as_str(), it.attrs.join(" "))).collect();
         let found: Vec<_> = found.iter().map(|(code, attrs)| (*code, attrs.as_str())).collect();

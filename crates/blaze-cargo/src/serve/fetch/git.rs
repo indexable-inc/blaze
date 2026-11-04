@@ -28,7 +28,11 @@ use super::{Fetcher, failed};
 use crate::serve::work::{Source, SourceFile};
 use blaze_vfs::Bytes;
 
-pub(super) fn tree<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str) -> Result<Source, ApiError> {
+pub(super) fn tree<H: Http + 'static>(
+    fetcher: &Fetcher<H>,
+    fetch: &Fetch,
+    commit: &str,
+) -> Result<Source, ApiError> {
     let commit = commit.to_ascii_lowercase();
     let short = commit.get(..8).unwrap_or(&commit);
     let top = format!("Unable to update {}#{short}", fetch.url);
@@ -36,11 +40,16 @@ pub(super) fn tree<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commi
     Ok(Source { files, under: String::new() })
 }
 
-fn checkout<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str) -> anyhow::Result<Vec<SourceFile>> {
+fn checkout<H: Http + 'static>(
+    fetcher: &Fetcher<H>,
+    fetch: &Fetch,
+    commit: &str,
+) -> anyhow::Result<Vec<SourceFile>> {
     if !(matches!(commit.len(), 40 | 64) && commit.bytes().all(|it| it.is_ascii_hexdigit())) {
         bail!("the locked revision `{commit}` is not a full commit id");
     }
-    let url = url::Url::parse(&fetch.url).with_context(|| format!("invalid url `{}`", fetch.url))?;
+    let url =
+        url::Url::parse(&fetch.url).with_context(|| format!("invalid url `{}`", fetch.url))?;
     let id = SourceId::for_git(&url, GitReference::Rev(commit.to_owned()))?;
     let ident = id.git_ident();
     cargo_home(&fetch.at, &ident, commit)?;
@@ -76,9 +85,12 @@ impl Scratch {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("failed to clear `{}`", dir.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to clear `{}`", dir.display()));
+            }
         }
-        std::fs::create_dir_all(&dir).with_context(|| format!("failed to create `{}`", dir.display()))?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create `{}`", dir.display()))?;
         Ok(Scratch(dir))
     }
 }
@@ -95,7 +107,9 @@ impl Drop for Scratch {
 /// `ident` is the repository's and the short id names `commit`.
 pub(super) fn cargo_home<'a>(at: &'a str, ident: &str, commit: &str) -> anyhow::Result<&'a Path> {
     let shape = || {
-        format!("`{at}` is not a checkout as cargo keeps one, `$CARGO_HOME/git/checkouts/{ident}/<short id>`")
+        format!(
+            "`{at}` is not a checkout as cargo keeps one, `$CARGO_HOME/git/checkouts/{ident}/<short id>`"
+        )
     };
     let at = Path::new(at);
     let short = at.file_name().and_then(|it| it.to_str()).with_context(shape)?;
@@ -119,8 +133,8 @@ pub(super) fn read_tree(root: &Path, skip: impl Fn(&str) -> bool) -> anyhow::Res
     let mut files = Vec::new();
     let mut dirs = vec![(root.to_owned(), String::new())];
     while let Some((dir, under)) = dirs.pop() {
-        let listed =
-            std::fs::read_dir(&dir).with_context(|| format!("failed to read `{}`", dir.display()))?;
+        let listed = std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read `{}`", dir.display()))?;
         for entry in listed {
             let entry = entry.with_context(|| format!("failed to read `{}`", dir.display()))?;
             let at = entry.path();
@@ -143,8 +157,9 @@ pub(super) fn read_tree(root: &Path, skip: impl Fn(&str) -> bool) -> anyhow::Res
                 let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &link_bytes(target, &at)?);
                 files.push(SourceFile { path, bytes, mode: Mode::Symlink });
             } else if kind.is_file() {
-                let metadata =
-                    entry.metadata().with_context(|| format!("failed to read `{}`", at.display()))?;
+                let metadata = entry
+                    .metadata()
+                    .with_context(|| format!("failed to read `{}`", at.display()))?;
                 let bytes = SourceFile::read(&at, metadata.len())
                     .with_context(|| format!("failed to read `{}`", at.display()))?;
                 let mode = if is_executable(&metadata) { Mode::Executable } else { Mode::Regular };

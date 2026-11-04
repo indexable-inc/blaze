@@ -73,11 +73,7 @@ pub fn closure_is_const(db: &Db, closure: InternedClosureId<'_>) -> bool {
     closure_expr_is_const(db, owner.expression_store_owner(db), expr)
 }
 
-fn closure_expr_is_const(
-    db: &Db,
-    owner: ExpressionStoreOwnerId,
-    expr: ExprId,
-) -> bool {
+fn closure_expr_is_const(db: &Db, owner: ExpressionStoreOwnerId, expr: ExprId) -> bool {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner);
     let Ok(source) = source_map.expr_syntax(expr) else { return false };
     // The span of an expression in parentheses is the parentheses' (as rustc's).
@@ -251,10 +247,7 @@ pub fn const_call_error<'db>(
 
 /// The calls in `def`'s body that are not const, when the body is const. Bodies of closures that
 /// are not `const` are skipped (making such a closure is fine, calling it is not).
-pub fn non_const_calls<'db>(
-    db: &'db Db,
-    def: DefWithBodyId,
-) -> Vec<(ExprId, NonConst<'db>)> {
+pub fn non_const_calls<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(ExprId, NonConst<'db>)> {
     let Some(constness) = body_constness(db, def) else { return Vec::new() }; // alloc: empty
     let mut walk = Walk {
         db,

@@ -137,7 +137,13 @@ fn crate_named(db: &Db, name: &str) -> Crate {
     all_crates(db)
         .iter()
         .copied()
-        .find(|krate| krate.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+        .find(|krate| {
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == name)
+        })
         .unwrap_or_else(|| panic!("no crate `{name}` in the fixture"))
 }
 
@@ -163,7 +169,9 @@ fn binding_name(db: &Db, held: &Held) -> String {
 
 fn owner_name(db: &Db, held: &Held) -> String {
     match held.call.owner {
-        hir_def::DefWithBodyId::FunctionId(func) => FunctionSignature::of(db, func).name.as_str().to_owned(),
+        hir_def::DefWithBodyId::FunctionId(func) => {
+            FunctionSignature::of(db, func).name.as_str().to_owned()
+        }
         owner => panic!("the call is in a function, not {owner:?}"),
     }
 }
@@ -272,12 +280,19 @@ pub fn work(query: &Query) -> &dyn Work {
 "#,
         |db, found| {
             assert!(found.held.is_empty(), "{:?}", found.held);
-            let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
+            let [broken] = &*found.broken else {
+                panic!("one broken promise, not {:?}", found.broken)
+            };
             match broken.promise {
-                Promise::Dyn { method: Some(method), .. } => assert_eq!(fn_named(db, method), "run"),
+                Promise::Dyn { method: Some(method), .. } => {
+                    assert_eq!(fn_named(db, method), "run")
+                }
                 ref promise => panic!("the promise of `Work::run`, not {promise:?}"),
             }
-            assert_eq!(broken.path_said(), "`run` → `variance` → `fetch` → `get_or_run` → `suspend`");
+            assert_eq!(
+                broken.path_said(),
+                "`run` → `variance` → `fetch` → `get_or_run` → `suspend`"
+            );
         },
     );
 }
@@ -343,12 +358,18 @@ pub fn plain(db: &Db, plain: Plain) -> u32 {
 "#,
         |db, found| {
             assert!(found.broken.is_empty(), "{:?}", found.broken);
-            let mut held: Vec<(String, String, Why)> =
-                found.held.iter().map(|it| (owner_name(db, it), binding_name(db, it), it.why)).collect();
+            let mut held: Vec<(String, String, Why)> = found
+                .held
+                .iter()
+                .map(|it| (owner_name(db, it), binding_name(db, it), it.why))
+                .collect();
             held.sort_by(|a, b| a.0.cmp(&b.0));
             assert_eq!(
                 held,
-                [("borrowed".to_owned(), "local".to_owned(), Why::NotSend), ("counted".to_owned(), "count".to_owned(), Why::NotSend)],
+                [
+                    ("borrowed".to_owned(), "local".to_owned(), Why::NotSend),
+                    ("counted".to_owned(), "count".to_owned(), Why::NotSend)
+                ],
             );
         },
     );
@@ -380,7 +401,10 @@ pub fn quiet() -> u32 {
             let held = one_held(found);
             assert_eq!(owner_name(db, held), "run");
             assert_eq!(binding_name(db, held), "guard");
-            assert_eq!(held.path_said(), "a closure in `queries` → `variance` → `fetch` → `get_or_run` → `suspend`");
+            assert_eq!(
+                held.path_said(),
+                "a closure in `queries` → `variance` → `fetch` → `get_or_run` → `suspend`"
+            );
         },
     );
 }
@@ -424,9 +448,14 @@ pub fn loose(db: &Db) -> u32 {
 "#,
         |_, found| {
             assert!(found.held.is_empty(), "{:?}", found.held);
-            let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
+            let [broken] = &*found.broken else {
+                panic!("one broken promise, not {:?}", found.broken)
+            };
             assert_eq!(broken.promise, Promise::Pointer);
-            assert_eq!(broken.path_said(), "`wait` → `variance` → `fetch` → `get_or_run` → `suspend`");
+            assert_eq!(
+                broken.path_said(),
+                "`wait` → `variance` → `fetch` → `get_or_run` → `suspend`"
+            );
         },
     );
 }
@@ -485,7 +514,10 @@ pub fn held(db: &Db) -> u32 {
         |db, found| {
             let held = one_held(found);
             assert_eq!(owner_name(db, held), "held");
-            assert_eq!(held.path_said(), "`odd` → `even` → `variance` → `fetch` → `get_or_run` → `suspend`");
+            assert_eq!(
+                held.path_said(),
+                "`odd` → `even` → `variance` → `fetch` → `get_or_run` → `suspend`"
+            );
         },
     );
 }
@@ -515,7 +547,11 @@ pub fn f() -> u32 {
     let db = &db;
     blaze_query::db::attach(db, || {
         let krate = crate_named(db, "x");
-        assert_eq!(*roots(db, krate), Roots::default(), "no root and no error without `blaze_graph`");
+        assert_eq!(
+            *roots(db, krate),
+            Roots::default(),
+            "no root and no error without `blaze_graph`"
+        );
         nothing(suspend_check(db, krate));
     });
 }
@@ -548,10 +584,19 @@ pub fn f() -> u32 {
         assert_eq!((missing.krate, missing.missing), (crate_named(db, "blaze_graph"), "stack"));
         assert_eq!(unchecked(db, krate), found.unchecked, "the lints' reading is the check's");
         let said = Unchecked::MissingRoot(missing).said(db, krate);
-        assert!(said.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"), "{said}");
-        assert!(said.contains("that `blaze_graph` is of no version at `/blaze_graph.rs`"), "names which one: {said}");
+        assert!(
+            said.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"),
+            "{said}"
+        );
+        assert!(
+            said.contains("that `blaze_graph` is of no version at `/blaze_graph.rs`"),
+            "names which one: {said}"
+        );
         assert!(said.ends_with("the check of `x` stops"), "names the crate checked: {said}");
-        assert!(found.held.is_empty() && found.broken.is_empty(), "nothing is checked without the root");
+        assert!(
+            found.held.is_empty() && found.broken.is_empty(),
+            "nothing is checked without the root"
+        );
     });
 }
 
@@ -658,14 +703,23 @@ pub fn mixed(db: &Db) -> u32 {
         |db, found| {
             let krate = crate_named(db, "x");
             let owner = one_held(found).call.owner;
-            let [point] = &**suspend_points(db, krate, owner) else { panic!("one point in `mixed`") };
+            let [point] = &**suspend_points(db, krate, owner) else {
+                panic!("one point in `mixed`")
+            };
             let mut held: Vec<(String, Option<Why>)> = point
                 .held
                 .iter()
-                .filter_map(|it| it.binding.map(|binding| (Body::of(db, owner)[binding].name.as_str().to_owned(), it.why)))
+                .filter_map(|it| {
+                    it.binding.map(|binding| {
+                        (Body::of(db, owner)[binding].name.as_str().to_owned(), it.why)
+                    })
+                })
                 .collect();
             held.sort_by(|a, b| a.0.cmp(&b.0));
-            assert!(matches!(&*held, [(guard, Some(Why::MustNotSuspend(_))), (plain, None)] if guard == "guard" && plain == "plain"), "{held:?}");
+            assert!(
+                matches!(&*held, [(guard, Some(Why::MustNotSuspend(_))), (plain, None)] if guard == "guard" && plain == "plain"),
+                "{held:?}"
+            );
             assert_eq!(
                 may_suspend_at(db, krate, point.call).as_deref(),
                 Some("`variance` → `fetch` → `get_or_run` → `suspend`"),
@@ -691,11 +745,15 @@ pub fn calm() -> u32 {
 }
 "#,
         |db, _| {
-            let names: Vec<String> = on_fiber(db, crate_named(db, "x")).iter().map(|&it| fn_named(db, it)).collect();
+            let names: Vec<String> =
+                on_fiber(db, crate_named(db, "x")).iter().map(|&it| fn_named(db, it)).collect();
             for name in ["waits", "variance", "fetch", "get_or_run"] {
                 assert!(names.iter().any(|it| it == name), "`{name}` runs on a fiber: {names:?}");
             }
-            assert!(!names.iter().any(|it| it == "calm"), "`calm` is not said to run on a fiber: {names:?}");
+            assert!(
+                !names.iter().any(|it| it == "calm"),
+                "`calm` is not said to run on a fiber: {names:?}"
+            );
         },
     );
 }

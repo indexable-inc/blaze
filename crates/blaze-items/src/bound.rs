@@ -28,7 +28,6 @@ use std::{alloc::Allocator, fmt::Write as _};
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
@@ -41,6 +40,7 @@ use hir_ty::{
     traits::ParamEnvAndCrate,
 };
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, IntoKind as _};
+use std::alloc::Global;
 
 use crate::{ItemId, ItemKey, Unhashable, hash, index, key};
 
@@ -140,11 +140,13 @@ fn reached<'db, 'f>(
         }
         for &it in nested.iter() {
             if seen.insert(it) {
-                work.push(match it {
-                    Either::Left(closure) => db.mir_body_for_closure(closure),
-                    Either::Right(coroutine) => db.mir_body_for_coroutine(coroutine),
-                }
-                .map_err(no_mir)?);
+                work.push(
+                    match it {
+                        Either::Left(closure) => db.mir_body_for_closure(closure),
+                        Either::Right(coroutine) => db.mir_body_for_coroutine(coroutine),
+                    }
+                    .map_err(no_mir)?,
+                );
             }
         }
     }

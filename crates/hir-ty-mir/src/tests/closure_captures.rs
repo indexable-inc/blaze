@@ -4,13 +4,13 @@ use hir_def::{
     expr_store::{Body, ExpressionStore},
     hir::{BindingId, ExprOrPatId},
 };
+use hir_expand::fixture;
 use hir_expand::{HirFileId, files::InFileWrapper};
 use itertools::Itertools;
 use rustc_type_ir::inherent::IntoKind;
 use span::{Edition, TextRange};
 use stdx::{format_to, never};
 use syntax::{AstNode, AstPtr};
-use hir_expand::fixture;
 
 use crate::{
     InferenceResult,

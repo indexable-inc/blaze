@@ -9,8 +9,8 @@ use std::{ffi::OsString, fmt::Write as _};
 
 use blaze_api::{Reach, Request, ResponseRef, ViewRef};
 use blaze_core::exit::Exit;
-use blaze_vfs::View;
 use blaze_ids::ContentId;
+use blaze_vfs::View;
 
 use super::{
     args::{self, Asked},
@@ -43,7 +43,12 @@ fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
             "--json" => json = true,
             _ if word.starts_with('-') => return Err(usage(format!("not `{word}`"))),
             _ if from.is_some() => return Err(usage(format!("one root, not `{word}` too"))),
-            _ => from = Some(root_of(word).ok_or_else(|| usage(format!("`{word}` is no root: 64 hex digits")))?),
+            _ => {
+                from = Some(
+                    root_of(word)
+                        .ok_or_else(|| usage(format!("`{word}` is no root: 64 hex digits")))?,
+                )
+            }
         }
     }
     // The targets `blaze check` here sends: the same config files, environment and features.
@@ -65,11 +70,13 @@ fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
         Ok(())
     })
     .map_err(failed)?;
-    let now = now.ok_or_else(|| failed("the daemon answered the checkout's open with no root".to_owned()))?;
+    let now = now
+        .ok_or_else(|| failed("the daemon answered the checkout's open with no root".to_owned()))?;
     let reached = match from {
         None => None,
         Some(from) => {
-            let (from, to) = (ViewRef::Root(View { root: from }), ViewRef::Root(View { root: now }));
+            let (from, to) =
+                (ViewRef::Root(View { root: from }), ViewRef::Root(View { root: now }));
             let mut reached = None;
             observe::ask(Request::Reach { to, from, targets }, Start::Never, |response| {
                 if let ResponseRef::Reached(it) = response {
@@ -78,7 +85,9 @@ fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
                 Ok(())
             })
             .map_err(failed)?;
-            Some(reached.ok_or_else(|| failed("the daemon answered `blaze reach` with no answer".to_owned()))?)
+            Some(reached.ok_or_else(|| {
+                failed("the daemon answered `blaze reach` with no answer".to_owned())
+            })?)
         }
     };
     let text = match json {

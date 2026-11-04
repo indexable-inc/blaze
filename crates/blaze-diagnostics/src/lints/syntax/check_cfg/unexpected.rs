@@ -19,12 +19,12 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use intern::Symbol;
+use std::alloc::Global;
 use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     Edition, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange,
@@ -295,7 +295,12 @@ impl<'db> Lints<'_, '_, 'db> {
 
     /// The `#[cfg]`s and `#[cfg_attr]`s of `owner`, outer then inner, in order, up to the first
     /// that is false; for an item an attribute macro replaces (`stop`), up to that macro's.
-    fn attrs(&mut self, tree: &Tree<'db>, owner: ast::Node<'db>, stop: Option<Option<ast::Meta<'db>>>) {
+    fn attrs(
+        &mut self,
+        tree: &Tree<'db>,
+        owner: ast::Node<'db>,
+        stop: Option<Option<ast::Meta<'db>>>,
+    ) {
         let Some(attrs) = ast::AnyHasAttrs::cast(owner) else { return };
         let anchor = Anchor { file: tree.file, node: owner, include: false };
         for attr in ast::attrs_including_inner(&attrs) {
@@ -355,7 +360,12 @@ impl<'db> Lints<'_, '_, 'db> {
         Some(censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1)
     }
 
-    fn predicate(&mut self, file: HirFileId, predicate: ast::CfgPredicate<'_>, anchor: &Anchor<'db>) {
+    fn predicate(
+        &mut self,
+        file: HirFileId,
+        predicate: ast::CfgPredicate<'_>,
+        anchor: &Anchor<'db>,
+    ) {
         let mut checks = std::mem::take(&mut self.checks);
         ast_checks(predicate, &mut checks);
         for check in &checks {
@@ -374,7 +384,9 @@ impl<'db> Lints<'_, '_, 'db> {
             return;
         }
         let node = loc.to_node_view(db);
-        let Some(tt) = ast::MacroCall::cast(node.value).and_then(|it| it.token_tree()) else { return };
+        let Some(tt) = ast::MacroCall::cast(node.value).and_then(|it| it.token_tree()) else {
+            return;
+        };
         let toks: Vec<meta::Tok<'_>> = tt
             .syntax()
             .descendants_with_tokens()
@@ -414,7 +426,9 @@ impl<'db> Lints<'_, '_, 'db> {
         };
         let at = self.at(anchor);
         source_fact(self.cx, &mut diag, at);
-        self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at).buffered(Stage::Collected));
+        self.emitted.push(
+            Emitted::new(diag, Phase::Resolve, Pass::Buffered, at).buffered(Stage::Collected),
+        );
     }
 
     fn span(&self, file: HirFileId, range: TextRange) -> Span {
@@ -476,12 +490,16 @@ impl<'db> Lints<'_, '_, 'db> {
             match expected.get(best).flatten() {
                 Some(best_values) => {
                     // alloc: the diagnostic's list of values
-                    let mut possibilities: Vec<&str> = best_values.order.iter().flatten().copied().collect();
+                    let mut possibilities: Vec<&str> =
+                        best_values.order.iter().flatten().copied().collect();
                     possibilities.sort_unstable();
                     let expected_values = |diag: &mut Diag| {
                         if !possibilities.is_empty() {
                             // alloc: the diagnostic's text
-                            diag.help(format!("expected values for `{best}` are: {}", listed(&possibilities, |it| it)));
+                            diag.help(format!(
+                                "expected values for `{best}` are: {}",
+                                listed(&possibilities, |it| it)
+                            ));
                         }
                     };
                     match &value {
@@ -496,7 +514,12 @@ impl<'db> Lints<'_, '_, 'db> {
                                     maybe,
                                 );
                             } else if best_values.contains(None) {
-                                diag.suggestion(both, "there is a config with a similar name and no value", shown, maybe);
+                                diag.suggestion(
+                                    both,
+                                    "there is a config with a similar name and no value",
+                                    shown,
+                                    maybe,
+                                );
                             } else {
                                 expected_values(&mut diag);
                                 let code = match possibilities.first() {
@@ -504,19 +527,34 @@ impl<'db> Lints<'_, '_, 'db> {
                                     Some(first) => format!("{shown} = \"{first}\""),
                                     None => shown.into_owned(),
                                 };
-                                diag.suggestion(both, "there is a config with a similar name and different values", code, maybe);
+                                diag.suggestion(
+                                    both,
+                                    "there is a config with a similar name and different values",
+                                    code,
+                                    maybe,
+                                );
                             }
                         }
                         None => {
                             expected_values(&mut diag);
                             // clone: the diagnostic's span
-                            diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
+                            diag.suggestion(
+                                name_span.clone(),
+                                "there is a config with a similar name",
+                                shown,
+                                maybe,
+                            );
                         }
                     }
                 }
                 None => {
                     // clone: the diagnostic's span
-                    diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
+                    diag.suggestion(
+                        name_span.clone(),
+                        "there is a config with a similar name",
+                        shown,
+                        maybe,
+                    );
                 }
             }
         } else {
@@ -561,11 +599,18 @@ impl<'db> Lints<'_, '_, 'db> {
                 };
                 let listed = listed(&names, |it| meta::shown(it, edition));
                 // alloc: the diagnostic's text
-                diag.sub(Sublevel::Help, format!("expected names are: {listed}{more}"), MultiSpan::default(), true);
+                diag.sub(
+                    Sublevel::Help,
+                    format!("expected names are: {listed}{more}"),
+                    MultiSpan::default(),
+                    true,
+                );
             }
         }
 
-        let arg = |quotes| check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes);
+        let arg = |quotes| {
+            check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes)
+        };
         if self.check.cargo {
             self.macro_help(&mut diag, &origin);
             if !is_feature && !origin.external {
@@ -645,10 +690,15 @@ impl<'db> Lints<'_, '_, 'db> {
                 n => format!(" and {n} more"),
             };
             // alloc: the diagnostic's text
-            diag.note(format!("expected values for `{name}` are: {none}{}{more}", listed(&sorted, |it| it)));
+            diag.note(format!(
+                "expected values for `{name}` are: {none}{}{more}",
+                listed(&sorted, |it| it)
+            ));
             match &value {
                 Some((value, value_span)) => {
-                    if let Some(best) = find_best_match_for_name(&possibilities, value, None).copied() {
+                    if let Some(best) =
+                        find_best_match_for_name(&possibilities, value, None).copied()
+                    {
                         diag.suggestion(
                             // clone: the diagnostic's span
                             value_span.clone(),
@@ -662,13 +712,23 @@ impl<'db> Lints<'_, '_, 'db> {
                 None => {
                     if let [only] = possibilities[..] {
                         // alloc: the diagnostic's text
-                        diag.suggestion(name_span.shrink_to_hi(), "specify a config value", format!(" = \"{only}\""), maybe);
+                        diag.suggestion(
+                            name_span.shrink_to_hi(),
+                            "specify a config value",
+                            format!(" = \"{only}\""),
+                            maybe,
+                        );
                     }
                 }
             }
         } else if have_none {
             if let Some((_, value_span)) = &value {
-                diag.suggestion(name_span.shrink_to_hi().to(value_span), "remove the value", "", maybe);
+                diag.suggestion(
+                    name_span.shrink_to_hi().to(value_span),
+                    "remove the value",
+                    "",
+                    maybe,
+                );
             }
             // alloc: the diagnostic's text
             diag.note(format!("no expected value for `{name}`"));
@@ -684,12 +744,16 @@ impl<'db> Lints<'_, '_, 'db> {
         }
 
         let can_add_value = !is_well_known;
-        let arg = |quotes| check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes);
+        let arg = |quotes| {
+            check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes)
+        };
         if self.check.cargo {
             if name == "feature" && !origin.external {
                 match &value {
                     // alloc: the diagnostic's text
-                    Some((value, _)) => diag.help(format!("consider adding `{value}` as a feature in `Cargo.toml`")),
+                    Some((value, _)) => {
+                        diag.help(format!("consider adding `{value}` as a feature in `Cargo.toml`"))
+                    }
                     None => diag.help("consider defining some features in `Cargo.toml`"),
                 };
             } else if can_add_value && !origin.external {
@@ -733,7 +797,9 @@ impl<'db> Lints<'_, '_, 'db> {
                 "using a cfg inside a {kind} will use the cfgs from the destination crate and not the ones from the defining crate"
             ));
             // alloc: as above
-            diag.help(format!("try referring to `{path}` crate for guidance on how handle this unexpected cfg"));
+            diag.help(format!(
+                "try referring to `{path}` crate for guidance on how handle this unexpected cfg"
+            ));
         }
     }
 
@@ -742,7 +808,9 @@ impl<'db> Lints<'_, '_, 'db> {
     fn edition_at(&self, file: HirFileId, range: TextRange) -> Edition {
         match file.macro_file() {
             None => self.cx.edition,
-            Some(call) => call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition(self.cx.db),
+            Some(call) => {
+                call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition(self.cx.db)
+            }
         }
     }
 
@@ -776,16 +844,20 @@ impl<'db> Lints<'_, '_, 'db> {
         let loc = call.loc(db);
         let node = loc.to_node_view(db).value;
         // alloc: the diagnostic's text, a macro's path
-        let path = |it: ast::Path<'_>| -> String { it.syntax().text().split_whitespace().collect() };
+        let path =
+            |it: ast::Path<'_>| -> String { it.syntax().text().split_whitespace().collect() };
         match &loc.kind {
             MacroCallKind::FnLike { .. } => ast::MacroCall::cast(node)?.path().map(path),
             MacroCallKind::Derive { derive_index, .. } => {
                 let meta = ast::Meta::cast(node)?;
                 derive_paths_view(meta).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
             }
-            MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
-                censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1.path().map(path)
-            }
+            MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => censored_attr_ids
+                .invoc_attr()
+                .find_attr_range_view(db, loc.krate, *ast_id)
+                .1
+                .path()
+                .map(path),
         }
     }
 
@@ -872,12 +944,19 @@ fn has_lint_id(node: ast::Node<'_>) -> bool {
     use SyntaxKind::*;
     let kind = node.kind();
     match kind {
-        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_ITEMS | MACRO_STMTS | SOURCE_FILE => false,
+        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_ITEMS | MACRO_STMTS
+        | SOURCE_FILE => false,
         BLOCK_EXPR => !bare_block(node),
-        VARIANT | WHERE_PRED | RECORD_FIELD | TUPLE_FIELD | RECORD_PAT_FIELD | RECORD_EXPR_FIELD | PARAM | SELF_PARAM
-        | TYPE_PARAM | LIFETIME_PARAM | CONST_PARAM | MATCH_ARM | LET_STMT => true,
+        VARIANT | WHERE_PRED | RECORD_FIELD | TUPLE_FIELD | RECORD_PAT_FIELD
+        | RECORD_EXPR_FIELD | PARAM | SELF_PARAM | TYPE_PARAM | LIFETIME_PARAM | CONST_PARAM
+        | MATCH_ARM | LET_STMT => true,
         EXPR_STMT => ast::ExprStmt::cast(node).is_some_and(|it| it.semicolon_token().is_some()),
-        _ => ast::Item::can_cast(kind) || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind) || ast::Type::can_cast(kind),
+        _ => {
+            ast::Item::can_cast(kind)
+                || ast::Expr::can_cast(kind)
+                || ast::Pat::can_cast(kind)
+                || ast::Type::can_cast(kind)
+        }
     }
 }
 
@@ -959,8 +1038,16 @@ fn atom_check(atom: ast::CfgAtom<'_>, prefix: Option<&str>) -> Option<Check> {
     };
     let range = atom.syntax().text_range();
     Some(match prefix {
-        Some(prefix) => Check { name: Symbol::intern_concat(&[prefix, name]), raw, name_range: range, value, range },
-        None => Check { name: Symbol::intern(name), raw, name_range: ident.text_range(), value, range },
+        Some(prefix) => Check {
+            name: Symbol::intern_concat(&[prefix, name]),
+            raw,
+            name_range: range,
+            value,
+            range,
+        },
+        None => {
+            Check { name: Symbol::intern(name), raw, name_range: ident.text_range(), value, range }
+        }
     })
 }
 
@@ -978,7 +1065,10 @@ fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
             Some("target") => {
                 for sub in list {
                     let Some(meta) = sub.meta() else { continue };
-                    let (Some(ident), meta::Kind::NameValue(lit)) = (meta.ident(), &meta.kind) else { continue };
+                    let (Some(ident), meta::Kind::NameValue(lit)) = (meta.ident(), &meta.kind)
+                    else {
+                        continue;
+                    };
                     if meta::is_path_segment_keyword(ident.name) {
                         return;
                     }
@@ -995,7 +1085,10 @@ fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
             _ => {}
         },
         meta::Kind::Word | meta::Kind::NameValue(_) => {
-            let Some(ident) = item.ident().filter(|it| !meta::is_path_segment_keyword(it.name)) else { return };
+            let Some(ident) = item.ident().filter(|it| !meta::is_path_segment_keyword(it.name))
+            else {
+                return;
+            };
             let value = match &item.kind {
                 meta::Kind::NameValue(lit) => match lit.value_str() {
                     Some(value) => Some((Symbol::intern(&value), lit.range)),
@@ -1023,8 +1116,14 @@ mod tests {
         assert_eq!(check_cfg_arg("foo", None, false), "cfg(foo)");
         assert_eq!(check_cfg_arg("foo", Some("bar"), false), r#"cfg(foo, values("bar"))"#);
         assert_eq!(check_cfg_arg("foo", Some("bar"), true), r#"cfg(foo, values(\"bar\"))"#);
-        assert_eq!(check_cfg_arg("quote", Some("quote\""), false), r#"cfg(quote, values("quote\""))"#);
-        assert_eq!(check_cfg_arg("quote", Some("quote\""), true), r#"cfg(quote, values(\"quote\\\\\"\"))"#);
+        assert_eq!(
+            check_cfg_arg("quote", Some("quote\""), false),
+            r#"cfg(quote, values("quote\""))"#
+        );
+        assert_eq!(
+            check_cfg_arg("quote", Some("quote\""), true),
+            r#"cfg(quote, values(\"quote\\\\\"\"))"#
+        );
     }
 
     /// Reading the cfgs of a tree again allocates nothing: the read list, its sort's scratch and
@@ -1034,7 +1133,9 @@ mod tests {
         use std::fmt::Write as _;
 
         for fns in [4, 400] {
-            let mut fixture = String::from("//- /lib.rs crate:main edition:2021\n#![cfg_attr(foo, allow(unused))]\n");
+            let mut fixture = String::from(
+                "//- /lib.rs crate:main edition:2021\n#![cfg_attr(foo, allow(unused))]\n",
+            );
             for at in 0..fns {
                 writeln!(fixture, "#[cfg_attr(foo, inline)]\n#[cfg(foo)]\npub fn f_{at}() {{}}\npub fn g_{at}(x: u32) -> u32 {{ x }}")
                     .unwrap();
@@ -1063,7 +1164,9 @@ mod tests {
                 let tree = walk.files().next().unwrap();
                 lints.tree(tree);
                 assert!(lints.read.len() > fns, "{} read at {fns} functions", lints.read.len());
-                blaze_alloc_count::assert_at_most(0, "reading a tree's cfgs again", || lints.tree(tree));
+                blaze_alloc_count::assert_at_most(0, "reading a tree's cfgs again", || {
+                    lints.tree(tree)
+                });
                 assert!(lints.emitted.is_empty(), "an expected cfg is not linted");
             });
         }

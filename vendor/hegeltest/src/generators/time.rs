@@ -56,10 +56,8 @@ impl Generator<Duration> for DurationGenerator {
         if self.min_nanos > self.max_nanos {
             invalid_argument!("Cannot have max_value < min_value");
         }
-        let nanos = integers::<u64>()
-            .min_value(self.min_nanos)
-            .max_value(self.max_nanos)
-            .do_draw(tc);
+        let nanos =
+            integers::<u64>().min_value(self.min_nanos).max_value(self.max_nanos).do_draw(tc);
         Duration::from_nanos(nanos)
     }
 }
@@ -88,11 +86,7 @@ impl PrintableGenerator<Duration> for DurationGenerator {
 /// }
 /// ```
 pub fn durations() -> DurationGenerator {
-    DurationGenerator {
-        min_nanos: 0,
-        max_nanos: u64::MAX,
-        min_unrepresentable: false,
-    }
+    DurationGenerator { min_nanos: 0, max_nanos: u64::MAX, min_unrepresentable: false }
 }
 
 fn duration_to_nanos(d: Duration) -> u64 {

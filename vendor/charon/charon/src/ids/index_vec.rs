@@ -55,15 +55,11 @@ where
     I: Idx,
 {
     pub fn new() -> Self {
-        IndexVec {
-            vector: index_vec::IndexVec::new(),
-        }
+        IndexVec { vector: index_vec::IndexVec::new() }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        IndexVec {
-            vector: index_vec::IndexVec::with_capacity(capacity),
-        }
+        IndexVec { vector: index_vec::IndexVec::with_capacity(capacity) }
     }
 
     /// Shadow the `index_vec::IndexVec` method because it silently shifts ids. Use
@@ -77,11 +73,7 @@ where
     }
 
     pub fn remove_and_shift_ids(&mut self, id: I) -> Option<T> {
-        if self.vector.get(id).is_some() {
-            Some(self.vector.remove(id))
-        } else {
-            None
-        }
+        if self.vector.get(id).is_some() { Some(self.vector.remove(id)) } else { None }
     }
 
     pub fn push_with(&mut self, f: impl FnOnce(I) -> T) -> I {
@@ -109,42 +101,24 @@ where
 
     /// Map each entry to a new one, keeping the same ids.
     pub fn map<U>(self, f: impl FnMut(T) -> U) -> IndexVec<I, U> {
-        IndexVec {
-            vector: self.vector.into_iter().map(f).collect(),
-        }
+        IndexVec { vector: self.vector.into_iter().map(f).collect() }
     }
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_ref<'a, U>(&'a self, f: impl FnMut(&'a T) -> U) -> IndexVec<I, U> {
-        IndexVec {
-            vector: self.vector.iter().map(f).collect(),
-        }
+        IndexVec { vector: self.vector.iter().map(f).collect() }
     }
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_ref_mut<'a, U>(&'a mut self, f: impl FnMut(&'a mut T) -> U) -> IndexVec<I, U> {
-        IndexVec {
-            vector: self.vector.iter_mut().map(f).collect(),
-        }
+        IndexVec { vector: self.vector.iter_mut().map(f).collect() }
     }
 
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_indexed<U>(self, mut f: impl FnMut(I, T) -> U) -> IndexVec<I, U> {
-        IndexVec {
-            vector: self
-                .vector
-                .into_iter_enumerated()
-                .map(|(i, x)| f(i, x))
-                .collect(),
-        }
+        IndexVec { vector: self.vector.into_iter_enumerated().map(|(i, x)| f(i, x)).collect() }
     }
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_ref_indexed<'a, U>(&'a self, mut f: impl FnMut(I, &'a T) -> U) -> IndexVec<I, U> {
-        IndexVec {
-            vector: self
-                .vector
-                .iter_enumerated()
-                .map(|(i, x)| f(i, x))
-                .collect(),
-        }
+        IndexVec { vector: self.vector.iter_enumerated().map(|(i, x)| f(i, x)).collect() }
     }
 
     pub fn into_iter_enumerated(self) -> impl Iterator<Item = (I, T)> {
@@ -153,9 +127,7 @@ where
 
     /// Like `Vec::split_off`.
     pub fn split_off(&mut self, at: usize) -> Self {
-        Self {
-            vector: self.vector.split_off(I::from_usize(at)),
-        }
+        Self { vector: self.vector.split_off(I::from_usize(at)) }
     }
 }
 
@@ -230,9 +202,7 @@ where
 {
     #[inline]
     fn from_iter<It: IntoIterator<Item = T>>(iter: It) -> IndexVec<I, T> {
-        IndexVec {
-            vector: index_vec::IndexVec::from_iter(iter),
-        }
+        IndexVec { vector: index_vec::IndexVec::from_iter(iter) }
     }
 }
 
@@ -259,9 +229,7 @@ impl<'de, I: Idx, T: Deserialize<'de>> Deserialize<'de> for IndexVec<I, T> {
     where
         D: serde::Deserializer<'de>,
     {
-        Ok(Self {
-            vector: Deserialize::deserialize(deserializer)?,
-        })
+        Ok(Self { vector: Deserialize::deserialize(deserializer)? })
     }
 }
 
@@ -273,9 +241,7 @@ impl<'de, I: Idx, State, T: DeserializeState<'de, State>> DeserializeState<'de, 
         D: serde::Deserializer<'de>,
     {
         let vec: Vec<_> = DeserializeState::deserialize_state(state, deserializer)?;
-        Ok(Self {
-            vector: index_vec::IndexVec::from(vec),
-        })
+        Ok(Self { vector: index_vec::IndexVec::from(vec) })
     }
 }
 

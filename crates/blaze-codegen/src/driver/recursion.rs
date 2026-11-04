@@ -94,14 +94,26 @@ struct Paths {
 impl Paths {
     /// Puts function `item` on the path of node `parent`: a node, or past the limit (only
     /// without `keep_past`).
-    fn place(&mut self, item: u32, counted: &Counted, parent: u32, keep_past: bool) -> Result<u32, Past> {
-        let up = self.nodes.get(parent as usize).and_then(|node| node.limit.map(|limit| (node, limit)));
+    fn place(
+        &mut self,
+        item: u32,
+        counted: &Counted,
+        parent: u32,
+        keep_past: bool,
+    ) -> Result<u32, Past> {
+        let up =
+            self.nodes.get(parent as usize).and_then(|node| node.limit.map(|limit| (node, limit)));
         let (parent, limit, head, limit_of) = match (up, counted.limit) {
             // Collected in its own crate's build: a path of its own, held to the larger limit.
             (Some((up, path)), Some(own)) if counted.heads_own_path && own.krate != path.krate => {
                 match own.value >= path.value {
                     true => (NONE, Some(own), item, item),
-                    false => (NONE, Some(Limit { krate: own.krate, value: path.value }), item, up.limit_of),
+                    false => (
+                        NONE,
+                        Some(Limit { krate: own.krate, value: path.value }),
+                        item,
+                        up.limit_of,
+                    ),
                 }
             }
             (Some((up, path)), _) => (parent, Some(path), up.head, up.limit_of),
@@ -126,7 +138,14 @@ impl Paths {
                 return Err(Past { item, depth, limit: limit.value, head, limit_of });
             }
         }
-        self.nodes.push(Node { parent, body: counted.body.map(|it| it.body), depth, limit, head, limit_of });
+        self.nodes.push(Node {
+            parent,
+            body: counted.body.map(|it| it.body),
+            depth,
+            limit,
+            head,
+            limit_of,
+        });
         Ok(self.nodes.len() as u32 - 1)
     }
 
@@ -226,7 +245,12 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
     /// The first level: each root of the build once, in order, then each check root that is
     /// none of them ([`CheckRoot`]). Also for the walk's next round, which reaches everything
     /// again.
-    pub(super) fn start(&mut self, roots: &[(I, Origin)], static_roots: &[S], check: &[CheckRoot<I, S>]) -> Level<I, S> {
+    pub(super) fn start(
+        &mut self,
+        roots: &[(I, Origin)],
+        static_roots: &[S],
+        check: &[CheckRoot<I, S>],
+    ) -> Level<I, S> {
         self.functions.clear();
         self.statics.clear();
         self.items.clear();
@@ -305,7 +329,12 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
         // clone: per build, the walk's handle of a function and who asks for it, twice: its
         // item's and the map's
         self.functions.insert(asked.clone(), item);
-        self.items.push(Item { function: Some(asked.clone()), counted: None, state: State::Queued, forced: false });
+        self.items.push(Item {
+            function: Some(asked.clone()),
+            counted: None,
+            state: State::Queued,
+            forced: false,
+        });
         (item, true)
     }
 
@@ -316,7 +345,12 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
         let item = self.items.len() as u32;
         // clone: per build, the walk's handle of a static
         self.statics.insert(value.clone(), item);
-        self.items.push(Item { function: None, counted: None, state: State::Queued, forced: false });
+        self.items.push(Item {
+            function: None,
+            counted: None,
+            state: State::Queued,
+            forced: false,
+        });
         (item, true)
     }
 
@@ -495,7 +529,9 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
         let mut more = false;
         for item in undescribed {
             let entry = &mut self.items[item as usize];
-            let (State::Deferred { from }, Some(function)) = (&entry.state, &entry.function) else { continue };
+            let (State::Deferred { from }, Some(function)) = (&entry.state, &entry.function) else {
+                continue;
+            };
             // clone: per build, the walk's handle of a deferred function, once
             next.functions.push(function.clone());
             next.function_items.push(item);
@@ -526,14 +562,18 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
             next.function_from.clear();
             return false;
         }
-        let spelled = |item: u32| match self.items.get(item as usize).and_then(|it| it.function.as_ref()) {
-            Some((instance, _)) => format!("`{}`", frontend.spell(instance)), // alloc: an error's text
-            None if item == NONE => "none".to_owned(),                        // alloc: an error's text
-            None => "a static".to_owned(),                                    // alloc: an error's text
-        };
+        let spelled =
+            |item: u32| match self.items.get(item as usize).and_then(|it| it.function.as_ref()) {
+                Some((instance, _)) => format!("`{}`", frontend.spell(instance)), // alloc: an error's text
+                None if item == NONE => "none".to_owned(), // alloc: an error's text
+                None => "a static".to_owned(),             // alloc: an error's text
+            };
         for it in &past {
-            let instance = |item: u32| self.items.get(item as usize).and_then(|it| it.function.as_ref()).map(|it| &it.0);
-            let (Some(at), Some(head), Some(limit_of)) = (instance(it.item), instance(it.head), instance(it.limit_of))
+            let instance = |item: u32| {
+                self.items.get(item as usize).and_then(|it| it.function.as_ref()).map(|it| &it.0)
+            };
+            let (Some(at), Some(head), Some(limit_of)) =
+                (instance(it.item), instance(it.head), instance(it.limit_of))
             else {
                 // A path's head and the item whose limit holds it are functions by construction
                 // ([`Paths::place`]); were one not, the refusal still stands, named as it is.
@@ -557,7 +597,8 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
             errors.push(frontend.past_recursion_limit(at, it.depth, it.limit, head, limit_of));
         }
         if past.is_empty()
-            && let Some(left) = self.items.iter().position(|it| matches!(it.state, State::Deferred { .. }))
+            && let Some(left) =
+                self.items.iter().position(|it| matches!(it.state, State::Deferred { .. }))
         {
             errors.push(CodegenError {
                 unit: InstanceKey(ContentId::default()),
@@ -587,12 +628,17 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
 
 /// The error of a front end whose [`Frontend::counted`] gave `given` entries for a level of
 /// `functions`: naming the front end and the functions left without one.
-fn miscounted<I, F: Frontend<Instance = I>>(frontend: &F, functions: &[(I, Origin)], given: usize) -> CodegenError {
+fn miscounted<I, F: Frontend<Instance = I>>(
+    frontend: &F,
+    functions: &[(I, Origin)],
+    given: usize,
+) -> CodegenError {
     /// How many functions left without an entry the error names before it says how many more.
     const NAMED: usize = 8;
     let left = functions.get(given..).unwrap_or_default();
     // alloc: the error's message
-    let mut names: Vec<String> = left.iter().take(NAMED).map(|(it, _)| format!("`{}`", frontend.spell(it))).collect();
+    let mut names: Vec<String> =
+        left.iter().take(NAMED).map(|(it, _)| format!("`{}`", frontend.spell(it))).collect();
     if left.len() > NAMED {
         names.push(format!("and {} more", left.len() - NAMED)); // alloc: the error's message
     }

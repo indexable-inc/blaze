@@ -213,6 +213,11 @@ dependencies without a reason, small focused changes. Comments say what the code
 why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
 
+When a build is slow, reruns what it should reuse, holds too much memory or a cycle will not
+settle, find out from the profile, not by guessing: the `debugging` skill
+([.agents/skills/debugging/SKILL.md](../.agents/skills/debugging/SKILL.md)) says where its
+files are, what they hold, the DuckDB queries that answer each question and the method.
+
 ## What a change needs
 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
@@ -230,7 +235,7 @@ did about it in one line.
   change through is not the harnesses passing on it.
 - blaze builds in the flake's dev shell, against the LLVM it pins:
   `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
-- `cargo fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
+- `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).

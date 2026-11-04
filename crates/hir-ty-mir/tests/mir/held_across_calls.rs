@@ -1,12 +1,8 @@
 //! `MirBody::held_across_calls_in`: what a call that may suspend keeps alive, by the analyses
 //! `held_locals_in` runs across a yield.
 
-use hir_ty::{
-    db::HirDatabase,
-    mir::TerminatorKind,
-    next_solver::TyKind,
-};
 use hir_expand::fixture;
+use hir_ty::{db::HirDatabase, mir::TerminatorKind, next_solver::TyKind};
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::function;

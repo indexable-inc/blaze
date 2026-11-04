@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use proc_macro_api::bridge::wire;
 use intern::Symbol;
+use proc_macro_api::bridge::wire;
 use span::Span;
 
 /// Whether the next token follows this one with nothing between, as rustc's lexer says it
@@ -60,14 +60,41 @@ pub(crate) enum DocKind {
 pub(crate) enum Tree {
     /// `open` is the spacing of its opening delimiter, `spacing` of its closing one
     /// (`rustc_ast::tokenstream::DelimSpacing`).
-    Group { delimiter: Delimiter, stream: Stream, span: DelimSpan, open: Spacing, spacing: Spacing },
-    Punct { ch: u8, spacing: Spacing, span: Span },
-    Ident { sym: Symbol, kind: IdentKind, span: Span, spacing: Spacing },
+    Group {
+        delimiter: Delimiter,
+        stream: Stream,
+        span: DelimSpan,
+        open: Spacing,
+        spacing: Spacing,
+    },
+    Punct {
+        ch: u8,
+        spacing: Spacing,
+        span: Span,
+    },
+    Ident {
+        sym: Symbol,
+        kind: IdentKind,
+        span: Span,
+        spacing: Spacing,
+    },
     /// `symbol` is the literal's text without its suffix, as the bridge has it.
-    Literal { kind: LitKind, symbol: Symbol, suffix: Option<Symbol>, span: Span, spacing: Spacing },
+    Literal {
+        kind: LitKind,
+        symbol: Symbol,
+        suffix: Option<Symbol>,
+        span: Span,
+        spacing: Spacing,
+    },
     /// A doc comment, kept as one token as rustc's streams keep it: printed as written, and
     /// made `#[doc = ".."]` only as the client takes the trees apart (`lex::desugar_doc`).
-    DocComment { kind: DocKind, inner: bool, data: Symbol, span: Span, spacing: Spacing },
+    DocComment {
+        kind: DocKind,
+        inner: bool,
+        data: Symbol,
+        span: Span,
+        spacing: Spacing,
+    },
 }
 
 impl Tree {
@@ -373,9 +400,13 @@ fn wire_into(trees: Vec<Tree>, out: &mut Vec<wire::Tree>) {
 /// before the literal without its sign.
 pub(crate) fn push_given(tree: Tree, out: &mut Vec<Tree>) {
     match tree {
-        Tree::Literal { kind: kind @ (LitKind::Integer | LitKind::Float), symbol, suffix, span, .. }
-            if symbol.as_str().starts_with('-') =>
-        {
+        Tree::Literal {
+            kind: kind @ (LitKind::Integer | LitKind::Float),
+            symbol,
+            suffix,
+            span,
+            ..
+        } if symbol.as_str().starts_with('-') => {
             out.push(Tree::Punct { ch: b'-', spacing: Spacing::JointHidden, span });
             let symbol = Symbol::intern(&symbol.as_str()[1..]);
             out.push(Tree::Literal { kind, symbol, suffix, span, spacing: Spacing::Alone });

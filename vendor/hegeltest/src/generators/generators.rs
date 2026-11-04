@@ -202,9 +202,7 @@ pub trait Generator<T> {
     where
         Self: Sized + Send + Sync + 'a,
     {
-        BoxedGenerator {
-            inner: Arc::new(self),
-        }
+        BoxedGenerator { inner: Arc::new(self) }
     }
 
     /// Make this generator printable by describing each drawn value with `print`.
@@ -239,10 +237,7 @@ pub trait Generator<T> {
         Self: Sized,
         F: Fn(&T, &mut PrettyPrinter) + Send + Sync,
     {
-        PrintedWith {
-            source: self,
-            print,
-        }
+        PrintedWith { source: self, print }
     }
 
     /// Make this generator printable by printing each drawn value's `Debug`
@@ -369,9 +364,7 @@ pub trait PrintableGenerator<T>: Generator<T> {
     where
         Self: Sized + Send + Sync + 'a,
     {
-        BoxedPrintableGenerator {
-            inner: Arc::new(self),
-        }
+        BoxedPrintableGenerator { inner: Arc::new(self) }
     }
 }
 
@@ -713,8 +706,7 @@ where
     /// predicates, so the chain costs one round of attempts and a source
     /// that runs its own attempts sees every predicate at once.
     fn do_draw_filtered(&self, tc: &TestCase, predicate: &dyn Fn(&T) -> bool) -> T {
-        self.source
-            .do_draw_filtered(tc, &|value| (self.predicate)(value) && predicate(value))
+        self.source.do_draw_filtered(tc, &|value| (self.predicate)(value) && predicate(value))
     }
 }
 
@@ -724,8 +716,7 @@ where
     F: Fn(&T) -> bool + Send + Sync,
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> T {
-        self.source
-            .do_draw_filtered_and_print(tc, &self.predicate, printer)
+        self.source.do_draw_filtered_and_print(tc, &self.predicate, printer)
     }
 
     fn do_draw_filtered_and_print(
@@ -749,9 +740,7 @@ pub struct BoxedGenerator<'a, T> {
 
 impl<T> Clone for BoxedGenerator<'_, T> {
     fn clone(&self) -> Self {
-        BoxedGenerator {
-            inner: Arc::clone(&self.inner),
-        }
+        BoxedGenerator { inner: Arc::clone(&self.inner) }
     }
 }
 
@@ -804,9 +793,7 @@ pub struct BoxedPrintableGenerator<'a, T> {
 
 impl<T> Clone for BoxedPrintableGenerator<'_, T> {
     fn clone(&self) -> Self {
-        BoxedPrintableGenerator {
-            inner: Arc::clone(&self.inner),
-        }
+        BoxedPrintableGenerator { inner: Arc::clone(&self.inner) }
     }
 }
 
@@ -835,8 +822,7 @@ impl<T> PrintableGenerator<T> for BoxedPrintableGenerator<'_, T> {
         predicate: &dyn Fn(&T) -> bool,
         printer: &mut PrettyPrinter,
     ) -> T {
-        self.inner
-            .do_draw_filtered_and_print(tc, predicate, printer)
+        self.inner.do_draw_filtered_and_print(tc, predicate, printer)
     }
 
     fn boxed_printable<'b>(self) -> BoxedPrintableGenerator<'b, T>

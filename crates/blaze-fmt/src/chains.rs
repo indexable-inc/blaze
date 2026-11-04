@@ -562,9 +562,7 @@ impl Rewrite for Chain {
         debug!("rewrite chain {:?} {:?}", self, shape);
 
         match context.config.indent_style() {
-            IndentStyle::Block => {
-                self.rewrite_with(ChainFormatterBlock::new(self), context, shape)
-            }
+            IndentStyle::Block => self.rewrite_with(ChainFormatterBlock::new(self), context, shape),
             IndentStyle::Visual => {
                 self.rewrite_with(ChainFormatterVisual::new(self), context, shape)
             }

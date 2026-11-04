@@ -73,8 +73,10 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 #[test]
 fn the_statics_section_lists_each_writable_static_at_its_placed_address() {
     let start = super::wasm_imports::entry();
-    let writable = Data { id: id(40), align: 4, bytes: vec![9; 8], relocs: Relocs::new(), writable: true };
-    let read_only = Data { id: id(41), align: 4, bytes: vec![8; 4], relocs: Relocs::new(), writable: false };
+    let writable =
+        Data { id: id(40), align: 4, bytes: vec![9; 8], relocs: Relocs::new(), writable: true };
+    let read_only =
+        Data { id: id(41), align: 4, bytes: vec![8; 4], relocs: Relocs::new(), writable: false };
     let counter = a_static(20, true, vec![writable, read_only]);
     let constant = a_static(21, false, Vec::new());
     let change = Change {
@@ -91,15 +93,27 @@ fn the_statics_section_lists_each_writable_static_at_its_placed_address() {
 
     // One entry: the counter's own 4 bytes, then its writable allocation; the constant and the
     // read-only allocation are not listed.
-    assert_eq!(list.len(), crate::wasm::STATICS_HEADER + 2 * crate::wasm::STATICS_RECORD, "{list:?}");
+    assert_eq!(
+        list.len(),
+        crate::wasm::STATICS_HEADER + 2 * crate::wasm::STATICS_RECORD,
+        "{list:?}"
+    );
     assert_eq!(list[4..36], id(20).0, "the counter's item key");
     assert_eq!(word(list, 36), 2, "its records");
     let symbols = &image.symbols;
     let at = |key| image.state.addr_of(symbols.find(key).unwrap()).unwrap();
-    let own = at(SymKey::Static(symbols.find_id(&id(20)).unwrap(), symbols.find_id(&id(120)).unwrap()));
+    let own =
+        at(SymKey::Static(symbols.find_id(&id(20)).unwrap(), symbols.find_id(&id(120)).unwrap()));
     let data = at(SymKey::Data(symbols.find_id(&id(40)).unwrap()));
-    assert_eq!((u64::from(word(list, 40)), word(list, 44)), (own, 4), "the counter where it is placed");
+    assert_eq!(
+        (u64::from(word(list, 40)), word(list, 44)),
+        (own, 4),
+        "the counter where it is placed"
+    );
     assert_eq!((u64::from(word(list, 48)), word(list, 52)), (data, 8), "its writable allocation");
     let heap_base = u64::from(word(list, 0));
-    assert!(own + 4 <= heap_base && data + 8 <= heap_base, "{own} {data} below the heap at {heap_base}");
+    assert!(
+        own + 4 <= heap_base && data + 8 <= heap_base,
+        "{own} {data} below the heap at {heap_base}"
+    );
 }

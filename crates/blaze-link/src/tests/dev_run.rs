@@ -10,13 +10,13 @@ use blaze_live::patch::{Message, hash};
 use object::read::elf::ProgramHeader as _;
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags, SectionFlags, SectionKind,
-    SymbolFlags, SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags,
+    SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
 use super::{
-    Change, Disk, Image, Linked, Native, NativeKind, Output, OutputKind, PAGE, Sparse, TO, code_memory, edit, first,
-    function, id, key, live, name, output, patch_in, program, returns,
+    Change, Disk, Image, Linked, Native, NativeKind, Output, OutputKind, PAGE, Sparse, TO,
+    code_memory, edit, first, function, id, key, live, name, output, patch_in, program, returns,
 };
 use crate::DevRun;
 use crate::model::{Class, Reserve};
@@ -35,7 +35,11 @@ fn hook() -> CompiledFunction {
 }
 
 /// `first`'s program with the dev runtime's start hook defined by Rust code.
-fn hooked<'a>(start: &'a CompiledFunction, g: &'a CompiledFunction, hook: &'a CompiledFunction) -> Change<'a> {
+fn hooked<'a>(
+    start: &'a CompiledFunction,
+    g: &'a CompiledFunction,
+    hook: &'a CompiledFunction,
+) -> Change<'a> {
     let mut change = first(start, g);
     change.added.push(hook);
     change.names.push((crate::stage::START_HOOK.into(), Target::Direct(key(HOOK))));
@@ -60,15 +64,20 @@ fn preinit_object() -> Vec<u8> {
         flags: SymbolFlags::None,
     });
     let preinit = b.add_section(Vec::new(), b".preinit_array".to_vec(), SectionKind::Data);
-    b.section_mut(preinit).flags =
-        SectionFlags::Elf { sh_type: elf::SHT_PREINIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
+    b.section_mut(preinit).flags = SectionFlags::Elf {
+        sh_type: elf::SHT_PREINIT_ARRAY,
+        sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE,
+    };
     let slot = b.append_section_data(preinit, &[0; 8], 8);
-    b.add_relocation(preinit, Relocation {
-        offset: slot,
-        symbol: init,
-        addend: 0,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-    })
+    b.add_relocation(
+        preinit,
+        Relocation {
+            offset: slot,
+            symbol: init,
+            addend: 0,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+        },
+    )
     .unwrap();
     b.write().unwrap()
 }
@@ -90,7 +99,13 @@ fn the_start_hook_is_the_first_preinit_entry_and_stays_first() {
     let mut image = Image::new(name(TO), dev(output(true), NO_RESERVATIONS)).unwrap();
     let mut disk = Disk::default();
     let mut change = hooked(&start, &g, &hook);
-    change.natives.push(Native { id: id(61), name: "preinit.o", bytes: &object, kind: NativeKind::Object, order: 0 });
+    change.natives.push(Native {
+        id: id(61),
+        name: "preinit.o",
+        bytes: &object,
+        kind: NativeKind::Object,
+        order: 0,
+    });
     disk.link(&mut image, change).unwrap();
     let a = Linked::of(disk.file(TO));
     let (hook_at, object_at) = preinit_entries(&a);
@@ -99,7 +114,11 @@ fn the_start_hook_is_the_first_preinit_entry_and_stays_first() {
 
     disk.link(&mut image, edit(&g2)).unwrap();
     let b = Linked::of(disk.file(TO));
-    assert_eq!(preinit_entries(&b), (hook_at, object_at), "an incremental stage keeps the pointer first");
+    assert_eq!(
+        preinit_entries(&b),
+        (hook_at, object_at),
+        "an incremental stage keeps the pointer first"
+    );
     assert_eq!(b.at(hook_at, 6), returns(HOOK));
 }
 
@@ -108,7 +127,10 @@ fn a_dev_run_without_the_dev_runtime_or_of_a_shared_image_is_an_error() {
     let (start, g) = program(Target::Function);
     let mut image = Image::new(name(TO), dev(output(true), NO_RESERVATIONS)).unwrap();
     let error = image.stage(first(&start, &g)).err().expect("no start hook to point at");
-    assert!(error.what.contains("`blaze_inproc_start`") && error.what.contains("dev runtime"), "{error}");
+    assert!(
+        error.what.contains("`blaze_inproc_start`") && error.what.contains("dev runtime"),
+        "{error}"
+    );
 
     let shared = Output {
         kind: OutputKind::Shared { name: "libapp.so".into(), exports: Vec::new() },
@@ -130,7 +152,9 @@ fn loads(linked: &Linked) -> Vec<(u64, u64, u64, u32)> {
     file.elf_program_headers()
         .iter()
         .filter(|it| it.p_type(endian) == elf::PT_LOAD)
-        .map(|it| (it.p_vaddr(endian), it.p_memsz(endian), it.p_filesz(endian), it.p_flags(endian).0))
+        .map(|it| {
+            (it.p_vaddr(endian), it.p_memsz(endian), it.p_filesz(endian), it.p_flags(endian).0)
+        })
         .collect()
 }
 
@@ -159,23 +183,40 @@ fn reservations_follow_everything_page_aligned_in_order_and_stay_where_they_are(
 
     let before = reservations(&image);
     let sized: Vec<(Reserve, u64)> = before.iter().map(|it| (it.0, it.2)).collect();
-    let want = [(Reserve::Arena, (3 * PAGE + 1).next_multiple_of(page)), (Reserve::Fixed, (5 * PAGE).next_multiple_of(page))];
+    let want = [
+        (Reserve::Arena, (3 * PAGE + 1).next_multiple_of(page)),
+        (Reserve::Fixed, (5 * PAGE).next_multiple_of(page)),
+    ];
     assert_eq!(sized, want, "rounded up to the page, and no region for the cells' 0");
     let [(_, arena, arena_len), (_, fixed, fixed_len)] = before[..] else { panic!("{before:?}") };
     assert!(arena.is_multiple_of(page) && fixed.is_multiple_of(page), "{arena:#x} {fixed:#x}");
     assert_eq!(arena + arena_len, fixed, "the fixed maps right after the arena");
-    let others = image.state.spaces.iter().filter(|it| !matches!(it.region.class, Class::Reserve(_)));
-    let end = others.map(|it| it.region.addr + it.region.capacity.max(it.region.size)).max().unwrap();
-    assert!(end <= arena, "every other region and its room ({end:#x}) before the reservations ({arena:#x})");
-    let reserved = image.state.spaces.iter().filter(|it| matches!(it.region.class, Class::Reserve(_)));
+    let others =
+        image.state.spaces.iter().filter(|it| !matches!(it.region.class, Class::Reserve(_)));
+    let end =
+        others.map(|it| it.region.addr + it.region.capacity.max(it.region.size)).max().unwrap();
+    assert!(
+        end <= arena,
+        "every other region and its room ({end:#x}) before the reservations ({arena:#x})"
+    );
+    let reserved =
+        image.state.spaces.iter().filter(|it| matches!(it.region.class, Class::Reserve(_)));
     for space in reserved {
-        assert!(space.zero && space.offset.is_none() && space.region.size == 0, "{:?}", space.region);
+        assert!(
+            space.zero && space.offset.is_none() && space.region.size == 0,
+            "{:?}",
+            space.region
+        );
     }
 
     let linked = Linked::of(disk.file(TO));
     let all = loads(&linked);
     let (rest, tail) = all.split_at(all.len() - 2);
-    assert_eq!(tail, [(arena, arena_len, 0, 0), (fixed, fixed_len, 0, 0)], "no access, no file bytes, last");
+    assert_eq!(
+        tail,
+        [(arena, arena_len, 0, 0), (fixed, fixed_len, 0, 0)],
+        "no access, no file bytes, last"
+    );
     assert!(rest.iter().all(|it| it.0 + it.1 <= arena), "{all:x?}");
 
     disk.link(&mut image, edit(&g2)).unwrap();
@@ -187,7 +228,10 @@ fn reservations_follow_everything_page_aligned_in_order_and_stay_where_they_are(
 /// Whether `memory`'s image part holds `file`'s bytes, and zeros past its end.
 fn holds(memory: &CodeMemory, file: &Sparse) -> bool {
     let bytes = memory.bytes(CodeRange { offset: 0, len: memory.image_len() }).unwrap();
-    bytes.chunks(PAGE as usize).enumerate().all(|(page, it)| *it == file.page(page as u64)[..it.len()])
+    bytes
+        .chunks(PAGE as usize)
+        .enumerate()
+        .all(|(page, it)| *it == file.page(page as u64)[..it.len()])
 }
 
 #[test]
@@ -205,9 +249,16 @@ fn a_commit_into_a_code_memory_holds_the_file_and_a_rollback_restores_it() {
     let Some(mut memory) = code_memory("blaze-link-dev-run", 2 * len) else { return };
     let mut small = CodeMemory::new("blaze-link-dev-run-small", 1, 0).unwrap();
     if len > small.image_len() {
-        let error = image.commit_into(staged, &mut small).err().expect("a file past the image part");
+        let error =
+            image.commit_into(staged, &mut small).err().expect("a file past the image part");
         assert!(error.what.contains("image part"), "{error}");
-        assert!(small.bytes(CodeRange { offset: 0, len: small.image_len() }).unwrap().iter().all(|it| *it == 0));
+        assert!(
+            small
+                .bytes(CodeRange { offset: 0, len: small.image_len() })
+                .unwrap()
+                .iter()
+                .all(|it| *it == 0)
+        );
         staged = image.stage(hooked(&start, &g, &hook)).unwrap();
     }
     assert_eq!(image.commit_into(staged, &mut memory), Ok(None), "no program runs the first link");
@@ -216,8 +267,9 @@ fn a_commit_into_a_code_memory_holds_the_file_and_a_rollback_restores_it() {
 
     disk.link(&mut on_disk, edit(&g2)).unwrap();
     let staged = image.stage(edit(&g2)).unwrap();
-    let message =
-        blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || image.commit_into(staged, &mut memory));
+    let message = blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || {
+        image.commit_into(staged, &mut memory)
+    });
     assert!(holds(&memory, disk.file(TO)), "the patch's bytes, as the file commit wrote them");
     assert_eq!(message, Ok(None), "an image that is not live tells no program");
     assert_eq!(image.generation(), on_disk.generation());
@@ -244,26 +296,42 @@ fn a_live_dev_runs_message_names_the_code_its_memory_holds() {
     disk.link(&mut on_disk, hooked(&start, &g, &hook)).unwrap();
 
     let staged = image.stage(hooked(&start, &g, &hook)).unwrap();
-    let Some(mut memory) = code_memory("blaze-link-live-dev-run", 2 * staged.writes.len) else { return };
+    let Some(mut memory) = code_memory("blaze-link-live-dev-run", 2 * staged.writes.len) else {
+        return;
+    };
     assert_eq!(image.commit_into(staged, &mut memory), Ok(None), "no program runs the first link");
     assert!(holds(&memory, disk.file(TO)), "the first link's file, its descriptor in it");
 
     let error = disk.link(&mut on_disk, edit(&g2)).unwrap_err();
-    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
+    assert!(
+        error.what.contains("only through the code memory") && error.what.contains("`commit_into`"),
+        "{error}"
+    );
     assert_eq!(on_disk.generation(), 1, "a refused commit leaves the image as it was");
     let staged = image.stage(edit(&g2)).unwrap();
-    let message =
-        blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || image.commit_into(staged, &mut memory));
+    let message = blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || {
+        image.commit_into(staged, &mut memory)
+    });
     let message = message.unwrap().expect("a message for the programs running generation 1");
     let patch = patch_in(&message, &memory);
     assert_eq!((patch.base, patch.generation), (1, 2));
-    assert!(patch.code.iter().any(|it| (it.len, it.hash) == (6, hash(&returns(2)))), "g2's code: {:?}", patch.code);
+    assert!(
+        patch.code.iter().any(|it| (it.len, it.hash) == (6, hash(&returns(2)))),
+        "g2's code: {:?}",
+        patch.code
+    );
 
     let mut effects = Vec::new();
     let error = image.roll_back(&mut effects).unwrap_err();
     assert!(error.what.contains("`roll_back_into`"), "{error}");
-    assert!(effects.is_empty() && image.generation() == 2, "a refused rollback leaves the image as it was");
-    let message = image.roll_back_into(&mut memory).unwrap().expect("a live image's rollback tells its programs");
+    assert!(
+        effects.is_empty() && image.generation() == 2,
+        "a refused rollback leaves the image as it was"
+    );
+    let message = image
+        .roll_back_into(&mut memory)
+        .unwrap()
+        .expect("a live image's rollback tells its programs");
     assert_eq!(Message::decode(&message), Ok(Message::RollBack { id: patch.id, to: 1 }));
     assert!(holds(&memory, disk.file(TO)), "the first link's file again");
     assert_eq!(image.generation(), 1);

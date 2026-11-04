@@ -17,13 +17,16 @@
 //! (`Visibility::to_string`) and `compiler/rustc_privacy/src/diagnostics.rs`
 //! (`PrivateInterfacesOrBoundsLint`, `InPublicInterface`) (MIT or Apache-2.0).
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 use std::cell::OnceCell;
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::Fact;
 use hir::{AsAssocItem as _, AssocItemContainer, InFile, ModuleDef, PathResolution};
+use std::alloc::Global;
 use syntax::{
     SyntaxKind,
     view::{self as ast, AstNode, HasGenericArgs, HasTypeBounds},
@@ -61,13 +64,18 @@ fn vis_str(cx: &Cx<'_, '_>, vis: Vis, def: Def) -> String {
     }
 }
 
-pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>], effective: &Effective) -> Vec<Found> {
+pub(super) fn lints<'db>(
+    cx: &Cx<'_, 'db>,
+    items: &[Item<'db>],
+    effective: &Effective,
+) -> Vec<Found> {
     // alloc: the pass's output, once per crate
     let mut checker = Checker { cx, effective, found: Vec::new(), seen: HashSet::new_in(Global) };
     let mut at = 0;
     while at < items.len() {
         let module = items[at].module;
-        let end = items[at..].iter().position(|it| it.module != module).map_or(items.len(), |it| at + it);
+        let end =
+            items[at..].iter().position(|it| it.module != module).map_or(items.len(), |it| at + it);
         for (index, item) in items.iter().enumerate().take(end).skip(at) {
             if matches!(item.container, Container::Module) {
                 checker.item(item, item.held(items, index));
@@ -84,7 +92,10 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>], effective: &Effe
 }
 
 /// One `SearchInterfaceForPrivateItemsVisitor`: the item it checks and what it requires.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 struct Check<'i, 'db> {
     item: Def,
     node: InFile<ast::Node<'db>>,
@@ -115,7 +126,10 @@ struct Checker<'c, 'a, 'db> {
 
 impl<'db> Checker<'_, '_, 'db> {
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+    )]
     fn check<'i>(
         &self,
         owner: &'i Item<'db>,
@@ -126,7 +140,18 @@ impl<'db> Checker<'_, '_, 'db> {
         required_ev: Option<Vis>,
     ) -> Check<'i, 'db> {
         let descr = OnceCell::new();
-        Check { item, node, kind, descr, required, required_ev, hard_error: false, primary: true, skip_assoc: false, owner }
+        Check {
+            item,
+            node,
+            kind,
+            descr,
+            required,
+            required_ev,
+            hard_error: false,
+            primary: true,
+            skip_assoc: false,
+            owner,
+        }
     }
 
     /// `check_item`, with `held` the items it holds (its own items among them).
@@ -138,7 +163,10 @@ impl<'db> Checker<'_, '_, 'db> {
         let ev = reachable(self.effective, def);
         let file = item.node.file_id;
         match item.node.value {
-            ast::Item::Const(_) | ast::Item::Static(_) | ast::Item::Fn(_) | ast::Item::TypeAlias(_) => {
+            ast::Item::Const(_)
+            | ast::Item::Static(_)
+            | ast::Item::Fn(_)
+            | ast::Item::TypeAlias(_) => {
                 let mut check = self.check(item, def, node, descr_kind(item, false), vis, ev);
                 self.generics(&mut check, item.node.value);
                 self.clauses(&mut check, item.node.value);
@@ -167,16 +195,20 @@ impl<'db> Checker<'_, '_, 'db> {
                 self.clauses(&mut check, item.node.value);
                 let effective = self.effective;
                 for field in walk::fields(item) {
-                    self.field(item, field, |field| (min(cx, vis, nominal(cx, field)), reachable(effective, field)));
+                    self.field(item, field, |field| {
+                        (min(cx, vis, nominal(cx, field)), reachable(effective, field))
+                    });
                 }
             }
             ast::Item::Impl(imp) => {
                 let Def::Impl(id) = def else { return };
                 let of_trait = imp.trait_().is_some();
                 let defs = effective::impl_defs(cx, id, false);
-                let impl_vis = defs.iter().fold(Vis::Public, |at, it| min(cx, nominal(cx, *it), at));
+                let impl_vis =
+                    defs.iter().fold(Vis::Public, |at, it| min(cx, nominal(cx, *it), at));
                 let impl_ev = self.effective.of_impl(cx, id).at(Level::Reachable);
-                let mut check = self.check(item, def, node, "implementation", impl_vis, Some(impl_ev));
+                let mut check =
+                    self.check(item, def, node, "implementation", impl_vis, Some(impl_ev));
                 if !of_trait {
                     self.generics(&mut check, item.node.value);
                     self.clauses(&mut check, item.node.value);
@@ -218,11 +250,18 @@ impl<'db> Checker<'_, '_, 'db> {
         self.ty(&mut check, item.node.value, None);
     }
 
-    fn field(&mut self, owner: &Item<'db>, field: InFile<ast::Node<'db>>, required: impl FnOnce(Def) -> (Vis, Option<Vis>)) {
+    fn field(
+        &mut self,
+        owner: &Item<'db>,
+        field: InFile<ast::Node<'db>>,
+        required: impl FnOnce(Def) -> (Vis, Option<Vis>),
+    ) {
         let cx = self.cx;
         let def = match field.value.kind() {
-            SyntaxKind::RECORD_FIELD => ast::RecordField::cast(field.value).and_then(|it| cx.vsema.to_def2(field.with_value(it))),
-            _ => ast::TupleField::cast(field.value).and_then(|it| cx.vsema.to_def2(field.with_value(it))),
+            SyntaxKind::RECORD_FIELD => ast::RecordField::cast(field.value)
+                .and_then(|it| cx.vsema.to_def2(field.with_value(it))),
+            _ => ast::TupleField::cast(field.value)
+                .and_then(|it| cx.vsema.to_def2(field.with_value(it))),
         };
         let Some(def) = def else { return };
         let def = Def::Field(def);
@@ -237,7 +276,14 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// `check_assoc_item`: of a trait (`in_trait`) or of an impl whose self type is `impl_self`.
-    fn assoc_item(&mut self, item: &Item<'db>, vis: Vis, ev: Option<Vis>, in_trait: bool, impl_self: Option<ast::Type<'db>>) {
+    fn assoc_item(
+        &mut self,
+        item: &Item<'db>,
+        vis: Vis,
+        ev: Option<Vis>,
+        in_trait: bool,
+        impl_self: Option<ast::Type<'db>>,
+    ) {
         let cx = self.cx;
         let Some(def) = visibility::def(cx, item) else { return };
         let is_assoc_ty = matches!(item.node.value, ast::Item::TypeAlias(_));
@@ -268,7 +314,9 @@ impl<'db> Checker<'_, '_, 'db> {
     /// `generics()`: the types of const parameters and the defaults of parameters.
     fn generics(&mut self, check: &mut Check<'_, 'db>, node: ast::Item<'db>) {
         check.primary = true;
-        let Some(params) = node.syntax().children().find_map(ast::GenericParamList::cast) else { return };
+        let Some(params) = node.syntax().children().find_map(ast::GenericParamList::cast) else {
+            return;
+        };
         let file = check.node.file_id;
         let mut aliases = HashSet::new_in(Global);
         for param in params.generic_params() {
@@ -313,7 +361,8 @@ impl<'db> Checker<'_, '_, 'db> {
             }
         }
         if let ast::Item::Fn(f) = node {
-            for ty in f.param_list().into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty()) {
+            for ty in f.param_list().into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty())
+            {
                 for apit in ty.syntax().descendants().filter_map(ast::ImplTraitType::cast) {
                     for bound in apit.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
                         self.visit(check, InFile::new(file, bound.syntax()), false, &mut aliases);
@@ -324,7 +373,12 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// `ty()`: a function's signature (and its impl's self type), else the item's type.
-    fn ty(&mut self, check: &mut Check<'_, 'db>, node: ast::Item<'db>, impl_self: Option<InFile<ast::Node<'db>>>) {
+    fn ty(
+        &mut self,
+        check: &mut Check<'_, 'db>,
+        node: ast::Item<'db>,
+        impl_self: Option<InFile<ast::Node<'db>>>,
+    ) {
         check.primary = true;
         let file = check.node.file_id;
         let mut aliases = HashSet::new_in(Global);
@@ -365,7 +419,13 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// The defs a type (or a bound) names, in the order rustc's skeleton visits them.
-    fn visit(&mut self, check: &Check<'_, 'db>, node: InFile<ast::Node<'db>>, skip_impl_trait: bool, aliases: &mut HashSet<hir::TypeAlias, Global>) {
+    fn visit(
+        &mut self,
+        check: &Check<'_, 'db>,
+        node: InFile<ast::Node<'db>>,
+        skip_impl_trait: bool,
+        aliases: &mut HashSet<hir::TypeAlias, Global>,
+    ) {
         let cx = self.cx;
         let mut walk = node.value.preorder();
         while let Some(event) = walk.next() {
@@ -394,7 +454,12 @@ impl<'db> Checker<'_, '_, 'db> {
                         && let Some(alias_node) = cx.vsema.source(alias)
                         && let Some(aliased) = alias_node.value.ty()
                     {
-                        self.visit(check, alias_node.with_value(aliased.syntax()), skip_impl_trait, aliases);
+                        self.visit(
+                            check,
+                            alias_node.with_value(aliased.syntax()),
+                            skip_impl_trait,
+                            aliases,
+                        );
                     }
                     if let Some(args) = path.segment().and_then(|it| it.generic_arg_list()) {
                         self.visit(check, node.with_value(args.syntax()), skip_impl_trait, aliases);
@@ -408,7 +473,9 @@ impl<'db> Checker<'_, '_, 'db> {
                     self.def_id(check, Def::Item(def), "type", descr);
                 }
                 Some(PathResolution::Def(ModuleDef::Trait(tr))) => {
-                    self.def_id(check, Def::Item(ModuleDef::Trait(tr)), "trait", || trait_descr(cx, tr, path));
+                    self.def_id(check, Def::Item(ModuleDef::Trait(tr)), "trait", || {
+                        trait_descr(cx, tr, path)
+                    });
                 }
                 _ => {}
             }
@@ -417,15 +484,25 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// `<T as Trait>::Assoc` (or `T::Assoc`): the associated type, its trait, then `T` and the
     /// trait's arguments.
-    fn projection(&mut self, check: &Check<'_, 'db>, path: InFile<ast::Path<'db>>, alias: hir::TypeAlias, aliases: &mut HashSet<hir::TypeAlias, Global>) {
+    fn projection(
+        &mut self,
+        check: &Check<'_, 'db>,
+        path: InFile<ast::Path<'db>>,
+        alias: hir::TypeAlias,
+        aliases: &mut HashSet<hir::TypeAlias, Global>,
+    ) {
         let cx = self.cx;
         let def = ModuleDef::TypeAlias(alias);
         self.def_id(check, Def::Item(def), "associated type", || cx.def_path(def));
-        let Some(AssocItemContainer::Trait(tr)) = alias.as_assoc_item(cx.db).map(|it| it.container(cx.db)) else {
+        let Some(AssocItemContainer::Trait(tr)) =
+            alias.as_assoc_item(cx.db).map(|it| it.container(cx.db))
+        else {
             return;
         };
-        let anchor = path.value.qualifier().and_then(|it| it.segment()).and_then(|it| it.type_anchor());
-        let mut types = anchor.iter().flat_map(|it| it.syntax().children().filter_map(ast::Type::cast));
+        let anchor =
+            path.value.qualifier().and_then(|it| it.segment()).and_then(|it| it.type_anchor());
+        let mut types =
+            anchor.iter().flat_map(|it| it.syntax().children().filter_map(ast::Type::cast));
         let self_ty = types.next();
         let trait_path = match types.next() {
             Some(ast::Type::PathType(it)) => it.path(),
@@ -439,14 +516,22 @@ impl<'db> Checker<'_, '_, 'db> {
         if let Some(self_ty) = &self_ty {
             self.visit(check, path.with_value(self_ty.syntax()), false, aliases);
         }
-        if let Some(args) = trait_path.and_then(|it| it.segment()).and_then(|it| it.generic_arg_list()) {
+        if let Some(args) =
+            trait_path.and_then(|it| it.segment()).and_then(|it| it.generic_arg_list())
+        {
             self.visit(check, path.with_value(args.syntax()), false, aliases);
         }
     }
 
     /// `check_def_id`: the error or the lint of a def named in the interface of `check.item`.
     /// What a lint must print is printed only once it fires.
-    fn def_id(&mut self, check: &Check<'_, 'db>, def: Def, kind: &str, descr: impl FnOnce() -> String) {
+    fn def_id(
+        &mut self,
+        check: &Check<'_, 'db>,
+        def: Def,
+        kind: &str,
+        descr: impl FnOnce() -> String,
+    ) {
         let cx = self.cx;
         if !is_local(cx, def) {
             return;
@@ -484,10 +569,16 @@ impl<'db> Checker<'_, '_, 'db> {
         let mut diag = Diag::lint(lint, message, item_span.clone()); // clone: the span of a lint that fires
         let item_vis = vis_str(cx, ev, check.item);
         // alloc: a lint that fires
-        diag.span_label(item_span, format!("{} `{item_descr}` is reachable at visibility `{item_vis}`", check.kind));
+        diag.span_label(
+            item_span,
+            format!("{} `{item_descr}` is reachable at visibility `{item_vis}`", check.kind),
+        );
         let def_vis = vis_str(cx, vis, def);
         // alloc: a lint that fires
-        diag.span_note(vis_span, format!("but {kind} `{descr}` is only usable at visibility `{def_vis}`"));
+        diag.span_note(
+            vis_span,
+            format!("but {kind} `{descr}` is only usable at visibility `{def_vis}`"),
+        );
         self.fact(check, &mut diag);
         let at = check.node.map(ast::ptr);
         self.push(Found::lint(diag, Phase::Late, at));
@@ -502,7 +593,13 @@ impl<'db> Checker<'_, '_, 'db> {
     fn push(&mut self, found: Found) {
         let diag = &found.diag;
         // alloc: the key of a diagnostic that fires, to emit it once
-        let key = format!("{}|{}|{:?}|{:?}", diag.message, diag.code.as_ref().map_or("", |it| it.as_str()), diag.span, diag.children);
+        let key = format!(
+            "{}|{}|{:?}|{:?}",
+            diag.message,
+            diag.code.as_ref().map_or("", |it| it.as_str()),
+            diag.span,
+            diag.children
+        );
         if self.seen.insert(key) {
             self.found.push(found);
         }
@@ -592,8 +689,12 @@ fn descr_kind(item: &Item<'_>, assoc: bool) -> &'static str {
 /// The syntax of a def, for its `def_span`, read only for a diagnostic that fires.
 fn source<'db>(cx: &Cx<'_, 'db>, def: Def) -> Option<InFile<ast::Node<'db>>> {
     match def {
-        Def::Item(ModuleDef::EnumVariant(it)) => cx.vsema.source(it).map(|it| it.map(|it| it.syntax())),
-        Def::Item(ModuleDef::Module(it)) => it.declaration_source_view(cx.db).map(|it| it.map(|it| it.syntax())),
+        Def::Item(ModuleDef::EnumVariant(it)) => {
+            cx.vsema.source(it).map(|it| it.map(|it| it.syntax()))
+        }
+        Def::Item(ModuleDef::Module(it)) => {
+            it.declaration_source_view(cx.db).map(|it| it.map(|it| it.syntax()))
+        }
         _ => visibility::interface_node(cx, def),
     }
 }

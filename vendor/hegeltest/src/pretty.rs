@@ -213,10 +213,7 @@ impl Document {
     /// Create an empty document with the default layout options (a maximum
     /// line width of 79 characters).
     pub fn new() -> Self {
-        Document {
-            max_width: DEFAULT_MAX_WIDTH,
-            printer: None,
-        }
+        Document { max_width: DEFAULT_MAX_WIDTH, printer: None }
     }
 
     /// Keep lines within `max_width` characters where the group structure
@@ -285,9 +282,7 @@ pub struct PrettyPrinter {
 
 impl std::fmt::Debug for PrettyPrinter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrettyPrinter")
-            .field("handle", &self.handle)
-            .finish()
+        f.debug_struct("PrettyPrinter").field("handle", &self.handle).finish()
     }
 }
 
@@ -303,10 +298,7 @@ impl PrettyPrinter {
     /// [`should_print`](PrettyPrinter::should_print) so the silent path
     /// stays cheap.
     pub fn noop() -> Self {
-        PrettyPrinter {
-            handle: None,
-            _single_owner: PhantomData,
-        }
+        PrettyPrinter { handle: None, _single_owner: PhantomData }
     }
 
     /// Whether printing to this printer produces output: `false` for the
@@ -321,10 +313,7 @@ impl PrettyPrinter {
     /// Wrap an existing engine printer handle (e.g. a test case's shared
     /// document).
     pub(crate) fn from_handle(handle: PrinterHandle) -> Self {
-        PrettyPrinter {
-            handle: Some(handle),
-            _single_owner: PhantomData,
-        }
+        PrettyPrinter { handle: Some(handle), _single_owner: PhantomData }
     }
 
     /// Emit literal, unbreakable text.
@@ -505,8 +494,7 @@ impl PrettyPrinter {
     /// content (an unbalanced `end_group` that could only be detected once
     /// the whole document was assembled).
     pub(crate) fn value(&mut self) -> String {
-        self.try_value()
-            .unwrap_or_else(|message| panic!("{message}"))
+        self.try_value().unwrap_or_else(|message| panic!("{message}"))
     }
 
     /// [`value`](PrettyPrinter::value), reporting a layout error in the
@@ -541,10 +529,7 @@ impl PrettyPrinter {
         if let Some(handle) = &self.handle {
             tolerate(handle.begin_speculative());
         }
-        Speculation {
-            printer: self,
-            resolved: false,
-        }
+        Speculation { printer: self, resolved: false }
     }
 }
 
@@ -576,10 +561,7 @@ impl Clone for PrettyPrinter {
                 Err(PrinterCallError::Other(message)) => unreachable!("{message}"),
             },
         };
-        PrettyPrinter {
-            handle,
-            _single_owner: PhantomData,
-        }
+        PrettyPrinter { handle, _single_owner: PhantomData }
     }
 }
 

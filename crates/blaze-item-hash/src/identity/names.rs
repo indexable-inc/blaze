@@ -34,7 +34,6 @@
 use base_db::Db;
 use blaze_format::cursor::Put;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use blaze_query::db::AsId;
@@ -57,6 +56,7 @@ use hir_def::{
 };
 use hir_expand::{mod_path::ModPath, name::AsName};
 use la_arena::RawIdx;
+use std::alloc::Global;
 
 use super::item::{Part, SELF, item_part, own_item, self_part, variant_part};
 
@@ -131,14 +131,7 @@ fn write(
     let base = def.resolver(db);
     let mut resolver = def.resolver(db);
     let mut walk = Walk {
-        out: Out {
-            db,
-            bytes: names,
-            own: own_item(def),
-            targets,
-            seen,
-            resolved: usize::MAX,
-        },
+        out: Out { db, bytes: names, own: own_item(def), targets, seen, resolved: usize::MAX },
         traits: Traits { db, out: traits, seen: scratch::lend_u32s() },
         pats: scratch::lend_u32s(),
         types: scratch::lend_u32s(),
@@ -213,9 +206,7 @@ impl Walk<'_, '_> {
             if let Some(pat) = self.pats.pop() {
                 let pat = PatId::from_raw(RawIdx::from_u32(pat));
                 match store.pat(pat) {
-                    Pat::Path(path)
-                    | Pat::TupleStruct { path, .. }
-                    | Pat::Record { path, .. } => {
+                    Pat::Path(path) | Pat::TupleStruct { path, .. } | Pat::Record { path, .. } => {
                         self.path(store, at, also, path, store.pat_path_hygiene(pat))?
                     }
                     _ => {}

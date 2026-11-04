@@ -51,7 +51,8 @@ enum Kind {
 fn kind(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Kind> {
     let db = cx.db();
     let adt = ty.as_adt()?;
-    let item = |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+    let item =
+        |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
     if item("Vec") {
         return Some(Kind::Vec);
     }
@@ -91,7 +92,10 @@ pub(super) fn covers(cx: &Cx<'_, '_>, field: FieldId, ty: &hir::Type<'_>) -> boo
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -111,7 +115,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         }
         let ty = field.ty(db);
         let Some((kind, most)) = bounded(cx, FieldId::from(field), &ty) else { continue };
-        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else { continue };
+        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else {
+            continue;
+        };
         let Some(range) = cx.range(node) else { continue };
         if most == 0 {
             // Built empty everywhere and never changed: an inline buffer of no items is no
@@ -148,7 +154,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             ),
             Kind::Vec => (
                 "elements",
-                format!("`[T; {most}]` when always full, `arrayvec::ArrayVec<T, {most}>` or `smallvec::SmallVec<[T; {most}]>`"),
+                format!(
+                    "`[T; {most}]` when always full, `arrayvec::ArrayVec<T, {most}>` or `smallvec::SmallVec<[T; {most}]>`"
+                ),
             ),
         };
         let message = format!(
@@ -173,7 +181,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
 /// The struct's type parameters that the field at `index` (of type `ty`) is the only field to
 /// use, written as a list ("`T`", "`T` and `U`"): removing the field would leave them unused
 /// (E0392), so it becomes a `PhantomData`. None when every one is used by another field too.
-fn only_user_of(db: &base_db::Db, def: hir::Struct, index: usize, ty: &hir::Type<'_>) -> Option<String> {
+fn only_user_of(
+    db: &base_db::Db,
+    def: hir::Struct,
+    index: usize,
+    ty: &hir::Type<'_>,
+) -> Option<String> {
     let mut carried: Vec<hir::GenericParam> = ty.generic_params(db).into_iter().collect(); // alloc: a few params, on a finding
     if carried.is_empty() {
         return None;
@@ -184,7 +197,8 @@ fn only_user_of(db: &base_db::Db, def: hir::Struct, index: usize, ty: &hir::Type
             carried.retain(|it| !used.contains(it));
         }
     }
-    let mut names: Vec<String> = carried.iter().map(|it| format!("`{}`", it.name(db).as_str())).collect(); // alloc: a finding's help
+    let mut names: Vec<String> =
+        carried.iter().map(|it| format!("`{}`", it.name(db).as_str())).collect(); // alloc: a finding's help
     names.sort_unstable();
     match names.as_slice() {
         [] => None,
@@ -195,7 +209,12 @@ fn only_user_of(db: &base_db::Db, def: hir::Struct, index: usize, ty: &hir::Type
 
 /// What the `PhantomData` of an always-empty `ty` holds: a `Vec<T>`'s `T` (a `String` has no
 /// type to carry, so it is never asked for).
-fn phantom_of(db: &base_db::Db, kind: Kind, ty: &hir::Type<'_>, target: hir::DisplayTarget) -> String {
+fn phantom_of(
+    db: &base_db::Db,
+    kind: Kind,
+    ty: &hir::Type<'_>,
+    target: hir::DisplayTarget,
+) -> String {
     match (kind, ty.type_arguments().next()) {
         (Kind::Vec, Some(element)) => element.display(db, target).to_string(), // alloc: a finding's help, once
         _ => ty.display(db, target).to_string(), // alloc: a finding's help, once

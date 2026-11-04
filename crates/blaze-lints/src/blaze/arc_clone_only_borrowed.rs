@@ -27,7 +27,10 @@ use base_db::Db;
 use hir_def::{
     DefWithBodyId,
     expr_store::Body,
-    hir::{BinaryOp, BindingAnnotation, BindingId, Expr, ExprId, Pat, Statement, UnaryOp, type_ref::{Mutability, Rawness}},
+    hir::{
+        BinaryOp, BindingAnnotation, BindingId, Expr, ExprId, Pat, Statement, UnaryOp,
+        type_ref::{Mutability, Rawness},
+    },
     resolver::ValueNs,
     signatures::FunctionSignature,
 };
@@ -84,9 +87,15 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
         }
         if let Some(part) = fix {
             // alloc: the fix's one part
-            diagnostic.multipart_suggestion("borrow the `Arc` you have", vec![part], Applicability::MachineApplicable);
+            diagnostic.multipart_suggestion(
+                "borrow the `Arc` you have",
+                vec![part],
+                Applicability::MachineApplicable,
+            );
         }
-        diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
+        diagnostic
+            .help(LINT.help())
+            .help(format!("for further information visit {}", LINT.docs_url()));
     }
 }
 
@@ -114,7 +123,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
     let Some(analysis) = cx.analysis() else { return found };
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let db = cx.db();
-    let Some(arc) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("Arc")) else { return found };
+    let Some(arc) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("Arc")) else {
+        return found;
+    };
     let body = analysis.body();
     let infer = analysis.infer();
     let mut parents = None;
@@ -132,8 +143,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
             "clone" if analysis.ty(infer.expr_ty(id)).as_adt() == Some(arc) => Made::Arc,
             "load_full"
                 if method
-                    && facts::impl_adt(db, callee)
-                        .is_some_and(|it| facts::crate_is(db, it.module(db).krate(db), "arc_swap")) =>
+                    && facts::impl_adt(db, callee).is_some_and(|it| {
+                        facts::crate_is(db, it.module(db).krate(db), "arc_swap")
+                    }) =>
             {
                 Made::LoadFull
             }
@@ -155,7 +167,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
             (Made::Arc, false) => "this `Arc::clone`",
             (Made::LoadFull, _) => "this `load_full()`",
         };
-        let message = format!("{what} is only borrowed ({uses}): it pays two atomic updates of the shared count for nothing");
+        let message = format!(
+            "{what} is only borrowed ({uses}): it pays two atomic updates of the shared count for nothing"
+        );
         let mut note = match made {
             Made::Arc => "borrow through the `Arc` it was cloned from (`&*x`, or call the method on `x`): the `Arc` \
                           stays alive while the borrow lasts, and no count is touched"
@@ -186,7 +200,8 @@ impl Walk<'_, '_> {
         match &first.kind {
             Adjust::Deref(Some(deref)) if !deref.0.is_mut() => Some(Borrow::Value),
             Adjust::Borrow(AutoBorrow::Ref(_)) => {
-                (!self.analysis.ty(first.target.as_ref()).is_mutable_reference()).then_some(Borrow::Other)
+                (!self.analysis.ty(first.target.as_ref()).is_mutable_reference())
+                    .then_some(Borrow::Other)
             }
             _ => None,
         }
@@ -196,7 +211,9 @@ impl Walk<'_, '_> {
     fn borrowed_at(&self, at: ExprId) -> Option<Borrow> {
         let parent = self.parents.of_expr(at)?;
         match self.body.expr(parent) {
-            Expr::Ref { expr, rawness: Rawness::Ref, mutability: Mutability::Shared } if expr == at => {
+            Expr::Ref { expr, rawness: Rawness::Ref, mutability: Mutability::Shared }
+                if expr == at =>
+            {
                 // `&*y` reads the value; `&y` borrows the `Arc`.
                 Some(Borrow::Other)
             }
@@ -230,9 +247,9 @@ impl Walk<'_, '_> {
             return Some(("used once, inline", false));
         };
         let (pat, typed) = statements.iter().find_map(|it| match it {
-            Statement::Let { pat, initializer: Some(init), else_branch: None, type_ref, .. } if init == clone => {
-                Some((pat, type_ref.is_some()))
-            }
+            Statement::Let {
+                pat, initializer: Some(init), else_branch: None, type_ref, ..
+            } if init == clone => Some((pat, type_ref.is_some())),
             _ => None,
         })?;
         let Pat::Bind { id: local, subpat: None } = self.body.pat(pat) else { return None };
@@ -261,7 +278,9 @@ impl Walk<'_, '_> {
         // alloc: the uses of one local, a few
         let mut uses = Vec::new();
         for (id, expr) in self.body.exprs() {
-            if matches!(expr, Expr::Path(_)) && local_of(self.db, self.def, self.body, id) == Some(local) {
+            if matches!(expr, Expr::Path(_))
+                && local_of(self.db, self.def, self.body, id) == Some(local)
+            {
                 uses.push(id);
             }
         }
@@ -308,17 +327,15 @@ impl Walk<'_, '_> {
             }
             let Some(clone_range) = self.analysis.expr_range(clone) else { return false };
             return self.uses(local).into_iter().all(|it| {
-                let inside = self.analysis.expr_range(it).is_some_and(|r| clone_range.contains_range(r));
+                let inside =
+                    self.analysis.expr_range(it).is_some_and(|r| clone_range.contains_range(r));
                 inside || self.place_borrowed(it)
             });
         }
         let Expr::Path(path) = self.body.expr(root) else { return false };
         let scope = hir_def::expr_store::scope::ExprScopes::of(self.db, self.def).scope_for(root);
-        let value = hir_def::resolver::resolver_for_scope(self.db, self.def, scope).resolve_path_in_value_ns_fully(
-            self.db,
-            path,
-            self.body.expr_path_hygiene(root),
-        );
+        let value = hir_def::resolver::resolver_for_scope(self.db, self.def, scope)
+            .resolve_path_in_value_ns_fully(self.db, path, self.body.expr_path_hygiene(root));
         matches!(value, Some(ValueNs::StaticId(it)) if !hir::Static::from(it).is_mut(self.db))
     }
 
@@ -328,7 +345,9 @@ impl Walk<'_, '_> {
         for _ in 0..PLACE {
             let Some(parent) = self.parents.of_expr(at) else { return false };
             match self.body.expr(parent) {
-                Expr::Field { expr, .. } if expr == at && self.adjusted(at).is_none() => at = parent,
+                Expr::Field { expr, .. } if expr == at && self.adjusted(at).is_none() => {
+                    at = parent
+                }
                 _ => return self.borrowed_at(at).is_some(),
             }
         }
@@ -341,7 +360,10 @@ impl Walk<'_, '_> {
         let file = self.analysis.tree().1;
         let source_map = self.analysis.source_map();
         let written = |it: ExprId| source_map.expr_syntax(it).is_ok_and(|it| it.file_id == file);
-        if !written(source) || !written(clone) || !matches!(self.body.expr(source), Expr::Path(_) | Expr::Field { .. }) {
+        if !written(source)
+            || !written(clone)
+            || !matches!(self.body.expr(source), Expr::Path(_) | Expr::Field { .. })
+        {
             return None;
         }
         let mut ty = self.analysis.ty(self.analysis.infer().expr_ty(source));
@@ -350,7 +372,8 @@ impl Walk<'_, '_> {
             ty = inner;
             stars += 1;
         }
-        let text = format!("&{}{}", "*".repeat(stars), cx.snippet(self.analysis.expr_range(source)?));
+        let text =
+            format!("&{}{}", "*".repeat(stars), cx.snippet(self.analysis.expr_range(source)?));
         Some((self.analysis.expr_range(clone)?, text))
     }
 }
@@ -387,6 +410,9 @@ fn take(config: Arc<Config>) -> u32 { config.limit }
         );
         assert_eq!(found.matches(FOUND).count(), 1, "{found}");
         assert!(found.contains("this `.clone()` of an `Arc` is only borrowed"), "{found}");
-        assert!(found.contains("let config = &**shared;"), "the clone is fixed to a borrow:\n{found}");
+        assert!(
+            found.contains("let config = &**shared;"),
+            "the clone is fixed to a borrow:\n{found}"
+        );
     }
 }

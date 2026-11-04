@@ -119,10 +119,8 @@ fn reborrow_stable<'t>(cx: &Cx<'_, 't>, used: ast::Node<'t>, parent: ast::Node<'
                 .map(|it| it.ty().clone()),
             Some(ast::Expr::CallExpr(call)) => {
                 // `Semantics::resolve_expr_as_callable`: the callee's type as adjusted.
-                let Some(callable) = call
-                    .expr()
-                    .and_then(|it| cx.adjusted_ty(it))
-                    .and_then(|it| it.as_callable(db))
+                let Some(callable) =
+                    call.expr().and_then(|it| cx.adjusted_ty(it)).and_then(|it| it.as_callable(db))
                 else {
                     return false;
                 };
@@ -260,8 +258,14 @@ pub(super) fn check_ref_pat<'t>(cx: &mut Cx<'_, 't>, pat: ast::IdentPat<'t>) {
         parts.push((shared.span(range), shared.snippet(name).to_owned()));
     }
     parts.extend(derefs.into_iter().map(|(at, text)| (cx.span(at), text.to_owned())));
-    cx.lint_after(LINT, pat.syntax(), body, span, "this pattern creates a reference to a reference")
-        .multipart_suggestion("try", parts, Applicability::MachineApplicable);
+    cx.lint_after(
+        LINT,
+        pat.syntax(),
+        body,
+        span,
+        "this pattern creates a reference to a reference",
+    )
+    .multipart_suggestion("try", parts, Applicability::MachineApplicable);
 }
 
 /// The body and, for a closure or a function, its parameters: where its bindings are.

@@ -144,8 +144,19 @@ mod tests {
     fn skipping_unwatched_tokens_keeps_every_answer() {
         let mut rng = SplitMix64::new(17);
         let kinds = [
-            T!['{'], T!['}'], T!['['], T![']'], T![#], T![<], OUTER_DOC_COMMENT, IDENT, T![;], T![fn],
-            SyntaxKind::INT_NUMBER, T![,], T![>],
+            T!['{'],
+            T!['}'],
+            T!['['],
+            T![']'],
+            T![#],
+            T![<],
+            OUTER_DOC_COMMENT,
+            IDENT,
+            T![;],
+            T![fn],
+            SyntaxKind::INT_NUMBER,
+            T![,],
+            T![>],
         ];
         for _ in 0..4000 {
             let mut input = Input::with_capacity(40);

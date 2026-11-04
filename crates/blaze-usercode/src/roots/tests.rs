@@ -26,8 +26,14 @@ struct Disk {
 impl Disk {
     fn of(home: &str, source: &[u8]) -> Disk {
         let mut files = BTreeMap::new();
-        files.insert(PathBuf::from(format!("{home}/ws/p/build.rs")), ContentId::of("test file", b"fn main() {}").0);
-        files.insert(PathBuf::from(format!("{home}/ws/p/src/lib.c")), ContentId::of("test file", source).0);
+        files.insert(
+            PathBuf::from(format!("{home}/ws/p/build.rs")),
+            ContentId::of("test file", b"fn main() {}").0,
+        );
+        files.insert(
+            PathBuf::from(format!("{home}/ws/p/src/lib.c")),
+            ContentId::of("test file", source).0,
+        );
         let env = vec![
             ("CARGO_MANIFEST_DIR".into(), format!("{home}/ws/p").into()),
             ("OUT_DIR".into(), format!("{home}/ws/target/debug/build/p-1/out").into()),
@@ -40,7 +46,11 @@ impl Disk {
 impl Inputs for Disk {
     type Error = String;
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
-        Ok(self.files.get(path).copied().or_else(|| self.files.keys().any(|it| it.starts_with(path)).then_some(DIRECTORY)))
+        Ok(self
+            .files
+            .get(path)
+            .copied()
+            .or_else(|| self.files.keys().any(|it| it.starts_with(path)).then_some(DIRECTORY)))
     }
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
         let names: Vec<&OsStr> =
@@ -66,11 +76,18 @@ impl Inputs for Disk {
 fn key(home: &str, map: &RootMap) -> RunKey {
     let roots = map.view();
     let mut given = Given::new(RunKind::BuildScript);
-    for (name, value) in [("CARGO_MANIFEST_DIR", format!("{home}/ws/p")), ("OUT_DIR", format!("{home}/ws/target/debug/build/p-1/out"))] {
+    for (name, value) in [
+        ("CARGO_MANIFEST_DIR", format!("{home}/ws/p")),
+        ("OUT_DIR", format!("{home}/ws/target/debug/build/p-1/out")),
+    ] {
         given.env(name, roots.os(OsStr::new(&value)).into_owned());
     }
     given.roots(&roots);
-    given.ported("program", format!("{home}/ws/target/debug/build/p-0/build-script-build").as_bytes(), &roots);
+    given.ported(
+        "program",
+        format!("{home}/ws/target/debug/build/p-0/build-script-build").as_bytes(),
+        &roots,
+    );
     given.ported("dir", format!("{home}/ws/p").as_bytes(), &roots);
     RunKey { code: ContentId::of("test code", b"script"), given: given.finish() }
 }
@@ -95,8 +112,17 @@ fn kept(run: &RunKey, traced: &Traced, value: &[u8]) -> BTreeMap<Key, Vec<u8>> {
     store
 }
 
-fn found(store: &BTreeMap<Key, Vec<u8>>, run: &RunKey, map: &RootMap, disk: &mut Disk) -> Option<Vec<u8>> {
-    let found = index::search(|key| Ok(store.get(key).map(Vec::as_slice)), run, &mut Rooted::new(map.view(), disk));
+fn found(
+    store: &BTreeMap<Key, Vec<u8>>,
+    run: &RunKey,
+    map: &RootMap,
+    disk: &mut Disk,
+) -> Option<Vec<u8>> {
+    let found = index::search(
+        |key| Ok(store.get(key).map(Vec::as_slice)),
+        run,
+        &mut Rooted::new(map.view(), disk),
+    );
     match found.expect("the check reads the disk") {
         Found::Hit { value, .. } => Some(value.to_vec()),
         Found::Miss { .. } => None,
@@ -108,7 +134,8 @@ fn two_checkouts_at_different_paths_give_one_key() {
     let (a, b) = (checkout("/home/a"), checkout("/srv/b/c"));
     assert_eq!(key("/home/a", &a), key("/srv/b/c", &b));
     let (disk_a, mut disk_b) = (Disk::of("/home/a", b"int x;"), Disk::of("/srv/b/c", b"int x;"));
-    let (ported_a, ported_b) = (a.view().traced(&read("/home/a", &disk_a)), b.view().traced(&read("/srv/b/c", &disk_b)));
+    let (ported_a, ported_b) =
+        (a.view().traced(&read("/home/a", &disk_a)), b.view().traced(&read("/srv/b/c", &disk_b)));
     assert_eq!(ported_a, ported_b);
     let run = key("/home/a", &a);
     assert_eq!(run.traced(&ported_a), run.traced(&ported_b));
@@ -160,11 +187,20 @@ fn a_value_that_embeds_a_root_is_found_only_where_that_root_is() {
     let run = key("/home/a", &a);
     let store = kept(&run, &traced, b"value");
     // Found again where the package is.
-    assert_eq!(found(&store, &run, &a, &mut Disk::of("/home/a", b"int x;")), Some(b"value".to_vec()));
+    assert_eq!(
+        found(&store, &run, &a, &mut Disk::of("/home/a", b"int x;")),
+        Some(b"value".to_vec())
+    );
     // Never in a checkout whose package is elsewhere.
     assert_eq!(found(&store, &key("/srv/b", &b), &b, &mut Disk::of("/srv/b", b"int x;")), None);
     // What it printed is this checkout's when it is reused.
-    assert!(b.view().restored(stored).unwrap().stdout.starts_with(b"cargo:rustc-link-search=/srv/b/ws/target/debug/build/p-1/out\n"));
+    assert!(
+        b.view()
+            .restored(stored)
+            .unwrap()
+            .stdout
+            .starts_with(b"cargo:rustc-link-search=/srv/b/ws/target/debug/build/p-1/out\n")
+    );
 }
 
 #[test]
@@ -197,18 +233,26 @@ fn a_path_is_written_against_the_nearest_root_by_whole_names() {
     let map = checkout("/home/a");
     let roots = map.view();
     assert_eq!(&*roots.path(Path::new("/home/a/ws/p/build.rs")), Path::new("\0p/build.rs"));
-    assert_eq!(&*roots.path(Path::new("/home/a/ws/target/debug/build/p-1/out/x")), Path::new("\0o/x"));
+    assert_eq!(
+        &*roots.path(Path::new("/home/a/ws/target/debug/build/p-1/out/x")),
+        Path::new("\0o/x")
+    );
     assert_eq!(&*roots.path(Path::new("/home/a/ws/pq")), Path::new("\0w/pq"));
     assert_eq!(&*roots.path(Path::new("/usr/include/stdio.h")), Path::new("/usr/include/stdio.h"));
     let other = checkout("/srv/b");
-    assert_eq!(&*other.view().real_path(Path::new("\0p/build.rs")).unwrap(), Path::new("/srv/b/ws/p/build.rs"));
+    assert_eq!(
+        &*other.view().real_path(Path::new("\0p/build.rs")).unwrap(),
+        Path::new("/srv/b/ws/p/build.rs")
+    );
     assert!(RootMap::default().view().real_path(Path::new("\0p/build.rs")).is_err());
     assert!(other.view().real_path(Path::new("\0pq")).is_err());
 }
 
 #[test]
 fn a_root_that_is_not_absolute_or_is_the_file_systems_names_none() {
-    let map = RootMap::default().with(Role::Package, Path::new("ws/p")).with(Role::Workspace, Path::new("/"));
+    let map = RootMap::default()
+        .with(Role::Package, Path::new("ws/p"))
+        .with(Role::Workspace, Path::new("/"));
     assert!(map.view().is_empty());
 }
 
@@ -219,20 +263,41 @@ fn a_root_that_is_not_absolute_or_is_the_file_systems_names_none() {
 fn a_read_outside_the_roots_is_not_shared() {
     let (a, b) = (checkout("/home/a"), checkout("/srv/b"));
     let mut disk_a = Disk::of("/home/a", b"int x;");
-    disk_a.files.insert(PathBuf::from("/home/proto/x.proto"), ContentId::of("test file", b"message X {}").0);
-    disk_a.files.insert(PathBuf::from("/usr/include/stdio.h"), ContentId::of("test file", b"int printf();").0);
-    let value = Value { code: Some(0), signal: None, stdout: Vec::new(), stderr: Vec::new(), files: Vec::new() };
+    disk_a.files.insert(
+        PathBuf::from("/home/proto/x.proto"),
+        ContentId::of("test file", b"message X {}").0,
+    );
+    disk_a.files.insert(
+        PathBuf::from("/usr/include/stdio.h"),
+        ContentId::of("test file", b"int printf();").0,
+    );
+    let value = Value {
+        code: Some(0),
+        signal: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        files: Vec::new(),
+    };
     let (kept, _) = a.view().kept(&read("/home/a", &disk_a), &value).unwrap();
     assert!(kept.shared.is_none(), "no copy for another checkout to verify");
     let run = key("/home/a", &a);
     let store = kept_store(&run, &kept.local);
     let mut disk_b = Disk::of("/srv/b", b"int x;");
-    disk_b.files.extend(disk_a.files.iter().filter(|it| !it.0.starts_with("/home/a")).map(|(path, hash)| (path.clone(), *hash)));
+    disk_b.files.extend(
+        disk_a
+            .files
+            .iter()
+            .filter(|it| !it.0.starts_with("/home/a"))
+            .map(|(path, hash)| (path.clone(), *hash)),
+    );
     assert_eq!(found(&store, &key("/srv/b", &b), &b, &mut disk_b), None);
     assert!(found(&store, &run, &a, &mut disk_a).is_some(), "found again where its roots are");
     // A read in a machine-wide place alone leaves a copy for another checkout to verify.
     let mut system = Disk::of("/home/a", b"int x;");
-    system.files.insert(PathBuf::from("/usr/include/stdio.h"), ContentId::of("test file", b"int printf();").0);
+    system.files.insert(
+        PathBuf::from("/usr/include/stdio.h"),
+        ContentId::of("test file", b"int printf();").0,
+    );
     let (kept, _) = a.view().kept(&read("/home/a", &system), &value).unwrap();
     assert!(kept.bound.is_empty() && kept.shared.is_some());
 }
@@ -249,15 +314,21 @@ fn another_layout_of_the_roots_misses() {
     let inside = checkout("/home/a");
     let elsewhere = checkout("/srv/b").with(Role::Target, Path::new("/cache/target"));
     assert_ne!(key("/home/a", &inside), key("/srv/b", &elsewhere));
-    let one = RootMap::default().with(Role::Package, Path::new("/home/a/ws")).with(Role::Workspace, Path::new("/home/a/ws"));
-    let two = RootMap::default().with(Role::Package, Path::new("/srv/b/ws/p")).with(Role::Workspace, Path::new("/srv/b/ws"));
+    let one = RootMap::default()
+        .with(Role::Package, Path::new("/home/a/ws"))
+        .with(Role::Workspace, Path::new("/home/a/ws"));
+    let two = RootMap::default()
+        .with(Role::Package, Path::new("/srv/b/ws/p"))
+        .with(Role::Workspace, Path::new("/srv/b/ws"));
     let given = |map: &RootMap| {
         let mut given = Given::new(RunKind::BuildScript);
         given.roots(&map.view());
         given.finish()
     };
     assert_ne!(given(&one), given(&two));
-    let same = RootMap::default().with(Role::Package, Path::new("/srv/c/ws")).with(Role::Workspace, Path::new("/srv/c/ws"));
+    let same = RootMap::default()
+        .with(Role::Package, Path::new("/srv/c/ws"))
+        .with(Role::Workspace, Path::new("/srv/c/ws"));
     assert_eq!(given(&one), given(&same));
 }
 
@@ -275,9 +346,23 @@ fn a_root_in_another_spelling_is_embedded() {
         b"/TMP/Blaze Roots/WS",
         b"file:///tmp/blaze%20roots/ws/a.rs",
     ] {
-        assert!(roots.embedded(spelled).contains(Role::Workspace), "{:?}", String::from_utf8_lossy(spelled));
-        let value = Value { code: Some(0), signal: None, stdout: spelled.to_vec(), stderr: Vec::new(), files: Vec::new() };
-        assert!(roots.stored(&value).unwrap().1.contains(Role::Workspace), "{:?}", String::from_utf8_lossy(spelled));
+        assert!(
+            roots.embedded(spelled).contains(Role::Workspace),
+            "{:?}",
+            String::from_utf8_lossy(spelled)
+        );
+        let value = Value {
+            code: Some(0),
+            signal: None,
+            stdout: spelled.to_vec(),
+            stderr: Vec::new(),
+            files: Vec::new(),
+        };
+        assert!(
+            roots.stored(&value).unwrap().1.contains(Role::Workspace),
+            "{:?}",
+            String::from_utf8_lossy(spelled)
+        );
     }
     let wide: Vec<u8> = "/tmp/blaze roots/ws".encode_utf16().flat_map(u16::to_le_bytes).collect();
     assert!(roots.embedded(&wide).contains(Role::Workspace));
@@ -293,7 +378,13 @@ fn a_root_inside_a_longer_path_is_not_ported() {
     let roots = map.view();
     assert_eq!(&*roots.ported(b"/usr/src/linux"), b"/usr/src/linux");
     assert_eq!(&*roots.ported(b"-I/src/include:/src"), b"-I/src/include:\0p");
-    let value = Value { code: Some(0), signal: None, stdout: b"/usr/src/linux\n".to_vec(), stderr: Vec::new(), files: Vec::new() };
+    let value = Value {
+        code: Some(0),
+        signal: None,
+        stdout: b"/usr/src/linux\n".to_vec(),
+        stderr: Vec::new(),
+        files: Vec::new(),
+    };
     assert!(roots.stored(&value).unwrap().1.contains(Role::Package));
 }
 
@@ -308,9 +399,14 @@ fn a_run_that_wrote_files_is_kept_against_its_roots_until_verified() {
         signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
-        files: vec![crate::run::OutFile { path: "5f3a-foo.o".into(), executable: false, bytes: Some(b"\x7fELF".to_vec()) }],
+        files: vec![crate::run::OutFile {
+            path: "5f3a-foo.o".into(),
+            executable: false,
+            bytes: Some(b"\x7fELF".to_vec()),
+        }],
     };
-    let (kept, _) = a.view().kept(&read("/home/a", &Disk::of("/home/a", b"int x;")), &value).unwrap();
+    let (kept, _) =
+        a.view().kept(&read("/home/a", &Disk::of("/home/a", b"int x;")), &value).unwrap();
     assert_eq!(marks(&kept.local), 4, "every root of the run is marked");
     assert_eq!(kept.shared.as_ref().map(marks), Some(0), "its copy has no mark");
 }
@@ -320,12 +416,21 @@ fn marks(traced: &Traced) -> usize {
 }
 
 fn printed(stdout: &[u8]) -> Value {
-    Value { code: Some(0), signal: None, stdout: stdout.to_vec(), stderr: Vec::new(), files: Vec::new() }
+    Value {
+        code: Some(0),
+        signal: None,
+        stdout: stdout.to_vec(),
+        stderr: Vec::new(),
+        files: Vec::new(),
+    }
 }
 
 fn reading(paths: &[&str]) -> Traced {
     let mut traced = Traced {
-        files: paths.iter().map(|it| (PathBuf::from(it), Some(ContentId::of("test file", it.as_bytes()).0))).collect(),
+        files: paths
+            .iter()
+            .map(|it| (PathBuf::from(it), Some(ContentId::of("test file", it.as_bytes()).0)))
+            .collect(),
         dirs: Vec::new(),
         env: Vec::new(),
         untraceable: Vec::new(),
@@ -355,10 +460,20 @@ fn a_path_between_roots_of_two_tops_is_kept_against_them() {
         .with(Role::Package, Path::new("/home/a/ws/p"))
         .with(Role::Workspace, Path::new("/home/a/ws"))
         .with(Role::Target, Path::new("/cache/a/target"));
-    let (_, embedded) = apart.view().stored(&printed(b"cargo:rustc-env=T=../../../../cache/a/target/debug\n")).unwrap();
+    let (_, embedded) = apart
+        .view()
+        .stored(&printed(b"cargo:rustc-env=T=../../../../cache/a/target/debug\n"))
+        .unwrap();
     assert!(embedded.contains(Role::Package) && embedded.contains(Role::Target));
     let inside = checkout("/home/a");
-    assert!(inside.view().stored(&printed(b"cargo:rustc-env=T=../target/debug\n")).unwrap().1.is_empty());
+    assert!(
+        inside
+            .view()
+            .stored(&printed(b"cargo:rustc-env=T=../target/debug\n"))
+            .unwrap()
+            .1
+            .is_empty()
+    );
 }
 
 /// A git dependency's build script, its package in blaze's sources, reading `../` of it reads
@@ -374,11 +489,20 @@ fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
         .with(Role::Tools, Path::new("/nix/store/x-blaze/bin"))
         .with_sources(Path::new("/b/sources"));
     let roots = map.view();
-    let (kept, _) = roots.kept(&reading(&["/b/sources/git/checkouts/dep-1/proto/x.proto"]), &printed(b"")).unwrap();
+    let (kept, _) = roots
+        .kept(&reading(&["/b/sources/git/checkouts/dep-1/proto/x.proto"]), &printed(b""))
+        .unwrap();
     assert!(kept.shared.is_none());
     assert_eq!(kept.bound, roots.all());
-    let (kept, _) =
-        roots.kept(&reading(&["/b/sources/registry/src/index/foo-1.0/lib.rs", "/nix/store/y-zlib/include/zlib.h"]), &printed(b"")).unwrap();
+    let (kept, _) = roots
+        .kept(
+            &reading(&[
+                "/b/sources/registry/src/index/foo-1.0/lib.rs",
+                "/nix/store/y-zlib/include/zlib.h",
+            ]),
+            &printed(b""),
+        )
+        .unwrap();
     assert!(kept.bound.is_empty() && kept.shared.is_some());
 }
 
@@ -411,12 +535,22 @@ fn apply(store: &mut BTreeMap<Key, Vec<u8>>, puts: Vec<verify::Put>) {
 /// The run of `home`'s checkout that prints `stdout`, kept in `store` with only what the store
 /// holds: no state of a verify lives anywhere else, so a daemon restored from the store says
 /// what one that never stopped says.
-fn ran(store: &mut BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap, stdout: &[u8]) -> verify::Verdict {
+fn ran(
+    store: &mut BTreeMap<Key, Vec<u8>>,
+    home: &str,
+    map: &RootMap,
+    stdout: &[u8],
+) -> verify::Verdict {
     ran_value(store, home, map, &printed(stdout))
 }
 
 /// [`ran`] of a run that gave `value`.
-fn ran_value(store: &mut BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap, value: &Value) -> verify::Verdict {
+fn ran_value(
+    store: &mut BTreeMap<Key, Vec<u8>>,
+    home: &str,
+    map: &RootMap,
+    value: &Value,
+) -> verify::Verdict {
     let (puts, verdict) = keeps_in(store, home, map, value);
     apply(store, puts);
     verdict
@@ -424,7 +558,12 @@ fn ran_value(store: &mut BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap, valu
 
 /// What [`verify::keeps`] says to put of the run of `home`'s checkout that gave `value`, the
 /// store as it is: nothing applied, so two checkouts can keep at once.
-fn keeps_in(store: &BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap, value: &Value) -> (Vec<verify::Put>, verify::Verdict) {
+fn keeps_in(
+    store: &BTreeMap<Key, Vec<u8>>,
+    home: &str,
+    map: &RootMap,
+    value: &Value,
+) -> (Vec<verify::Put>, verify::Verdict) {
     let disk = Disk::of(home, b"int x;");
     let roots = map.view();
     let (marked, stored) = roots.kept(&read(home, &disk), value).unwrap();
@@ -446,7 +585,11 @@ fn found_in(store: &BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap) -> Option
 /// The store of `sim` in `store`, opened (again, after a drop: what a restarted daemon reads).
 fn opened(sim: &mut blaze_core::sim::Sim) -> blaze_cas::Store {
     let mut effects = Vec::new();
-    let config = blaze_cas::Config { dir: blaze_core::FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+    let config = blaze_cas::Config {
+        dir: blaze_core::FileName::new("store").unwrap(),
+        layers: Vec::new(),
+        tags: 1 << 48,
+    };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         _ = store.complete(completion, effects);
@@ -465,18 +608,35 @@ fn flushed(sim: &mut blaze_core::sim::Sim, store: &mut blaze_cas::Store) {
 }
 
 /// [`ran`] into a real store, through [`verify::keep`].
-fn ran_kept(store: &mut blaze_cas::Store, home: &str, map: &RootMap, stdout: &[u8]) -> verify::Verdict {
+fn ran_kept(
+    store: &mut blaze_cas::Store,
+    home: &str,
+    map: &RootMap,
+    stdout: &[u8],
+) -> verify::Verdict {
     let disk = Disk::of(home, b"int x;");
     let roots = map.view();
     let (marked, stored) = roots.kept(&read(home, &disk), &printed(stdout)).unwrap();
-    let kept = verify::keep(store, &roots, &key(home, map), marked, stored.encode(), crate::run::ported_differs).unwrap();
+    let kept = verify::keep(
+        store,
+        &roots,
+        &key(home, map),
+        marked,
+        stored.encode(),
+        crate::run::ported_differs,
+    )
+    .unwrap();
     kept.verdict
 }
 
 /// [`found_in`] of a real store.
 fn found_kept(store: &blaze_cas::Store, home: &str, map: &RootMap) -> Option<Vec<u8>> {
     let mut disk = Disk::of(home, b"int x;");
-    let found = index::search(|key| Ok(store.get(key)?.map(|it| it.bytes)), &key(home, map), &mut Rooted::new(map.view(), &mut disk));
+    let found = index::search(
+        |key| Ok(store.get(key)?.map(|it| it.bytes)),
+        &key(home, map),
+        &mut Rooted::new(map.view(), &mut disk),
+    );
     match found.expect("the check reads the disk") {
         Found::Hit { value, .. } => Some(value.to_vec()),
         Found::Miss { .. } => None,
@@ -500,8 +660,16 @@ fn another_checkout_verifies_a_run_before_it_is_given_it() {
     flushed(&mut sim, &mut store);
     drop(store);
     let mut store = opened(&mut sim);
-    assert_eq!(found_kept(&store, "/home/a", &a), Some(here.clone()), "restored, found where it ran");
-    assert_eq!(found_kept(&store, "/srv/b", &b), None, "restored, still not given another checkout");
+    assert_eq!(
+        found_kept(&store, "/home/a", &a),
+        Some(here.clone()),
+        "restored, found where it ran"
+    );
+    assert_eq!(
+        found_kept(&store, "/srv/b", &b),
+        None,
+        "restored, still not given another checkout"
+    );
 
     let b_printed = b"cargo:rustc-link-search=/srv/b/ws/target/debug/build/p-1/out\n";
     assert_eq!(ran_kept(&mut store, "/srv/b", &b, b_printed), verify::Verdict::Verified);
@@ -509,7 +677,8 @@ fn another_checkout_verifies_a_run_before_it_is_given_it() {
     flushed(&mut sim, &mut store);
     drop(store);
     let store = opened(&mut sim);
-    let given = found_kept(&store, "/opt/c", &c).expect("restored, verified, given to a third checkout");
+    let given =
+        found_kept(&store, "/opt/c", &c).expect("restored, verified, given to a third checkout");
     assert_eq!(given, fresh, "the restored store gives the bytes the running one did");
     let given = c.view().restored(Value::decode(&given).unwrap()).unwrap();
     assert_eq!(given.stdout, b"cargo:rustc-link-search=/opt/c/ws/target/debug/build/p-1/out\n");
@@ -537,10 +706,17 @@ fn verifying_across_one_root_keeps_the_others_marked() {
     assert_eq!(ran(&mut store, "/h", &a, b"cargo:rustc-cfg=x\n"), verify::Verdict::Copied);
     assert_eq!(ran(&mut store, "/h", &b, b"cargo:rustc-cfg=x\n"), verify::Verdict::Verified);
     let target_elsewhere = sharing("/tc/target", "/opt/tools");
-    assert!(found_in(&store, "/h", &target_elsewhere).is_some(), "a root seen to differ is not marked");
+    assert!(
+        found_in(&store, "/h", &target_elsewhere).is_some(),
+        "a root seen to differ is not marked"
+    );
     let tools_elsewhere = sharing("/tc/target", "/opt/other-tools");
     assert_eq!(key("/h", &tools_elsewhere), key("/h", &a));
-    assert_eq!(found_in(&store, "/h", &tools_elsewhere), None, "a root the same in both checkouts stays marked");
+    assert_eq!(
+        found_in(&store, "/h", &tools_elsewhere),
+        None,
+        "a root the same in both checkouts stays marked"
+    );
 }
 
 /// N4 (round 5): a pair of checkouts that agree is evidence for the roots that differed in that
@@ -564,9 +740,19 @@ fn a_pair_verifies_only_the_roots_that_differed_in_it() {
     assert_eq!(verdict, verify::Verdict::Verified);
     assert_eq!(puts.len(), 2, "one verified put per pair's set of roots: {puts:?}");
     apply(&mut store, puts);
-    assert!(found_in(&store, "/h", &sharing("/td/target", tools)).is_some(), "target elsewhere: shown by k and a");
-    assert!(found_in(&store, "/h", &sharing("/tk/target", "/opt/d-tools")).is_some(), "tools elsewhere: shown by k and b");
-    assert_eq!(found_in(&store, "/h", &sharing("/td/target", "/opt/d-tools")), None, "both elsewhere: shown by no pair");
+    assert!(
+        found_in(&store, "/h", &sharing("/td/target", tools)).is_some(),
+        "target elsewhere: shown by k and a"
+    );
+    assert!(
+        found_in(&store, "/h", &sharing("/tk/target", "/opt/d-tools")).is_some(),
+        "tools elsewhere: shown by k and b"
+    );
+    assert_eq!(
+        found_in(&store, "/h", &sharing("/td/target", "/opt/d-tools")),
+        None,
+        "both elsewhere: shown by no pair"
+    );
 }
 
 /// D1 (round 5): the record that a run depends on where its roots are, put when another
@@ -582,22 +768,38 @@ fn a_record_that_a_run_depends_on_its_roots_is_held_durable() {
     let durable: Vec<&verify::Put> = puts.iter().filter(|it| it.durable).collect();
     assert_eq!(durable.len(), 1, "{puts:?}");
     assert_eq!(durable[0].value, verify::DEPENDS);
-    assert!(puts.iter().filter(|it| !it.durable).all(|it| it.run == key("/srv/b", &b)), "its own value is no record");
+    assert!(
+        puts.iter().filter(|it| !it.durable).all(|it| it.run == key("/srv/b", &b)),
+        "its own value is no record"
+    );
 
     let mut sim = blaze_core::sim::Sim::new(12, blaze_core::sim::Faults::default());
     let mut real = opened(&mut sim);
     assert_eq!(ran_kept(&mut real, "/home/a", &a, b"cargo:rustc-cfg=a\n"), verify::Verdict::Copied);
     let disk = Disk::of("/srv/b", b"int x;");
     let roots = b.view();
-    let (marked, stored) = roots.kept(&read("/srv/b", &disk), &printed(b"cargo:rustc-cfg=b\n")).unwrap();
-    let kept = verify::keep(&mut real, &roots, &key("/srv/b", &b), marked, stored.encode(), crate::run::ported_differs).unwrap();
+    let (marked, stored) =
+        roots.kept(&read("/srv/b", &disk), &printed(b"cargo:rustc-cfg=b\n")).unwrap();
+    let kept = verify::keep(
+        &mut real,
+        &roots,
+        &key("/srv/b", &b),
+        marked,
+        stored.encode(),
+        crate::run::ported_differs,
+    )
+    .unwrap();
     let ticket = kept.retracted.expect("the record's ticket is handed back");
     assert!(!real.durable(ticket), "not durable before a flush, so the run is held");
     flushed(&mut sim, &mut real);
     assert!(real.durable(ticket));
     drop(real);
     let real = opened(&mut sim);
-    assert_eq!(found_kept(&real, "/var/d", &checkout("/var/d")), None, "restored, the record still keeps it from others");
+    assert_eq!(
+        found_kept(&real, "/var/d", &checkout("/var/d")),
+        None,
+        "restored, the record still keeps it from others"
+    );
 }
 
 /// C1 (round 4): a file a run wrote that holds a root is tied to where that root is, even
@@ -611,7 +813,11 @@ fn a_written_file_that_embeds_a_root_is_kept_here_alone() {
         signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
-        files: vec![crate::run::OutFile { path: "flags".into(), executable: false, bytes: Some(b"-B/opt/tools/bin".to_vec()) }],
+        files: vec![crate::run::OutFile {
+            path: "flags".into(),
+            executable: false,
+            bytes: Some(b"-B/opt/tools/bin".to_vec()),
+        }],
     };
     let (kept, _) = a.view().kept(&read("/h", &Disk::of("/h", b"int x;")), &wrote).unwrap();
     assert!(kept.bound.contains(Role::Tools) && kept.shared.is_none(), "{kept:?}");
@@ -635,12 +841,25 @@ fn the_written_file_scan_finds_every_spelling_embedded_does() {
         signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
-        files: vec![crate::run::OutFile { path: "f".into(), executable: false, bytes: Some(bytes) }],
+        files: vec![crate::run::OutFile {
+            path: "f".into(),
+            executable: false,
+            bytes: Some(bytes),
+        }],
     };
     let wide: Vec<u8> = "/opt/tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let relative = super::relative("/h/ws/p", "/ta/target");
-    for bytes in [b"-B//OPT\\Tools/bin".to_vec(), wide, relative.clone().into_bytes(), b"x /h/ws/p/src".to_vec()] {
-        assert_eq!(roots.stored(&wrote(bytes.clone())).unwrap().1.is_empty(), roots.embedded(&bytes).is_empty(), "{bytes:?}");
+    for bytes in [
+        b"-B//OPT\\Tools/bin".to_vec(),
+        wide,
+        relative.clone().into_bytes(),
+        b"x /h/ws/p/src".to_vec(),
+    ] {
+        assert_eq!(
+            roots.stored(&wrote(bytes.clone())).unwrap().1.is_empty(),
+            roots.embedded(&bytes).is_empty(),
+            "{bytes:?}"
+        );
         assert!(!roots.stored(&wrote(bytes.clone())).unwrap().1.is_empty(), "{bytes:?}");
     }
     assert!(roots.stored(&wrote(b"int x; /usr/include".to_vec())).unwrap().1.is_empty());
@@ -654,9 +873,15 @@ fn a_run_another_checkout_gets_otherwise_is_kept_where_it_ran() {
     let (a, b, c) = (checkout("/home/a"), checkout("/srv/b"), checkout("/opt/c"));
     let mut store = BTreeMap::new();
     assert_eq!(ran(&mut store, "/home/a", &a, b"cargo:rustc-cfg=a\n"), verify::Verdict::Copied);
-    assert!(matches!(ran(&mut store, "/srv/b", &b, b"cargo:rustc-cfg=b\n"), verify::Verdict::Depends { .. }));
+    assert!(matches!(
+        ran(&mut store, "/srv/b", &b, b"cargo:rustc-cfg=b\n"),
+        verify::Verdict::Depends { .. }
+    ));
     assert!(found_in(&store, "/srv/b", &b).is_some(), "kept where it ran");
-    assert!(matches!(ran(&mut store, "/opt/c", &c, b"cargo:rustc-cfg=a\n"), verify::Verdict::Depends { .. }));
+    assert!(matches!(
+        ran(&mut store, "/opt/c", &c, b"cargo:rustc-cfg=a\n"),
+        verify::Verdict::Depends { .. }
+    ));
     assert!(found_in(&store, "/opt/c", &c).is_some());
     let d = checkout("/var/d");
     assert_eq!(found_in(&store, "/var/d", &d), None, "nothing verified");
@@ -666,7 +891,10 @@ fn a_run_another_checkout_gets_otherwise_is_kept_where_it_ran() {
     assert_eq!(ran(&mut store, "/home/a", &a, b"cargo:rustc-cfg=a\n"), verify::Verdict::Copied);
     assert_eq!(ran(&mut store, "/srv/b", &b, b"cargo:rustc-cfg=a\n"), verify::Verdict::Verified);
     assert!(found_in(&store, "/var/d", &d).is_some());
-    assert!(matches!(ran(&mut store, "/opt/c", &c, b"cargo:rustc-cfg=c\n"), verify::Verdict::Depends { .. }));
+    assert!(matches!(
+        ran(&mut store, "/opt/c", &c, b"cargo:rustc-cfg=c\n"),
+        verify::Verdict::Depends { .. }
+    ));
     assert_eq!(found_in(&store, "/var/d", &d), None, "the verified value is not given again");
     assert!(found_in(&store, "/opt/c", &c).is_some(), "each keeps its own");
 }
@@ -712,7 +940,8 @@ fn a_root_left_in_a_given_string_is_kept_against_where_it_is() {
     assert!(left.contains(Role::Package));
     assert!(a.view().left(b"/home/a/ws/p/lib").is_empty(), "a root at a path's start is ported");
     a.bind(left);
-    let (kept, _) = a.view().kept(&read("/home/a", &Disk::of("/home/a", b"int x;")), &printed(b"")).unwrap();
+    let (kept, _) =
+        a.view().kept(&read("/home/a", &Disk::of("/home/a", b"int x;")), &printed(b"")).unwrap();
     assert!(kept.shared.is_none());
 }
 
@@ -731,7 +960,8 @@ fn a_package_that_is_its_workspace_marks_nothing() {
     let roots = a.view();
     assert_eq!(roots.top(Role::Package), roots.top(Role::Workspace));
     assert!(roots.embedded(b"cargo:rustc-cfg=x\n").is_empty());
-    let (kept, stored) = roots.kept(&reading(&["/home/a/p/build.rs"]), &printed(b"cargo:rustc-cfg=x\n")).unwrap();
+    let (kept, stored) =
+        roots.kept(&reading(&["/home/a/p/build.rs"]), &printed(b"cargo:rustc-cfg=x\n")).unwrap();
     assert!(roots.stored(&printed(b"cargo:rustc-cfg=x\n")).unwrap().1.is_empty());
     assert_eq!(stored.stdout, b"cargo:rustc-cfg=x\n");
     assert!(kept.bound.is_empty());

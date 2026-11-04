@@ -56,6 +56,8 @@ pub(crate) mod toolchain;
 pub(crate) mod unwind;
 pub(crate) mod wasm;
 
+#[cfg(feature = "llvm")]
+pub use crate::llvm::pgo::Profile;
 pub use allocator::allocations_unobserved;
 pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
@@ -63,12 +65,10 @@ pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
 pub use linked::{Assumed, LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
-pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
-pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
-#[cfg(feature = "llvm")]
-pub use crate::llvm::pgo::Profile;
 #[cfg(feature = "llvm")]
 pub use release::{give_profile, profile_id};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
+pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
@@ -76,20 +76,31 @@ pub use release::{give_profile, profile_id};
 pub trait Hashes: Sync {
     /// Which item `item` is, by its path and kind.
     fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String>;
-    /// What a body is: its normalized MIR, each callee and type by content.
+    /// What a body is: its normalized MIR, each callee and type by content. With the key of
+    /// the store it is written in, whose span tables its positions name: two bodies written
+    /// alike in two places are two codes, so two instances ([`blaze_codegen::Instance::key`],
+    /// what the link names a function by), each reporting its own positions.
     fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
+    /// What a body is with nothing of where it is written or what it or its callees are
+    /// called: [`Hashes::code`] without the store's key. With [`Hashes::names_read`] folded in
+    /// by the front end, the code of the key its template is kept under when its positions
+    /// are its own tables' only, which the template holds by table
+    /// ([`blaze_codegen::template::own_anchor`]) and its instance fills
+    /// (docs/v2/plan/design/name-free-identity.md).
+    fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
+    /// What a compiled body reads of names beside its code, which every key of it holds: the
+    /// names of the files its `file!()` reads and, when `told` (a debugger is told of its
+    /// locals), what their types' identities read (`hir_ty_share::code::told_names`). With
+    /// whether that is all of it: not when a told local's type holds an alias, which neither
+    /// the code nor the instance's arguments key, so its template is kept under its code.
+    fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String>;
     /// A type by content: an ADT by its item and its layout's facts, never by its name.
     /// Regions are erased.
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String>;
     /// A const generic argument by its value and type.
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String>;
     /// Where a statement or expression of `owner`'s body is, in its item's span table.
-    fn span(
-        &self,
-        db: &Db,
-        owner: DefWithBodyId,
-        span: MirSpan,
-    ) -> Result<SpanRef, String>;
+    fn span(&self, db: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String>;
     /// The anchors of `owner`'s span tables in [`hir_ty_share::code::table_of`]'s order: what
     /// [`Hashes::span`] names a span of the body by, beside its index in the table.
     fn anchors(&self, db: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String>;
@@ -122,6 +133,22 @@ impl Hashes for HashSource {
             HashSource::Items(it) => it.code(db, body),
             #[cfg(test)]
             HashSource::ById(it) => it.code(db, body),
+        }
+    }
+
+    fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
+        match self {
+            HashSource::Items(it) => it.template_code(db, body),
+            #[cfg(test)]
+            HashSource::ById(it) => it.template_code(db, body),
+        }
+    }
+
+    fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String> {
+        match self {
+            HashSource::Items(it) => it.names_read(db, body, told),
+            #[cfg(test)]
+            HashSource::ById(it) => it.names_read(db, body, told),
         }
     }
 
@@ -367,7 +394,8 @@ pub(crate) fn failed_in_front(
     why: impl std::fmt::Display,
 ) -> CodegenError {
     // alloc: the error's message, its parts kept apart for the reader
-    let (named, why) = blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
+    let (named, why) =
+        blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
     let front = frontend::item_of(db, &instance.0).ok().map(|id| {
         // clone: the error's parts, kept beside its message
         Box::new(blaze_codegen::FrontItem { id, named: named.clone(), why: why.clone() })

@@ -23,7 +23,12 @@ trait Watch {
     fn stop(&mut self, effects: &mut Vec<Effect>);
     fn owns(&self, tag: Tag) -> bool;
     fn idle(&self) -> bool;
-    fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Watched>;
+    fn complete(
+        &mut self,
+        vfs: &mut Vfs,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<Watched>;
 }
 
 macro_rules! watch {
@@ -44,7 +49,12 @@ macro_rules! watch {
             fn idle(&self) -> bool {
                 <$watcher>::idle(self)
             }
-            fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Watched> {
+            fn complete(
+                &mut self,
+                vfs: &mut Vfs,
+                completion: Completion,
+                effects: &mut Vec<Effect>,
+            ) -> Vec<Watched> {
                 <$watcher>::complete(self, vfs, completion, effects)
             }
         }
@@ -155,7 +165,9 @@ impl<W: Watch> Run<W> {
                     Effect::ReadAll { file, .. } | Effect::ReadLink { file, .. } => {
                         self.reads.push(file.as_str()["ws/".len()..].into())
                     }
-                    Effect::Stamp { files, .. } => self.stamped.extend(files.iter().map(str::to_owned)),
+                    Effect::Stamp { files, .. } => {
+                        self.stamped.extend(files.iter().map(str::to_owned))
+                    }
                     _ => {}
                 }
             }
@@ -275,10 +287,15 @@ fn a_symlink_to_a_directory_is_its_target_never_followed() {
         });
         run.check(&format!("{what}: changed while down"));
         assert_eq!(run.mode(".claude/skills"), Some(Mode::Symlink), "{what}");
-        assert_eq!(run.mode("up"), Some(Mode::Symlink), "{what}: one out of the checkout is kept as it is");
+        assert_eq!(
+            run.mode("up"),
+            Some(Mode::Symlink),
+            "{what}: one out of the checkout is kept as it is"
+        );
         assert_eq!(run.mode("lib.rs"), Some(Mode::Regular), "{what}: a link replaced by a file");
 
-        let fresh: Run<W> = Run::linked(2, kind, &files, &[(".claude/skills", "../.agents/skills")]);
+        let fresh: Run<W> =
+            Run::linked(2, kind, &files, &[(".claude/skills", "../.agents/skills")]);
         fresh.check(&format!("{what}: there at the first look"));
         assert_eq!(fresh.mode(".claude/skills"), Some(Mode::Symlink), "{what}");
         assert!(fresh.reads.iter().any(|it| it == ".claude/skills"), "{what}: its target read");
@@ -297,7 +314,11 @@ fn a_symlink_to_a_directory_is_its_target_never_followed() {
 fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
     fn case<W: Watch>() {
         let what = std::any::type_name::<W>();
-        let files = [(".agents/skills/a/SKILL.md", "a"), (".claude/settings.json", "{}"), (".claude/rules", "r")];
+        let files = [
+            (".agents/skills/a/SKILL.md", "a"),
+            (".claude/settings.json", "{}"),
+            (".claude/rules", "r"),
+        ];
         let mut run: Run<W> = Run::with(7, Journal::Usn, &files);
         run.check(what);
         let cursor = run.vfs.disks.get("disk").expect("a disk").cursor;
@@ -308,7 +329,12 @@ fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
         // Changes no watch hears.
         run.link(".claude/skills", "../.agents/skills");
         run.link(".claude/rules", "../.agents");
-        let told = Journaled { files: Vec::new(), lost: vec![(ws(".claude"), Lost::Unnamed)], cursor, caught_up: true };
+        let told = Journaled {
+            files: Vec::new(),
+            lost: vec![(ws(".claude"), Lost::Unnamed)],
+            cursor,
+            caught_up: true,
+        };
         let journal = Completion { tag: Tag(TAGS), done: Done::Journaled(Box::new(told)) };
         let out = run.watcher.complete(&mut run.vfs, journal, &mut run.effects);
         run.out.extend(out);
@@ -324,9 +350,15 @@ fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
         for link in [".claude/skills", ".claude/rules"] {
             assert_eq!(run.mode(link), Some(Mode::Symlink), "{what}: {link}");
             let file = ws(link);
-            let as_file = run.log.iter().any(|it| matches!(it, Effect::ReadAll { file: read, .. } if *read == file));
+            let as_file = run
+                .log
+                .iter()
+                .any(|it| matches!(it, Effect::ReadAll { file: read, .. } if *read == file));
             assert!(!as_file, "{what}: {link} read as a file");
-            let as_link = run.log.iter().any(|it| matches!(it, Effect::ReadLink { file: read, .. } if *read == file));
+            let as_link = run
+                .log
+                .iter()
+                .any(|it| matches!(it, Effect::ReadLink { file: read, .. } if *read == file));
             assert!(as_link, "{what}: {link}'s target read");
         }
         assert_eq!(run.mode(".claude/skills/a/SKILL.md"), None, "{what}: not followed");
@@ -387,7 +419,11 @@ fn what_changed_while_down_is_read_and_what_moved_is_not() {
             assert!(run.lost().is_empty(), "{what}: {:?}", run.lost());
             // A journal names what changed: nothing it did not name is stamped.
             if kind != Journal::None {
-                assert!(!run.stamped.iter().any(|it| it == "ws/src/lib.rs"), "{what}: {:?}", run.stamped);
+                assert!(
+                    !run.stamped.iter().any(|it| it == "ws/src/lib.rs"),
+                    "{what}: {:?}",
+                    run.stamped
+                );
             }
             let commits = run.out.iter().filter(|it| matches!(it, Watched::Committed(_))).count();
             assert_eq!(commits, 1, "{what}: what changed while down is one transaction");
@@ -563,7 +599,9 @@ fn the_head_follows_the_disk_across_restarts() {
                     let there = disk.contains_key(path);
                     let free = PATHS.iter().find(|it| {
                         !disk.contains_key(**it)
-                            && !disk.keys().any(|k| k.starts_with(&format!("{it}/")) || it.starts_with(&format!("{k}/")))
+                            && !disk.keys().any(|k| {
+                                k.starts_with(&format!("{it}/")) || it.starts_with(&format!("{k}/"))
+                            })
                     });
                     match rng.below(4) {
                         0 if there => {
@@ -586,7 +624,9 @@ fn the_head_follows_the_disk_across_restarts() {
                             touched.insert(path.to_owned());
                             steps.push((2, path.to_owned(), String::new()));
                         }
-                        _ if disk.keys().any(|k| path.starts_with(&format!("{k}/")) || k.starts_with(&format!("{path}/"))) => {}
+                        _ if disk.keys().any(|k| {
+                            path.starts_with(&format!("{k}/")) || k.starts_with(&format!("{path}/"))
+                        }) => {}
                         _ => {
                             let bytes = format!("{seed}:{round}:{step}");
                             disk.insert(path.into(), bytes.clone().into_bytes());
@@ -621,7 +661,8 @@ type Step = (u8, String, String);
 /// Up to 8 random changes among `PATHS` to a disk holding `disk`, each only where the disk
 /// allows it.
 fn steps(rng: &mut Rng, disk: &BTreeMap<String, Vec<u8>>, mark: &str) -> Vec<Step> {
-    const PATHS: &[&str] = &["a", "b", "d/x", "d/y", "d/e/z", "f/g/h", "k", "src/old/one.rs", "src/new.rs"];
+    const PATHS: &[&str] =
+        &["a", "b", "d/x", "d/y", "d/e/z", "f/g/h", "k", "src/old/one.rs", "src/new.rs"];
     let clash = |disk: &BTreeMap<String, Vec<u8>>, path: &str| {
         disk.keys().any(|k| is_below(path, k) || is_below(k, path))
     };
@@ -636,7 +677,9 @@ fn steps(rng: &mut Rng, disk: &BTreeMap<String, Vec<u8>>, mark: &str) -> Vec<Ste
                 steps.push((0, path.to_owned(), String::new()));
             }
             1 if there => {
-                let Some(to) = PATHS.iter().find(|it| !disk.contains_key(**it) && !clash(&disk, it)) else {
+                let Some(to) =
+                    PATHS.iter().find(|it| !disk.contains_key(**it) && !clash(&disk, it))
+                else {
                     continue;
                 };
                 let bytes = disk.remove(path).expect("there");
@@ -735,7 +778,9 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
     // The stamps of the batch the watcher just asked for: what the column saved of each name,
     // its mtime moved by `moved`. Its buffer is dropped, as a driver drops it once done.
     let stamps = |run: &mut Run, moved: u64| {
-        let Some(Effect::Stamp { files, tag }) = run.effects.pop() else { panic!("{:?}", run.effects) };
+        let Some(Effect::Stamp { files, tag }) = run.effects.pop() else {
+            panic!("{:?}", run.effects)
+        };
         assert!(run.effects.is_empty(), "{:?}", run.effects);
         let disk = run.vfs.disks.get("disk").expect("a disk");
         let stamps: Vec<Stamp> = files
@@ -776,7 +821,10 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
         assert_at_most(budget(n), "their stamps, a read asked for each", || {
             run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
         });
-        assert_eq!(run.effects.iter().filter(|it| matches!(it, Effect::ReadAll { .. })).count() as u64, n);
+        assert_eq!(
+            run.effects.iter().filter(|it| matches!(it, Effect::ReadAll { .. })).count() as u64,
+            n
+        );
         run.pump();
         assert!(run.watcher.idle());
         assert_eq!(run.head(), run.disk, "the same bytes read make no change");
@@ -787,7 +835,10 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
 /// is under it, as the strings made would say.
 #[test]
 fn a_name_compares_with_a_directory_as_the_joined_string_does() {
-    let names = ["", "a", "a-", "a.b", "a/", "a/b", "a0", "ab", "a/b/c", "b", "/", "a//", "\u{e9}", "a\u{e9}"];
+    let names = [
+        "", "a", "a-", "a.b", "a/", "a/b", "a0", "ab", "a/b/c", "b", "/", "a//", "\u{e9}",
+        "a\u{e9}",
+    ];
     for name in names {
         for dir in names {
             let joined = format!("{dir}/");

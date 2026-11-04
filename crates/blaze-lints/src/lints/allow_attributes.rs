@@ -16,7 +16,10 @@ use crate::{check::Cx, diag::Applicability, msrvs};
 const LINT: Implemented = Implemented::AllowAttributes;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, attr: ast::Attr<'t>) {
-    if !cx.on(LINT) || attr.kind() != AttrKind::Outer || !cx.conf().meets(msrvs::LINT_REASONS_STABILIZATION) {
+    if !cx.on(LINT)
+        || attr.kind() != AttrKind::Outer
+        || !cx.conf().meets(msrvs::LINT_REASONS_STABILIZATION)
+    {
         return;
     }
     for meta in level_metas(cx, attr, &["allow"]) {
@@ -42,11 +45,13 @@ pub(super) fn level_metas<'q, 't>(
     levels: &'static [&'static str],
 ) -> impl Iterator<Item = ast::TokenTreeMeta<'t>> + use<'q, 't> {
     let db = cx.db();
-    hir_expand::attrs::cfg_attrs_view(std::iter::once(attr), cx.krate().cfg(db)).filter_map(move |(meta, _)| {
-        let ast::Meta::TokenTreeMeta(meta) = meta else { return None };
-        let name = meta.path()?.as_single_name_ref()?;
-        levels.contains(&name.text()).then_some(meta)
-    })
+    hir_expand::attrs::cfg_attrs_view(std::iter::once(attr), cx.krate().cfg(db)).filter_map(
+        move |(meta, _)| {
+            let ast::Meta::TokenTreeMeta(meta) = meta else { return None };
+            let name = meta.path()?.as_single_name_ref()?;
+            levels.contains(&name.text()).then_some(meta)
+        },
+    )
 }
 
 /// The lints a level meta names, as written between its parentheses, its `reason` left out.
@@ -55,8 +60,11 @@ pub(super) fn lints_of(meta: ast::TokenTreeMeta<'_>) -> String {
     let text = tt.syntax().text();
     let inner = text.strip_prefix('(').and_then(|it| it.strip_suffix(')')).unwrap_or(text);
     // alloc: the lint's message, once per finding
-    let names: Vec<&str> =
-        inner.split(',').map(str::trim).filter(|it| !it.is_empty() && !it.starts_with("reason")).collect();
+    let names: Vec<&str> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|it| !it.is_empty() && !it.starts_with("reason"))
+        .collect();
     names.join(", ")
 }
 
@@ -107,7 +115,11 @@ fn g() {}
 struct s;
 "#,
         );
-        assert_eq!(found.matches("an `allow` stays after its warning is gone").count(), 2, "{found}");
+        assert_eq!(
+            found.matches("an `allow` stays after its warning is gone").count(),
+            2,
+            "{found}"
+        );
         assert!(found.contains("`#[allow(dead_code)]` on fn `f`"), "{found}");
         assert!(found.contains("`#[allow(non_camel_case_types)]` on struct `s`"), "{found}");
         assert!(!found.contains("`#[allow(unused)]`"), "an inner attribute is not found:\n{found}");
@@ -124,7 +136,11 @@ quiet!();
 keep! { #[allow(dead_code)] fn handed() {} }
 "#,
         );
-        assert_eq!(found.matches("an `allow` stays after its warning is gone").count(), 1, "{found}");
+        assert_eq!(
+            found.matches("an `allow` stays after its warning is gone").count(),
+            1,
+            "{found}"
+        );
         assert!(found.contains("on fn `handed`"), "{found}");
     }
 

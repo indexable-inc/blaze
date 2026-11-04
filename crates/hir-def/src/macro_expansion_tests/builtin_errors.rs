@@ -6,6 +6,7 @@
 //! macro fragment's node maps up to, and which identifiers `${concat(..)}` made.
 
 use expect_test::{Expect, expect};
+use hir_expand::fixture;
 use hir_expand::{
     BuiltinChild, ExpandErrorKind, ExpandTo, FileRange, InFile, MacroCallId, MacroCallKind,
     MbeErrorKind, resolve_span,
@@ -16,7 +17,6 @@ use syntax::{
     AstPtr, SyntaxKind, TextSize, ast as tag,
     view::{self as ast, AstNode},
 };
-use hir_expand::fixture;
 
 use super::resolve_macro_call_id;
 use crate::{

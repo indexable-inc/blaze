@@ -77,8 +77,9 @@ impl Shared {
                 Arc::strong_count(db) == 1
             }));
         }
-        let db = Arc::get_mut(&mut self.db)
-            .expect("a reader of the database is held past its last `Reader`: only `Reader`s clone it");
+        let db = Arc::get_mut(&mut self.db).expect(
+            "a reader of the database is held past its last `Reader`: only `Reader`s clone it",
+        );
         if db.storage().readers_stopped() {
             db.storage_mut().resume_readers();
         }
@@ -131,6 +132,8 @@ impl Clone for Reader {
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("base_db::Shared").field("readers", &(Arc::strong_count(&self.db) - 1)).finish()
+        f.debug_struct("base_db::Shared")
+            .field("readers", &(Arc::strong_count(&self.db) - 1))
+            .finish()
     }
 }

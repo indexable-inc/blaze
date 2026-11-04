@@ -80,7 +80,9 @@ impl Writer {
         self.bytes.reserve(values.len() * width.bytes());
         match width {
             Width::U8 => self.bytes.extend(values.iter().map(|&it| it as u8)),
-            Width::U16 => self.bytes.extend(values.iter().flat_map(|&it| (it as u16).to_le_bytes())),
+            Width::U16 => {
+                self.bytes.extend(values.iter().flat_map(|&it| (it as u16).to_le_bytes()))
+            }
             Width::U32 => self.bytes.extend(values.iter().flat_map(|&it| it.to_le_bytes())),
         }
         PlacedHot { width, at, len: values.len() }
@@ -90,7 +92,13 @@ impl Writer {
     pub fn push_warm(&mut self, values: &[u32]) -> PlacedWarm {
         let packed = Packed::pack(values);
         let at = self.push_slice(&packed.words);
-        PlacedWarm { min: packed.min, bits: packed.bits, len: packed.len, at, words: packed.words.len() }
+        PlacedWarm {
+            min: packed.min,
+            bits: packed.bits,
+            len: packed.len,
+            at,
+            words: packed.words.len(),
+        }
     }
 }
 
@@ -101,7 +109,8 @@ impl HotColumn {
         let mut column = HotColumn { u8s: Slice::EMPTY, u16s: Slice::EMPTY, u32s: Slice::EMPTY };
         match placed.width {
             Width::U8 => {
-                column.u8s = Slice::between(field(offset_of!(HotColumn, u8s)), placed.at, placed.len)
+                column.u8s =
+                    Slice::between(field(offset_of!(HotColumn, u8s)), placed.at, placed.len)
             }
             Width::U16 => {
                 column.u16s =
@@ -174,7 +183,9 @@ impl HotRef<'_> {
         let end = start + out.len();
         match self {
             HotRef::U8(it) => out.iter_mut().zip(&it[start..end]).for_each(|(o, &v)| *o = v as u32),
-            HotRef::U16(it) => out.iter_mut().zip(&it[start..end]).for_each(|(o, &v)| *o = v as u32),
+            HotRef::U16(it) => {
+                out.iter_mut().zip(&it[start..end]).for_each(|(o, &v)| *o = v as u32)
+            }
             HotRef::U32(it) => out.copy_from_slice(&it[start..end]),
         }
     }
@@ -272,9 +283,8 @@ fn place(len: usize, bits: u32, at: usize) -> (usize, usize, u32) {
 
 impl Packed {
     pub fn pack(values: &[u32]) -> Packed {
-        let (min, max) = values
-            .iter()
-            .fold((u32::MAX, 0), |(min, max), &it| (min.min(it), max.max(it)));
+        let (min, max) =
+            values.iter().fold((u32::MAX, 0), |(min, max), &it| (min.min(it), max.max(it)));
         let len = values.len();
         let (min, bits) = frame(min, max, len);
         // alloc: once a column packed
@@ -379,7 +389,9 @@ impl WarmColumn {
             && words.len() == words_for(self.len as usize, self.bits);
         match fits {
             true => Ok(WarmRef { min: self.min, bits: self.bits, len: self.len as usize, words }),
-            false => Err(FormatError::Invalid { at, what: "a warm column whose words don't fit it" }),
+            false => {
+                Err(FormatError::Invalid { at, what: "a warm column whose words don't fit it" })
+            }
         }
     }
 }
@@ -438,7 +450,8 @@ impl WarmRef<'_> {
                     unpack_by_width!(self.bits, words, self.min, &mut scratch;
                         1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
                     let upto = last.min(end);
-                    out[at - start..upto - start].copy_from_slice(&scratch[at - first..upto - first]);
+                    out[at - start..upto - start]
+                        .copy_from_slice(&scratch[at - first..upto - first]);
                     at = upto;
                 }
             }
@@ -502,7 +515,10 @@ impl Eq for ColdDictionary {}
 
 impl std::fmt::Debug for ColdDictionary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ColdDictionary").field("id", &self.id).field("len", &self.bytes.len()).finish()
+        f.debug_struct("ColdDictionary")
+            .field("id", &self.id)
+            .field("len", &self.bytes.len())
+            .finish()
     }
 }
 
@@ -563,7 +579,8 @@ fn put_packed(out: &mut Vec<u8>, values: &[u32]) {
     out.extend(packed.words.iter().flat_map(|word| word.to_le_bytes()));
 }
 
-const CORRUPT: FormatError = FormatError::Invalid { at: 0, what: "a cold column that does not decode" };
+const CORRUPT: FormatError =
+    FormatError::Invalid { at: 0, what: "a cold column that does not decode" };
 
 /// The most values a column holds, as a [`Slice`]'s length does: a cold column claiming more
 /// is refused before anything is allocated for it. A run or a constant column takes a few bytes
@@ -636,12 +653,10 @@ struct Shape {
 }
 
 fn steps(values: &[u32]) -> (u32, u32) {
-    values
-        .windows(2)
-        .fold((u32::MAX, 0), |(least, most), pair| {
-            let step = pair[1].wrapping_sub(pair[0]);
-            (least.min(step), most.max(step))
-        })
+    values.windows(2).fold((u32::MAX, 0), |(least, most), pair| {
+        let step = pair[1].wrapping_sub(pair[0]);
+        (least.min(step), most.max(step))
+    })
 }
 
 impl Shape {
@@ -756,7 +771,9 @@ fn encode_with(values: &[u32], codec: Codec, distinct: &[u32]) -> Option<Vec<u8>
             let gaps: Vec<u32> = distinct.windows(2).map(|pair| pair[1] - pair[0]).collect();
             let indices: Vec<u32> = values
                 .iter()
-                .map(|value| distinct.binary_search(value).expect("a value among the distinct") as u32)
+                .map(|value| {
+                    distinct.binary_search(value).expect("a value among the distinct") as u32
+                })
                 // alloc: once a column encoded
                 .collect();
             leb::write_u64(&mut out, distinct.len() as u64);
@@ -875,7 +892,10 @@ pub fn encode_cold(values: &[u32], dictionary: Option<&ColdDictionary>) -> Vec<u
     compress(&raw_cold(values), dictionary)
 }
 
-pub fn decode_cold(bytes: &[u8], dictionary: Option<&ColdDictionary>) -> Result<Vec<u32>, FormatError> {
+pub fn decode_cold(
+    bytes: &[u8],
+    dictionary: Option<&ColdDictionary>,
+) -> Result<Vec<u32>, FormatError> {
     decode_raw(&decompress(bytes, dictionary)?)
 }
 
@@ -946,7 +966,9 @@ fn decompress(bytes: &[u8], dictionary: Option<&ColdDictionary>) -> Result<Vec<u
     }
     let mut raw = Vec::with_capacity(len as usize);
     let read = CONTEXTS.with_borrow_mut(|(_, decompressor)| match dictionary {
-        Some(dictionary) => decompressor.decompress_using_ddict(&mut raw, frame, &dictionary.decompress),
+        Some(dictionary) => {
+            decompressor.decompress_using_ddict(&mut raw, frame, &dictionary.decompress)
+        }
         None => decompressor.decompress(&mut raw, frame),
     });
     match read {

@@ -52,7 +52,9 @@ fn failed(what: impl Into<String>) -> Refused {
 fn run(words: Vec<OsString>) -> Result<(), Refused> {
     let words: Vec<String> = words
         .into_iter()
-        .map(|it| it.into_string().map_err(|it| usage(format!("{} is not UTF-8", it.to_string_lossy()))))
+        .map(|it| {
+            it.into_string().map_err(|it| usage(format!("{} is not UTF-8", it.to_string_lossy())))
+        })
         .collect::<Result<_, _>>()?;
     let Some((verb, rest)) = words.split_first() else {
         return Err(usage("`blaze perf` takes record, runs or diff"));
@@ -111,12 +113,16 @@ fn record(words: &[String]) -> Result<(), Refused> {
     while at < words.len() {
         match words[at].as_str() {
             flag @ ("--target-dir" | "--workspace") => {
-                let value = words.get(at + 1).ok_or_else(|| usage(format!("`{flag}` takes a directory")))?;
+                let value = words
+                    .get(at + 1)
+                    .ok_or_else(|| usage(format!("`{flag}` takes a directory")))?;
                 let slot = if flag == "--target-dir" { &mut target_dir } else { &mut workspace };
                 *slot = Some(PathBuf::from(value));
                 at += 2;
             }
-            other if other.starts_with("--") => return Err(usage(format!("`blaze perf record` has no {other}"))),
+            other if other.starts_with("--") => {
+                return Err(usage(format!("`blaze perf record` has no {other}")));
+            }
             file => {
                 files.push(PathBuf::from(file));
                 at += 1;
@@ -124,9 +130,12 @@ fn record(words: &[String]) -> Result<(), Refused> {
         }
     }
     if files.is_empty() {
-        return Err(usage("`blaze perf record` takes the .ixprof file of each repetition of one run"));
+        return Err(usage(
+            "`blaze perf record` takes the .ixprof file of each repetition of one run",
+        ));
     }
-    let cwd = std::env::current_dir().map_err(|error| failed(format!("the current directory: {error}")))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| failed(format!("the current directory: {error}")))?;
     let workspace = workspace.or_else(|| workspace_of(&cwd));
     let target_dir = match (target_dir, std::env::var_os("CARGO_TARGET_DIR"), &workspace) {
         (Some(it), _, _) => it,
@@ -144,12 +153,15 @@ fn record(words: &[String]) -> Result<(), Refused> {
             .map_err(|error| format!("the digest of {}: {error}", workspace.display())),
         None => Err(format!("no workspace at or above {}", cwd.display())),
     };
-    let blaze = blaze_profile::identity::binary().map_err(|error| failed(format!("blaze's own executable: {error}")))?;
+    let blaze = blaze_profile::identity::binary()
+        .map_err(|error| failed(format!("blaze's own executable: {error}")))?;
     let host = host().map_err(failed)?;
     let perf = target_dir.join("perf");
     let mut reps = Vec::with_capacity(files.len());
     for file in &files {
-        reps.push(std::fs::read(file).map_err(|error| failed(format!("{}: {error}", file.display())))?);
+        reps.push(
+            std::fs::read(file).map_err(|error| failed(format!("{}: {error}", file.display())))?,
+        );
     }
     let (row, functions) = record::record(&reps, &Inputs { perf: perf.clone(), tree, blaze, host })
         .map_err(|why| failed(format!("recording {}: {why}", files[0].display())))?;
@@ -186,7 +198,8 @@ fn runs(words: &[String]) -> Result<(), Refused> {
     };
     let runs = rows::runs(&history_dir()?).map_err(failed)?;
     if json {
-        let text = serde_json::to_string_pretty(&runs).map_err(|error| failed(error.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(&runs).map_err(|error| failed(error.to_string()))?;
         println!("{text}");
         return Ok(());
     }
@@ -194,7 +207,10 @@ fn runs(words: &[String]) -> Result<(), Refused> {
         println!("no runs recorded: `blaze perf record FILE.ixprof...` records one");
         return Ok(());
     }
-    println!("{:<16}  {:>19}  {:>4}  {:>9}  {:<12}  target", "run", "started (unix s)", "reps", "samples", "tree");
+    println!(
+        "{:<16}  {:>19}  {:>4}  {:>9}  {:<12}  target",
+        "run", "started (unix s)", "reps", "samples", "tree"
+    );
     for it in &runs {
         println!(
             "{:<16}  {:>19}  {:>4}  {:>9}  {:<12}  {}{}",
@@ -217,7 +233,9 @@ fn compare(words: &[String]) -> Result<(), Refused> {
         match word.as_str() {
             "--json" => json = true,
             "--all" => all = true,
-            other if other.starts_with("--") => return Err(usage(format!("`blaze perf diff` has no {other}"))),
+            other if other.starts_with("--") => {
+                return Err(usage(format!("`blaze perf diff` has no {other}")));
+            }
             other => named.push(other),
         }
     }
@@ -228,19 +246,25 @@ fn compare(words: &[String]) -> Result<(), Refused> {
     let runs = rows::runs(&dir).map_err(failed)?;
     let run = match named.first() {
         Some(name) => diff::find(&runs, name).map_err(failed)?,
-        None => runs.last().ok_or_else(|| failed("no runs recorded: `blaze perf record FILE.ixprof...` records one"))?,
+        None => runs.last().ok_or_else(|| {
+            failed("no runs recorded: `blaze perf record FILE.ixprof...` records one")
+        })?,
     };
     let base = match named.get(1) {
         Some(name) => diff::find(&runs, name).map_err(failed)?,
         None => diff::default_base(&runs, run).ok_or_else(|| {
-            failed(format!("run {} is the first of {} recorded: name a base run to compare it with", run.run, run.target))
+            failed(format!(
+                "run {} is the first of {} recorded: name a base run to compare it with",
+                run.run, run.target
+            ))
         })?,
     };
     let run_rows = rows::functions(&dir, &run.run).map_err(failed)?;
     let base_rows = rows::functions(&dir, &base.run).map_err(failed)?;
     let diff = diff::compare((run, &run_rows), (base, &base_rows)).map_err(failed)?;
     if json {
-        let text = serde_json::to_string_pretty(&diff).map_err(|error| failed(error.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(&diff).map_err(|error| failed(error.to_string()))?;
         println!("{text}");
     } else {
         print!("{}", diff::render(&diff, all));

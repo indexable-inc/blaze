@@ -212,7 +212,8 @@ mod tests {
     #[test]
     fn a_warm_table_interns_without_allocating() {
         let mut paths = Paths::default();
-        let names: Vec<String> = (0..512).map(|it| format!("ws/dir{}/file{it}.rs", it % 7)).collect();
+        let names: Vec<String> =
+            (0..512).map(|it| format!("ws/dir{}/file{it}.rs", it % 7)).collect();
         for name in &names {
             paths.intern(name);
         }
@@ -238,7 +239,11 @@ fn paths_with_one_old_hash_take_bounded_probes() {
     let start = std::time::Instant::now();
     let ids: Vec<PathId> = names.iter().map(|it| paths.intern(it)).collect(); // alloc: a test's ids
     let interned = crate::probes::take();
-    eprintln!("flood: Paths::intern of {} paths with one old hash: {:?}, {interned} names compared", names.len(), start.elapsed());
+    eprintln!(
+        "flood: Paths::intern of {} paths with one old hash: {:?}, {interned} names compared",
+        names.len(),
+        start.elapsed()
+    );
     assert!(paths.key.is_some(), "the flood did not switch the table to a key");
     assert_eq!(paths.switches, 1, "the table switched more than once");
     for (name, id) in names.iter().zip(&ids) {
@@ -246,8 +251,16 @@ fn paths_with_one_old_hash_take_bounded_probes() {
     }
     let found = crate::probes::take();
     let bound = 16 * names.len() as u64;
-    assert!(interned <= bound, "interning {} paths with one old hash compared {interned} names, over {bound}", names.len());
-    assert!(found <= bound, "finding {} paths with one old hash compared {found} names, over {bound}", names.len());
+    assert!(
+        interned <= bound,
+        "interning {} paths with one old hash compared {interned} names, over {bound}",
+        names.len()
+    );
+    assert!(
+        found <= bound,
+        "finding {} paths with one old hash compared {found} names, over {bound}",
+        names.len()
+    );
 }
 
 /// A flood switches the table once, at the intern that compares

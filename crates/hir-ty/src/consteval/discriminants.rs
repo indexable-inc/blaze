@@ -261,7 +261,9 @@ impl<'db> EnumDiscriminants<'db> {
         let mut keyed = Vec::with_capacity(self.len());
         for run in 0..self.starts.len() {
             let (start, first) = (self.starts[run], int.key(self.firsts[run]));
-            keyed.extend((start..self.run_end(run)).map(|index| (first + (index - start) as u128, index)));
+            keyed.extend(
+                (start..self.run_end(run)).map(|index| (first + (index - start) as u128, index)),
+            );
         }
         keyed.sort_unstable();
         let mut groups: Vec<SmallVec<[u32; 2]>> = keyed
@@ -352,7 +354,8 @@ impl<'db> Builder<'db> {
     pub fn finish(self) -> EnumDiscriminants<'db> {
         let Builder { int, count, starts, firsts, failed, overflowed } = self;
         let runs = starts.len();
-        let len = |run: usize| (starts.get(run + 1).copied().unwrap_or(count) - starts[run]) as u128;
+        let len =
+            |run: usize| (starts.get(run + 1).copied().unwrap_or(count) - starts[run]) as u128;
         // alloc: inline for one run
         let mut by_value: SmallVec<[u32; 1]> = (0..runs as u32).collect();
         by_value.sort_unstable_by_key(|&run| (int.key(firsts[run as usize]), starts[run as usize]));
@@ -386,7 +389,11 @@ impl<'db> Builder<'db> {
 pub fn explicit_discriminant_indices(db: &Db, e: EnumId) -> Box<[u32]> {
     let variants = e.enum_variants(db).with_explicit_discriminant();
     // alloc: the memo, empty (no allocation) for an enum without explicit discriminants
-    variants.enumerate().filter(|(_, (_, _, explicit))| *explicit).map(|(at, _)| at as u32).collect()
+    variants
+        .enumerate()
+        .filter(|(_, (_, _, explicit))| *explicit)
+        .map(|(at, _)| at as u32)
+        .collect()
 }
 
 /// The value of `variant`'s explicit discriminant expression, in the enum's `repr` type.
@@ -397,7 +404,8 @@ pub fn explicit_discriminant<'db>(
 ) -> Result<i128, ConstEvalError<'db>> {
     let int = DiscrInt::of(db, variant.lookup(db).parent)?;
     let value = evaluate(db, variant.into(), GenericArgs::empty(), None)?;
-    let value = if int.signed { allocation_as_isize(value) } else { allocation_as_usize(value) as i128 };
+    let value =
+        if int.signed { allocation_as_isize(value) } else { allocation_as_usize(value) as i128 };
     Ok(int.normalize(value))
 }
 
@@ -479,7 +487,10 @@ mod tests {
     }
 
     /// A variant as the tests write one: `None` without an explicit discriminant.
-    fn build(int: DiscrInt, variants: &[Option<Result<i128, Error>>]) -> EnumDiscriminants<'static> {
+    fn build(
+        int: DiscrInt,
+        variants: &[Option<Result<i128, Error>>],
+    ) -> EnumDiscriminants<'static> {
         let mut builder = Builder::new(int);
         for variant in variants {
             match variant {
@@ -492,7 +503,10 @@ mod tests {
 
     /// Each variant's discriminant by the table, checked against a pass that counts each one
     /// from its run's explicit value, as `variant_discriminant` does.
-    fn values(table: &EnumDiscriminants<'static>, variants: &[Option<Result<i128, Error>>]) -> Vec<Result<i128, Error>> {
+    fn values(
+        table: &EnumDiscriminants<'static>,
+        variants: &[Option<Result<i128, Error>>],
+    ) -> Vec<Result<i128, Error>> {
         let int = table.int().unwrap();
         let mut start = (0, Ok(0));
         let mut out = Vec::new();
@@ -516,7 +530,10 @@ mod tests {
     fn implicit_discriminants_count_from_zero_and_from_each_explicit_one() {
         let variants = [None, None, Some(Ok(10)), None, None, Some(Ok(-3)), None];
         let table = build(int(true, Integer::I64), &variants);
-        assert_eq!(values(&table, &variants), [Ok(0), Ok(1), Ok(10), Ok(11), Ok(12), Ok(-3), Ok(-2)]);
+        assert_eq!(
+            values(&table, &variants),
+            [Ok(0), Ok(1), Ok(10), Ok(11), Ok(12), Ok(-3), Ok(-2)]
+        );
         assert_eq!(table.starts.len(), 3);
         assert!(!table.has_duplicates());
         assert!(table.overflowed().is_empty());

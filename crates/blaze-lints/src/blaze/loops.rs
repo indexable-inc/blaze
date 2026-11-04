@@ -47,7 +47,9 @@ pub(super) fn written(analysis: &hir::BodyAnalysis<'_>, id: ExprId) -> bool {
 pub(super) fn is_int(body: &hir_def::expr_store::Body, expr: ExprId, value: u128) -> bool {
     match body.expr(expr) {
         Expr::Literal(hir_def::hir::Literal::Uint(it, _)) => *it == value,
-        Expr::Literal(hir_def::hir::Literal::Int(it, _)) => u128::try_from(*it).is_ok_and(|it| it == value),
+        Expr::Literal(hir_def::hir::Literal::Int(it, _)) => {
+            u128::try_from(*it).is_ok_and(|it| it == value)
+        }
         _ => false,
     }
 }

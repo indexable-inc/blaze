@@ -123,7 +123,9 @@ fn read_body(db: &Db, def: DefWithBodyId, out: &mut HashMap<FieldId, FieldFacts,
     for (id, expr) in body.exprs() {
         match expr {
             Expr::Field { .. } if !derived => {
-                let Some(either::Either::Left(field)) = infer.field_resolution(id) else { continue };
+                let Some(either::Either::Left(field)) = infer.field_resolution(id) else {
+                    continue;
+                };
                 let parents = parents.get_or_insert_with(|| facts::Parents::of(body));
                 let facts = out.entry(field).or_default();
                 classify(db, &analysis, parents, id, facts);
@@ -151,7 +153,12 @@ fn read_body(db: &Db, def: DefWithBodyId, out: &mut HashMap<FieldId, FieldFacts,
 }
 
 /// The name of the function the call `call` resolves to.
-fn called<'db>(db: &'db Db, body: &Body, infer: &hir_ty::InferenceResult<'db>, call: ExprId) -> Option<&'db str> {
+fn called<'db>(
+    db: &'db Db,
+    body: &Body,
+    infer: &hir_ty::InferenceResult<'db>,
+    call: ExprId,
+) -> Option<&'db str> {
     let (f, _) = written_callee(infer, body, call)?;
     Some(FunctionSignature::of(db, f).name.as_str())
 }
@@ -206,18 +213,24 @@ fn classify(
         }
         _ if cast => facts.other = true,
         Expr::Index { base, .. } if base == at => facts.indexed = true,
-        Expr::MethodCall { receiver, .. } if receiver == at => match called(db, body, infer, parent) {
-            Some("push" | "push_str" | "extend" | "extend_from_slice" | "append" | "clear") => facts.pushed = true,
-            Some("iter" | "into_iter") => facts.iterated = true,
-            Some("len" | "is_empty") => facts.measured = true,
-            Some(
-                "get" | "get_mut" | "first" | "last" | "first_mut" | "last_mut" | "insert" | "remove" | "swap"
-                | "swap_remove" | "split_at" | "split_at_mut",
-            ) => facts.indexed = true,
-            _ => facts.other = true,
-        },
+        Expr::MethodCall { receiver, .. } if receiver == at => {
+            match called(db, body, infer, parent) {
+                Some("push" | "push_str" | "extend" | "extend_from_slice" | "append" | "clear") => {
+                    facts.pushed = true
+                }
+                Some("iter" | "into_iter") => facts.iterated = true,
+                Some("len" | "is_empty") => facts.measured = true,
+                Some(
+                    "get" | "get_mut" | "first" | "last" | "first_mut" | "last_mut" | "insert"
+                    | "remove" | "swap" | "swap_remove" | "split_at" | "split_at_mut",
+                ) => facts.indexed = true,
+                _ => facts.other = true,
+            }
+        }
         Expr::Assignment { value, .. } if value != at => facts.written = true,
-        Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { .. }), .. } if lhs == at => facts.written = true,
+        Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { .. }), .. } if lhs == at => {
+            facts.written = true
+        }
         // `for x in &s.f` / `for x in s.f`: `IntoIterator::into_iter(..)` of the desugaring.
         Expr::Ref { .. } | Expr::Call { .. } => {
             let call = match body.expr(parent) {
@@ -225,7 +238,8 @@ fn classify(
                 _ => Some(parent),
             };
             let iterated = call.is_some_and(|call| {
-                matches!(body.expr(call), Expr::Call { .. }) && called(db, body, infer, call) == Some("into_iter")
+                matches!(body.expr(call), Expr::Call { .. })
+                    && called(db, body, infer, call) == Some("into_iter")
             });
             if iterated {
                 facts.iterated = true;
@@ -258,7 +272,12 @@ fn field_of(analysis: &hir::BodyAnalysis<'_>, expr: ExprId) -> Option<FieldId> {
 
 /// The bound `init` builds `field` with: `Some(Some(n))` a known bound, `Some(None)` a clone
 /// of `field` itself, `None` unbounded or unknown.
-fn bound_of(db: &Db, analysis: &hir::BodyAnalysis<'_>, init: ExprId, field: FieldId) -> Option<Option<u64>> {
+fn bound_of(
+    db: &Db,
+    analysis: &hir::BodyAnalysis<'_>,
+    init: ExprId,
+    field: FieldId,
+) -> Option<Option<u64>> {
     let body = analysis.body();
     let infer = analysis.infer();
     match body.expr(init) {

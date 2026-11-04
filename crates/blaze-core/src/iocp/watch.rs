@@ -128,7 +128,8 @@ impl Watching {
         }
         // SAFETY: the read's completion was taken, so the system writes the buffer no more; it
         // wrote `got` bytes of it, read here as bytes while the watch holds it.
-        let bytes = unsafe { std::slice::from_raw_parts(self.buffer.ptr().cast_const(), got.min(BUFFER)) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(self.buffer.ptr().cast_const(), got.min(BUFFER)) };
         let Scratch { name, joined, spans } = scratch;
         joined.clear();
         spans.clear();
@@ -207,7 +208,8 @@ fn is_dir(paths: &mut Paths, name: &FileName) -> bool {
 /// name is not Unicode, the rest is.
 fn parse(bytes: &[u8], name: &mut String, mut each: impl FnMut(u32, &str)) -> bool {
     let mut at = 0usize;
-    let u32_at = |at: usize| bytes.get(at..at + 4).map(|it| u32::from_ne_bytes(it.try_into().unwrap()));
+    let u32_at =
+        |at: usize| bytes.get(at..at + 4).map(|it| u32::from_ne_bytes(it.try_into().unwrap()));
     loop {
         let (Some(next), Some(action), Some(len)) = (u32_at(at), u32_at(at + 4), u32_at(at + 8))
         else {
@@ -253,7 +255,8 @@ fn walk(path: &Path, name: &FileName, files: &mut Vec<FileName>) -> io::Result<(
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         // alloc: a directory come in, walked once (`take`).
-        let Some(file) = entry.file_name().to_str().and_then(|it| FileName::new(&format!("{name}/{it}")))
+        let Some(file) =
+            entry.file_name().to_str().and_then(|it| FileName::new(&format!("{name}/{it}")))
         else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a name that is not Unicode"));
         };
@@ -284,7 +287,9 @@ mod tests {
 
     fn records(bytes: &[u8]) -> (Vec<(u32, String)>, bool) {
         let mut records = Vec::new();
-        let lost = parse(bytes, &mut String::new(), |action, name| records.push((action, name.to_owned())));
+        let lost = parse(bytes, &mut String::new(), |action, name| {
+            records.push((action, name.to_owned()))
+        });
         (records, lost)
     }
 
@@ -297,7 +302,10 @@ mod tests {
         bytes.extend(first);
         let (records, lost) = records(&bytes);
         assert!(!lost);
-        assert_eq!(records, [(3, "keep".to_owned()), (FILE_ACTION_ADDED, "deep/lib.rs".to_owned())]);
+        assert_eq!(
+            records,
+            [(3, "keep".to_owned()), (FILE_ACTION_ADDED, "deep/lib.rs".to_owned())]
+        );
     }
 
     #[test]

@@ -8,7 +8,8 @@ use crate::tests::{checked, items::ui_core, ui};
 /// The errors of a crate of `main.rs` and `minicore` (`flags`), each as `4:17 message`: the
 /// line and column of its primary span in `source`, and its message.
 fn errors(flags: &str, source: &str) -> Vec<String> {
-    let checked = checked(&format!("//- minicore: {flags}\n//- /main.rs crate:other:main\n{source}"));
+    let checked =
+        checked(&format!("//- minicore: {flags}\n//- /main.rs crate:other:main\n{source}"));
     checked
         .diags
         .iter()

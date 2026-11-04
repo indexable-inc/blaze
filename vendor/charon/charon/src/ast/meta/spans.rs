@@ -9,8 +9,20 @@ use std::{borrow::Cow, cmp::Ordering, ops::Range, path::PathBuf};
 generate_index_type!(FileId);
 
 /// A filename.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum FileName {
     /// A remapped path (namely paths into stdlib)
     Virtual(PathBuf),
@@ -20,8 +32,20 @@ pub enum FileName {
     NotReal(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct File {
     /// The file identifier.
     #[cfg_attr(feature = "charon_on_charon", charon::opaque)]
@@ -35,8 +59,21 @@ pub struct File {
     pub contents: Option<String>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct Loc {
     /// The (1-based) line number.
     pub line: u32,
@@ -45,8 +82,9 @@ pub struct Loc {
 }
 
 /// A snippet of source code within a file.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Drive, DriveMut, DriveTwo,
+)]
 pub struct SpanData {
     #[cfg_attr(feature = "charon_on_charon", charon::rename("file"))]
     pub file_id: FileId,
@@ -124,15 +162,22 @@ mod pack {
 
 /// A [`Span`] with its contents laid out, used for serialization and unpacking into a
 /// more readable format.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
     Serialize,
     Deserialize,
     SerializeState,
     DeserializeState,
     Drive,
     DriveMut,
-    DriveTwo
+    DriveTwo,
 )]
 #[cfg_attr(feature = "charon_on_charon", charon::rename("Span"))]
 #[serde_state(stateless)]
@@ -160,10 +205,7 @@ struct WideSpans {
 impl Span {
     #[inline]
     pub fn new(data: SpanData, generated_from_span: Option<SpanData>) -> Self {
-        Self::from_unpacked(SerializedSpan {
-            data,
-            generated_from_span,
-        })
+        Self::from_unpacked(SerializedSpan { data, generated_from_span })
     }
 
     /// The source code span; for code coming from a macro expansion, the location of the macro
@@ -209,19 +251,13 @@ impl Span {
         let beg_line = get(self.0, BEG_LINE_SHIFT, LINE_BITS);
         let data = SpanData {
             file_id: FileId::from_raw(get(self.0, FILE_SHIFT, FILE_BITS)),
-            beg: Loc {
-                line: beg_line,
-                col: get(self.0, BEG_COL_SHIFT, COL_BITS),
-            },
+            beg: Loc { line: beg_line, col: get(self.0, BEG_COL_SHIFT, COL_BITS) },
             end: Loc {
                 line: beg_line + get(self.0, NLINES_SHIFT, NLINES_BITS),
                 col: get(self.0, END_COL_SHIFT, COL_BITS),
             },
         };
-        SerializedSpan {
-            data,
-            generated_from_span: None,
-        }
+        SerializedSpan { data, generated_from_span: None }
     }
 
     #[cold]
@@ -351,10 +387,7 @@ impl Loc {
 
     fn min(l0: &Loc, l1: &Loc) -> Loc {
         match l0.line.cmp(&l1.line) {
-            Ordering::Equal => Loc {
-                line: l0.line,
-                col: std::cmp::min(l0.col, l1.col),
-            },
+            Ordering::Equal => Loc { line: l0.line, col: std::cmp::min(l0.col, l1.col) },
             Ordering::Less => *l0,
             Ordering::Greater => *l1,
         }
@@ -362,10 +395,7 @@ impl Loc {
 
     fn max(l0: &Loc, l1: &Loc) -> Loc {
         match l0.line.cmp(&l1.line) {
-            Ordering::Equal => Loc {
-                line: l0.line,
-                col: std::cmp::max(l0.col, l1.col),
-            },
+            Ordering::Equal => Loc { line: l0.line, col: std::cmp::max(l0.col, l1.col) },
             Ordering::Greater => *l0,
             Ordering::Less => *l1,
         }
@@ -378,11 +408,7 @@ impl Loc {
 
 impl SpanData {
     pub const fn dummy() -> Self {
-        SpanData {
-            file_id: FileId::ZERO,
-            beg: Loc::dummy(),
-            end: Loc::dummy(),
-        }
+        SpanData { file_id: FileId::ZERO, beg: Loc::dummy(), end: Loc::dummy() }
     }
 
     /// Value with which we order `SpanDatas`s.
@@ -483,14 +509,8 @@ fn span_dummy_is_zero() {
 fn span_roundtrip() {
     let data = |file: usize, beg: (u32, u32), end: (u32, u32)| SpanData {
         file_id: FileId::from_usize(file),
-        beg: Loc {
-            line: beg.0,
-            col: beg.1,
-        },
-        end: Loc {
-            line: end.0,
-            col: end.1,
-        },
+        beg: Loc { line: beg.0, col: beg.1 },
+        end: Loc { line: end.0, col: end.1 },
     };
     let packed = data(12, (34, 56), (78, 90));
     let huge_file = data(1 << 20, (34, 56), (78, 90));

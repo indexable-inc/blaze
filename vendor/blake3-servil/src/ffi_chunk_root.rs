@@ -12,7 +12,12 @@ use core::mem::MaybeUninit;
 /// `input`'s root output (its first 32 bytes), one chunk at counter 0.
 /// Requires SSE4.1, and AVX-512F and AVX-512VL with `avx512`.
 #[inline(always)]
-pub(crate) unsafe fn chunk_root(avx512: bool, input: &[u8], key: &CVWords, flags: u8) -> [u8; OUT_LEN] {
+pub(crate) unsafe fn chunk_root(
+    avx512: bool,
+    input: &[u8],
+    key: &CVWords,
+    flags: u8,
+) -> [u8; OUT_LEN] {
     assert!(input.len() <= CHUNK_LEN, "one chunk or less");
     let blocks = input.len() / BLOCK_LEN;
     if blocks == 0 || input.len() % BLOCK_LEN != 0 {
@@ -23,14 +28,27 @@ pub(crate) unsafe fn chunk_root(avx512: bool, input: &[u8], key: &CVWords, flags
     // put stack traffic back on this path (John, #141).
     // Sound: the input holds `blocks` whole blocks; the last is in place.
     let last = unsafe { input.as_ptr().add((blocks - 1) * BLOCK_LEN) };
-    unsafe { call(avx512, input, key, last, flags as u64 | (BLOCK_LEN as u64) << 8 | ((blocks - 1) as u64) << 16) }
+    unsafe {
+        call(
+            avx512,
+            input,
+            key,
+            last,
+            flags as u64 | (BLOCK_LEN as u64) << 8 | ((blocks - 1) as u64) << 16,
+        )
+    }
 }
 
 /// An input that ends in a partial block, or is empty: the final block
 /// zero-padded in a 64-byte-aligned copy on this function's own stack.
 #[cold]
 #[inline(never)]
-unsafe fn chunk_root_partial(avx512: bool, input: &[u8], key: &CVWords, flags: u8) -> [u8; OUT_LEN] {
+unsafe fn chunk_root_partial(
+    avx512: bool,
+    input: &[u8],
+    key: &CVWords,
+    flags: u8,
+) -> [u8; OUT_LEN] {
     let blocks = input.len() / BLOCK_LEN;
     let tail = input.len() % BLOCK_LEN;
     /// The zero-padded final block, 64-byte aligned.
@@ -38,12 +56,26 @@ unsafe fn chunk_root_partial(avx512: bool, input: &[u8], key: &CVWords, flags: u
     struct Padded([u8; BLOCK_LEN]);
     let mut padded = Padded([0; BLOCK_LEN]);
     padded.0[..tail].copy_from_slice(&input[blocks * BLOCK_LEN..]);
-    unsafe { call(avx512, input, key, padded.0.as_ptr(), flags as u64 | (tail as u64) << 8 | (blocks as u64) << 16) }
+    unsafe {
+        call(
+            avx512,
+            input,
+            key,
+            padded.0.as_ptr(),
+            flags as u64 | (tail as u64) << 8 | (blocks as u64) << 16,
+        )
+    }
 }
 
 /// One kernel call: `packed` is flags | last_len << 8 | whole << 16.
 #[inline(always)]
-unsafe fn call(avx512: bool, input: &[u8], key: &CVWords, last: *const u8, packed: u64) -> [u8; OUT_LEN] {
+unsafe fn call(
+    avx512: bool,
+    input: &[u8],
+    key: &CVWords,
+    last: *const u8,
+    packed: u64,
+) -> [u8; OUT_LEN] {
     let mut out = MaybeUninit::<[u8; OUT_LEN]>::uninit();
     // Sound: the caller passes `whole` blocks of input before `last`, and
     // `last` holding 64 readable bytes; `out` has 32 writable ones; the
@@ -51,10 +83,22 @@ unsafe fn call(avx512: bool, input: &[u8], key: &CVWords, last: *const u8, packe
     unsafe {
         if avx512 {
             crate::ran_kernel(ffi::blake3_servil_avx512_chunk_root as *const ());
-            ffi::blake3_servil_avx512_chunk_root(input.as_ptr(), key.as_ptr(), last, packed, out.as_mut_ptr().cast());
+            ffi::blake3_servil_avx512_chunk_root(
+                input.as_ptr(),
+                key.as_ptr(),
+                last,
+                packed,
+                out.as_mut_ptr().cast(),
+            );
         } else {
             crate::ran_kernel(ffi::blake3_servil_sse41_chunk_root as *const ());
-            ffi::blake3_servil_sse41_chunk_root(input.as_ptr(), key.as_ptr(), last, packed, out.as_mut_ptr().cast());
+            ffi::blake3_servil_sse41_chunk_root(
+                input.as_ptr(),
+                key.as_ptr(),
+                last,
+                packed,
+                out.as_mut_ptr().cast(),
+            );
         }
         out.assume_init()
     }
@@ -62,8 +106,20 @@ unsafe fn call(avx512: bool, input: &[u8], key: &CVWords, last: *const u8, packe
 
 pub(crate) mod ffi {
     unsafe extern "C" {
-        pub fn blake3_servil_sse41_chunk_root(input: *const u8, key: *const u32, last: *const u8, packed: u64, out: *mut u8);
-        pub fn blake3_servil_avx512_chunk_root(input: *const u8, key: *const u32, last: *const u8, packed: u64, out: *mut u8);
+        pub fn blake3_servil_sse41_chunk_root(
+            input: *const u8,
+            key: *const u32,
+            last: *const u8,
+            packed: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_avx512_chunk_root(
+            input: *const u8,
+            key: *const u32,
+            last: *const u8,
+            packed: u64,
+            out: *mut u8,
+        );
     }
 }
 
@@ -100,15 +156,21 @@ mod test {
         let mut buf = vec![0u8; CHUNK_LEN + 3];
         crate::test::paint_test_input(&mut buf);
         let keyed = crate::platform::words_from_le_bytes_32(&[0x42; 32]);
-        let derive = crate::platform::words_from_le_bytes_32(&crate::performance::context_key("chunk root"));
-        let modes = [(crate::IV, 0), (&keyed, crate::KEYED_HASH), (&derive, crate::DERIVE_KEY_MATERIAL)];
+        let derive =
+            crate::platform::words_from_le_bytes_32(&crate::performance::context_key("chunk root"));
+        let modes =
+            [(crate::IV, 0), (&keyed, crate::KEYED_HASH), (&derive, crate::DERIVE_KEY_MATERIAL)];
         for &avx512 in &variants {
             for offset in 0..4 {
                 for len in 0..=CHUNK_LEN.min(buf.len() - offset) {
                     for &(key, flags) in &modes {
                         let input = &buf[offset..][..len];
                         let got = unsafe { chunk_root(avx512, input, key, flags) };
-                        assert_eq!(got, reference(input, key, flags), "avx512={avx512} offset={offset} len={len} flags={flags}");
+                        assert_eq!(
+                            got,
+                            reference(input, key, flags),
+                            "avx512={avx512} offset={offset} len={len} flags={flags}"
+                        );
                     }
                 }
             }
@@ -132,7 +194,11 @@ mod test {
                     for (key, flags) in [(crate::IV, 0), (&keyed, crate::KEYED_HASH)] {
                         let input = &lines.0[offset..][..len];
                         let got = unsafe { chunk_root(avx512, input, key, flags) };
-                        assert_eq!(got, reference(input, key, flags), "avx512={avx512} offset={offset} len={len} flags={flags}");
+                        assert_eq!(
+                            got,
+                            reference(input, key, flags),
+                            "avx512={avx512} offset={offset} len={len} flags={flags}"
+                        );
                     }
                 }
             }
@@ -149,14 +215,21 @@ mod test {
         for (n, line) in source.lines().enumerate() {
             let code = line.split("//").next().unwrap().trim();
             for word in ["push", "pop", "rsp", "rbp", "rip", "esp", "ebp", "call"] {
-                assert!(!code.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == word), "line {}: {word}: {line}", n + 1);
+                assert!(
+                    !code.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == word),
+                    "line {}: {word}: {line}",
+                    n + 1
+                );
             }
         }
         // And the one memory each instruction may touch is an argument's.
         for line in source.lines() {
             if let Some(open) = line.find('[') {
                 let base = line[open + 1..].split(|c| c == '+' || c == ']').next().unwrap().trim();
-                assert!(["rdi", "rsi", "rdx", "r8"].contains(&base), "memory outside the arguments: {line}");
+                assert!(
+                    ["rdi", "rsi", "rdx", "r8"].contains(&base),
+                    "memory outside the arguments: {line}"
+                );
             }
         }
     }

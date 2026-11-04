@@ -28,11 +28,8 @@ impl TransformPass for Transform {
                 .filter(|(_, assoc_ty)| !assoc_ty.params.has_explicits())
             {
                 // Try to move them all out of the binder, or bail.
-                if let Some(clauses) = assoc_ty
-                    .skip_binder
-                    .clone()
-                    .implied_clauses
-                    .move_from_under_binder()
+                if let Some(clauses) =
+                    assoc_ty.skip_binder.clone().implied_clauses.move_from_under_binder()
                 {
                     assoc_ty.skip_binder.implied_clauses.clear();
                     let id_map = clauses.map(|mut clause| {
@@ -45,9 +42,7 @@ impl TransformPass for Transform {
                         // Move non-trait-clause-predicates of non-GAT types to be predicates on
                         // the trait itself.
                         decl.generics.take_predicates_from(
-                            mem::take(&mut assoc_ty.params)
-                                .move_from_under_binder()
-                                .unwrap(),
+                            mem::take(&mut assoc_ty.params).move_from_under_binder().unwrap(),
                         );
                     }
                     map.set_slot_extend(type_id, id_map);
@@ -77,13 +72,8 @@ impl TransformPass for Transform {
             use TraitRefKind::*;
             match trkind {
                 ItemClause { .. } => take_mut::take(trkind, |trkind| {
-                    let ItemClause {
-                        trait_ref,
-                        type_id,
-                        generics,
-                        clause_id,
-                        clause_args,
-                    } = trkind
+                    let ItemClause { trait_ref, type_id, generics, clause_id, clause_args } =
+                        trkind
                     else {
                         unreachable!()
                     };
@@ -96,20 +86,10 @@ impl TransformPass for Transform {
                     })();
                     match new_id {
                         Some(new_id) => ParentClause(trait_ref, new_id, clause_args),
-                        None => ItemClause {
-                            trait_ref,
-                            type_id,
-                            generics,
-                            clause_id,
-                            clause_args,
-                        },
+                        None => ItemClause { trait_ref, type_id, generics, clause_id, clause_args },
                     }
                 }),
-                BuiltinOrAuto {
-                    parent_trait_refs,
-                    types,
-                    ..
-                } => {
+                BuiltinOrAuto { parent_trait_refs, types, .. } => {
                     for assoc_ty in types.iter_mut() {
                         for tref in std::mem::take(&mut assoc_ty.implied_trait_refs) {
                             // Note: this assumes that we listed the types in the same order as in

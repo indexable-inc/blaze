@@ -13,13 +13,13 @@
 //! that a rename keeps them.
 
 use base_db::{Crate, Db};
-use hir_expand::{MacroCallId, mod_path::ModPath, name::Name};
 use blaze_query::db::{AsId, FromId};
+use hir_expand::{MacroCallId, mod_path::ModPath, name::Name};
 use span::SyntaxContext;
 
 use crate::{
-    BlockId, ConstId, EnumId, EnumVariantId, FunctionId, ImplId, Macro2Id, MacroRulesId,
-    ModuleId, ProcMacroId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
+    BlockId, ConstId, EnumId, EnumVariantId, FunctionId, ImplId, Macro2Id, MacroRulesId, ModuleId,
+    ProcMacroId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
     deps::signatures::table::relocate_store,
     expr_store::{Body, ExpressionStore},
     hir::{

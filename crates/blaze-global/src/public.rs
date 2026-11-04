@@ -55,7 +55,11 @@ use crate::sign::Publisher;
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Origin {
     /// A crates.io crate version: the SHA-256 of its `.crate`, as the lock file names it.
-    CratesIo { name: String, version: String, checksum: [u8; 32] },
+    CratesIo {
+        name: String,
+        version: String,
+        checksum: [u8; 32],
+    },
     /// The pinned toolchain, by its code identity (`blaze_codegen::settings::Toolchain::id`).
     Toolchain(ContentId),
     /// A system image of blaze's builders, by its content ID.
@@ -66,9 +70,13 @@ pub enum Origin {
     Workspace,
     /// A path dependency outside the workspace.
     Path,
-    Git { url: String },
+    Git {
+        url: String,
+    },
     /// A registry other than crates.io.
-    Registry { index: String },
+    Registry {
+        index: String,
+    },
 }
 
 impl fmt::Display for Origin {
@@ -182,12 +190,25 @@ pub enum RunPart {
 /// A function instance and the crates its code and type arguments come from.
 #[derive(Clone, Debug)]
 pub struct FnSource {
+    /// The instance the link names it by (`blaze_codegen::backend::Described::code`).
     pub instance: Instance,
+    /// The code its template is kept under (`Described::template_code`): its code without the
+    /// key of the store it is written in where its template holds its positions by table
+    /// (docs/v2/plan/design/name-free-identity.md), else `instance.code`.
+    pub template_code: blaze_items::CodeHash,
     /// The crate of the item its code hash is of.
     pub code: Origin,
     /// The crates of the facts of its type arguments: the types' crates, the toolchain for
     /// primitives.
     pub args: Vec<Origin>,
+}
+
+impl FnSource {
+    /// The instance its template is kept under, as the driver's `FnNode::template_instance`
+    /// gives `dev_template_key` and `release_template_key`.
+    pub fn template_instance(&self) -> Instance {
+        Instance { code: self.template_code, ..self.instance }
+    }
 }
 
 /// An LLVM-optimized function as the release driver keeps it: under
@@ -341,7 +362,10 @@ impl Rule {
         let mut by_hash = Vec::with_capacity(roots.len());
         let mut depths = 0;
         for (at, root) in roots.iter().enumerate() {
-            let (hash, depth) = root.path.components().fold((0, 0), |(hash, depth), it| (component_hash(hash, it), depth + 1));
+            let (hash, depth) = root
+                .path
+                .components()
+                .fold((0, 0), |(hash, depth), it| (component_hash(hash, it), depth + 1));
             depths |= depth_bit(depth);
             by_hash.push((hash, depth, at as u32));
         }
@@ -372,17 +396,20 @@ impl Rule {
     /// Whether `origin` is public here.
     pub fn origin(&self, origin: &Origin) -> Result<(), String> {
         match origin {
-            Origin::CratesIo { name, version, .. } if !name.is_empty() && !version.is_empty() => Ok(()),
+            Origin::CratesIo { name, version, .. } if !name.is_empty() && !version.is_empty() => {
+                Ok(())
+            }
             Origin::CratesIo { .. } => Err("a crates.io crate with no name or version".into()),
             Origin::Toolchain(id) if *id == self.toolchain => Ok(()),
             // alloc: an error's message, made only when it fails.
-            Origin::Toolchain(id) => Err(format!(
-                "it reads the toolchain {:x}, not the pinned {:x}",
-                id, self.toolchain
-            )),
+            Origin::Toolchain(id) => {
+                Err(format!("it reads the toolchain {:x}, not the pinned {:x}", id, self.toolchain))
+            }
             Origin::System(id) if self.systems.contains(id) => Ok(()),
             // alloc: an error's message, made only when it fails.
-            Origin::System(id) => Err(format!("it reads the system image {:x}, which is not a builder's", id)),
+            Origin::System(id) => {
+                Err(format!("it reads the system image {:x}, which is not a builder's", id))
+            }
             Origin::Outputs => Ok(()),
             // alloc: an error's message, made only when it fails.
             private => Err(format!("it reads {private}")),
@@ -439,7 +466,11 @@ impl Rule {
         let private = |why: String| Private { key, why };
         if made.origins.len() != made.inputs.len() {
             // alloc: an error path.
-            return Err(private(format!("{} origins for {} inputs", made.origins.len(), made.inputs.len())));
+            return Err(private(format!(
+                "{} origins for {} inputs",
+                made.origins.len(),
+                made.inputs.len()
+            )));
         }
         for origin in made.origins {
             self.origin(origin).map_err(private)?;
@@ -465,13 +496,18 @@ impl Rule {
             if path.is_absolute() {
                 self.public_path(path)
                     // alloc: an error's message, made only when it fails.
-                    .map_err(|why| private(format!("{} names a path: {why}", name.to_string_lossy())))?;
+                    .map_err(|why| {
+                        private(format!("{} names a path: {why}", name.to_string_lossy()))
+                    })?;
             }
         }
         let traced = made.traced;
         if let Some(it) = traced.untraceable.first() {
             // alloc: an error's message, made only when it fails.
-            return Err(private(format!("it read what can't be traced ({})", trace::untraceable_name(*it))));
+            return Err(private(format!(
+                "it read what can't be traced ({})",
+                trace::untraceable_name(*it)
+            )));
         }
         for (path, _) in &traced.files {
             self.public_path(path).map_err(private)?;
@@ -501,12 +537,14 @@ impl Rule {
             .map(|it| it.iter().map(|it| it.instance.key()).collect())
             .collect();
         // alloc: per function shown public, one per import
-        let imported_built_in: Vec<&[InstanceKey]> = imported_keys.iter().map(Vec::as_slice).collect();
+        let imported_built_in: Vec<&[InstanceKey]> =
+            imported_keys.iter().map(Vec::as_slice).collect();
         // alloc: per function shown public, one per import
-        let imported_units: Vec<InstanceKey> = made.imported.iter().map(|it| it.instance.key()).collect();
+        let imported_units: Vec<InstanceKey> =
+            made.imported.iter().map(|it| it.instance.key()).collect();
         let (_, key) = with_keys(made.built_in, |built_in| {
             blaze_codegen::driver::release_template_key(
-                &made.function.instance,
+                &made.function.template_instance(),
                 built_in,
                 made.refs,
                 made.imports,
@@ -517,7 +555,10 @@ impl Rule {
         });
         let private = |why: String| Private { key, why };
         ascending(made.built_in).map_err(private)?;
-        for (given, what) in [(made.imported_refs.len(), "the references"), (made.imported_built_in.len(), "the bodies built in")] {
+        for (given, what) in [
+            (made.imported_refs.len(), "the references"),
+            (made.imported_built_in.len(), "the bodies built in"),
+        ] {
             if given != made.imports.imported.len() {
                 // alloc: an error's message, made only when it fails.
                 return Err(private(format!(
@@ -535,18 +576,26 @@ impl Rule {
             return Err(private("its settings are not those of the spec given".into()));
         }
         if !spec.backend.is_release() {
-            return Err(private("it is not compiled by LLVM: dev code is shown public by `Rule::dev_function`".into()));
+            return Err(private(
+                "it is not compiled by LLVM: dev code is shown public by `Rule::dev_function`"
+                    .into(),
+            ));
         }
         let decided = made.imports.imported.len();
-        for (given, what) in
-            [(made.imported_names.len(), "names"), (made.imported.len(), "built imports"), (made.imported_specs.len(), "import specs")]
-        {
+        for (given, what) in [
+            (made.imported_names.len(), "names"),
+            (made.imported.len(), "built imports"),
+            (made.imported_specs.len(), "import specs"),
+        ] {
             if given != decided {
                 // alloc: an error's message, made only when it fails.
-                return Err(private(format!("it is given {given} {what} for its {decided} imports")));
+                return Err(private(format!(
+                    "it is given {given} {what} for its {decided} imports"
+                )));
             }
         }
-        for (at, (name, key)) in made.imported_names.iter().zip(&made.imports.imported).enumerate() {
+        for (at, (name, key)) in made.imported_names.iter().zip(&made.imports.imported).enumerate()
+        {
             if name.key() != *key {
                 // alloc: an error's message, made only when it fails.
                 return Err(private(format!(
@@ -556,9 +605,12 @@ impl Rule {
                 )));
             }
         }
-        for (at, (built, import_spec)) in made.imported.iter().zip(made.imported_specs).enumerate() {
+        for (at, (built, import_spec)) in made.imported.iter().zip(made.imported_specs).enumerate()
+        {
             // alloc: an error's message, made only when it fails.
-            let refused = |why: String| private(format!("its import {at}, built as {:x}: {why}", built.instance.key().0));
+            let refused = |why: String| {
+                private(format!("its import {at}, built as {:x}: {why}", built.instance.key().0))
+            };
             if import_spec.settings() != built.instance.settings {
                 return Err(refused("its settings are not those of the spec given for it".into()));
             }
@@ -587,7 +639,8 @@ impl Rule {
         self.code(spec, all).map_err(private)?;
         for (at, built_in) in made.imported_built_in.iter().enumerate() {
             // alloc: an error's message, made only when it fails.
-            self.code(spec, built_in.iter()).map_err(|why| private(format!("import {at}'s built-in body: {why}")))?;
+            self.code(spec, built_in.iter())
+                .map_err(|why| private(format!("import {at}'s built-in body: {why}")))?;
         }
         Ok(Public { key, kind: Kind::Code })
     }
@@ -600,7 +653,12 @@ impl Rule {
     pub fn dev_function(&self, made: &DevFunctionMade<'_>) -> Result<Public, Private> {
         let spec = made.spec;
         let key = with_keys(made.built_in, |built_in| {
-            blaze_codegen::driver::dev_template_key(&made.function.instance, built_in, made.refs, &spec.toolchain.id)
+            blaze_codegen::driver::dev_template_key(
+                &made.function.template_instance(),
+                built_in,
+                made.refs,
+                &spec.toolchain.id,
+            )
         });
         let private = |why: String| Private { key, why };
         ascending(made.built_in).map_err(private)?;
@@ -612,7 +670,9 @@ impl Rule {
         // tier-up's too, is compiled with imports under the release key: refused until a
         // publisher of the lone kind is written with a test.
         if spec.backend.is_release() {
-            return Err(private("it is compiled by LLVM: release code is shown public by `Rule::function`".into()));
+            return Err(private(
+                "it is compiled by LLVM: release code is shown public by `Rule::function`".into(),
+            ));
         }
         if !spec.toolchain.features.is_empty() {
             // alloc: an error's message, made only when it fails.
@@ -628,7 +688,11 @@ impl Rule {
 
     /// What every function's code needs, whatever compiles it: the pinned toolchain, and the
     /// code and type arguments of each of `sources` from public crates.
-    fn code<'s>(&self, spec: &Spec, sources: impl Iterator<Item = &'s FnSource>) -> Result<(), String> {
+    fn code<'s>(
+        &self,
+        spec: &Spec,
+        sources: impl Iterator<Item = &'s FnSource>,
+    ) -> Result<(), String> {
         if spec.toolchain.id != self.toolchain {
             // alloc: an error's message, made only when it fails.
             return Err(format!(
@@ -642,7 +706,8 @@ impl Rule {
             self.origin(&source.code).map_err(|why| format!("the code of {:x}: {why}", what()))?;
             for origin in &source.args {
                 // alloc: an error's message, made only when it fails.
-                self.origin(origin).map_err(|why| format!("a type argument of {:x}: {why}", what()))?;
+                self.origin(origin)
+                    .map_err(|why| format!("a type argument of {:x}: {why}", what()))?;
             }
         }
         Ok(())
@@ -665,7 +730,10 @@ impl Rule {
         });
         if base.kind != Kind::Query {
             // alloc: an error's message, made only when it fails.
-            return Err(Private { key, why: format!("it is made from {:x}, which is not a front-end value", base.key.0) });
+            return Err(Private {
+                key,
+                why: format!("it is made from {:x}, which is not a front-end value", base.key.0),
+            });
         }
         let deps: &[Public] = match made {
             DerivedMade::Bodies { deps, .. } => *deps,
@@ -673,7 +741,10 @@ impl Rule {
         };
         if let Some(dep) = deps.iter().find(|it| it.kind != Kind::Query) {
             // alloc: an error's message, made only when it fails.
-            return Err(Private { key, why: format!("a dependency's check key {:x} is not a front-end value", dep.key.0) });
+            return Err(Private {
+                key,
+                why: format!("a dependency's check key {:x} is not a front-end value", dep.key.0),
+            });
         }
         Ok(Public { key, kind: Kind::Query })
     }
@@ -683,7 +754,10 @@ impl Rule {
         let key = keys::side(id);
         if of.kind != Kind::Code {
             // alloc: an error's message, made only when it fails.
-            return Err(Private { key, why: format!("a side table of {:x}, which is not code", of.key.0) });
+            return Err(Private {
+                key,
+                why: format!("a side table of {:x}, which is not code", of.key.0),
+            });
         }
         Ok(Public { key, kind: Kind::Debug })
     }
@@ -716,9 +790,15 @@ impl Rule {
                 _ => private(format!("a crate it depends on: {why}")),
             };
             match origin {
-                Origin::CratesIo { .. } | Origin::Toolchain(_) => self.origin(origin).map_err(which)?,
+                Origin::CratesIo { .. } | Origin::Toolchain(_) => {
+                    self.origin(origin).map_err(which)?
+                }
                 // alloc: an error path.
-                other => return Err(which(format!("it is {other}, not a crates.io crate or the toolchain"))),
+                other => {
+                    return Err(which(format!(
+                        "it is {other}, not a crates.io crate or the toolchain"
+                    )));
+                }
             }
         }
         for &out in made.out_dirs {
@@ -737,17 +817,24 @@ impl Rule {
         }
         if part == ImagePart::Image && !made.reads.is_empty() {
             // alloc: an error path.
-            return Err(private("a crate that read names besides its key's inputs has no image under its key alone".into()));
+            return Err(private(
+                "a crate that read names besides its key's inputs has no image under its key alone"
+                    .into(),
+            ));
         }
         for read in made.reads {
             match *read {
                 ImageRead::File(path) | ImageRead::Dir(path) => {
                     // alloc: an error path.
-                    self.public_path(path).map_err(|why| private(format!("a name it read: {why}")))?
+                    self.public_path(path)
+                        .map_err(|why| private(format!("a name it read: {why}")))?
                 }
                 ImageRead::Untraceable(it) => {
                     // alloc: an error path.
-                    return Err(private(format!("it read what can't be traced ({})", trace::untraceable_name(it))));
+                    return Err(private(format!(
+                        "it read what can't be traced ({})",
+                        trace::untraceable_name(it)
+                    )));
                 }
                 ImageRead::Verified => {
                     return Err(private(
@@ -755,8 +842,11 @@ impl Rule {
                     ));
                 }
                 // alloc: an error path.
-                ImageRead::Env(name) if name == trace::ALL_ENV_NAME => return Err(private("it read the whole environment".into())),
-                ImageRead::Env(name) if self.public_env.iter().any(|it| it.as_os_str() == name) => {}
+                ImageRead::Env(name) if name == trace::ALL_ENV_NAME => {
+                    return Err(private("it read the whole environment".into()));
+                }
+                ImageRead::Env(name) if self.public_env.iter().any(|it| it.as_os_str() == name) => {
+                }
                 ImageRead::Env(name) => {
                     // alloc: an error path.
                     return Err(private(format!(
@@ -871,12 +961,17 @@ impl Secrets {
     pub fn publisher(&mut self, publisher: &Publisher) {
         let seed = publisher.seed();
         self.add("the publisher's seed", seed).expect("a seed is 32 bytes");
-        self.add("the publisher's seed in hex", crate::sign::hex(seed).as_bytes()).expect("64 bytes");
+        self.add("the publisher's seed in hex", crate::sign::hex(seed).as_bytes())
+            .expect("64 bytes");
     }
 
     /// Every value of `vars` of at least [`Secrets::SHORTEST`] bytes whose name is not in
     /// `public`, named by its variable.
-    pub fn env(&mut self, vars: impl IntoIterator<Item = (OsString, OsString)>, public: &[OsString]) {
+    pub fn env(
+        &mut self,
+        vars: impl IntoIterator<Item = (OsString, OsString)>,
+        public: &[OsString],
+    ) {
         for (name, value) in vars {
             if public.contains(&name) {
                 continue;
@@ -909,9 +1004,8 @@ impl Default for Secrets {
 #[cfg(test)]
 mod tests {
     use blaze_codegen::{
-        Backend, Settings,
+        Arch, Backend, Settings,
         settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
-        Arch,
     };
     use blaze_core::Untraceable;
     use blaze_items::CodeHash;
@@ -959,7 +1053,9 @@ mod tests {
     #[test]
     fn each_origin_is_public_or_not() {
         let rule = rule();
-        for public in [serde(), Origin::Toolchain(TOOLCHAIN), Origin::System(SYSTEM), Origin::Outputs] {
+        for public in
+            [serde(), Origin::Toolchain(TOOLCHAIN), Origin::System(SYSTEM), Origin::Outputs]
+        {
             assert_eq!(rule.origin(&public), Ok(()), "{public}");
         }
         for private in private_origins() {
@@ -974,7 +1070,10 @@ mod tests {
         assert_eq!(rule.path(Path::new("/reg/serde-1.0.219/vendored/a.c")), Ok(&Origin::Path));
         assert_eq!(rule.path(Path::new("/work/target/build/x/out/a.rs")), Ok(&Origin::Outputs));
         assert_eq!(rule.path(Path::new("/work/src/main.rs")), Ok(&Origin::Workspace));
-        assert!(rule.path(Path::new("/reg/serde-1.0.2190/src/lib.rs")).is_err(), "a root is whole components");
+        assert!(
+            rule.path(Path::new("/reg/serde-1.0.2190/src/lib.rs")).is_err(),
+            "a root is whole components"
+        );
         assert!(rule.path(Path::new("/home/alice/.ssh/id_ed25519")).is_err());
     }
 
@@ -991,22 +1090,51 @@ mod tests {
     #[test]
     fn the_indexed_lookup_is_the_longest_root_scan() {
         let mut rng = blaze_ids::rng::SplitMix64::new(7);
-        let origins = [serde(), Origin::Workspace, Origin::Outputs, Origin::Path, Origin::Toolchain(TOOLCHAIN)];
+        let origins = [
+            serde(),
+            Origin::Workspace,
+            Origin::Outputs,
+            Origin::Path,
+            Origin::Toolchain(TOOLCHAIN),
+        ];
         for round in 0..200 {
             let roots = (0..rng.next_u64() % 12)
-                .map(|n| Root { path: drawn(&mut rng, 5), origin: origins[n as usize % origins.len()].clone() })
+                .map(|n| Root {
+                    path: drawn(&mut rng, 5),
+                    origin: origins[n as usize % origins.len()].clone(),
+                })
                 .collect();
             let rule = Rule::new(TOOLCHAIN, BUILD, Vec::new(), roots, Vec::new());
             for _ in 0..50 {
                 let path = drawn(&mut rng, 8);
-                assert_eq!(rule.path(&path).ok(), rule.path_scanned(&path), "round {round}: {}", path.display());
+                assert_eq!(
+                    rule.path(&path).ok(),
+                    rule.path_scanned(&path),
+                    "round {round}: {}",
+                    path.display()
+                );
             }
         }
-        let doubled = Rule::new(TOOLCHAIN, BUILD, Vec::new(), vec![Root { path: "/a//b/".into(), origin: serde() }], Vec::new());
+        let doubled = Rule::new(
+            TOOLCHAIN,
+            BUILD,
+            Vec::new(),
+            vec![Root { path: "/a//b/".into(), origin: serde() }],
+            Vec::new(),
+        );
         assert_eq!(doubled.path(Path::new("/a/b/./c")), Ok(&serde()), "components, not bytes");
-        let everything =
-            Rule::new(TOOLCHAIN, BUILD, Vec::new(), vec![Root { path: "".into(), origin: Origin::Outputs }], Vec::new());
-        assert_eq!(everything.path(Path::new("/x")).ok(), Some(&Origin::Outputs), "an empty root is under everything");
+        let everything = Rule::new(
+            TOOLCHAIN,
+            BUILD,
+            Vec::new(),
+            vec![Root { path: "".into(), origin: Origin::Outputs }],
+            Vec::new(),
+        );
+        assert_eq!(
+            everything.path(Path::new("/x")).ok(),
+            Some(&Origin::Outputs),
+            "an empty root is under everything"
+        );
         assert_eq!(everything.path_scanned(Path::new("/x")), Some(&Origin::Outputs));
     }
 
@@ -1033,11 +1161,17 @@ mod tests {
         assert_eq!(public.kind(), Kind::Query);
         let (again, used) = blaze_alloc_count::measure(|| rule.query(&made).map(|it| it.key()));
         assert_eq!(again, Ok(public.key()));
-        assert_eq!(used, blaze_alloc_count::Used::default(), "a public query is shown so with no allocation");
+        assert_eq!(
+            used,
+            blaze_alloc_count::Used::default(),
+            "a public query is shown so with no allocation"
+        );
         for private in private_origins() {
             let inputs = [ContentId([6; 32]), ContentId([8; 32])];
             let origins = [serde(), private.clone()];
-            let error = rule.query(&QueryMade { schema, producer, inputs: &inputs, origins: &origins }).unwrap_err();
+            let error = rule
+                .query(&QueryMade { schema, producer, inputs: &inputs, origins: &origins })
+                .unwrap_err();
             assert_eq!(error.key, Key::of(schema, producer, &inputs));
         }
         let short = QueryMade { schema, producer, inputs: &inputs, origins: &origins[..1] };
@@ -1046,7 +1180,9 @@ mod tests {
 
     fn given() -> Given {
         let mut given = Given::new(RunKind::BuildScript);
-        given.env("TARGET", "x86_64-unknown-linux-gnu").env("CARGO_MANIFEST_DIR", "/reg/serde-1.0.219");
+        given
+            .env("TARGET", "x86_64-unknown-linux-gnu")
+            .env("CARGO_MANIFEST_DIR", "/reg/serde-1.0.219");
         given.env("OUT_DIR", "/work/target/build/serde-1/out");
         given
     }
@@ -1072,7 +1208,8 @@ mod tests {
     fn a_public_run_is_keyed_as_usercode_keeps_it() {
         let (rule, given, traced) = (rule(), given(), traced());
         let run = run_key(&given);
-        let made = RunMade { run, given: &given, code: &serde(), caller: &serde(), traced: &traced };
+        let made =
+            RunMade { run, given: &given, code: &serde(), caller: &serde(), traced: &traced };
         let result = rule.run(&made, RunPart::Result).unwrap();
         assert_eq!((result.key(), result.kind()), (index::result_key(&run, &traced), Kind::Run));
         assert_eq!(rule.run(&made, RunPart::Shape(2)).unwrap().key(), index::slot(&run, 2));
@@ -1100,7 +1237,8 @@ mod tests {
         for (says, change) in changes {
             let mut changed = traced.clone();
             change(&mut changed);
-            let why = check(&changed, &serde(), &serde(), &given).unwrap_or_else(|| panic!("{says} is public"));
+            let why = check(&changed, &serde(), &serde(), &given)
+                .unwrap_or_else(|| panic!("{says} is public"));
             assert!(why.contains(says), "{why:?} does not say {says:?}");
         }
         for private in private_origins() {
@@ -1111,7 +1249,13 @@ mod tests {
         other.env("OUT_DIR", "/home/alice/proj/target/out");
         assert!(check(&traced, &serde(), &serde(), &other).unwrap().contains("given"));
         let other_run = RunKey { code: run.code, given: other.finish() };
-        let made = RunMade { run: other_run, given: &other, code: &serde(), caller: &serde(), traced: &traced };
+        let made = RunMade {
+            run: other_run,
+            given: &other,
+            code: &serde(),
+            caller: &serde(),
+            traced: &traced,
+        };
         assert!(rule.run(&made, RunPart::Result).unwrap_err().why.contains("OUT_DIR names a path"));
     }
 
@@ -1148,7 +1292,12 @@ mod tests {
 
     fn source(n: u8, settings: Settings, code: Origin) -> FnSource {
         FnSource {
-            instance: Instance { code: CodeHash(ContentId([n; 32])), args: ContentId([n + 1; 32]), settings },
+            instance: Instance {
+                code: CodeHash(ContentId([n; 32])),
+                args: ContentId([n + 1; 32]),
+                settings,
+            },
+            template_code: CodeHash(ContentId([n; 32])),
             code,
             args: vec![Origin::Toolchain(TOOLCHAIN)],
         }
@@ -1187,41 +1336,69 @@ mod tests {
         // key is of the built unit, so it moves with the tier the import is built at.
         let other_tier = spec(Backend::Llvm { opt: 2 }, TOOLCHAIN);
         let tiered = [source(30, other_tier.settings(), serde())];
-        let up = rule.function(&FunctionMade { imported: &tiered, imported_specs: &[&other_tier], ..made }).unwrap();
+        let up = rule
+            .function(&FunctionMade { imported: &tiered, imported_specs: &[&other_tier], ..made })
+            .unwrap();
         assert_ne!(up.key(), public.key(), "the key covers the settings an import is built at");
         let why = rule.function(&FunctionMade { imported: &tiered, ..made }).unwrap_err().why;
-        assert!(why.contains("its import 0, built as") && why.contains("spec given for it"), "{why}");
+        assert!(
+            why.contains("its import 0, built as") && why.contains("spec given for it"),
+            "{why}"
+        );
         // The likeliest caller's slip in a tier-up: the walk's first tier given as built.
         let first_tier = spec(Backend::Cranelift { speed: false }, TOOLCHAIN);
         let cranelift = [source(30, first_tier.settings(), serde())];
-        let why =
-            rule.function(&FunctionMade { imported: &cranelift, imported_specs: &[&first_tier], ..made }).unwrap_err().why;
+        let why = rule
+            .function(&FunctionMade {
+                imported: &cranelift,
+                imported_specs: &[&first_tier],
+                ..made
+            })
+            .unwrap_err()
+            .why;
         assert!(why.contains("not built by LLVM"), "{why}");
         let unpinned = spec(Backend::Llvm { opt: 3 }, ContentId([9; 32]));
         let elsewhere_built = [source(30, unpinned.settings(), serde())];
-        let why = (rule.function(&FunctionMade { imported: &elsewhere_built, imported_specs: &[&unpinned], ..made }))
-            .unwrap_err()
-            .why;
+        let why = (rule.function(&FunctionMade {
+            imported: &elsewhere_built,
+            imported_specs: &[&unpinned],
+            ..made
+        }))
+        .unwrap_err()
+        .why;
         assert!(why.contains("its import 0") && why.contains("not the pinned"), "{why}");
         let elsewhere = [source(31, settings, serde())];
         let why = rule.function(&FunctionMade { imported: &elsewhere, ..made }).unwrap_err().why;
-        assert!(why.contains("its import 0 is built as") && why.contains("code and type arguments"), "{why}");
+        assert!(
+            why.contains("its import 0 is built as") && why.contains("code and type arguments"),
+            "{why}"
+        );
         let why = rule.function(&FunctionMade { imported_names: &[], ..made }).unwrap_err().why;
         assert!(why.contains("given 0 names for its 1 imports"), "{why}");
         let other_name = [source(32, settings, serde()).instance];
-        let why = rule.function(&FunctionMade { imported_names: &other_name, ..made }).unwrap_err().why;
-        assert!(why.contains("its import 0 is named") && why.contains("its import decision names"), "{why}");
+        let why =
+            rule.function(&FunctionMade { imported_names: &other_name, ..made }).unwrap_err().why;
+        assert!(
+            why.contains("its import 0 is named") && why.contains("its import decision names"),
+            "{why}"
+        );
         let why = rule.function(&FunctionMade { imported_specs: &[], ..made }).unwrap_err().why;
         assert!(why.contains("given 0 import specs"), "{why}");
         // The key as the driver's release compile spells it, by hand: its own and its imports'
         // references laid out, of its placed stored key.
-        let stored = blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
+        let stored =
+            blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
         let placed = blaze_codegen::driver::placed(stored, &refs);
         let (_, places) = blaze_codegen::backend::release_refs(&refs, &imported_refs);
         assert_eq!(places, [0, 1, 0, 2], "the import's call of the same callee is one place");
         let laid = blaze_codegen::backend::laid_out(placed, &places);
         let inlined_keys = [inlined[0].instance.key()];
-        let imported = blaze_codegen::driver::with_imported(laid, &[imported[0].instance.key()], &imported_refs, &[&inlined_keys]);
+        let imported = blaze_codegen::driver::with_imported(
+            laid,
+            &[imported[0].instance.key()],
+            &imported_refs,
+            &[&inlined_keys],
+        );
         let key = keys::release(&imports.blob_key(imported));
         assert_eq!((public.key(), public.kind()), (key, Kind::Code));
         // An edit of a body an import builds in moves no import's key, but this one's: its
@@ -1231,16 +1408,32 @@ mod tests {
         assert_ne!(after.key(), public.key(), "the key covers the bodies its imports build in");
         let why = rule.function(&FunctionMade { imported_built_in: &[], ..made }).unwrap_err().why;
         assert!(why.contains("bodies built in of 0"), "{why}");
-        let mut unsorted = [source(52, settings, Origin::Toolchain(TOOLCHAIN)), source(53, settings, Origin::Toolchain(TOOLCHAIN))];
+        let mut unsorted = [
+            source(52, settings, Origin::Toolchain(TOOLCHAIN)),
+            source(53, settings, Origin::Toolchain(TOOLCHAIN)),
+        ];
         if unsorted[0].instance.key() < unsorted[1].instance.key() {
             unsorted.swap(0, 1);
         }
-        let why = rule.function(&FunctionMade { imported_built_in: &[&unsorted], ..made }).unwrap_err().why;
+        let why = rule
+            .function(&FunctionMade { imported_built_in: &[&unsorted], ..made })
+            .unwrap_err()
+            .why;
         assert!(why.contains("its import 0") && why.contains("strictly ascending"), "{why}");
         let other_layout = [Target::Data(ContentId([43; 32])), Target::Data(ContentId([42; 32]))];
-        let moved = rule.function(&FunctionMade { imported_refs: &[&other_layout], ..made }).unwrap();
-        assert_ne!(moved.key(), public.key(), "the key covers which of its and its imports' references are one");
-        assert!(rule.function(&FunctionMade { imported_refs: &[], ..made }).unwrap_err().why.contains("references of 0"));
+        let moved =
+            rule.function(&FunctionMade { imported_refs: &[&other_layout], ..made }).unwrap();
+        assert_ne!(
+            moved.key(),
+            public.key(),
+            "the key covers which of its and its imports' references are one"
+        );
+        assert!(
+            rule.function(&FunctionMade { imported_refs: &[], ..made })
+                .unwrap_err()
+                .why
+                .contains("references of 0")
+        );
         assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
 
         let dev = spec(Backend::Cranelift { speed: false }, TOOLCHAIN);
@@ -1263,10 +1456,18 @@ mod tests {
             imported[0].args.push(private.clone());
             assert!(rule.function(&FunctionMade { imported: &imported, ..made }).is_err());
         }
-        assert!(rule.function(&FunctionMade { imported: &[], ..made }).unwrap_err().why.contains("imports"));
+        assert!(
+            rule.function(&FunctionMade { imported: &[], ..made })
+                .unwrap_err()
+                .why
+                .contains("imports")
+        );
         for private in private_origins() {
             let inlined = [source(50, settings, private.clone())];
-            let why = rule.function(&FunctionMade { imported_built_in: &[&inlined], ..made }).unwrap_err().why;
+            let why = rule
+                .function(&FunctionMade { imported_built_in: &[&inlined], ..made })
+                .unwrap_err()
+                .why;
             assert!(why.contains("import 0's built-in body"), "{private}: {why}");
         }
     }
@@ -1274,37 +1475,71 @@ mod tests {
     #[test]
     fn a_dev_function_of_public_crates_for_the_baseline_is_public_under_its_template_key() {
         let rule = rule();
-        let alone = [Backend::Cranelift { speed: true }, Backend::Cranelift { speed: false }, Backend::Stencil];
+        let alone = [
+            Backend::Cranelift { speed: true },
+            Backend::Cranelift { speed: false },
+            Backend::Stencil,
+        ];
         for backend in alone {
             let dev = spec(backend, TOOLCHAIN);
             let settings = dev.settings();
             let function = source(10, settings, serde());
             let built_in = [source(20, settings, Origin::Toolchain(TOOLCHAIN))];
-            let refs = [Target::Function(InstanceKey(ContentId([40; 32]))), Target::Data(ContentId([41; 32]))];
-            let made = DevFunctionMade { spec: &dev, function: &function, built_in: &built_in, refs: &refs };
+            let refs = [
+                Target::Function(InstanceKey(ContentId([40; 32]))),
+                Target::Data(ContentId([41; 32])),
+            ];
+            let made = DevFunctionMade {
+                spec: &dev,
+                function: &function,
+                built_in: &built_in,
+                refs: &refs,
+            };
             let public = rule.dev_function(&made).unwrap();
-            let stored = blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
+            let stored = blaze_codegen::driver::stored(
+                function.instance.key(),
+                &[built_in[0].instance.key()],
+            );
             let placed = blaze_codegen::driver::placed(stored, &refs);
             let key = blaze_codegen::kernel::template(&placed, &settings, &dev.toolchain.id);
             assert_eq!((public.key(), public.kind()), (key, Kind::Code));
-            let direct = [Target::Direct(InstanceKey(ContentId([40; 32]))), Target::Data(ContentId([41; 32]))];
+            let direct = [
+                Target::Direct(InstanceKey(ContentId([40; 32]))),
+                Target::Data(ContentId([41; 32])),
+            ];
             let moved = rule.dev_function(&DevFunctionMade { refs: &direct, ..made }).unwrap();
             assert_ne!(moved.key(), public.key(), "the key covers each reference's kind");
-            let mut unsorted = [source(21, settings, Origin::Toolchain(TOOLCHAIN)), source(20, settings, Origin::Toolchain(TOOLCHAIN))];
+            let mut unsorted = [
+                source(21, settings, Origin::Toolchain(TOOLCHAIN)),
+                source(20, settings, Origin::Toolchain(TOOLCHAIN)),
+            ];
             if unsorted[0].instance.key() < unsorted[1].instance.key() {
                 unsorted.swap(0, 1);
             }
-            let why = rule.dev_function(&DevFunctionMade { built_in: &unsorted, ..made }).unwrap_err().why;
+            let why = rule
+                .dev_function(&DevFunctionMade { built_in: &unsorted, ..made })
+                .unwrap_err()
+                .why;
             assert!(why.contains("strictly ascending"), "{why}");
             assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
 
             let mut native = spec(backend, TOOLCHAIN);
             native.toolchain.features = vec!["+avx2".into()];
             let native_fn = source(10, native.settings(), serde());
-            let tuned = DevFunctionMade { spec: &native, function: &native_fn, built_in: &built_in, refs: &refs };
+            let tuned = DevFunctionMade {
+                spec: &native,
+                function: &native_fn,
+                built_in: &built_in,
+                refs: &refs,
+            };
             let why = rule.dev_function(&tuned).unwrap_err().why;
             assert!(why.contains("baseline") && why.contains("+avx2"), "{why}");
-            assert!(rule.dev_function(&DevFunctionMade { spec: &native, ..made }).unwrap_err().why.contains("settings"));
+            assert!(
+                rule.dev_function(&DevFunctionMade { spec: &native, ..made })
+                    .unwrap_err()
+                    .why
+                    .contains("settings")
+            );
 
             let other = spec(backend, ContentId([9; 32]));
             let other_fn = source(10, other.settings(), serde());
@@ -1313,16 +1548,23 @@ mod tests {
 
             for private in private_origins() {
                 let built_in = [source(20, settings, private.clone())];
-                assert!(rule.dev_function(&DevFunctionMade { built_in: &built_in, ..made }).is_err(), "{private}");
+                assert!(
+                    rule.dev_function(&DevFunctionMade { built_in: &built_in, ..made }).is_err(),
+                    "{private}"
+                );
                 let function = source(10, settings, private.clone());
-                let why = rule.dev_function(&DevFunctionMade { function: &function, ..made }).unwrap_err().why;
+                let why = rule
+                    .dev_function(&DevFunctionMade { function: &function, ..made })
+                    .unwrap_err()
+                    .why;
                 assert!(why.contains("the code of"), "{private}: {why}");
             }
         }
         // LLVM code is release code, shown public only under its release key.
         let release = spec(Backend::Llvm { opt: 3 }, TOOLCHAIN);
         let function = source(10, release.settings(), serde());
-        let made = DevFunctionMade { spec: &release, function: &function, built_in: &[], refs: &[] };
+        let made =
+            DevFunctionMade { spec: &release, function: &function, built_in: &[], refs: &[] };
         let why = rule.dev_function(&made).unwrap_err().why;
         assert!(why.contains("Rule::function"), "{why}");
     }
@@ -1337,33 +1579,54 @@ mod tests {
 
         let bodies = DerivedMade::Bodies { deps: &deps, borrowck: Mode::Nll };
         let check = rule.derived(&base, &bodies).unwrap();
-        assert_eq!((check.key(), check.kind()), (Key(cache::bodies_key(IMAGE, &[ContentId([21; 32])], Mode::Nll)), Kind::Query));
-        let (again, used) = blaze_alloc_count::measure(|| rule.derived(&base, &bodies).map(|it| it.key()));
+        assert_eq!(
+            (check.key(), check.kind()),
+            (Key(cache::bodies_key(IMAGE, &[ContentId([21; 32])], Mode::Nll)), Kind::Query)
+        );
+        let (again, used) =
+            blaze_alloc_count::measure(|| rule.derived(&base, &bodies).map(|it| it.key()));
         assert_eq!(again, Ok(check.key()));
-        assert_eq!(used, blaze_alloc_count::Used::default(), "a check key is shown public with no allocation");
-        let polonius = rule.derived(&base, &DerivedMade::Bodies { deps: &deps, borrowck: Mode::Polonius }).unwrap();
+        assert_eq!(
+            used,
+            blaze_alloc_count::Used::default(),
+            "a check key is shown public with no allocation"
+        );
+        let polonius = rule
+            .derived(&base, &DerivedMade::Bodies { deps: &deps, borrowck: Mode::Polonius })
+            .unwrap();
         assert_ne!(polonius.key(), check.key());
 
         let flags = vec!["-Wunused".to_owned(), "--cap-lints=allow".to_owned()];
         let inputs = Inputs { lint_flags: &flags, keep_duplicates: false, borrowck: Mode::Nll };
         let outcome = rule.derived(&check, &DerivedMade::Outcome(inputs)).unwrap();
-        assert_eq!((outcome.key(), outcome.kind()), (Key(cache::key(check.key().0, &inputs)), Kind::Query));
+        assert_eq!(
+            (outcome.key(), outcome.kind()),
+            (Key(cache::key(check.key().0, &inputs)), Kind::Query)
+        );
 
         let item = ContentId([22; 32]);
         let value = rule.derived(&check, &DerivedMade::Const { item }).unwrap();
         assert_eq!(value.key(), Key(hir_ty::consteval::deps::key(check.key().0, item)));
 
-        let many: Vec<Public> = (0..100u8).map(|n| Public::listed(Key(ContentId([n; 32])), Kind::Query)).collect();
+        let many: Vec<Public> =
+            (0..100u8).map(|n| Public::listed(Key(ContentId([n; 32])), Kind::Query)).collect();
         let ids: Vec<ContentId> = many.iter().map(|it| it.key().0).collect();
-        let wide = rule.derived(&base, &DerivedMade::Bodies { deps: &many, borrowck: Mode::Nll }).unwrap();
-        assert_eq!(wide.key(), Key(cache::bodies_key(IMAGE, &ids, Mode::Nll)), "more dependencies than kept inline");
+        let wide =
+            rule.derived(&base, &DerivedMade::Bodies { deps: &many, borrowck: Mode::Nll }).unwrap();
+        assert_eq!(
+            wide.key(),
+            Key(cache::bodies_key(IMAGE, &ids, Mode::Nll)),
+            "more dependencies than kept inline"
+        );
 
         let code = Public::listed(Key(ContentId([23; 32])), Kind::Code);
         let error = rule.derived(&code, &DerivedMade::Const { item }).unwrap_err();
         assert!(error.why.contains("not a front-end value"), "{error}");
         assert_eq!(error.key, Key(hir_ty::consteval::deps::key(code.key().0, item)));
         let run = [Public::listed(Key(ContentId([24; 32])), Kind::Run)];
-        let error = rule.derived(&base, &DerivedMade::Bodies { deps: &run, borrowck: Mode::Nll }).unwrap_err();
+        let error = rule
+            .derived(&base, &DerivedMade::Bodies { deps: &run, borrowck: Mode::Nll })
+            .unwrap_err();
         assert!(error.why.contains("a dependency's check key"), "{error}");
     }
 
@@ -1382,7 +1645,10 @@ mod tests {
             &["TARGET".into()],
         );
         let key = Key(ContentId([1; 32]));
-        assert_eq!(secrets.check(key, b"fn main() { println!(\"x86_64-unknown-linux-gnu abc\") }"), Ok(()));
+        assert_eq!(
+            secrets.check(key, b"fn main() { println!(\"x86_64-unknown-linux-gnu abc\") }"),
+            Ok(())
+        );
         let error = secrets.check(key, b"token=ghp_abcdefghijklmnop;").unwrap_err();
         assert!(error.why.contains("GITHUB_TOKEN") && !error.why.contains("ghp_"), "{error}");
         let mut seeded = b"head ".to_vec();
@@ -1399,7 +1665,11 @@ mod tests {
     const FILED: ContentId = ContentId([14; 32]);
     const OUT: &str = "/work/target/build/serde-1/out";
 
-    fn image<'a>(crates: &'a [Origin], out_dirs: &'a [&'a Path], reads: &'a [ImageRead<'a>]) -> ImageMade<'a> {
+    fn image<'a>(
+        crates: &'a [Origin],
+        out_dirs: &'a [&'a Path],
+        reads: &'a [ImageRead<'a>],
+    ) -> ImageMade<'a> {
         ImageMade { key: IMAGE, build: BUILD, crates, out_dirs, reads }
     }
 
@@ -1411,9 +1681,14 @@ mod tests {
         let made = image(&crates, &out_dirs, &[]);
         let public = rule.image(&made, ImagePart::Image).unwrap();
         assert_eq!((public.key(), public.kind()), (Key(IMAGE), Kind::Query));
-        let (again, used) = blaze_alloc_count::measure(|| rule.image(&made, ImagePart::Image).map(|it| it.key()));
+        let (again, used) =
+            blaze_alloc_count::measure(|| rule.image(&made, ImagePart::Image).map(|it| it.key()));
         assert_eq!(again, Ok(Key(IMAGE)));
-        assert_eq!(used, blaze_alloc_count::Used::default(), "a public image is shown so with no allocation");
+        assert_eq!(
+            used,
+            blaze_alloc_count::Used::default(),
+            "a public image is shown so with no allocation"
+        );
 
         let reads = [
             ImageRead::File(Path::new("/reg/serde-1.0.219/src/table.in")),
@@ -1423,7 +1698,10 @@ mod tests {
             ImageRead::Env(OsStr::new("TARGET")),
         ];
         let read = image(&crates, &out_dirs, &reads);
-        assert_eq!(rule.image(&read, ImagePart::Slot(SLOT)).map(|it| (it.key(), it.kind())), Ok((Key(SLOT), Kind::Query)));
+        assert_eq!(
+            rule.image(&read, ImagePart::Slot(SLOT)).map(|it| (it.key(), it.kind())),
+            Ok((Key(SLOT), Kind::Query))
+        );
         assert_eq!(rule.image(&read, ImagePart::Filed(FILED)).map(|it| it.key()), Ok(Key(FILED)));
         let alone = rule.image(&read, ImagePart::Image).unwrap_err();
         assert!(alone.why.contains("its key alone"), "{alone}");
@@ -1436,9 +1714,15 @@ mod tests {
         let out_dirs = [Path::new(OUT)];
         for public in [serde(), Origin::Toolchain(TOOLCHAIN)] {
             let crates = [public.clone(), serde()];
-            assert!(rule.image(&image(&crates, &out_dirs, &[]), ImagePart::Image).is_ok(), "{public}");
+            assert!(
+                rule.image(&image(&crates, &out_dirs, &[]), ImagePart::Image).is_ok(),
+                "{public}"
+            );
             let closure = [serde(), public.clone()];
-            assert!(rule.image(&image(&closure, &out_dirs, &[]), ImagePart::Image).is_ok(), "{public}");
+            assert!(
+                rule.image(&image(&closure, &out_dirs, &[]), ImagePart::Image).is_ok(),
+                "{public}"
+            );
         }
         let not_crates = [Origin::System(SYSTEM), Origin::Outputs];
         for private in private_origins().into_iter().chain(not_crates) {
@@ -1451,7 +1735,12 @@ mod tests {
                 assert!(error.why.starts_with("a crate it depends on: "), "{private}: {error}");
             }
         }
-        assert!(rule.image(&image(&[], &out_dirs, &[]), ImagePart::Image).unwrap_err().why.contains("no crate"));
+        assert!(
+            rule.image(&image(&[], &out_dirs, &[]), ImagePart::Image)
+                .unwrap_err()
+                .why
+                .contains("no crate")
+        );
     }
 
     #[test]

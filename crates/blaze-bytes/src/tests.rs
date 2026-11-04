@@ -12,8 +12,17 @@ use crate::{Bytes, Text, ascii_prefix, check, text_of};
 /// cross 64-byte chunks, then a multibyte char, a bad byte, or a char cut by the end.
 #[test]
 fn the_check_is_stds() {
-    const PIECES: [&[u8]; 9] =
-        [b"a", b"fn x() {}\n", b"\xc3\xa9", b"\xe2\x82\xac", b"\xf0\x9f\xa6\x80", b"\x80", b"\xc3", b"\xff", b"\xed\xa0\x80"];
+    const PIECES: [&[u8]; 9] = [
+        b"a",
+        b"fn x() {}\n",
+        b"\xc3\xa9",
+        b"\xe2\x82\xac",
+        b"\xf0\x9f\xa6\x80",
+        b"\x80",
+        b"\xc3",
+        b"\xff",
+        b"\xed\xa0\x80",
+    ];
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..4000 {
         let mut bytes = vec![b'x'; rng.index(300)];
@@ -169,7 +178,10 @@ fn kept_bytes_hold_what_was_written_and_a_failed_write_frees_its_block() {
             Ok::<(), ()>(())
         })
         .expect("the write succeeds");
-        assert!(written.iter().enumerate().all(|(at, &byte)| byte == at as u8), "the bytes as written");
+        assert!(
+            written.iter().enumerate().all(|(at, &byte)| byte == at as u8),
+            "the bytes as written"
+        );
         assert!(written.shared().is_none(), "not a global-heap `Arc<[u8]>`");
         assert!(live() >= before + 5000, "counted to the tag");
         let failed = Bytes::kept(Tag::Vfs, 4000, |_| Err("short read"));

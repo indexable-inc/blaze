@@ -2,12 +2,12 @@
 
 use std::{fmt, marker::PhantomData, num::NonZeroU32, ops::ControlFlow};
 
+pub use attached_db::{DETACHED, fmt_with_attached_db};
 use either::Either;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
 pub(crate) use tls_cache::drop_shared_solver_caches;
-pub use attached_db::{DETACHED, fmt_with_attached_db};
 
 use base_db::{Crate, Db};
 use hir_def::{
@@ -46,10 +46,10 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
-        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, AssocTyId, BoundConst, CallableIdWrapper,
-        CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper,
-        Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId, FxIndexMap,
-        ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
+        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, AssocTyId, BoundConst,
+        CallableIdWrapper, CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper,
+        CoroutineIdWrapper, Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId,
+        FxIndexMap, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
         InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst,
         InternedRegion, LateParamRegionKind, OpaqueTyIdWrapper, OpaqueTypeKey, RegionAssumptions,
         Scalar, ScalarInt, SimplifiedType, SolverContext, SolverDefIds, TermId, TraitAssocConstId,
@@ -78,7 +78,9 @@ macro_rules! interned_slice {
     ($storage:ident, $name:ident, $stored_name:ident, $default_types_field:ident, $ty_db:ty, $ty_static:ty $(,)?) => {
         const _: () = {
             #[allow(unused_lifetimes)]
-            fn _ensure_correct_types<'db: 'static>(v: $ty_db) -> $ty_static { v }
+            fn _ensure_correct_types<'db: 'static>(v: $ty_db) -> $ty_static {
+                v
+            }
         };
 
         // SAFETY: `$ty_static` is `$ty_db` with `'db` as `'static` (`_ensure_correct_types`
@@ -202,7 +204,9 @@ macro_rules! interned_slice {
             type IntoIter = ::std::iter::Copied<::std::slice::Iter<'db, $ty_db>>;
             type Item = $ty_db;
             #[inline]
-            fn into_iter(self) -> Self::IntoIter { self.iter() }
+            fn into_iter(self) -> Self::IntoIter {
+                self.iter()
+            }
         }
 
         impl<'db> ::std::ops::Deref for $name<'db> {
@@ -916,7 +920,9 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
                     .fields()
                     .iter()
                     .nth(field_idx)
-                    .unwrap_or_else(|| panic!("variant {variant_idx} of {base:?} has no field {field_idx}"));
+                    .unwrap_or_else(|| {
+                        panic!("variant {variant_idx} of {base:?} has no field {field_idx}")
+                    });
                 let (_, field_ty) = db
                     .field_types(variant_id)
                     .iter()
@@ -1043,12 +1049,11 @@ fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIn
             start.flags() | end.flags(),
             start.outer_exclusive_binder().max(end.outer_exclusive_binder()),
         ),
-        PatternKind::Or(pats) => pats.iter().fold(
-            (TypeFlags::empty(), rustc_type_ir::INNERMOST),
-            |(flags, binder), pat| {
+        PatternKind::Or(pats) => pats
+            .iter()
+            .fold((TypeFlags::empty(), rustc_type_ir::INNERMOST), |(flags, binder), pat| {
                 (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
-            },
-        ),
+            }),
         PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
     }
 }
@@ -2288,7 +2293,9 @@ impl<'db> Interner for DbInterner<'db> {
             TyKind::Param(_) | TyKind::Bound(_, _) => (),
 
             // These variants should not exist as a self type.
-            TyKind::Infer(InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_)) => {
+            TyKind::Infer(
+                InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_),
+            ) => {
                 panic!("unexpected self type: {self_ty:?}")
             }
         }
@@ -2654,9 +2661,10 @@ impl<'db> Interner for DbInterner<'db> {
         // has no bounds of its own.
         let mut rpitit_fn = None;
         let (conditions, trait_) = match def_id {
-            SolverDefId::TraitId(trait_) => {
-                (crate::lower::const_conditions(self.db(), trait_.into()).skip_binder(), Some(trait_))
-            }
+            SolverDefId::TraitId(trait_) => (
+                crate::lower::const_conditions(self.db(), trait_.into()).skip_binder(),
+                Some(trait_),
+            ),
             SolverDefId::TypeAliasId(alias) => {
                 (crate::lower::implied_const_bounds(self.db(), alias.into()).skip_binder(), None)
             }
@@ -2667,7 +2675,10 @@ impl<'db> Interner for DbInterner<'db> {
                 crate::rpitit::RpititSide::Trait(_) => {
                     rpitit_fn = Some(rpitit.function);
                     let opaque = rpitit.opaque(self.db);
-                    (crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(), None)
+                    (
+                        crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(),
+                        None,
+                    )
                 }
                 crate::rpitit::RpititSide::Impl { .. } => (&[][..], None),
             },
@@ -2680,7 +2691,8 @@ impl<'db> Interner for DbInterner<'db> {
             crate::effects::effect_trait_refs(conditions.iter().copied())
                 .filter(move |it| {
                     trait_.is_none_or(|trait_| {
-                        it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
+                        it.skip_binder().def_id.0 != trait_
+                            && is_ty_self(it.skip_binder().self_ty())
                     })
                 })
                 .map(move |it| match rpitit_fn {
@@ -2701,10 +2713,7 @@ impl<'db> Interner for DbInterner<'db> {
         crate::effects::impl_is_const(self.db(), def_id)
     }
 
-    fn opt_alias_variances(
-        self,
-        kind: impl Into<AliasTermKind<'db>>,
-    ) -> Option<Self::VariancesOf> {
+    fn opt_alias_variances(self, kind: impl Into<AliasTermKind<'db>>) -> Option<Self::VariancesOf> {
         super::opaque_variances::opt_alias_variances(self, kind.into())
     }
 
@@ -3140,10 +3149,7 @@ impl<'db> DbInterner<'db> {
     }
 }
 
-fn generic_predicates_of<'db>(
-    db: &'db Db,
-    def_id: SolverDefId<'db>,
-) -> &'db GenericPredicates {
+fn generic_predicates_of<'db>(db: &'db Db, def_id: SolverDefId<'db>) -> &'db GenericPredicates {
     match def_id {
         SolverDefId::BuiltinDeriveImplId(impl_) => crate::builtin_derive::predicates(db, impl_),
         SolverDefId::AnonConstId(anon_const) => {
@@ -3159,7 +3165,9 @@ fn generic_predicates_of<'db>(
         // impl (`gather_explicit_predicates_of`, `ImplTraitInTraitData::Impl`), not the impl
         // method's own: the impl's predicates and the trait method's own for the impl.
         SolverDefId::RpititId(rpitit) => match rpitit.side(db) {
-            crate::rpitit::RpititSide::Trait(_) => GenericPredicates::query(db, rpitit.function.into()),
+            crate::rpitit::RpititSide::Trait(_) => {
+                GenericPredicates::query(db, rpitit.function.into())
+            }
             crate::rpitit::RpititSide::Impl { .. } => {
                 crate::rpitit::impl_method_hybrid_predicates(db, rpitit.function)
             }
@@ -3312,7 +3320,9 @@ mod attached_db {
         use hir_expand::fixture;
 
         fn attached_here() -> Option<usize> {
-            blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| it.map(|it| std::ptr::from_ref(it).addr()))
+            blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| {
+                it.map(|it| std::ptr::from_ref(it).addr())
+            })
         }
 
         /// An ADT of a fixture's `struct S`, made with its database attached.
@@ -3325,7 +3335,8 @@ mod attached_db {
                     for (_, module) in crate_def_map(db, krate).modules(db) {
                         for (name, per_ns) in module.scope(db).entries() {
                             if name.as_str() == "S"
-                                && let Some(ModuleDefId::AdtId(AdtId::StructId(it))) = per_ns.take_types()
+                                && let Some(ModuleDefId::AdtId(AdtId::StructId(it))) =
+                                    per_ns.take_types()
                             {
                                 found = Some(it);
                             }
@@ -3333,7 +3344,10 @@ mod attached_db {
                     }
                 }
                 let id = found.expect("struct `S`");
-                let adt = super::super::AdtDef::new(id.into(), super::super::DbInterner::new_no_crate(db));
+                let adt = super::super::AdtDef::new(
+                    id.into(),
+                    super::super::DbInterner::new_no_crate(db),
+                );
                 assert_eq!(format!("{adt:?}"), "S", "named with a database attached");
                 adt
             })
@@ -3350,14 +3364,20 @@ mod attached_db {
             assert_eq!(attached_here(), None);
             if cfg!(debug_assertions) {
                 let refused =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?}"))).expect_err("formatted detached");
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?}")))
+                        .expect_err("formatted detached");
                 let message = stdx::panic_text(&*refused).unwrap_or("");
-                assert!(message.contains("`AdtDef` was formatted with no database attached"), "{message}");
+                assert!(
+                    message.contains("`AdtDef` was formatted with no database attached"),
+                    "{message}"
+                );
                 return;
             }
             let (text, reported) = stdx::assert::reported::expecting("AdtDef", || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?} and {adt:?}")))
-                    .expect("a release build never panics formatting detached")
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    format!("{adt:?} and {adt:?}")
+                }))
+                .expect("a release build never panics formatting detached")
             });
             assert_eq!(
                 text,
@@ -3375,7 +3395,11 @@ mod attached_db {
             let db = fixture::db("struct S;").into_db();
             let adt = adt_of_s(&db);
             let driver = std::thread::Builder::new().name("driver".to_owned());
-            let text = driver.spawn(move || format!("{adt:?}")).unwrap().join().expect("the driver's thread ended");
+            let text = driver
+                .spawn(move || format!("{adt:?}"))
+                .unwrap()
+                .join()
+                .expect("the driver's thread ended");
             assert_eq!(text, "<a blaze bug: AdtDef formatted with no database attached>");
             assert_eq!(stdx::assert::reported::total(), 1);
             let sites = stdx::assert::reported::sites();
@@ -3390,19 +3414,33 @@ mod attached_db {
         /// kind, the `Debug` impl and the thread; a debug build fails the test at the format.
         #[test]
         fn a_driver_formatting_detached_fails_its_process_not_its_thread() {
-            let name = "next_solver::interner::attached_db::tests::a_driver_formats_an_adt_detached";
+            let name =
+                "next_solver::interner::attached_db::tests::a_driver_formats_an_adt_detached";
             let exe = std::env::current_exe().expect("the test binary's path");
-            let out = std::process::Command::new(exe).args(["--exact", name, "--ignored"]).output().expect("running it");
-            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let out = std::process::Command::new(exe)
+                .args(["--exact", name, "--ignored"])
+                .output()
+                .expect("running it");
+            let (stdout, stderr) =
+                (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
             assert_eq!(out.status.code(), Some(101), "stdout: {stdout}\nstderr: {stderr}");
             if cfg!(debug_assertions) {
                 let said = format!("{stdout}{stderr}");
-                assert!(said.contains("`AdtDef` was formatted with no database attached"), "{said}");
+                assert!(
+                    said.contains("`AdtDef` was formatted with no database attached"),
+                    "{said}"
+                );
                 return;
             }
-            assert!(stdout.contains("1 passed"), "the driver went on\nstdout: {stdout}\nstderr: {stderr}");
+            assert!(
+                stdout.contains("1 passed"),
+                "the driver went on\nstdout: {stdout}\nstderr: {stderr}"
+            );
             assert!(stderr.contains("this process reported 1 blaze bug(s)"), "{stderr}");
-            assert!(stderr.contains("a blaze bug: `AdtDef` formatted with no database attached at "), "{stderr}");
+            assert!(
+                stderr.contains("a blaze bug: `AdtDef` formatted with no database attached at "),
+                "{stderr}"
+            );
             assert!(stderr.contains("next_solver/interner.rs:"), "{stderr}");
             assert!(stderr.contains("first on thread `driver`"), "{stderr}");
         }
@@ -3448,7 +3486,8 @@ mod attached_db {
                 let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
                 let held = flights.get_or_run(key, || {
                     for (at, db) in dbs.iter().enumerate() {
-                        let (db, other, flights) = (db.clone(), dbs[1 - at].clone(), flights.clone());
+                        let (db, other, flights) =
+                            (db.clone(), dbs[1 - at].clone(), flights.clone());
                         let tx = tx.clone();
                         pool.submit(
                             None,
@@ -3456,24 +3495,44 @@ mod attached_db {
                                 let mine = Arc::as_ptr(&db).addr();
                                 let wait = || {
                                     assert_eq!(attached_here(), Some(mine));
-                                    assert_eq!(flights.get_or_run(key, || panic!("the test holds the key")), Ok(round));
-                                    assert_eq!(attached_here(), Some(mine), "a job resumed with another's database");
+                                    assert_eq!(
+                                        flights
+                                            .get_or_run(key, || panic!("the test holds the key")),
+                                        Ok(round)
+                                    );
+                                    assert_eq!(
+                                        attached_here(),
+                                        Some(mine),
+                                        "a job resumed with another's database"
+                                    );
                                 };
                                 if at == 0 {
                                     blaze_query::db::attach(&*db, wait);
                                 } else {
-                                    blaze_query::db::attach(&*other, || blaze_query::db::attach(&*db, wait));
+                                    blaze_query::db::attach(&*other, || {
+                                        blaze_query::db::attach(&*db, wait)
+                                    });
                                 }
-                                assert_eq!(attached_here(), None, "a worker kept a database its job detached");
+                                assert_eq!(
+                                    attached_here(),
+                                    None,
+                                    "a worker kept a database its job detached"
+                                );
                             },
-                            move |it| _ = tx.send(it.map_err(|_| format!("job {at} of round {round} panicked"))),
+                            move |it| {
+                                _ = tx.send(
+                                    it.map_err(|_| format!("job {at} of round {round} panicked")),
+                                )
+                            },
                         );
                     }
                     // Linked as the run's waiters, not only about to ask: a job that asked after the
                     // run ended would find the key idle and run it.
-                    blaze_graph::spin::SpinWait::within("both jobs to wait", std::time::Duration::from_secs(60), || {
-                        flights.waiters(key) >= 2
-                    });
+                    blaze_graph::spin::SpinWait::within(
+                        "both jobs to wait",
+                        std::time::Duration::from_secs(60),
+                        || flights.waiters(key) >= 2,
+                    );
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
@@ -3484,8 +3543,18 @@ mod attached_db {
                     let tx = tx.clone();
                     pool.submit(
                         None,
-                        || assert_eq!(attached_here(), None, "a job began with a database attached"),
-                        move |it| _ = tx.send(it.map_err(|_| format!("a later job of round {round} panicked"))),
+                        || {
+                            assert_eq!(
+                                attached_here(),
+                                None,
+                                "a job began with a database attached"
+                            )
+                        },
+                        move |it| {
+                            _ = tx.send(
+                                it.map_err(|_| format!("a later job of round {round} panicked")),
+                            )
+                        },
                     );
                 }
                 for _ in 0..4 {
@@ -3505,7 +3574,9 @@ mod attached_db {
             let flights = Arc::new(Flights::<u32>::new());
             let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
                 let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
-                pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
+                pool.submit(None, f, move |it| {
+                    _ = tx.send(it.map_err(|_| format!("{what} panicked")))
+                });
                 rx.recv().unwrap().unwrap();
             };
             for round in 0..20u32 {
@@ -3538,21 +3609,38 @@ mod attached_db {
                         move || {
                             let own = Arc::as_ptr(&db).addr();
                             let wait = || {
-                                assert_eq!(attached_here(), Some(own), "a job came on to another's database");
+                                assert_eq!(
+                                    attached_here(),
+                                    Some(own),
+                                    "a job came on to another's database"
+                                );
                                 waiting.fetch_add(1, Ordering::SeqCst);
-                                assert_eq!(flights.get_or_run(on, || panic!("the test holds the key")), Ok(round));
-                                assert_eq!(attached_here(), Some(own), "a job resumed with another's database");
+                                assert_eq!(
+                                    flights.get_or_run(on, || panic!("the test holds the key")),
+                                    Ok(round)
+                                );
+                                assert_eq!(
+                                    attached_here(),
+                                    Some(own),
+                                    "a job resumed with another's database"
+                                );
                             };
                             if mine == 0 {
                                 blaze_query::db::attach(&*db, wait);
                             } else {
-                                blaze_query::db::attach(&*other, || blaze_query::db::attach(&*db, wait));
+                                blaze_query::db::attach(&*other, || {
+                                    blaze_query::db::attach(&*db, wait)
+                                });
                             }
                             assert_eq!(attached_here(), None, "a job kept a database it detached");
                             order.lock().push(mine);
                             mine
                         },
-                        move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
+                        move |it| {
+                            _ = tx.send(
+                                it.map_err(|_| format!("job {mine} of round {round} panicked")),
+                            )
+                        },
                     );
                 };
                 let held = flights.get_or_run(first, || {
@@ -3576,7 +3664,9 @@ mod attached_db {
                 assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
                 run(
                     "a later job",
-                    Box::new(|| assert_eq!(attached_here(), None, "a job came on to its worker's database")),
+                    Box::new(|| {
+                        assert_eq!(attached_here(), None, "a job came on to its worker's database")
+                    }),
                 );
             }
         }
@@ -3604,8 +3694,8 @@ mod tls_cache;
 /// skip, as the index names only published rows), and a kind goes in and out under its
 /// `'static` name through [`Erase`]. What unsafe buys here, against the safe version of each:
 ///
-    /// - a column of `OnceLock<T>` segments: a state word per value (a type row's 4-byte flags
-    ///   and binder take 8 each) and a state check on every read of every column;
+/// - a column of `OnceLock<T>` segments: a state word per value (a type row's 4-byte flags
+///   and binder take 8 each) and a state check on every read of every column;
 /// - an index whose grown tables are reference counted rather than retired through an epoch
 ///   ([`blaze_reclaim`]): a shared counter written on every hit, which every core then contends
 ///   on, where entering a task is a count in the reader's own thread.
@@ -4116,7 +4206,8 @@ pub(crate) mod table {
             assert!(len.is_power_of_two() && len >= FIRST_SLOTS);
             let layout = Slots::layout(len);
             // SAFETY: `layout` is not zero-sized: `len` is at least `FIRST_SLOTS`.
-            let words = for_the_tables(|| unsafe { alloc::alloc_zeroed(layout) }).cast::<AtomicU64>();
+            let words =
+                for_the_tables(|| unsafe { alloc::alloc_zeroed(layout) }).cast::<AtomicU64>();
             if words.is_null() {
                 alloc::handle_alloc_error(layout);
             }
@@ -4264,7 +4355,8 @@ pub(crate) mod table {
     impl Index {
         const fn new() -> Index {
             const fn empty() -> [Shard; SHARDS] {
-                [const { Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) } }; SHARDS]
+                [const { Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) } };
+                    SHARDS]
             }
             Index {
                 keyed: AtomicBool::new(false),
@@ -4312,7 +4404,8 @@ pub(crate) mod table {
                 let _walk = blaze_graph::sched::NoWait::new();
                 // The acquire load pairs with `Vacant::insert`'s release store of a grown table,
                 // so its copied slots read as written.
-                let slots = Slots::unpack(Self::shard(&self.fixed, hash).slots.load(Ordering::Acquire))?;
+                let slots =
+                    Slots::unpack(Self::shard(&self.fixed, hash).slots.load(Ordering::Acquire))?;
                 match slots.find(hash as u32, true, same) {
                     Probe::Hit(row) => Some(row),
                     Probe::Miss | Probe::Flooded => None,
@@ -4339,7 +4432,8 @@ pub(crate) mod table {
             blaze_reclaim::pinned(|| -> Option<NonZeroU32> {
                 #[cfg(debug_assertions)]
                 let _walk = blaze_graph::sched::NoWait::new();
-                let slots = Slots::unpack(Self::shard(&self.secret, hash).slots.load(Ordering::Acquire))?;
+                let slots =
+                    Slots::unpack(Self::shard(&self.secret, hash).slots.load(Ordering::Acquire))?;
                 match slots.find(hash as u32, false, same) {
                     Probe::Hit(row) => Some(row),
                     Probe::Miss | Probe::Flooded => None,
@@ -4556,8 +4650,7 @@ pub(crate) mod table {
     }
 
     /// The bytes a row takes in its hot columns (`tag`, `flags`, `binder`), its kind aside.
-    pub(crate) const ROW_BYTES: usize =
-        size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>();
+    pub(crate) const ROW_BYTES: usize = size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>();
     const _: () = assert!(ROW_BYTES == 9);
 
     impl<K: Copy + Hash + Eq> Rows<K> {
@@ -4612,12 +4705,18 @@ pub(crate) mod table {
         fn add(&self, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
             let info = info();
             assert!(info.tag < u8::MAX, "a {} tag of {}", self.what, info.tag);
-            let vacant = match self.index.lock(&kind, |row| self.indexed(row) == kind, self.rehash()) {
-                Entry::Found(row) => return row,
-                Entry::Vacant(vacant) => vacant,
-            };
+            let vacant =
+                match self.index.lock(&kind, |row| self.indexed(row) == kind, self.rehash()) {
+                    Entry::Found(row) => return row,
+                    Entry::Vacant(vacant) => vacant,
+                };
             let row = self.next.fetch_add(1, Ordering::Relaxed);
-            assert!(row <= u64::from(self.last), "the {} table holds {} rows", self.what, self.last);
+            assert!(
+                row <= u64::from(self.last),
+                "the {} table holds {} rows",
+                self.what,
+                self.last
+            );
             // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
             unsafe { self.kinds.write(row, kind) };
             // SAFETY: as above.
@@ -4773,7 +4872,8 @@ pub(crate) mod table {
         ) -> NonZeroU32 {
             let info = info();
             assert_eq!(info.is_some(), self.flagged, "the flags of a list of {}", self.what);
-            let vacant = match self.index.lock(items, |row| self.items(row) == items, self.rehash()) {
+            let vacant = match self.index.lock(items, |row| self.items(row) == items, self.rehash())
+            {
                 Entry::Found(row) => return row,
                 Entry::Vacant(vacant) => vacant,
             };
@@ -5131,9 +5231,13 @@ pub(crate) mod table {
         fn a_row_interned_twice_is_one_row() {
             static ROWS: Rows<(u32, u64)> = Rows::new("test rows", 1000);
             let values = [(0, 0), (0, 7), (1, 7), (1, u64::MAX), (3, 1 << 40)];
-            let rows: Vec<_> = values.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
+            let rows: Vec<_> =
+                values.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
             for (&kind, &row) in values.iter().zip(&rows) {
-                assert_eq!(ROWS.intern(kind, || panic!("computed the info of a value interned")), row);
+                assert_eq!(
+                    ROWS.intern(kind, || panic!("computed the info of a value interned")),
+                    row
+                );
                 assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
                 assert_eq!(u32::from(ROWS.tag(row)), kind.0);
                 assert!(ROWS.published(row));
@@ -5252,7 +5356,8 @@ pub(crate) mod table {
         fn one_fixed_hash(n: u64) -> Vec<(u32, u64)> {
             /// foldhash 0.2's fixed per-hasher seed (`ARBITRARY3`), what `FixedState` starts from.
             const SEED: u64 = 0x082e_fa98_ec4e_6c89;
-            let kinds: Vec<(u32, u64)> = (0..n).map(|i| (SEED as u32, (SEED >> 32) | (i << 32))).collect();
+            let kinds: Vec<(u32, u64)> =
+                (0..n).map(|i| (SEED as u32, (SEED >> 32) | (i << 32))).collect();
             let one = super::fixed_hash(&kinds[0]);
             assert!(kinds.iter().all(|it| super::fixed_hash(it) == one), "one fixed hash");
             kinds
@@ -5268,7 +5373,8 @@ pub(crate) mod table {
             const THREADS: u64 = 8;
             let flood = one_fixed_hash(4000);
             let honest: Vec<(u32, u64)> = (0..4000u64).map(|i| (7, i * 0x9e37_79b9)).collect();
-            let kinds: Vec<(u32, u64)> = flood.iter().zip(&honest).flat_map(|(&a, &b)| [a, b]).collect();
+            let kinds: Vec<(u32, u64)> =
+                flood.iter().zip(&honest).flat_map(|(&a, &b)| [a, b]).collect();
             let barrier = Barrier::new(THREADS as usize);
             let seen: Vec<Vec<NonZeroU32>> = std::thread::scope(|scope| {
                 let threads: Vec<_> = (0..THREADS)
@@ -5289,9 +5395,20 @@ pub(crate) mod table {
                 threads.into_iter().map(|thread| thread.join().unwrap()).collect()
             });
             assert!(ROWS.index.keyed(), "the flood did not switch the index");
-            assert_eq!(ROWS.index.switches.load(Ordering::Relaxed), 1, "the index switched more than once");
-            assert!(seen.iter().all(|rows| *rows == seen[0]), "two threads got different rows for one kind");
-            assert_eq!(seen[0].iter().collect::<HashSet<_>>().len(), kinds.len(), "two kinds got one row");
+            assert_eq!(
+                ROWS.index.switches.load(Ordering::Relaxed),
+                1,
+                "the index switched more than once"
+            );
+            assert!(
+                seen.iter().all(|rows| *rows == seen[0]),
+                "two threads got different rows for one kind"
+            );
+            assert_eq!(
+                seen[0].iter().collect::<HashSet<_>>().len(),
+                kinds.len(),
+                "two kinds got one row"
+            );
             for (&kind, &row) in kinds.iter().zip(&seen[0]) {
                 assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
                 assert_eq!(ROWS.intern(kind, || panic!("a kind interned was added again")), row);
@@ -5307,11 +5424,14 @@ pub(crate) mod table {
             static LISTS: Lists<u32> = Lists::new("switched lists");
             static VALUES: Values<String> = Values::new("switched values");
             let kinds: Vec<(u32, u64)> = (0..3000u64).map(|i| ((i % 5) as u32, i << 17)).collect();
-            let lists: Vec<Vec<u32>> = (0..3000u32).map(|i| (0..i % 9).map(|j| i ^ j).collect()).collect();
+            let lists: Vec<Vec<u32>> =
+                (0..3000u32).map(|i| (0..i % 9).map(|j| i ^ j).collect()).collect();
             let values: Vec<String> = (0..3000).map(|i| format!("value {i}")).collect();
-            let rows: Vec<_> = kinds.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
+            let rows: Vec<_> =
+                kinds.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
             let list_rows: Vec<_> = lists.iter().map(|items| LISTS.intern(&items[..])).collect();
-            let value_rows: Vec<_> = values.iter().map(|value| VALUES.intern(value.clone())).collect();
+            let value_rows: Vec<_> =
+                values.iter().map(|value| VALUES.intern(value.clone())).collect();
             let next = [&ROWS.next, &LISTS.next, &VALUES.next].map(|it| it.load(Ordering::Relaxed));
             ROWS.index.switch(&ROWS.rehash());
             LISTS.index.switch(&LISTS.rehash());
@@ -5326,7 +5446,11 @@ pub(crate) mod table {
             for (value, &row) in values.iter().zip(&value_rows) {
                 assert_eq!(VALUES.intern(value.clone()), row);
             }
-            assert_eq!(next, [&ROWS.next, &LISTS.next, &VALUES.next].map(|it| it.load(Ordering::Relaxed)), "a switched table added a row it had");
+            assert_eq!(
+                next,
+                [&ROWS.next, &LISTS.next, &VALUES.next].map(|it| it.load(Ordering::Relaxed)),
+                "a switched table added a row it had"
+            );
             let row = ROWS.intern((9, 9), tagged(9));
             assert_eq!(ROWS.intern((9, 9), tagged(9)), row);
             assert_eq!(ROWS.kind::<(u32, u64)>(row), (9, 9));
@@ -5370,19 +5494,36 @@ pub(crate) mod table {
             let kinds = one_fixed_hash(10_000);
             super::probes::take();
             let start = std::time::Instant::now();
-            let rows: Vec<NonZeroU32> = kinds.iter().map(|&kind| ROWS.intern(kind, tagged(0))).collect();
+            let rows: Vec<NonZeroU32> =
+                kinds.iter().map(|&kind| ROWS.intern(kind, tagged(0))).collect();
             let interned = super::probes::take();
-            eprintln!("flood: interning {} kinds with one fixed hash: {:?}, {interned} slots", kinds.len(), start.elapsed());
+            eprintln!(
+                "flood: interning {} kinds with one fixed hash: {:?}, {interned} slots",
+                kinds.len(),
+                start.elapsed()
+            );
             for (&kind, &row) in kinds.iter().zip(&rows) {
                 assert_eq!(ROWS.intern(kind, tagged(0)), row);
                 assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
             }
             let found = super::probes::take();
             assert!(ROWS.index.keyed(), "the flood did not switch the index to its key");
-            assert_eq!(ROWS.index.switches.load(Ordering::Relaxed), 1, "the index switched more than once");
+            assert_eq!(
+                ROWS.index.switches.load(Ordering::Relaxed),
+                1,
+                "the index switched more than once"
+            );
             let bound = 16 * kinds.len() as u64;
-            assert!(interned <= bound, "interning {} kinds with one fixed hash looked at {interned} slots, over {bound}", kinds.len());
-            assert!(found <= bound, "finding {} kinds with one fixed hash looked at {found} slots, over {bound}", kinds.len());
+            assert!(
+                interned <= bound,
+                "interning {} kinds with one fixed hash looked at {interned} slots, over {bound}",
+                kinds.len()
+            );
+            assert!(
+                found <= bound,
+                "finding {} kinds with one fixed hash looked at {found} slots, over {bound}",
+                kinds.len()
+            );
         }
 
         /// What an intern costs, new and found again, for kinds shaped as the solver's are
@@ -5448,7 +5589,9 @@ pub(crate) mod table {
                 // Slots looked at a hit: 0 in a build that counts nothing (outside `cfg(test)`).
                 let probes = super::probes::take() as f64 / (f64::from(rounds) * f64::from(n));
                 assert_eq!(rows.index.keyed(), hash == "keyed", "the {hash} bench table's index");
-                println!("interning_cost {hash}: {n} kinds, new {new:.1} ns each, found again {found:.1} ns each (best of {rounds}), {probes:.2} slots a hit");
+                println!(
+                    "interning_cost {hash}: {n} kinds, new {new:.1} ns each, found again {found:.1} ns each (best of {rounds}), {probes:.2} slots a hit"
+                );
             }
         }
 
@@ -5564,12 +5707,11 @@ mod tests {
             parent: function(),
             local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0)),
         });
-        let ty = GenericParamId::TypeParamId(TypeParamId::from_unchecked(
-            hir_def::TypeOrConstParamId {
+        let ty =
+            GenericParamId::TypeParamId(TypeParamId::from_unchecked(hir_def::TypeOrConstParamId {
                 parent: function(),
                 local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0)),
-            },
-        ));
+            }));
         let statik: GenericArg<'static> = default_types().regions.statik.into();
         let u32_: GenericArg<'static> = default_types().types.u32.into();
         assert!(args_fit_params([lifetime, ty], &[statik, u32_]));

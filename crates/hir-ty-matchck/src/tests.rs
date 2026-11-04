@@ -7,10 +7,7 @@ mod ui;
 
 use base_db::{Db, all_crates};
 use hir_def::{
-    DefWithBodyId, ModuleDefId,
-    expr_store::Body,
-    hir::ExprOrPatId,
-    nameres::crate_def_map,
+    DefWithBodyId, ModuleDefId, expr_store::Body, hir::ExprOrPatId, nameres::crate_def_map,
 };
 use hir_expand::fixture;
 
@@ -19,11 +16,14 @@ use crate::{
     match_check,
 };
 
-
 fn render_lint(lint: &MatchLint) -> (ExprOrPatId, String) {
     match lint {
         MatchLint::UnreachablePattern(UnreachablePattern {
-            pat, covered_by, catchall, typo, ..
+            pat,
+            covered_by,
+            catchall,
+            typo,
+            ..
         }) => {
             let mut text = String::from("unreachable_patterns");
             if covered_by.is_empty() {
@@ -474,10 +474,7 @@ fn unreachable_pattern() {
     }
 }
 "#,
-        &[
-            ("let () = x", "irrefutable_let_patterns: IfLetGuard"),
-            ("None", "unreachable_patterns"),
-        ],
+        &[("let () = x", "irrefutable_let_patterns: IfLetGuard"), ("None", "unreachable_patterns")],
     );
 }
 
@@ -617,9 +614,13 @@ fn refutable_param((1, _): (u8, u8)) {}
                     let walked = super::visit::slow::walk(hir_db, def, infer);
                     if !super::visit::may_name_a_variant(hir_db, &body, infer) {
                         assert_eq!(walked, crate::MatchCheck::default(), "{def:?}");
-                        blaze_alloc_count::assert_at_most(0, "a body with nothing to check", || {
-                            assert_eq!(super::visit::check_body(hir_db, def, infer), walked);
-                        });
+                        blaze_alloc_count::assert_at_most(
+                            0,
+                            "a body with nothing to check",
+                            || {
+                                assert_eq!(super::visit::check_body(hir_db, def, infer), walked);
+                            },
+                        );
                     }
                     assert_eq!(super::visit::check_body(hir_db, def, infer), walked, "{def:?}");
                 }

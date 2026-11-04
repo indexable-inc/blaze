@@ -650,7 +650,9 @@ impl PathColumns {
             TypeBound::ForLifetime(names, path) => {
                 TypeBound::ForLifetime(self.push_names(from.names(names).iter().cloned()), path)
             }
-            TypeBound::Use(args) => TypeBound::Use(self.push_use_args(from.use_args(args).iter().cloned())),
+            TypeBound::Use(args) => {
+                TypeBound::Use(self.push_use_args(from.use_args(args).iter().cloned()))
+            }
             TypeBound::Path(..) | TypeBound::Lifetime(_) | TypeBound::Error => bound,
         }
     }
@@ -866,9 +868,10 @@ impl<'a> Path<'a> {
                 segments: path.mod_path.segments(),
                 generic_args: Some(path.generic_args),
             },
-            Path::LangItem(_, seg) => {
-                PathSegments { segments: seg.map_or(&[][..], std::slice::from_ref), generic_args: None }
-            }
+            Path::LangItem(_, seg) => PathSegments {
+                segments: seg.map_or(&[][..], std::slice::from_ref),
+                generic_args: None,
+            },
         }
     }
 
@@ -910,14 +913,19 @@ impl<'a> Path<'a> {
                 if mod_path.is_ident() {
                     return None;
                 }
-                Some(Qualifier { mod_path: strip_last(mod_path), type_anchor: None, generic_args: None })
+                Some(Qualifier {
+                    mod_path: strip_last(mod_path),
+                    type_anchor: None,
+                    generic_args: None,
+                })
             }
             Path::Normal(path) => {
                 if path.mod_path.is_ident() {
                     return None;
                 }
                 let generic_args = path.generic_args.strip_last();
-                let keep = path.type_anchor.is_some() || generic_args.slots.iter().any(|&it| it != 0);
+                let keep =
+                    path.type_anchor.is_some() || generic_args.slots.iter().any(|&it| it != 0);
                 Some(Qualifier {
                     mod_path: strip_last(path.mod_path),
                     type_anchor: path.type_anchor,
@@ -1200,7 +1208,9 @@ impl Hash for Bindings<'_> {
                         path.hash(state);
                     }
                     TypeBound::Use(args) => self.columns.use_args(args).hash(state),
-                    TypeBound::Path(..) | TypeBound::Lifetime(_) | TypeBound::Error => bound.hash(state),
+                    TypeBound::Path(..) | TypeBound::Lifetime(_) | TypeBound::Error => {
+                        bound.hash(state)
+                    }
                 }
             }
         }
@@ -1313,7 +1323,9 @@ impl<'a> PathSegments<'a> {
     pub fn take(&self, len: usize) -> PathSegments<'a> {
         PathSegments {
             segments: self.segments.get(..len).unwrap_or(self.segments),
-            generic_args: self.generic_args.map(|it| it.with(it.slots.get(..len).unwrap_or(it.slots))),
+            generic_args: self
+                .generic_args
+                .map(|it| it.with(it.slots.get(..len).unwrap_or(it.slots))),
         }
     }
 
@@ -1420,15 +1432,20 @@ impl ExpressionStoreBuilder {
         type_ref: Option<TypeRefId>,
         bounds: ListMark,
     ) -> BindingRow {
-        self.types.paths.binding(name, args, type_ref, self.lists.bounds.drain(bounds.bounds as usize..))
+        self.types.paths.binding(
+            name,
+            args,
+            type_ref,
+            self.lists.bounds.drain(bounds.bounds as usize..),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use blaze_query::db::FromId;
     use intern::Symbol;
     use la_arena::RawIdx;
-    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{FunctionId, type_ref::TraitBoundModifier};
@@ -1446,7 +1463,9 @@ mod tests {
     }
 
     fn lang_item() -> LangItemTarget {
-        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(5 + (1 << 20))))
+        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(
+            5 + (1 << 20),
+        )))
     }
 
     /// Every shape: bare, lang items with and without a name, `Normal` with a type anchor only,
@@ -1480,7 +1499,8 @@ mod tests {
             ],
         );
         let names = columns.push_names([name("'a"), name("'b")]);
-        let use_args = columns.push_use_args([UseArgRef::Name(name("T")), UseArgRef::Lifetime(idx(0))]);
+        let use_args =
+            columns.push_use_args([UseArgRef::Name(name("T")), UseArgRef::Lifetime(idx(0))]);
         let with_runs = columns.binding(
             name("Runs"),
             None,
@@ -1502,13 +1522,18 @@ mod tests {
             [output],
             GenericArgsParentheses::ParenSugar,
         );
-        let rtn = columns.push_generic_args([], false, [], GenericArgsParentheses::ReturnTypeNotation);
+        let rtn =
+            columns.push_generic_args([], false, [], GenericArgsParentheses::ReturnTypeNotation);
         paths.push(columns.push_normal(
             mod_path(PathKind::Abs, &["std", "Iter", "f"]),
             None,
             [0, slot(Some(outer)), slot(Some(rtn))],
         ));
-        paths.push(columns.push_normal(mod_path(PathKind::Plain, &["Fn"]), None, [slot(Some(sugar))]));
+        paths.push(columns.push_normal(
+            mod_path(PathKind::Plain, &["Fn"]),
+            None,
+            [slot(Some(sugar))],
+        ));
         let self_args = columns.with_self_type(Some(outer), t(4));
         let bare_self = columns.with_self_type(None, t(4));
         paths.push(columns.push_normal(
@@ -1544,7 +1569,10 @@ mod tests {
         assert_eq!(columns.get(paths[2]).segments().len(), 0);
         assert_eq!(columns.get(paths[3]), Path::LangItem(lang_item(), None));
         assert_eq!(columns.get(paths[4]), Path::LangItem(lang_item(), Some(&name("branch"))));
-        assert_eq!(columns.get(paths[4]).segments().first().map(|it| it.name), Some(&name("branch")));
+        assert_eq!(
+            columns.get(paths[4]).segments().first().map(|it| it.name),
+            Some(&name("branch"))
+        );
 
         let anchored = columns.get(paths[5]);
         assert_eq!(anchored.type_anchor(), Some(t(3)));
@@ -1557,7 +1585,10 @@ mod tests {
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].args_and_bindings, None);
         let outer = segments[1].args_and_bindings.expect("the second segment has arguments");
-        assert_eq!(outer.args, &[GenericArg::Type(t(0)), GenericArg::Const(ConstRef { expr: idx(0) })]);
+        assert_eq!(
+            outer.args,
+            &[GenericArg::Type(t(0)), GenericArg::Const(ConstRef { expr: idx(0) })]
+        );
         assert!(!outer.has_self_type);
         assert_eq!(outer.parenthesized, GenericArgsParentheses::No);
         let bindings: Vec<_> = outer.bindings.iter().collect();
@@ -1566,7 +1597,9 @@ mod tests {
         assert_eq!(bindings[0].type_ref, Some(t(1)));
         assert_eq!(bindings[1].args.map(|it| it.args), Some(&[GenericArg::Lifetime(idx(0))][..]));
         assert_eq!(bindings[1].bounds.len(), 3);
-        let TypeBound::ForLifetime(names, _) = bindings[2].bounds[0] else { panic!("a for<..> bound") };
+        let TypeBound::ForLifetime(names, _) = bindings[2].bounds[0] else {
+            panic!("a for<..> bound")
+        };
         assert_eq!(columns.names(names), &[name("'a"), name("'b")]);
         let TypeBound::Use(args) = bindings[2].bounds[1] else { panic!("a use<..> bound") };
         assert_eq!(columns.use_args(args)[1], UseArgRef::Lifetime(idx(0)));
@@ -1575,7 +1608,10 @@ mod tests {
             Some(GenericArgsParentheses::ReturnTypeNotation)
         );
         assert_eq!(path.segments().skip(1).len(), 2);
-        assert_eq!(path.segments().skip(1).first().and_then(|it| it.args_and_bindings), Some(outer));
+        assert_eq!(
+            path.segments().skip(1).first().and_then(|it| it.args_and_bindings),
+            Some(outer)
+        );
         assert_eq!(path.segments().take(1).last().and_then(|it| it.args_and_bindings), None);
         assert_eq!(path.segments().strip_last_two().len(), 1);
 
@@ -1620,7 +1656,10 @@ mod tests {
         let built = columns.clone();
         let frozen = columns.freeze_into();
         assert_eq!(frozen, built);
-        assert!(columns.is_empty() && columns.generic_args.is_empty(), "freezing empties the scratch");
+        assert!(
+            columns.is_empty() && columns.generic_args.is_empty(),
+            "freezing empties the scratch"
+        );
         assert_eq!(every_path(&mut columns), paths);
         assert_eq!(columns.freeze_into(), frozen);
         assert_eq!(frozen.iter().count(), paths.len());
@@ -1684,7 +1723,8 @@ mod tests {
     #[test]
     fn check_refuses_a_binding_whose_arguments_are_not_an_earlier_row() {
         let (mut columns, _) = filled();
-        let assoc = columns.bindings.iter().position(|it| it.args != 0).expect("a binding with args");
+        let assoc =
+            columns.bindings.iter().position(|it| it.args != 0).expect("a binding with args");
         columns.bindings[assoc].args = len(columns.generic_args.len());
         assert_eq!(check(&columns), Err(BINDING_ARGS));
     }

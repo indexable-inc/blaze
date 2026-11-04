@@ -23,11 +23,7 @@ use crate::test_case::invalid_argument;
 /// Convert a [`Date`] to the engine's date struct. Every jiff `Date` fits:
 /// jiff spans years ±9999 and the engine accepts ±999999.
 fn hegel_date(d: Date) -> hegel_c::hegel_date_t {
-    hegel_c::hegel_date_t {
-        year: i32::from(d.year()),
-        month: d.month() as u8,
-        day: d.day() as u8,
-    }
+    hegel_c::hegel_date_t { year: i32::from(d.year()), month: d.month() as u8, day: d.day() as u8 }
 }
 
 /// Generator for [`jiff::civil::Date`] values. Created by [`dates()`].
@@ -92,10 +88,7 @@ impl PrintableGenerator<Date> for DateGenerator {
 /// }
 /// ```
 pub fn dates() -> DateGenerator {
-    DateGenerator {
-        min_value: Date::constant(1, 1, 1),
-        max_value: Date::constant(9999, 12, 31),
-    }
+    DateGenerator { min_value: Date::constant(1, 1, 1), max_value: Date::constant(9999, 12, 31) }
 }
 
 fn hegel_time(t: Time) -> hegel_c::hegel_time_t {
@@ -137,13 +130,7 @@ impl Generator<Time> for TimeGenerator {
             invalid_argument!("Cannot have max_value < min_value");
         }
         let t = tc.generate_time(hegel_time(self.min_value), hegel_time(self.max_value));
-        Time::new(
-            t.hour as i8,
-            t.minute as i8,
-            t.second as i8,
-            t.nanosecond as i32,
-        )
-        .unwrap()
+        Time::new(t.hour as i8, t.minute as i8, t.second as i8, t.nanosecond as i32).unwrap()
     }
 }
 
@@ -171,10 +158,7 @@ impl PrintableGenerator<Time> for TimeGenerator {
 /// }
 /// ```
 pub fn times() -> TimeGenerator {
-    TimeGenerator {
-        min_value: Time::MIN,
-        max_value: Time::MAX,
-    }
+    TimeGenerator { min_value: Time::MIN, max_value: Time::MAX }
 }
 
 /// Convert a [`DateTime`] to nanoseconds since the Unix epoch, treating it
@@ -193,10 +177,7 @@ fn datetime_to_nanos(dt: DateTime) -> i128 {
 
 /// Inverse of [`datetime_to_nanos`].
 fn nanos_to_datetime(n: i128) -> DateTime {
-    Timestamp::from_nanosecond(n)
-        .unwrap()
-        .to_zoned(TimeZone::UTC)
-        .datetime()
+    Timestamp::from_nanosecond(n).unwrap().to_zoned(TimeZone::UTC).datetime()
 }
 
 /// Generator for [`jiff::civil::DateTime`] values. Created by [`datetimes()`].
@@ -327,10 +308,7 @@ impl PrintableGenerator<Timestamp> for TimestampGenerator {
 /// }
 /// ```
 pub fn timestamps() -> TimestampGenerator {
-    TimestampGenerator {
-        min_value: Timestamp::MIN,
-        max_value: Timestamp::MAX,
-    }
+    TimestampGenerator { min_value: Timestamp::MIN, max_value: Timestamp::MAX }
 }
 
 /// The largest absolute nanosecond magnitude jiff allows in a `Span`.
@@ -368,10 +346,8 @@ impl Generator<Span> for SpanGenerator {
         if self.min_nanos < -SPAN_NANOS_LIMIT {
             invalid_argument!("min_nanoseconds must be >= -i64::MAX (the Span nanosecond limit)");
         }
-        let nanos = integers::<i64>()
-            .min_value(self.min_nanos)
-            .max_value(self.max_nanos)
-            .do_draw(tc);
+        let nanos =
+            integers::<i64>().min_value(self.min_nanos).max_value(self.max_nanos).do_draw(tc);
         Span::new().try_nanoseconds(nanos).unwrap()
     }
 }
@@ -398,10 +374,7 @@ impl PrintableGenerator<Span> for SpanGenerator {
 /// }
 /// ```
 pub fn spans() -> SpanGenerator {
-    SpanGenerator {
-        min_nanos: -SPAN_NANOS_LIMIT,
-        max_nanos: SPAN_NANOS_LIMIT,
-    }
+    SpanGenerator { min_nanos: -SPAN_NANOS_LIMIT, max_nanos: SPAN_NANOS_LIMIT }
 }
 
 /// Inverse of [`SignedDuration::as_nanos`].
@@ -469,10 +442,7 @@ impl PrintableGenerator<SignedDuration> for SignedDurationGenerator {
 /// }
 /// ```
 pub fn signed_durations() -> SignedDurationGenerator {
-    SignedDurationGenerator {
-        min_value: SignedDuration::MIN,
-        max_value: SignedDuration::MAX,
-    }
+    SignedDurationGenerator { min_value: SignedDuration::MIN, max_value: SignedDuration::MAX }
 }
 
 /// The minimum representable offset in seconds (-25:59:59).
@@ -596,10 +566,8 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> Zoned {
-        let (ts, tz) = tc.draw_silent(crate::generators::tuples2(
-            &self.timestamp_gen,
-            &self.timezone_gen,
-        ));
+        let (ts, tz) =
+            tc.draw_silent(crate::generators::tuples2(&self.timestamp_gen, &self.timezone_gen));
         Zoned::new(ts, tz)
     }
 }
@@ -631,8 +599,5 @@ where
 /// ```
 pub fn zoneds() -> ZonedGenerator {
     use crate::generators::DefaultGenerator;
-    ZonedGenerator::new(
-        timestamps(),
-        <TimeZone as DefaultGenerator>::default_generator(),
-    )
+    ZonedGenerator::new(timestamps(), <TimeZone as DefaultGenerator>::default_generator())
 }

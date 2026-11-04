@@ -96,7 +96,9 @@ impl fmt::Display for ShapeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ShapeError::NoCores => f.write_str("a scheduler's shape has no core"),
-            ShapeError::TooManyCores(n) => write!(f, "a scheduler's shape has {n} cores, past {MAX_CORES}"),
+            ShapeError::TooManyCores(n) => {
+                write!(f, "a scheduler's shape has {n} cores, past {MAX_CORES}")
+            }
             ShapeError::SiblingsSplit { core, other } => write!(
                 f,
                 "cores {core} and {other} are SMT siblings in different L3 groups, nodes or sockets"
@@ -299,8 +301,9 @@ impl Cores {
     /// `core`'s tiers, nearest first: each one's level and mask.
     pub(crate) fn tiers(&self, core: u32) -> impl Iterator<Item = (Level, &[u64])> + '_ {
         let (start, end) = (self.tier_start[core as usize], self.tier_start[core as usize + 1]);
-        (start as usize..end as usize)
-            .map(move |t| (self.tier_level[t], &self.tier_masks[t * self.words..(t + 1) * self.words]))
+        (start as usize..end as usize).map(move |t| {
+            (self.tier_level[t], &self.tier_masks[t * self.words..(t + 1) * self.words])
+        })
     }
 
     /// Whether `core` is in L3 group `l3`, or node `node`: for a placement hint.
@@ -317,7 +320,12 @@ impl Cores {
 /// and wrapping, so searchers that start at their own id spread over their victims.
 #[blaze::noalloc]
 #[blaze::nonblocking]
-pub(crate) fn first_from(bits: &[u64], mask: &[u64], filter: Option<&[u64]>, start: usize) -> Option<u32> {
+pub(crate) fn first_from(
+    bits: &[u64],
+    mask: &[u64],
+    filter: Option<&[u64]>,
+    start: usize,
+) -> Option<u32> {
     let words = bits.len();
     let word = |w: usize| bits[w] & mask[w] & filter.map_or(u64::MAX, |it| it[w]);
     let start = if start >= words * 64 { 0 } else { start };

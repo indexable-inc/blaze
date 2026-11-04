@@ -4,8 +4,7 @@ use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 
 /// `#[inline]` built-in attribute.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
 pub enum InlineAttr {
     /// `#[inline]`
     Hint,
@@ -16,9 +15,9 @@ pub enum InlineAttr {
 }
 
 /// Attributes (`#[...]`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, EnumAsInner, Serialize, Deserialize, Drive, DriveMut, DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Attr"))]
 pub enum Attribute {
     /// Do not translate the body of this item.
@@ -41,10 +40,7 @@ pub enum Attribute {
     /// An item annotated with `#[charon::contract(kind = "...", parent)]` or
     /// `#[charon::contract(kind = "...", for = "...")]`. This makes it a contract for the target
     /// item.
-    IsContract {
-        kind: String,
-        target: MaybeAssocItemId,
-    },
+    IsContract { kind: String, target: MaybeAssocItemId },
     /// An item that has a contract that applies to it. The referenced item is the function that
     /// specifies the contract.
     HasContract { kind: String, contract: FunDeclId },
@@ -57,8 +53,7 @@ pub enum Attribute {
 }
 
 /// A general attribute.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
 pub struct RawAttribute {
     pub path: String,
     /// The arguments passed to the attribute, if any. We don't distinguish different delimiters or
@@ -67,8 +62,7 @@ pub struct RawAttribute {
 }
 
 /// Information about the attributes and visibility of an item, field or variant..
-#[derive(Debug, Default, Clone)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
 pub struct AttrInfo {
     /// Attributes (`#[...]`).
     pub attributes: Vec<Attribute>,
@@ -111,10 +105,7 @@ impl Attribute {
                     | LinkSection { .. }
                     | Naked(..)
                     | NoMangle(..)
-                    | TargetFeature {
-                        was_forced: true,
-                        ..
-                    }
+                    | TargetFeature { was_forced: true, .. }
             )
         )
     }
@@ -122,16 +113,10 @@ impl Attribute {
 
 impl AttrInfo {
     pub fn dummy_private() -> Self {
-        AttrInfo {
-            public: false,
-            ..Default::default()
-        }
+        AttrInfo { public: false, ..Default::default() }
     }
 
     pub fn dummy_public() -> Self {
-        AttrInfo {
-            public: true,
-            ..Default::default()
-        }
+        AttrInfo { public: true, ..Default::default() }
     }
 }

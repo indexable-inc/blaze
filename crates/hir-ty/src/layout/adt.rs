@@ -3,24 +3,24 @@
 use std::cmp;
 
 use base_db::Db;
+use blaze_hashcons::Interned;
+use blaze_mem::Frame;
 use hir_def::{AdtId, VariantId, attrs::AttrFlags, signatures::StructFlags};
 use rustc_abi::{
     BackendRepr, Float, Integer, NicheOptimizations, Primitive, ReprOptions, Scalar,
     TargetDataLayout, WrappingRange,
 };
 use rustc_index::IndexVec;
-use blaze_hashcons::Interned;
-use blaze_mem::Frame;
 
 use crate::{
     consteval::discriminants::enum_discriminants,
     db::HirDatabase,
+    layout::field_order::{self, FieldLayouts},
     layout::{
         InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
         bits_layout, enum_variant_ids, intern_layout, scalar_unit, struct_flags,
         struct_tail_may_be_unsized, variant_field_ids,
     },
-    layout::field_order::{self, FieldLayouts},
     next_solver::{DbInterner, GenericArgs, StoredGenericArgs},
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
@@ -122,35 +122,34 @@ fn layout_of_adt_in(
     let variants = variants_of(&fields, &ends);
     // The calculator, given the `#[repr]` and the fields in some order: rustc's layout below,
     // a hot-first one in `field_order`.
-    let layout_with = |repr: &ReprOptions,
-                       variants: &FieldLayouts<'_, 'static>|
-     -> Result<Layout, LayoutError> {
-        Ok(if matches!(def, AdtId::UnionId(..)) {
-            cx.calc.layout_of_union(repr, variants)?
-        } else {
-            // As rustc has a discriminant: the bits of its type, and no more.
-            let discr_size = Integer::from_attr(dl, repr.discr_type()).size();
-            cx.calc.layout_of_struct_or_enum(
-                repr,
-                variants,
-                matches!(def, AdtId::EnumId(..)),
-                niche_optimizations,
-                // As rustc's `Integer::repr_discr`, a `#[repr]` too small for the values is a
-                // bug: the values are truncated to it above.
-                |min, max| {
-                    repr_discr(dl, repr, min.start, max.last).unwrap_or_else(|err| {
-                        panic!("`#[repr]` of {def:?} too small for its discriminants: {err}")
-                    })
-                },
-                discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(
-                    |(index, d)| {
-                        Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
+    let layout_with =
+        |repr: &ReprOptions, variants: &FieldLayouts<'_, 'static>| -> Result<Layout, LayoutError> {
+            Ok(if matches!(def, AdtId::UnionId(..)) {
+                cx.calc.layout_of_union(repr, variants)?
+            } else {
+                // As rustc has a discriminant: the bits of its type, and no more.
+                let discr_size = Integer::from_attr(dl, repr.discr_type()).size();
+                cx.calc.layout_of_struct_or_enum(
+                    repr,
+                    variants,
+                    matches!(def, AdtId::EnumId(..)),
+                    niche_optimizations,
+                    // As rustc's `Integer::repr_discr`, a `#[repr]` too small for the values is a
+                    // bug: the values are truncated to it above.
+                    |min, max| {
+                        repr_discr(dl, repr, min.start, max.last).unwrap_or_else(|err| {
+                            panic!("`#[repr]` of {def:?} too small for its discriminants: {err}")
+                        })
                     },
-                ),
-                !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
-            )?
-        })
-    };
+                    discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(
+                        |(index, d)| {
+                            Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
+                        },
+                    ),
+                    !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
+                )?
+            })
+        };
     let result = layout_with(&repr, &variants)?;
     // Without a plan ranking `def`, `result` as it is.
     let shape = field_order::Shape { repr, flags, maybe_unsized, niches: niche_optimizations };
@@ -325,9 +324,8 @@ mod tests {
                 // A struct or a union.
                 _ => 1,
             };
-            let mut variants: Vec<Vec<&Layout>> = (0..count)
-                .map(|_| (0..seed_len.index(6)).map(|_| field()).collect())
-                .collect();
+            let mut variants: Vec<Vec<&Layout>> =
+                (0..count).map(|_| (0..seed_len.index(6)).map(|_| field()).collect()).collect();
             let unsized_tail = case % 3 == 2 && seed_len.below(2) == 0;
             if unsized_tail {
                 variants[0].push(&tail);
@@ -353,7 +351,11 @@ mod tests {
                 let union = |variants: &Variants<'_, '_>| -> Result<Layout, LayoutError> {
                     Ok(cx.calc.layout_of_union(&repr, variants)?)
                 };
-                assert_eq!(flat(&variants, union), nested_with_vecs(&variants, union), "case {case}");
+                assert_eq!(
+                    flat(&variants, union),
+                    nested_with_vecs(&variants, union),
+                    "case {case}"
+                );
             }
         }
     }

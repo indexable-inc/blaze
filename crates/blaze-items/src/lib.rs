@@ -69,8 +69,8 @@ pub use bound::{BOUND_DOMAIN, bound_hash};
 pub use facts::*;
 pub use form::{Nested, observes_names};
 pub use hash::{
-    Unhashable, Unhashed, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
-    layout_hash, macros_built, signature_hash,
+    Unhashable, Unhashed, closure_code, code_hash, coroutine_code, deep_hash, hashes,
+    interface_hash, layout_hash, macros_built, signature_hash,
 };
 pub use index::*;
 pub use key::{Resolved, item_key, resolve};
@@ -250,16 +250,28 @@ pub enum Fact {
     /// T's layout hash: read by the codegen of everything that moves or stores a T.
     Layout(ItemKey),
     /// The type and offset of T's field `field` (by position).
-    Field { ty: ItemKey, field: u32 },
+    Field {
+        ty: ItemKey,
+        field: u32,
+    },
     /// What `x.m()` resolves to on T: changes when an impl or trait adds, removes or changes
     /// an `m` reachable for T.
-    Method { self_ty: SimplifiedType, name: NameHash },
+    Method {
+        self_ty: SimplifiedType,
+        name: NameHash,
+    },
     /// Whether T implements Trait: changes when an impl of Trait whose simplified self type
     /// unifies with T's is added, removed or changed.
-    Implements { trait_: ItemKey, self_ty: SimplifiedType },
+    Implements {
+        trait_: ItemKey,
+        self_ty: SimplifiedType,
+    },
     /// What N in S resolves to (globs included): changes when an item named N appears or
     /// disappears in a scope S sees.
-    Resolves { scope: Scope, name: NameHash },
+    Resolves {
+        scope: Scope,
+        name: NameHash,
+    },
     /// F's code hash: read by F's codegen, and by callers that inlined F (release).
     Code(ItemKey),
     /// The evaluated value, not its expression, of a const, a static's initializer (by the
@@ -277,7 +289,10 @@ pub enum Fact {
     Coherence(ItemKey),
     Specializes(ItemKey),
     DropCheck(ItemKey),
-    Vtable { trait_: ItemKey, self_ty: SimplifiedType },
+    Vtable {
+        trait_: ItemKey,
+        self_ty: SimplifiedType,
+    },
     Derive(ItemKey),
     /// The target a crate (by its [`key::crate_key`]) is built for: its tuple, data layout and
     /// spec, or why it could not be loaded.

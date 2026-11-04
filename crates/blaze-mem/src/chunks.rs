@@ -296,9 +296,10 @@ pub struct Cached {
 
 /// [`Cached`] now: two loads a place made.
 pub fn cached() -> Cached {
-    SPACES.iter().filter_map(|space| space.get()?.as_ref().ok()).map(Space::cached).fold(Cached::default(), |sum, it| {
-        Cached { warm: sum.warm + it.warm, cold: sum.cold + it.cold }
-    })
+    SPACES.iter().filter_map(|space| space.get()?.as_ref().ok()).map(Space::cached).fold(
+        Cached::default(),
+        |sum, it| Cached { warm: sum.warm + it.warm, cold: sum.cold + it.cold },
+    )
 }
 
 /// Bytes of chunks carved so far (held or cached), over every place.
@@ -401,7 +402,10 @@ impl Space {
         // A chunk is aligned to a huge page and committed whole, so a purge gives back all of it
         // or none. A part given back would still go cold, never warm: a warm take skips `reuse`,
         // which the given pages need (Windows decommitted them).
-        debug_assert!(given == 0 || given == CHUNK, "a purge of a {CHUNK}-byte chunk gave back {given} bytes");
+        debug_assert!(
+            given == 0 || given == CHUNK,
+            "a purge of a {CHUNK}-byte chunk gave back {given} bytes"
+        );
         if given == 0 {
             self.warm_count.fetch_add(1, Ordering::Relaxed);
             self.warm.push(local, &self.links);
@@ -426,7 +430,8 @@ mod tests {
     fn a_space_trims_its_warm_chunks_to_keep_once_they_pass_most() {
         const CHUNKS: u32 = 8;
         let space = Space {
-            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver).expect("a test's space"),
+            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver)
+                .expect("a test's space"),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),
@@ -443,11 +448,23 @@ mod tests {
             space.give(&[local]);
             seen.push(warm());
         }
-        assert_eq!(seen, [1, 2, 3, 4, 2, 3, 4, 2], "one at a time: up to most, then trimmed to keep");
+        assert_eq!(
+            seen,
+            [1, 2, 3, 4, 2, 3, 4, 2],
+            "one at a time: up to most, then trimmed to keep"
+        );
         let cold = || space.cold_count.load(Ordering::Relaxed);
-        assert_eq!(cold(), 6, "each purged chunk counts cold, so the memory line can say it is not resident");
+        assert_eq!(
+            cold(),
+            6,
+            "each purged chunk counts cold, so the memory line can say it is not resident"
+        );
         let again: Vec<u32> = (0..CHUNKS).map(|_| space.take().expect("a chunk")).collect();
-        assert_eq!(space.carved.load(Ordering::Relaxed), CHUNKS, "the purged chunks are taken again, none carved");
+        assert_eq!(
+            space.carved.load(Ordering::Relaxed),
+            CHUNKS,
+            "the purged chunks are taken again, none carved"
+        );
         assert_eq!(warm(), 0);
         assert_eq!(cold(), 0, "a cold chunk taken again counts cold no more");
         space.give(&again);
@@ -465,7 +482,8 @@ mod tests {
     fn a_chunk_whose_purge_gave_nothing_back_stays_warm_and_in_the_footprint() {
         const CHUNKS: u32 = 4;
         let space = Space {
-            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver).expect("a test's space"),
+            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver)
+                .expect("a test's space"),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),
@@ -477,7 +495,10 @@ mod tests {
         };
         let kept = space.take().expect("a chunk");
         let given = space.take().expect("a chunk");
-        assert!(!space.cache_purged(kept, 0), "a purge that gave nothing back leaves the chunk warm");
+        assert!(
+            !space.cache_purged(kept, 0),
+            "a purge that gave nothing back leaves the chunk warm"
+        );
         assert_eq!(
             space.cached(),
             Cached { warm: CHUNK as u64, cold: 0 },
@@ -485,8 +506,16 @@ mod tests {
         );
         assert!(space.cache_purged(given, CHUNK), "a purge that gave the chunk back makes it cold");
         assert_eq!(space.cached(), Cached { warm: CHUNK as u64, cold: CHUNK as u64 });
-        assert_eq!(space.take().expect("a chunk"), kept, "the warm chunk is taken first, with no reuse");
-        assert_eq!(space.take().expect("a chunk"), given, "then the cold one, made the process's again");
+        assert_eq!(
+            space.take().expect("a chunk"),
+            kept,
+            "the warm chunk is taken first, with no reuse"
+        );
+        assert_eq!(
+            space.take().expect("a chunk"),
+            given,
+            "then the cold one, made the process's again"
+        );
         assert_eq!(space.cached(), Cached::default());
         assert_eq!(space.carved.load(Ordering::Relaxed), 2, "both were taken again, none carved");
     }
