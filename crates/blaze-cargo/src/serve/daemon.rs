@@ -1878,6 +1878,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
+        let (span_map_bytes, span_map_pieces) = ::span::kept_maps();
+        blaze_profile::plot(Plot::SpanMapBytes, span_map_bytes);
+        blaze_profile::plot(Plot::SpanMapPieces, span_map_pieces);
         if now.saturating_sub(self.memory_logged) >= MEMORY_LOG_EVERY {
             self.memory_logged = now;
             log_memory(&memory);

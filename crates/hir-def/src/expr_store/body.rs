@@ -368,6 +368,10 @@ pub struct BodySyntax {
     /// The maps of the anchor, the same for every body written in it, and so shared by them.
     pub ast_id_map: Arc<AstIdMap>,
     pub span_map: Arc<RealSpanMap>,
+    /// The anchor the spans of [`BodySyntax::span_map`] at its start are relative to: that of
+    /// the span of offset 0, found once here, not once per span placed. Made from `span_map`,
+    /// so equality need not compare it.
+    pub anchor: span::SpanAnchor,
 }
 
 /// What every body written in one anchor has the same of: made for the first of them and shared
@@ -696,6 +700,7 @@ fn in_owner_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
         ast_id_map: owner.ast_id_map.clone(),
         // clone: a count of the anchor's maps
         span_map: owner.span_map.clone(),
+        anchor: owner.anchor,
     })
 }
 
@@ -734,6 +739,7 @@ fn anchored_body_syntax(
             outline: holds_lazy(anchor),
         }
     });
+    let span_anchor = span_map.span_for_range(TextRange::empty(0.into())).anchor;
     Some(BodySyntax {
         file_id,
         tree,
@@ -746,6 +752,7 @@ fn anchored_body_syntax(
         item: view::ptr(relative),
         ast_id_map,
         span_map,
+        anchor: span_anchor,
     })
 }
 
