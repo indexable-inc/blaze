@@ -63,7 +63,7 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
         "codex" => codex(ctx)?,
         "cursor" => cursor(ctx)?,
         "shell" => Launch {
-            program: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()),
+            program: login_shell(),
             args: vec!["-l".into()],
             env: common_env(ctx),
         },
@@ -323,4 +323,16 @@ fn cursor_disable_plugin_mcps(dot: &std::path::Path, cwd: &std::path::Path) -> a
 
 fn which(bin: &str) -> Option<String> {
     std::env::var_os("PATH")?.to_str()?.split(':').map(|d| PathBuf::from(d).join(bin)).find(|p| p.is_file()).map(|p| p.display().to_string())
+}
+
+/// The user's login shell from the account database (what Terminal/Ghostty start), not `$SHELL`, which is whatever
+/// shell happened to launch the daemon.
+fn login_shell() -> String {
+    // SAFETY: getpwuid returns a pointer into static storage or null; we copy the string out at once.
+    let from_db = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        (!pw.is_null() && !(*pw).pw_shell.is_null())
+            .then(|| std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned())
+    };
+    from_db.filter(|s| !s.is_empty()).or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/zsh".into())
 }
