@@ -2,7 +2,7 @@
 //!
 //! Every value (colours, sizes, spring tunes) is in the scene (scene/00-tokens.flecs, scene/10-harness.flecs); this file
 //! reads prefabs by name and keeps only runtime state: a running dot's breath, a part shown while its row is hovered, a
-//! disclosure chevron's turn, and the selection pill's spring between rows.
+//! disclosure chevron's turn,.
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{Fold, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
@@ -71,9 +71,6 @@ pub fn padding(w: WorldRef<'_>, name: &str) -> Padding {
 
 /// How near its end a breath turns back (of its 0..1 travel).
 const BREATH_TURN: f32 = 0.04;
-/// A pill jump longer than this (points: a far row, a scrolled tree) lands at once instead of sliding.
-const PILL_LEAP: f32 = 600.0;
-
 /// The springs: breaths, chevrons' turns.
 pub fn install(w: WorldRef<'_>) {
     let breath = tune(w, "breath");
@@ -177,34 +174,3 @@ pub const GROUP_ICON: &str = "\u{EA82}";
 pub const CHEVRON: &str = "\u{EAB6}";
 pub const ARCHIVE_ICON: &str = "\u{EA98}";
 
-/// The selection pill: it springs from the row it lit to the row selected next.
-#[derive(Default)]
-pub struct Pill {
-    y: Spring,
-    h: Spring,
-    row: Option<u64>,
-    pub dt: f32,
-}
-
-impl Pill {
-    /// Where to draw the pill for selected row `row` laid at `(y, h)`, and whether it is still moving.
-    pub fn place(&mut self, row: u64, y: f32, h: f32, tune: Tune) -> (f32, f32, bool) {
-        if self.row.is_none() {
-            self.y = Spring::at(y);
-            self.h = Spring::at(h);
-        }
-        self.row = Some(row);
-        let a = settle(&mut self.y, y, tune, self.dt);
-        let b = settle(&mut self.h, h, tune, self.dt);
-        // A jump of more than a screenful (a far row, a scrolled tree) lands at once.
-        if (self.y.x - y).abs() > PILL_LEAP {
-            self.y = Spring::at(y);
-        }
-        (self.y.x, self.h.x, a || b)
-    }
-
-    /// No row lit this frame: the next selection lands where it is.
-    pub fn lost(&mut self) {
-        self.row = None;
-    }
-}

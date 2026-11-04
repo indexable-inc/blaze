@@ -158,8 +158,6 @@ pub struct App {
     chrome_laid: Option<(Chrome, f32, f32)>,
     /// The dark appearance (the window's effective NSAppearance; the scene's fills pick their dark or light half).
     pub dark: bool,
-    /// The selection pill's spring between rows.
-    pill: crate::look::Pill,
     /// The sidebar tree's scroll (src/app/sidebar.rs).
     tree: sidebar::TreeScroll,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
@@ -334,7 +332,6 @@ impl App {
             chrome: Chrome::default(),
             chrome_laid: None,
             dark: true,
-            pill: crate::look::Pill::default(),
             tree: sidebar::TreeScroll::default(),
             fold: fold::TreeFold::default(),
             tree_focus: false,
@@ -531,7 +528,7 @@ impl App {
             }
         }
         let sel = self.selected();
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
+        let clear = tone(w, "clear");
         // The device row.
         let dev = w.lookup(model::LOCAL);
         let device = View::of(w.entity_from_id(self.ids.device));
@@ -601,7 +598,7 @@ impl App {
                 // A group of runs without a listed session: pressing it shows it (its runs in a group pane); pressing it
                 // again folds it.
                 row.action(&format!("group:{e}"));
-                set_if(row, if sel == Some(e) { chosen } else { clear });
+                selection(row, sel == Some(e), clear);
                 indent(row, depth);
                 fold::disclosure(row, Some(o));
                 if let Some(p) = row.part("glyph") {
@@ -617,7 +614,7 @@ impl App {
             }
             row.action(&format!("select:{e}"));
             fold::disclosure(row, Some(o));
-            set_if(row, if sel == Some(e) { chosen } else { clear });
+            selection(row, sel == Some(e), clear);
             indent(row, depth);
             let run = me.run_of(e);
             let status = me.status_of(e);
@@ -966,7 +963,6 @@ impl App {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
             self.grid = Grid::new(&mut self.fonts, TERM_SIZE, scale);
         }
-        self.pill.dt = dt;
         self.step_sidebar(dt);
         self.lay_chrome(z);
         self.step_fold();
@@ -1036,10 +1032,10 @@ impl App {
     /// card from the window's top, its terminal padded down by the strip; the title bar the strip's height, its title at
     /// the card's text inset.
     fn lay_chrome(&mut self, z: f32) {
-        use harness_native_ui_layout_api::{Padding, ScrollState};
+        use harness_native_ui_layout_api::{Padding, SafeAreaInset, ScrollState};
         let w = self.world.world_ref();
         let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
-        let (Some(full), Some(pad)) = (proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
+        let Some(full) = proto.try_cloned::<&Size>() else { return };
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
         let width = open * x;
@@ -1054,7 +1050,6 @@ impl App {
             let mut size = side.try_cloned::<&Size>().unwrap_or(full);
             size.w = Sizing::fixed(open);
             side.set(size);
-            side.set(Padding { t: top + pad.t, ..pad });
             if let Some(clip) = side.parent() {
                 let mut size = clip.try_cloned::<&Size>().unwrap_or(full);
                 size.w = Sizing::fixed(width);
@@ -1062,7 +1057,11 @@ impl App {
                 clip.set(ScrollState { x: open - width, y: 0.0 });
             }
         }
-        w.entity_from_id(self.ids.main).set(Padding { l: 0.0, r: 0.0, t: top, b: 0.0 });
+        // The strip is the window's safe-area inset: the sidebar and the main card pad themselves out of it
+        // (SafeAreaPadding in the scene).
+        if let Some(window) = w.entity_from_id(self.ids.main).parent() {
+            window.set(SafeAreaInset { l: 0.0, r: 0.0, t: top, b: 0.0 });
+        }
         let bar = w.entity_from_id(self.ids.bar);
         if let Some(mut size) = bar.try_cloned::<&Size>() {
             size.h = Sizing { kind: SizeKind::Fixed, value: top, min: 0.0, max: 0.0 };
@@ -1225,11 +1224,7 @@ impl App {
         let held = self.world.lookup(APP).target(Pressed::id(), 0).map(|t| *t.id());
         let painted = harness_native_ui_draw::painted(self.world.world_ref());
         let dark = self.dark;
-        let (lo, chosen, pill_tune) = {
-            let w = self.world.world_ref();
-            (crate::look::floor(w, "breath"), tone(w, "selected"), crate::look::tune(w, "pill"))
-        };
-        let (mut lit, mut pill_moving) = (false, false);
+        let lo = crate::look::floor(self.world.world_ref(), "breath");
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -1263,14 +1258,6 @@ impl App {
                     }
                     let (fc, ec) = if dark { (fill.dark, edge.dark) } else { (fill.light, edge.light) };
                     let mut panel = panel_from(rgba(fc), rgba(ec), shape, rect, p.alpha);
-                    // The selected tree row's pill springs from the row it lit before.
-                    if fill == chosen && self.ids.tree != 0 && e.parent().is_some_and(|q| *q.id() == self.ids.tree) {
-                        let (y, h, moving) = self.pill.place(id, rect[1], rect[3], pill_tune);
-                        panel.rect[1] = y;
-                        panel.rect[3] = h;
-                        lit = true;
-                        pill_moving |= moving;
-                    }
                     if let Some(l) = e.try_cloned::<&Lift>() {
                         panel.fx = [l.blur, l.alpha, 0.0, 0.0];
                         panel.fx2[0] = l.dy;
@@ -1363,12 +1350,6 @@ impl App {
             let _ = Level::Base;
         }
         self.emit_tree_knob(d);
-        if !lit {
-            self.pill.lost();
-        }
-        if pill_moving {
-            self.poke();
-        }
     }
 
     fn palette_key(&mut self, code: u16, chars: &str) {
@@ -1612,6 +1593,19 @@ impl RowLooks {
             crate::look::breathe(d.entity(), status == "running");
         }
         let _ = self.failed;
+    }
+}
+
+/// A tree row's selection: a `hn.Selection` pill under it while selected (MatchedGeometry slides it from the row lit
+/// before), the row's own fill clear.
+fn selection(row: View<'_>, on: bool, clear: Fill) {
+    set_if(row, clear);
+    match (row.part("pill"), on) {
+        (None, true) => {
+            row.child("hn.Selection").named("pill");
+        }
+        (Some(p), false) => p.entity().destruct(),
+        _ => {}
     }
 }
 

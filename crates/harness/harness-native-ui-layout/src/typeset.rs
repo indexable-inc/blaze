@@ -144,7 +144,8 @@ pub fn elide(text: &str, mode: TruncateMode, room: f32, mut width: impl FnMut(&s
             hi = mid - 1;
         }
     }
-    cut(lo)
+    // Not one character fits: nothing, rather than an ellipsis standing for all of it.
+    if lo == 0 { String::new() } else { cut(lo) }
 }
 
 #[cfg(test)]
@@ -162,7 +163,7 @@ mod tests {
         assert_eq!(elide("harness-native", TruncateMode::Head, 60.0, w), "\u{2026}ative");
         assert_eq!(elide("harness-native", TruncateMode::Middle, 60.0, w), "har\u{2026}ve");
         assert_eq!(elide("short", TruncateMode::Tail, 60.0, w), "short");
-        assert_eq!(elide("harness", TruncateMode::Tail, 5.0, w), "\u{2026}");
+        assert_eq!(elide("harness", TruncateMode::Tail, 15.0, w), "");
         // Spaces at the cut are dropped, not counted against the room.
         assert_eq!(elide("ab cdefgh", TruncateMode::Tail, 40.0, w), "ab\u{2026}");
     }
