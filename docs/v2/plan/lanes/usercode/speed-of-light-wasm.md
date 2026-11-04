@@ -85,7 +85,7 @@ than per read. That is about 0.1 ms for the syn module, so today's 3.5 ms is 35 
     holds the keys equal.
 - **In the way**: the store gives a value only as a copied `Vec`. A page-aligned, verified
   mapping of it (or an open `File`) would let `Module::deserialize_open_file` load in place.
-  Request [00928](../../../../../v2/queue/00928.json) to lane store asks for this, in blaze-cas,
+  Request 00928 of the lanes' queue (tools/v2/queue.py) to lane store asks for this, in blaze-cas,
   which replaces blaze-store at integration.
 - **`macros.md` says** the code "comes from the store as bytes and is copied in", which is
   right; this section adds the counts.
@@ -252,7 +252,7 @@ Every call validates its guest pointers and reads the memory handle, which is a 
   4 KB file.
 - **In the way**: the workspace has no safe `openat2` (only `libc`, whose raw `syscall` would
   be a new unsafe module that can't be checked by a build in this round). Request
-  [00929](../../../../../v2/queue/00929.json) asks the coordinator for `rustix`, which is in
+  Request 00929 asks the coordinator for `rustix`, which is in
   `Cargo.lock` already through wasmtime. The change is then about 30 lines in `resolve` and
   the `path_open` closure.
 

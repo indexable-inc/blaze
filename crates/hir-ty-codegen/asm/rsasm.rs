@@ -1,4 +1,4 @@
-//! The assembler of a blaze built without LLVM (the seed: todo/bootstrap/plan.md, "std and
+//! The assembler of a blaze built without LLVM (the seed: docs/future/bootstrap.md, "std and
 //! assembly in the seed"): rsasm, an assembler in Rust with no dependencies, run in this
 //! process. It is a dependency of the code generator, so its version is part of the code
 //! generator's identity (`v2::toolchain::CodegenCode`) and of every key over what it made.
@@ -11,7 +11,7 @@
 //!
 //! A build with LLVM assembles with LLVM's, so a process has one assembler. Making this the
 //! one assembler of every build, checked against LLVM's on every block blaze's own build
-//! assembles, is the next step (`todo/bootstrap/plan.md`).
+//! assembles, is the next step (`docs/future/bootstrap.md`).
 
 use std::fmt::Write;
 

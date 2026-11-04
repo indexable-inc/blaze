@@ -118,7 +118,7 @@ Linux. There are `const` size asserts on `Span` (24 bytes).
   byte for byte.
 - **Not yet bound by the workspace lints**: `blaze-live` has no dependencies and isn't
   `[lints] workspace = true` (the `safety-audit` lane lists it). It can take them once
-  `v2/requests/link.md` item 12 is in. The unsafe in `slots/` is spread over the platform files rather
+  `docs/v2/requests/link.md` item 12 is in. The unsafe in `slots/` is spread over the platform files rather
   than one `raw.rs`: each platform's file is the module that reaches its kernel, and the
   switch's unsafe is only `Writes::put`, `Switch::image` and the cell's first load.
 - **For the safety lane**: the pool's relaxed slot stores published by one release store,
@@ -134,7 +134,7 @@ Linux. There are `const` size asserts on `Span` (24 bytes).
 leaves as "NOT upheld". v1 now writes jumps and statics with every other thread stopped, and
 `slots` writes data by atomic stores. Read that doc for the current state.
 
-The `safety-audit` lane's findings on blaze-live are in `v2/requests/link.md`, under "## From
+The `safety-audit` lane's findings on blaze-live are in `docs/v2/requests/link.md`, under "## From
 safety-audit". The answer, and what the linker owes, is item 12 there. Every proposed comment
 and split is applied, in the v1 modules too, since blaze-engine, blaze-cargo, the demos and the
 live harnesses still run on them. The checks below decline a patch rather than write it.
@@ -173,7 +173,7 @@ live harnesses still run on them. The checks below decline a patch rather than w
 - **Windows dual mapping**: an image's section can't be remapped from a section object, so the
   RW alias Linux uses doesn't exist for image pages. One `VirtualProtect` pair per run is what's
   left.
-- **Requests to lead `link`** (in `v2/requests/link.md`, item 10):
+- **Requests to lead `link`** (in `docs/v2/requests/link.md`, item 10):
   1. `live.rs`'s `message()` copies each piece (`to_vec`) into an owned `Patch`. A `PatchRef`
      borrowing `self.new.bytes(piece)` encodes the same bytes with no copy, sized exactly
      (`encoded_len`, `encode_into`).

@@ -77,17 +77,17 @@ twin. `resolver.rs`: `extern_crate_decls_in_scope` reads `loc.source_view(db)`; 
 
 | from | what | heading |
 |---|---|---|
-| frontend-tree (`syntax-tree/src/view.rs`) | `Node::subtree_without(self, elided: &[Node<'t, L>]) -> FlatTree`, the cursors' `clone_subtree_without` | `## frontend-tree-move-def-sigs: Node::subtree_without (crates/syntax-tree src/view.rs)` in `v2/requests/frontend-tree.md` |
-| parent (`src.rs`) | `HasSource::source_view` | `## frontend-tree: hir-def src.rs: onto views (1)` (in `v2/requests/db-expand.md`) |
-| frontend-tree-move-expand (`name.rs`, `mod_path.rs`) | `AsName` for `view::Name`/`NameRef`; `ModPath::from_src_view` | `## frontend-tree: hir-expand name.rs + mod_path.rs: onto views (4)` (in `v2/requests/db-expand.md`) |
+| frontend-tree (`syntax-tree/src/view.rs`) | `Node::subtree_without(self, elided: &[Node<'t, L>]) -> FlatTree`, the cursors' `clone_subtree_without` | `## frontend-tree-move-def-sigs: Node::subtree_without (crates/syntax-tree src/view.rs)` in `docs/v2/requests/frontend-tree.md` |
+| parent (`src.rs`) | `HasSource::source_view` | `## frontend-tree: hir-def src.rs: onto views (1)` (in `docs/v2/requests/db-expand.md`) |
+| frontend-tree-move-expand (`name.rs`, `mod_path.rs`) | `AsName` for `view::Name`/`NameRef`; `ModPath::from_src_view` | `## frontend-tree: hir-expand name.rs + mod_path.rs: onto views (4)` (in `docs/v2/requests/db-expand.md`) |
 | def-lower (`expr_store/lower.rs`) | in place, views by value: `lower_type_ref(.., InFile<Option<ast::Type<'_>>>, ..)`, `lower_generic_params_within(.., Option<ast::GenericParamList<'_>>, Option<ast::WhereClause<'_>>, ..)`, `lower_impl`/`lower_trait`/`lower_type_alias`/`lower_function` taking `InFile<ast::X<'_>>`, `ExprCollector::lower_type_ref_opt(Option<ast::Type<'_>>, ..)`, `lower_const_arg(ast::ConstArg<'_>)` | `## frontend-tree: hir-def expr_store/lower.rs: onto views` (not filed yet) |
-| def-items (`item_tree/lower.rs`) | in place: `visibility_from_ast(db, Option<ast::Visibility<'_>>, span_for_range)` | `## frontend-tree: hir-def item_tree/lower.rs: onto views (1)` (in `v2/requests/frontend-deps-items.md`) |
+| def-items (`item_tree/lower.rs`) | in place: `visibility_from_ast(db, Option<ast::Visibility<'_>>, span_for_range)` | `## frontend-tree: hir-def item_tree/lower.rs: onto views (1)` (in `docs/v2/requests/frontend-deps-items.md`) |
 | def-attrs (`attrs.rs`) | in place: `AttrFlags::is_cfg_enabled_for<'t>(owner: impl ast::HasAttrs<'t>, cfg_options)`, the view by value | `## frontend-tree: hir-def attrs.rs: onto views (1)` |
 
 The headings are the siblings' own (their notes); each request of mine names them on its `needs:`
 line.
 
-`outline_item`/`outline_root` (db-expand-attrs' section in `v2/requests/db-expand.md`, for
+`outline_item`/`outline_root` (db-expand-attrs' section in `docs/v2/requests/db-expand.md`, for
 attrs' `Tree::Outline`) move to the views frontend-tree-move-def-attrs asked for under their own
 heading, `outline_item/outline_root onto views (2)`. That heading needs only db-expand-attrs'
 section, not attrs (1): attrs (1) calls the view forms and (27) needs attrs (1), so folding them
@@ -98,13 +98,13 @@ keeps db-expand-attrs' `may_start_with_inner_attr` check, on a view.
 
 | heading | file | owner (window) |
 |---|---|---|
-| `## frontend-tree-move-def-sigs: Node::subtree_without (crates/syntax-tree src/view.rs)` | `v2/requests/frontend-tree.md` | frontend-tree (`frontend-tree-next1`) |
-| `## frontend-tree: hir-def signatures.rs: onto views (27)` | `v2/requests/db-expand.md` | db-expand-sigs |
-| `## frontend-tree: hir-def signatures.rs: outline_item/outline_root onto views (2)` | `v2/requests/db-expand.md` | db-expand-sigs |
-| `## frontend-tree: hir-def visibility.rs: onto views (4)` | `v2/requests/db-expand.md` | db-expand-paths |
-| `## frontend-tree: hir-def find_path.rs: onto views (1)` | `v2/requests/db-expand.md` | db-expand-paths |
-| `## frontend-tree: hir-def resolver.rs: onto views (1)` | `v2/requests/db-expand.md` | db-expand-names-next2 |
-| `## frontend-tree: hir-def diagnostic_item/tests.rs: onto views (1)` | `v2/requests/db-expand.md` | db-expand-items |
+| `## frontend-tree-move-def-sigs: Node::subtree_without (crates/syntax-tree src/view.rs)` | `docs/v2/requests/frontend-tree.md` | frontend-tree (`frontend-tree-next1`) |
+| `## frontend-tree: hir-def signatures.rs: onto views (27)` | `docs/v2/requests/db-expand.md` | db-expand-sigs |
+| `## frontend-tree: hir-def signatures.rs: outline_item/outline_root onto views (2)` | `docs/v2/requests/db-expand.md` | db-expand-sigs |
+| `## frontend-tree: hir-def visibility.rs: onto views (4)` | `docs/v2/requests/db-expand.md` | db-expand-paths |
+| `## frontend-tree: hir-def find_path.rs: onto views (1)` | `docs/v2/requests/db-expand.md` | db-expand-paths |
+| `## frontend-tree: hir-def resolver.rs: onto views (1)` | `docs/v2/requests/db-expand.md` | db-expand-names-next2 |
+| `## frontend-tree: hir-def diagnostic_item/tests.rs: onto views (1)` | `docs/v2/requests/db-expand.md` | db-expand-items |
 
 ## Speed
 

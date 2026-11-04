@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of [tree-move-def.md](tree-move-def.md) (frontend.md item 16). Paths in `crates/hir-def/src`:
 `nameres.rs`, `nameres/**`, `macro_expansion_tests/**`, `test_db.rs`. Every one has a live owner
-(db-expand's children), so every edit is a request in `v2/requests/db-expand.md` under
+(db-expand's children), so every edit is a request in `docs/v2/requests/db-expand.md` under
 `## frontend-tree: hir-def <file>: onto views (<n>)`, except the new test file below.
 
 ## The twins this part adds (callers outside hir-def program against these)

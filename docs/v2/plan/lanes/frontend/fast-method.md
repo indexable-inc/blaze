@@ -316,6 +316,6 @@ runs every probe of the fixtures cached and uncached.
 
 ## 8. Requests
 
-In `v2/requests/` as named in the report: lane db (`crates/hir` construction sites),
+In `docs/v2/requests/` as named in the report: lane db (`crates/hir` construction sites),
 db-ty-d-infer2 (`sized_bound.rs`), the infer.rs holder (the three fields), db-ty (a
 region-erased column in the type table, so key forming is one load).

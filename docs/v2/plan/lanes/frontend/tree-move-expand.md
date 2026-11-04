@@ -10,8 +10,8 @@ Part of [tree.md](tree.md) (frontend.md item 16). This crate is the bottom layer
 callers onto the twins declared here, by these names and signatures. A twin sits beside its handle
 function and adds to it. It has the handle function's meaning exactly: the same nodes, ranges and
 order, and `None` in the same cases. It returns views borrowed from the database (`'db` from
-`db: &'db Db`). Requests for `hir-expand` go to `v2/requests/db-expand.md` and for `base-db` to
-`v2/requests/db.md`, under headings `## frontend-tree: hir-expand <file>: onto views (<n>)`.
+`db: &'db Db`). Requests for `hir-expand` go to `docs/v2/requests/db-expand.md` and for `base-db` to
+`docs/v2/requests/db.md`, under headings `## frontend-tree: hir-expand <file>: onto views (<n>)`.
 
 Callers write `use syntax::view as ast;`. Below, `view::X<'db>` is the view type and `ast::X` the
 handle type, used as a kind tag only (`AstId<ast::Fn>`, `AstPtr<ast::Fn>`).

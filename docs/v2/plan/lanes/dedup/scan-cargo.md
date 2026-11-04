@@ -9,9 +9,9 @@ Part of [dedup](../dedup.md). The one shared file written here is
 [`crates/blaze-core/src/signal.rs`](../../../../../crates/blaze-core/src/signal.rs); everything
 else is a request, because no path it touches is free:
 
-- `v2/requests/cargo.md` "dedup: one copy of each piece the load ported from v1's cargo crates"
-- `v2/requests/coordinator.md` "dedup: the v1 cargo crates call blaze-units' copies"
-- `v2/requests/usercode.md` "dedup: one list of build-script keys, one table of signal names"
+- `docs/v2/requests/cargo.md` "dedup: one copy of each piece the load ported from v1's cargo crates"
+- `docs/v2/requests/coordinator.md` "dedup: the v1 cargo crates call blaze-units' copies"
+- `docs/v2/requests/usercode.md` "dedup: one list of build-script keys, one table of signal names"
 
 ## Which way the copies point
 

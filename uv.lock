@@ -104,7 +104,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0" },
-    { name = "typed-input", editable = "python/typed-input" },
+    { name = "typed-input", editable = "tools/typed-input" },
 ]
 
 [package.metadata.requires-dev]
@@ -184,7 +184,7 @@ wheels = [
 [[package]]
 name = "typed-input"
 version = "0"
-source = { editable = "python/typed-input" }
+source = { editable = "tools/typed-input" }
 
 [[package]]
 name = "typing-extensions"

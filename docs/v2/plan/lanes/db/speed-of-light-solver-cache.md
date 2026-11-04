@@ -81,7 +81,7 @@ The lookup is then 4 + 6 + 1 = **11 cycles, 90%**. The cost moves to making an i
 35 cycles, next to the `lang_items` and def-map reads it already does (tens of nanoseconds).
 It also grows `DbInterner` from 48 to 72 bytes, which costs one or two cycles on a copy the
 optimizer doesn't elide. `interner.rs` belongs to another lane, so this is filed as a request
-(`v2/requests/solver-sync-glue.md`). `proof` should compare the build with and without it,
+(`docs/v2/requests/solver-sync-glue.md`). `proof` should compare the build with and without it,
 because the copy cost is spread over every interner pass, not one call.
 
 **The guard.** `of_query` and `shared` hand a reference to a closure, so they need one
@@ -136,7 +136,7 @@ allocation, and a budget test holds it to zero: a replace after a warm-up alloca
 The two slot arrays are setup (once per process), which the memory doc allows. They move to a
 `Region` tagged `Infer` so the cache's 264 KB shows in that budget.
 
-What stands in the way, filed in `v2/requests/solver-sync-glue.md`:
+What stands in the way, filed in `docs/v2/requests/solver-sync-glue.md`:
 - `blaze_mem::Pool` isn't written yet, and `blaze_reclaim::Limbo` boxes and pushes per retire
   (lane mem, request 8).
 - `GlobalCache` has no `clear` that keeps its chunks, and its chunks come from `Box`, not a

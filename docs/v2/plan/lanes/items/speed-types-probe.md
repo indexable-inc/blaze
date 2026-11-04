@@ -49,7 +49,7 @@ Files: in `crates/hir-ty/src/`, `method_resolution.rs` and `method_resolution/{p
 Matches rustc: one lookup per crate plus a binary search per trait, against rustc's binary
 search per trait. Left: rustc's name-sorted items are per trait and built with the trait;
 here `trait_value_items` sorts per crate. A name-sorted `TraitItems`/`ImplItems` in `hir-def`
-(requested by items-hirty, `v2/requests/speed-types-probe.md`) would remove that sort and turn
+(requested by items-hirty, `docs/v2/requests/speed-types-probe.md`) would remove that sort and turn
 `impl_value_item`'s scan into a binary search.
 
 Invalidation: an item of name N added to a trait of crate C reruns `trait_value_items(C)` and

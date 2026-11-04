@@ -118,13 +118,13 @@ looks at a response once, like the CLI's printer.
 
 ## What is left, and whose it is
 
-- **Driver buffers** (lane core: `v2/requests/core.md`).
+- **Driver buffers** (lane core: `docs/v2/requests/core.md`).
   - K3, filed here: `Done::Sent` hands its `Vec` back, so a connection's queue is reused and
     a warm connection allocates nothing per reply.
   - K2 (`RecvInto`), from speed-link-edge-remote, serves the server too. It lets `Frames`
     pass its own buffer in, giving one copy from the kernel and no allocation per receive.
   - With both, io_uring registered buffers or provided-buffer rings are the next step.
-- **Other crates' field order** (lanes vfs and db: `v2/requests/vfs.md`, `v2/requests/db.md`).
+- **Other crates' field order** (lanes vfs and db: `docs/v2/requests/vfs.md`, `docs/v2/requests/db.md`).
   `Op`, `Change`, `Edge`, `Changed` and `Why` are declared out of key order, so each is put
   in order on every frame that carries it. Reordering their declarations changes no byte.
 - **Bytes as byte strings** (needs a `SCHEMA` bump, so lane ci decides).

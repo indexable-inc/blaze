@@ -6,7 +6,7 @@ date: 2026-10-29
 # blaze v2: lane ci's notes
 
 Notes on [ci.md](../ci.md) as built, 2026-10-29. Requests of other lanes are in
-`v2/requests/ci.md`.
+`docs/v2/requests/ci.md`.
 
 ## The agent API (`crates/blaze-api`)
 

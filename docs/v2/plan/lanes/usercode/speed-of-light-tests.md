@@ -172,7 +172,7 @@ nothing warm below `blaze_radix::PARALLEL` hashes. Each has a test with `blaze-a
 **What stands in the way, outside these paths:** cargo's `Trace::traced` turns each result into
 a `Traced` and rehashes every common line for every test, about 20 µs for 2,000 lines. With
 `common_is` it can build the common part once per server and merge each test's own lines into
-it. That is asked for in `v2/requests/usercode-fast-tests.md`.
+it. That is asked for in `docs/v2/requests/usercode-fast-tests.md`.
 
 ## A suite's critical path
 
@@ -222,7 +222,7 @@ lookup, and `record` computes it again for the key. Caching it needs a field on 
 fields are public and built by the parent's code. The removal is for the caller to compute
 `Test::identity` once and pass it to both, or for codegen to hand over `reached` already sorted
 and deduped. Then the sort goes too and identity is 64 µs. Both are asked for in
-`v2/requests/usercode-fast-tests.md`.
+`docs/v2/requests/usercode-fast-tests.md`.
 
 Rejected: an additive set hash (the sum of the hashes modulo 2^256) needs no sort and costs
 about 10 µs. It is weak against chosen inputs (Wagner's generalized birthday attack), and a

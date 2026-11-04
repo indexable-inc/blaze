@@ -126,4 +126,4 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `intern_table` | an interner table's section, `Table::restore` and its `validate` (`intern::fuzz::restore`, into a fresh table of a small text shape), in an image whose CRCs are good | never panics; bounded; refused as `Invalid` at a byte of the section or `Corrupt` by a column's place; restored IDs ascend below the end, every compiled-in one there, every value UTF-8, `find` never another value's ID; written again it restores to the same IDs, bytes and end, `find` the first ID holding each value, and writes the same bytes |
 
 Several seed corpora hold inputs that show a bug their owner has not fixed yet (each listed in
-the owner's `v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.
+the owner's `docs/v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.

@@ -9,7 +9,7 @@ Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md)
 `crates/blaze-diagnostics/src/lints/syntax/delims.rs` and `delims/precedence.rs`. Child of
 [tree-move-diag-lints.md](tree-move-diag-lints.md). Both files are held by lane `diagnostics`:
 the move is one request, `## frontend-tree: blaze-diagnostics lints/syntax/delims.rs,
-delims/precedence.rs: onto views (1)` in `v2/requests/diagnostics.md`.
+delims/precedence.rs: onto views (1)` in `docs/v2/requests/diagnostics.md`.
 
 ## What the pass reads, on views
 

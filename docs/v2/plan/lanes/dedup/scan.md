@@ -12,7 +12,7 @@ The scan (`/tmp/dedup-scan.py`) finds runs of equal lines; its rerun with every 
 not a keyword spelled `I` (`/tmp/dedup-scan-norm.py`) also finds copies that were renamed. Most
 normalized hits are `match` tables or struct literals with the same shape and different meaning;
 each one below was read on both sides. Only `crates/blaze-core/src/create_process.rs` (and one
-`mod` line) is written here; the rest are exact edits in `v2/requests/<owner>.md` under
+`mod` line) is written here; the rest are exact edits in `docs/v2/requests/<owner>.md` under
 `## dedup: …`, since every owner was running.
 
 ## Per primitive

@@ -55,12 +55,12 @@ the kept value and re-encodes it, recording a difference from the kept bytes.
   in a `const fn` it calls) is an input the image key leaves out. The check-result key has to
   cover body expansions' reads and each dependency's own check-result key anyway (a check
   evaluates dependencies' constants); told frontend-fast-bodies-cache and frontend-deps
-  (2026-10-29, tmux, and `v2/requests/frontend-deps.md`). The driver hands the base over: at
+  (2026-10-29, tmux, and `docs/v2/requests/frontend-deps.md`). The driver hands the base over: at
   session start for each crate whose outcome was served (`set`), at the end for each crate
   checked in this session (`drain`), since a fresh crate's base is known only once its bodies are
   expanded.
 - **`item`**, frontend-deps' item key (`hir_def::deps::const_key`, asked in
-  `v2/requests/frontend-deps.md` and applied): the item's container (module index in the crate's def map,
+  `docs/v2/requests/frontend-deps.md` and applied): the item's container (module index in the crate's def map,
   impl or trait by module and ast id) and ast id, with no salsa id and no path.
 - **`VERSION`** of the bytes below (`codec::VERSION`).
 
@@ -115,7 +115,7 @@ panic. The store checks the content hash on every read.
   refused, so their constants are too, and it counts them), sorts and dedups by key (a key with
   two different values is an error naming the constant: evaluation is not deterministic), and
   `put`s each on the store's pool (`ImageStore::for_each`).
-- **Requests to lane cargo** (`v2/requests/cargo.md`, `## frontend-fast-const-deps`): an owned
+- **Requests to lane cargo** (`docs/v2/requests/cargo.md`, `## frontend-fast-const-deps`): an owned
   adapter (`Arc<dyn ImageStore + Send + Sync>`, the same store `deps::serve` reads), `set` right
   after `deps::serve` and the check-result serve, `drain` after the check-result store, its
   error stopping the build like `deps::store`'s.

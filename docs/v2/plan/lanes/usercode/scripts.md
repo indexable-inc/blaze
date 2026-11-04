@@ -6,7 +6,7 @@ date: 2026-10-29
 # Build scripts
 
 Part of [usercode](../usercode.md). Code: `crates/blaze-build-script/`. Requests:
-`v2/requests/usercode-fast-scripts.md`.
+`docs/v2/requests/usercode-fast-scripts.md`.
 
 Every part below reads its input once, borrowed, and allocates only what it hands back. Each
 rewrite keeps the code it replaced as a test-only reference (`tests/reference.rs` beside its tests) and a
@@ -170,7 +170,7 @@ which is read whole, and of blaze's rustc version, which is in every key through
 - A benchmark: the seeded generators of the differential tests at sizes from real crates
   (the corpus of `harness/scripts.py`), old against new, per part. Until then the claims
   above are of technique.
-- The callers' side, which is other lanes' (`v2/requests/usercode-fast-scripts.md`): blaze-
+- The callers' side, which is other lanes' (`docs/v2/requests/usercode-fast-scripts.md`): blaze-
   cargo judging runs by borrowing (`run::judge`) rather than cloning both outputs, making
   `OUT_DIR`, the run directory and cargo's files through effects, and blaze-usercode reading
   what reruns a script with `watch::watched_in` rather than parsing the whole output.

@@ -7,7 +7,7 @@ date: 2026-10-29
 
 [tree.md](tree.md), [frontend.md](../../design/frontend.md) item 16. Crates:
 `crates/hir-ty-mir`, `crates/hir-ty-codegen`, `crates/blaze-engine` (lane codegen; every edit is a
-request in `v2/requests/codegen.md`).
+request in `docs/v2/requests/codegen.md`).
 
 ## No twins of my own
 
@@ -56,7 +56,7 @@ makes the same bytes.
 
 ## The rest of blaze-engine
 
-Requests (6)-(9) in `v2/requests/codegen.md` move every other reader of syntax in the crate onto
+Requests (6)-(9) in `docs/v2/requests/codegen.md` move every other reader of syntax in the crate onto
 `hir::view::Semantics` and `Node<'db>`: `as_rustc`, `consteval`, `mirdump`, `check`,
 `borrowck`, the doctest collector (`doctest.rs`, `doctest/{program,extract}.rs`), the test
 harness, and what stays in `lib.rs` (tests' attributes, a function's written place and hash).

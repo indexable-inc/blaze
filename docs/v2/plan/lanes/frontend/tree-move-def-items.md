@@ -15,7 +15,7 @@ handle code did, with no counted cursor, no clone and no `dyn`. Kind tags stay h
 `lower_whole` and `block_item_tree_query`, keeps `ast` for the tags and names views
 `view::X`.
 
-Requests go to `v2/requests/frontend-deps-items.md` (owner `frontend-deps-items`), one heading
+Requests go to `docs/v2/requests/frontend-deps-items.md` (owner `frontend-deps-items`), one heading
 per file: `## frontend-tree: hir-def item_tree/<file>: onto views (<n>)`.
 
 ## Signatures changed in place (callers in hir-def, moved by their part)

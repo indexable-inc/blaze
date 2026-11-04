@@ -9,18 +9,18 @@ Part of `mem-db` (`docs/v2/plan/lanes/mem/db.md`, whose **contract** this progra
 Paths: `crates/hir-ty/` except `src/next_solver/` (`mem-db-solver`'s). The owners are lane db
 (and its children) and, for `method_resolution.rs`, `method_resolution/`, `traits.rs`,
 `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/` and `drop.rs`, lane items; none is
-done, so every change is a request. The index is `v2/requests/mem-db-infer.md`; the changes, file
+done, so every change is a request. The index is `docs/v2/requests/mem-db-infer.md`; the changes, file
 by file, are in its part files:
 
 | part | files of `crates/hir-ty/src/` | request file |
 |---|---|---|
-| `mem-db-infer` | `db.rs`, `lib.rs`, `Cargo.toml`, the budget tests | `v2/requests/mem-db-infer.md` |
-| `mem-db-infer-ctx` | `infer.rs`, `infer/{unify,columns,persist,fallback,diagnostics,ambiguity,at_error,mutability,opaques,path,autoderef}.rs` | `v2/requests/mem-db-infer-ctx.md` |
-| `mem-db-infer-expr` | `infer/{expr,pat,coerce,callee,cast,op,place_op}.rs` | `v2/requests/mem-db-infer-expr.md` |
-| `mem-db-infer-closure` | `infer/closure.rs`, `infer/closure/` | `v2/requests/mem-db-infer-closure.md` |
-| `mem-db-infer-lower` | `lower.rs`, `lower/`, `generics.rs`, `utils.rs`, `variance.rs`, `variance/`, `dyn_compatibility.rs`, `builtin_derive.rs`, `effects.rs` | `v2/requests/mem-db-infer-lower.md` |
-| `mem-db-infer-method` | `method_resolution.rs`, `method_resolution/`, `autoderef.rs`, `traits.rs`, `specialization.rs`, `opaques.rs`, `drop.rs`, `inhabitedness.rs`, `representability.rs` | `v2/requests/mem-db-infer-method.md` |
-| `mem-db-infer-eval` | `layout.rs`, `layout/`, `consteval.rs`, `mir.rs`, `mir/`, `intrinsic.rs`, `target_feature.rs`, `target_feature/`, `lang_items.rs`, `primitive.rs`, `solver_errors.rs`, `evict.rs` | `v2/requests/mem-db-infer-eval.md` |
+| `mem-db-infer` | `db.rs`, `lib.rs`, `Cargo.toml`, the budget tests | `docs/v2/requests/mem-db-infer.md` |
+| `mem-db-infer-ctx` | `infer.rs`, `infer/{unify,columns,persist,fallback,diagnostics,ambiguity,at_error,mutability,opaques,path,autoderef}.rs` | `docs/v2/requests/mem-db-infer-ctx.md` |
+| `mem-db-infer-expr` | `infer/{expr,pat,coerce,callee,cast,op,place_op}.rs` | `docs/v2/requests/mem-db-infer-expr.md` |
+| `mem-db-infer-closure` | `infer/closure.rs`, `infer/closure/` | `docs/v2/requests/mem-db-infer-closure.md` |
+| `mem-db-infer-lower` | `lower.rs`, `lower/`, `generics.rs`, `utils.rs`, `variance.rs`, `variance/`, `dyn_compatibility.rs`, `builtin_derive.rs`, `effects.rs` | `docs/v2/requests/mem-db-infer-lower.md` |
+| `mem-db-infer-method` | `method_resolution.rs`, `method_resolution/`, `autoderef.rs`, `traits.rs`, `specialization.rs`, `opaques.rs`, `drop.rs`, `inhabitedness.rs`, `representability.rs` | `docs/v2/requests/mem-db-infer-method.md` |
+| `mem-db-infer-eval` | `layout.rs`, `layout/`, `consteval.rs`, `mir.rs`, `mir/`, `intrinsic.rs`, `target_feature.rs`, `target_feature/`, `lang_items.rs`, `primitive.rs`, `solver_errors.rs`, `evict.rs` | `docs/v2/requests/mem-db-infer-eval.md` |
 
 ## Rules every part follows
 
@@ -127,7 +127,7 @@ pub(crate) const MIR_TAG: blaze_mem::Tag = blaze_mem::Tag::Mir;
 
 and every `#[salsa::tracked(..)]` fn of hir-ty adds `mem_tag = crate::db::INFER_TAG` (MIR
 queries `crate::db::MIR_TAG`), the option `mem-db-salsa` adds to the tracked attribute
-(`v2/requests/mem-db-salsa.md`; asked to take a path to a `Tag` constant, not only a variant
+(`docs/v2/requests/mem-db-salsa.md`; asked to take a path to a `Tag` constant, not only a variant
 name). Each part lists its tracked fns with their line and tag.
 
 ### R7. Per-call scratch on hit paths
@@ -147,10 +147,10 @@ counter `solver-sync-glue`'s request 6 installs in `lib.rs`.
 ## What each part found
 
 Details, file by file, are in the part files; the summary and the places where two parts meet
-are in `v2/requests/mem-db-infer.md` (5 to 7, "What the parts found").
+are in `docs/v2/requests/mem-db-infer.md` (5 to 7, "What the parts found").
 
 - **The solver has no frame.** mem-db-solver chose recycled per-worker storage for `InferCtxt`,
-  goals and the search graph (`v2/requests/mem-db-solver.md`, "The one design decision"):
+  goals and the search graph (`docs/v2/requests/mem-db-solver.md`, "The one design decision"):
   thousands of `InferCtxt`s per run would sum in a frame that can't roll back under `&Frame`.
   So `InferenceTable` stays without `'f` (R2), and `could_unify` needs no task.
 - **Nothing rolls back within a run.** `Frame::scope` and `reset_to` take `&mut Frame`, and

@@ -95,7 +95,7 @@ default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "ppro
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 # The default build's C, C++ and assembly dependencies, one feature each; the seed profile
-# has none of them (todo/bootstrap/plan.md, "The seed has no C").
+# has none of them (docs/future/bootstrap.md, "The seed has no C").
 # blaze-stencil's stencils made by the pinned LLVM at build time (llvm-sys).
 llvm-stencils = ["blaze-cargo/llvm-stencils", "hir-ty-codegen/llvm-stencils"]
 # Fetching over HTTPS: rustls on ring, and the global cache's client.

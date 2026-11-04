@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # dedup-bits-db: the front end's bit sets
 
-Part of [bits](bits.md). Every move is a request in `v2/requests/db.md` under
+Part of [bits](bits.md). Every move is a request in `docs/v2/requests/db.md` under
 `## dedup: bits: ...`; nothing here was free to edit.
 
 ## What each copy became

@@ -90,7 +90,7 @@ const STACK: u64 = 1 << 20;
 
 /// The main thread's stack on `wasm64-blaze-wasip1`, the seed's target: 64 MiB of linear memory
 /// for `__stack_pointer`, room for the front end's deepest recursion with margin
-/// (todo/bootstrap/plan.md, "Stack in the seed"). A property of the target, so every program
+/// (docs/future/bootstrap.md, "Stack in the seed"). A property of the target, so every program
 /// built for it, the seed among them, links with it and no flag is needed.
 const SEED_STACK: u64 = 64 << 20;
 

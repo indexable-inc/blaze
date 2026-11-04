@@ -19,5 +19,5 @@ line and per sandboxed run, are in [speed-link-edge-usercode](speed-link-edge-us
 - **Windows sandbox**: read grants are checked without the session lock, and each path costs one
   `metadata` call.
 - Still open: sharing traces between the tests of one server needs `trace::assemble` over borrowed
-  lines (`v2/requests/usercode.md`). Write capabilities per directory and an in-process launcher
-  are proposals in `v2/requests/usercode-sandbox.md` section 6.
+  lines (`docs/v2/requests/usercode.md`). Write capabilities per directory and an in-process launcher
+  are proposals in `docs/v2/requests/usercode-sandbox.md` section 6.

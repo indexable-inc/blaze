@@ -66,7 +66,7 @@ fuzz targets (`link_*`). The one unsafe block is `intern::name_at`'s `from_utf8_
 the bytes were appended from a `&str`, and checking them again costs a UTF-8 validation per name
 read. It has a test against the checked version. The missing root gate, and a test's
 `from_raw_parts` that buys nothing (made safe with `zerocopy::IntoBytes`), are requested in
-`v2/requests/link.md`, because `lib.rs` and `tests.rs` are held by requests-link-next-lazy and
+`docs/v2/requests/link.md`, because `lib.rs` and `tests.rs` are held by requests-link-next-lazy and
 -sanitize.
 
 ## blaze-api, blaze-protocol, blaze-ci, blaze-ui, blaze-web
@@ -92,7 +92,7 @@ in the piece that differs, which reads that piece twice and pays a call per diff
 
 ## Filed
 
-- `v2/requests/link.md` "speed-unsafe-back": the blaze-link root gate and the test view
+- `docs/v2/requests/link.md` "speed-unsafe-back": the blaze-link root gate and the test view
   (applied by requests, pass 45).
-- `v2/requests/safety.md` "From speed-unsafe-back": a fuzz target for `blaze-vfs`'s
+- `docs/v2/requests/safety.md` "From speed-unsafe-back": a fuzz target for `blaze-vfs`'s
   `Base::check`, over arbitrary columns and a blobs length.

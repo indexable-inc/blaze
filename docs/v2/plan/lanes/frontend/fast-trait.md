@@ -11,7 +11,7 @@ and `goal_store/` (the persistent cache, child `frontend-fast-trait-store`), cas
 `harness/v2/frontend/cases/trait/` (child `frontend-fast-trait-cases`). The hooks in files of lane
 db (`solver.rs`, `fulfill.rs`, `interner.rs`, `interner/tls_cache.rs`, `next_solver.rs`,
 `infer/mod.rs`) and in the vendored solver (`rustc_type_ir`, `rustc_next_trait_solver`, lane db's
-solver-sync series) are requests in `v2/requests/db-ty.md` under `## frontend-fast-trait: ...`.
+solver-sync series) are requests in `docs/v2/requests/db-ty.md` under `## frontend-fast-trait: ...`.
 
 Nothing here was run. Costs are counted from the code with the machine of
 [../db/speed-of-light.md](../db/speed-of-light.md): about 3.5 GHz, L1 in 4 to 5 cycles, L2 in 14,
@@ -241,7 +241,7 @@ level where the walk counts the whole subtree. The walk then declines where the 
 still fit, and the solver evaluates the goal as rustc does. A larger charge only makes a cache
 entry apply at fewer depths, and recomputing gives rustc's result (the search graph's
 cache-independence, which its validation mode checks). The vendored edits are in
-`v2/requests/db-ty.md`, "the shape table charges search-graph depth as rustc does". Before them,
+`docs/v2/requests/db-ty.md`, "the shape table charges search-graph depth as rustc does". Before them,
 a goal nested within 24 levels of the limit held in blaze where rustc overflowed:
 `harness/v2/frontend/cases/trait/recursion_send_nested_past_twice_small_limit_rejects.rs` is
 that program, and `recursion_*` pins the limits around it.

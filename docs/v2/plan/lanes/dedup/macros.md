@@ -14,7 +14,7 @@ and the in-process bridge (`crates/blaze-expand/src/native/`), both lane usercod
 contents became v2's keyed expansions. The crate stays. Its `native/` directory is no longer an
 expander cache (#1297 is superseded and its expanders are deleted). It is the proc-macro bridge
 that change 20 ([compile-time.md](../../design/compile-time.md)) runs macros against, handed to
-fastcompile in `v2/requests/usercode-bridge.md`. The wasm path stays until the evaluator runs
+fastcompile in `docs/v2/requests/usercode-bridge.md`. The wasm path stays until the evaluator runs
 every macro, and then it is removed ([usercode/macros.md](../usercode/macros.md), last item).
 So both paths live for now, the bridge outlives the wasm path, and the shared code belongs to
 the bridge.

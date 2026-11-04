@@ -103,6 +103,6 @@ module's impl column.
 | an impl reruns only its trait's bucket; a non-impl item reruns no bucket | `narrow.rs` `an_impl_in_one_module_reruns_only_its_trait_bucket`, `an_item_that_is_no_impl_reruns_no_bucket` (requested) |
 | frozen tables are unchanged | `frozen::check` in `Mode::Check` over the merged `for_crate` (existing frozen tests) |
 
-The hooks: `v2/requests/db.md` (re-export), `v2/requests/items.md` (the hir-ty and blaze-items
-code, tests, hir-ide expectations), `v2/requests/db-ty.md` (query kinds). Index:
-`v2/requests/frontend-nameres.md`, `## impls`.
+The hooks: `docs/v2/requests/db.md` (re-export), `docs/v2/requests/items.md` (the hir-ty and blaze-items
+code, tests, hir-ide expectations), `docs/v2/requests/db-ty.md` (query kinds). Index:
+`docs/v2/requests/frontend-nameres.md`, `## impls`.

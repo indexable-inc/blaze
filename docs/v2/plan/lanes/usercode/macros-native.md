@@ -15,7 +15,7 @@ What carries over to fastcompile's proc-macro bridge is in
 the plan.
 
 Part of [usercode](../usercode.md). Code: `crates/blaze-expand/src/native/`; requests:
-`v2/requests/usercode-macros-native.md`.
+`docs/v2/requests/usercode-macros-native.md`.
 
 ## What runs
 

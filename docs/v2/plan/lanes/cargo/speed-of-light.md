@@ -185,7 +185,7 @@ Work: std's own workspace (`library/`) loaded as a foreign workspace (`Foreign`)
 
 The daemon is a sans-IO loop (`serve/daemon.rs`, `serve/job.rs`) with plane tasks for the
 work. This section gives the bound and what stands in the way. The code changes are cargo-sync's
-(requests in `v2/requests/cargo.md`, from cargo-sol).
+(requests in `docs/v2/requests/cargo.md`, from cargo-sol).
 
 ### Heads and cookies (`serve/heads.rs`)
 

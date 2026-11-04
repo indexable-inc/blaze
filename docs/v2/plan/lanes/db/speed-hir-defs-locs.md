@@ -70,7 +70,7 @@ Hashes per intern: one, before and after (salsa's), now 3 or 4 rounds instead of
 - `ProcMacroLoc`'s 2 bytes of padding would need `CustomProcMacroExpander` narrowed in hir-expand.
 - Salsa's own cost per value (the LRU link, revision, memo table and durability next to the loc)
   and the shard lock taken on an intern hit are salsa's: concurrency-audit item 4 in
-  `v2/requests/db.md` and `speed-salsa.md`.
+  `docs/v2/requests/db.md` and `speed-salsa.md`.
 
 ## Lang items (`lang_item.rs`)
 

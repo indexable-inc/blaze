@@ -64,7 +64,7 @@ Before, the first section in file order was taken. clang and `ld -r` never write
 
 ### On the zero-copy contract (second pass, `speed-link-edge-macho-input2`)
 
-`model.rs` now has the reader contract this lane asked for (`v2/requests/link.md` items 5, 5a,
+`model.rs` now has the reader contract this lane asked for (`docs/v2/requests/link.md` items 5, 5a,
 7), and the reader is on it:
 
 | per | before this pass | after |
@@ -83,7 +83,7 @@ The kind (`SectionKind`) moves into a section's last atom rather than being clon
 a `Class::Named` holds a `String`, so only the other atoms of a split named section clone it.
 
 What still allocates per item, outside these files (filed with the parent
-`speed-link-edge-macho`, in `v2/requests/speed-link-edge-macho.md`):
+`speed-link-edge-macho`, in `docs/v2/requests/speed-link-edge-macho.md`):
 
 - `macho.rs` `push_core_name`: a `format!("\x01{text}")` for every name without a leading
   underscore, which is every assembler-local label clang keeps (`ltmp0`…, `l_…`). The fix is a

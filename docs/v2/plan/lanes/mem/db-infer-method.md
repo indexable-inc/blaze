@@ -10,7 +10,7 @@ Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8) un
 `method_resolution/{probe,confirm,frozen}.rs`, `autoderef.rs`, `traits.rs`, `specialization.rs`,
 `opaques.rs`, `drop.rs`, `inhabitedness.rs`, `representability.rs`. Lane db owns them all and lane
 items most of them, so every change is a request, written as exact before/after code in
-`v2/requests/mem-db-infer-method.md`.
+`docs/v2/requests/mem-db-infer-method.md`.
 
 ## Where the frame comes from
 

@@ -1,6 +1,6 @@
 # The repository's Python, as one uv workspace: scripts run with `uv run --frozen` from the
 # lock beside this file, on the Python `.python-version` pins. Shared helpers are its members
-# (python/*). The older scripts of harness/ and .github/scripts/ move here when next changed.
+# (tools/typed-input). The older scripts of harness/ and .github/scripts/ move here when next changed.
 [project]
 name = "blaze-scripts"
 version = "0"
@@ -15,7 +15,7 @@ dev = ["ruff>=0.14", "pyright[nodejs]>=1.1.400"]
 package = false
 
 [tool.uv.workspace]
-members = ["python/*"]
+members = ["tools/typed-input"]
 # Its own project with its own lock, so torch stays out of this one.
 exclude = ["tools/similar"]
 
@@ -39,11 +39,11 @@ include = [
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
-  "python/**/*.py",
   "tools/astlog/scan.py",
   "tools/devirt/*.py",
   "tools/layout",
   "tools/similar",
+  "tools/typed-input",
   "tools/v2",
 ]
 
@@ -69,10 +69,10 @@ include = [
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
-  "python",
   "tools/astlog/scan.py",
   "tools/devirt",
   "tools/layout",
+  "tools/typed-input",
   "tools/v2",
 ]
 pythonVersion = "3.13"

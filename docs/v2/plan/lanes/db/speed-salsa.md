@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # speed-salsa: vendor/salsa against the state of the art
 
-The changes were filed in `v2/requests/db-salsa.md` under "From speed-salsa" while `db-salsa`
+The changes were filed in `docs/v2/requests/db-salsa.md` under "From speed-salsa" while `db-salsa`
 held `vendor/salsa*`, then applied on 10-29: S1, S3 and S4 by speed-salsa, S2 by
 speed-salsa-interned, and S5 (the edges, claim-free verify and the 24-byte memo header) by
 speed-salsa. "How salsa
@@ -253,7 +253,7 @@ sol-salsa).**
   reads the page again. Test: `cached_lookups_find_the_slots_own_memos`. Bench:
   `benches/memo_hit.rs`.
 
-## What is filed (v2/requests/db-salsa.md, "From speed-salsa")
+## What is filed (docs/v2/requests/db-salsa.md, "From speed-salsa")
 
 1. **LRU with no write on a hit.** `Lru` keeps only its capacity. At the revision boundary
    (`reset_for_new_revision`, which already has `&mut Table`), the memos that hold values are

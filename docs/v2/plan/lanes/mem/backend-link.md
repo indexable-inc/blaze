@@ -9,7 +9,7 @@ date: 2026-10-29
 Part of [backend.md](backend.md), under lane mem's [memory.md](../../design/memory.md). Every
 file of `crates/blaze-link` was held by an agent still working when this was written
 (`requests-link-fuzz-core-model`, `-core-stage`, `-pe`, `-wasm`, `speed-link-edge-sol-link`), so
-the moves into existing files are exact edits in `v2/requests/mem-backend-link.md` (L1 to L5); the
+the moves into existing files are exact edits in `docs/v2/requests/mem-backend-link.md` (L1 to L5); the
 new code is in two new files, `src/intern.rs` and `src/arena.rs`, which compile once `lib.rs`
 declares them (L1).
 
@@ -143,7 +143,7 @@ a relink's copies take slots the history's dropped states gave back: no global a
 - **In place.** A chunk is up to 88 KiB (`FunctionInfo`) and a longer list's up to 512 MiB, so it
   must never pass through the stack, as `Cache::share(value)` and `Shared::make_mut` would make
   it. `cow.rs` stays `#![forbid(unsafe_code)]`; the in-place write is one constructor in
-  blaze-mem, `Cache::share_from(head, fill)` (request M1 in `v2/requests/mem-backend-cow.md`,
+  blaze-mem, `Cache::share_from(head, fill)` (request M1 in `docs/v2/requests/mem-backend-cow.md`,
   `pool.rs` being lane mem's). `cow.rs`'s `unique` copies with `share_from(&old[..], &old[0])`
   while `Shared::owners` is above one, then takes `Shared::get_mut`: `Arc::make_mut`'s rule in
   one pass over the slot.

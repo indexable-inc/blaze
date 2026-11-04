@@ -118,8 +118,8 @@ where clauses, const generics with block expressions, `macro_rules!` items, buil
 
 ## Open
 
-Hooks into db's paths (`v2/requests/db.md`, "frontend-deps-sigs: serve signatures from a
-dependency image") and the shared test lock (`v2/requests/frontend-deps.md`). Until db lands
+Hooks into db's paths (`docs/v2/requests/db.md`, "frontend-deps-sigs: serve signatures from a
+dependency image") and the shared test lock (`docs/v2/requests/frontend-deps.md`). Until db lands
 them `deps/signatures` does not compile: it uses frozen's id codes, the two `from_parts` and
 `EnumVariants::lower`, and nothing calls `served_*`. It has not been built or run yet (this lane
 runs nothing); the first build after the hooks land is its first check.

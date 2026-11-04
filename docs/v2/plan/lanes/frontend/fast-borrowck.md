@@ -141,7 +141,7 @@ Already in `lib.rs` (2). Kept.
 ### 3.6 The body's frame
 
 Every per-body buffer of the files above comes from the body's task frame (`Ctx.frame`, the
-design of `v2/requests/mem-db-checks.md` B1-B5: `FVec`, `FMap`, frame `BitSet`/`Csr`/`Facts`),
+design of `docs/v2/requests/mem-db-checks.md` B1-B5: `FVec`, `FMap`, frame `BitSet`/`Csr`/`Facts`),
 so after the first body warms the frame a check allocates nothing from the global allocator.
 The new structures take `&'f Frame` from the start; the B5 signature table (what `regions.rs`
 and `check.rs` call) is kept, so B6 and B7 apply as written but for the call sites listed in

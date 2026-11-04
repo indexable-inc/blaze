@@ -70,7 +70,7 @@ wasm-encoder = { workspace = true, features = ["std"] }
 # inkwell's llvm-sys (vendor/llvm-sys) links it statically, with libstdc++ on Linux. Nothing of
 # LLVM's calls into libffi, so inkwell need not link it.
 inkwell = { workspace = true, features = ["llvm23-1-prefer-static", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }
-# The assembler of a build without LLVM (the seed, todo/bootstrap/plan.md): Rust, no
+# The assembler of a build without LLVM (the seed, docs/future/bootstrap.md): Rust, no
 # dependencies, in process (`asm/rsasm.rs`).
 rsasm = { workspace = true, optional = true }
 

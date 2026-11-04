@@ -9,7 +9,7 @@
 //! Beside rustc's targets blaze defines its own, in the same form, in `own_targets.json`: a
 //! target no rustc has, so nothing was printed for it, and its cfgs, data layout, pointer width
 //! and linker flavour are blaze's decision, made there and nowhere else. It is
-//! `wasm64-blaze-wasip1`, the target of the bootstrap seed (`todo/bootstrap/plan.md`): wasm64
+//! `wasm64-blaze-wasip1`, the target of the bootstrap seed (`docs/future/bootstrap.md`): wasm64
 //! (memory64) with WASI preview 1 over 64-bit pointers and sizes, whose calls import from the
 //! module `wasi_snapshot_preview1_64` (blaze's `library/`), so a stock wasip1 host refuses it at
 //! instantiation, naming them. A triple in both files is an error.

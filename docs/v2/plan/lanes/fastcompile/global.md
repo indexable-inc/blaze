@@ -166,7 +166,7 @@ The publicness rule is tested per input kind in `public.rs`.
 
 ## Hooks asked of other lanes
 
-See `v2/requests/fastcompile.md`, `fastcompile-global` 1 to 4:
+See `docs/v2/requests/fastcompile.md`, `fastcompile-global` 1 to 4:
 
 | lane | hook | why |
 |---|---|---|

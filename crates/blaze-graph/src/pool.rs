@@ -35,7 +35,7 @@
 //!
 //! Every job runs as a task of [`crate::pump`]'s stack, so a wait inside it pumps this pool.
 //!
-//! On a target without threads (the wasm64 seed, todo/bootstrap/plan.md "One thread") a pool
+//! On a target without threads (the wasm64 seed, docs/future/bootstrap.md "One thread") a pool
 //! starts no thread: each worker's loop, the same `work` as every worker's, runs on a fiber that
 //! the thread that made the pool drives ([`Pool::driven`], [`block_until`]). That thread, as it
 //! waits on no fiber (a client's [`crate::sched::wait`]), gives each worker a turn of one job at
@@ -835,7 +835,7 @@ impl Pool {
     /// whenever it waits on no fiber ([`crate::sched::wait`], so [`Pool::scope`],
     /// [`Pool::install`] and every query wait of it), a job at a time until its wait ends, and
     /// as the pool is dropped, until every job given it has run. What [`Pool::new`] makes on a
-    /// target without threads, the wasm64 seed (todo/bootstrap/plan.md, "One thread"); on any
+    /// target without threads, the wasm64 seed (docs/future/bootstrap.md, "One thread"); on any
     /// other, the same pool as the seed's, for a test.
     ///
     /// Only the thread that made it drives it: a job queued from another thread waits for that

@@ -1,6 +1,10 @@
-"""The lanes' request queue: one request per file under `v2/queue/`, each with an owner.
+"""The lanes' request queue: one request per file in the queue folder, each with an owner.
 
-A request is `v2/queue/<id>.json`: who it is from, the lane that owns it, the paths it touches,
+The queue is state, not source: it lives outside the checkout, in `blaze-queue/` under the
+repository's common git directory (`git rev-parse --git-common-dir`), so every worktree of the
+repository shares one queue and nothing of it is committed. `"queue": "<folder>"` names another.
+
+A request is `<queue>/<id>.json`: who it is from, the lane that owns it, the paths it touches,
 what to do, its state (`open`, `taken`, `applied`, or `refused` with why) and when each change
 happened. The owner is a lane; `list` and `stale` resolve it to its live tmux window in session
 `blaze-v2` (`<lane>`, or its latest successor `<lane>-next<N>`; the coordinator is `coord`).
@@ -15,13 +19,17 @@ Input: one JSON object (inline, a path, or `-`), its `command` choosing the rest
     {"command": "list", "owner": "link"}
     {"command": "stale", "minutes": 60}
     {"command": "import"}
+    {"command": "restore", "rev": "8498b0dfc1"}
 
 `list` shows open and taken requests by owner, oldest first. `stale` shows requests open longer
 than `minutes` (since added or last reassigned) with the owner's window or "no live window".
-`import` files every open item of `v2/requests/*.md` once (an item is the section under a
+`import` files every open item of `docs/v2/requests/*.md` once (an item is the section under a
 heading; it is open when its last `Status:` line or `> applied|answered|done ...` answer says
-nothing closed it), and skips items already imported. Every write takes `v2/queue/.lock` and
-replaces the file whole, so two agents never interleave.
+nothing closed it), and skips items already imported. Every write takes `<queue>/.lock` and
+replaces the file whole, so two agents never interleave. `restore` fills an empty queue with
+the requests a commit of the tree held under `v2/queue/` (where the queue was committed until
+2026-11-03; its last such commit is 8498b0dfc1). A command on a queue folder that does not exist
+stops and says to restore or create it; it never starts an empty queue in its place.
 """
 
 import dataclasses
@@ -45,6 +53,9 @@ SESSION = "blaze-v2"
 COORDINATOR = "coordinator"
 COORDINATOR_WINDOW = "coord"
 TREE = str(Path(__file__).resolve().parents[2])
+QUEUE_FOLDER = "blaze-queue"
+# Where the queue was committed in the tree, for `restore`.
+COMMITTED = "v2/queue"
 
 type State = Literal["open", "taken", "applied", "refused"]
 type Action = Literal["add", "import", "take", "done", "refuse", "reassign"]
@@ -82,7 +93,7 @@ class Add:
     owner: str
     what: str
     paths: tuple[str, ...] = ()
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -90,7 +101,7 @@ class Take:
     command: Literal["take"]
     id: str
     by: str
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,7 +110,7 @@ class Done:
     id: str
     by: str
     note: str
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,7 +119,7 @@ class Refuse:
     id: str
     by: str
     why: str
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,7 +129,7 @@ class Reassign:
     by: str
     owner: str
     why: str
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,7 +139,7 @@ class List:
     from_lane: str | None = None
     states: tuple[State, ...] = ("open", "taken")
     format: Format = "text"
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,22 +148,31 @@ class Stale:
     minutes: int
     states: tuple[State, ...] = ("open",)
     format: Format = "text"
-    root: str = TREE
+    queue: str = ""
 
 
 @dataclass(frozen=True)
 class Import:
     command: Literal["import"]
-    requests: str = "v2/requests"
+    requests: str = "docs/v2/requests"
     lanes_from: tuple[str, ...] = (
         str(Path.home() / "restart-2026-10-28/briefs/v2"),
         "/tmp/blaze-lanes",
     )
     dry_run: bool = False
-    root: str = TREE
+    tree: str = TREE
+    queue: str = ""
 
 
-type Command = Add | Take | Done | Refuse | Reassign | List | Stale | Import
+@dataclass(frozen=True)
+class Restore:
+    command: Literal["restore"]
+    rev: str
+    tree: str = TREE
+    queue: str = ""
+
+
+type Command = Add | Take | Done | Refuse | Reassign | List | Stale | Import | Restore
 
 COMMANDS: dict[str, type[Command]] = {
     "add": Add,
@@ -163,6 +183,7 @@ COMMANDS: dict[str, type[Command]] = {
     "list": List,
     "stale": Stale,
     "import": Import,
+    "restore": Restore,
 }
 
 
@@ -186,8 +207,29 @@ def lane_of(name: str) -> str:
     return re.sub(r"-next\d+$", "", name)
 
 
-def queue_dir(root: str) -> Path:
-    return Path(root) / "v2" / "queue"
+def queue_dir(queue: str) -> Path:
+    """The queue folder: `queue` when given, else `blaze-queue/` in the tree's common git directory."""
+    if queue:
+        return Path(queue)
+    try:
+        common = subprocess.run(
+            ["git", "-C", TREE, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise QueueError(f"no git directory for {TREE} to keep the queue in (git rev-parse: {e.stderr.strip()})") from e
+    return Path(common) / QUEUE_FOLDER
+
+
+def existing(queue: str) -> Path:
+    folder = queue_dir(queue)
+    if not folder.is_dir():
+        raise QueueError(
+            f"no queue at {folder}: restore it from the tree's history with "
+            f'{{"command": "restore", "rev": "<commit>"}} (the last commit that held `{COMMITTED}/` is '
+            f"8498b0dfc1), or `mkdir {folder}` to start a new one"
+        )
+    return folder
 
 
 def normal_id(id: str) -> str:
@@ -200,15 +242,13 @@ def load(path: Path) -> Request:
     return parse(Request, str(path), f"{SCRIPT}: {path}")
 
 
-def load_all(root: str) -> list[Request]:
-    folder = queue_dir(root)
-    if not folder.is_dir():
-        return []
+def load_all(queue: str) -> list[Request]:
+    folder = existing(queue)
     return [load(p) for p in sorted(folder.glob("*.json"))]
 
 
-def save(root: str, request: Request) -> None:
-    folder = queue_dir(root)
+def save(queue: str, request: Request) -> None:
+    folder = existing(queue)
     path = folder / f"{request.id}.json"
     scratch = folder / f".{request.id}.json.tmp"
     scratch.write_text(json.dumps(dataclasses.asdict(request), indent=2, ensure_ascii=False) + "\n")
@@ -216,9 +256,8 @@ def save(root: str, request: Request) -> None:
 
 
 @contextmanager
-def locked(root: str) -> Generator[None]:
-    folder = queue_dir(root)
-    folder.mkdir(parents=True, exist_ok=True)
+def locked(queue: str) -> Generator[None]:
+    folder = existing(queue)
     with open(folder / ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -227,13 +266,13 @@ def locked(root: str) -> Generator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def next_id(root: str) -> str:
-    ids = [int(p.stem) for p in queue_dir(root).glob("*.json") if p.stem.isdigit()]
+def next_id(queue: str) -> str:
+    ids = [int(p.stem) for p in existing(queue).glob("*.json") if p.stem.isdigit()]
     return str(max(ids, default=0) + 1).zfill(5)
 
 
-def get(root: str, id: str) -> Request:
-    path = queue_dir(root) / f"{normal_id(id)}.json"
+def get(queue: str, id: str) -> Request:
+    path = existing(queue) / f"{normal_id(id)}.json"
     if not path.is_file():
         raise QueueError(f"no request {normal_id(id)} (no {path})")
     return load(path)
@@ -275,9 +314,9 @@ def add(c: Add) -> Request:
     if not c.owner.strip() or not c.from_lane.strip():
         raise QueueError("`owner` and `from_lane` name lanes; one of them is empty")
     at = stamp(now())
-    with locked(c.root):
+    with locked(c.queue):
         request = Request(
-            id=next_id(c.root),
+            id=next_id(c.queue),
             from_lane=lane_of(c.from_lane),
             owner=lane_of(c.owner),
             paths=c.paths,
@@ -287,14 +326,14 @@ def add(c: Add) -> Request:
             updated=at,
             history=(Event(at=at, by=c.from_lane, action="add"),),
         )
-        save(c.root, request)
+        save(c.queue, request)
     return request
 
 
-def change(root: str, id: str, edit: Callable[[Request], Request]) -> Request:
-    with locked(root):
-        request = edit(get(root, id))
-        save(root, request)
+def change(queue: str, id: str, edit: Callable[[Request], Request]) -> Request:
+    with locked(queue):
+        request = edit(get(queue, id))
+        save(queue, request)
     return request
 
 
@@ -320,7 +359,7 @@ def take(c: Take) -> Request:
             r, state="taken", taken_by=c.by, updated=at, history=(*r.history, Event(at=at, by=c.by, action="take"))
         )
 
-    return change(c.root, c.id, edit)
+    return change(c.queue, c.id, edit)
 
 
 def done(c: Done) -> Request:
@@ -336,7 +375,7 @@ def done(c: Done) -> Request:
             history=(*r.history, Event(at=at, by=c.by, action="done", note=c.note)),
         )
 
-    return change(c.root, c.id, edit)
+    return change(c.queue, c.id, edit)
 
 
 def refuse(c: Refuse) -> Request:
@@ -351,7 +390,7 @@ def refuse(c: Refuse) -> Request:
             r, state="refused", why=c.why, updated=at, history=(*r.history, Event(at=at, by=c.by, action="refuse", note=c.why))
         )
 
-    return change(c.root, c.id, edit)
+    return change(c.queue, c.id, edit)
 
 
 def reassign(c: Reassign) -> Request:
@@ -370,7 +409,7 @@ def reassign(c: Reassign) -> Request:
             history=(*r.history, Event(at=at, by=c.by, action="reassign", note=note)),
         )
 
-    return change(c.root, c.id, edit)
+    return change(c.queue, c.id, edit)
 
 
 def summary(what: str) -> str:
@@ -394,7 +433,7 @@ def by_owner(requests: list[Request]) -> list[tuple[str, list[Request]]]:
 def listing(c: List) -> str:
     chosen = [
         r
-        for r in load_all(c.root)
+        for r in load_all(c.queue)
         if r.state in c.states
         and (c.owner is None or r.owner == lane_of(c.owner))
         and (c.from_lane is None or r.from_lane == lane_of(c.from_lane))
@@ -422,7 +461,7 @@ def listing(c: List) -> str:
 def stale(c: Stale) -> str:
     until = now()
     old = sorted(
-        (r for r in load_all(c.root) if r.state in c.states and minutes_since(r.updated, until) > c.minutes),
+        (r for r in load_all(c.queue) if r.state in c.states and minutes_since(r.updated, until) > c.minutes),
         key=lambda r: (r.updated, r.id),
     )
     live = windows()
@@ -440,7 +479,7 @@ def stale(c: Stale) -> str:
     )
 
 
-# Importing v2/requests/*.md.
+# Importing docs/v2/requests/*.md.
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 FENCE = re.compile(r"^\s*(?:>\s*)?(```|~~~)")
@@ -456,7 +495,7 @@ CLOSED_WORDS = frozenset(
      "refused", "declined", "wrong", "resolved", "obsolete"}
 )
 PATH = re.compile(
-    r"(?<![\w/.-])((?:crates|tools|docs|v2|harness|python|vendor|fuzz|bench|\.github)/[A-Za-z0-9_./-]*[A-Za-z0-9_]"
+    r"(?<![\w/.-])((?:crates|tools|docs|harness|vendor|fuzz|demo|site|library|\.github)/[A-Za-z0-9_./-]*[A-Za-z0-9_]"
     r"|Cargo\.toml|Cargo\.lock)"
 )
 DATE = re.compile(r"(?<![\w-])(20\d\d-\d\d-\d\d)(?:[ T](\d\d:\d\d))?")
@@ -528,7 +567,7 @@ def is_open(text: str) -> bool:
 
 
 def known_lanes(c: Import) -> set[str]:
-    names = {p.stem for p in (Path(c.root) / c.requests).glob("*.md")}
+    names = {p.stem for p in (Path(c.tree) / c.requests).glob("*.md")}
     for folder in c.lanes_from:
         names |= {p.stem.removeprefix("v2-") for p in Path(folder).glob("*.md")}
     names |= {name for _, name in windows()}
@@ -563,13 +602,13 @@ def paths_of(text: str) -> tuple[str, ...]:
 
 
 def import_requests(c: Import) -> list[Request]:
-    folder = Path(c.root) / c.requests
+    folder = Path(c.tree) / c.requests
     if not folder.is_dir():
         raise QueueError(f"no request folder {folder}")
     lanes = known_lanes(c)
     found: list[tuple[datetime, Item, str, str, str]] = []
     for path in sorted(folder.glob("*.md")):
-        rel = str(path.relative_to(c.root))
+        rel = str(path.relative_to(c.tree))
         info = path.stat()
         born = datetime.fromtimestamp(getattr(info, "st_birthtime", info.st_mtime), UTC)
         seen: dict[str, int] = {}
@@ -583,9 +622,9 @@ def import_requests(c: Import) -> list[Request]:
     found.sort(key=lambda f: (f[0], f[1].file, f[1].first_line))
     at = stamp(now())
     added: list[Request] = []
-    with locked(c.root):
-        have = {r.source for r in load_all(c.root) if r.source}
-        number = int(next_id(c.root))
+    with locked(c.queue):
+        have = {r.source for r in load_all(c.queue) if r.source}
+        number = int(next_id(c.queue))
         for created, item, source, author, owner in found:
             if source in have:
                 continue
@@ -604,12 +643,37 @@ def import_requests(c: Import) -> list[Request]:
             number += 1
             added.append(request)
             if not c.dry_run:
-                save(c.root, request)
+                save(c.queue, request)
     return added
+
+
+def restore(c: Restore) -> int:
+    """Write the requests commit `c.rev` held under `v2/queue/` into an empty queue folder."""
+    folder = queue_dir(c.queue)
+    if folder.is_dir() and any(folder.glob("*.json")):
+        raise QueueError(f"the queue at {folder} already has requests; restore only fills an empty one")
+    listed = subprocess.run(
+        ["git", "-C", c.tree, "ls-tree", "--name-only", f"{c.rev}:{COMMITTED}"], capture_output=True, text=True
+    )
+    if listed.returncode != 0:
+        raise QueueError(f"no `{COMMITTED}/` at {c.rev} in {c.tree} (git ls-tree: {listed.stderr.strip()})")
+    names = [n for n in listed.stdout.split() if re.fullmatch(r"\d+\.json", n)]
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shown = subprocess.run(
+            ["git", "-C", c.tree, "show", f"{c.rev}:{COMMITTED}/{name}"], capture_output=True, text=True
+        )
+        if shown.returncode != 0:
+            raise QueueError(f"git show {c.rev}:{COMMITTED}/{name} failed: {shown.stderr.strip()}")
+        (folder / name).write_text(shown.stdout)
+        load(folder / name)
+    return len(names)
 
 
 def run(c: Command) -> str:
     match c:
+        case Restore():
+            return f"restored {restore(c)} requests from {c.rev}:{COMMITTED} into {queue_dir(c.queue)}"
         case Add():
             r = add(c)
             window = window_of(r.owner, windows())

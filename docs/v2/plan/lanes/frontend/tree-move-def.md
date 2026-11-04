@@ -54,7 +54,7 @@ Part of [tree.md](tree.md) (frontend.md item 16). Every use of `SyntaxNode`, `Sy
   ast::UseTree<'db>>>`: `UseId`'s `child_source` with view values, for callers without
   `la_arena` (blaze-diagnostics `used.rs`). Filed by frontend-tree-move-diag-lints-uses as
   `## frontend-tree: hir-def src.rs: use_tree_sources_view, the UseId child source as views (2)`
-  in `v2/requests/db-expand.md`; its test is in `src/tests.rs`.
+  in `docs/v2/requests/db-expand.md`; its test is in `src/tests.rs`.
 
 `expr_store/source_map.rs` (this lane), on `ExpressionStoreSourceMap`. Each one takes the view by
 value and looks up `AstPtr::of(node)`:
@@ -109,10 +109,10 @@ This lane's request headings, for the other parts' `needs:` lines:
 
 | file | heading | requests file (applier) |
 |---|---|---|
-| `src.rs` | `## frontend-tree: hir-def src.rs: onto views (1)` | `v2/requests/db-expand.md` (`db-expand-items`) |
-| `expr_store/source_map.rs` | `## frontend-tree: hir-def expr_store/source_map.rs: onto views (1)` | `v2/requests/db.md`, applied in the tree by this lane (the file is free) |
+| `src.rs` | `## frontend-tree: hir-def src.rs: onto views (1)` | `docs/v2/requests/db-expand.md` (`db-expand-items`) |
+| `expr_store/source_map.rs` | `## frontend-tree: hir-def expr_store/source_map.rs: onto views (1)` | `docs/v2/requests/db.md`, applied in the tree by this lane (the file is free) |
 | `expr_store/body.rs` | none: edited in the tree by this lane (the file is free) | |
-| `lib.rs` | `## frontend-tree: hir-def lib.rs: onto views (1)` | `v2/requests/db-expand.md` (`db-expand-items`) |
+| `lib.rs` | `## frontend-tree: hir-def lib.rs: onto views (1)` | `docs/v2/requests/db-expand.md` (`db-expand-items`) |
 
 The other parts declare their edge twins in their own notes (below). Each part lists them there
 first, then tells `frontend-tree-move-hir`, `-diag-lower`, `-diag-lints` and `-codegen` by tmux.

@@ -44,7 +44,7 @@ this says of them is the record of the plan at its date.
 Part of [usercode](../usercode.md). Code: `crates/blaze-expand/`, `crates/blaze-macro-wasm/`,
 `crates/proc-macro-api/` (warm servers, `src/warm.rs`), `crates/proc-macro-srv/` (scope
 markers). Requests:
-`v2/requests/usercode-macros.md`.
+`docs/v2/requests/usercode-macros.md`.
 
 ## What runs where
 

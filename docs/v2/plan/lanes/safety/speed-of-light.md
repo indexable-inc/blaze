@@ -400,7 +400,7 @@ How the code reaches each term:
 - **The edge.** Reading another worker's file (once per file), the directory listing (once a
   second), a finding's report and error messages allocate, each marked `// alloc:`.
 - Until blaze-mem has a fuzzer tag, the corpus counts under `Tag::Other`
-  (`v2/requests/mem.md`, "From safety-fuzz").
+  (`docs/v2/requests/mem.md`, "From safety-fuzz").
 
 The previous version of the engine was far from these bounds:
 - Its drain made a variable-length copy per 8-byte word, about 15 cycles, or 2N cycles in
@@ -423,7 +423,7 @@ The previous version of the engine was far from these bounds:
     the D lines the drain listed, halving the scans.
 - N itself. Every term above with N in it is time spent on code the input never reached, and
   a counter of a function the link dropped should not be there at all. That is requested of
-  link (`v2/requests/link.md`, "From safety-fuzz"): drop SanitizerCoverage's entries with
+  link (`docs/v2/requests/link.md`, "From safety-fuzz"): drop SanitizerCoverage's entries with
   their function, as lld and ld64 do. Until then, a `hir_*` target's N may pass L2, and its
   scans run from L3 at half the rate.
 
@@ -468,7 +468,7 @@ operands in a slot.
   `-jobs`, and shared L3 bandwidth once N passes L2. The second is covered by the link request
   above.
 - CI is asked to run `--jobs "$(nproc)"`, and to build the 52 binaries in one build rather
-  than 52 (`v2/requests/safety.md`, F1 amended).
+  than 52 (`docs/v2/requests/safety.md`, F1 amended).
 
 ### The plain `#[test]` of each target
 

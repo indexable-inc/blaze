@@ -6,7 +6,7 @@ date: 2026-10-29
 # blaze v2: lane cargo's design
 
 Lane cargo's notes, as of 2026-10-29: [building.md](../../process/building.md) section 18, #1450, #805, #804, #86, #91, #298, #601.
-Requests are in `v2/requests/cargo.md`; the shared types in
+Requests are in `docs/v2/requests/cargo.md`; the shared types in
 `crates/blaze-units/src/query.rs` (feature `query`).
 
 ## Parts and owners
@@ -32,7 +32,7 @@ with a `BuildConfig` (`Database::open_with(view, &config.encode())`), the only t
 `Cx::config` reads:
 
 - `invocation`: the cargo command line (`blaze_api::Cargo`, added in schema 5 by
-  `v2/requests/cargo.md` request 3), or one the daemon makes of an agent's `Targets` (`-p`, `--profile`, `--target`,
+  `docs/v2/requests/cargo.md` request 3), or one the daemon makes of an agent's `Targets` (`-p`, `--profile`, `--target`,
   `-F`, `--all-features`, `--no-default-features`, cwd at the root, an empty environment but
   `PATH` and `HOME` of the daemon).
 - `mounts`: where every directory cargo names is: the view at the client's checkout path, each

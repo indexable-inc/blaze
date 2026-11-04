@@ -488,7 +488,7 @@ mod stencil_pin {
 
 /// The package whose stencil libraries are keyed by their pin.
 const STENCIL_PACKAGE: &str = "blaze-stencil";
-/// The program's feature that builds it as the seed (todo/bootstrap/plan.md): no LLVM, its
+/// The program's feature that builds it as the seed (docs/future/bootstrap.md): no LLVM, its
 /// stencils copied and held to their pin. blaze-engine's build script refuses it with any
 /// feature that brings LLVM back.
 pub const SEED_FEATURE: &str = "CARGO_FEATURE_SEED";

@@ -6,9 +6,9 @@ date: 2026-10-29
 # dedup-scan-diag: the diagnostics against blaze-lints
 
 Part of [dedup](../dedup.md), under `dedup-scan`. Every edit is a request, because neither crate
-is free: `v2/requests/diagnostics.md` and `v2/requests/coordinator.md`, both under
+is free: `docs/v2/requests/diagnostics.md` and `docs/v2/requests/coordinator.md`, both under
 `## dedup: ...` headings naming `blaze-lints`. The reference emitter for the proptest is staged
-at `v2/requests/dedup-scan-diag/emit_reference.rs`.
+at `docs/v2/requests/dedup-scan-diag/emit_reference.rs`.
 
 ## diagnostics model against blaze-lints
 

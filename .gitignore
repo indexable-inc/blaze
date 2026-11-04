@@ -2,6 +2,10 @@
 # hir-ty's `target_feature/`, blaze-link's `target/`, fuzz/targets).
 /target*/
 __pycache__/
+# uv's environment for the workspace's Python (pyproject.toml), and wrangler's state for the
+# Cloudflare Workers (site/, tools/remote-cache/) when run from the root.
+/.venv/
+.wrangler/
 # Hegel's failing-example database, where a run finds no hegel.toml (it turns it off).
 .hegel/
 # The standard library is upstream's file for file (harness/library.py import), `target/` source

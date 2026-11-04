@@ -75,15 +75,15 @@ Every memo hit is 2× its 5.4 ns bound, all of it salsa's hit path (speed-salsa'
 Budgets: `crates/hir-def/src/alloc_budgets.rs` (flag reads, gated values, loc intern hits,
 lang-item lookups, upvar reads: 0 each), path resolution (`nameres/tests/paths.rs`), hir-expand
 (`budget_tests.rs`, `macro_expansion_tests/budgets.rs`), base-db (`tests.rs`); the item tree
-accessors' budgets are filed as edit D in `v2/requests/frontend-deps.md` ("speed-hir-sol-items"). hir-def's harness (the
+accessors' budgets are filed as edit D in `docs/v2/requests/frontend-deps.md` ("speed-hir-sol-items"). hir-def's harness (the
 `#[global_allocator]`, `mod alloc_budgets`, and the port of `paths.rs` off its own allocator,
-which must land together) is filed in `v2/requests/db-expand.md`, "speed-hir-sol-defs" item 1
+which must land together) is filed in `docs/v2/requests/db-expand.md`, "speed-hir-sol-defs" item 1
 and "speed-hir-sol-nameres".
 
-Requests left with owners (2026-10-29), all in `v2/requests/db-expand.md` "## speed-hir: four
+Requests left with owners (2026-10-29), all in `docs/v2/requests/db-expand.md` "## speed-hir: four
 edits" unless said: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`; base-db's
 `Table` onto `intern::swiss::Index`; `upvars` reading `ExpressionStore::has_closures`
-(the store side in `v2/requests/mem-format.md`); deleting `impl_internable!(ModPath)`, which
+(the store side in `docs/v2/requests/mem-format.md`); deleting `impl_internable!(ModPath)`, which
 nothing uses since `Interned<ModPath>` is gone everywhere.
 
 ## Left, and what it would take

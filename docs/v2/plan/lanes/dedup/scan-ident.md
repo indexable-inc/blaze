@@ -8,9 +8,9 @@ date: 2026-10-29
 Part of [dedup](../dedup.md), under `dedup-scan`. The edits are requests, because neither
 owner is free:
 
-- `v2/requests/fastcompile-ident-share.md`, `## dedup: one type identity for the code
+- `docs/v2/requests/fastcompile-ident-share.md`, `## dedup: one type identity for the code
   generator and the share key`;
-- `v2/requests/codegen.md`, `## dedup: one type identity (hashes.rs onto hir-ty-share)`.
+- `docs/v2/requests/codegen.md`, `## dedup: one type identity (hashes.rs onto hir-ty-share)`.
 
 ## The copies
 

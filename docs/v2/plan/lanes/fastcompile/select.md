@@ -9,7 +9,7 @@ Idea 3 of [compile-time.md](../../design/compile-time.md): each test run records
 executed; after an edit only tests that executed a changed function, or read a changed input,
 run again; the rest report their cached result, marked as cached. The code is in
 `crates/blaze-testsel`; what it needs of other crates is requested in
-`v2/requests/fastcompile.md` under `fastcompile-ident-select <n>`.
+`docs/v2/requests/fastcompile.md` under `fastcompile-ident-select <n>`.
 
 ## What exists
 
@@ -204,7 +204,7 @@ are named: an incomplete record keeps a pass under the reached set with why, sho
 
 ## Hooks
 
-Each is a request in `v2/requests/fastcompile.md`:
+Each is a request in `docs/v2/requests/fastcompile.md`:
 
 | n | Owner | What |
 | --- | --- | --- |

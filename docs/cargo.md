@@ -978,7 +978,7 @@ is the one place Cranelift's code generator runs. `codegen-backend = "cranelift"
 asks for the fast unoptimized code stencils are, and is taken; at 2 and up it is an error.
 `codegen-backend = "stencil"` compiles every function of the build as stencils whatever its
 level, the standard library's and what build scripts and proc macros run included. It is the
-seed's setting (todo/bootstrap/plan.md, "std and assembly in the seed"), works with or without
+seed's setting (docs/future/bootstrap.md, "std and assembly in the seed"), works with or without
 LLVM, and is taken for a whole build from the profile, never per package. Otherwise the
 standard library's own functions are compiled as rustc's shipped std is, at `-O3`, and a blaze
 built without LLVM refuses a profile that asks for LLVM, saying so and naming

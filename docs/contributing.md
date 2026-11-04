@@ -21,6 +21,32 @@ you send them, including fixes you find here and want to upstream.
 
 ## Layout of the tree
 
+The root holds only what a reader needs first or a tool requires there; everything else is
+one level down:
+
+    crates/                   blaze's crates, and the front end's (below)
+    library/                  the standard library blaze builds, upstream's sources with blaze's changes
+    vendor/                   third-party crates blaze patches or builds as dependencies
+    harness/                  the test harnesses and their fixtures
+    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
+                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
+                              (the pinned PGO profiles), bench/results/ (recorded results),
+                              remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              workspace's shared helper), v2/ (the lanes' scripts and queue)
+    docs/                     these documents; docs/future/ the plans for work not started,
+                              docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
+                              requests
+    demo/                     small projects the harnesses build, and the live-reload demo
+    fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
+    site/                     the website
+    licenses/                 NOTICE and the license texts of code blaze includes
+    install.sh                the installer `curl | sh` and CI run
+    hegel.toml                Hegel's settings for the property tests (read from the root)
+    Cargo.toml, pyproject.toml, flake.nix
+                              the Rust, Python (uv) and Nix workspaces, each with its lock
+
+The crates to know first:
+
     crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
     crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
@@ -30,15 +56,6 @@ you send them, including fixes you find here and want to upstream.
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
     crates/blaze-wasm/        experiment: the compiler running in a web page (not in the workspace)
-    harness/                  the test harnesses and their fixtures
-    demo/                     small projects the harnesses build
-    docs/                     these documents
-    docs/reports/             working reports, one per piece of work, as written at the time
-    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
-                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/ (recorded results), remote-cache/
-                              (the cache gateway Worker)
-    licenses/                 NOTICE and the license texts of code blaze includes
     .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)

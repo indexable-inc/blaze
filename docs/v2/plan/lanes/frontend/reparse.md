@@ -46,7 +46,7 @@ the file is parsed whole. That is not a fallback: `reparse_to` gives the tree a 
 new text gives (`reparse_to_random_edits` holds them equal), so the two paths are one result
 reached at two costs. The outline choice is kept: an outline is only reparsed as an outline.
 
-base-db is db's: the request in `v2/requests/db.md` (`## frontend-deps-reparse: parse a file
+base-db is db's: the request in `docs/v2/requests/db.md` (`## frontend-deps-reparse: parse a file
 from its previous parse`) gives the exact edit to `EditionedFileId::parse`, one call to
 `parse_file` keyed by the file's span id.
 

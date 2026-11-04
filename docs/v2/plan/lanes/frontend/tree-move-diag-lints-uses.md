@@ -9,9 +9,9 @@ Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md)
 `crates/blaze-diagnostics/src/lints/names/imports.rs`, `imports/`, `stability.rs` and `stability/`.
 Child of [tree-move-diag-lints.md](tree-move-diag-lints.md). Every file has a holder, so every
 move is a request in the holder's request file, under `## frontend-tree: blaze-diagnostics <file>:
-onto views (<n>)`: `imports*` in `v2/requests/diagnostics-lints-names-hot-imports.md` (lane
+onto views (<n>)`: `imports*` in `docs/v2/requests/diagnostics-lints-names-hot-imports.md` (lane
 `diagnostics-lints-names-hot-imports`, done; its successor applies), `stability*` in
-`v2/requests/diagnostics-lints-names-hot-stability.md` (whoever holds the stability lints;
+`docs/v2/requests/diagnostics-lints-names-hot-stability.md` (whoever holds the stability lints;
 `walk.rs` was `diagnostics-lints-names-stability-walk`'s port).
 
 ## What the files hold after the move
@@ -86,7 +86,7 @@ Each owner's notes are the authority; a hunk is corrected when they change.
   `expand_cfg_attr_view`, `AstKeyValueMetaExt for view::KeyValueMeta<'_>`,
   `ModPath::from_src_view`, `AsName for view::{Name, NameRef}`.
 - `hir-def` `src.rs` (`frontend-tree-move-def`'s twins, held by db-expand): `use_tree_sources_view`,
-  requested in `v2/requests/db-expand.md` under `## frontend-tree: hir-def src.rs:
+  requested in `docs/v2/requests/db-expand.md` under `## frontend-tree: hir-def src.rs:
   use_tree_sources_view, the UseId child source as views (2)`.
 
 ## Speed

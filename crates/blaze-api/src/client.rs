@@ -95,7 +95,7 @@ impl From<io::Error> for ClientError {
 }
 
 /// A daemon in this same process, spoken to in the Unix socket's frames with no socket: the
-/// seed's one-shot build (todo/bootstrap/plan.md), whose engine is the daemon's, taking this
+/// seed's one-shot build (docs/future/bootstrap.md), whose engine is the daemon's, taking this
 /// process's requests alone ([`crate::server::Config::local`]).
 pub trait Local {
     /// Hands the daemon `frame`, a request's.

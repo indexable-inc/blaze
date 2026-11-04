@@ -145,7 +145,7 @@ All are in `crates/blaze-vfs/src/image/tests.rs` unless noted.
 ## Open
 
 - **The daemon's start and stop** (cargo's `serve/daemon.rs`) still call `Vfs::recover` and
-  write no VFS sections, so a start loads the journal alone. Asked in `v2/requests/cargo.md`
+  write no VFS sections, so a start loads the journal alone. Asked in `docs/v2/requests/cargo.md`
   with the exact edits. blaze-vfs's own wiring (`lib.rs`, `Cargo.toml`, `tests.rs`) and
   blaze-query's `Tree::file` are in.
 - **A repair is in memory only.** The journal does not record the mended file, because its

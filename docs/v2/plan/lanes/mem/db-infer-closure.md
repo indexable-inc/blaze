@@ -8,7 +8,7 @@ date: 2026-10-29
 Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8) under `mem-db`
 (`docs/v2/plan/lanes/mem/db.md`). Paths, in `crates/hir-ty/src/infer/`: `closure.rs`,
 `closure/analysis.rs`, `closure/analysis/expr_use_visitor.rs`. The exact changes, with before and
-after code and their lines, are in `v2/requests/mem-db-infer-closure.md` (entries C0 to C2, E1 to
+after code and their lines, are in `docs/v2/requests/mem-db-infer-closure.md` (entries C0 to C2, E1 to
 E8, A0 to A8, and interfaces X1 to X5 for `infer.rs`, `persist.rs` and `lib.rs`). This note is
 the design.
 

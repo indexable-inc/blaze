@@ -73,7 +73,7 @@ view of the call (`syntax_bridge::call_input`), one pass over the call's slice o
 flat tokens with spans from the side table in order; an attribute or derive input, which strips
 cfgs and applies fixups, from `call_input_modified`, the same walk with removals and appends
 keyed by `NodeId`. Neither makes a syntax handle. hir-expand's move onto both is requested of
-db-expand (`v2/requests/db-expand.md`, the two "from a view" sections); the handle versions stay
+db-expand (`docs/v2/requests/db-expand.md`, the two "from a view" sections); the handle versions stay
 for `expand_speculative` (IDE, edited green trees) and as the tests' reference. An expansion's
 output is parsed straight from its columns.
 
@@ -96,7 +96,7 @@ offsets, the two top spans, then the symbols' UTF-8 (layout in `tt/src/storage/w
 It allocates at most a constant times its input, after checking each column's length against
 the bytes left. The crates that send trees (`proc-macro-api`, `proc-macro-srv`,
 `blaze-macro-wasm`) are lane usercode's; the change to use the wire there is requested in
-`v2/requests/usercode.md` (`## frontend-tokens: send token trees over the proc-macro wire as
+`docs/v2/requests/usercode.md` (`## frontend-tokens: send token trees over the proc-macro wire as
 their columns`).
 
 ## The benchmark it is held to
@@ -147,7 +147,7 @@ Where the token-tree paths allocate, by lifetime:
 | What | Lifetime | Now | Plan |
 | --- | --- | --- | --- |
 | Builder buffers, the walk's open-subtree stack, mbe's matcher input | per call | kept per thread at their high-water mark (mbe's is freed above 64K tokens) | as is; the budget tests hold warm calls to 0 |
-| A built `TopSubtree` (expansions, macro arguments, proc-macro answers) | its salsa memo's, which has no lifetime group | one `Box<[u32]>` block from the global allocator: a header of column offsets and lengths, then the columns, every reference an offset; the encoder's columns and tables are kept per thread, so a warm `build` allocates once (`walking_and_the_wire_allocate_the_same_for_any_size_of_tree`) | per mem's answer (`v2/requests/mem.md`): stays on the global allocator until memos persist into the image, then the same words become a checked view of the mapped pack behind the same accessors |
+| A built `TopSubtree` (expansions, macro arguments, proc-macro answers) | its salsa memo's, which has no lifetime group | one `Box<[u32]>` block from the global allocator: a header of column offsets and lengths, then the columns, every reference an offset; the encoder's columns and tables are kept per thread, so a warm `build` allocates once (`walking_and_the_wire_allocate_the_same_for_any_size_of_tree`) | per mem's answer (`docs/v2/requests/mem.md`): stays on the global allocator until memos persist into the image, then the same words become a checked view of the mapped pack behind the same accessors |
 | A tree read from the proc-macro wire | a request | the same one block, written after every column is checked, plus the checks' buffers (at most 3 in all) | as is |
 | Errors | rare | global allocator | as is |
 
@@ -211,7 +211,7 @@ Order of work, as done: `parser::Tokens` (additive), then the `Parser` reading i
 frontend-deps' `outline.rs` signature), then the `tt` columns with their builder and wire, then
 the call input from views (`call_input`, `call_input_modified`), then mbe's `expect_fragment`
 and `token_tree_to_syntax_node` on kept words. Each step is checked against the reference.
-Then a tree's columns become one `Box<[u32]>` block (mem's answer in `v2/requests/mem.md`;
+Then a tree's columns become one `Box<[u32]>` block (mem's answer in `docs/v2/requests/mem.md`;
 child `frontend-tokens-block`).
 
 | Test | Proves |

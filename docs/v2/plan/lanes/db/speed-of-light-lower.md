@@ -65,7 +65,7 @@ parameters of what it names, lower or default each argument, and intern the argu
 
 **What stands in the way, and the design:**
 1. The `substs` heap buffer. A `SmallVec<[GenericArg; 8]>` holds every real path's arguments
-   on the stack. This is requested of db-ty-d-lower (`v2/requests/db-ty-sol-lower.md` 2):
+   on the stack. This is requested of db-ty-d-lower (`docs/v2/requests/db-ty-sol-lower.md` 2):
    −20 ns.
 2. Salsa's memo hits at 18 ns instead of 5.4. That is speed-salsa's work (MemoRows, a row
    base cached per task): −38 ns per path.
@@ -208,7 +208,7 @@ the costs are those of section 1. `generic_defaults` returns early for an item w
 parameters before it builds a resolver. `const_param_types` should do the same for an item
 without const parameters: it builds a resolver and a context first today, about 130 ns spent
 on nothing for most items. That early return is requested of db-ty-d-lower
-(`v2/requests/db-ty-sol-lower.md` 5), since it is editing `lower.rs`.
+(`docs/v2/requests/db-ty-sol-lower.md` 5), since it is editing `lower.rs`.
 
 ## 5. Variance (`variance.rs`)
 

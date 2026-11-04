@@ -428,7 +428,7 @@ with nothing to report that `Vec` is empty and unallocated.
 `written` with nothing found makes zero allocations.
 
 **What stands in the way.**
-- `Tag::Diagnostics` is requested of mem (`v2/requests/diagnostics.md` 9).
+- `Tag::Diagnostics` is requested of mem (`docs/v2/requests/diagnostics.md` 9).
 - The passes the driver calls are the rest of the cost. Their sections follow, one per part:
   `diagnostics-speed-{checks,lower,lints,bodies}`.
 - Every check walks the whole crate. The edit bound ("recomputing only what changed") needs
@@ -507,7 +507,7 @@ one probe, and returns a slice, with zero allocations. For `k` unresolved names 
 `O(D + k)` against rustc's `O(k·D)`, which beats rustc from the second name on.
 `unresolved_import`'s `module_candidate` uses `Decls` too, instead of every module's name.
 `checks/names/paths.rs` is to use it for `named` and `variant_enums`
-(`v2/requests/diagnostics-speed-lower.md` 4).
+(`docs/v2/requests/diagnostics-speed-lower.md` 4).
 
 **`typo`.** rustc's `lookup_typo_candidate` collects the names in scope of the namespace,
 sorts them and takes `find_best_match_for_name`, an edit distance per candidate. The shared
@@ -526,7 +526,7 @@ chosen. `unresolved_import`'s `Resolver` asks Semantics for its module once (`cu
   `trimmed`, `visible_parent` and `reexport_name` make zero allocations.
 
 **What stands in the way.**
-- `cx.rs` must hold `Paths<'a>` (`v2/requests/diagnostics-speed-lower.md` 1). The crate does not
+- `cx.rs` must hold `Paths<'a>` (`docs/v2/requests/diagnostics-speed-lower.md` 1). The crate does not
   compile without it.
 - `incorrect_case` reads hir's kind through its `Display` into a stack buffer until hir exports
   `IdentType` (request 2).
@@ -819,7 +819,7 @@ dependency it loads.
   allocations.
 
 **What blocks the last 10%.** Each item is a request in
-`v2/requests/diagnostics-speed-checks.md`.
+`docs/v2/requests/diagnostics-speed-checks.md`.
 - `owners` is computed twice per check, once by `checks::check` and once by the attribute
   lints. A `Cx::owners()` cache next to `Cx::walk()` would make it once, saving about 0.6 ms
   (request 1).

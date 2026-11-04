@@ -106,15 +106,15 @@ A text of N bytes on one core:
 
 | Where | What | Request |
 | --- | --- | --- |
-| `crates/blaze-vfs/src/lib.rs` | declare `text` (unsafe allowed), export `text_of` | `v2/requests/frontend-journal.md`, applied |
-| `crates/blaze-vfs` (`store.rs`, `image.rs`, `lib.rs`, `Cargo.toml`) | `Bytes` is `blaze_bytes::Bytes`, image ranges through `Bytes::held`; export `Text`, `TextFile` | `v2/requests/frontend-journal.md` |
-| root `Cargo.toml` | `blaze-bytes` workspace dependency | `v2/requests/frontend.md` |
-| `crates/base-db`, `crates/hir-def` | `FileText` and `BodySyntax` hold a `Text`; two callers of the tree's source | `v2/requests/db.md` |
-| `crates/base-db` | `line_index` query; `ViewFile` carries the tree's `Arc<[u8]>`; `FileText` from `text_of` | `v2/requests/db.md` |
-| `crates/hir-expand` | `line_and_column` on `line_index`, `line_starts` removed | `v2/requests/db.md` |
-| `crates/load-cargo` | `set_files`' `ViewFile`; `line_column` on `line_index` | `v2/requests/cargo.md` |
-| `crates/hir-ty-mir`, `crates/hir-ty-codegen`, `crates/blaze-engine` | caller locations, debug-info rows, body rows, test and doctest lines | `v2/requests/codegen.md` |
-| `crates/blaze-diagnostics/src/emit.rs` | `File`'s line starts on `LineIndex` | `v2/requests/diagnostics.md` |
+| `crates/blaze-vfs/src/lib.rs` | declare `text` (unsafe allowed), export `text_of` | `docs/v2/requests/frontend-journal.md`, applied |
+| `crates/blaze-vfs` (`store.rs`, `image.rs`, `lib.rs`, `Cargo.toml`) | `Bytes` is `blaze_bytes::Bytes`, image ranges through `Bytes::held`; export `Text`, `TextFile` | `docs/v2/requests/frontend-journal.md` |
+| root `Cargo.toml` | `blaze-bytes` workspace dependency | `docs/v2/requests/frontend.md` |
+| `crates/base-db`, `crates/hir-def` | `FileText` and `BodySyntax` hold a `Text`; two callers of the tree's source | `docs/v2/requests/db.md` |
+| `crates/base-db` | `line_index` query; `ViewFile` carries the tree's `Arc<[u8]>`; `FileText` from `text_of` | `docs/v2/requests/db.md` |
+| `crates/hir-expand` | `line_and_column` on `line_index`, `line_starts` removed | `docs/v2/requests/db.md` |
+| `crates/load-cargo` | `set_files`' `ViewFile`; `line_column` on `line_index` | `docs/v2/requests/cargo.md` |
+| `crates/hir-ty-mir`, `crates/hir-ty-codegen`, `crates/blaze-engine` | caller locations, debug-info rows, body rows, test and doctest lines | `docs/v2/requests/codegen.md` |
+| `crates/blaze-diagnostics/src/emit.rs` | `File`'s line starts on `LineIndex` | `docs/v2/requests/diagnostics.md` |
 
 ## What proves it
 

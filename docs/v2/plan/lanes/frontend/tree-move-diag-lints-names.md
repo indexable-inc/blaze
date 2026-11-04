@@ -8,7 +8,7 @@ date: 2026-10-29
 Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md), parent
 [tree-move-diag-lints.md](tree-move-diag-lints.md). Paths: `crates/blaze-diagnostics/src/lints/
 names.rs`, `names/effective.rs`, `names/dead.rs`, `names/dead/`. Holder: `diagnostics-lints-names`
-(requests in `v2/requests/diagnostics-lints-names.md`).
+(requests in `docs/v2/requests/diagnostics-lints-names.md`).
 
 ## Inventory
 

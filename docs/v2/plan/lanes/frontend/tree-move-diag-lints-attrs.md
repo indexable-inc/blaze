@@ -8,7 +8,7 @@ date: 2026-10-29
 Child of [tree-move-diag-lints.md](tree-move-diag-lints.md) (item 16 of
 [frontend.md](../../design/frontend.md), design in [tree.md](tree.md)). Paths:
 `crates/blaze-diagnostics/src/lints/syntax/attrs.rs`, `attrs/`, `check_cfg.rs`, `check_cfg/`.
-Every edit is a request in `v2/requests/diagnostics.md` (lane `diagnostics` holds the crate),
+Every edit is a request in `docs/v2/requests/diagnostics.md` (lane `diagnostics` holds the crate),
 headed `## frontend-tree: blaze-diagnostics lints/syntax/<file>: onto views (1)`. Each needs
 the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)` (the `Walk`
 and `Tree` on views) and lands with it.

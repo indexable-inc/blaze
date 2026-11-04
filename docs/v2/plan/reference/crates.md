@@ -15,7 +15,7 @@ comments; step 0 left each body a lane writes as a panic naming the lane.
   items, tests, new public items and its crates' own `Cargo.toml` (with `workspace = true`
   dependencies) freely.
 - **The interface items** (every public item step 0 wrote, listed per crate below) change
-  only through a request: append what, where and why to `v2/requests/<lane>.md`; the
+  only through a request: append what, where and why to `docs/v2/requests/<lane>.md`; the
   coordinator changes it for every lane at once. The root `Cargo.toml` and `Cargo.lock` are
   the coordinator's too: a new workspace dependency is a request.
 - **A new crate's `src/lib.rs` comes first**, before its `Cargo.toml`, even as one doc
@@ -66,7 +66,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 
 | lane | paths |
 |---|---|
-| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `v2/requests/` (applying them) |
+| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `docs/v2/requests/` (applying them) |
 | cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/blaze-lower/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
 | diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |

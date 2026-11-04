@@ -11,7 +11,7 @@
 /// The pin, in blaze-stencil's directory.
 pub(crate) const PIN_FILE: &str = "stencils.json";
 /// The directory, in blaze-stencil's, of the pinned libraries as committed data
-/// (todo/bootstrap/plan.md, "Who owns stencil generation"): the seed profile, which has no
+/// (docs/future/bootstrap.md, "Who owns stencil generation"): the seed profile, which has no
 /// LLVM, includes these bytes; a build with LLVM checks that what it made is them.
 pub(crate) const PREBUILT: &str = "prebuilt";
 

@@ -137,4 +137,4 @@ searched column apart from the rest.
 - Facts are computed over all crates of the build (`all_crates`), which is coarse for a build
   of many workspaces but never misses an impl.
 
-The requests are in `v2/requests/items.md`.
+The requests are in `docs/v2/requests/items.md`.

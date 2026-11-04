@@ -152,7 +152,7 @@ bytes only, so a group is folded however hot its members are. Where that costs r
 
 What would bound it, in order of value:
 1. **A sibling call in the thunk** (`return_call` under the platform convention, a request
-   already in `v2/requests/codegen.md` section 5, forwarded to integration). A thunk becomes a
+   already in `docs/v2/requests/codegen.md` section 5, forwarded to integration). A thunk becomes a
    few moves and a jump, and a folded call costs about what it cost unfolded. This removes
    most of the cost without giving up any folding.
 2. **Until then, a run-time floor in `profitable`**: refuse a group whose body is under

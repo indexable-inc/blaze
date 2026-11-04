@@ -99,7 +99,7 @@ type parameter is unknown, and unknown means no lint. `cost` and `closure_cost` 
 estimates the same way.
 
 The summary lives in blaze-lints for now; the front end's `hir-ty-mir` is its long-term home
-(semantics in the front end), asked of lane codegen in `v2/requests/lints-parallel.md`.
+(semantics in the front end), asked of lane codegen in `docs/v2/requests/lints-parallel.md`.
 
 ## Exactness and misses
 

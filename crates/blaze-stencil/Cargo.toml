@@ -67,7 +67,7 @@ libc.workspace = true
 default = ["llvm-stencils"]
 # The stencils are made by the pinned LLVM when blaze is built, and must be the libraries
 # committed in `prebuilt/`, which `stencils.json` pins. Without it (the seed profile,
-# todo/bootstrap/plan.md) those committed libraries are included (build.rs).
+# docs/future/bootstrap.md) those committed libraries are included (build.rs).
 llvm-stencils = ["dep:llvm-sys", "dep:object"]
 
 [lints]

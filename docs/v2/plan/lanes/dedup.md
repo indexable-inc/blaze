@@ -48,7 +48,7 @@ not memory, and are compared only with each other.
   against the simplest copy as the reference, kept as a test-only module until that copy is
   deleted (then the reference stays in the test, as the spec).
 - A caller is edited only when every agent that owns it reports `STATUS: DONE` (the "free" rule
-  of the mem lane's brief). Otherwise the exact edit goes to `v2/requests/<owner>.md` under
+  of the mem lane's brief). Otherwise the exact edit goes to `docs/v2/requests/<owner>.md` under
   `## dedup: <title>`, and the owner hears of it by tmux.
 
 ## Parts

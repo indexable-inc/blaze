@@ -260,7 +260,7 @@ correctness for speed, which the rules forbid.
 native inputs are the same C archives plus `libSystem.tbd` (about 1 MB of YAML in about 40
 documents, 30,000 names) and any dylibs. The files were held by the `requests-link-fuzz` agents
 during this pass, so the changes below are filed as exact edits in
-`v2/requests/requests-link-fuzz.md` (A1 to A5) and `v2/requests/link.md` (19.1 to 19.5) rather
+`docs/v2/requests/requests-link-fuzz.md` (A1 to A5) and `docs/v2/requests/link.md` (19.1 to 19.5) rather
 than made. Budgets are the bound × 1.1; the figures are arithmetic, not yet measured.
 
 | phase | bound | where it is | filed as |
@@ -437,7 +437,7 @@ named link.md item 11 here).
 
 **Made, and filed.** 19.1, 19.2, 19.5, A2, A4 and A5 are made (requests-link-next-writers, not
 yet built: the lane made them without a build, so the tests above are written and not yet run).
-A6 and A8 are in `v2/requests/requests-link-fuzz.md`; both are made (A8 on 2026-10-30 by
+A6 and A8 are in `docs/v2/requests/requests-link-fuzz.md`; both are made (A8 on 2026-10-30 by
 speed-sol2-link-writers, written without a build, like the rest).
 
 ### Rebase opcodes and function starts: `macho/linkedit.rs` (speed-sol2-link-writers)
@@ -1160,7 +1160,7 @@ of a core-serializing IPI), costs tens of µs whatever the thread count, but onl
 the patch site is one instruction. The slots design needs neither: **0 per thread**, the cell's
 store. So the fix is moving v1's users onto slots, not a faster stop. `slots::Live` now has
 what they need (the macOS sampler, the directory `tiers()` reads, and `apply_as_they_come`), and
-[request 20 of `link.md`](../../../../../v2/requests/link.md) asks for the daemon's side and the
+[request 20 of `link.md`](../../../requests/link.md) asks for the daemon's side and the
 users' switch, after which v1 is removed. Request 15's blind spots go with it.
 
 ### Rollback, and the answer written once
@@ -1179,7 +1179,7 @@ The switch keeps every generation the program ran (`switch.rs` `Log`) and every 
 writes of code and 4,096 lasting ranges. Past that, a column doubled: one allocation, plus a
 copy of the whole column, on the latency path of the patch that crossed the line. The
 allocation-budget test only held below those counts. blaze-mem's `RegionVec` can't be used
-(`v2/requests/mem-backend-live.md`, "refused by requests"): blaze-live is published and built
+(`docs/v2/requests/mem-backend-live.md`, "refused by requests"): blaze-live is published and built
 alone into user programs, and blaze-mem reserved about 264 GB, which broke `Live::open` under
 `ulimit -v` and valgrind.
 
@@ -1266,7 +1266,7 @@ the functions' counters are packed eight to a line, so two hot functions on two 
 line back and forth (about 50 to 100 ns each time, against about one cycle). The bound is about
 one cycle an add: each function's counters on their own 128 bytes, and per-thread blocks when
 one function is hot on many threads. That is codegen's (`hir-ty-codegen/tier.rs` `count`):
-filed in `v2/requests/codegen.md`.
+filed in `docs/v2/requests/codegen.md`.
 
 ### Read-only pages a patch writes, per platform (speed-sol2-link-live)
 
@@ -1420,6 +1420,6 @@ Proof:
 
 v1 writes a jump over each replaced function's entry with every other thread stopped (the
 section on `apply::write_stopped` above counts it). It is removed once its users move onto
-`slots` (request 20, and the section in `v2/requests/requests.md` it points to), so it gets no
+`slots` (request 20, and the section in `docs/v2/requests/requests.md` it points to), so it gets no
 work beyond correctness here. Its tiering formats in `format.rs` (`Sample`, `Profile`,
 `Tiers`) are written a few times a second and read by the daemon: not on an edit's path.

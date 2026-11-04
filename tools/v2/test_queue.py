@@ -1,4 +1,4 @@
-"""tools/v2/queue.py's commands and its import of v2/requests/*.md, on a scratch tree with tmux faked.
+"""tools/v2/queue.py's commands and its import of docs/v2/requests/*.md, on a scratch tree and queue with tmux faked.
 
   python3 -m unittest tools/v2/test_queue.py
 """
@@ -15,7 +15,7 @@ from typing import Protocol
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parents[1] / "python" / "typed-input" / "src"))
+sys.path.insert(0, str(HERE.parent / "typed-input" / "src"))
 
 # Loaded by path under another name: `tools/v2` on sys.path would shadow the stdlib's `queue`.
 _spec = importlib.util.spec_from_file_location("lane_queue", HERE / "queue.py")
@@ -32,6 +32,7 @@ class Queue(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = tempfile.TemporaryDirectory()
         self.root = self.scratch.name
+        (Path(self.root) / "queue").mkdir()
         self.clock = T0
         self.patches = [
             mock.patch.object(q, "now", lambda: self.clock),
@@ -46,7 +47,7 @@ class Queue(unittest.TestCase):
         self.scratch.cleanup()
 
     def cmd(self, **fields: object) -> object:
-        return q.parse(q.COMMANDS[str(fields["command"])], json.dumps({**fields, "root": self.root}), "test")
+        return q.parse(q.COMMANDS[str(fields["command"])], json.dumps({**fields, "queue": str(Path(self.root) / "queue")}), "test")
 
     def add(self, owner: str = "link", what: str = "make `Patch` 16 bytes") -> str:
         r = q.add(self.cmd(command="add", from_lane="cargo-next3", owner=owner, what=what, paths=["Cargo.toml"]))
@@ -55,7 +56,7 @@ class Queue(unittest.TestCase):
     def test_add_writes_one_file_per_request_with_lanes_normalized(self) -> None:
         a, b = self.add(), self.add(owner="link-next4")
         self.assertEqual((a, b), ("00001", "00002"))
-        stored = json.loads((Path(self.root) / "v2/queue/00002.json").read_text())
+        stored = json.loads((Path(self.root) / "queue/00002.json").read_text())
         self.assertEqual(stored["owner"], "link")
         self.assertEqual(stored["from_lane"], "cargo")
         self.assertEqual(stored["state"], "open")
@@ -201,17 +202,19 @@ class Import(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = tempfile.TemporaryDirectory()
         self.root = Path(self.scratch.name)
-        (self.root / "v2/requests").mkdir(parents=True)
-        (self.root / "v2/requests/cargo.md").write_text(REQUESTS)
-        (self.root / "v2/requests/db.md").write_text("Make `crates/hir-def/src/lib.rs` smaller.\n")
+        (self.root / "docs/v2/requests").mkdir(parents=True)
+        (self.root / "docs/v2/requests/cargo.md").write_text(REQUESTS)
+        (self.root / "docs/v2/requests/db.md").write_text("Make `crates/hir-def/src/lib.rs` smaller.\n")
         made = datetime(2026, 10, 28, 12, 0, tzinfo=UTC).timestamp()
         for f in ("cargo.md", "db.md"):
-            os.utime(self.root / "v2/requests" / f, (made, made))
+            os.utime(self.root / "docs/v2/requests" / f, (made, made))
         lanes = self.root / "lanes"
         lanes.mkdir()
         for name in ("v2-frontend", "v2-link", "v2-requests"):
             (lanes / f"{name}.md").write_text("")
-        self.input: dict[str, object] = {"command": "import", "root": str(self.root), "lanes_from": [str(lanes)]}
+        (self.root / "queue").mkdir()
+        self.input: dict[str, object] = {
+            "command": "import", "tree": str(self.root), "queue": str(self.root / "queue"), "lanes_from": [str(lanes)]}
         self.patches = [
             mock.patch.object(q, "now", lambda: T0),
             mock.patch.object(q, "windows", lambda: [(3, "link-next1")]),
@@ -231,12 +234,12 @@ class Import(unittest.TestCase):
         added = self.run_import()
         got = {r.source: (r.from_lane, r.owner, r.paths) for r in added}
         self.assertEqual(got, {
-            "v2/requests/cargo.md#1. `crates/blaze-link/src/model.rs`: a field (2026-10-29 21:04)":
+            "docs/v2/requests/cargo.md#1. `crates/blaze-link/src/model.rs`: a field (2026-10-29 21:04)":
                 ("cargo", "link", ("crates/blaze-link/src/model.rs",)),
-            "v2/requests/cargo.md#frontend: one database for `crates/blaze-cargo/src/serve/daemon.rs`":
+            "docs/v2/requests/cargo.md#frontend: one database for `crates/blaze-cargo/src/serve/daemon.rs`":
                 ("frontend", "cargo", ("crates/blaze-cargo/src/serve/daemon.rs",)),
-            "v2/requests/cargo.md#5. Taken but not finished": ("cargo", "requests", ()),
-            "v2/requests/db.md#": ("db", "coordinator", ("crates/hir-def/src/lib.rs",)),
+            "docs/v2/requests/cargo.md#5. Taken but not finished": ("cargo", "requests", ()),
+            "docs/v2/requests/db.md#": ("db", "coordinator", ("crates/hir-def/src/lib.rs",)),
         })
         first = next(r for r in added if r.owner == "link")
         self.assertEqual([r.id for r in added], ["00001", "00002", "00003", "00004"])
@@ -244,7 +247,7 @@ class Import(unittest.TestCase):
         self.assertEqual(first.created, q.stamp(datetime.fromisoformat("2026-10-29T21:04").astimezone()))
         self.assertEqual(next(r for r in added if r.from_lane == "db").created, "2026-10-28T12:00:00Z")
         self.assertIn("### Part a", next(r for r in added if r.from_lane == "frontend").what)
-        self.assertEqual(len(list((self.root / "v2/queue").glob("*.json"))), 4)
+        self.assertEqual(len(list((self.root / "queue").glob("*.json"))), 4)
 
     def test_import_twice_adds_nothing(self) -> None:
         self.run_import()
@@ -253,7 +256,7 @@ class Import(unittest.TestCase):
     def test_dry_run_writes_nothing(self) -> None:
         self.input["dry_run"] = True
         self.assertEqual(len(self.run_import()), 4)
-        self.assertEqual(list((self.root / "v2/queue").glob("*.json")), [])
+        self.assertEqual(list((self.root / "queue").glob("*.json")), [])
 
 
 if __name__ == "__main__":

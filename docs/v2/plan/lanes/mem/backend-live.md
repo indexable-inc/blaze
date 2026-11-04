@@ -9,7 +9,7 @@ date: 2026-10-29
 A child of [backend.md](backend.md), under lane mem's plan
 ([../../design/memory.md](../../design/memory.md)). Paths: `blaze-splice`, `blaze-in-place`
 (written here), `blaze-live` and `blaze-lazy` (requested of their holders in
-`v2/requests/mem-backend-live.md`). `blaze-tier` does not exist in the tree.
+`docs/v2/requests/mem-backend-live.md`). `blaze-tier` does not exist in the tree.
 
 ## By lifetime
 

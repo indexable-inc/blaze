@@ -27,7 +27,7 @@
 //! listen naming it otherwise. Nothing is made in its place.
 //!
 //! A server that listens on nothing takes requests from its own process instead
-//! ([`Config::local`]): the seed's one-shot build (todo/bootstrap/plan.md), whose CLI runs the
+//! ([`Config::local`]): the seed's one-shot build (docs/future/bootstrap.md), whose CLI runs the
 //! daemon's engine in process. Its connections ([`Server::open_local`]) speak the Unix socket's
 //! frames both ways, handed in ([`Server::send_local`]) and taken out ([`Server::take_local`])
 //! by the caller rather than received and sent through the driver.

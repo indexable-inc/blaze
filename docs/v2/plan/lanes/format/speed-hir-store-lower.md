@@ -75,4 +75,4 @@ built once and moved, never cloned. Source maps are append-only and sorted once 
 - `expander.rs` allocates nothing per node (it clones a parse's green-tree `Arc` per expansion);
   nothing to change.
 - The builder API lowering calls is requested from speed-hir-store-core
-  (`v2/requests/speed-hir.md`, "for speed-hir-store-core (from speed-hir-store-lower)").
+  (`docs/v2/requests/speed-hir.md`, "for speed-hir-store-core (from speed-hir-store-lower)").

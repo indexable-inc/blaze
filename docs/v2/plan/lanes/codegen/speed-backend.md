@@ -28,16 +28,16 @@ part names the tests and measurements the coordinator's first build should run.
 - **Dev code speed against cargo debug on ripgrep**: the two largest open shares are not in
   these paths. A v2 unit builds no `#[inline(always)]` callee in (devspeed request 6, the
   adapter's unit key), and std's non-generic code is built at `opt_level=none` (requested of
-  the lead in `v2/requests/codegen.md`: a level in `Backend::Cranelift` and the level in the
+  the lead in `docs/v2/requests/codegen.md`: a level in `Backend::Cranelift` and the level in the
   key).
 - **x86-64 SIMD past SSE2** (`pshufb` in Teddy, SSE4, AVX2 shuffles): the process has one
   Cranelift ISA, built at the target's baseline. It needs a per-function ISA from
-  `#[target_feature]`, filed in `v2/requests/speed.md`. Vector reductions on NEON
+  `#[target_feature]`, filed in `docs/v2/requests/speed.md`. Vector reductions on NEON
   (`umaxv`) need Cranelift ops of their own (vendor cranelift-codegen, also filed there).
 - **Thunks of a fold** are a call and a return, not a jump: Cranelift has sibling calls only
-  under its `tail` convention (`v2/requests/codegen.md` section 5).
+  under its `tail` convention (`docs/v2/requests/codegen.md` section 5).
 - **Release imports** are written to bitcode and parsed again in every importer. It needs
-  `emit` scheduled on the thread that ran `summarize` (`v2/requests/codegen-release.md` 3,
+  `emit` scheduled on the thread that ran `summarize` (`docs/v2/requests/codegen-release.md` 3,
   the driver's).
 - **v2's unwind conversion** writes and parses a whole `.eh_frame` with its CIE per function
   (`v2/unwind.rs`, the adapter's; requested by debug).
