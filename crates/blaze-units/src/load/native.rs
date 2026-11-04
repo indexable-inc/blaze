@@ -23,7 +23,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use blaze_manifest::Files;
+use blaze_manifest::files::Files;
 use serde::Deserialize;
 
 use crate::query::{LoadError, NativeInput};
@@ -303,7 +303,8 @@ fn read_pin<F: Files>(
     let bad = bad_pin(input, manifest);
     // Plain matches, not `map_err`/`ok_or_else` chains: stage 0 (0.20261030.1) can't resolve
     // those methods here; return to the chains after the next stage-0 promotion.
-    let bytes = match files.read(Path::new(&input.pin)) {
+    let pin_path = Path::new(&input.pin);
+    let bytes = match files.read(pin_path) {
         Ok(it) => it,
         Err(error) => return Err(bad(format!("can't be read: {error}"))),
     };

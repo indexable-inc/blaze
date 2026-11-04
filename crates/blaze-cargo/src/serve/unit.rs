@@ -1014,7 +1014,7 @@ impl Writer<Real> for UnitWriter {
         deps::served(self.front.db(), &self.job, &self.session)
     }
 
-    fn ran(&self) -> blaze_query::db::Taken {
+    fn run_log(&self) -> blaze_query::db::Taken {
         blaze_query::db::take_log_in(self.front.db())
     }
 

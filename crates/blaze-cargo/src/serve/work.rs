@@ -780,7 +780,7 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// engine logged of why its queries ran since the last take, each memo and input named
     /// with the database in hand ([`blaze_query::db::take_log_in`]); none for a front end
     /// with no database, and while the run log is off.
-    fn ran(&self) -> blaze_query::db::Taken {
+    fn run_log(&self) -> blaze_query::db::Taken {
         blaze_query::db::Taken::default()
     }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with

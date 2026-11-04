@@ -2339,7 +2339,7 @@ impl<S: Steps> Job<S> {
         // Its front end's run log, named with its database in hand, before the front end is
         // kept or dropped: why each of its queries ran again.
         let provenance = match &self.stage {
-            Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.ran()),
+            Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.run_log()),
             _ => Vec::new(),
         };
         let mut errors = std::mem::take(&mut self.panics);
@@ -3724,9 +3724,15 @@ impl<S: Steps> Jobs<S> {
                     // A path read where it is must be outside what blaze keeps itself: one
                     // under its sources or its agents' views is a source fetched or a view
                     // mounted, and a load asking for it there is a bug, said, never read past.
-                    if let FetchKind::Local { .. } = fetch.kind
-                        && let Some(kept) = [&self.setup.sources, &self.setup.views].into_iter().find(|it| under(&fetch.at, it))
-                    {
+                    // Owned, so no borrow of `self` outlives the check into the `end` below.
+                    let kept = match fetch.kind {
+                        // clone: an error's text, only when it is under one
+                        FetchKind::Local { .. } => {
+                            [&self.setup.sources, &self.setup.views].into_iter().find(|it| under(&fetch.at, it)).cloned()
+                        }
+                        _ => None,
+                    };
+                    if let Some(kept) = kept {
                         let error = ApiError::new(
                             // alloc: an error, once
                             format!("the load asked to read {} where it is on the disk, but it is under {kept}, which blaze keeps and mounts itself", fetch.at),

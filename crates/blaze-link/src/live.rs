@@ -53,13 +53,20 @@ pub fn descriptor_of(bytes: &[u8]) -> Result<Descriptor, String> {
         Err(it) => return Err(format!("reading the image's exports: {it}")),
     };
     let mut at = None;
-    for export in &exports {
-        let it = export.name();
+    for export in exports {
+        let export = match export {
+            Ok(it) => it,
+            Err(it) => return Err(format!("reading the image's exports: {it}")),
+        };
+        let object::read::NameOrOrdinal::Name(it) = export.name() else { continue };
         if it.len() == prefix.len() + name.len()
             && it.starts_with(prefix.as_bytes())
             && it.ends_with(name.as_bytes())
         {
-            at = Some(export.address());
+            let object::read::ExportTarget::Address { address } = export.target() else {
+                return Err(format!("the image exports {DESCRIPTOR} as no address in it"));
+            };
+            at = Some(address);
             break;
         }
     }
