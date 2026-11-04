@@ -560,6 +560,7 @@ impl Graph {
         assert!(self.jobs[j].life == Life::Live, "job {} ended while not live", job.0);
         assert!(self.jobs[j].wait == Target::None, "job {} ended while it waits", job.0);
         assert!(self.jobs[j].scope == NONE, "job {} ended inside a scope", job.0);
+        self.refuse_ending_a_flight(job);
         self.jobs[j].life = Life::Done;
         let head = std::mem::replace(&mut self.jobs[j].waiters, NONE);
         self.drain(head, woken);
@@ -583,6 +584,25 @@ impl Graph {
                     self.free_counter(counter);
                 }
             }
+        }
+    }
+
+    /// A pump run's flight ([`crate::pump`]) is ended by its run's end alone, which writes
+    /// every waiter its end first: the job that runs it ends it before the job itself ends,
+    /// even as it unwinds. So a job that ends still holding one ran under an id its run word
+    /// did not name (a flight claimed for the wrong job), and ending it here would wake each
+    /// waiter to find no end written. Refused here, where the cause is, naming both.
+    fn refuse_ending_a_flight(&self, job: JobId) {
+        let mut claim = self.jobs[job.0 as usize].claims;
+        while claim != NONE {
+            let key = &self.key_name[claim as usize];
+            assert!(
+                !crate::pump::is_flight(key),
+                "job {} ended holding the pump flight {key:?}, which only its run's end may end: the flight was \
+                 claimed for a job that does not run it (its waiters would wake with no end written)",
+                job.0,
+            );
+            claim = self.key_next_claim[claim as usize];
         }
     }
 

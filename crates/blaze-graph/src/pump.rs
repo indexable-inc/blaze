@@ -326,12 +326,20 @@ fn claim_flight(runner: u64, scope: Option<CounterId>) -> u64 {
 /// starts while the last one's waiters are being woken never finds its flight taken.
 static FLIGHTS: AtomicU64 = AtomicU64::new(1);
 
+/// The tag in the last 24 bytes of every flight key: no content hash's.
+const FLIGHT_TAG: &[u8; 24] = b"a run's flight, of pump.";
+
 /// The scheduler's key of flight `number`: no content hash's.
 fn flight(number: u64) -> Key {
     let mut key = [0u8; 32];
     key[..8].copy_from_slice(&number.to_le_bytes());
-    key[8..].copy_from_slice(b"a run's flight, of pump.");
+    key[8..].copy_from_slice(FLIGHT_TAG);
     Key(key)
+}
+
+/// Whether `key` is a run's flight ([`flight`]), which only that run's end may end.
+pub(crate) fn is_flight(key: &Key) -> bool {
+    key.0[8..] == *FLIGHT_TAG
 }
 
 /// Keeps a linked [`Waiter`] in place until its run is done with it: dropped before the run
@@ -511,7 +519,10 @@ fn wait<V>(
         return Err(give_way());
     }
     Ok(waiter.ended().unwrap_or_else(|| {
-        unreachable!("a wait on a run's flight ended before the run wrote its waiters")
+        unreachable!(
+            "a wait on the flight {flight:?} of the run of key {} ended before the run wrote its waiters",
+            hex(&key)
+        )
     }))
 }
 
