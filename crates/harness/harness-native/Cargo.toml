@@ -32,7 +32,7 @@ harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
 harness-native-ui-prims = { path = "../harness-native-ui-prims" }
 harness-native-ui-view = { path = "../harness-native-ui-view" }
-hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["pipeline", "script"] }
+hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script"] }
 harness-vt = { path = "../harness-vt" }
 harness-ghostty-config = { path = "../harness-ghostty-config" }
 serde_json = "1"

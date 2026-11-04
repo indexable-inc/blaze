@@ -194,8 +194,8 @@ pub mod flecs {
         Inherit,
         /// `(OnInstantiate, DontInherit)`: a prefab's instances do not get it.
         DontInherit,
-        /// `(OnInstantiate, Override)`: a prefab's instances copy it (the default).
-        Override,
+        /// `(OnInstantiate, Copy)`: a prefab's instances copy it (the default; `Override` before flecs 4.2).
+        Copy,
         /// Stable storage, no table move on add or remove.
         Sparse,
         /// Does not fragment tables (implies Sparse; no `target_for`, inheritance or Or/Optional terms).

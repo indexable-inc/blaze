@@ -118,7 +118,7 @@ pub fn field_ok(it: &sys::ecs_iter_t, index: i8, built: usize, what: &str) -> bo
     // SAFETY: valid iterator.
     let id = unsafe { sys::ecs_field_id(it, index) };
     // SAFETY: the real world of the iterator.
-    let w = unsafe { World::from_raw(it.real_world.cast()) };
+    let w = unsafe { World::from_raw(it.world.cast()) };
     report(w, id, have, built, what);
     false
 }
