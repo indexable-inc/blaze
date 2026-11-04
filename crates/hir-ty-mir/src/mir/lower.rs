@@ -715,7 +715,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             Some((last, rest)) => match &last.kind {
                 Adjust::NeverToAny => {
                     let temp = self.temp(self.types.types.never, current, MirSpan::Unknown)?;
-                    self.lower_expr_to_place_with_adjust(expr_id, temp.into(), current, rest)
+                    if let Some(block) = self.lower_expr_to_place_with_adjust(expr_id, temp.into(), current, rest)? {
+                        // A place of type `!` can still lower to a copy. Evaluating that
+                        // value cannot continue, and it never initializes `place`.
+                        self.set_terminator(block, TerminatorKind::Unreachable, expr_id.into());
+                    }
+                    Ok(None)
                 }
                 Adjust::Deref(_) => {
                     let Some((p, current)) =
@@ -1559,6 +1564,14 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.resolver.reset_to_guard(resolver_guard);
                 if self.is_unterminated(current) {
                     self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
+                }
+                if let Some(block) = end
+                    && self.is_uninhabited(expr_id)
+                {
+                    // `?` is a match too: when its output is an empty enum, no arm can
+                    // produce a value and execution cannot reach the following binding.
+                    self.set_terminator(block, TerminatorKind::Unreachable, expr_id.into());
+                    end = None;
                 }
                 match (temporaries, end) {
                     (Some(temporaries), Some(end)) => {
