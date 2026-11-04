@@ -90,17 +90,10 @@ prefab hn.Selection : ui.Node {
 
 // The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a chevron on hover;
 // pressed, the Archive pane (hn.ArchivePane) takes the main card.
-prefab hn.ArchiveRow : ui.Row {
-  Pressable
+prefab hn.ArchiveRow : ui.IconButton {
   Action: {name: "archive:open"}
   Tooltip: {text: "Archive"}
   Fill: $tone_clear
-  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
-  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   // On the row's hover the box rises and grows (on the row's HoverAmt spring); when an object is archived it bounces.
   icon : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}

@@ -94,6 +94,21 @@ prefab ui.Button : ui.Row, Wash {
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
 }
 
+// An icon button: a square that hugs its one symbol, its hover and press wash on the square only (never the row it
+// sits in), with an optional Tooltip. Children: `icon : ui.Symbol`.
+prefab ui.IconButton : ui.Row, Wash {
+  Pressable
+  Action: {name: ""}
+  Cursor: {shape: Hand}
+  AlignSelf: {align: Start}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+}
+
 // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
 prefab ui.Toggle : ui.Button {
   OnLook: {dark: $tone_switch_on.dark, light: $tone_switch_on.light}
