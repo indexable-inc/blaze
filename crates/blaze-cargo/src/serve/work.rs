@@ -745,7 +745,7 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// engine logged of why its queries ran since the last take, each memo and input named
     /// with the database in hand ([`blaze_query::db::take_log_in`]); none for a front end
     /// with no database, and while the run log is off.
-    fn ran(&self) -> blaze_query::db::Taken {
+    fn run_log(&self) -> blaze_query::db::Taken {
         blaze_query::db::Taken::default()
     }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
@@ -975,6 +975,9 @@ pub struct RunPuts {
     pub retracted: bool,
     /// Why a run was not reused, for `blaze why`: handed to its job's misses with its puts.
     pub misses: Vec<blaze_kernel::Miss>,
+    /// The tests a run finished, for the history's `test_runs` table: handed to its job with
+    /// its puts, which gives them its build id as it ends.
+    pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
 }
 
 impl RunPuts {
@@ -998,5 +1001,6 @@ impl RunPuts {
         self.tickets.extend(&other.tickets);
         self.retracted |= other.retracted;
         self.misses.extend(other.misses);
+        self.test_runs.extend(other.test_runs);
     }
 }

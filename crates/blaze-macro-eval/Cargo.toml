@@ -35,6 +35,8 @@ hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
 intern.workspace = true
+# Names a proc macro's machine code in CPU samples (`ix_prof::jit`).
+ix-prof.workspace = true
 blaze-lower.workspace = true
 parser.workspace = true
 proc-macro-api.workspace = true

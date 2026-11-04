@@ -2,11 +2,12 @@
 -- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`, and
 -- `span_sums` over `spans` and `folded`.
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
--- that table's files, `['<dir>/<file>.<table>.parquet', ...]`, each named (never a glob): the
--- files of the history's directory a reader's pin holds (`history::Pin`) and, with `--live`, the
--- recorder's last seconds beside it. Each directory holds an empty `schema.<table>.parquet` of
--- every table, so each list holds a file with every column: the reader writes those a history
--- older than the table lacks (`history::ensure_schemas`).
+-- that table's files the history's manifest lists (`history/manifest.rs`), all of them or
+-- those that can hold one build's rows: `['<dir>/schema.<table>.parquet', '<dir>/<file>', ...]`.
+-- The list leads with the table's empty `schema.<table>.parquet`, which has every column, so
+-- each view resolves with no file of its own: the reader writes those a history older than the
+-- table lacks (`history::ensure_schemas`). No glob: a glob read a merge's output beside its
+-- inputs.
 
 CREATE OR REPLACE VIEW spans AS
 SELECT * FROM read_parquet(@spans, union_by_name = true);
@@ -16,10 +17,23 @@ SELECT * FROM read_parquet(@counters, union_by_name = true);
 
 -- One row a build: a build has a row as it starts (outcome `running`, no `dur_ns`) and another
 -- as it ends, with the same `started_ns`, and the view keeps the end's. A build with only its start's row never ended: it
--- runs, or its daemon died (`history::writes` tells which).
+-- runs, or its daemon died (`history::writes` tells which). A build whose daemon died with its flight recorder persisted
+-- has an end row of outcome `crashed`, written by the postmortem (`flight::postmortem`), to the last row read back. Once
+-- its client sent its rows the end's row is written again with `client_started_ns` and `client_ended_ns`, and the view
+-- keeps that one.
 CREATE OR REPLACE VIEW builds AS
 SELECT * FROM read_parquet(@builds, union_by_name = true)
-QUALIFY row_number() OVER (PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST) = 1;
+QUALIFY row_number() OVER (
+    PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST, client_ended_ns DESC NULLS LAST
+) = 1;
+
+-- One row a child process blaze spawned and reaped, with its own CPU, memory and faults.
+CREATE OR REPLACE VIEW processes AS
+SELECT * FROM read_parquet(@processes, union_by_name = true);
+
+-- One row a test a build ran.
+CREATE OR REPLACE VIEW test_runs AS
+SELECT * FROM read_parquet(@test_runs, union_by_name = true);
 
 CREATE OR REPLACE VIEW samples AS
 SELECT * FROM read_parquet(@samples, union_by_name = true);
@@ -46,8 +60,56 @@ SELECT * FROM read_parquet(@switches, union_by_name = true);
 CREATE OR REPLACE VIEW events AS
 SELECT * FROM read_parquet(@events, union_by_name = true);
 
+-- One row a field of a kept event other than its message, its value in the column `kind` names
+-- (i64, u64, f64, bool or str); `process` and `event_id` name its event, as in `events`. A file
+-- of schema version 4 or older has no rows here: its fields are in its events' `message`.
+CREATE OR REPLACE VIEW event_fields AS
+SELECT * FROM read_parquet(@event_fields, union_by_name = true);
+
+-- `event_fields` with every value as text (`value_text`) and an integer one, i64 or u64, as one
+-- HUGEINT (`value_int`): what a filter on a field reads without knowing its kind.
+CREATE OR REPLACE VIEW event_values AS
+SELECT
+    build_id, process, event_id, ordinal, key, kind, value_i64, value_u64, value_f64, value_bool, value_str,
+    coalesce(CAST(value_i64 AS HUGEINT), CAST(value_u64 AS HUGEINT)) AS value_int,
+    coalesce(CAST(value_i64 AS VARCHAR), CAST(value_u64 AS VARCHAR), CAST(value_f64 AS VARCHAR),
+        CAST(value_bool AS VARCHAR), value_str) AS value_text
+FROM event_fields;
+
+-- `events` with each one's fields beside it: `fields` all of them as `key=value` text in the
+-- order the event recorded them (null for none), then the keys blaze's events say most as
+-- columns of their own, as text (null where the event has no field of that key). Every other
+-- key is in `event_values`.
+CREATE OR REPLACE VIEW events_wide AS
+SELECT
+    events.*, said.fields, said.unit, said.image, said.path, said.dir, said.what, said.why,
+    said.error, said.outcome, said.step, said.bytes
+FROM events
+LEFT JOIN (
+    SELECT
+        process, event_id,
+        string_agg(key || '=' || coalesce(value_text, '?'), ' ' ORDER BY ordinal) AS fields,
+        max(value_text) FILTER (WHERE key = 'unit') AS unit,
+        max(value_text) FILTER (WHERE key = 'image') AS image,
+        max(value_text) FILTER (WHERE key = 'path') AS path,
+        max(value_text) FILTER (WHERE key = 'dir') AS dir,
+        max(value_text) FILTER (WHERE key = 'what') AS what,
+        max(value_text) FILTER (WHERE key = 'why') AS why,
+        max(value_text) FILTER (WHERE key = 'error') AS error,
+        max(value_text) FILTER (WHERE key = 'outcome') AS outcome,
+        max(value_text) FILTER (WHERE key = 'step') AS step,
+        max(value_int) FILTER (WHERE key = 'bytes') AS bytes
+    FROM event_values
+    GROUP BY process, event_id
+) AS said
+    ON said.process = events.process AND said.event_id = events.event_id;
+
 CREATE OR REPLACE VIEW errors AS
 SELECT * FROM read_parquet(@errors, union_by_name = true);
+
+-- Each panic and fatal signal of a blaze process, with its stack (`kind` panic or signal).
+CREATE OR REPLACE VIEW panics AS
+SELECT * FROM read_parquet(@panics, union_by_name = true);
 
 CREATE OR REPLACE VIEW links AS
 SELECT * FROM read_parquet(@links, union_by_name = true);
@@ -85,6 +147,11 @@ SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
 -- (`folded_spans`, `folded_ns`).
 CREATE OR REPLACE VIEW folded AS
 SELECT * FROM read_parquet(@folded, union_by_name = true);
+
+-- The code images samples' and panics' `stack_pcs` are in, one row an image a process (once it held an
+-- address a flush wrote): which file, its build id and BLAKE3, and where it was loaded.
+CREATE OR REPLACE VIEW images AS
+SELECT * FROM read_parquet(@images, union_by_name = true);
 
 -- Every span, as a row of `spans` (`runs` 1) or as a sum of `folded` (`runs` its spans): what a
 -- count, total or longest by name, query kind or thread reads, so the folded ones are counted.
@@ -189,3 +256,25 @@ SELECT
     self_cpu_ns, alloc_bytes, allocs
 FROM spans
 WHERE function IS NOT NULL AND query_kind IS NULL;
+
+-- One row a span name a build: the per-build summary CI keeps for each self-build (`blaze debug
+-- gate --summary`, `harness/profile_gate.py`) and `slower_between_commits` compares across
+-- builds. Its rows are `spans`' alone, so a name only `folded` holds is missing. The one place it
+-- is defined: a stored summary written with the build keeps these names and columns.
+CREATE OR REPLACE VIEW build_summary AS
+SELECT
+    spans.build_id AS build_id,
+    any_value(builds.commit) AS commit,
+    any_value(builds.tree) AS tree,
+    any_value(builds.blaze) AS blaze,
+    any_value(builds.started_unix_ns) AS started_unix_ns,
+    any_value(builds.dur_ns) AS build_dur_ns,
+    any_value(builds.outcome) AS outcome,
+    spans.name AS name,
+    count(*) AS runs,
+    median(spans.dur_ns) AS median_ns,
+    sum(spans.dur_ns) AS total_ns,
+    sum(spans.self_cpu_ns) AS self_cpu_ns
+FROM spans
+JOIN builds ON builds.build_id = spans.build_id
+GROUP BY spans.build_id, spans.name;

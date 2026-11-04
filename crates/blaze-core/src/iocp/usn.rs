@@ -163,9 +163,7 @@ pub(super) fn parse(bytes: &[u8], records: &mut Vec<Record>) -> Result<i64, Stri
             3 => (u128_at(8), u128_at(24), 56),
             // alloc: an error path.
             _ => {
-                return Err(bad(&format!(
-                    "is of version {major}; versions 2 and 3 were asked for"
-                )));
+                return Err(bad(&format!("is of version {major}; versions 2 and 3 were asked for")));
             }
         };
         let u32_at = |at| word::<4>(record, at).map(u32::from_le_bytes);

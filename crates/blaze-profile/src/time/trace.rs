@@ -1,7 +1,7 @@
 //! The model as Chrome trace events (ui.perfetto.dev): a track per fiber with its jobs' runs,
 //! parks and queueing as slices, a track per core with the runs on it, a flow arrow from
 //! each waker's slice to the run its wake resumed, and each kept `tracing` event as an instant
-//! on its job's track. `trace.json` (crate::chrome) puts these
+//! on its job's track. The flight dump (crate::dump::chrome) puts these
 //! beside the threads' spans; `blaze debug time --trace` writes them alone.
 
 use serde_json::{Value, json};
@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::{LaneId, Model, State, report};
 
 /// The track id of a fiber's lane, beside a thread's own (its id), its steps (1 << 32) and
-/// its samples (2 << 32) in crate::chrome.
+/// its samples (2 << 32) in crate::dump::chrome.
 pub const FIBER_TRACK: u64 = 3 << 32;
 /// The track id of a core.
 pub const CORE_TRACK: u64 = 4 << 32;
@@ -107,12 +107,20 @@ pub fn events(model: &Model, us: impl Fn(i64) -> f64) -> Vec<Value> {
     out
 }
 
-/// An event as an instant on the track `tid`: `WARN no unit's step ended for 60 s`.
-fn instant(it: &super::EventIn, tid: u64, ts: f64) -> Value {
-    let message = it.message.as_deref().unwrap_or("(its text was let go)");
+/// An event as an instant on the track `tid`: `WARN no unit's step ended for 60 s unit=serde`,
+/// its fields typed in its args beside what correlates it (build, job, span, its id).
+pub(crate) fn instant(it: &super::EventIn, tid: u64, ts: f64) -> Value {
+    // alloc: an event's fields, once an event a trace
+    let fields: serde_json::Map<String, Value> = it
+        .fields
+        .iter()
+        // clone: a field's key, once an event a trace
+        .map(|(key, value)| (key.clone(), value.json()))
+        .collect();
     // alloc: an instant's name, once an event a trace
-    json!({"ph": "i", "s": "t", "name": format!("{} {message}", it.level), "cat": "event", "pid": it.process, "tid": tid, "ts": ts,
-        "args": {"level": it.level, "target": it.target, "callsite": it.name, "message": it.message, "job": it.job, "span": it.span}})
+    json!({"ph": "i", "s": "t", "name": format!("{} {}", it.level, it.said()), "cat": "event", "pid": it.process, "tid": tid, "ts": ts,
+        "args": {"level": it.level, "target": it.target, "callsite": it.name, "message": it.message, "fields": fields,
+            "build": it.build, "job": it.job, "span": it.span, "event_id": it.event_id}})
 }
 
 /// The fiber tracks of a flight read, for `trace.json` beside its threads' spans, with its

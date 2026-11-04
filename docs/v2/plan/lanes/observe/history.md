@@ -87,8 +87,9 @@ for each table (`spans`, `counters`, `builds`, `samples`, `provenance`, `inputs`
 - `job_spans`: `spans` with the `job` running on the span's thread when it began (an ASOF join
   on `switches`), which the explorer's per-job lane draws from.
 
-`views::prelude(&[dir, ...])` fills in each `@<table>` with the list of globs, one per
-directory. That is the history's directory, plus the live window's directory with `--live`.
+`views::prelude(dir, manifest, scope)` fills in each `@<table>` with the table's schema file and
+the files the history's manifest lists (all, or one build's). Until 2026-11-04 it was a glob a
+directory, plus the live window's directory with `--live`; see docs/profiling.md, "The manifest".
 
 `sql/examples.sql` holds the named queries, each a `-- name:` line, a `-- says:` line, then its
 SQL. `views::VIEWS` cuts them out at compile time, so a missing section is a compile error.
@@ -118,8 +119,8 @@ view's arguments as JSON Schema (`views::args_schema`).
 DuckDB's CLI has no Arrow IPC output without an extension, so the answer goes through a Parquet
 file. If DuckDB refuses the query, the result is `SqlError::Duckdb` with DuckDB's own message,
 the query and the script, and the scratch directory is kept so the script can be read.
-`sql::run_live(query, window)` first writes the recorder's last `window` as
-`live.<table>.parquet` (`history::write_live`), then queries it beside the history.
+`sql::run_live` and `history::write_live` (the recorder's last seconds beside the history) are
+gone since 2026-11-04: a reader asks the daemon to flush first (`blaze_api::Request::Flush`).
 
 ## Errors as rows
 
@@ -214,4 +215,4 @@ and the bytes a span takes. Not measured yet: lanes don't build.
   - the script installs nothing and wraps one query in `COPY`;
   - a DuckDB that is not an absolute path is an error;
   - an `#[ignore]` test, with `BLAZE_DUCKDB` naming the pinned CLI, runs every view and
-    `--live` over a flushed history, and checks DuckDB's own message on a bad query.
+    one build's scope over a flushed history, and checks DuckDB's own message on a bad query.

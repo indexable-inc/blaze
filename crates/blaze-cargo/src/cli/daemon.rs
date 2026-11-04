@@ -604,7 +604,14 @@ pub struct Died {
     /// ([`blaze_profile::reading::last`]), for a daemon that is gone: `Ok(None)` where the
     /// history holds none, the error where it could not be read.
     pub inside: Result<Option<blaze_profile::reading::Reading>, String>,
+    /// The fatal signal it recorded as it died, with the faulting thread's stack
+    /// ([`blaze_profile::crash`]), for a daemon that is gone: `Ok(None)` where it left no record
+    /// of one, the error where the record was refused or could not be read.
+    pub crash: Result<Option<blaze_profile::panics::PanicRow>, String>,
 }
+
+/// How many frames of a dead daemon's crash record the CLI names.
+const CRASH_FRAMES: usize = 12;
 
 /// How many threads of a dead daemon's last reading the CLI names.
 const INSIDE_THREADS: usize = 16;
@@ -675,6 +682,28 @@ impl std::fmt::Display for Died {
             )?,
             Err(why) => write!(f, "\nwhat its threads were inside is unread: {why}")?,
         }
+        match &self.crash {
+            Ok(Some(row)) => {
+                write!(
+                    f,
+                    "\nits crash record: {} on thread {} (tid {})",
+                    row.message.as_deref().unwrap_or("a fatal signal"),
+                    row.thread_name,
+                    row.thread
+                )?;
+                if let Some(at) = &row.location {
+                    write!(f, ", its last panic at {at}")?;
+                }
+                for frame in blaze_profile::panics::top_frames(&row.stack, CRASH_FRAMES) {
+                    write!(f, "\n  at {frame}")?;
+                }
+                if !row.open_spans.is_empty() {
+                    write!(f, "\n  inside {}", row.open_spans.join(" > "))?;
+                }
+            }
+            Ok(None) => {}
+            Err(why) => write!(f, "\nits crash record is unread: {why}")?,
+        }
         Ok(())
     }
 }
@@ -712,7 +741,7 @@ pub fn died() -> anyhow::Result<Died> {
         .with_context(|| format!("reading the end of the daemon's log {}", log.display()))?;
     let text = String::from_utf8_lossy(&bytes); // alloc: as above, where the log is not UTF-8
     let Some((pid, said)) = last_start(&text) else {
-        return Ok(Died { log, ended: None, said: Vec::new(), inside: Ok(None) }); // alloc: none, empty
+        return Ok(Died { log, ended: None, said: Vec::new(), inside: Ok(None), crash: Ok(None) }); // alloc: none, empty
     };
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
     let ended = crate::raw::process::ended_within(pid, ENDING)
@@ -722,14 +751,17 @@ pub fn died() -> anyhow::Result<Died> {
         (true, None) => Ended::Gone,
         (false, None) => Ended::Running,
     };
-    let inside = match ended {
-        Ended::Running => Ok(None),
+    let (inside, crash) = match ended {
+        Ended::Running => (Ok(None), Ok(None)),
         _ => {
             let history = blaze_profile::history::dir_in(&crate::serve::state()?);
-            blaze_profile::reading::last(&history, pid).map_err(|why| why.to_string())
+            (
+                blaze_profile::reading::last(&history, pid).map_err(|why| why.to_string()),
+                blaze_profile::crash::of_process(&history, pid).map_err(|why| why.to_string()),
+            )
         }
     };
-    Ok(Died { log, ended: Some((pid, ended)), said, inside })
+    Ok(Died { log, ended: Some((pid, ended)), said, inside, crash })
 }
 
 /// The last [`TAIL_BYTES`] of the daemon's log.
@@ -1252,6 +1284,7 @@ mod refusals {
             ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))),
             said,
             inside: Ok(None),
+            crash: Ok(None),
         };
         let text = died.to_string();
         assert!(
@@ -1285,6 +1318,7 @@ mod refusals {
             ended: Some((7, Ended::Gone)),
             said: Vec::new(),
             inside: Ok(Some(inside)),
+            crash: Ok(None),
         }
         .to_string();
         assert!(
@@ -1300,9 +1334,14 @@ mod refusals {
             "{killed}"
         );
         assert!(killed.contains("SIGKILL"), "{killed}");
-        let running =
-            Died { log, ended: Some((7, Ended::Running)), said: Vec::new(), inside: Ok(None) }
-                .to_string();
+        let running = Died {
+            log,
+            ended: Some((7, Ended::Running)),
+            said: Vec::new(),
+            inside: Ok(None),
+            crash: Ok(None),
+        }
+        .to_string();
         assert!(
             running.contains("still runs: it hung up on this request alone")
                 && !running.contains("SIGKILL"),

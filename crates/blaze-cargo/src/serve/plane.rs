@@ -36,7 +36,6 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use parking_lot::Mutex;
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
@@ -372,43 +371,20 @@ impl fmt::Display for Panic {
     }
 }
 
-/// The panics the hook saw and no task took yet, oldest first: (message, where).
-static RAISED: Mutex<VecDeque<(Option<String>, String)>> = Mutex::new(VecDeque::new());
-
-/// How many panics [`RAISED`] holds: a panic no task catches (a thread's own) is dropped
-/// once this many are newer.
-const RAISED_KEPT: usize = 64;
-
 /// Whether a task of `kind` is a part of a program's build: admitted by that program's own
 /// measure, and alone until it has one ([`Plane::push_program`]).
 const fn of_program(kind: TaskKind) -> bool {
     matches!(kind, kinds::PROGRAM | kinds::PROGRAM_LINK)
 }
 
-/// Has every panic of the process recorded where it was raised, for the task that catches it
-/// ([`Panic::at`]), then printed as before. Once, as the daemon starts; a later call does
-/// nothing, so the hook never wraps itself and records each panic once (tests call it each).
+/// Has every panic of the process recorded as it is raised, then printed as before: the one
+/// record of panics, `blaze_profile::panics`, whose ring the task that catches one reads where
+/// it was raised from ([`Panic::at`]) and the history writes as `panics` rows, each with its
+/// stack and whether a job caught it ([`in_a_job`]). Once, as the daemon starts; a later call
+/// does nothing, so the hook never wraps itself and records each panic once (tests call it
+/// each).
 pub fn record_panics() {
-    static RECORDING: std::sync::Once = std::sync::Once::new();
-    RECORDING.call_once(set_recording_hook);
-}
-
-fn set_recording_hook() {
-    let printed = std::panic::take_hook();
-    // alloc: the process's one panic hook
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(location) = info.location() {
-            let thread = std::thread::current();
-            let at = format!("{location} on thread {}", thread.name().unwrap_or("<unnamed>")); // alloc: a panic, once
-            let message = info.payload_as_str().map(str::to_owned); // alloc: a panic, once
-            let mut raised = RAISED.lock();
-            if raised.len() == RAISED_KEPT {
-                raised.pop_front();
-            }
-            raised.push_back((message, at));
-        }
-        printed(info);
-    }));
+    blaze_profile::panics::record(in_a_job);
 }
 
 /// Has an allocation the allocator could not make panic, naming its size, instead of aborting
@@ -484,12 +460,7 @@ pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     let message = stdx::panic_text(payload)
         .map(str::to_owned) // alloc: a panic, once
         .or_else(|| blaze_query::db::unwind_text(payload));
-    let mut raised = RAISED.lock();
-    let at = raised
-        .iter()
-        .rposition(|(it, _)| *it == message)
-        .and_then(|place| raised.remove(place))
-        .map(|(_, at)| at);
+    let at = blaze_profile::panics::claim(message.as_deref());
     Panic { message, at }
 }
 

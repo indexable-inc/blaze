@@ -762,7 +762,7 @@ fn name_row(ingredient: &'static str, id: blaze_query::db::Id, out: &mut String)
                     return false;
                 };
                 let file = text.file_id(db);
-                match db.path_for_file(file) {
+                match db.path_for_file(*file) {
                     Some(path) => _ = write!(out, "{path}"),
                     None => _ = write!(out, "{file:?}"),
                 }

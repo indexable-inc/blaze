@@ -2026,9 +2026,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
         match tls_directory(placed)? {
             TlsDirectory::Crt(addr) | TlsDirectory::Ours(addr) => check_start_hook(placed, addr)?,
             TlsDirectory::None => {
-                return Err(error(
-                    "a dev run's executable has no TLS directory for its start hook",
-                ));
+                return Err(error("a dev run's executable has no TLS directory for its start hook"));
             }
         }
         check_no_guard(placed)?;

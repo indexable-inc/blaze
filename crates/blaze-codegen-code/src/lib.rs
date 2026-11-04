@@ -2104,7 +2104,11 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
         let from = llvm_pin_path
             .as_ref()
             .map_or_else(|| "the shipped tree's".to_owned(), |it| it.display().to_string());
-        let pinned = pin::Pin::parse(json)
+        // The types written out and `refusal` called by its path: the stage 0 blaze's check
+        // (0.20261030) reads no `include!` from another package, so `pin`'s items are unknown to
+        // it, and a method of an unknown type is an error there. Plain again once the pinned
+        // release's check is the v2 front end, which reads it (`Db::resolve_path`).
+        let pinned: pin::Pin = pin::Pin::parse(json)
             .map_err(|why| format!("blaze's LLVM pin `{from}` can't be read: {why}"))?;
         if let Some(path) = llvm_pin_path {
             files.insert(path);
@@ -2117,7 +2121,7 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
             built_for.insert(tuple);
         }
         for tuple in built_for {
-            let sha =
+            let sha: Option<String> =
                 pin::pin_sha256(json, &tuple).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
             let released = sha.as_deref().map_or(&b"none"[..], str::as_bytes);
             let digest = digest_of(
@@ -2132,7 +2136,7 @@ fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Resul
                 Some(std::ffi::OsStr::new(prefix)),
                 std::env::consts::EXE_SUFFIX,
             )
-            .map_err(|found| pinned.refusal(&found))?;
+            .map_err(|found| pin::Pin::refusal(&pinned, &found))?;
             let prefix =
                 canonical(Path::new(prefix)).map_err(|why| format!("${LLVM_PREFIX}: {why}"))?;
             let marker = prefix.join(pin::PIN_MARKER);

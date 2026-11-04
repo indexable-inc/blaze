@@ -5,8 +5,9 @@
 //! named view of that history; and `blaze why`, what the last build computed again and why.
 //!
 //! `blaze debug sql` and `blaze explain` run the DuckDB [`observe::DUCKDB`] names, here in
-//! the CLI over the history's files; `--live` asks the daemon, whose flight recorder it reads
-//! too. Unset, they fail naming `nix run .#duckdb`: nothing looks for a DuckDB on `PATH`.
+//! the CLI over the history's files, after asking the daemon that writes the history to flush
+//! ([`history_source`]), so they read every row it recorded before they asked, each once.
+//! Unset, they fail naming `nix run .#duckdb`: nothing looks for a DuckDB on `PATH`.
 
 use std::{
     ffi::OsString,
@@ -20,7 +21,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
 use blaze_core::exit::Exit;
 use blaze_profile::{
-    history, live, slow, sql,
+    history, live, schema, slow, sql,
     time::{load, report::By},
     views,
 };
@@ -34,9 +35,10 @@ use crate::serve::observe;
 
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
-const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--live] [--last SECONDS] [--json] QUERY \
+const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
-                           [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE]";
+                           [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
+                           | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
@@ -115,6 +117,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("sql") => query(words.collect()),
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
+        Some("gate") => gate(words.collect()),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -330,6 +333,66 @@ fn slowed(words: Vec<OsString>) -> Result<(), Refusal> {
         .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
+/// `blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]`: the profile's gate
+/// (blaze_profile::gate) over a build of the history (the daemon's, or `--history`'s), each
+/// check's outcome printed, as JSON with `--json`; `--summary` writes the build's per-build
+/// summary (`build_summary`) as Parquet, after the verdict is printed. It exits non-zero unless
+/// every check passed (one that could not run fails it too) and the summary was written.
+fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str = "blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
+    let (mut build, mut dir, mut json, mut summary) = (None, None, false, None);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let mut next = |what: &str| {
+            words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes {what}")))
+        };
+        match word.as_str() {
+            "--build" => {
+                build =
+                    Some(next("a build id")?.parse::<u64>().map_err(|_| {
+                        Refusal::Usage(format!("{USAGE}: `--build` takes a build id"))
+                    })?);
+            }
+            "--history" => dir = Some(PathBuf::from(next("a history's directory")?)),
+            "--summary" => summary = Some(PathBuf::from(next("a Parquet file to write")?)),
+            "--json" => json = true,
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    let (duckdb, dir) = match dir {
+        Some(dir) => {
+            let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
+                format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
+            })?;
+            (duckdb, dir)
+        }
+        None => history_source()?,
+    };
+    let verdict =
+        blaze_profile::gate::check(&duckdb, &dir, build).map_err(|error| error.to_string())?;
+    let text = match json {
+        true => {
+            serde_json::to_string(&verdict)
+                .map_err(|error| format!("the gate's verdict as JSON: {error}"))?
+                + "\n"
+        }
+        false => verdict.to_string(),
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))?;
+    // After the verdict is printed, so a summary that fails to write never hides it.
+    if let Some(out) = summary {
+        blaze_profile::gate::summary(&duckdb, &dir, verdict.build, &out)
+            .map_err(|error| error.to_string())?;
+    }
+    match verdict.passed() {
+        true => Ok(()),
+        false => Err(Refusal::Failed(format!("the profile's gate: {}", verdict.summary()))),
+    }
+}
+
 enum Refusal {
     Usage(String),
     Failed(String),
@@ -443,17 +506,18 @@ fn watch() -> Result<(), Refusal> {
     let width = super::place::stderr_columns().map_or(100, usize::from);
     let mut top = live::Top::default();
     let mut text = String::new();
+    // Each table is one stream across the frames: its decoder keeps the schema and dictionaries.
+    let mut decoders = [&schema::SPANS, &schema::COUNTERS, &schema::OPEN].map(live::Decoder::new);
+    let mut tables: [Vec<RecordBatch>; 3] = Default::default();
     ask(Request::Live, Start::Never, |response| {
         let ResponseRef::Live(frame) = response else { return Ok(()) };
-        let decoded = |what: &str, bytes: &[u8]| {
-            live::decode(bytes).map_err(|error| format!("the live feed's {what}: {error}"))
-        };
-        let (spans, counters, open) = (
-            decoded("spans", frame.spans)?,
-            decoded("counters", frame.counters)?,
-            decoded("open spans", frame.open)?,
-        );
-        top.take(frame.at_ns, frame.skipped, frame.lost, &spans, &counters, &open)
+        for ((decoder, bytes), batches) in
+            decoders.iter_mut().zip([frame.spans, frame.counters, frame.open]).zip(&mut tables)
+        {
+            decoder.decode(bytes, batches).map_err(|error| format!("the live feed: {error}"))?;
+        }
+        let [spans, counters, open] = &tables;
+        top.take(frame.at_ns, frame.skipped, frame.lost, spans, counters, open)
             .map_err(|error| format!("the live feed: {error}"))?;
         top.render(width, &mut text);
         let mut out = std::io::stdout().lock();
@@ -472,19 +536,14 @@ enum Shape {
     Json,
 }
 
-/// `blaze debug sql [--live] [--last SECONDS] [--json] QUERY`.
+/// `blaze debug sql [--json] QUERY`: over every row the daemon recorded before it was asked
+/// ([`history_source`]). `--live` and `--last` are gone (2026-11-04): the plain query sees what
+/// they showed, with no row read twice.
 fn query(words: Vec<OsString>) -> Result<(), Refusal> {
-    let (mut live, mut last_s, mut shape, mut sql) = (false, 30u32, Shape::Table, None);
-    let mut words = texts(words)?.into_iter();
-    while let Some(word) = words.next() {
+    let (mut shape, mut sql) = (Shape::Table, None);
+    for word in texts(words)? {
         match word.as_str() {
-            "--live" => live = true,
             "--json" => shape = Shape::Json,
-            "--last" => {
-                last_s = words.next().and_then(|it| it.parse().ok()).ok_or_else(|| {
-                    Refusal::Usage("`--last` takes a number of seconds".to_owned())
-                })?;
-            }
             flag if flag.starts_with("--") => {
                 return Err(Refusal::Usage(format!("{DEBUG_USAGE}, not `{flag}`")));
             }
@@ -495,26 +554,7 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
         }
     }
     let sql = sql.ok_or_else(|| Refusal::Usage(DEBUG_USAGE.to_owned()))?;
-    let batches = match live {
-        false => run(&sql)?,
-        true => {
-            let mut batches = None;
-            ask(Request::Sql { sql, last_s }, Start::Never, |response| {
-                if let ResponseRef::Queried { ipc, .. } = response {
-                    batches = Some(match ipc.is_empty() {
-                        true => Vec::new(),
-                        false => live::decode(ipc)
-                            .map_err(|error| format!("the daemon's answer: {error}"))?,
-                    });
-                }
-                Ok(())
-            })?;
-            batches.ok_or_else(|| {
-                "the daemon answered `blaze debug sql --live` with no answer".to_owned()
-            })?
-        }
-    };
-    print(&batches, shape)
+    print(&run(&sql)?, shape)
 }
 
 fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
@@ -647,17 +687,58 @@ fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal
 /// names.
 fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
     let (duckdb, dir) = history_source()?;
-    let query = sql::Query { duckdb: &duckdb, history: &dir, sql };
+    let query = sql::Query { duckdb: &duckdb, history: &dir, scope: sql::Scope::All, sql };
     Ok(sql::run(&query).map_err(|error| error.to_string())?)
 }
 
-/// The DuckDB [`observe::DUCKDB`] names, and the history in the daemon's state directory.
+/// The DuckDB [`observe::DUCKDB`] names, and the history in the daemon's state directory,
+/// flushed: what every reader of the history (`blaze debug sql`, `blaze explain`, `blaze
+/// slow`, `blaze debug time`) reads through.
+///
+/// A daemon that writes the history ([`history::writer`]) holds rows it has recorded and not
+/// yet flushed (up to [`history::EVERY`] of them). It is asked to flush ([`Request::Flush`])
+/// and answers with the flush's number once the flush committed; the manifest read after says
+/// that flush or a later one ([`history::Manifest::flushed`]), so the reader reads every row
+/// recorded before it asked, each once: a flush moves rows from the recorder to a file, and
+/// nothing is in both. With no daemon writing it, every row is in a file already. A daemon
+/// that writes the history and can't be asked, or whose flush the manifest does not show, is
+/// an error naming it: never a read that quietly misses rows.
 fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
+    Ok(history_paths()?)
+}
+
+/// The DuckDB that reads the history, and the history's directory: an error names what is
+/// missing.
+pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
         format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
     })?;
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
-    Ok((duckdb, history::dir_in(&state)))
+    let dir = history::dir_in(&state);
+    if let Some(pid) = history::writer(&dir) {
+        let mut flushed = None;
+        ask(Request::Flush, Start::Never, |response| {
+            if let ResponseRef::Flushed { seq } = response {
+                flushed = Some(seq);
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("the daemon (pid {pid}) writes the profile history {}, and asking it to flush failed: {error}", dir.display()))?;
+        let seq = flushed.ok_or_else(|| {
+            format!(
+                "the daemon (pid {pid}) answered the ask to flush the profile history with no flush"
+            )
+        })?;
+        let manifest = history::manifest::read(&dir).map_err(|error| error.to_string())?;
+        if manifest.flushed() < seq {
+            return Err(format!(
+                "the daemon (pid {pid}) said its flush {seq} of the profile history {} committed, and the manifest says flush {}",
+                dir.display(),
+                manifest.flushed()
+            ));
+        }
+    }
+    Ok((duckdb, dir))
 }
 
 fn print(batches: &[RecordBatch], shape: Shape) -> Result<(), Refusal> {

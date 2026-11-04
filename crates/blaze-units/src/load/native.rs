@@ -23,7 +23,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use blaze_manifest::Files;
+use blaze_manifest::files::Files;
 use serde::Deserialize;
 
 use crate::query::{LoadError, NativeInput};
@@ -272,20 +272,28 @@ pub(crate) fn needed<F: Files>(
             ),
             at: at.clone(),
         };
-        let bytes = files.read(pin_path).map_err(|error| bad(format!("can't be read: {error}")))?;
+        // Plain matches, not `map_err`/`ok_or_else` chains: stage 0 (0.20261030.1) can't
+        // resolve those methods here; return to the chains after the next stage-0 promotion.
+        let bytes = match files.read(pin_path) {
+            Ok(it) => it,
+            Err(error) => return Err(bad(format!("can't be read: {error}"))),
+        };
         let shape = "JSON with `release` and `targets` of `name` and `sha256`";
-        let pin: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)
-            .map_err(|error| bad(format!("is not {shape}: {error}")))?;
-        let release = pin
-            .get("release")
-            .and_then(|it| it.as_str())
-            .ok_or_else(|| bad(format!("has no `release` string ({shape})")))?;
-        let archives: BTreeMap<String, PinTarget> = pin
-            .get("targets")
-            .map(BTreeMap::<String, PinTarget>::deserialize)
-            .transpose()
-            .map_err(|error| bad(format!("`targets` is not {shape}: {error}")))?
-            .ok_or_else(|| bad(format!("has no `targets` ({shape})")))?;
+        let pin: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(&bytes) {
+            Ok(it) => it,
+            Err(error) => return Err(bad(format!("is not {shape}: {error}"))),
+        };
+        let release = match pin.get("release") {
+            Some(serde_json::Value::String(it)) => it.as_str(),
+            _ => return Err(bad(format!("has no `release` string ({shape})"))),
+        };
+        let archives: BTreeMap<String, PinTarget> = match pin.get("targets") {
+            None => return Err(bad(format!("has no `targets` ({shape})"))),
+            Some(value) => match BTreeMap::<String, PinTarget>::deserialize(value) {
+                Ok(it) => it,
+                Err(error) => return Err(bad(format!("`targets` is not {shape}: {error}"))),
+            },
+        };
         let release_raw = release;
         let release = release.trim_end_matches('/');
         if !release.starts_with("https://") || release.len() == "https://".len() {

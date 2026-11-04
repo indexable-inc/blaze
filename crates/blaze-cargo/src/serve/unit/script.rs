@@ -1107,6 +1107,13 @@ fn run_miss(
 /// The step `blaze why` names a build script's run by.
 const RUN: &str = "build script run";
 
+/// Names the build script's process the spawn `tag` starts for the profile's `processes` table,
+/// as blaze's spans name the unit: `libc v0.2.155 (build script run)`.
+fn label_run(tag: Tag, package: &str) {
+    let unit = format!("{package} ({RUN})"); // alloc: the unit's name, once per build script run
+    blaze_core::reaped::label(tag, "build_script", Some(&unit));
+}
+
 /// Why the sandboxed run of unit `unit`'s build script, keyed as `prepared` says, was not
 /// reused, for `blaze why`: its key's parts by name (its code, each variable it is given), and
 /// past them, what it read when it last ran. Made on a miss only.
@@ -1565,6 +1572,7 @@ impl ScriptRun {
                 });
                 self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
+                label_run(self.tag, &start.unit.package.descr());
                 self.state = State::Running {
                     start,
                     run: None,
@@ -1586,6 +1594,7 @@ impl ScriptRun {
                         self.finish(&start, value, began, writer, effects, out)
                     }
                     Ok(Begun::Running(run)) => {
+                        label_run(self.tag, &start.unit.package.descr());
                         let miss = run_missed(&self.job, self.unit, prepared);
                         self.puts.misses.push(miss);
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));

@@ -1,0 +1,58 @@
+# Each night, the spans main's newest self-build got slower in against the builds before it, on
+# the same class of machine: `slower_between_commits` (crates/blaze-profile/sql/examples.sql)
+# over the per-build summaries blaze-platform.yaml's profile-gate job uploads
+# (harness/profile_trend.py). It fails naming each span that slowed by the bounds below, so a
+# slowdown has a span's name before anyone looks for it (AGENTS.md rule slow-is-p0-traced).
+# Reads artifacts with the run's own token; no secret.
+name: profile nightly
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      count:
+        description: the newest commits' summaries compared, the newest against the rest
+        type: number
+        default: 10
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: profile-nightly
+  cancel-in-progress: false
+
+jobs:
+  trend:
+    name: profile trend, ${{ matrix.platform }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, linux-arm64, macos-arm64]
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned DuckDB (flake.nix).
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - id: duckdb
+        run: echo "path=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: slower_between_commits over the last summaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DUCKDB: ${{ steps.duckdb.outputs.path }}
+          PLATFORM: ${{ matrix.platform }}
+          COUNT: ${{ inputs.count || 10 }}
+        run: |
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg platform "$PLATFORM" --arg duckdb "$DUCKDB" \
+            --arg out "$RUNNER_TEMP/profile-trend" --argjson count "$COUNT" \
+            '{repo: $repo, platform: $platform, duckdb: $duckdb, out: $out, count: $count}' > "$RUNNER_TEMP/profile-trend.json"
+          uv run --frozen --no-dev python harness/profile_trend.py "$RUNNER_TEMP/profile-trend.json"
+      - if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/profile-trend/report.md" ]; then cat "$RUNNER_TEMP/profile-trend/report.md" >> "$GITHUB_STEP_SUMMARY"; fi

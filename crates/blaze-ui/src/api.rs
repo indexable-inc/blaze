@@ -273,9 +273,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
             out.push('\n');
         }
-        Response::Queried { rows, ipc } => {
-            put!(out, "{} {rows} rows, {} bytes of Arrow IPC\n", status("Queried"), ipc.len())
-        }
+        Response::Flushed { seq } => put!(out, "{} flush {seq}\n", status("Flushed")),
         Response::Hot(hot) => hot_lines(out, hot),
         Response::Collected { report } => out.push_str(report),
         Response::UnitBegan(unit) => {
@@ -852,6 +850,7 @@ mod tests {
             reran: 12,
             green: 300,
             served: Vec::new(),
+            build_id: None,
             compiled: 2,
             found: 40,
             link: LinkKind::Patched,
@@ -902,6 +901,7 @@ mod tests {
             reran: 0,
             green: 0,
             served: Vec::new(),
+            build_id: None,
             compiled: 0,
             found: 0,
             link: LinkKind::Placed,

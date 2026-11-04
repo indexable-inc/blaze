@@ -894,9 +894,7 @@ pub fn with_saves(info: &[u8], out: &mut Vec<u8, impl Allocator>) -> Result<(), 
             UWOP_SAVE_NONVOL | UWOP_SAVE_XMM128 => 1,
             // alloc: the error's message.
             _ => {
-                return Err(Error::new(format!(
-                    "a Windows unwind code {op} the glue never writes"
-                )));
+                return Err(Error::new(format!("a Windows unwind code {op} the glue never writes")));
             }
         };
         let word = u16::from_le_bytes([nodes[at + 2 * following], nodes[at + 2 * following + 1]]);

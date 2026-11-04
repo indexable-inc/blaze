@@ -13,8 +13,8 @@
 //!   daemon ([`daemon::Failed`]).
 //! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
 //! - It keeps the profile history in `<state>/profile` on the thread `blaze-history`, samples
-//!   its CPUs, and answers `blaze explore`, `blaze debug live` and `blaze debug sql --live`
-//!   itself ([`observe`]).
+//!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
+//!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
 mod daemon;
 mod fetch;
@@ -887,8 +887,11 @@ pub(crate) fn engine(
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
     let duckdb =
         observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
+    // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
+    // a value that names no level stops the daemon, naming it.
+    let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
     let (profiling, keeper) =
-        observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
+        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
     // Fixed for the daemon's life before any job: a build's tasks only read it.
     let sysroot = crate::toolchain::sysroot().with_context(|| {
         format!(
@@ -976,6 +979,9 @@ pub(crate) fn engine(
     }
     signals::catch();
     signals::record_ends();
+    // After `record_ends`, which leaves a signal something handles alone: the crash record's
+    // handler goes in front of what is there and hands each signal on to it.
+    blaze_profile::crash::install();
     plane::record_panics();
     plane::record_alloc_failures();
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is

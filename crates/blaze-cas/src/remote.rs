@@ -258,9 +258,7 @@ fn parse_filter(bytes: &[u8]) -> Result<(bool, u64, Fuse8), String> {
         1 => true,
         // alloc: an error path.
         other => {
-            return Err(format!(
-                "a filter that neither adds (0) nor replaces (1) but says {other}"
-            ));
+            return Err(format!("a filter that neither adds (0) nor replaces (1) but says {other}"));
         }
     };
     let epoch = reader.u64().map_err(truncated)?;
