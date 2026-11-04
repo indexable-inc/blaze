@@ -80,7 +80,8 @@ fn check(data: &[u8]) {
     let mut input = Input::new(data);
     match input.u8() % 3 {
         0 => {
-            let keys: Vec<Key> = (0..=u32::from(input.u8() % FETCHES_MOST)).map(shared::key).collect();
+            let keys: Vec<Key> =
+                (0..=u32::from(input.u8() % FETCHES_MOST)).map(shared::key).collect();
             let piece = piece(&mut input);
             fetch_all(&keys, input.rest(), piece);
         }
@@ -160,13 +161,18 @@ fn expected(keys: &[Key], stream: &[u8]) -> Vec<Expect> {
         }
         let (key, expect) = match Answer::decode(body) {
             Ok(Answer::Missing { key }) => (key, Expect::Missing),
-            Ok(Answer::Value { key, content, bytes, .. }) => match shared::content_of(&bytes) == content {
-                true => (key, Expect::Kept(bytes)),
-                false => (key, Expect::Refused),
-            },
+            Ok(Answer::Value { key, content, bytes, .. }) => {
+                match shared::content_of(&bytes) == content {
+                    true => (key, Expect::Kept(bytes)),
+                    false => (key, Expect::Refused),
+                }
+            }
             Err(_) => break,
         };
-        let Some(waiting) = keys.iter().position(|it| *it == key).filter(|&it| ends[it].is_none()) else { break };
+        let Some(waiting) = keys.iter().position(|it| *it == key).filter(|&it| ends[it].is_none())
+        else {
+            break;
+        };
         ends[waiting] = Some(expect);
     }
     ends.into_iter().map(|it| it.unwrap_or(Expect::Refused)).collect()
@@ -215,7 +221,11 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
     let mut effects = Vec::new();
     let tags: Vec<Tag> = keys
         .iter()
-        .map(|key| store.fetch(key, &mut client, admit_any, &mut effects).expect("an empty store fetches a key it lacks"))
+        .map(|key| {
+            store
+                .fetch(key, &mut client, admit_any, &mut effects)
+                .expect("an empty store fetches a key it lacks")
+        })
         .collect();
     let (mut at, mut answered, mut theirs) = (0, Vec::new(), Vec::new());
     while !effects.is_empty() {
@@ -238,10 +248,14 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
                     Done::Read(into)
                 }
                 Effect::Hangup { .. } => continue,
-                other => panic!("a client asks to connect, send, receive and hang up, not {other:?}"),
+                other => {
+                    panic!("a client asks to connect, send, receive and hang up, not {other:?}")
+                }
             };
             let mut answers = Vec::new();
-            bounded(at, "a client's step", || client.complete(Completion { tag, done }, &mut effects, &mut answers));
+            bounded(at, "a client's step", || {
+                client.complete(Completion { tag, done }, &mut effects, &mut answers)
+            });
             for answer in answers {
                 assert!(
                     tags.contains(&answer.tag) && !answered.contains(&answer.tag),
@@ -249,12 +263,18 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
                     answer.tag
                 );
                 answered.push(answer.tag);
-                bounded(at, "the store's take of an answer", || store.complete(answer, &mut effects));
+                bounded(at, "the store's take of an answer", || {
+                    store.complete(answer, &mut effects)
+                });
             }
         }
         shared::drive(&mut sim, &mut store, &mut theirs);
     }
-    assert_eq!(answered.len(), tags.len(), "every fetch is answered by the time the connection is done");
+    assert_eq!(
+        answered.len(),
+        tags.len(),
+        "every fetch is answered by the time the connection is done"
+    );
     let mut fetched = store.fetched();
     fetched.sort_by_key(|(key, _)| keys.iter().position(|it| it == key));
     assert_eq!(
@@ -265,11 +285,14 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
     for ((key, fetched), expect) in fetched.iter().zip(expected(keys, stream)) {
         match (fetched, &expect) {
             (Fetched::Kept(_), Expect::Kept(bytes)) => {
-                let entry = store.get(key).expect("a value kept is whole").expect("a value kept is there");
+                let entry =
+                    store.get(key).expect("a value kept is whole").expect("a value kept is there");
                 assert!(entry.bytes == bytes.as_slice(), "a value kept is the bytes sent");
             }
             (Fetched::Missing, Expect::Missing) | (Fetched::Refused(_), Expect::Refused) => {}
-            (fetched, expect) => panic!("a fetch of {:x} ended {fetched:?}; its frame says {expect:?}", key.0),
+            (fetched, expect) => {
+                panic!("a fetch of {:x} ended {fetched:?}; its frame says {expect:?}", key.0)
+            }
         }
     }
     fetched
@@ -277,11 +300,15 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
 
 /// What the servers' store holds in mode 1.
 fn served() -> Vec<Value> {
-    [(Kind::Query, b"a served query's result".repeat(4)), (Kind::Code, vec![0xc3; 2000]), (Kind::Image, Vec::new())]
-        .into_iter()
-        .zip(0..)
-        .map(|((kind, bytes), n)| Value { key: shared::key(n), kind, bytes })
-        .collect()
+    [
+        (Kind::Query, b"a served query's result".repeat(4)),
+        (Kind::Code, vec![0xc3; 2000]),
+        (Kind::Image, Vec::new()),
+    ]
+    .into_iter()
+    .zip(0..)
+    .map(|((kind, bytes), n)| Value { key: shared::key(n), kind, bytes })
+    .collect()
 }
 
 /// The files of a store of [`served`], written once; each run's server opens a store of them.
@@ -306,7 +333,8 @@ fn serve(asks: &[u8], piece: usize) {
         sim.change(file, bytes);
     }
     let mut store = shared::open(&mut sim);
-    let mut server = Server::new(address(), SERVER_TAGS).expect("a server listens on a unix socket");
+    let mut server =
+        Server::new(address(), SERVER_TAGS).expect("a server listens on a unix socket");
     let mut effects = Vec::new();
     server.refresh(&mut store, &mut effects);
     server.start(&mut effects);
@@ -326,7 +354,9 @@ fn serve(asks: &[u8], piece: usize) {
                     bytes.clear();
                     Done::Sent(bytes)
                 }
-                Effect::Recv { most, into, .. } if at == asks.len() && parked.is_none() && most > 0 => {
+                Effect::Recv { most, into, .. }
+                    if at == asks.len() && parked.is_none() && most > 0 =>
+                {
                     parked = Some((tag, into));
                     continue;
                 }
@@ -337,14 +367,20 @@ fn serve(asks: &[u8], piece: usize) {
                     Done::Read(into)
                 }
                 Effect::Hangup { .. } | Effect::Unlisten { .. } => continue,
-                other => panic!("a server asks to listen, send, receive and hang up, not {other:?}"),
+                other => {
+                    panic!("a server asks to listen, send, receive and hang up, not {other:?}")
+                }
             };
-            corrupt.extend(bounded(at, "a server's step", || server.complete(Completion { tag, done }, &store, &mut effects)));
+            corrupt.extend(bounded(at, "a server's step", || {
+                server.complete(Completion { tag, done }, &store, &mut effects)
+            }));
         }
     }
     assert!(corrupt.is_empty(), "a server of a whole store finds nothing corrupt: {corrupt:?}");
     let first = frame_at(&sent, 0).expect("a server sends a peer its filter first");
-    let Some((true, filter)) = filter_in(first) else { panic!("a server's first frame is a full filter") };
+    let Some((true, filter)) = filter_in(first) else {
+        panic!("a server's first frame is a full filter")
+    };
     assert!(
         served().iter().all(|value| filter.contains(word(&value.key))),
         "a server's filter holds every key its store does"
@@ -360,7 +396,10 @@ fn serve(asks: &[u8], piece: usize) {
     let asked: Vec<Answer> = blocks
         .iter()
         .take_while(|it| it[..8] == ASK_HEADER[..])
-        .map(|it| Answer::of(&store, &Key(ContentId(it[8..].try_into().expect("32 bytes")))).expect("a whole store"))
+        .map(|it| {
+            Answer::of(&store, &Key(ContentId(it[8..].try_into().expect("32 bytes"))))
+                .expect("a whole store")
+        })
         .collect();
     assert!(
         answers.len() <= asked.len() && answers[..] == asked[..answers.len()],
@@ -376,8 +415,12 @@ fn serve(asks: &[u8], piece: usize) {
 fn frames_of(values: &[Value], settles: u8) -> (Vec<Key>, Vec<u8>) {
     let mut sim = shared::write(values, settles);
     let store = shared::open(&mut sim);
-    let keys: Vec<Key> = values.iter().map(|it| it.key).chain([shared::key(u32::MAX - 1)]).collect();
-    let frames = keys.iter().flat_map(|key| frame(&Answer::of(&store, key).expect("a whole store"))).collect();
+    let keys: Vec<Key> =
+        values.iter().map(|it| it.key).chain([shared::key(u32::MAX - 1)]).collect();
+    let frames = keys
+        .iter()
+        .flat_map(|key| frame(&Answer::of(&store, key).expect("a whole store")))
+        .collect();
     (keys, frames)
 }
 
@@ -387,12 +430,18 @@ fn frame(answer: &Answer) -> Vec<u8> {
 }
 
 fn value(n: u32, kind: Kind, bytes: &[u8]) -> Answer {
-    Answer::Value { key: shared::key(n), kind, content: shared::content_of(bytes), bytes: bytes.to_vec() }
+    Answer::Value {
+        key: shared::key(n),
+        kind,
+        content: shared::content_of(bytes),
+        bytes: bytes.to_vec(),
+    }
 }
 
 /// A filter frame of `keys`, as a server sends one.
 fn filter_frame(replaces: bool, keys: &[Key]) -> Vec<u8> {
-    let mut body = [&ANSWER_HEADER[..], &[FILTER, u8::from(replaces)], &0u64.to_le_bytes()].concat();
+    let mut body =
+        [&ANSWER_HEADER[..], &[FILTER, u8::from(replaces)], &0u64.to_le_bytes()].concat();
     Fuse8::of(keys.iter().map(word).collect()).encode(&mut body);
     [(body.len() as u64).to_le_bytes().as_slice(), &body].concat()
 }
@@ -416,7 +465,9 @@ fn seeds() -> Vec<Vec<u8>> {
     let full = filter_frame(true, &[shared::key(0), shared::key(1)]);
     let mut neither = filter_frame(false, &[shared::key(0)]);
     neither[17] = 7;
-    let client = |fetches: u8, piece: u16, stream: &[u8]| [&[0, fetches - 1][..], &piece.to_le_bytes(), stream].concat();
+    let client = |fetches: u8, piece: u16, stream: &[u8]| {
+        [&[0, fetches - 1][..], &piece.to_le_bytes(), stream].concat()
+    };
     let mut out = vec![
         client(1, 0, &missing),
         client(1, 0, &one),
@@ -430,11 +481,17 @@ fn seeds() -> Vec<Vec<u8>> {
         client(1, 0, &(1u64 << 30).to_le_bytes()),
         client(1, 0, &[(1u64 << 30).to_le_bytes().as_slice(), &[0; 64]].concat()),
         client(1, 0, b""),
-        client(2, 0, &[full.clone(), two.clone(), filter_frame(false, &[shared::key(2)]), one.clone()].concat()),
+        client(
+            2,
+            0,
+            &[full.clone(), two.clone(), filter_frame(false, &[shared::key(2)]), one.clone()]
+                .concat(),
+        ),
         client(2, 5, &[full, one.clone(), neither, two.clone()].concat()),
         client(1, 0, &[one.clone(), one.clone()].concat()),
     ];
-    let asks: Vec<u8> = [0, 1, 2, u32::MAX - 1].into_iter().flat_map(|n| ask(shared::key(n))).collect();
+    let asks: Vec<u8> =
+        [0, 1, 2, u32::MAX - 1].into_iter().flat_map(|n| ask(shared::key(n))).collect();
     out.push([&[1, 0, 0][..], &asks].concat());
     out.push([&[1, 7, 0][..], &asks].concat());
     out.push([&[1, 0, 0][..], &asks, b"not an ask at all, forty bytes of it...."].concat());
@@ -442,7 +499,10 @@ fn seeds() -> Vec<Vec<u8>> {
     for values in shared::sample_inputs() {
         out.push([&[2, 0, 0][..], &values].concat());
         out.push([&[2, 0, 0x10][..], &values, &[0, 0x30, 0, 0, 0, 0x01]].concat());
-        out.push([&[2, 0, 0][..], &values, &[1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]].concat());
+        out.push(
+            [&[2, 0, 0][..], &values, &[1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]]
+                .concat(),
+        );
     }
     out
 }

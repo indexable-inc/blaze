@@ -47,11 +47,16 @@ impl Diagnostics {
         self.0.borrow_mut().extend(diagnostic.iter().cloned());
     }
 
-    fn push_ty_diagnostics(&self, diagnostics: impl ExactSizeIterator<Item = TyLoweringDiagnostic>) {
+    fn push_ty_diagnostics(
+        &self,
+        diagnostics: impl ExactSizeIterator<Item = TyLoweringDiagnostic>,
+    ) {
         if diagnostics.len() == 0 {
             return;
         }
-        self.0.borrow_mut().extend(diagnostics.map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
+        self.0
+            .borrow_mut()
+            .extend(diagnostics.map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
     }
 
     pub(super) fn any(&self, f: impl FnMut(&InferenceDiagnostic) -> bool) -> bool {

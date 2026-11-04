@@ -123,18 +123,13 @@ impl Chars {
     /// the alphabet of every string choice the set serves (see
     /// [`CompiledRegex::intervals`]); the set must not be empty.
     fn least(&self, intervals: &IntervalSet) -> Result<char, InternalError> {
-        self.least
-            .get_or_try_init(|| least_char(&self.chars, intervals).map(Box::new))
-            .copied()
+        self.least.get_or_try_init(|| least_char(&self.chars, intervals).map(Box::new)).copied()
     }
 }
 
 impl From<Vec<char>> for Chars {
     fn from(chars: Vec<char>) -> Chars {
-        Chars {
-            chars: chars.into_boxed_slice(),
-            least: OnceBox::new(),
-        }
+        Chars { chars: chars.into_boxed_slice(), least: OnceBox::new() }
     }
 }
 
@@ -197,10 +192,7 @@ impl Complement {
             }
         }
         let removed: u64 = merged.iter().map(|(lo, hi)| u64::from(hi - lo) + 1).sum();
-        Complement {
-            excluded: merged,
-            len: 0x10000 - removed,
-        }
+        Complement { excluded: merged, len: 0x10000 - removed }
     }
 
     /// The `idx`th remaining character in codepoint order.
@@ -230,10 +222,7 @@ impl Complement {
         let least = (0..intervals.len())
             .map(|i| intervals.char_in_shrink_order(i))
             .find(|&c| !self.excludes(u32::from(c)));
-        Ok(hegel_internal_unwrap!(
-            least,
-            "Complement::least: no character remains"
-        ))
+        Ok(hegel_internal_unwrap!(least, "Complement::least: no character remains"))
     }
 }
 
@@ -325,11 +314,7 @@ impl CompiledRegex {
         let verified = approximated(&parsed.pattern, true);
         let caches = Caches::default();
         let producible = producible_sub(&parsed.pattern, parsed.flags, &alphabet, &caches)?;
-        let unproducible = caches
-            .producible
-            .lock()
-            .values()
-            .any(|&producible| !producible);
+        let unproducible = caches.producible.lock().values().any(|&producible| !producible);
         Ok(CompiledRegex {
             pattern: pattern.to_string(),
             parsed,
@@ -837,12 +822,7 @@ fn generate_op<D: Draws>(
             };
             generate_subpattern(d, item, state, alphabet, out)?;
         }
-        OpCode::Subpattern {
-            group,
-            add_flags,
-            del_flags,
-            p,
-        } => {
+        OpCode::Subpattern { group, add_flags, del_flags, p } => {
             let saved_flags = state.flags;
             state.flags = combine_flags(state.flags, *add_flags, *del_flags);
             let before = out.len();
@@ -863,11 +843,7 @@ fn generate_op<D: Draws>(
             }
             out.extend_from_slice(val);
         }
-        OpCode::GroupRefExists {
-            cond_group,
-            yes,
-            no,
-        } => {
+        OpCode::GroupRefExists { cond_group, yes, no } => {
             if state.groups.contains_key(cond_group) {
                 generate_subpattern(d, yes, state, alphabet, out)?;
             } else if let Some(no) = no {
@@ -896,11 +872,7 @@ fn generate_op<D: Draws>(
                 return Ok(());
             }
             let min = *min as usize;
-            let max = if *max == u32::MAX {
-                None
-            } else {
-                Some(*max as usize)
-            };
+            let max = if *max == u32::MAX { None } else { Some(*max as usize) };
             let mut ms = ManyState::new(min, max);
             if let [OpCode::In(items)] = item.data.as_slice() {
                 if !d.simplest() {
@@ -1062,13 +1034,7 @@ pub(crate) fn describe_alphabet(alphabet: &IntervalSet) -> String {
         .intervals
         .iter()
         .take(SHOWN)
-        .map(|&(lo, hi)| {
-            if lo == hi {
-                show(lo)
-            } else {
-                format!("{}..={}", show(lo), show(hi))
-            }
-        })
+        .map(|&(lo, hi)| if lo == hi { show(lo) } else { format!("{}..={}", show(lo), show(hi)) })
         .collect();
     match alphabet.intervals.len().saturating_sub(SHOWN) {
         0 if ranges.is_empty() => String::from("of no characters"),
@@ -1135,12 +1101,7 @@ fn producible_op(
             }
             any
         }
-        OpCode::Subpattern {
-            add_flags,
-            del_flags,
-            p,
-            ..
-        } => {
+        OpCode::Subpattern { add_flags, del_flags, p, .. } => {
             let flags = combine_flags(flags, *add_flags, *del_flags);
             producible_sub(p, flags, alphabet, caches)?
         }
@@ -1185,11 +1146,9 @@ fn not_literal_chars(
     if alphabet.is_none() {
         return cached_default_not_literal(c, flags);
     }
-    cached_chars(
-        &caches.char_cache,
-        CharKey::NotLiteral(c, flags & CASE_FLAGS),
-        || gather_chars(alphabet, |x| !casefold::literal_matches(c, x, flags)),
-    )
+    cached_chars(&caches.char_cache, CharKey::NotLiteral(c, flags & CASE_FLAGS), || {
+        gather_chars(alphabet, |x| !casefold::literal_matches(c, x, flags))
+    })
 }
 
 /// The characters an `ANY` node may emit under `flags` from an alphabet:
@@ -1301,9 +1260,8 @@ fn cached_default_not_literal(c: char, flags: u32) -> Arc<Chars> {
             return Arc::clone(cached);
         }
     }
-    let computed = Arc::new(Chars::from(gather_chars(&None, |x| {
-        !casefold::literal_matches(c, x, flags)
-    })));
+    let computed =
+        Arc::new(Chars::from(gather_chars(&None, |x| !casefold::literal_matches(c, x, flags))));
     CACHE.lock().insert(cache_key, Arc::clone(&computed));
     computed
 }
@@ -1353,13 +1311,7 @@ fn build_in_set(
             }
         }
         if !categories.is_empty() {
-            out.extend(gather_category_class(
-                alphabet,
-                &categories,
-                false,
-                &seen,
-                flags,
-            ));
+            out.extend(gather_category_class(alphabet, &categories, false, &seen, flags));
         }
         Ok(InSet::Listed(Arc::new(Chars::from(out))))
     } else {
@@ -1373,10 +1325,9 @@ fn build_in_set(
                 .collect();
             Ok(InSet::Complement(Arc::new(Complement::new(excluded))))
         } else if categories.is_empty() {
-            Ok(InSet::Listed(Arc::new(Chars::from(gather_chars(
-                alphabet,
-                |c| !excluded.contains(&c),
-            )))))
+            Ok(InSet::Listed(Arc::new(Chars::from(gather_chars(alphabet, |c| {
+                !excluded.contains(&c)
+            })))))
         } else {
             Ok(InSet::Listed(Arc::new(Chars::from(gather_category_class(
                 alphabet,
@@ -1445,11 +1396,7 @@ fn gather_category_class(
             let uniform = start >= CATEGORY_ALONE_FROM
                 && excluded.get(next_excluded).is_none_or(|&cp| cp > end);
             if uniform {
-                if categories
-                    .iter()
-                    .any(|cat| category_in(category, *cat, ascii))
-                    != negate
-                {
+                if categories.iter().any(|cat| category_in(category, *cat, ascii)) != negate {
                     out.extend((start..=end).filter_map(char::from_u32));
                 }
             } else {
@@ -1625,10 +1572,7 @@ fn mark_invalid<D: Draws>(d: &mut D) -> EngineError {
 }
 
 fn codepoint_to_char(cp: u32) -> Result<char, InternalError> {
-    Ok(hegel_internal_unwrap!(
-        char::from_u32(cp),
-        "invalid codepoint in regex AST: {cp:#x}"
-    ))
+    Ok(hegel_internal_unwrap!(char::from_u32(cp), "invalid codepoint in regex AST: {cp:#x}"))
 }
 
 /// The length of the strings the generator draws from `p` on average, in

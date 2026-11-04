@@ -191,12 +191,17 @@ fn corosenseis_trampolines_assemble_to_an_object_defining_them() {
         let object = object.unwrap_or_else(|| panic!("{triple}: no object of two `global_asm!`s"));
         assert!(object.name.contains("crate `corosensei`"), "{triple}: {}", object.name);
         let file = object::File::parse(&*object.bytes).unwrap();
-        for name in ["stack_init_trampoline", "stack_init_trampoline_return", "stack_call_trampoline"] {
+        for name in
+            ["stack_init_trampoline", "stack_init_trampoline_return", "stack_call_trampoline"]
+        {
             let symbol = file
                 .symbols()
                 .find(|it| it.name() == Ok(&format!("{prefix}{name}")))
                 .unwrap_or_else(|| panic!("{triple}: no symbol `{prefix}{name}`"));
-            assert!(symbol.is_definition() && symbol.is_global(), "{triple}: `{name}` is not defined global");
+            assert!(
+                symbol.is_definition() && symbol.is_global(),
+                "{triple}: `{name}` is not defined global"
+            );
             let section = file.section_by_index(symbol.section_index().unwrap()).unwrap();
             assert_eq!(section.kind(), object::SectionKind::Text, "{triple}: `{name}` is not code");
         }
@@ -205,7 +210,11 @@ fn corosenseis_trampolines_assemble_to_an_object_defining_them() {
             "{triple}: no unwind entries of the `.cfi_*`s"
         );
         let again = assembled(triple, &text).unwrap().unwrap();
-        assert_eq!((again.id, &*again.bytes), (object.id, &*object.bytes), "{triple}: built twice, other bytes");
+        assert_eq!(
+            (again.id, &*again.bytes),
+            (object.id, &*object.bytes),
+            "{triple}: built twice, other bytes"
+        );
     }
 }
 
@@ -235,14 +244,18 @@ fn a_directive_blaze_cannot_assemble_is_an_error_naming_it() {
             assert!(error.contains(said), "{triple}: says {said:?}: {error}");
         }
         let first = line_of(&text, "global_asm!(\".balign 4\");");
-        assert!(!error.contains(&format!("lib.rs:{first} ")), "{triple}: names the block that has it alone: {error}");
+        assert!(
+            !error.contains(&format!("lib.rs:{first} ")),
+            "{triple}: names the block that has it alone: {error}"
+        );
     }
 }
 
 /// What a `global_asm!` has that blaze assembles nothing of is an error naming it.
 #[test]
 fn an_operand_or_a_wasm_target_is_an_error_naming_the_block() {
-    let text = format!("//- /lib.rs crate:operands\n{BUILTINS}\nglobal_asm!(\".byte {{}}\", const 5);\n");
+    let text =
+        format!("//- /lib.rs crate:operands\n{BUILTINS}\nglobal_asm!(\".byte {{}}\", const 5);\n");
     let error = assembled("x86_64-unknown-linux-gnu", &text).unwrap_err();
     assert!(error.contains("of crate `operands` has a `const` operand"), "{error}");
     let text = format!("//- /lib.rs crate:wasm\n{BUILTINS}\nglobal_asm!(\".globl x\");\n");
@@ -273,7 +286,12 @@ fn an_assemblers_lines_are_read_from_its_error() {
 fn without_llvm_a_global_asm_is_an_error_not_the_machines_compiler() {
     let text = format!("//- /lib.rs crate:nollvm\n{BUILTINS}\nglobal_asm!(\"nop\");\n");
     let error = assembled("x86_64-unknown-linux-gnu", &text).unwrap_err();
-    for said in ["of crate `nollvm`", "built with no assembler", "blaze-engine's `native`", "hir-ty-codegen's `rsasm`"] {
+    for said in [
+        "of crate `nollvm`",
+        "built with no assembler",
+        "blaze-engine's `native`",
+        "hir-ty-codegen's `rsasm`",
+    ] {
         assert!(error.contains(said), "says {said:?}: {error}");
     }
 }

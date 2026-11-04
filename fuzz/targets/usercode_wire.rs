@@ -66,7 +66,11 @@ fn body_of(frame: &Frame) -> Vec<u8> {
 /// `Frame::decode` of `body`, its answer checked against the writer's bytes.
 fn decode(body: &[u8]) -> Result<Frame, String> {
     let frame = Frame::decode(body)?;
-    assert_eq!(body_of(&frame), body, "a body decoded is the bytes its frame encodes to: {frame:?}");
+    assert_eq!(
+        body_of(&frame),
+        body,
+        "a body decoded is the bytes its frame encodes to: {frame:?}"
+    );
     Ok(frame)
 }
 
@@ -76,12 +80,19 @@ fn walk(stream: &[u8]) -> (Vec<Frame>, Ended) {
     let mut at = 0;
     loop {
         let rest = &stream[at..];
-        let Some(&[a, b, c, d]) = rest.get(..4) else { return (frames, Ended::Waiting(rest.len())) };
+        let Some(&[a, b, c, d]) = rest.get(..4) else {
+            return (frames, Ended::Waiting(rest.len()));
+        };
         let len = u32::from_le_bytes([a, b, c, d]);
         if len > LONGEST {
-            return (frames, Ended::Broken(format!("a frame of {len} bytes, past the most of {LONGEST}")));
+            return (
+                frames,
+                Ended::Broken(format!("a frame of {len} bytes, past the most of {LONGEST}")),
+            );
         }
-        let Some(body) = rest.get(4..4 + len as usize) else { return (frames, Ended::Waiting(rest.len())) };
+        let Some(body) = rest.get(4..4 + len as usize) else {
+            return (frames, Ended::Waiting(rest.len()));
+        };
         match decode(body) {
             Ok(frame) => frames.push(frame),
             Err(why) => return (frames, Ended::Broken(why)),
@@ -93,7 +104,9 @@ fn walk(stream: &[u8]) -> (Vec<Frame>, Ended) {
 /// What `Frames::needed` must say when `waiting` are the bytes of the frame not yet whole.
 fn needed(waiting: &[u8]) -> usize {
     match waiting.get(..4) {
-        Some(&[a, b, c, d]) => 4 + u32::from_le_bytes([a, b, c, d]).min(LONGEST) as usize - waiting.len(),
+        Some(&[a, b, c, d]) => {
+            4 + u32::from_le_bytes([a, b, c, d]).min(LONGEST) as usize - waiting.len()
+        }
         _ => 4 - waiting.len(),
     }
 }
@@ -129,8 +142,15 @@ fn cut(stream: &[u8], pieces: Pieces<'_>, owned: bool) -> (Vec<Frame>, Ended) {
     loop {
         let waiting = reader.waiting();
         let asked = reader.needed();
-        assert_eq!(asked, needed(&stream[at - waiting..at]), "`needed` says what the frame lacks ({pieces:?})");
-        assert!(asked > 0 && asked <= 4 + LONGEST as usize, "`needed` of {asked} is past what a frame can need");
+        assert_eq!(
+            asked,
+            needed(&stream[at - waiting..at]),
+            "`needed` says what the frame lacks ({pieces:?})"
+        );
+        assert!(
+            asked > 0 && asked <= 4 + LONGEST as usize,
+            "`needed` of {asked} is past what a frame can need"
+        );
         if at == stream.len() {
             return (frames, Ended::Waiting(waiting));
         }
@@ -151,7 +171,10 @@ fn cut(stream: &[u8], pieces: Pieces<'_>, owned: bool) -> (Vec<Frame>, Ended) {
             Err(why) => return (frames, Ended::Broken(why)),
         };
         if waiting >= 4 && take == asked {
-            assert!(popped > 0, "a push of what `needed` asked for makes the frame whole ({pieces:?})");
+            assert!(
+                popped > 0,
+                "a push of what `needed` asked for makes the frame whole ({pieces:?})"
+            );
         }
     }
 }
@@ -191,7 +214,11 @@ fn check_case(data: &[u8], case: usize) {
         };
         (frames, ended)
     });
-    assert!(most <= blaze_fuzz::allowed(stream.len()), "reading {} bytes asked for {most} at once", stream.len());
+    assert!(
+        most <= blaze_fuzz::allowed(stream.len()),
+        "reading {} bytes asked for {most} at once",
+        stream.len()
+    );
     assert_eq!(whole.0, expected, "the frames pushed whole are the stream's");
     assert_eq!(whole.1, ended, "the stream pushed whole ends as a walk of it does");
 
@@ -201,8 +228,14 @@ fn check_case(data: &[u8], case: usize) {
     };
     if let Some((pieces, owned)) = chosen {
         let got = cut(stream, pieces, owned);
-        assert_eq!(got.0, expected, "the frames pushed in {pieces:?} (owned: {owned}) are the stream's");
-        assert_eq!(got.1, ended, "the stream pushed in {pieces:?} (owned: {owned}) ends as it does whole");
+        assert_eq!(
+            got.0, expected,
+            "the frames pushed in {pieces:?} (owned: {owned}) are the stream's"
+        );
+        assert_eq!(
+            got.1, ended,
+            "the stream pushed in {pieces:?} (owned: {owned}) ends as it does whole"
+        );
     }
 
     // The input as one body: whatever it decodes to, it is that frame's bytes.

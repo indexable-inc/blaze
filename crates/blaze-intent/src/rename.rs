@@ -11,7 +11,6 @@
 use base_db::{Db, FileId};
 use blaze_api::{ApiError, How, Target};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_vfs::Op;
 use either::Either;
@@ -19,6 +18,7 @@ use hir::{
     AsAssocItem, Crate, Field, HasVisibility, ModuleDef, PathResolution, Trait, Visibility,
     view::Semantics,
 };
+use std::alloc::Global;
 use syntax::{
     LexedStr, NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasAttrs as _},
@@ -59,7 +59,11 @@ struct Hit {
 }
 
 /// Renames the item `target` names to `to`.
-pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) -> Result<(), ApiError> {
+pub(crate) fn rename(
+    cx: &mut Edits<'_, impl Files>,
+    target: &Target,
+    to: &str,
+) -> Result<(), ApiError> {
     let fail = |what: String| ApiError::new(what, Some(target.file.clone()));
     let home = cx.open(&target.file).map_err(fail)?;
     let node = path::find(cx.roots[home as usize], &target.item)
@@ -96,10 +100,11 @@ pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) 
     let finder = memchr::memmem::Finder::new(bare.as_bytes());
     let files = cx.files;
     for file in files_of(cx.db, def) {
-        let path = files
-            .path(file)
-            .ok_or_else(|| fail(format!("a file of a crate that can see `{}` is outside the view", target.item)))?;
-        let (_, bytes) = files.file(path).ok_or_else(|| fail(format!("{path} is not in the view")))?;
+        let path = files.path(file).ok_or_else(|| {
+            fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
+        })?;
+        let (_, bytes) =
+            files.file(path).ok_or_else(|| fail(format!("{path} is not in the view")))?;
         if finder.find(bytes).is_none() {
             continue;
         }
@@ -164,7 +169,8 @@ pub(crate) fn ident_at(root: ast::Node<'_>, at: usize, len: usize) -> Option<ast
         true => own.start() + TextSize::from(2),
         false => own.start(),
     };
-    (token.kind() == SyntaxKind::IDENT && start == range.start() && own.end() == range.end()).then_some(token)
+    (token.kind() == SyntaxKind::IDENT && start == range.start() && own.end() == range.end())
+        .then_some(token)
 }
 
 /// The front end's item for the node a path named.
@@ -182,9 +188,13 @@ fn def_of<'db>(sema: &Semantics<'db>, node: ast::Node<'db>) -> Option<Def> {
         SyntaxKind::MACRO_RULES => {
             sema.to_macro_def(ast::Macro::MacroRules(ast::MacroRules::cast(node)?))?.into()
         }
-        SyntaxKind::MACRO_DEF => sema.to_macro_def(ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?.into(),
+        SyntaxKind::MACRO_DEF => {
+            sema.to_macro_def(ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?.into()
+        }
         SyntaxKind::VARIANT => sema.to_enum_variant_def(ast::Variant::cast(node)?)?.into(),
-        SyntaxKind::RECORD_FIELD => return Some(Def::Field(sema.to_def(ast::RecordField::cast(node)?)?)),
+        SyntaxKind::RECORD_FIELD => {
+            return Some(Def::Field(sema.to_def(ast::RecordField::cast(node)?)?));
+        }
         _ => return None,
     };
     Some(Def::Item(item))
@@ -197,7 +207,9 @@ fn trait_of(db: &Db, item: ModuleDef) -> Option<Trait> {
 
 /// Whether `found` is an impl's item implementing the trait item `item`.
 fn implements(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
-    trait_of(db, item).is_some_and(|of| found.as_assoc_item(db).and_then(|it| it.implemented_trait(db)) == Some(of))
+    trait_of(db, item).is_some_and(|of| {
+        found.as_assoc_item(db).and_then(|it| it.implemented_trait(db)) == Some(of)
+    })
 }
 
 /// Whether `found`, a reference resolved, is `item` or implements it.
@@ -244,7 +256,12 @@ fn files_of(db: &Db, def: Def) -> Vec<FileId> {
 }
 
 /// What `token`, the old name, is to `def`, across every macro expansion it is in.
-fn classify<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: Def, node: ast::Node<'db>) -> Result<Class, String> {
+fn classify<'db>(
+    cx: &Edits<'db, impl Files>,
+    token: ast::Token<'db>,
+    def: Def,
+    node: ast::Node<'db>,
+) -> Result<Class, String> {
     let mut found = Class::No;
     let mut other = false;
     for mapped in cx.sema.descend_into_macros_exact(token) {
@@ -252,13 +269,18 @@ fn classify<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: Def, 
         match classify_one(cx, mapped, def, node)? {
             Class::No => other = true,
             Class::Shorthand | Class::ShorthandValue if expanded => {
-                return Err("a field shorthand in a macro's input: write it out (`x: x`) to rename it".to_owned());
+                return Err(
+                    "a field shorthand in a macro's input: write it out (`x: x`) to rename it"
+                        .to_owned(),
+                );
             }
             class => found = class,
         }
     }
     if found != Class::No && other {
-        return Err("a macro uses this token both for the renamed item and for something else".to_owned());
+        return Err(
+            "a macro uses this token both for the renamed item and for something else".to_owned()
+        );
     }
     Ok(found)
 }
@@ -269,7 +291,12 @@ fn unresolved() -> String {
         .to_owned()
 }
 
-fn classify_one<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: Def, node: ast::Node<'db>) -> Result<Class, String> {
+fn classify_one<'db>(
+    cx: &Edits<'db, impl Files>,
+    token: ast::Token<'db>,
+    def: Def,
+    node: ast::Node<'db>,
+) -> Result<Class, String> {
     let sema = &cx.sema;
     let db = cx.db;
     let parent = token.parent().ok_or("a token outside any node")?;
@@ -301,12 +328,22 @@ fn classify_one<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: D
                 return Ok(Class::No);
             }
             let found: Option<ModuleDef> = match owner.kind() {
-                SyntaxKind::FN => ast::Fn::cast(owner).and_then(|it| sema.to_fn_def(it)).map(Into::into),
-                SyntaxKind::CONST => ast::Const::cast(owner).and_then(|it| sema.to_const_def(it)).map(Into::into),
-                SyntaxKind::TYPE_ALIAS => ast::TypeAlias::cast(owner).and_then(|it| sema.to_def(it)).map(Into::into),
+                SyntaxKind::FN => {
+                    ast::Fn::cast(owner).and_then(|it| sema.to_fn_def(it)).map(Into::into)
+                }
+                SyntaxKind::CONST => {
+                    ast::Const::cast(owner).and_then(|it| sema.to_const_def(it)).map(Into::into)
+                }
+                SyntaxKind::TYPE_ALIAS => {
+                    ast::TypeAlias::cast(owner).and_then(|it| sema.to_def(it)).map(Into::into)
+                }
                 _ => None,
             };
-            Ok(if found.is_some_and(|it| implements(db, it, item)) { Class::Name } else { Class::No })
+            Ok(if found.is_some_and(|it| implements(db, it, item)) {
+                Class::Name
+            } else {
+                Class::No
+            })
         }
         SyntaxKind::NAME_REF => {
             let name_ref = ast::NameRef::cast(parent).expect("a name reference");
@@ -384,7 +421,11 @@ fn classify_one<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: D
 
 /// What a record expression's field name is to `def`: the field, and in a shorthand
 /// (`S { x }`) the value too, a path of one segment.
-fn record_expr_field<'db>(cx: &Edits<'db, impl Files>, field: ast::RecordExprField<'db>, def: Def) -> Result<Class, String> {
+fn record_expr_field<'db>(
+    cx: &Edits<'db, impl Files>,
+    field: ast::RecordExprField<'db>,
+    def: Def,
+) -> Result<Class, String> {
     let shorthand = field.name_ref().is_none();
     let resolved = cx.sema.resolve_record_field(field);
     if let Some((it, _, _)) = &resolved
@@ -458,7 +499,13 @@ fn body_of(top: ast::Node<'_>) -> Option<TextRange> {
 /// The moves of a renamed module's own file, and of its directory when its children are in it:
 /// `m.rs` to `n.rs` (and `m/` to `n/`), or `m/mod.rs`'s `m/` to `n/`. A module with a `#[path]`
 /// keeps its files.
-fn moves(cx: &mut Edits<'_, impl Files>, module: hir::Module, node: ast::Node<'_>, old: &str, to: &str) -> Result<(), String> {
+fn moves(
+    cx: &mut Edits<'_, impl Files>,
+    module: hir::Module,
+    node: ast::Node<'_>,
+    old: &str,
+    to: &str,
+) -> Result<(), String> {
     let decl = ast::Module::cast(node).expect("a module's node");
     if decl.item_list().is_some() {
         return Ok(());
@@ -470,7 +517,8 @@ fn moves(cx: &mut Edits<'_, impl Files>, module: hir::Module, node: ast::Node<'_
         .as_source_file_id(cx.db)
         .ok_or_else(|| format!("`mod {old};` has no file the front end knows"))?
         .file_id(cx.db);
-    let path = cx.files.path(file).ok_or_else(|| format!("`mod {old};`'s file is outside the view"))?;
+    let path =
+        cx.files.path(file).ok_or_else(|| format!("`mod {old};`'s file is outside the view"))?;
     let split = |path: &str| match path.rsplit_once('/') {
         Some((parent, name)) => (format!("{parent}/"), name.to_owned()),
         None => (String::new(), path.to_owned()),

@@ -126,10 +126,13 @@ impl Scale {
             // A pairing read less than 100 µs after the origin's would be off by its own
             // skew (tens of ns) over too short a time: wait out the rest of the 100 µs, once.
             if at.duration_since(began).as_micros() < 100 {
-                blaze_graph::spin::busy(std::time::Duration::from_micros(100).saturating_sub(began.elapsed()));
+                blaze_graph::spin::busy(
+                    std::time::Duration::from_micros(100).saturating_sub(began.elapsed()),
+                );
                 (ticks, at, mono) = paired(1.0);
             }
-            let ns_per_tick = at.duration_since(began).as_nanos() as f64 / ticks.wrapping_sub(first).max(1) as f64;
+            let ns_per_tick = at.duration_since(began).as_nanos() as f64
+                / ticks.wrapping_sub(first).max(1) as f64;
             Scale { ticks, at, mono, ns_per_tick }
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

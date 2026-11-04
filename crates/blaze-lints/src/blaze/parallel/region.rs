@@ -4,11 +4,11 @@
 //! Only the edges control takes when nothing unwinds count: a cleanup block runs once, on the
 //! way out of a panic, and what it reads does not carry from one iteration to the next.
 
+use super::effects::index_of;
 use hir_ty::mir::{
     BasicBlockId, LocalId, MirBody, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind,
     StoredPlace, TerminatorKind,
 };
-use super::effects::index_of;
 
 pub(crate) fn block_index(id: BasicBlockId) -> usize {
     id.into_raw().into_u32() as usize

@@ -2,7 +2,7 @@
 
 use std::iter;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_expand::{
     AstId, InFile, Lookup,
     mod_path::{ModPath, PathKind},
@@ -51,7 +51,10 @@ pub enum VisibilityError {
 
 /// The path rustc resolves for `pub(in path)` (`try_resolve_visibility`): one that starts with a
 /// name is from the crate root in Rust 2015 and an error after it.
-pub(crate) fn visibility_path(path: &ModPath, edition: Edition) -> Result<ModPath, VisibilityError> {
+pub(crate) fn visibility_path(
+    path: &ModPath,
+    edition: Edition,
+) -> Result<ModPath, VisibilityError> {
     match path.kind {
         PathKind::Plain if edition == Edition::Edition2015 => {
             Ok(ModPath::from_segments(PathKind::Abs, path.segments().iter().copied()))
@@ -73,7 +76,9 @@ pub fn visibility_error_from_ast_view(
         span_map.get_or_insert_with(|| ast_vis.file_id.span_map(db)).span_for_range(range).ctx
     });
     match raw_vis {
-        RawVisibility::Module(..) => Visibility::try_resolve(db, &scope.resolver(db), &raw_vis).err(),
+        RawVisibility::Module(..) => {
+            Visibility::try_resolve(db, &scope.resolver(db), &raw_vis).err()
+        }
         RawVisibility::PubSelf(_) | RawVisibility::PubCrate | RawVisibility::Public => None,
     }
 }
@@ -119,11 +124,7 @@ impl Visibility {
         matches!(self, Visibility::Public)
     }
 
-    pub fn is_visible_from<'db>(
-        self,
-        db: &'db Db,
-        from_module: ModuleIdLt<'db>,
-    ) -> bool {
+    pub fn is_visible_from<'db>(self, db: &'db Db, from_module: ModuleIdLt<'db>) -> bool {
         let to_module = match self {
             // A `Visibility` is resolved against `db`'s def maps and asked with the same `db`.
             Visibility::Module(m, _) => m.to_db(db),
@@ -217,12 +218,7 @@ impl Visibility {
     ///
     /// If there is no subset relation between `self` and `other`, returns `None` (i.e. they're only
     /// visible in unrelated modules).
-    pub(crate) fn max(
-        self,
-        db: &Db,
-        other: Visibility,
-        def_map: &DefMap,
-    ) -> Option<Visibility> {
+    pub(crate) fn max(self, db: &Db, other: Visibility, def_map: &DefMap) -> Option<Visibility> {
         match (self, other) {
             (_, Visibility::Public) | (Visibility::Public, _) => Some(Visibility::Public),
             (Visibility::PubCrate(krate), Visibility::PubCrate(krateb)) => {
@@ -292,12 +288,7 @@ impl Visibility {
     ///
     /// If there is no subset relation between `self` and `other`, returns `None` (i.e. they're only
     /// visible in unrelated modules).
-    pub(crate) fn min(
-        self,
-        db: &Db,
-        other: Visibility,
-        def_map: &DefMap,
-    ) -> Option<Visibility> {
+    pub(crate) fn min(self, db: &Db, other: Visibility, def_map: &DefMap) -> Option<Visibility> {
         match (self, other) {
             (vis, Visibility::Public) | (Visibility::Public, vis) => Some(vis),
             (Visibility::PubCrate(krate), Visibility::PubCrate(krateb)) => {
@@ -403,7 +394,11 @@ pub fn written_visibility<N: AstIdNode>(
     resolve_raw(db, has_resolver, &crate::signatures::written_visibility(db, id, module))
 }
 
-fn resolve_raw(db: &Db, has_resolver: impl HasResolver + HasModule, raw_vis: &RawVisibility) -> Visibility {
+fn resolve_raw(
+    db: &Db,
+    has_resolver: impl HasResolver + HasModule,
+    raw_vis: &RawVisibility,
+) -> Visibility {
     match raw_vis {
         &RawVisibility::PubSelf(explicitness) => {
             Visibility::Module(has_resolver.module(db), explicitness)
@@ -439,10 +434,7 @@ impl AssocItemId {
     }
 }
 
-fn trait_item_visibility(
-    db: &Db,
-    container: ItemContainerId,
-) -> Option<Visibility> {
+fn trait_item_visibility(db: &Db, container: ItemContainerId) -> Option<Visibility> {
     match container {
         ItemContainerId::TraitId(trait_) => Some(trait_visibility(db, trait_)),
         _ => None,
@@ -455,8 +447,8 @@ fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
 
 #[cfg(test)]
 mod view_tests {
-    use syntax::view::{HasName as _, HasVisibility as _};
     use hir_expand::fixture;
+    use syntax::view::{HasName as _, HasVisibility as _};
 
     use super::*;
     use crate::{
@@ -595,14 +587,17 @@ pub struct S;
 pub(super) fn too_far() {}
 "#,
         );
-        assert_eq!(restricted_visibilities(fx), [
-            "not_a_module E0577",
-            "not_ancestor E0742",
-            "ok ok",
-            "relative 2018",
-            "too_far E0433",
-            "unresolved E0433",
-        ]);
+        assert_eq!(
+            restricted_visibilities(fx),
+            [
+                "not_a_module E0577",
+                "not_ancestor E0742",
+                "ok ok",
+                "relative 2018",
+                "too_far E0433",
+                "unresolved E0433",
+            ]
+        );
     }
 
     /// In Rust 2015 a `pub(in path)` that starts with a name is from the crate root, as rustc

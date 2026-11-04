@@ -132,14 +132,18 @@ fn known_digests() {
         assert_eq!(hex(&reference(input)), want, "reference: {}", String::from_utf8_lossy(input));
     }
     let million = vec![b'a'; 1_000_000];
-    assert_eq!(hex(&digest(&million)), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    assert_eq!(
+        hex(&digest(&million)),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
 }
 
 /// The lengths around one and two padding blocks, and the page sizes a code signature hashes.
 #[test]
 fn every_length_around_the_padding() {
     let bytes = noise(70_000, 1);
-    for len in [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 4096, 16384, 69_952, 70_000] {
+    for len in [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 4096, 16384, 69_952, 70_000]
+    {
         assert_eq!(digest(&bytes[..len]), reference(&bytes[..len]), "{len} bytes");
     }
 }
@@ -194,7 +198,10 @@ fn parts_hash_as_the_whole() {
     }
     let mut hasher = Sha256::default();
     hasher.update(b"ab").update(b"c");
-    assert_eq!(hex(&hasher.finish()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(
+        hex(&hasher.finish()),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
 
 #[test]

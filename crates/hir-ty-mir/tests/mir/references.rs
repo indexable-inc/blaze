@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use hir_def::StaticId;
+use hir_expand::fixture;
 use hir_ty::{
     db::HirDatabase,
     next_solver::{StoredConst, StoredTy},
@@ -13,7 +14,6 @@ use hir_ty_mir::mir::{
     CastKind, MirBody, MirOptLevel, MirOptions, Operand, OperandKind, Rvalue, StatementKind,
     TerminatorKind,
 };
-use hir_expand::fixture;
 
 use crate::function;
 
@@ -82,7 +82,8 @@ fn release_adds_nothing(fixture: &str, functions: &[&str]) {
                     .unwrap_or_else(|error| panic!("the MIR of `{name}`: {error:?}"))
             };
             let (debug, release) = (body(MirOptLevel::Debug), body(MirOptLevel::Release));
-            let added: Vec<_> = references(release).difference(&references(debug)).copied().collect();
+            let added: Vec<_> =
+                references(release).difference(&references(debug)).copied().collect();
             assert!(added.is_empty(), "`{name}` at Release references {added:?}");
             assert_eq!(debug.closures, release.closures, "`{name}`");
             for &closure in &debug.closures {

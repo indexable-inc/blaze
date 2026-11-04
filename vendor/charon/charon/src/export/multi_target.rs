@@ -72,13 +72,7 @@ impl CrateMerger {
             has_errors,
         } = krate;
         self.merged.has_errors |= has_errors;
-        let target = krate
-            .target_information
-            .keys()
-            .exactly_one()
-            .ok()
-            .unwrap()
-            .clone();
+        let target = krate.target_information.keys().exactly_one().ok().unwrap().clone();
 
         // Remap all ids inside `krate`.
         krate.drive_mut(&mut {
@@ -171,35 +165,14 @@ impl CrateMerger {
                 "cannot merge crates with different runtime-check settings"
             );
         }
-        self.merged
-            .translated
-            .target_information
-            .extend(target_information);
+        self.merged.translated.target_information.extend(target_information);
         self.merged.translated.item_names.extend(item_names);
-        self.merged
-            .translated
-            .assoc_item_names
-            .extend_from_other(assoc_item_names);
-        self.merged
-            .translated
-            .type_decls
-            .extend_from_other(type_decls);
-        self.merged
-            .translated
-            .fun_decls
-            .extend_from_other(fun_decls);
-        self.merged
-            .translated
-            .global_decls
-            .extend_from_other(global_decls);
-        self.merged
-            .translated
-            .trait_decls
-            .extend_from_other(trait_decls);
-        self.merged
-            .translated
-            .trait_impls
-            .extend_from_other(trait_impls);
+        self.merged.translated.assoc_item_names.extend_from_other(assoc_item_names);
+        self.merged.translated.type_decls.extend_from_other(type_decls);
+        self.merged.translated.fun_decls.extend_from_other(fun_decls);
+        self.merged.translated.global_decls.extend_from_other(global_decls);
+        self.merged.translated.trait_decls.extend_from_other(trait_decls);
+        self.merged.translated.trait_impls.extend_from_other(trait_impls);
     }
 }
 
@@ -259,11 +232,7 @@ impl ItemComparer<'_> {
             let id = (*id).into();
             self.remap.get(&id).copied().unwrap_or(id)
         };
-        if remap(left) == remap(right) {
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Break(())
-        }
+        if remap(left) == remap(right) { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
     }
 
     fn compare_iters<'a, T: AstVisitable + 'a>(
@@ -445,11 +414,8 @@ impl TargetGroup {
         krate: &TranslatedCrate,
         remap: &HashMap<ItemId, ItemId>,
     ) -> MergeDecision {
-        let items: Vec<Option<ItemRef<'_>>> = self
-            .ids
-            .values()
-            .map(|&id| krate.get_item(id))
-            .collect_vec();
+        let items: Vec<Option<ItemRef<'_>>> =
+            self.ids.values().map(|&id| krate.get_item(id)).collect_vec();
 
         // Items that don't exist in the crate can't be compared; if they're all missing we can
         // still merge them tho.
@@ -626,21 +592,16 @@ impl<'a> ItemDeduplicator<'a> {
                 break;
             }
         }
-        let groups: IndexVec<TargetGroupId, TargetGroup> = groups_map
-            .into_values()
-            .map(|ids| TargetGroup { ids })
-            .collect();
+        let groups: IndexVec<TargetGroupId, TargetGroup> =
+            groups_map.into_values().map(|ids| TargetGroup { ids }).collect();
         groups
     }
 
     /// Decide how to merge each group. Skipped groups are not included in the output.
     fn decide_group_mergings(&self) -> Vec<(TargetGroupId, MergeDecision)> {
         // Start with all groups as candidates.
-        let mut candidates: Vec<(TargetGroupId, MergeDecision)> = self
-            .groups
-            .indices()
-            .map(|id| (id, MergeDecision::Skip))
-            .collect();
+        let mut candidates: Vec<(TargetGroupId, MergeDecision)> =
+            self.groups.indices().map(|id| (id, MergeDecision::Skip)).collect();
 
         // Fixpoint: assume that all included groups are mapped to a single item; keep the groups
         // that can be merged under such a mapping. Iterate until fixpoint.
@@ -719,8 +680,7 @@ impl<'a> ItemDeduplicator<'a> {
         self.krate.drive_mut(&mut IdRefMapperVisitor::new(&remap));
 
         for decl in facade_decls {
-            self.krate
-                .set_new_item_slot(ItemId::Fun(decl.def_id), ItemByVal::Fun(decl));
+            self.krate.set_new_item_slot(ItemId::Fun(decl.def_id), ItemByVal::Fun(decl));
         }
     }
 
@@ -823,12 +783,8 @@ fn remove_unmentioned_methods(krate: &mut TranslatedCrate) {
             let fun_node = Fun(fun_id);
             graph.add_node(fun_node);
 
-            if let FunSource::TraitDefault {
-                trait_ref, item_id, ..
-            }
-            | FunSource::TraitImpl {
-                trait_ref, item_id, ..
-            } = &fun.src
+            if let FunSource::TraitDefault { trait_ref, item_id, .. }
+            | FunSource::TraitImpl { trait_ref, item_id, .. } = &fun.src
             {
                 let method_key = (trait_ref.id, *item_id);
                 // The method node is reachable iff any of the corresponding function nodes is.
@@ -871,10 +827,7 @@ fn remove_unmentioned_methods(krate: &mut TranslatedCrate) {
         match n {
             Root => {}
             Method((trait_id, method_id)) => {
-                unused_methods
-                    .entry(trait_id)
-                    .or_default()
-                    .insert(method_id);
+                unused_methods.entry(trait_id).or_default().insert(method_id);
             }
             Fun(fun_id) => {
                 // Remove unreachable functions.
@@ -890,16 +843,12 @@ fn remove_unmentioned_methods(krate: &mut TranslatedCrate) {
     for trait_impl in krate.trait_impls.iter_mut() {
         let trait_id = trait_impl.impl_trait.id;
         if let Some(unused_methods) = unused_methods.get(&trait_id) {
-            trait_impl
-                .methods
-                .retain(|method_id, _| !unused_methods.contains(&method_id));
+            trait_impl.methods.retain(|method_id, _| !unused_methods.contains(&method_id));
         }
     }
     for (trait_id, unused_methods) in unused_methods {
         if let Some(trait_decl) = krate.trait_decls.get_mut(trait_id) {
-            trait_decl
-                .methods
-                .retain(|method_id, _| !unused_methods.contains(&method_id));
+            trait_decl.methods.retain(|method_id, _| !unused_methods.contains(&method_id));
         }
     }
 }

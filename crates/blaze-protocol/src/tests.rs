@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
+use std::alloc::Global;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -606,12 +606,12 @@ fn a_record_of_nodes_is_these_bytes() {
     let record = Record { at_ns: 0, event };
     let expected = [
         "a2 6561745f6e73 00 656576656e74 a1 654e6f646573 a6", // {"at_ns": 0, "event": {"Nodes":
-        "64 64657073 82 00 01",                                //   "deps": [0, 1]
-        "65 6669727374 01",                                    //   "first": 1
-        "65 6b696e6473 82 63537464 654e616d6573",              //   "kinds": ["Std", "Names"]
-        "65 6e616d6573 65 7374646162",                         //   "names": "stdab"
-        "67 646570735f6174 83 00 01 02",                       //   "deps_at": [0, 1, 2]
-        "67 6e616d655f6174 83 00 03 05",                       //   "name_at": [0, 3, 5]}}
+        "64 64657073 82 00 01",                               //   "deps": [0, 1]
+        "65 6669727374 01",                                   //   "first": 1
+        "65 6b696e6473 82 63537464 654e616d6573",             //   "kinds": ["Std", "Names"]
+        "65 6e616d6573 65 7374646162",                        //   "names": "stdab"
+        "67 646570735f6174 83 00 01 02",                      //   "deps_at": [0, 1, 2]
+        "67 6e616d655f6174 83 00 03 05",                      //   "name_at": [0, 3, 5]}}
     ];
     let bytes = to_vec(&record).unwrap();
     assert_eq!(hex(&bytes), expected.concat().replace(' ', ""));
@@ -676,9 +676,8 @@ struct Columns<'a> {
 fn a_malformed_record_of_nodes_is_refused() {
     use crate::events::{Event, NodeKind, Order};
     // Ids 5 and 6: "std" waiting for 1, said before, and "é" waiting for 5.
-    let good = || {
-        nodes_record(5, &[(NodeKind::Std, "std", &[1]), (NodeKind::Names, "\u{e9}", &[5])])
-    };
+    let good =
+        || nodes_record(5, &[(NodeKind::Std, "std", &[1]), (NodeKind::Names, "\u{e9}", &[5])]);
     let mut order = Order::default();
     assert!(good().nodes(&mut order).unwrap().is_ok());
     assert_eq!(order.places(), [0, 1]);
@@ -804,9 +803,10 @@ fn plain_order(nodes: &[(u32, Vec<u32>)]) -> Vec<u32> {
     while order.len() < nodes.len() {
         let can = (0..nodes.len()).find(|&at| {
             !placed[at]
-                && nodes[at].1.iter().all(|dep| {
-                    nodes.iter().position(|it| it.0 == *dep).is_none_or(|it| placed[it])
-                })
+                && nodes[at]
+                    .1
+                    .iter()
+                    .all(|dep| nodes.iter().position(|it| it.0 == *dep).is_none_or(|it| placed[it]))
         });
         let at = can.expect("a batch that was read has no cycle");
         placed[at] = true;

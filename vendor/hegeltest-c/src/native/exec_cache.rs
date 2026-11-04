@@ -118,10 +118,7 @@ pub(crate) struct ExecCache {
 impl ExecCache {
     #[cfg(test)]
     fn with_full_tier_bound(max_bytes: usize) -> Self {
-        ExecCache {
-            max_full_bytes: Some(max_bytes),
-            ..ExecCache::default()
-        }
+        ExecCache { max_full_bytes: Some(max_bytes), ..ExecCache::default() }
     }
 
     /// Record one executed conclusion under its serialized-values `key`,
@@ -144,17 +141,8 @@ impl ExecCache {
                 mismatched_origin: v.origin.clone().or_else(|| origin.map(String::from)),
             },
             None => {
-                self.verdicts.insert(
-                    digest,
-                    Verdict {
-                        status,
-                        origin: origin.map(String::from),
-                    },
-                );
-                Recorded {
-                    verdict_mismatch: false,
-                    mismatched_origin: None,
-                }
+                self.verdicts.insert(digest, Verdict { status, origin: origin.map(String::from) });
+                Recorded { verdict_mismatch: false, mismatched_origin: None }
             }
         };
         if keep_full && !recorded.verdict_mismatch && !self.full.contains_key(&key) {

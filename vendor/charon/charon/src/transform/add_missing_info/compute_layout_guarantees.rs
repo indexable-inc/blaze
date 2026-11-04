@@ -80,20 +80,16 @@ fn compute_guarantees(
             .map(SizeExpr::align_of)
             .map(OffsetGuarantee::GuaranteedAlignment)
             .collect();
-        return Some(Guarantees {
-            size,
-            align,
-            offsets: [offsets].into(),
-        });
+        return Some(Guarantees { size, align, offsets: [offsets].into() });
     }
 
     // `repr(C)` and `repr(int)` enums have a tag of the given type, or of the C default one.
     // <https://doc.rust-lang.org/reference/type-layout.html#r-layout.repr.c.enum>
     // <https://doc.rust-lang.org/reference/type-layout.html#r-layout.repr.primitive.enum>
     let tag_ty = (decl.kind.is_enum() && repr.guarantees_fixed_field_order()).then(|| {
-        let int_ty = repr.explicit_discr_type.unwrap_or(IntegerTy::Signed(
-            krate.target_information[target].c_enum_smallest_repr_ty,
-        ));
+        let int_ty = repr
+            .explicit_discr_type
+            .unwrap_or(IntegerTy::Signed(krate.target_information[target].c_enum_smallest_repr_ty));
         TyKind::Scalar(ScalarTy::Integer(int_ty)).into_ty()
     });
     let is_repr_c_like = repr.repr_algo == ReprAlgorithm::C || tag_ty.is_some();
@@ -110,11 +106,7 @@ fn compute_guarantees(
             SizeExpr::max_size(fields.iter().map(SizeExpr::size_of).collect()),
             align.clone(),
         );
-        return Some(Guarantees {
-            size,
-            align,
-            offsets: [offsets].into(),
-        });
+        return Some(Guarantees { size, align, offsets: [offsets].into() });
     }
 
     // A field-less enum has the layout of its tag.
@@ -144,10 +136,8 @@ fn compute_guarantees(
             let offset = SizeExpr::offset_of(decl.self_ref(), *variant, FieldId::from_usize(last));
             Some(SizeExprKind::Plus(offset, SizeExpr::size_of(ty)).into_expr())
         });
-        let field_aligns = variants
-            .iter()
-            .flat_map(|(_, fields)| fields.iter().map(field_align))
-            .collect_vec();
+        let field_aligns =
+            variants.iter().flat_map(|(_, fields)| fields.iter().map(field_align)).collect_vec();
         let tag_size = tag_ty.as_ref().map(SizeExpr::size_of);
         let tag_align = tag_ty.as_ref().map(SizeExpr::align_of);
 
@@ -181,11 +171,7 @@ fn compute_guarantees(
                     .collect()
             })
             .collect();
-        return Some(Guarantees {
-            size,
-            align,
-            offsets,
-        });
+        return Some(Guarantees { size, align, offsets });
     }
 
     // `repr(Rust)` only guarantees that the fields are aligned and don't overlap, and that the
@@ -203,10 +189,7 @@ fn compute_guarantees(
     let offsets = variants
         .iter()
         .map(|(_, fields)| {
-            fields
-                .iter()
-                .map(|ty| OffsetGuarantee::GuaranteedAlignment(field_align(ty)))
-                .collect()
+            fields.iter().map(|ty| OffsetGuarantee::GuaranteedAlignment(field_align(ty))).collect()
         })
         .collect();
     Some(Guarantees {

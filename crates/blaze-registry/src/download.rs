@@ -118,9 +118,8 @@ impl Registry {
         // cargo's words for a `.crate` that is not its checksum's, over blaze-fetch's (which
         // name both digests) as its cause.
         let checked = |e: FetchError| match e {
-            FetchError::Mismatch { .. } => {
-                anyhow::Error::new(e).context(format!("failed to verify the checksum of `{package}`"))
-            }
+            FetchError::Mismatch { .. } => anyhow::Error::new(e)
+                .context(format!("failed to verify the checksum of `{package}`")),
             e => anyhow::Error::new(e),
         };
         if let Some(objects) = objects
@@ -144,7 +143,9 @@ impl Registry {
                 };
                 match kept {
                     Ok(()) => return Ok((bytes, From::CargoCache)),
-                    Err(e @ FetchError::Mismatch { .. }) if self.is_local() => return Err(checked(e)),
+                    Err(e @ FetchError::Mismatch { .. }) if self.is_local() => {
+                        return Err(checked(e));
+                    }
                     // Not what the index says: downloaded again in its place.
                     Err(FetchError::Mismatch { .. }) => _ = std::fs::remove_file(&cache_file),
                     Err(e) => return Err(e.into()),
@@ -187,7 +188,8 @@ impl Registry {
             None => StoreOf::Unkept,
         };
         let net = Arc::new(crate::pinned::Net::new(Arc::clone(&context.http)));
-        let fetcher = Fetcher::new(store, net, scratch).with_policy(crate::pinned::policy(&context.net.retry));
+        let fetcher = Fetcher::new(store, net, scratch)
+            .with_policy(crate::pinned::policy(&context.net.retry));
         let bytes = match objects {
             Some(objects) => {
                 let source = Source::Url { url, digest: pin };
@@ -219,7 +221,8 @@ impl PrivateDir {
             .map_or(0, |it| it.subsec_nanos());
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // alloc: once a download
-        let dir = std::env::temp_dir().join(format!("blaze-fetch-{}-{n}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-fetch-{}-{n}-{nanos}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -275,7 +278,9 @@ fn is_unpacked(dst: &Path) -> anyhow::Result<bool> {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e),
             }
-            .with_context(|| format!("failed to remove `{}`, an unpacking that did not finish", dst.display()))?;
+            .with_context(|| {
+                format!("failed to remove `{}`, an unpacking that did not finish", dst.display())
+            })?;
             Ok(false)
         }
         Err(e) => bail!("unable to read .cargo-ok file at {ok:?}: {e}"),
@@ -331,8 +336,12 @@ fn set_generated_mtimes(dst: &Path) {
 fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<u64> {
     let limit = MAX_UNPACK_SIZE.max(tarball.len() as u64 * MAX_COMPRESSION_RATIO);
     let gz = flate2::read::GzDecoder::new(tarball);
-    let prefix = dst.file_name().and_then(|it| it.to_str()).context("a package directory has a UTF-8 name")?;
-    std::fs::create_dir_all(dst).with_context(|| format!("failed to create `{}`", dst.display()))?;
+    let prefix = dst
+        .file_name()
+        .and_then(|it| it.to_str())
+        .context("a package directory has a UTF-8 name")?;
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create `{}`", dst.display()))?;
     #[cfg(unix)]
     let mask = umask();
     #[cfg(not(unix))]
@@ -356,7 +365,11 @@ fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow
     match blaze_fetch::unpack::unpack(LimitErrorReader { inner: gz, left: limit }, dst, &rules) {
         Ok(unpacked) => Ok(unpacked.bytes),
         Err(refused) => {
-            let reserved = cfg!(windows) && refused.path.as_deref().is_some_and(|it| is_windows_reserved_path(Path::new(it)));
+            let reserved = cfg!(windows)
+                && refused
+                    .path
+                    .as_deref()
+                    .is_some_and(|it| is_windows_reserved_path(Path::new(it)));
             let error = anyhow::anyhow!("invalid tarball downloaded for {prefix}: {refused}");
             match reserved {
                 true => Err(error.context(format!(
@@ -445,7 +458,8 @@ mod tests {
 
     #[test]
     fn a_reserved_path_is_one_on_either_copy() {
-        let parts = ["a", "con", "CON.txt", "nul.tar.gz", "com1", "com10", "lpt9.rs", ".", "", "x.con"];
+        let parts =
+            ["a", "con", "CON.txt", "nul.tar.gz", "com1", "com10", "lpt9.rs", ".", "", "x.con"];
         let mut paths = vec![String::new()];
         for first in parts {
             for second in parts {

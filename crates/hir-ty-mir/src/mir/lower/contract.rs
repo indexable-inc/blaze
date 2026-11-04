@@ -144,7 +144,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.refuse_mut_param()?;
             }
             for &clause in exprs {
-                let Some(next) = self.check_clause(func, SpecClauseKind::Ensures, clause, current)?
+                let Some(next) =
+                    self.check_clause(func, SpecClauseKind::Ensures, clause, current)?
                 else {
                     return Ok(None);
                 };

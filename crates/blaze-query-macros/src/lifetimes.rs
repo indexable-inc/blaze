@@ -4,9 +4,9 @@
 // alloc: expansion time, once per annotated item; no query runs this
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use proc_macro2::Span;
 use quote::quote;
+use std::alloc::Global;
 use syn::visit_mut::{self, VisitMut};
 use syn::{Expr, Lifetime, Type};
 

@@ -290,7 +290,10 @@ impl<'t, FileId: Copy, N: view::AstNode<'t>> InFileWrapper<FileId, N> {
     }
 
     pub fn node_file_range_view(&self) -> FileRangeWrapper<FileId> {
-        FileRangeWrapper { file_id: self.file_id, range: view::AstNode::syntax(&self.value).text_range() }
+        FileRangeWrapper {
+            file_id: self.file_id,
+            range: view::AstNode::syntax(&self.value).text_range(),
+        }
     }
 }
 
@@ -357,11 +360,8 @@ impl<'db> InFile<view::Node<'db>> {
             _ => return None,
         };
 
-        let FileRange { file_id: editioned_file_id, range } = map_node_range_up_rooted(
-            db,
-            file_id.expansion_span_map(db),
-            self.value.text_range(),
-        )?;
+        let FileRange { file_id: editioned_file_id, range } =
+            map_node_range_up_rooted(db, file_id.expansion_span_map(db), self.value.text_range())?;
 
         let kind = self.value.kind();
         let value = editioned_file_id
@@ -483,10 +483,7 @@ impl InFile<TextRange> {
         }
     }
 
-    pub fn original_node_file_range_with_macro_call_input(
-        self,
-        db: &Db,
-    ) -> FileRange {
+    pub fn original_node_file_range_with_macro_call_input(self, db: &Db) -> FileRange {
         match self.file_id {
             HirFileId::FileId(file_id) => FileRange { file_id, range: self.value },
             HirFileId::MacroFile(mac_file) => {
@@ -501,10 +498,7 @@ impl InFile<TextRange> {
         }
     }
 
-    pub fn original_node_file_range_opt(
-        self,
-        db: &Db,
-    ) -> Option<(FileRange, SyntaxContext)> {
+    pub fn original_node_file_range_opt(self, db: &Db) -> Option<(FileRange, SyntaxContext)> {
         match self.file_id {
             HirFileId::FileId(file_id) => Some((
                 FileRange { file_id, range: self.value },

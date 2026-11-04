@@ -70,37 +70,236 @@ mod asm {
         /// k1 entered with the input pointer itself in place of a table,
         /// and the address of the last block as a seventh argument: blocks
         /// 0..blocks-1 come from `input`, the last from `last`.
-        pub fn blake3_servil_hybrid_c1(input: *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, last: *const u8);
-        pub fn blake3_servil_hybrid_k1(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k2(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k3(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k4(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k5(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k6(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k7(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k8(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k9(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_k10(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
+        pub fn blake3_servil_hybrid_c1(
+            input: *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            last: *const u8,
+        );
+        pub fn blake3_servil_hybrid_k1(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k2(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k3(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k4(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k5(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k6(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k7(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k8(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k9(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_k10(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
         /// q<n>: n whole chunks and a partial chunk, `n + 1` inputs. The
         /// partial chunk is the last input, read as `blocks` whole blocks
         /// (zero-padded), its final block recording `last_len` bytes;
         /// `partial` is `blocks | last_len << 8`.
-        pub fn blake3_servil_hybrid_q1(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q2(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q3(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q4(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q7(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q5(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q6(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q8(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_q9(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8, partial: u64);
-        pub fn blake3_servil_hybrid_p2(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p3(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p5(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p7(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p9(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p4(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p8(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
+        pub fn blake3_servil_hybrid_q1(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q2(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q3(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q4(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q7(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q5(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q6(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q8(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_q9(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+            partial: u64,
+        );
+        pub fn blake3_servil_hybrid_p2(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p3(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p5(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p7(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p9(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p4(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
+        pub fn blake3_servil_hybrid_p8(
+            inputs: *const *const u8,
+            blocks: u64,
+            key: *const u32,
+            counter: u64,
+            packed_flags: u64,
+            out: *mut u8,
+        );
     }
     /// The kernels on scalars and quads alone, which need no SHA-3.
     macro_rules! plain {
@@ -110,8 +309,20 @@ mod asm {
             }
         };
     }
-    plain!(blake3_servil_hybrid_kn2, blake3_servil_hybrid_kn4, blake3_servil_hybrid_kn5, blake3_servil_hybrid_kn6, blake3_servil_hybrid_kn8);
-    plain!(blake3_servil_hybrid_pn2, blake3_servil_hybrid_pn4, blake3_servil_hybrid_pn5, blake3_servil_hybrid_pn6, blake3_servil_hybrid_pn10);
+    plain!(
+        blake3_servil_hybrid_kn2,
+        blake3_servil_hybrid_kn4,
+        blake3_servil_hybrid_kn5,
+        blake3_servil_hybrid_kn6,
+        blake3_servil_hybrid_kn8
+    );
+    plain!(
+        blake3_servil_hybrid_pn2,
+        blake3_servil_hybrid_pn4,
+        blake3_servil_hybrid_pn5,
+        blake3_servil_hybrid_pn6,
+        blake3_servil_hybrid_pn10
+    );
     // Extended output, one, four and eight blocks: (table, 1, cv, counter,
     // packed, out), 64 bytes a block.
     plain!(blake3_servil_hybrid_x1, blake3_servil_hybrid_x4, blake3_servil_hybrid_x8);
@@ -122,17 +333,29 @@ mod asm {
 /// `block_len`, both halves of the state), eight blocks a call where they
 /// fit (x8), then four (x4); the bytes filled, a multiple of 256. Every
 /// AArch64 CPU runs them (quads, which need no SHA-3).
-pub fn xof_many(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, mut counter: u64, flags: u8, out: &mut [u8]) -> usize {
+pub fn xof_many(
+    cv: &CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    mut counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) -> usize {
     let table = [block.as_ptr(); 8];
     let packed = flags as u64 | (block_len as u64) << 24;
     let mut done = 0;
     while out.len() - done >= 4 * BLOCK_LEN {
-        let (kernel, blocks): (Kernel, usize) =
-            if out.len() - done >= 8 * BLOCK_LEN { (asm::blake3_servil_hybrid_x8, 8) } else { (asm::blake3_servil_hybrid_x4, 4) };
+        let (kernel, blocks): (Kernel, usize) = if out.len() - done >= 8 * BLOCK_LEN {
+            (asm::blake3_servil_hybrid_x8, 8)
+        } else {
+            (asm::blake3_servil_hybrid_x4, 4)
+        };
         crate::ran_kernel(kernel as *const ());
         // Sound: every table entry points at the 64-byte block; the kernel
         // writes 64 bytes a block within `out[done..]`.
-        unsafe { kernel(table.as_ptr(), 1, cv.as_ptr(), counter, packed, out[done..].as_mut_ptr()) };
+        unsafe {
+            kernel(table.as_ptr(), 1, cv.as_ptr(), counter, packed, out[done..].as_mut_ptr())
+        };
         counter = counter.wrapping_add(blocks as u64);
         done += blocks * BLOCK_LEN;
     }
@@ -143,22 +366,47 @@ pub fn xof_many(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, mut counte
 /// (x1). The four-lane x4 costs about two compressions on the M4's cores
 /// and the VM's: one block of output through it took 2.1 times the
 /// portable compression's time, and through x1 0.97 (VM, BLAKE3 #190).
-pub fn xof_block(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) -> [u8; BLOCK_LEN] {
+pub fn xof_block(
+    cv: &CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+) -> [u8; BLOCK_LEN] {
     let mut out = [0u8; BLOCK_LEN];
     let table = [block.as_ptr()];
     let packed = flags as u64 | (block_len as u64) << 24;
     crate::ran_kernel(asm::blake3_servil_hybrid_x1 as *const ());
     // Sound: the table's one entry points at the 64-byte block; the kernel
     // writes the block's 64 bytes of output to `out`.
-    unsafe { asm::blake3_servil_hybrid_x1(table.as_ptr(), 1, cv.as_ptr(), counter, packed, out.as_mut_ptr()) };
+    unsafe {
+        asm::blake3_servil_hybrid_x1(
+            table.as_ptr(),
+            1,
+            cv.as_ptr(),
+            counter,
+            packed,
+            out.as_mut_ptr(),
+        )
+    };
     out
 }
 
 /// The last one to three blocks of extended output into `out`, from block
 /// `counter`: one or two blocks on x1, three on x4 (its fourth discarded),
 /// which takes about the time of two x1 calls.
-pub fn xof_tail(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8, out: &mut [u8]) {
-    assert!(out.len() < 4 * BLOCK_LEN && out.len() % BLOCK_LEN == 0, "a tail of one to three blocks");
+pub fn xof_tail(
+    cv: &CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) {
+    assert!(
+        out.len() < 4 * BLOCK_LEN && out.len() % BLOCK_LEN == 0,
+        "a tail of one to three blocks"
+    );
     if out.len() == 3 * BLOCK_LEN {
         let mut four = [0u8; 4 * BLOCK_LEN];
         xof_many(cv, block, block_len, counter, flags, &mut four);
@@ -166,7 +414,13 @@ pub fn xof_tail(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u
         return;
     }
     for (i, out) in out.chunks_exact_mut(BLOCK_LEN).enumerate() {
-        out.copy_from_slice(&xof_block(cv, block, block_len, counter.wrapping_add(i as u64), flags));
+        out.copy_from_slice(&xof_block(
+            cv,
+            block,
+            block_len,
+            counter.wrapping_add(i as u64),
+            flags,
+        ));
     }
 }
 
@@ -199,8 +453,25 @@ const CHUNK_KERNELS: [Option<Kernel>; 11] = [
 /// and the partial chunk after it (every split cost more); one whole chunk
 /// with a partial one uses q1 from five partial blocks (below that P-cores
 /// lost up to 14%).
-const CHUNK_PLANS: [&[usize]; 17] =
-    [&[], &[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9], &[10], &[8, 3], &[9, 3], &[10, 3], &[10, 4], &[10, 5], &[10, 6]];
+const CHUNK_PLANS: [&[usize]; 17] = [
+    &[],
+    &[1],
+    &[2],
+    &[3],
+    &[4],
+    &[5],
+    &[6],
+    &[7],
+    &[8],
+    &[9],
+    &[10],
+    &[8, 3],
+    &[9, 3],
+    &[10, 3],
+    &[10, 4],
+    &[10, 5],
+    &[10, 6],
+];
 
 /// Parent kernel per exact input count.
 const PARENT_KERNELS: [Option<Kernel>; 10] = [
@@ -230,8 +501,25 @@ const PARENT_KERNELS: [Option<Kernel>; 10] = [
 /// September 27, 2026): hash_many is built for top speed, P-cores do most
 /// of this machine's work, and four messages were the last batch where
 /// BLAKE3 official led (P -12%, E +30% in cycles per call).
-const PARENT_PLANS: [&[usize]; 17] =
-    [&[], &[1], &[2], &[3], &[4], &[5], &[3, 3], &[7], &[8], &[9], &[7, 3], &[9, 2], &[9, 3], &[9, 4], &[9, 5], &[8, 7], &[8, 8]];
+const PARENT_PLANS: [&[usize]; 17] = [
+    &[],
+    &[1],
+    &[2],
+    &[3],
+    &[4],
+    &[5],
+    &[3, 3],
+    &[7],
+    &[8],
+    &[9],
+    &[7, 3],
+    &[9, 2],
+    &[9, 3],
+    &[9, 4],
+    &[9, 5],
+    &[8, 7],
+    &[8, 8],
+];
 
 /// The kernels without SHA-3 per exact input count: scalars and quads
 /// alone (k1, k9, k10, p8, and p9 among them).
@@ -265,8 +553,25 @@ const PLAIN_PARENT_KERNELS: [Option<Kernel>; 11] = [
 
 /// Kernel sizes per count 1..=16 without SHA-3, chunks and parents alike:
 /// 3 and 7 run a kernel and k1 after it.
-const PLAIN_PLANS: [&[usize]; 17] =
-    [&[], &[1], &[2], &[2, 1], &[4], &[5], &[6], &[6, 1], &[8], &[9], &[10], &[10, 1], &[10, 2], &[9, 4], &[10, 4], &[10, 5], &[10, 6]];
+const PLAIN_PLANS: [&[usize]; 17] = [
+    &[],
+    &[1],
+    &[2],
+    &[2, 1],
+    &[4],
+    &[5],
+    &[6],
+    &[6, 1],
+    &[8],
+    &[9],
+    &[10],
+    &[10, 1],
+    &[10, 2],
+    &[9, 4],
+    &[10, 4],
+    &[10, 5],
+    &[10, 6],
+];
 
 /// A set of kernels and the plans that compose them, for chunks and for
 /// parents: one with SHA-3, one without.
@@ -277,9 +582,18 @@ struct Family {
     parent_kernels: &'static [Option<Kernel>],
 }
 
-static WITH_SHA3: Family = Family { chunk_plans: &CHUNK_PLANS, chunk_kernels: &CHUNK_KERNELS, parent_plans: &PARENT_PLANS, parent_kernels: &PARENT_KERNELS };
-static PLAIN: Family =
-    Family { chunk_plans: &PLAIN_PLANS, chunk_kernels: &PLAIN_CHUNK_KERNELS, parent_plans: &PLAIN_PLANS, parent_kernels: &PLAIN_PARENT_KERNELS };
+static WITH_SHA3: Family = Family {
+    chunk_plans: &CHUNK_PLANS,
+    chunk_kernels: &CHUNK_KERNELS,
+    parent_plans: &PARENT_PLANS,
+    parent_kernels: &PARENT_KERNELS,
+};
+static PLAIN: Family = Family {
+    chunk_plans: &PLAIN_PLANS,
+    chunk_kernels: &PLAIN_CHUNK_KERNELS,
+    parent_plans: &PLAIN_PLANS,
+    parent_kernels: &PLAIN_PARENT_KERNELS,
+};
 
 /// This CPU's family.
 fn family() -> &'static Family {
@@ -448,7 +762,14 @@ pub fn sha3_detected() -> bool {
 ///
 /// The kernel uses only integer instructions. Unsafe because `blocks` must
 /// hold `count * 64` readable bytes and `count` must be in 1..=16.
-pub unsafe fn compress_blocks(cv: &mut CVWords, blocks: *const u8, count: usize, counter: u64, flags: u8, flags_start: u8) {
+pub unsafe fn compress_blocks(
+    cv: &mut CVWords,
+    blocks: *const u8,
+    count: usize,
+    counter: u64,
+    flags: u8,
+    flags_start: u8,
+) {
     debug_assert!((1..=16).contains(&count));
     let packed = flags as u64 | (flags_start as u64) << 8 | (BLOCK_LEN as u64) << 24;
     // The kernel reads the whole key in its prologue and stores the output
@@ -458,7 +779,15 @@ pub unsafe fn compress_blocks(cv: &mut CVWords, blocks: *const u8, count: usize,
     unsafe {
         let last = blocks.add((count - 1) * BLOCK_LEN);
         crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
-        asm::blake3_servil_hybrid_c1(blocks, count as u64, cv_ptr, counter, packed, cv_ptr as *mut u8, last);
+        asm::blake3_servil_hybrid_c1(
+            blocks,
+            count as u64,
+            cv_ptr,
+            counter,
+            packed,
+            cv_ptr as *mut u8,
+            last,
+        );
     }
 }
 
@@ -472,7 +801,13 @@ pub unsafe fn compress_blocks(cv: &mut CVWords, blocks: *const u8, count: usize,
 /// The kernel uses only integer instructions and runs on every AArch64
 /// core. `block_len` is at most 64; the block is 64 bytes, zero-padded
 /// past `block_len` by the caller as the portable compressor requires.
-pub fn compress_in_place(cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) {
+pub fn compress_in_place(
+    cv: &mut CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+) {
     debug_assert!(block_len as usize <= BLOCK_LEN);
     // The one block is both first and last: the kernel ORs flags_start
     // into the first block and flags_end into the last, so the flags go
@@ -514,16 +849,28 @@ pub unsafe fn hash_chunk(
 ) {
     debug_assert!((1..=16).contains(&blocks));
     debug_assert!(last_len as usize <= BLOCK_LEN);
-    let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
+    let packed = flags as u64
+        | (flags_start as u64) << 8
+        | (flags_end as u64) << 16
+        | (last_len as u64) << 24;
     unsafe {
         crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
-        asm::blake3_servil_hybrid_c1(input, blocks as u64, key.as_ptr(), counter, packed, out.as_mut_ptr(), last.as_ptr());
+        asm::blake3_servil_hybrid_c1(
+            input,
+            blocks as u64,
+            key.as_ptr(),
+            counter,
+            packed,
+            out.as_mut_ptr(),
+            last.as_ptr(),
+        );
     }
 }
 
 /// A kernel for whole chunks plus a partial chunk: the arguments of
 /// [`Kernel`] and the partial chunk's `blocks | last_len << 8`.
-type PartialKernel = unsafe extern "C" fn(*const *const u8, u64, *const u32, u64, u64, *mut u8, u64);
+type PartialKernel =
+    unsafe extern "C" fn(*const *const u8, u64, *const u32, u64, u64, *mut u8, u64);
 
 /// Every assembly entry point of the hybrids, named: from the kernel
 /// tables, the q kernels, and the integer kernel (for the self-test's
@@ -608,18 +955,35 @@ pub unsafe fn hash_chunks_with_partial(
     out: &mut [u8],
 ) {
     assert!(partial_covers(chunks.len()), "1 to 15 whole chunks but 10");
-    assert!(!partial.is_empty() && partial.len() < CHUNK_LEN, "a partial chunk holds 1 to 1023 bytes");
+    assert!(
+        !partial.is_empty() && partial.len() < CHUNK_LEN,
+        "a partial chunk holds 1 to 1023 bytes"
+    );
     assert!(out.len() >= (chunks.len() + 1) * OUT_LEN);
     // Ten whole chunks and more: the first ones through the usual plans,
     // so the q kernel takes the last nine or fewer.
     let lead = chunks.len().saturating_sub(9);
     if lead > 0 {
-        let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+        let packed = flags as u64
+            | (flags_start as u64) << 8
+            | (flags_end as u64) << 16
+            | (BLOCK_LEN as u64) << 24;
         unsafe {
-            run_plan(CHUNK_PLANS[lead], &CHUNK_KERNELS, chunks.as_ptr() as *const *const u8, CHUNK_LEN / BLOCK_LEN, key, counter, 1, packed, out);
+            run_plan(
+                CHUNK_PLANS[lead],
+                &CHUNK_KERNELS,
+                chunks.as_ptr() as *const *const u8,
+                CHUNK_LEN / BLOCK_LEN,
+                key,
+                counter,
+                1,
+                packed,
+                out,
+            );
         }
     }
-    let (chunks, counter, out) = (&chunks[lead..], counter + lead as u64, &mut out[lead * OUT_LEN..]);
+    let (chunks, counter, out) =
+        (&chunks[lead..], counter + lead as u64, &mut out[lead * OUT_LEN..]);
     let n = chunks.len();
     let kernel = partial_kernel(n);
     crate::ran_kernel(kernel as *const ());
@@ -632,9 +996,20 @@ pub unsafe fn hash_chunks_with_partial(
         padded[..partial.len()].copy_from_slice(partial);
         let table = [chunks[0].as_ptr(), padded.as_ptr(), chunks[0].as_ptr()];
         let mut cvs = [0u8; 3 * OUT_LEN];
-        let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+        let packed = flags as u64
+            | (flags_start as u64) << 8
+            | (flags_end as u64) << 16
+            | (BLOCK_LEN as u64) << 24;
         unsafe {
-            kernel(table.as_ptr(), (CHUNK_LEN / BLOCK_LEN) as u64, key.as_ptr(), counter, packed, cvs.as_mut_ptr(), blocks as u64 | (last_len as u64) << 8);
+            kernel(
+                table.as_ptr(),
+                (CHUNK_LEN / BLOCK_LEN) as u64,
+                key.as_ptr(),
+                counter,
+                packed,
+                cvs.as_mut_ptr(),
+                blocks as u64 | (last_len as u64) << 8,
+            );
         }
         out[..2 * OUT_LEN].copy_from_slice(&cvs[..2 * OUT_LEN]);
         return;
@@ -650,9 +1025,20 @@ pub unsafe fn hash_chunks_with_partial(
         *slot = chunk.as_ptr();
     }
     table[n] = padded.as_ptr();
-    let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+    let packed = flags as u64
+        | (flags_start as u64) << 8
+        | (flags_end as u64) << 16
+        | (BLOCK_LEN as u64) << 24;
     unsafe {
-        kernel(table.as_ptr(), (CHUNK_LEN / BLOCK_LEN) as u64, key.as_ptr(), counter, packed, out.as_mut_ptr(), blocks as u64 | (last_len as u64) << 8);
+        kernel(
+            table.as_ptr(),
+            (CHUNK_LEN / BLOCK_LEN) as u64,
+            key.as_ptr(),
+            counter,
+            packed,
+            out.as_mut_ptr(),
+            blocks as u64 | (last_len as u64) << 8,
+        );
     }
 }
 
@@ -662,9 +1048,23 @@ pub unsafe fn hash_chunks_with_partial(
 /// pause the code comes from memory), the last of an odd count paired with
 /// itself; each message's last block `last_len` bytes (1 to 64, zero past
 /// it). Unsafe because the CPU must have NEON and the SHA-3 extension.
-pub unsafe fn hash_pairs(inputs: &[&[u8; BLOCK_LEN]], key: &CVWords, flags: u8, flags_start: u8, flags_end: u8, last_len: usize, out: &mut [u8]) {
-    assert!(out.len() >= inputs.len() * OUT_LEN && (1..=BLOCK_LEN).contains(&last_len), "a digest per input, a last block of 1 to 64 bytes");
-    let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
+pub unsafe fn hash_pairs(
+    inputs: &[&[u8; BLOCK_LEN]],
+    key: &CVWords,
+    flags: u8,
+    flags_start: u8,
+    flags_end: u8,
+    last_len: usize,
+    out: &mut [u8],
+) {
+    assert!(
+        out.len() >= inputs.len() * OUT_LEN && (1..=BLOCK_LEN).contains(&last_len),
+        "a digest per input, a last block of 1 to 64 bytes"
+    );
+    let packed = flags as u64
+        | (flags_start as u64) << 8
+        | (flags_end as u64) << 16
+        | (last_len as u64) << 24;
     let pair = PARENT_KERNELS[2].expect("the pair kernel");
     crate::ran_kernel(pair as *const ());
     let table = inputs.as_ptr() as *const *const u8;
@@ -703,7 +1103,14 @@ unsafe fn run_plan(
         let kernel = kernels[size].expect("plan names an existing kernel");
         crate::ran_kernel(kernel as *const ());
         unsafe {
-            kernel(inputs.add(done), blocks as u64, key.as_ptr(), counter + done as u64 * counter_step, packed_flags, out[done * OUT_LEN..].as_mut_ptr());
+            kernel(
+                inputs.add(done),
+                blocks as u64,
+                key.as_ptr(),
+                counter + done as u64 * counter_step,
+                packed_flags,
+                out[done * OUT_LEN..].as_mut_ptr(),
+            );
         }
         done += size;
     }
@@ -726,7 +1133,19 @@ pub unsafe fn hash_many<const N: usize>(
     flags_end: u8,
     out: &mut [u8],
 ) {
-    unsafe { hash_many_last_len(inputs, key, counter, increment_counter, flags, flags_start, flags_end, BLOCK_LEN, out) }
+    unsafe {
+        hash_many_last_len(
+            inputs,
+            key,
+            counter,
+            increment_counter,
+            flags,
+            flags_start,
+            flags_end,
+            BLOCK_LEN,
+            out,
+        )
+    }
 }
 
 /// [`hash_many`] with each input's last block `last_len` bytes long (1 to
@@ -744,7 +1163,20 @@ pub unsafe fn hash_many_last_len<const N: usize>(
     last_len: usize,
     out: &mut [u8],
 ) {
-    unsafe { hash_many_in(family(), inputs, key, counter, increment_counter, flags, flags_start, flags_end, last_len, out) }
+    unsafe {
+        hash_many_in(
+            family(),
+            inputs,
+            key,
+            counter,
+            increment_counter,
+            flags,
+            flags_start,
+            flags_end,
+            last_len,
+            out,
+        )
+    }
 }
 
 /// [`hash_many_last_len`] on the kernels of `family`.
@@ -764,13 +1196,17 @@ unsafe fn hash_many_in<const N: usize>(
     assert!(out.len() >= inputs.len() * OUT_LEN);
     assert!((1..=BLOCK_LEN).contains(&last_len), "a last block of 1 to 64 bytes");
     const { assert!(N > 0 && N % BLOCK_LEN == 0 && N <= CHUNK_LEN, "1 to 16 whole blocks") };
-    let (plans, kernels, counter_step): (&[&[usize]; 17], &[Option<Kernel>], u64) = if increment_counter.yes() {
-        assert_eq!(N, CHUNK_LEN, "incrementing counters hash whole chunks");
-        (family.chunk_plans, family.chunk_kernels, 1)
-    } else {
-        (family.parent_plans, family.parent_kernels, 0)
-    };
-    let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
+    let (plans, kernels, counter_step): (&[&[usize]; 17], &[Option<Kernel>], u64) =
+        if increment_counter.yes() {
+            assert_eq!(N, CHUNK_LEN, "incrementing counters hash whole chunks");
+            (family.chunk_plans, family.chunk_kernels, 1)
+        } else {
+            (family.parent_plans, family.parent_kernels, 0)
+        };
+    let packed = flags as u64
+        | (flags_start as u64) << 8
+        | (flags_end as u64) << 16
+        | (last_len as u64) << 24;
     let blocks = N / BLOCK_LEN;
     // `&[&[u8; N]]` is a table of pointers, which is what the kernels take.
     let table = inputs.as_ptr() as *const *const u8;
@@ -814,13 +1250,31 @@ pub unsafe fn hash_messages_raw(
     out: &mut [u8],
 ) {
     assert!(out.len() >= count * OUT_LEN, "room for every digest");
-    assert!((1..=16).contains(&blocks) && (1..=BLOCK_LEN).contains(&last_len), "1 to 16 blocks, the last of 1 to 64 bytes");
-    let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
+    assert!(
+        (1..=16).contains(&blocks) && (1..=BLOCK_LEN).contains(&last_len),
+        "1 to 16 blocks, the last of 1 to 64 bytes"
+    );
+    let packed = flags as u64
+        | (flags_start as u64) << 8
+        | (flags_end as u64) << 16
+        | (last_len as u64) << 24;
     let mut done = 0;
     while done < count {
         let n = core::cmp::min(GROUP, count - done);
         let family = family();
-        unsafe { run_plan(family.parent_plans[n], family.parent_kernels, table.add(done), blocks, key, counter, 0, packed, &mut out[done * OUT_LEN..]) };
+        unsafe {
+            run_plan(
+                family.parent_plans[n],
+                family.parent_kernels,
+                table.add(done),
+                blocks,
+                key,
+                counter,
+                0,
+                packed,
+                &mut out[done * OUT_LEN..],
+            )
+        };
         done += n;
     }
 }
@@ -836,12 +1290,18 @@ mod test {
         for partial in [false, true] {
             for n in 1..=if partial { 9 } else { 10 } {
                 let (start, end) = chunk_code(n, partial);
-                assert!(start < end && end - start < 32 * 1024, "kernel {n} (partial {partial}): {start:#x}..{end:#x}");
+                assert!(
+                    start < end && end - start < 32 * 1024,
+                    "kernel {n} (partial {partial}): {start:#x}..{end:#x}"
+                );
             }
         }
         for n in [1, 2, 3, 4, 5, 7, 8, 9] {
             let (start, end) = parent_code(n);
-            assert!(start < end && end - start < 32 * 1024, "parent kernel {n}: {start:#x}..{end:#x}");
+            assert!(
+                start < end && end - start < 32 * 1024,
+                "parent kernel {n}: {start:#x}..{end:#x}"
+            );
         }
         // The plans' mirror takes every shape compress_chunks_parallel does.
         for whole in 1..=16 {
@@ -854,6 +1314,8 @@ mod test {
     /// The groups of four against fixed values (crate::test::xof_groups_sweep).
     #[test]
     fn test_xof_many_groups() {
-        crate::test::xof_groups_sweep(&mut |cv, block, block_len, counter, flags, out| xof_many(cv, block, block_len, counter, flags, out));
+        crate::test::xof_groups_sweep(&mut |cv, block, block_len, counter, flags, out| {
+            xof_many(cv, block, block_len, counter, flags, out)
+        });
     }
 }

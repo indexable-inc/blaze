@@ -82,9 +82,12 @@ impl hasher::Hooks for HasherHooks<'_> {
         // kernels (about 0.2 us of other work between them puts the SME
         // unit in its slow state: `sme2`'s documentation).
         #[cfg(blake3_sme2)]
-        if !self.pooled && matches!(self.platform, Platform::SME2) && sme2::flat_takes(input.len()) {
+        if !self.pooled && matches!(self.platform, Platform::SME2) && sme2::flat_takes(input.len())
+        {
             // Safe: the SME2 platform is selected only where the CPU has it.
-            return Some(unsafe { sme2::compress_subtree_flat_to_cv(input, ahead, self.key, counter, self.flags) });
+            return Some(unsafe {
+                sme2::compress_subtree_flat_to_cv(input, ahead, self.key, counter, self.flags)
+            });
         }
         None
     }
@@ -106,9 +109,23 @@ impl hasher::Hooks for HasherHooks<'_> {
             // Pooled, the subtrees below take the lock one at a time, and
             // the pool's own never use SME2.
             let own = platform::Sme2Turn::take(self.chunk_platform, input.len() >= SME2_SIZED_LEN);
-            compress_subtree_to_parent_node(input, ahead, self.key, counter, self.flags, own.platform())
+            compress_subtree_to_parent_node(
+                input,
+                ahead,
+                self.key,
+                counter,
+                self.flags,
+                own.platform(),
+            )
         } else {
-            compress_subtree_to_parent_node(input, ahead, self.key, counter, self.flags, self.platform)
+            compress_subtree_to_parent_node(
+                input,
+                ahead,
+                self.key,
+                counter,
+                self.flags,
+                self.platform,
+            )
         };
         [pair[..OUT_LEN].try_into().unwrap(), pair[OUT_LEN..].try_into().unwrap()]
     }
@@ -120,12 +137,23 @@ type HasherKernels<'a> = hasher::Kernels<'a, Platform, HasherHooks<'a>>;
 
 /// A Hasher's kernels on its key and chunk state (see HasherHooks).
 #[inline(always)]
-fn kernels_on<'a>(key: &'a CVWords, chunk_state: &ChunkState, platform: Platform, pooled: bool) -> HasherKernels<'a> {
+fn kernels_on<'a>(
+    key: &'a CVWords,
+    chunk_state: &ChunkState,
+    platform: Platform,
+    pooled: bool,
+) -> HasherKernels<'a> {
     hasher::Kernels {
         key,
         flags: chunk_state.flags,
         platform: chunk_state.platform,
-        hooks: HasherHooks { key, flags: chunk_state.flags, chunk_platform: chunk_state.platform, platform, pooled },
+        hooks: HasherHooks {
+            key,
+            flags: chunk_state.flags,
+            chunk_platform: chunk_state.platform,
+            platform,
+            pooled,
+        },
     }
 }
 
@@ -143,7 +171,12 @@ impl Hasher {
     /// Copy `bytes` into the stage after what it holds.
     pub(crate) fn stage(&mut self, bytes: &[u8]) {
         // Sound: MaybeUninit<u8> has u8's layout, and the bytes fit (gather).
-        let room = unsafe { core::slice::from_raw_parts_mut(self.stage.as_mut_ptr().add(self.staged) as *mut u8, bytes.len()) };
+        let room = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.stage.as_mut_ptr().add(self.staged) as *mut u8,
+                bytes.len(),
+            )
+        };
         room.copy_from_slice(bytes);
         self.staged += bytes.len();
     }
@@ -163,16 +196,25 @@ impl Hasher {
     /// whole group (from offset zero) is kept for the caller to hash with
     /// others' (`held_group`), and the rest of `input`
     /// returned; else nothing is left.
-    pub(crate) fn gather_part<'a>(&mut self, mut input: &'a [u8], pooled: bool, hold: bool) -> &'a [u8] {
+    pub(crate) fn gather_part<'a>(
+        &mut self,
+        mut input: &'a [u8],
+        pooled: bool,
+        hold: bool,
+    ) -> &'a [u8] {
         self.core.assert_room(self.count(), input.len());
         while !input.is_empty() {
             // Whole groups, and a fresh hasher's first chunk (which hashes
             // serially either way), skip the stage.
-            if self.staged == 0 && (input.len() >= STAGE_LEN || self.core.count() + input.len() as u64 <= CHUNK_LEN as u64) {
+            if self.staged == 0
+                && (input.len() >= STAGE_LEN
+                    || self.core.count() + input.len() as u64 <= CHUNK_LEN as u64)
+            {
                 self.core.update_pooled(input, pooled);
                 return &[];
             }
-            let at = (self.core.initial_chunk_counter * CHUNK_LEN as u64 + self.count()) % STAGE_LEN as u64;
+            let at = (self.core.initial_chunk_counter * CHUNK_LEN as u64 + self.count())
+                % STAGE_LEN as u64;
             let to_boundary = STAGE_LEN - at as usize;
             let take = cmp::min(to_boundary, input.len());
             // The loop's variant: every pass stages at least one byte of
@@ -189,7 +231,8 @@ impl Hasher {
             let staged = core::mem::replace(&mut self.staged, 0);
             // Sound: the first `staged` bytes were written; the core reads
             // them before the stage is written again.
-            let bytes = unsafe { core::slice::from_raw_parts(self.stage.as_ptr() as *const u8, staged) };
+            let bytes =
+                unsafe { core::slice::from_raw_parts(self.stage.as_ptr() as *const u8, staged) };
             self.core.update_pooled(bytes, pooled);
         }
         &[]
@@ -199,8 +242,9 @@ impl Hasher {
     /// counter and its bytes.
     #[cfg(feature = "std")]
     pub(crate) fn held_group(&self) -> Option<(u64, &[u8; STAGE_LEN])> {
-        (self.staged == STAGE_LEN && self.core.initial_chunk_counter == 0)
-            .then(|| (self.core.count() / CHUNK_LEN as u64, self.staged_bytes().try_into().unwrap()))
+        (self.staged == STAGE_LEN && self.core.initial_chunk_counter == 0).then(|| {
+            (self.core.count() / CHUNK_LEN as u64, self.staged_bytes().try_into().unwrap())
+        })
     }
 
     #[cfg(not(feature = "std"))]
@@ -215,7 +259,8 @@ impl Hasher {
     pub(crate) fn take_held(&mut self, result: &[u8; BLOCK_LEN]) {
         let staged = core::mem::replace(&mut self.staged, 0);
         // Sound: as in gather_part.
-        let bytes = unsafe { core::slice::from_raw_parts(self.stage.as_ptr() as *const u8, staged) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(self.stage.as_ptr() as *const u8, staged) };
         self.core.update_with_results(bytes, &mut core::iter::once(result));
     }
 
@@ -295,7 +340,10 @@ impl Hasher {
     /// This method is idempotent. Calling it twice will give the same result.
     /// You can also add more input and finalize again.
     pub fn finalize(&self) -> Hash {
-        assert_eq!(self.core.initial_chunk_counter, 0, "set_input_offset must be used with finalize_non_root",);
+        assert_eq!(
+            self.core.initial_chunk_counter, 0,
+            "set_input_offset must be used with finalize_non_root",
+        );
         self.final_output().root_hash()
     }
 
@@ -307,7 +355,10 @@ impl Hasher {
     ///
     /// [`OutputReader`]: struct.OutputReader.html
     pub fn finalize_xof(&self) -> OutputReader {
-        assert_eq!(self.core.initial_chunk_counter, 0, "set_input_offset must be used with finalize_non_root",);
+        assert_eq!(
+            self.core.initial_chunk_counter, 0,
+            "set_input_offset must be used with finalize_non_root",
+        );
         OutputReader::new(self.final_output())
     }
 
@@ -367,12 +418,18 @@ impl HasherCore {
     /// [`HasherCore::new_internal`] on `platform` (the self-test's way in,
     /// as [`hash_serial_from`]).
     pub(crate) fn new_from(key: &CVWords, flags: u8, platform: Platform) -> Self {
-        Self { key: *key, chunk_state: ChunkState::new(key, 0, flags, platform), initial_chunk_counter: 0, cv_stack: CvStack::new() }
+        Self {
+            key: *key,
+            chunk_state: ChunkState::new(key, 0, flags, platform),
+            initial_chunk_counter: 0,
+            cv_stack: CvStack::new(),
+        }
     }
 
     /// Back to the empty message, with the same key, flags, and platform.
     pub(crate) fn reset(&mut self) -> &mut Self {
-        self.chunk_state = ChunkState::new(&self.key, 0, self.chunk_state.flags, self.chunk_state.platform);
+        self.chunk_state =
+            ChunkState::new(&self.key, 0, self.chunk_state.flags, self.chunk_state.platform);
         self.cv_stack.clear();
         self
     }
@@ -448,17 +505,29 @@ impl HasherCore {
     /// [`lanes::TASK_LEN`], as [`hasher::subtree_len`] cuts them), as
     /// [`lanes::Task`] computes them.
     #[cfg(feature = "std")]
-    pub(crate) fn update_with_results<'a>(&mut self, input: &[u8], results: &mut impl Iterator<Item = &'a [u8; BLOCK_LEN]>) {
+    pub(crate) fn update_with_results<'a>(
+        &mut self,
+        input: &[u8],
+        results: &mut impl Iterator<Item = &'a [u8; BLOCK_LEN]>,
+    ) {
         for part in input.chunks(lanes::TASK_LEN) {
             self.update_part_with_results(part, results);
         }
     }
 
     #[cfg(feature = "std")]
-    fn update_part_with_results<'a>(&mut self, mut input: &[u8], results: &mut impl Iterator<Item = &'a [u8; BLOCK_LEN]>) {
+    fn update_part_with_results<'a>(
+        &mut self,
+        mut input: &[u8],
+        results: &mut impl Iterator<Item = &'a [u8; BLOCK_LEN]>,
+    ) {
         // Its one caller hands it a whole held group, from a group boundary,
         // where the core's chunk is empty (Hasher::take_held).
-        debug_assert_eq!(self.chunk_state.count(), 0, "a held group starts where the core's chunk is empty");
+        debug_assert_eq!(
+            self.chunk_state.count(),
+            0,
+            "a held group starts where the core's chunk is empty"
+        );
         while input.len() > CHUNK_LEN {
             let len = hasher::subtree_len(self.chunk_state.chunk_counter, input.len());
             let chunks = (len / CHUNK_LEN) as u64;
@@ -487,20 +556,40 @@ impl HasherCore {
         self.assert_room(self.count(), input.len());
         // The partial chunk first (hasher::fill), then whole subtrees and the
         // last chunk (hasher::feed), as src/hasher.rs describes.
-        let fill_kernels = kernels_on(&self.key, &self.chunk_state, self.chunk_state.platform, pooled);
-        let rest = hasher::fill(&fill_kernels, &mut self.chunk_state, &mut self.cv_stack, self.initial_chunk_counter, input);
+        let fill_kernels =
+            kernels_on(&self.key, &self.chunk_state, self.chunk_state.platform, pooled);
+        let rest = hasher::fill(
+            &fill_kernels,
+            &mut self.chunk_state,
+            &mut self.cv_stack,
+            self.initial_chunk_counter,
+            input,
+        );
         if rest.is_empty() {
             return self;
         }
         // Pooled, the subtrees take the lock one at a time (children).
-        let turn = platform::Sme2Turn::take(self.chunk_state.platform, !pooled && rest.len() >= SME2_SIZED_LEN);
+        let turn = platform::Sme2Turn::take(
+            self.chunk_state.platform,
+            !pooled && rest.len() >= SME2_SIZED_LEN,
+        );
         let kernels = kernels_on(&self.key, &self.chunk_state, turn.platform(), pooled);
-        hasher::feed(&kernels, &mut self.chunk_state, &mut self.cv_stack, self.initial_chunk_counter, rest);
+        hasher::feed(
+            &kernels,
+            &mut self.chunk_state,
+            &mut self.cv_stack,
+            self.initial_chunk_counter,
+            rest,
+        );
         self
     }
 
     pub(crate) fn final_output(&self) -> Output {
-        hasher::final_node(&self.kernels(self.chunk_state.platform, false), &self.chunk_state, &self.cv_stack)
+        hasher::final_node(
+            &self.kernels(self.chunk_state.platform, false),
+            &self.chunk_state,
+            &self.cv_stack,
+        )
     }
 
     /// The serial update: whole subtrees now, the last chunk kept.
@@ -513,7 +602,13 @@ impl HasherCore {
     pub(crate) fn assert_room(&self, count: u64, len: usize) {
         let input_offset = self.initial_chunk_counter * CHUNK_LEN as u64;
         if let Some(max) = max_subtree_len(input_offset) {
-            assert!(len as u64 <= max - count, "the subtree starting at {} contains at most {} bytes (found {})", input_offset, max, count + len as u64,);
+            assert!(
+                len as u64 <= max - count,
+                "the subtree starting at {} contains at most {} bytes (found {})",
+                input_offset,
+                max,
+                count + len as u64,
+            );
         }
     }
 
@@ -522,7 +617,11 @@ impl HasherCore {
     #[cfg(test)]
     pub(crate) fn set_input_offset(&mut self, offset: u64) -> &mut Self {
         assert_eq!(self.count(), 0, "hasher has already accepted input");
-        assert_eq!(offset % CHUNK_LEN as u64, 0, "offset ({offset}) must be a chunk boundary (divisible by {CHUNK_LEN})",);
+        assert_eq!(
+            offset % CHUNK_LEN as u64,
+            0,
+            "offset ({offset}) must be a chunk boundary (divisible by {CHUNK_LEN})",
+        );
         let counter = offset / CHUNK_LEN as u64;
         self.chunk_state.chunk_counter = counter;
         self.initial_chunk_counter = counter;
@@ -531,14 +630,18 @@ impl HasherCore {
 
     /// Bytes so far, counted from the input offset.
     pub(crate) fn count(&self) -> u64 {
-        (self.chunk_state.chunk_counter - self.initial_chunk_counter) * CHUNK_LEN as u64 + self.chunk_state.count() as u64
+        (self.chunk_state.chunk_counter - self.initial_chunk_counter) * CHUNK_LEN as u64
+            + self.chunk_state.count() as u64
     }
 }
 
 // Don't derive(Debug), because the state may be secret.
 impl fmt::Debug for Hasher {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Hasher").field("flags", &self.core.chunk_state.flags).field("platform", &self.core.chunk_state.platform).finish()
+        f.debug_struct("Hasher")
+            .field("flags", &self.core.chunk_state.flags)
+            .field("platform", &self.core.chunk_state.platform)
+            .finish()
     }
 }
 

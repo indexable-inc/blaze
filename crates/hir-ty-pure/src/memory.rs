@@ -83,7 +83,8 @@ impl MemoryEffects {
 
     /// Where a cycle of instances starts its fixpoint: nothing touched yet, but recursion may
     /// not end.
-    pub(crate) const RECURSIVE: MemoryEffects = MemoryEffects { diverges: true, ..MemoryEffects::NONE };
+    pub(crate) const RECURSIVE: MemoryEffects =
+        MemoryEffects { diverges: true, ..MemoryEffects::NONE };
 
     /// LLVM `memory(none)`: reads and writes nothing outside its frame.
     pub fn touches_nothing(self) -> bool {
@@ -381,7 +382,12 @@ type Snapshot = (SmallVec<[Prov; 16]>, SmallVec<[bool; 16]>, [Prov; 4], MemoryEf
 impl State<'_> {
     fn snapshot(&self) -> Snapshot {
         // clone: one copy of a body's locals' facts per round of the fixpoint, inline up to 16
-        (self.prov.clone(), self.taken.clone(), [self.high, self.fresh, self.direct, self.deep], self.fx)
+        (
+            self.prov.clone(),
+            self.taken.clone(),
+            [self.high, self.fresh, self.direct, self.deep],
+            self.fx,
+        )
     }
 
     fn no_pointer(&self, at: usize) -> bool {
@@ -402,7 +408,11 @@ impl State<'_> {
         while bits != 0 {
             let at = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            out = out.join(if at == HIGH { self.high } else { self.prov.get(at).copied().unwrap_or(ANY) });
+            out = out.join(if at == HIGH {
+                self.high
+            } else {
+                self.prov.get(at).copied().unwrap_or(ANY)
+            });
         }
         if of.fresh {
             out = out.join(self.fresh);
@@ -494,7 +504,9 @@ impl State<'_> {
             OperandKind::Copy(place) | OperandKind::Move(place) => self.read(place),
             // Constants point only to constant memory, and a static the walk let through is
             // immutable and `Freeze`: what changes refuses the instance before this runs.
-            OperandKind::Constant { .. } | OperandKind::Allocation { .. } | OperandKind::Static(_) => FRESH,
+            OperandKind::Constant { .. }
+            | OperandKind::Allocation { .. }
+            | OperandKind::Static(_) => FRESH,
         }
     }
 
@@ -530,12 +542,20 @@ impl State<'_> {
                 EMPTY
             }
             Rvalue::CopyForDeref(place) => self.read(place),
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
         }
     }
 
     /// Takes in what the call terminator of `block` does; gives its value's provenance.
-    fn call(&mut self, block: BasicBlockId, args: &[Operand], kinds: &[CallKind], sites: &[SiteFacts]) -> Prov {
+    fn call(
+        &mut self,
+        block: BasicBlockId,
+        args: &[Operand],
+        kinds: &[CallKind],
+        sites: &[SiteFacts],
+    ) -> Prov {
         let ops: SmallVec<[Prov; 8]> = args.iter().map(|it| self.operand(it)).collect(); // alloc: inline up to eight operands
         let kind = kinds.get(block.into_raw().into_u32() as usize).copied().unwrap_or_default();
         match kind {
@@ -699,8 +719,10 @@ fn loops(body: &MirBody<'_>) -> bool {
         stack.push((root, 0));
         while let Some(top) = stack.last_mut() {
             let (id, next) = *top;
-            let successor =
-                body.basic_blocks[id].terminator.as_ref().and_then(|it| it.kind.successors().nth(next));
+            let successor = body.basic_blocks[id]
+                .terminator
+                .as_ref()
+                .and_then(|it| it.kind.successors().nth(next));
             let Some(successor) = successor else {
                 marks[at(id)] = Mark::Done;
                 stack.pop();

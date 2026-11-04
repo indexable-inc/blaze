@@ -90,9 +90,7 @@ impl DefaultGenerator for AmbiguousOffset {
     fn default_generator() -> Self::Generator {
         use crate::tuples;
         one_of([
-            offsets()
-                .map(|offset| AmbiguousOffset::Unambiguous { offset })
-                .boxed(),
+            offsets().map(|offset| AmbiguousOffset::Unambiguous { offset }).boxed(),
             tuples!(offsets(), offsets())
                 .map(|(before, after)| AmbiguousOffset::Gap { before, after })
                 .boxed(),

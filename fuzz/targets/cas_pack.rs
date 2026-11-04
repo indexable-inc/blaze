@@ -59,9 +59,15 @@ fn check(data: &[u8]) {
             shared::reseal_records(&mut pack, &starts);
         }
         let keys: Vec<Key> = shared::walk(&pack).iter().map(|(_, record)| record.key).collect();
-        let head = shared::head(None, &[shared::PackRef { committed: pack.len() as u64, ..shared::lone_ref(0) }], &[]);
-        let mut sim =
-            shared::store_of(&[(HEAD, head.as_slice()), (shared::pack_file(0).as_str(), pack.as_slice())]);
+        let head = shared::head(
+            None,
+            &[shared::PackRef { committed: pack.len() as u64, ..shared::lone_ref(0) }],
+            &[],
+        );
+        let mut sim = shared::store_of(&[
+            (HEAD, head.as_slice()),
+            (shared::pack_file(0).as_str(), pack.as_slice()),
+        ]);
         let wants: Vec<(Key, Option<&[u8]>)> = keys.iter().map(|key| (*key, None)).collect();
         shared::read_back(&mut sim, &wants);
     } else {

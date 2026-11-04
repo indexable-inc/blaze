@@ -14,12 +14,7 @@
 //! ([`while_busy`], waiting as [`crate::busy`] says). Past its bound the spawn fails, naming the
 //! error; never another path, never a copy of the file.
 
-use std::{
-    ffi::OsString,
-    io,
-    os::fd::OwnedFd,
-    path::Path,
-};
+use std::{ffi::OsString, io, os::fd::OwnedFd, path::Path};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
     ffi::{CStr, OsStr},
@@ -56,7 +51,11 @@ pub(super) struct Spawned {
 /// `program` started with its output piped, its input piped where it has `input` (else
 /// `/dev/null`), joining the cgroup whose `cgroup.procs` is `procs` before its program runs.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn spawn(program: &Program<'_>, input: bool, procs: Option<&CStr>) -> io::Result<Spawned> {
+pub(super) fn spawn(
+    program: &Program<'_>,
+    input: bool,
+    procs: Option<&CStr>,
+) -> io::Result<Spawned> {
     let plan = Plan::new(program)?;
     let (stdin_child, stdin) = match input {
         true => {
@@ -324,7 +323,12 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
 /// `stack` is the start of at least `STACK` writable bytes, which nothing else reads or writes
 /// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
-unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
+unsafe fn clone_on(
+    stack: *mut u8,
+    plan: &Plan,
+    fds: [RawFd; 3],
+    procs: RawFd,
+) -> io::Result<(libc::pid_t, OwnedFd)> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child { plan, fds, procs, step: 0, failed: 0 };
@@ -460,9 +464,7 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
     // all kept by the parent until the program runs. Async-signal-safe; on success the child
     // leaves the shared memory and the parent runs again.
-    unsafe {
-        libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr())
-    };
+    unsafe { libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr()) };
     fail(child, 4)
 }
 

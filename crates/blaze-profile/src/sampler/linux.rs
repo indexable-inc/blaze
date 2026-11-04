@@ -202,8 +202,15 @@ fn parse(body: &[u8], clock: &Clock) -> Option<Sample> {
     let tid = u32::from_ne_bytes(body.get(4..8)?.try_into().ok()?);
     let time = word(body, 8)?;
     let nr = word(body, 16)? as usize;
-    let mut sample =
-        Sample { at: clock.instant(time), tid: u64::from(tid), depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
+    let mut sample = Sample {
+        at: clock.instant(time),
+        tid: u64::from(tid),
+        depth: 0,
+        pcs: [0; DEPTH],
+        span: 0,
+        build: 0,
+        on_cpu: true,
+    };
     for i in 0..nr {
         let pc = word(body, 24 + 8 * i)?;
         if pc >= PERF_CONTEXT_MAX {
@@ -304,7 +311,10 @@ pub(super) fn run(hz: u32) {
         now.sort_unstable();
         events.retain(|tid, _| now.binary_search(tid).is_ok());
         refused.retain(|tid| now.binary_search(tid).is_ok());
-        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here"
+        )]
         std::thread::sleep(EVERY.saturating_sub(started.elapsed()));
     }
 }

@@ -167,14 +167,17 @@ impl Build {
                     // search from the start each time.
                     Ok(batch) => {
                         let len = batch.len();
-                        let of_it = |dep: u32| dep.checked_sub(*first).filter(|&it| it < len as u32);
+                        let of_it =
+                            |dep: u32| dep.checked_sub(*first).filter(|&it| it < len as u32);
                         let mut placed = vec![false; len];
-                        while let Some(at_node) = (0..len).find(|&it| {
-                            !placed[it]
-                                && batch.node(it).deps.iter().all(|&dep| {
-                                    of_it(dep).is_none_or(|dep| placed[dep as usize])
-                                })
-                        }) {
+                        while let Some(at_node) =
+                            (0..len).find(|&it| {
+                                !placed[it]
+                                    && batch.node(it).deps.iter().all(|&dep| {
+                                        of_it(dep).is_none_or(|dep| placed[dep as usize])
+                                    })
+                            })
+                        {
                             placed[at_node] = true;
                             let node = batch.node(at_node);
                             self.noded(node.id, node.kind, node.name, node.deps, at);

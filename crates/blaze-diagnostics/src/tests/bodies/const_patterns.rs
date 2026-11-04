@@ -2,12 +2,12 @@
 //! E0579 and the constants `const_to_pat` refuses) and of the range lints of match checking
 //! (`overlapping_range_endpoints`, `non_contiguous_range_endpoints`).
 
+use crate::tests::{assert_reports, error, warning};
 use crate::tests::{
     items::ui_core,
     lints::bodies::{reachable::PRINTLN, types::ui_std},
     ui,
 };
-use crate::tests::{assert_reports, error, warning};
 
 #[test]
 fn a_range_with_its_lower_bound_above_its_upper_is_e0030() {
@@ -90,7 +90,10 @@ fn main() {
     }
 }
 "##;
-    assert_reports(&ui_core("no-eq-branch-fail.rs", "2015", "panic", source), &[error(19, &["`Foo`"])]);
+    assert_reports(
+        &ui_core("no-eq-branch-fail.rs", "2015", "panic", source),
+        &[error(19, &["`Foo`"])],
+    );
 }
 
 #[test]
@@ -361,7 +364,15 @@ LL +         if Some(C) == Some(S) { return; };
 error: aborting due to 10 previous errors
 
 "##;
-    assert_eq!(ui_core("suggest_equality_comparison_instead_of_pattern_matching.rs", "2024", "option, eq", source), stderr);
+    assert_eq!(
+        ui_core(
+            "suggest_equality_comparison_instead_of_pattern_matching.rs",
+            "2024",
+            "option, eq",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -546,9 +557,7 @@ fn main() {
     let name = "derive-and-manual-partialeq-issue-147714.rs";
     assert_reports(
         &ui_std(name, "2015", "sized, fmt, derive, eq, panic", PRINTLN, source),
-        &[
-            error(27, &["`Thing<Incomparable>`"]),
-        ],
+        &[error(27, &["`Thing<Incomparable>`"])],
     );
 }
 
@@ -606,5 +615,8 @@ error: aborting due to 1 previous error
 
 "##;
     let name = "reject_non_partial_eq.rs";
-    assert_eq!(ui_std(name, "2015", "sized, fmt, derive, eq, option, panic", PRINTLN, source), stderr);
+    assert_eq!(
+        ui_std(name, "2015", "sized, fmt, derive, eq, option, panic", PRINTLN, source),
+        stderr
+    );
 }

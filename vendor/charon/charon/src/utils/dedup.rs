@@ -15,8 +15,7 @@ use crate::utils::type_map::{Mappable, Mapper, TypeMap};
 
 /// Identifies a deduplicated value amongst the values of its type within a single serialized
 /// output. Ids are allocated in the order in which we serialize the values.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DedupId(u32);
 
 /// A value that we deduplicate in the serialized output. We identify values by equality, hence
@@ -83,11 +82,7 @@ impl DedupSerializerState for DedupSerializer {
         self.de.borrow_mut().or_default::<T>().insert(id, value);
     }
     fn get_deserialized<T: Dedup>(&self, id: DedupId) -> Option<T> {
-        self.de
-            .borrow()
-            .get::<T>()
-            .and_then(|table| table.get(&id))
-            .cloned()
+        self.de.borrow().get::<T>().and_then(|table| table.get(&id)).cloned()
     }
 }
 
@@ -143,24 +138,22 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
-    Ok(
-        match SerDedup::<R>::deserialize_state(state, deserializer)? {
-            SerDedup::Value(id, repr) => {
-                let value = build(repr);
-                state.record_deserialized(id, value.clone());
-                value
-            }
-            SerDedup::Deduplicated(id) => state.get_deserialized(id).ok_or_else(|| {
-                let msg = format!(
-                    "can't deserialize deduplicated value of type {}; \
+    Ok(match SerDedup::<R>::deserialize_state(state, deserializer)? {
+        SerDedup::Value(id, repr) => {
+            let value = build(repr);
+            state.record_deserialized(id, value.clone());
+            value
+        }
+        SerDedup::Deduplicated(id) => state.get_deserialized(id).ok_or_else(|| {
+            let msg = format!(
+                "can't deserialize deduplicated value of type {}; \
                 were you careful with managing the deduplication state?",
-                    type_name::<T>()
-                );
-                D::Error::custom(msg)
-            })?,
-            SerDedup::Untagged(repr) => build(repr),
-        },
-    )
+                type_name::<T>()
+            );
+            D::Error::custom(msg)
+        })?,
+        SerDedup::Untagged(repr) => build(repr),
+    })
 }
 
 /// The error we report when a deduplicated value is deserialized with serde's stateless

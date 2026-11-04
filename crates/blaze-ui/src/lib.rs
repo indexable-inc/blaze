@@ -46,7 +46,6 @@ use std::fmt::{self, Write as _};
 use std::hash::BuildHasher;
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeBatch, NodeKind, NodeState, Order, Record,
@@ -54,6 +53,7 @@ use blaze_protocol::events::{
 };
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
+use std::alloc::Global;
 
 /// The longest a plain rendering says nothing while a step is under way.
 pub const HEARTBEAT_NS: u64 = 15_000_000_000;
@@ -673,8 +673,8 @@ impl Build {
                 all.total = all.total - was.total + fns.total;
                 all.done = all.done - was.done + fns.done;
                 all.kept = all.kept - was.kept + fns.kept;
-                self.index.unknown = self.index.unknown - u32::from(unknown(was))
-                    + u32::from(unknown(*fns));
+                self.index.unknown =
+                    self.index.unknown - u32::from(unknown(was)) + u32::from(unknown(*fns));
                 Change::Crate { at: index, moved }
             }
             Event::Rebuilt { name, krate, cause } => {

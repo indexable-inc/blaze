@@ -447,10 +447,24 @@ one place a run is made. A script is given the command's whole environment with 
 sets for scripts over it (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), as cargo
 gives it (`script.rs`, `inherited`). The variables are the command's, not those of whoever
 started the daemon: `SDK_DIR=/opt/sdk blaze build` gives the script `SDK_DIR` with a daemon
-started without it. What the run read, its files and the variables (all of them: a process may
-walk `environ`, which no call shows), the sandbox traces, and the run is kept in the store by
-its code, what it was given and what it read (`blaze_usercode::run`), so a command whose
-inputs to it are as they were finds it there and runs nothing. A script that provably prints
+started without it. What the run read, its files and its variables, the sandbox traces, and the run is kept in
+the store by its code, what it was given and what it read (`blaze_usercode::run`), so a
+command whose inputs to it are as they were finds it there and runs nothing. On Linux and
+macOS the variables passed through from the command (all but what cargo sets) are lent to the
+script rather than put in its environment (`blaze_usercode::confine::GIVEN`,
+`crates/blaze-cargo/src/sandbox/v2.rs`): it sees each when it reads it by name, and that read
+is traced, so a variable it never reads (a shell's `OLDPWD` or `SHLVL`) is in no key. What the
+C library and the loader read themselves (`PATH`, `TZ`, `LANG`, `LC_*`, `LD_LIBRARY_PATH`,
+... : `READ_BY_THE_C_LIBRARY` there) stays in its environment and is in every such key. A
+script that walks its environment (`env::vars`, a `Command` it changes the environment of) is
+lent all of it then, and is keyed by all of it. A program it starts with its environment gets
+all of it, as with no sandbox, and is keyed by what it reads: by all of it, unless its
+executable proves std alone walks its environment (`__blaze_std_says_walks`, from blaze's
+linker), which no C compiler or shell does, so a script that runs `cc` (through `cc-rs`) is
+still keyed by every variable; a program the sandbox can't load its interposer in (a static
+one, one macOS protects) makes the run not whole, kept as cargo keys it. The run's temporary directory is
+the sandbox's own, under every name one goes by (`TMPDIR`, `TMP`, `TEMP`, `TEMPDIR`,
+`NIX_BUILD_TOP`), so a shell's (`/tmp/nix-shell.XXXXXX`) is never in a key. A script that provably prints
 only constants is neither compiled nor run (`blaze_usercode::script::inert`;
 `BLAZE_ELIDE=verify` compiles and runs it as well and fails the build where the two differ).
 The root manifest is the one of the workspace built, also for a path dependency that is a

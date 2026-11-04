@@ -33,7 +33,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::QueryCycle) -> Vec<Found> {
             "cycle detected when computing type of `impl`: its self type needs itself".to_owned() // alloc: as above
         }
         CycleQuery::ImplTrait => {
-            "cycle detected when computing trait implemented by `impl`: its trait needs itself".to_owned() // alloc: as above
+            "cycle detected when computing trait implemented by `impl`: its trait needs itself"
+                .to_owned() // alloc: as above
         }
     };
     let diag = Diag::error(Some("E0391"), message, span);

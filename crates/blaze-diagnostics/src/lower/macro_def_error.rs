@@ -54,7 +54,8 @@ pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, mac: InFile<ast::Macro<'db>>) -> Vec<
     // alloc: empty, allocates nothing
     let Some(body) = rules.token_tree() else { return Vec::new() };
     // alloc: empty, allocates only when the definition is in error
-    let mut checker = Checker { cx, file: mac.file_id, errors: Vec::new(), binders: SmallVec::new() };
+    let mut checker =
+        Checker { cx, file: mac.file_id, errors: Vec::new(), binders: SmallVec::new() };
     checker.definition(body, item_range(rules.syntax()));
     if checker.errors.is_empty() {
         // alloc: empty, allocates nothing
@@ -115,14 +116,18 @@ fn is_doc(kind: SyntaxKind) -> bool {
 /// doc comments kept (they are tokens to rustc). A direct token child that is a delimiter is the
 /// group's own; nested ones are inside child groups.
 struct Trees<'db> {
-    children: std::iter::Peekable<std::iter::FilterMap<ChildrenWithTokens<'db>, fn(Element<'db>) -> Option<Tree<'db>>>>,
+    children: std::iter::Peekable<
+        std::iter::FilterMap<ChildrenWithTokens<'db>, fn(Element<'db>) -> Option<Tree<'db>>>,
+    >,
     /// Where the last tree taken ends: rustc's `prev_token.span.hi()`.
     end: TextSize,
 }
 
 impl<'db> Trees<'db> {
     fn of(group: ast::TokenTree<'db>) -> Trees<'db> {
-        let end = group.left_delimiter_token().map_or(group.syntax().text_range().start(), |it| it.text_range().end());
+        let end = group
+            .left_delimiter_token()
+            .map_or(group.syntax().text_range().start(), |it| it.text_range().end());
         let tree: fn(Element<'db>) -> Option<Tree<'db>> = tree;
         Trees { children: group.syntax().children_with_tokens().filter_map(tree).peekable(), end }
     }
@@ -152,7 +157,8 @@ impl<'db> Trees<'db> {
             return None;
         }
         let NodeOrToken::Token(gt) = eq.next_sibling_or_token()? else { return None };
-        (gt.kind() == SyntaxKind::R_ANGLE).then(|| TextRange::new(eq.text_range().start(), gt.text_range().end()))
+        (gt.kind() == SyntaxKind::R_ANGLE)
+            .then(|| TextRange::new(eq.text_range().start(), gt.text_range().end()))
     }
 
     /// Takes the punctuation written right after `token` that rustc's lexer glues to it into one
@@ -197,8 +203,21 @@ fn is_ident(token: Token<'_>) -> bool {
 fn is_fragment(name: &str) -> bool {
     matches!(
         name,
-        "item" | "block" | "stmt" | "pat" | "pat_param" | "expr" | "expr_2021" | "ty" | "ident" | "lifetime"
-            | "literal" | "meta" | "path" | "vis" | "tt"
+        "item"
+            | "block"
+            | "stmt"
+            | "pat"
+            | "pat_param"
+            | "expr"
+            | "expr_2021"
+            | "ty"
+            | "ident"
+            | "lifetime"
+            | "literal"
+            | "meta"
+            | "path"
+            | "vis"
+            | "tt"
     )
 }
 
@@ -241,7 +260,9 @@ impl Elem {
     fn matches_empty(self) -> bool {
         matches!(
             self,
-            Elem::Doc | Elem::Decl { vis: true } | Elem::Sequence(Kleene::ZeroOrMore | Kleene::ZeroOrOne)
+            Elem::Doc
+                | Elem::Decl { vis: true }
+                | Elem::Sequence(Kleene::ZeroOrMore | Kleene::ZeroOrOne)
         )
     }
 }
@@ -310,7 +331,8 @@ impl<'db> Checker<'_, '_, 'db> {
                 self.args_parens("derive", &args);
                 let args_empty = matches!(args, Tree::Group(it) if Trees::of(it).peek().is_none());
                 if !args_empty {
-                    let msg = "`derive` rules do not accept arguments; `derive` must be followed by `()`";
+                    let msg =
+                        "`derive` rules do not accept arguments; `derive` must be followed by `()`";
                     self.error(args.range(), msg);
                 }
                 if self.no_eof(&mut trees, "expected macro derive body") {
@@ -377,7 +399,8 @@ impl<'db> Checker<'_, '_, 'db> {
             let at = TextRange::empty(prev_end);
             let span = self.span(at);
             // alloc: the error's text, on the error path
-            self.error(at, format!("expected `{token}`, found end of macro arguments")).span_label(span, label);
+            self.error(at, format!("expected `{token}`, found end of macro arguments"))
+                .span_label(span, label);
             return;
         };
         let (at, found_descr) = match *found {
@@ -393,7 +416,8 @@ impl<'db> Checker<'_, '_, 'db> {
         let message = format!("expected `{token}`, found {found_descr}");
         let span = self.span(at);
         let root = self.cx.root(self.file);
-        let on_next_line = prev_end < at.start() && root.text()[TextRange::new(prev_end, at.start())].contains('\n');
+        let on_next_line = prev_end < at.start()
+            && root.text()[TextRange::new(prev_end, at.start())].contains('\n');
         if token == ";" && on_next_line {
             let prev = self.span(TextRange::empty(prev_end));
             self.error(at, message).span_label(prev, label).span_label(span, "unexpected token");
@@ -408,12 +432,26 @@ impl<'db> Checker<'_, '_, 'db> {
         if delimiter(group) == Some(SyntaxKind::L_PAREN) {
             return;
         }
-        let (Some(open), Some(close)) = (group.left_delimiter_token(), group.right_delimiter_token()) else { return };
+        let (Some(open), Some(close)) =
+            (group.left_delimiter_token(), group.right_delimiter_token())
+        else {
+            return;
+        };
         // alloc: the error's parts, on the error path
-        let parts = vec![(self.span(open.text_range()), "(".to_owned()), (self.span(close.text_range()), ")".to_owned())];
+        let parts = vec![
+            (self.span(open.text_range()), "(".to_owned()),
+            (self.span(close.text_range()), ")".to_owned()),
+        ];
         // alloc: the error's text, on the error path
-        self.error(group.syntax().text_range(), format!("`{rule_kw}` rule argument matchers require parentheses"))
-            .multipart_suggestion("the delimiters should be `(` and `)`", parts, Applicability::MachineApplicable);
+        self.error(
+            group.syntax().text_range(),
+            format!("`{rule_kw}` rule argument matchers require parentheses"),
+        )
+        .multipart_suggestion(
+            "the delimiters should be `(` and `)`",
+            parts,
+            Applicability::MachineApplicable,
+        );
     }
 
     /// rustc's `parse_one_tt` of a matcher, then `check_lhs`: delimited, and no repetition that
@@ -425,21 +463,26 @@ impl<'db> Checker<'_, '_, 'db> {
                 self.parse(&mut Trees::of(group), Part::Pattern, &mut empty);
             }
             Tree::Token(token) => {
-                self.error(token.text_range(), "invalid macro matcher; matchers must be contained in balanced delimiters");
+                self.error(
+                    token.text_range(),
+                    "invalid macro matcher; matchers must be contained in balanced delimiters",
+                );
             }
         }
         let Some(EmptySequence { range, vis_op }) = empty else { return };
         let diag = self.error(range, "repetition matches empty token tree");
         let Some(op) = vis_op else { return };
         diag.note("a `vis` fragment can already be empty");
-        let open = TextRange::new(range.start() - TextSize::of('$'), range.start() + TextSize::of('('));
+        let open =
+            TextRange::new(range.start() - TextSize::of('$'), range.start() + TextSize::of('('));
         let close = TextRange::new(range.end() - TextSize::of(')'), op.end());
         // alloc: the error's parts, on the error path
         let parts = vec![(self.span(open), String::new()), (self.span(close), String::new())];
-        self.errors
-            .last_mut()
-            .expect("just pushed")
-            .multipart_suggestion("remove the `$(` and `)?`", parts, Applicability::MaybeIncorrect);
+        self.errors.last_mut().expect("just pushed").multipart_suggestion(
+            "remove the `$(` and `)?`",
+            parts,
+            Applicability::MaybeIncorrect,
+        );
     }
 
     /// `check_meta_variables`' `check_binders`: a name bound twice in the matchers of one rule.
@@ -447,7 +490,9 @@ impl<'db> Checker<'_, '_, 'db> {
     fn duplicate_binders(&mut self) {
         for i in 1..self.binders.len() {
             let name = unraw(self.binders[i].0.text());
-            let Some(prev) = self.binders[..i].iter().find(|(it, _)| unraw(it.text()) == name).map(|it| it.1) else {
+            let Some(prev) =
+                self.binders[..i].iter().find(|(it, _)| unraw(it.text()) == name).map(|it| it.1)
+            else {
                 continue;
             };
             let range = self.binders[i].1;
@@ -467,11 +512,18 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// rustc's `quoted::parse`: whether every tree matches nothing, and whether the first is a
     /// `vis` declaration.
-    fn parse(&mut self, trees: &mut Trees<'db>, part: Part, empty: &mut Option<EmptySequence>) -> (bool, bool) {
+    fn parse(
+        &mut self,
+        trees: &mut Trees<'db>,
+        part: Part,
+        empty: &mut Option<EmptySequence>,
+    ) -> (bool, bool) {
         let (mut all_empty, mut first_vis, mut first) = (true, false, true);
         while let Some(tree) = trees.next() {
             let elem = match self.parse_tree(tree, trees, part, empty) {
-                (Elem::Var, Some((start, name))) if part == Part::Pattern => self.declaration(start, name, trees),
+                (Elem::Var, Some((start, name))) if part == Part::Pattern => {
+                    self.declaration(start, name, trees)
+                }
                 (elem, _) => elem,
             };
             all_empty &= elem.matches_empty();
@@ -484,7 +536,12 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// The fragment specifier after a metavariable `$name` of a matcher, starting at `start`.
-    fn declaration(&mut self, start: TextRange, name: Option<Token<'db>>, trees: &mut Trees<'db>) -> Elem {
+    fn declaration(
+        &mut self,
+        start: TextRange,
+        name: Option<Token<'db>>,
+        trees: &mut Trees<'db>,
+    ) -> Elem {
         let mut name = name;
         let mut record = |this: &mut Self, range: TextRange| {
             if let Some(name) = name.take() {
@@ -505,14 +562,24 @@ impl<'db> Checker<'_, '_, 'db> {
         };
         if !is_ident(token) {
             record(self, token.text_range());
-            if token.kind() == SyntaxKind::DOLLAR && trees.peek().and_then(Tree::token).is_some_and(is_ident) {
+            if token.kind() == SyntaxKind::DOLLAR
+                && trees.peek().and_then(Tree::token).is_some_and(is_ident)
+            {
                 let span = self.span(token.text_range());
                 self.error(token.text_range(), "missing fragment specifier")
                     .note("fragment specifiers must be provided")
                     .help(VALID_FRAGMENT_NAMES)
-                    .suggestion_verbose(span, "fragment specifiers should not be prefixed with `$`", "", Applicability::MaybeIncorrect);
+                    .suggestion_verbose(
+                        span,
+                        "fragment specifiers should not be prefixed with `$`",
+                        "",
+                        Applicability::MaybeIncorrect,
+                    );
             } else {
-                self.missing_fragment(token.text_range(), TextRange::empty(token.text_range().end()));
+                self.missing_fragment(
+                    token.text_range(),
+                    TextRange::empty(token.text_range().end()),
+                );
             }
             return Elem::Decl { vis: false };
         }
@@ -523,7 +590,8 @@ impl<'db> Checker<'_, '_, 'db> {
             return Elem::Decl { vis: fragment == "vis" };
         }
         // alloc: the error's text, on the error path
-        self.error(range, format!("invalid fragment specifier `{}`", token.text())).help(VALID_FRAGMENT_NAMES);
+        self.error(range, format!("invalid fragment specifier `{}`", token.text()))
+            .help(VALID_FRAGMENT_NAMES);
         Elem::Decl { vis: false }
     }
 
@@ -533,7 +601,12 @@ impl<'db> Checker<'_, '_, 'db> {
         self.error(range, "missing fragment specifier")
             .note("fragment specifiers must be provided")
             .help(VALID_FRAGMENT_NAMES)
-            .suggestion_verbose(add, "try adding a specifier here", ":spec", Applicability::MaybeIncorrect);
+            .suggestion_verbose(
+                add,
+                "try adding a specifier here",
+                ":spec",
+                Applicability::MaybeIncorrect,
+            );
     }
 
     /// rustc's `quoted::parse_tree`. A metavariable comes back with its range and name (none when
@@ -596,7 +669,10 @@ impl<'db> Checker<'_, '_, 'db> {
             }
             Tree::Token(token) => {
                 // alloc: the error's text, on the error path
-                self.error(token.text_range(), format!("expected identifier, found `{}`", token.text()));
+                self.error(
+                    token.text_range(),
+                    format!("expected identifier, found `{}`", token.text()),
+                );
                 (Elem::Var, Some((token.text_range(), None)))
             }
         }
@@ -613,7 +689,11 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// rustc's `parse_sep_and_kleene_op`: whether there is a separator, the operator and its range.
-    fn separator_and_kleene(&mut self, trees: &mut Trees<'db>, span: TextRange) -> (bool, Kleene, TextRange) {
+    fn separator_and_kleene(
+        &mut self,
+        trees: &mut Trees<'db>,
+        span: TextRange,
+    ) -> (bool, Kleene, TextRange) {
         let at = match trees.next() {
             Some(Tree::Token(token)) => {
                 // A `*` or `+` glued to what follows (`*=`, `+=`) is a separator, as to rustc.
@@ -623,7 +703,8 @@ impl<'db> Checker<'_, '_, 'db> {
                     _ => match trees.next() {
                         Some(tree) => match Kleene::of(tree.kind()) {
                             Some(Kleene::ZeroOrOne) => {
-                                let msg = "the `?` macro repetition operator does not take a separator";
+                                let msg =
+                                    "the `?` macro repetition operator does not take a separator";
                                 self.error(separator, msg);
                                 return (false, Kleene::ZeroOrMore, tree.range());
                             }

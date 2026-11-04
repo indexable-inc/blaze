@@ -62,14 +62,7 @@ pub struct ShrinkPass<'a> {
 impl<'a> ShrinkPass<'a> {
     /// Construct a named pass from a closure.
     pub fn new(name: &'static str, run: ShrinkPassFn<'a>) -> Self {
-        ShrinkPass {
-            name,
-            run,
-            calls: 0,
-            shrinks: 0,
-            deletions: 0,
-            stochastic: false,
-        }
+        ShrinkPass { name, run, calls: 0, shrinks: 0, deletions: 0, stochastic: false }
     }
 
     /// Mark the pass as stochastic (see [`ShrinkPass::stochastic`]).
@@ -160,18 +153,12 @@ impl<'a> Shrinker<'a> {
                 }
                 let before_nodes_len = self.current_nodes.len();
                 let epoch_before_pass = self.improvements;
-                let max_failures = if passes[idx].stochastic {
-                    STOCHASTIC_MAX_FAILURES
-                } else {
-                    1
-                };
+                let max_failures = if passes[idx].stochastic { STOCHASTIC_MAX_FAILURES } else { 1 };
                 let mut failures: usize = 0;
 
                 while failures < max_failures {
                     let span = self.calls.saturating_sub(calls_at_loop_start);
-                    let target = max_calls_per_failing_step
-                        .saturating_mul(2)
-                        .saturating_add(span);
+                    let target = max_calls_per_failing_step.saturating_mul(2).saturating_add(span);
                     if target > self.max_stall {
                         self.max_stall = target;
                     }
@@ -233,10 +220,7 @@ impl<'a> Shrinker<'a> {
         &self,
         passes: &[ShrinkPass<'a>],
     ) -> Vec<(&'static str, usize, usize, usize)> {
-        passes
-            .iter()
-            .map(|sp| (sp.name, sp.calls, sp.shrinks, sp.deletions))
-            .collect()
+        passes.iter().map(|sp| (sp.name, sp.calls, sp.shrinks, sp.deletions)).collect()
     }
 }
 

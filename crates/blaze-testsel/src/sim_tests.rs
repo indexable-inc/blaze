@@ -93,9 +93,17 @@ impl Program {
 
     fn image(&self) -> Image {
         let fns = (0..FNS)
-            .map(|n| Version { id: id(n), bound: placed(n, self.versions[n as usize], self.places[n as usize]) })
+            .map(|n| Version {
+                id: id(n),
+                bound: placed(n, self.versions[n as usize], self.places[n as usize]),
+            })
             .collect();
-        Image::new(fns, (0..SLOTS).collect(), ContentId::of("blaze v2 testsel sim beside 1", &self.beside.to_le_bytes())).unwrap()
+        Image::new(
+            fns,
+            (0..SLOTS).collect(),
+            ContentId::of("blaze v2 testsel sim beside 1", &self.beside.to_le_bytes()),
+        )
+        .unwrap()
     }
 
     fn run(&self, root: u32, data: u8) -> Truth {
@@ -138,14 +146,18 @@ fn world(data: u8) -> World {
 
 fn traced(truth: &Truth, data: u8) -> Traced {
     match truth.read {
-        true => Traced { files: vec![(PathBuf::from(DATA), Some([data; 32]))], ..Traced::default() },
+        true => {
+            Traced { files: vec![(PathBuf::from(DATA), Some([data; 32]))], ..Traced::default() }
+        }
         false => Traced::default(),
     }
 }
 
 fn record(truth: &Truth, whole: bool) -> Record {
     match whole {
-        true => Record::of_hits(SLOTS, truth.executed.iter().copied().filter(|&n| n < SLOTS).collect()),
+        true => {
+            Record::of_hits(SLOTS, truth.executed.iter().copied().filter(|&n| n < SLOTS).collect())
+        }
         false => Record::incomplete("killed"),
     }
 }
@@ -183,7 +195,9 @@ impl Past {
             && self.beside == program.beside
             && self.unlogged == program.versions[SLOTS as usize..]
             && self.unlogged_places == program.places[SLOTS as usize..]
-            && self.executed.iter().all(|&(n, v, p)| program.versions[n as usize] == v && program.places[n as usize] == p)
+            && self.executed.iter().all(|&(n, v, p)| {
+                program.versions[n as usize] == v && program.places[n as usize] == p
+            })
             && self.data.is_none_or(|it| it == data)
     }
 }
@@ -222,9 +236,15 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
             for t in 0..TESTS {
                 let root = t % SLOTS;
                 let reached = program.reached(root);
-                let subject = Subject { name: &names[t as usize], attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
+                let subject = Subject {
+                    name: &names[t as usize],
+                    attrs: &attrs,
+                    outside: false,
+                    reached: Reached::Known(&reached),
+                };
                 let truth = program.run(root, data);
-                let choice = choose(&store, given(), &image, &subject, false, &mut world(data)).unwrap();
+                let choice =
+                    choose(&store, given(), &image, &subject, false, &mut world(data)).unwrap();
                 match choice {
                     Choice::Cached(_) => {
                         skipped += 1;
@@ -238,7 +258,12 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
                         ran += 1;
                         let traced = traced(&truth, data);
                         let record = record(&truth, rng.below(6) != 0);
-                        let it = Ran { passed: truth.passed, took: Duration::from_millis(1), traced: Some(&traced), record: &record };
+                        let it = Ran {
+                            passed: truth.passed,
+                            took: Duration::from_millis(1),
+                            traced: Some(&traced),
+                            record: &record,
+                        };
                         keep(&mut store, given(), &image, &subject, &it).unwrap();
                         pasts[t as usize].push(Past::of(&program, &truth, data));
                     }
@@ -247,7 +272,10 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
             edit(&mut rng, &mut program, &mut data);
         }
     }
-    assert!(skipped > ran / 4, "the simulation skips too little to say anything: {skipped} skipped, {ran} ran");
+    assert!(
+        skipped > ran / 4,
+        "the simulation skips too little to say anything: {skipped} skipped, {ran} ran"
+    );
 }
 
 /// A selector kept across random edits, reverts, input changes, incomplete records, other
@@ -278,9 +306,15 @@ fn a_selector_chooses_as_the_store_alone_does() {
                 let reached = program.reached(root);
                 let attrs = if (t + step) % 7 == 0 { &ignored } else { &plain };
                 let outside = t == 5 && step % 9 == 0;
-                let subject = Subject { name: &names[t as usize], attrs, outside, reached: Reached::Known(&reached) };
+                let subject = Subject {
+                    name: &names[t as usize],
+                    attrs,
+                    outside,
+                    reached: Reached::Known(&reached),
+                };
                 let all = step % 13 == 12;
-                let want = choose(&store, given(), &image, &subject, all, &mut world(data)).unwrap();
+                let want =
+                    choose(&store, given(), &image, &subject, all, &mut world(data)).unwrap();
                 let got = selector.choose(&store, &subject, all, &mut world(data)).unwrap();
                 assert_eq!(got, want, "seed {seed}, step {step}, test {t}");
                 if let Choice::Run { .. } = got {
@@ -289,7 +323,8 @@ fn a_selector_chooses_as_the_store_alone_does() {
                     let traced = traced(&truth, data);
                     let record = record(&truth, rng.below(6) != 0);
                     let took = Duration::from_micros(1_500 + u64::from(t));
-                    let it = Ran { passed: truth.passed, took, traced: Some(&traced), record: &record };
+                    let it =
+                        Ran { passed: truth.passed, took, traced: Some(&traced), record: &record };
                     selector.keep(&mut store, &subject, &it).unwrap();
                 } else {
                     cached += 1;
@@ -327,11 +362,17 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
         }
         let image = program.image();
         let reached = program.reached(root);
-        let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
+        let subject =
+            Subject { name: "t", attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
         let mut store = Mem::default();
         let traced = traced(&truth, data);
         let record = record(&truth, true);
-        let ran = Ran { passed: true, took: Duration::from_millis(1), traced: Some(&traced), record: &record };
+        let ran = Ran {
+            passed: true,
+            took: Duration::from_millis(1),
+            traced: Some(&traced),
+            record: &record,
+        };
         keep(&mut store, given(), &image, &subject, &ran).unwrap();
 
         let before = program.clone();
@@ -352,9 +393,14 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
         let should_run = changed.iter().any(|n| truth.executed.binary_search(n).is_ok())
             || changed.iter().any(|&n| n >= SLOTS)
             || (truth.read && now != data);
-        let choice = choose(&store, given(), &program.image(), &subject, false, &mut world(now)).unwrap();
+        let choice =
+            choose(&store, given(), &program.image(), &subject, false, &mut world(now)).unwrap();
         let runs_now = matches!(choice, Choice::Run { .. });
-        assert_eq!(runs_now, should_run, "seed {seed}: executed {:?}, changed {changed:?}, {choice:?}", truth.executed);
+        assert_eq!(
+            runs_now, should_run,
+            "seed {seed}: executed {:?}, changed {changed:?}, {choice:?}",
+            truth.executed
+        );
         match runs_now {
             true => runs += 1,
             false => cached += 1,
@@ -367,5 +413,8 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
         }
     }
     assert!(cached > 50 && runs > 50, "{cached} cached, {runs} ran");
-    assert!(moved_kept > 10 && moved_ran > 10, "of moves only, {moved_kept} kept the pass and {moved_ran} ran it");
+    assert!(
+        moved_kept > 10 && moved_ran > 10,
+        "of moves only, {moved_kept} kept the pass and {moved_ran} ran it"
+    );
 }

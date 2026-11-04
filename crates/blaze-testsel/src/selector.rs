@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use blaze_cas::{Corrupt, Key};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
@@ -39,6 +38,7 @@ use blaze_usercode::{
     },
     trace::Inputs,
 };
+use std::alloc::Global;
 
 use crate::{
     select::{
@@ -104,7 +104,9 @@ fn walk(blocks: &[Block], chain: Chain, mut each: impl FnMut(u32)) {
 
 /// The first eight bytes of a BLAKE3 output, which are uniform: a hash with nothing to compute.
 fn word(bytes: &[u8; 32]) -> u64 {
-    u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]])
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 fn version_hash(version: &Version) -> u64 {
@@ -344,13 +346,20 @@ impl Selector {
     }
 
     /// Gives the set kept under `key` an id: its versions, its postings, its stale count.
-    fn register(&mut self, key: Key, unlogged: ContentId, versions: impl IntoIterator<Item = Version>) -> u32 {
+    fn register(
+        &mut self,
+        key: Key,
+        unlogged: ContentId,
+        versions: impl IntoIterator<Item = Version>,
+    ) -> u32 {
         let set = self.sets.keys.len() as u32;
         let mut stale = 0;
         for version in versions {
             let id = self.version(version);
             post(&mut self.blocks, &mut self.versions.postings[id as usize], set);
-            if self.functions.now[self.versions.function[id as usize] as usize] != Some(version.bound) {
+            if self.functions.now[self.versions.function[id as usize] as usize]
+                != Some(version.bound)
+            {
                 stale += 1;
             }
         }
@@ -370,7 +379,8 @@ impl Selector {
     /// Whether every function of the set is in the binary as it was, and the unlogged code is:
     /// what `Image::changed` says, read from counts.
     fn fits(&self, set: u32) -> bool {
-        self.sets.stale[set as usize] == 0 && self.sets.unlogged[set as usize] == self.image.unlogged()
+        self.sets.stale[set as usize] == 0
+            && self.sets.unlogged[set as usize] == self.image.unlogged()
     }
 
     /// The memo of the test `name`, its history's end read once.
@@ -397,7 +407,14 @@ impl Selector {
 
     /// Reads entries of test `t`'s history (whose newest is at slot `end`) until the `i`th
     /// back is in its memo.
-    fn summary<P: Passes + ?Sized>(&mut self, store: &P, t: usize, name: &str, end: u32, i: usize) -> Result<(), Unread> {
+    fn summary<P: Passes + ?Sized>(
+        &mut self,
+        store: &P,
+        t: usize,
+        name: &str,
+        end: u32,
+        i: usize,
+    ) -> Result<(), Unread> {
         while self.tests[t].entries.len() <= i {
             let slot = end - self.tests[t].entries.len() as u32;
             let read = entry(store, self.given, name, slot)?;
@@ -418,7 +435,12 @@ impl Selector {
 
     /// The id of the set entry `i` of test `t` was kept under, read from the store the first
     /// time; `None` while the store has no set under its key.
-    fn resolve<P: Passes + ?Sized, E>(&mut self, store: &P, t: usize, i: usize) -> Result<Option<u32>, SelectError<E>> {
+    fn resolve<P: Passes + ?Sized, E>(
+        &mut self,
+        store: &P,
+        t: usize,
+        i: usize,
+    ) -> Result<Option<u32>, SelectError<E>> {
         let key = match self.tests[t].entries[i].set {
             SetRef::Known(set) => return Ok(Some(set)),
             SetRef::Key(key) => key,
@@ -427,7 +449,8 @@ impl Selector {
             Some(set) => set,
             None => {
                 let Some(bytes) = store.get(&key)? else { return Ok(None) };
-                let view = SetView::decode(bytes).map_err(|why| SelectError::NotOurs { key, why })?;
+                let view =
+                    SetView::decode(bytes).map_err(|why| SelectError::NotOurs { key, why })?;
                 self.register(key, view.unlogged(), view.versions())
             }
         };
@@ -447,7 +470,10 @@ impl Selector {
         let name = subject.name;
         let t = self.test(store, name)?;
         let End::At(end) = self.tests[t].end else {
-            return Ok(Choice::Run { why: if subject.outside { Why::Outside } else { Why::New }, expected: None });
+            return Ok(Choice::Run {
+                why: if subject.outside { Why::Outside } else { Why::New },
+                expected: None,
+            });
         };
         self.summary(store, t, name, end, 0)?;
         let expected = Some(self.tests[t].entries[0].took);
@@ -484,20 +510,32 @@ impl Selector {
                         why.get_or_insert(Reason::Why(Why::Read(input)));
                         continue;
                     }
-                    None => return Ok(Choice::Run { why: self.explain(store, why, Why::Failed)?, expected }),
+                    None => {
+                        return Ok(Choice::Run {
+                            why: self.explain(store, why, Why::Failed)?,
+                            expected,
+                        });
+                    }
                 }
             }
             if !kept {
                 why.get_or_insert(Reason::Why(Why::NoPass));
                 continue;
             }
-            let run = RunKey { code: identity(name, &attrs, &self.sets.keys[set as usize]), given: self.given };
+            let run = RunKey {
+                code: identity(name, &attrs, &self.sets.keys[set as usize]),
+                given: self.given,
+            };
             if find(store, &run, inputs)? {
                 let summary = &self.tests[t].entries[i];
                 // clone: the basis the caller is handed, which owns a reason only for the reached set
-                return Ok(Choice::Cached(Cached { took: summary.took, basis: summary.basis.clone() }));
+                return Ok(Choice::Cached(Cached {
+                    took: summary.took,
+                    basis: summary.basis.clone(),
+                }));
             }
-            let reason = self.read_changed(store, name, slot, inputs)?.map_or(Why::NoPass, Why::Read);
+            let reason =
+                self.read_changed(store, name, slot, inputs)?.map_or(Why::NoPass, Why::Read);
             why.get_or_insert(Reason::Why(reason));
         }
         Ok(Choice::Run { why: self.explain(store, why, Why::NoPass)?, expected })
@@ -519,7 +557,12 @@ impl Selector {
 
     /// The `Why` of a run: the first reason met, `otherwise` when none was. A changed set is
     /// explained as `Image::changed` explains it, from its bytes.
-    fn explain<P: Passes + ?Sized, E>(&self, store: &P, why: Option<Reason>, otherwise: Why) -> Result<Why, SelectError<E>> {
+    fn explain<P: Passes + ?Sized, E>(
+        &self,
+        store: &P,
+        why: Option<Reason>,
+        otherwise: Why,
+    ) -> Result<Why, SelectError<E>> {
         let set = match why {
             None => return Ok(otherwise),
             Some(Reason::Why(why)) => return Ok(why),
@@ -541,7 +584,12 @@ impl Selector {
 
     /// [`keep`](crate::select::keep) through the selector, which remembers the entry and its
     /// set.
-    pub fn keep<P: Passes + ?Sized>(&mut self, store: &mut P, subject: &Subject<'_>, ran: &Ran<'_>) -> Result<Kept, RecordError> {
+    pub fn keep<P: Passes + ?Sized>(
+        &mut self,
+        store: &mut P,
+        subject: &Subject<'_>,
+        ran: &Ran<'_>,
+    ) -> Result<Kept, RecordError> {
         let (set, basis) = kept_set(&self.image, subject, ran)?;
         let t = self.test(&*store, subject.name)?;
         let from = match self.tests[t].end {

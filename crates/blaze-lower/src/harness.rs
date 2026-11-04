@@ -6,8 +6,8 @@
 
 use base_db::{Crate, FileText};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_expand::proc_macro::ProcMacros;
+use std::alloc::Global;
 
 use super::{ContentId, Db, LowerError, Lowered};
 use blaze_units::{query::UnitPlan, schema::Unit};
@@ -71,7 +71,9 @@ impl Lowered {
         let written = match asked.is_empty() {
             true => 0,
             false => {
-                let trigger = base_db::Trigger::named("crate roots appended to (test harnesses, wasm macro glue)");
+                let trigger = base_db::Trigger::named(
+                    "crate roots appended to (test harnesses, wasm macro glue)",
+                );
                 self.batch(trigger, |this| this.write_roots(&units, asked, &mut refused))
             }
         };
@@ -86,7 +88,12 @@ impl Lowered {
 
     /// [`Lowered::append_roots`]'s writes, in its batch: each root of `asked` made, `units` the
     /// units it was given, each unit whose root can't be made added to `refused` and left.
-    fn write_roots(&mut self, units: &[u32], asked: Vec<(usize, Crate, Appended)>, refused: &mut Vec<(usize, LowerError)>) -> usize {
+    fn write_roots(
+        &mut self,
+        units: &[u32],
+        asked: Vec<(usize, Crate, Appended)>,
+        refused: &mut Vec<(usize, LowerError)>,
+    ) -> usize {
         let mut made: HashSet<base_db::FileId, Global> = HashSet::new_in(Global);
         let mut written = 0;
         for (unit, krate, appended) in asked {
@@ -101,10 +108,18 @@ impl Lowered {
                 _ => {}
             }
             let before = self.db.file_text(file).content(&self.db);
-            if let Err(error) = self.db.set_alias_appended(file, Some((appended.module, &appended.after))) {
+            if let Err(error) =
+                self.db.set_alias_appended(file, Some((appended.module, &appended.after)))
+            {
                 let what = &self.crates.units[unit].what;
                 // alloc: the error's message
-                refused.push((unit, LowerError::at(format!("the root of {what} can't have a module appended: {error}"), what.clone())));
+                refused.push((
+                    unit,
+                    LowerError::at(
+                        format!("the root of {what} can't have a module appended: {error}"),
+                        what.clone(),
+                    ),
+                ));
                 continue;
             }
             made.insert(file);

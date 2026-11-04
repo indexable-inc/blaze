@@ -113,11 +113,7 @@ fn an_impl_trait_outlives_static_by_its_written_static_bound() {
 fn an_impl_trait_with_no_static_bound_outlives_static_only_if_its_captures_do() {
     for result in checked("unbounded") {
         assert_eq!(result.not_checked, None);
-        assert!(
-            result.diagnostics.iter().any(|it| it.code == "E0521"),
-            "{:?}",
-            result.diagnostics
-        );
+        assert!(result.diagnostics.iter().any(|it| it.code == "E0521"), "{:?}", result.diagnostics);
     }
 }
 

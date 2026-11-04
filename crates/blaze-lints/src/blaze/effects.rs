@@ -15,7 +15,9 @@
 //! The attributes change diagnostics only: no codegen key reads their bits, so a function with
 //! or without one builds byte for byte the same.
 
-use hir_def::{AttrDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::PureAttr};
+use hir_def::{
+    AttrDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::PureAttr,
+};
 use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
 use hir_ty_pure::{
@@ -45,7 +47,11 @@ type StepNote = (span::FileId, syntax::TextRange, String);
 /// The notes of `refusal`'s steps placed in `krate`'s own files (another crate's file may have
 /// no name in the build, and the message already names each step): each step but the last
 /// calls the next, the last does what the refusal is about.
-fn step_notes(db: &base_db::Db, krate: base_db::Crate, refusal: &hir_ty_pure::Refusal) -> Vec<StepNote> {
+fn step_notes(
+    db: &base_db::Db,
+    krate: base_db::Crate,
+    refusal: &hir_ty_pure::Refusal,
+) -> Vec<StepNote> {
     let own = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     let chain = &refusal.chain;
     chain
@@ -81,7 +87,9 @@ fn marked(db: &base_db::Db, func: FunctionId, effect: &EffectDef) -> Option<Pure
 /// The refusal of `lint` of the body `cx` walks, if any, with its steps' notes.
 fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
     let analysis = cx.analysis()?;
-    let Ok(DefWithBodyId::FunctionId(func)) = DefWithBodyId::try_from(analysis.def()) else { return None };
+    let Ok(DefWithBodyId::FunctionId(func)) = DefWithBodyId::try_from(analysis.def()) else {
+        return None;
+    };
     let db = cx.db();
     // A trait's method with no body is a declaration: there is no code of it to check, and each
     // impl's method is checked in its place.
@@ -99,8 +107,12 @@ fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
             // Asked only of a function marked `nopanic`, so a crate's profile is read only there.
             marked(db, func, nopanic_for(true))?;
             match crate_checks_overflow(db, krate) {
-                Some(true) => (nopanic_for(true), " (checked as this crate builds: with overflow checks)"),
-                Some(false) => (nopanic_for(false), " (checked as this crate builds: without overflow checks)"),
+                Some(true) => {
+                    (nopanic_for(true), " (checked as this crate builds: with overflow checks)")
+                }
+                Some(false) => {
+                    (nopanic_for(false), " (checked as this crate builds: without overflow checks)")
+                }
                 None => {
                     let message = format!(
                         "`{name}` is `#[blaze::nopanic]`, but whether its crate keeps overflow checks is not known, so it can't be checked"

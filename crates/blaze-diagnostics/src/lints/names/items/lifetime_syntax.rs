@@ -15,13 +15,13 @@
 //! (`resolve_fn_params`, `find_lifetime_for_self`) and `compiler/rustc_lint/src/lints.rs`
 //! (`MismatchedLifetimeSyntaxes`) (MIT or Apache-2.0).
 
+use blaze_hash::hash_map::Entry;
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
-use blaze_hash::hash_map::Entry;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SmolStr, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode, HasGenericArgs, HasName},
@@ -112,7 +112,9 @@ impl Info {
     /// The span that removes an explicit lifetime of a reference, up to its referent.
     fn removing(&self) -> TextRange {
         match (self.source, self.referent) {
-            (Source::Reference, Some(referent)) => TextRange::new(self.ident.start(), referent.max(self.ident.start())),
+            (Source::Reference, Some(referent)) => {
+                TextRange::new(self.ident.start(), referent.max(self.ident.start()))
+            }
             _ => self.ident,
         }
     }
@@ -121,13 +123,17 @@ impl Info {
     fn suggestion(&self, name: &str) -> (TextRange, String) {
         match self.syntax {
             Syntax::Implicit => (self.ident, format!("{name} ")), // alloc: the firing lint's suggestion
-            _ => (self.ident, name.to_owned()),                    // alloc: the firing lint's suggestion
+            _ => (self.ident, name.to_owned()), // alloc: the firing lint's suggestion
         }
     }
 }
 
 /// The lints of `item` at rustc's `check_fn`, `check_trait_item` and `check_foreign_item`.
-pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, anonymous_in_impl_trait: bool) -> Vec<Found> {
+pub(super) fn item<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
+    anonymous_in_impl_trait: bool,
+) -> Vec<Found> {
     let ast::Item::Fn(f) = item.node.value else { return Vec::new() }; // alloc: empty, allocates nothing
     let times = match (&item.container, f.body().is_some()) {
         (Container::Trait(_), true) => 2,
@@ -147,7 +153,13 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, anonymous_in_impl_tr
 
 /// rustc's `check_fn_like`. The return type is walked first: one with no lifetime (most) can
 /// mismatch nothing, and its parameters are not looked at.
-fn check<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, f: ast::Fn<'db>, anonymous_in_impl_trait: bool, found: &mut Vec<Found>) {
+fn check<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
+    f: ast::Fn<'db>,
+    anonymous_in_impl_trait: bool,
+    found: &mut Vec<Found>,
+) {
     let Some(params) = f.param_list() else { return };
     if params.self_param().is_none() && params.params().next().is_none() {
         return;
@@ -200,12 +212,25 @@ fn check<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, f: ast::Fn<'db>, anonymous_in_
                             syntax_of(lifetime),
                             lifetime.syntax().text_range(),
                         ),
-                        None => (walk.fresh(), SmolStr::default(), Syntax::Implicit, TextRange::empty(amp.text_range().end())),
+                        None => (
+                            walk.fresh(),
+                            SmolStr::default(),
+                            Syntax::Implicit,
+                            TextRange::empty(amp.text_range().end()),
+                        ),
                     };
                     if let Some(res) = res {
                         let referent = param.name().map(|it| it.syntax().text_range().start());
                         self_refs.push(res);
-                        let info = Info { res, name, syntax, source: Source::Reference, ident, ty: ident, referent };
+                        let info = Info {
+                            res,
+                            name,
+                            syntax,
+                            source: Source::Reference,
+                            ident,
+                            ty: ident,
+                            referent,
+                        };
                         walk.push(&mut inputs, &scope, info);
                     }
                 }
@@ -253,7 +278,8 @@ fn check<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, f: ast::Fn<'db>, anonymous_in_
             continue;
         }
         // alloc: the group of the lint that fires
-        let (group_ins, group_outs): (Vec<&Info>, Vec<&Info>) = (resolving(ins, res).collect(), resolving(outs, res).collect());
+        let (group_ins, group_outs): (Vec<&Info>, Vec<&Info>) =
+            (resolving(ins, res).collect(), resolving(outs, res).collect());
         found.push(mismatch(cx, item, &group_ins, &group_outs));
     }
 }
@@ -285,14 +311,23 @@ fn elide(elision: &mut Option<Option<Res>>, param: &[Res]) {
 /// Whether `ty`, a reference's referent in `self`'s type, names `Self` or the impl's self type
 /// (rustc's `find_lifetime_for_self`). A path is resolved only when it is not `Self` and the
 /// impl's self type names a definition.
-fn names_self<'db>(cx: &Cx<'_, 'db>, ty: ast::Node<'db>, impl_self: Option<ast::Type<'db>>) -> bool {
+fn names_self<'db>(
+    cx: &Cx<'_, 'db>,
+    ty: ast::Node<'db>,
+    impl_self: Option<ast::Type<'db>>,
+) -> bool {
     let impl_def = impl_self.and_then(|it| match it {
         ast::Type::PathType(p) => p.path().and_then(|p| cx.vsema.resolve_path(p)),
         _ => None,
     });
-    let paths = ty.descendants().filter(|it| it.kind() == SyntaxKind::PATH_TYPE).filter_map(ast::PathType::cast);
+    let paths = ty
+        .descendants()
+        .filter(|it| it.kind() == SyntaxKind::PATH_TYPE)
+        .filter_map(ast::PathType::cast);
     paths.filter_map(|it| it.path()).any(|path| {
-        if path.qualifier().is_none() && path.segment().is_some_and(|it| it.self_type_token().is_some()) {
+        if path.qualifier().is_none()
+            && path.segment().is_some_and(|it| it.self_type_token().is_some())
+        {
             return true;
         }
         let Some(PathResolution::Def(def)) = &impl_def else { return false };
@@ -394,7 +429,9 @@ impl<'db> Walk<'_, '_, 'db> {
             SyntaxKind::CONST_ARG | SyntaxKind::FOR_BINDER => return,
             SyntaxKind::FN_PTR_TYPE => scope.nested = true,
             // `Fn(..) -> ..`, whose return type is the segment's, not the argument list's.
-            SyntaxKind::PATH_SEGMENT if node.children().any(|it| it.kind() == SyntaxKind::PARENTHESIZED_ARG_LIST) => {
+            SyntaxKind::PATH_SEGMENT
+                if node.children().any(|it| it.kind() == SyntaxKind::PARENTHESIZED_ARG_LIST) =>
+            {
                 scope.nested = true
             }
             SyntaxKind::IMPL_TRAIT_TYPE if !self.output => scope.impl_trait = true,
@@ -417,18 +454,28 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     /// [`Walk::ty`] of `node`, of the kind `kind`, once its scope is known.
-    fn node(&mut self, node: ast::Node<'db>, kind: SyntaxKind, scope: &Scope, out: &mut Walked<'db>) {
+    fn node(
+        &mut self,
+        node: ast::Node<'db>,
+        kind: SyntaxKind,
+        scope: &Scope,
+        out: &mut Walked<'db>,
+    ) {
         if kind == SyntaxKind::REF_TYPE
             && let Some(r) = ast::RefType::cast(node)
         {
             let inner = r.ty();
             let referent = inner.as_ref().map(|it| it.syntax().text_range().start());
             let (res, syntax, ident, name) = match r.lifetime() {
-                Some(lifetime) => {
-                    (self.named(lifetime, scope), syntax_of(lifetime), lifetime.syntax().text_range(), SmolStr::new(lifetime.text()))
-                }
+                Some(lifetime) => (
+                    self.named(lifetime, scope),
+                    syntax_of(lifetime),
+                    lifetime.syntax().text_range(),
+                    SmolStr::new(lifetime.text()),
+                ),
                 None => {
-                    let at = r.amp_token().map_or(node.text_range().start(), |it| it.text_range().end());
+                    let at =
+                        r.amp_token().map_or(node.text_range().start(), |it| it.text_range().end());
                     (self.elided(scope), Syntax::Implicit, TextRange::empty(at), SmolStr::default())
                 }
             };
@@ -438,7 +485,15 @@ impl<'db> Walk<'_, '_, 'db> {
                 {
                     out.refs.push((inner.syntax(), res));
                 }
-                let info = Info { res, name, syntax, source: Source::Reference, ident, ty: ident, referent };
+                let info = Info {
+                    res,
+                    name,
+                    syntax,
+                    source: Source::Reference,
+                    ident,
+                    ty: ident,
+                    referent,
+                };
                 self.push(out, scope, info);
             }
             if let Some(inner) = inner {
@@ -455,12 +510,21 @@ impl<'db> Walk<'_, '_, 'db> {
                 let args = segment.as_ref().and_then(|it| it.generic_arg_list());
                 let (angle, ident) = match &args {
                     None => {
-                        let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
+                        let name = segment
+                            .as_ref()
+                            .and_then(|it| it.name_ref())
+                            .map(|it| it.syntax().text_range());
                         (Angle::Missing, name.unwrap_or(node.text_range()))
                     }
                     Some(args) => {
-                        let after = args.l_angle_token().map_or(args.syntax().text_range().start(), |it| it.text_range().end());
-                        let angle = if args.generic_args().next().is_none() { Angle::Empty } else { Angle::Full };
+                        let after = args
+                            .l_angle_token()
+                            .map_or(args.syntax().text_range().start(), |it| it.text_range().end());
+                        let angle = if args.generic_args().next().is_none() {
+                            Angle::Empty
+                        } else {
+                            Angle::Full
+                        };
                         (angle, TextRange::empty(after))
                     }
                 };
@@ -468,7 +532,15 @@ impl<'db> Walk<'_, '_, 'db> {
                     if let Some(res) = self.elided(scope) {
                         let source = Source::Path(angle);
                         let name = SmolStr::default();
-                        let info = Info { res, name, syntax: Syntax::Implicit, source, ident, ty: ident, referent: None };
+                        let info = Info {
+                            res,
+                            name,
+                            syntax: Syntax::Implicit,
+                            source,
+                            ident,
+                            ty: ident,
+                            referent: None,
+                        };
                         self.push(out, scope, info);
                     }
                 }
@@ -478,8 +550,13 @@ impl<'db> Walk<'_, '_, 'db> {
             let Some(lifetime) = ast::Lifetime::cast(node) else { return };
             let Some(source) = source_of(node) else { return };
             if let Some(res) = self.named(lifetime, scope) {
-                let (name, syntax, ident) = (SmolStr::new(lifetime.text()), syntax_of(lifetime), node.text_range());
-                self.push(out, scope, Info { res, name, syntax, source, ident, ty: ident, referent: None });
+                let (name, syntax, ident) =
+                    (SmolStr::new(lifetime.text()), syntax_of(lifetime), node.text_range());
+                self.push(
+                    out,
+                    scope,
+                    Info { res, name, syntax, source, ident, ty: ident, referent: None },
+                );
             }
             return;
         }
@@ -501,7 +578,10 @@ impl<'db> Walk<'_, '_, 'db> {
 
     /// How many lifetimes a path leaves out: all of its type's, when it gives none.
     fn hidden(&self, path: ast::Path<'db>) -> usize {
-        let given = path.segment().and_then(|it| it.generic_arg_list()).is_some_and(|it| it.lifetime_args().next().is_some());
+        let given = path
+            .segment()
+            .and_then(|it| it.generic_arg_list())
+            .is_some_and(|it| it.lifetime_args().next().is_some());
         if given {
             return 0;
         }
@@ -615,8 +695,15 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, inputs: &[&Info], outputs: 
         _ => "hiding or eliding a lifetime that's named elsewhere is confusing",
     };
     // alloc: the firing lint's primary spans
-    let primary: Vec<Span> = in_hidden.iter().chain(&in_elided).chain(&out_hidden).chain(&out_elided).map(|&it| span(it)).collect();
-    let first = primary.first().cloned().unwrap_or_else(|| span(item.node.value.syntax().text_range()));
+    let primary: Vec<Span> = in_hidden
+        .iter()
+        .chain(&in_elided)
+        .chain(&out_hidden)
+        .chain(&out_elided)
+        .map(|&it| span(it))
+        .collect();
+    let first =
+        primary.first().cloned().unwrap_or_else(|| span(item.node.value.syntax().text_range()));
     let mut diag = Diag::lint("mismatched_lifetime_syntaxes", message, first);
     diag.span.primary = primary;
     for &it in &in_hidden {
@@ -648,12 +735,17 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, inputs: &[&Info], outputs: 
     for &it in &out_named {
         diag.span_label(span(it), "the same lifetime is named here");
     }
-    diag.help("the same lifetime is referred to in inconsistent ways, making the signature confusing");
+    diag.help(
+        "the same lifetime is referred to in inconsistent ways, making the signature confusing",
+    );
 
     let mut suggestions: Vec<(String, Vec<(TextRange, String)>)> = Vec::new(); // alloc: the firing lint's suggestions
     if let Some(bound) = bound {
         // alloc: the firing lint's suggestion
-        suggestions.push((format!("consistently use `{}`", bound.name), for_lifetime(&bound.name, &to_bound)));
+        suggestions.push((
+            format!("consistently use `{}`", bound.name),
+            for_lifetime(&bound.name, &to_bound),
+        ));
     }
     let mixed = saw_reference
         && saw_path
@@ -665,7 +757,8 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, inputs: &[&Info], outputs: 
             false => "remove the lifetime name from references and use `'_` for type paths",
         };
         // alloc: the firing lint's suggestion
-        let mut parts: Vec<(TextRange, String)> = to_mixed_implicit.iter().map(|it| (it.removing(), String::new())).collect();
+        let mut parts: Vec<(TextRange, String)> =
+            to_mixed_implicit.iter().map(|it| (it.removing(), String::new())).collect();
         parts.extend(for_lifetime("'_", &to_mixed_anonymous));
         suggestions.push((message.to_owned(), parts)); // alloc: the firing lint's suggestion
     }

@@ -80,7 +80,9 @@ fn interpretable(func: &ir::Function) -> ir::Function {
         while let Some(inst) = cursor.next_inst() {
             match cursor.func.dfg.insts[inst].opcode() {
                 ir::Opcode::Bitcast => {
-                    let &[x] = cursor.func.dfg.inst_args(inst) else { unreachable!("bitcast takes one operand") };
+                    let &[x] = cursor.func.dfg.inst_args(inst) else {
+                        unreachable!("bitcast takes one operand")
+                    };
                     let from = cursor.func.dfg.value_type(x);
                     let to = cursor.func.dfg.value_type(cursor.func.dfg.first_result(inst));
                     if from.lane_bits() <= 64 && to.lane_bits() <= 64 {
@@ -100,7 +102,8 @@ fn interpretable(func: &ir::Function) -> ir::Function {
                 | ir::Opcode::Uload16x4
                 | ir::Opcode::Sload32x2
                 | ir::Opcode::Uload32x2) => {
-                    let ir::InstructionData::Load { arg, offset, .. } = cursor.func.dfg.insts[inst] else {
+                    let ir::InstructionData::Load { arg, offset, .. } = cursor.func.dfg.insts[inst]
+                    else {
                         unreachable!("an extending load is a load")
                     };
                     let flags = cursor.func.dfg.insts[inst]
@@ -115,7 +118,10 @@ fn interpretable(func: &ir::Function) -> ir::Function {
                     let wide = cursor.ins().scalar_to_vector(types::I64X2, word);
                     let little = ir::MemFlagsData::new().with_endianness(ir::Endianness::Little);
                     let lanes = cursor.ins().bitcast(narrow, little, wide);
-                    if matches!(opcode, ir::Opcode::Sload8x8 | ir::Opcode::Sload16x4 | ir::Opcode::Sload32x2) {
+                    if matches!(
+                        opcode,
+                        ir::Opcode::Sload8x8 | ir::Opcode::Sload16x4 | ir::Opcode::Sload32x2
+                    ) {
                         cursor.func.replace(inst).swiden_low(lanes);
                     } else {
                         cursor.func.replace(inst).uwiden_low(lanes);
@@ -132,7 +138,9 @@ fn interpretable(func: &ir::Function) -> ir::Function {
                     cursor.func.replace(inst).isub(or, half);
                 }
                 ir::Opcode::Srem => {
-                    let &[x, y] = cursor.func.dfg.inst_args(inst) else { unreachable!("srem takes two operands") };
+                    let &[x, y] = cursor.func.dfg.inst_args(inst) else {
+                        unreachable!("srem takes two operands")
+                    };
                     let ty = cursor.func.dfg.value_type(y);
                     let all_ones = int(&mut cursor, ty, -1);
                     let minus_one = cursor.ins().icmp(ir::condcodes::IntCC::Equal, y, all_ones);
@@ -197,9 +205,10 @@ pub fn same(ty: ir::Type, a: &DataValue, b: &DataValue, nans: Nans) -> bool {
         return false;
     }
     let lane_bytes = lane.bytes() as usize;
-    a[..width].chunks_exact(lane_bytes).zip(b[..width].chunks_exact(lane_bytes)).all(|(a, b)| {
-        a == b || (is_nan(lane, a) && is_nan(lane, b))
-    })
+    a[..width]
+        .chunks_exact(lane_bytes)
+        .zip(b[..width].chunks_exact(lane_bytes))
+        .all(|(a, b)| a == b || (is_nan(lane, a) && is_nan(lane, b)))
 }
 
 /// Whether every value of `a` and `b` (of `tys`) is the same result.
@@ -212,7 +221,11 @@ pub fn same_all(tys: &[ir::Type], a: &[DataValue], b: &[DataValue], nans: Nans) 
 /// Whether `got` (of a backend's code) is what `reference` (the interpreter's run) says, for
 /// a function returning `tys`: equal values with any NaN for a NaN, or a trap for a trap.
 /// Trap codes are not compared: stencil code reports a trap by its signal only.
-pub fn agrees(tys: &[ir::Type], reference: &Run, got: &Outcome<Vec<DataValue>>) -> Result<(), String> {
+pub fn agrees(
+    tys: &[ir::Type],
+    reference: &Run,
+    got: &Outcome<Vec<DataValue>>,
+) -> Result<(), String> {
     match (reference, got) {
         (Run::Returned(want), Outcome::Returned(got)) => {
             if same_all(tys, want, got, Nans::Any) {
@@ -308,7 +321,8 @@ fn the_interpreter_runs_a_bitcast_of_a_128_bit_lane() {
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let x = b.block_params(entry)[0];
-        let y = b.ins().bitcast(to, ir::MemFlagsData::new().with_endianness(ir::Endianness::Little), x);
+        let y =
+            b.ins().bitcast(to, ir::MemFlagsData::new().with_endianness(ir::Endianness::Little), x);
         b.ins().return_(&[y]);
         b.seal_all_blocks();
         let config = super::host::isa(&super::host::TARGETS[0]).frontend_config();
@@ -326,7 +340,10 @@ fn the_interpreter_runs_a_bitcast_of_a_128_bit_lane() {
         Ok(Run::Returned(vec![DataValue::I128(wide as i128)]))
     );
     let f128 = DataValue::F128(cranelift_codegen::ir::immediates::Ieee128::with_bits(wide));
-    assert_eq!(bitcast(types::F128, types::I32X4, f128), Ok(Run::Returned(vec![DataValue::V128(bytes)])));
+    assert_eq!(
+        bitcast(types::F128, types::I32X4, f128),
+        Ok(Run::Returned(vec![DataValue::V128(bytes)]))
+    );
 }
 
 /// `avg_round` is `(x + y + 1) >> 1` of each lane, computed wide.
@@ -350,7 +367,8 @@ fn the_interpreter_runs_a_vector_avg_round() {
     b.finalize(config);
     let x: [u8; 16] = std::array::from_fn(|i| [0, 0, 1, 254, 255, 255, 7, 128][i % 8]);
     let y: [u8; 16] = std::array::from_fn(|i| [0, 1, 1, 255, 254, 255, 100, 127][i % 8]);
-    let want: [u8; 16] = std::array::from_fn(|i| ((u16::from(x[i]) + u16::from(y[i]) + 1) >> 1) as u8);
+    let want: [u8; 16] =
+        std::array::from_fn(|i| ((u16::from(x[i]) + u16::from(y[i]) + 1) >> 1) as u8);
     assert_eq!(
         run(&[&func], 0, &[DataValue::V128(x), DataValue::V128(y)]),
         Ok(Run::Returned(vec![DataValue::V128(want)]))

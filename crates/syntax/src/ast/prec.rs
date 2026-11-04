@@ -384,9 +384,21 @@ impl Expr {
 
             FieldExpr(_) => (31, 32),
 
-            ArrayExpr(_) | TupleExpr(_) | Literal(_) | PathExpr(_) | ParenExpr(_) | IfExpr(_)
-            | WhileExpr(_) | ForExpr(_) | LoopExpr(_) | MatchExpr(_) | BlockExpr(_)
-            | RecordExpr(_) | UnderscoreExpr(_) | IncludeBytesExpr(_) | CfgPredExpr(_)
+            ArrayExpr(_)
+            | TupleExpr(_)
+            | Literal(_)
+            | PathExpr(_)
+            | ParenExpr(_)
+            | IfExpr(_)
+            | WhileExpr(_)
+            | ForExpr(_)
+            | LoopExpr(_)
+            | MatchExpr(_)
+            | BlockExpr(_)
+            | RecordExpr(_)
+            | UnderscoreExpr(_)
+            | IncludeBytesExpr(_)
+            | CfgPredExpr(_)
             | UnsafeBinderCastExpr(_) => (0, 0),
         }
     }
@@ -529,10 +541,23 @@ impl Expr {
                 OffsetOfExpr(e) => e.builtin_token(),
                 FormatArgsExpr(e) => e.builtin_token(),
                 AsmExpr(e) => e.builtin_token(),
-                ArrayExpr(_) | TupleExpr(_) | Literal(_) | PathExpr(_) | ParenExpr(_)
-                | IfExpr(_) | WhileExpr(_) | ForExpr(_) | LoopExpr(_) | MatchExpr(_)
-                | BlockExpr(_) | RecordExpr(_) | UnderscoreExpr(_) | MacroExpr(_)
-                | IncludeBytesExpr(_) | CfgPredExpr(_) | UnsafeBinderCastExpr(_) => None,
+                ArrayExpr(_)
+                | TupleExpr(_)
+                | Literal(_)
+                | PathExpr(_)
+                | ParenExpr(_)
+                | IfExpr(_)
+                | WhileExpr(_)
+                | ForExpr(_)
+                | LoopExpr(_)
+                | MatchExpr(_)
+                | BlockExpr(_)
+                | RecordExpr(_)
+                | UnderscoreExpr(_)
+                | MacroExpr(_)
+                | IncludeBytesExpr(_)
+                | CfgPredExpr(_)
+                | UnsafeBinderCastExpr(_) => None,
             };
 
             token.map(|t| t.text_range()).unwrap_or_else(|| this.syntax().text_range()).start()
@@ -543,11 +568,29 @@ impl Expr {
         use Expr::*;
 
         match self {
-            ArrayExpr(_) | AwaitExpr(_) | BlockExpr(_) | CallExpr(_) | CastExpr(_)
-            | ClosureExpr(_) | FieldExpr(_) | IndexExpr(_) | Literal(_) | LoopExpr(_)
-            | MacroExpr(_) | MethodCallExpr(_) | ParenExpr(_) | PathExpr(_) | RecordExpr(_)
-            | TryExpr(_) | TupleExpr(_) | UnderscoreExpr(_) | OffsetOfExpr(_)
-            | FormatArgsExpr(_) | AsmExpr(_) | CfgPredExpr(_) | UnsafeBinderCastExpr(_) => false,
+            ArrayExpr(_)
+            | AwaitExpr(_)
+            | BlockExpr(_)
+            | CallExpr(_)
+            | CastExpr(_)
+            | ClosureExpr(_)
+            | FieldExpr(_)
+            | IndexExpr(_)
+            | Literal(_)
+            | LoopExpr(_)
+            | MacroExpr(_)
+            | MethodCallExpr(_)
+            | ParenExpr(_)
+            | PathExpr(_)
+            | RecordExpr(_)
+            | TryExpr(_)
+            | TupleExpr(_)
+            | UnderscoreExpr(_)
+            | OffsetOfExpr(_)
+            | FormatArgsExpr(_)
+            | AsmExpr(_)
+            | CfgPredExpr(_)
+            | UnsafeBinderCastExpr(_) => false,
 
             // For BinExpr and RangeExpr this is technically wrong -- the child can be on the left...
             BinExpr(_) | RangeExpr(_) | BreakExpr(_) | ContinueExpr(_) | PrefixExpr(_)

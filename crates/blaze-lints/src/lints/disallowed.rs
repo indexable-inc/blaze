@@ -17,9 +17,9 @@
 
 use blaze_diagnostics::model::Applicability;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_intent::retarget::{Names, Retarget};
 use hir::{ModuleDef, PathResolution};
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasArgList as _, HasName as _},
@@ -69,9 +69,9 @@ impl Resolved {
 
 /// What `blaze::wall_clock` reports, after the configured entries: clippy refuses a `lint` key
 /// in `clippy.toml`, so the lint knows its paths, and an entry configured for one wins.
-const WALL_CLOCK: [&str; 3] = ["std::time::Instant::now", "std::time::SystemTime::now", "std::time::Instant::elapsed"];
-const WALL_CLOCK_REASON: &str =
-    "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 11); drivers read the wall clock";
+const WALL_CLOCK: [&str; 3] =
+    ["std::time::Instant::now", "std::time::SystemTime::now", "std::time::Instant::elapsed"];
+const WALL_CLOCK_REASON: &str = "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 11); drivers read the wall clock";
 
 /// The `disallowed-*` entries of `key`'s configuration, resolved as `krate` names their paths:
 /// once per crate and configuration.
@@ -91,13 +91,22 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             }
         };
         for entry in list {
-            let defs: Vec<ModuleDef> =
-                resolve(db, krate, &entry.path).into_iter().filter(|it| of_kind(*it, kind)).collect();
+            let defs: Vec<ModuleDef> = resolve(db, krate, &entry.path)
+                .into_iter()
+                .filter(|it| of_kind(*it, kind))
+                .collect();
             if defs.is_empty() && !entry.allow_invalid {
                 let found = resolve(db, krate, &entry.path);
                 errors.push(match found.first() {
-                    None => format!("`{}` of `{}` does not refer to an item `{}` can name", entry.path, kind.key(), krate.base().named(db)),
-                    Some(_) => format!("`{}` of `{}` is not a {}", entry.path, kind.key(), kind_name(kind)),
+                    None => format!(
+                        "`{}` of `{}` does not refer to an item `{}` can name",
+                        entry.path,
+                        kind.key(),
+                        krate.base().named(db)
+                    ),
+                    Some(_) => {
+                        format!("`{}` of `{}` is not a {}", entry.path, kind.key(), kind_name(kind))
+                    }
                 });
             }
             let blaze = match &entry.lint {
@@ -106,16 +115,18 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
                     let name = lint.strip_prefix("blaze::").unwrap_or(lint);
                     let found = blaze::Lint::ALL.iter().copied().find(|it| it.name() == name);
                     if found.is_none() {
-                        errors.push(format!("`lint` of `{}` is `{lint}`, which is no lint of blaze's", entry.path));
+                        errors.push(format!(
+                            "`lint` of `{}` is `{lint}`, which is no lint of blaze's",
+                            entry.path
+                        ));
                     }
                     found
                 }
             };
-            let replacement = entry
-                .replacement
-                .as_deref()
-                .filter(|it| is_path(it))
-                .and_then(|it| resolve(db, krate, it).into_iter().find(|it| of_kind(*it, kind)));
+            let replacement =
+                entry.replacement.as_deref().filter(|it| is_path(it)).and_then(|it| {
+                    resolve(db, krate, it).into_iter().find(|it| of_kind(*it, kind))
+                });
             let at = entries.len() as u32;
             for def in defs {
                 resolved.by_def.entry(def).or_insert(at);
@@ -139,7 +150,12 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             lint: Some(format!("blaze::{}", blaze::Lint::WallClock.name())),
             ..Disallowed::default()
         };
-        entries.push(Entry { kind: Kind::Methods, entry, blaze: Some(blaze::Lint::WallClock), replacement: None });
+        entries.push(Entry {
+            kind: Kind::Methods,
+            entry,
+            blaze: Some(blaze::Lint::WallClock),
+            replacement: None,
+        });
     }
     resolved.entries = entries.into_boxed_slice();
     resolved.errors = errors.into_boxed_slice();
@@ -159,7 +175,10 @@ fn of_kind(def: ModuleDef, kind: Kind) -> bool {
     match kind {
         Kind::Types => matches!(
             def,
-            ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::Trait(_) | ModuleDef::BuiltinType(_)
+            ModuleDef::Adt(_)
+                | ModuleDef::TypeAlias(_)
+                | ModuleDef::Trait(_)
+                | ModuleDef::BuiltinType(_)
         ),
         Kind::Methods => matches!(def, ModuleDef::Function(_)),
         Kind::Macros => matches!(def, ModuleDef::Macro(_)),
@@ -169,7 +188,10 @@ fn of_kind(def: ModuleDef, kind: Kind) -> bool {
 /// Whether `text` is a path, which a fix can write: `parking_lot::Mutex`, not
 /// `std::hash::BuildHasherDefault<FxHasher>`.
 fn is_path(text: &str) -> bool {
-    !text.is_empty() && text.split("::").all(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    !text.is_empty()
+        && text
+            .split("::")
+            .all(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
 }
 
 /// What `path` names from `krate`: its first segment `crate`, a dependency's name or the crate's
@@ -178,7 +200,9 @@ fn is_path(text: &str) -> bool {
 fn resolve(db: &base_db::Db, krate: hir::Crate, path: &str) -> Vec<ModuleDef> {
     let mut segments = path.split("::");
     let Some(first) = segments.next() else { return Vec::new() };
-    let root = if first == "crate" || krate.display_name(db).is_some_and(|it| it.crate_name().as_str() == first) {
+    let root = if first == "crate"
+        || krate.display_name(db).is_some_and(|it| it.crate_name().as_str() == first)
+    {
         Some(krate)
     } else {
         krate.dependencies_iter(db).find(|it| it.name.as_str() == first).map(|it| it.krate)
@@ -216,12 +240,18 @@ fn resolve(db: &base_db::Db, krate: hir::Crate, path: &str) -> Vec<ModuleDef> {
     current
 }
 
-fn assoc_named(db: &base_db::Db, items: Vec<hir::AssocItem>, name: &str) -> impl Iterator<Item = ModuleDef> {
-    items.into_iter().filter(move |it| it.name(db).is_some_and(|it| it.as_str() == name)).map(|it| match it {
-        hir::AssocItem::Function(it) => ModuleDef::Function(it),
-        hir::AssocItem::Const(it) => ModuleDef::Const(it),
-        hir::AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
-    })
+fn assoc_named(
+    db: &base_db::Db,
+    items: Vec<hir::AssocItem>,
+    name: &str,
+) -> impl Iterator<Item = ModuleDef> {
+    items.into_iter().filter(move |it| it.name(db).is_some_and(|it| it.as_str() == name)).map(
+        |it| match it {
+            hir::AssocItem::Function(it) => ModuleDef::Function(it),
+            hir::AssocItem::Const(it) => ModuleDef::Const(it),
+            hir::AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
+        },
+    )
 }
 
 /// The lint each list reports under.
@@ -248,7 +278,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     {
         return;
     }
-    if Kind::ALL.iter().all(|it| cx.conf().value(it.key()).is_none()) && !cx.on_blaze(blaze::Lint::WallClock) {
+    if Kind::ALL.iter().all(|it| cx.conf().value(it.key()).is_none())
+        && !cx.on_blaze(blaze::Lint::WallClock)
+    {
         return;
     }
     let resolved = cx.disallowed();
@@ -260,7 +292,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             let span = cx.span(TextRange::empty(TextSize::new(0)));
             let lint = Implemented::DisallowedTypes;
             if cx.on(lint) {
-                cx.lint(lint, node, span, format!("error reading Clippy's configuration file: {error}"));
+                cx.lint(
+                    lint,
+                    node,
+                    span,
+                    format!("error reading Clippy's configuration file: {error}"),
+                );
             }
         }
     }
@@ -294,7 +331,9 @@ fn check_derive<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, attr: ast::Attr<'t
             (Some(replacement), None) => Some(
                 written(cx, attr.syntax(), range)
                     .map(|it| vec![(it, replacement.clone())])
-                    .ok_or_else(|| "the derive is made by a macro: write it outside the macro".to_owned()),
+                    .ok_or_else(|| {
+                        "the derive is made by a macro: write it outside the macro".to_owned()
+                    }),
             ),
         };
         let Some(at) = written(cx, attr.syntax(), range) else { continue };
@@ -327,7 +366,12 @@ fn allowed<'t>(cx: &Cx<'_, 't>, entry: &Entry, node: ast::Node<'t>) -> bool {
     }
     let db = cx.db();
     let Some(module) = module_of(cx, node) else { return false };
-    let mut names: Vec<String> = module.path_to_root(db).iter().filter_map(|it| it.name(db)).map(|it| it.as_str().to_owned()).collect();
+    let mut names: Vec<String> = module
+        .path_to_root(db)
+        .iter()
+        .filter_map(|it| it.name(db))
+        .map(|it| it.as_str().to_owned())
+        .collect();
     names.reverse();
     let mut path = String::from("crate");
     let mut within = vec![path.clone()];
@@ -377,7 +421,13 @@ fn unfixable(cx: &Cx<'_, '_>, entry: &Entry) -> Option<String> {
 }
 
 /// The finding of `entry` at `at`, with its fix or the reason there is none.
-fn report<'t>(cx: &mut Cx<'_, 't>, entry: &Entry, at: ast::Node<'t>, message: String, fix: Option<Result<Vec<(TextRange, String)>, String>>) {
+fn report<'t>(
+    cx: &mut Cx<'_, 't>,
+    entry: &Entry,
+    at: ast::Node<'t>,
+    message: String,
+    fix: Option<Result<Vec<(TextRange, String)>, String>>,
+) {
     let Some(range) = cx.range(at) else { return };
     report_at(cx, entry, at, range, message, fix);
 }
@@ -392,7 +442,11 @@ fn report_at<'t>(
     fix: Option<Result<Vec<(TextRange, String)>, String>>,
 ) {
     let span = cx.span(range);
-    let fix = fix.map(|it| it.map(|parts| parts.into_iter().map(|(range, text)| (cx.span(range), text)).collect::<Vec<_>>()));
+    let fix = fix.map(|it| {
+        it.map(|parts| {
+            parts.into_iter().map(|(range, text)| (cx.span(range), text)).collect::<Vec<_>>()
+        })
+    });
     let reason = entry.entry.reason.clone();
     let diag = match entry.blaze {
         Some(lint) => cx.blaze(lint, at, span, message),
@@ -400,7 +454,11 @@ fn report_at<'t>(
     };
     match fix {
         Some(Ok(parts)) => {
-            diag.multipart_suggestion(reason.unwrap_or_else(|| "use".to_owned()), parts, Applicability::MachineApplicable);
+            diag.multipart_suggestion(
+                reason.unwrap_or_else(|| "use".to_owned()),
+                parts,
+                Applicability::MachineApplicable,
+            );
         }
         Some(Err(why)) => {
             if let Some(reason) = reason {
@@ -445,7 +503,12 @@ fn check_path<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>)
 /// A glob `use` of `module`, `path`, through which the scope of the `use` names a disallowed
 /// item: no path of the `use` names the item, so the finding of its rewrite is the glob's, under
 /// the first such item's entry. A body's walk sees only the body, never the file's `use`.
-fn check_glob<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>, module: hir::Module) {
+fn check_glob<'t>(
+    cx: &mut Cx<'_, 't>,
+    resolved: &Resolved,
+    path: ast::Path<'t>,
+    module: hir::Module,
+) {
     let Some(tree) = path.syntax().parent().and_then(ast::UseTree::cast) else { return };
     if tree.star_token().is_none() || cx.analysis().is_some() {
         return;
@@ -459,7 +522,10 @@ fn check_glob<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>,
     let named = module.scope(cx.db(), None).into_iter().find_map(|(name, def)| {
         let hir::ScopeDef::ModuleDef(def) = def else { return None };
         let entry = resolved.of(def)?;
-        (on(cx, entry) && !allowed(cx, entry, path.syntax()) && retarget.names(scope, name.as_str(), def)).then_some(entry)
+        (on(cx, entry)
+            && !allowed(cx, entry, path.syntax())
+            && retarget.names(scope, name.as_str(), def))
+        .then_some(entry)
     });
     let Some(entry) = named else { return };
     let fix = match (&entry.entry.replacement, unfixable(cx, entry)) {
@@ -473,13 +539,20 @@ fn check_glob<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>,
 /// The fix of a path naming a disallowed item whose replacement is `replacement`: the `use` it
 /// is in, retargeted whole; a qualified path, rewritten; a bare name, the `use` of the file
 /// that brings it, retargeted.
-fn path_fix<'t>(cx: &Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>, replacement: &str) -> Result<Vec<(TextRange, String)>, String> {
+fn path_fix<'t>(
+    cx: &Cx<'_, 't>,
+    resolved: &Resolved,
+    path: ast::Path<'t>,
+    replacement: &str,
+) -> Result<Vec<(TextRange, String)>, String> {
     if let Some(item) = path.syntax().ancestors().find_map(ast::Use::cast) {
-        return use_fix(cx, resolved, item)?.ok_or_else(|| "the `use` resolves to nothing the fix moves".to_owned());
+        return use_fix(cx, resolved, item)?
+            .ok_or_else(|| "the `use` resolves to nothing the fix moves".to_owned());
     }
     let name = path.segment().and_then(|it| it.name_ref()).ok_or("the path names no item")?;
     if path.qualifier().is_some() {
-        let range = TextRange::new(path.syntax().text_range().start(), name.syntax().text_range().end());
+        let range =
+            TextRange::new(path.syntax().text_range().start(), name.syntax().text_range().end());
         return written(cx, path.syntax(), range)
             .map(|range| vec![(range, replacement.to_owned())])
             .ok_or_else(|| "the path is made by a macro: write it outside the macro".to_owned());
@@ -489,7 +562,10 @@ fn path_fix<'t>(cx: &Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>, repla
             return Ok(fix);
         }
     }
-    Err(format!("`{}` is brought in by an import outside this item: the fix is made at that import", name.text()))
+    Err(format!(
+        "`{}` is brought in by an import outside this item: the fix is made at that import",
+        name.text()
+    ))
 }
 
 /// The `use` items of the scopes around `node`, innermost first, that may bring `name`: one
@@ -497,7 +573,10 @@ fn path_fix<'t>(cx: &Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>, repla
 fn uses_in_scope<'t>(node: ast::Node<'t>, name: &str) -> Vec<ast::Use<'t>> {
     let mut found = Vec::new();
     for scope in node.ancestors() {
-        if !matches!(scope.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::STMT_LIST) {
+        if !matches!(
+            scope.kind(),
+            SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::STMT_LIST
+        ) {
             continue;
         }
         for item in scope.children().filter_map(ast::Use::cast) {
@@ -505,8 +584,14 @@ fn uses_in_scope<'t>(node: ast::Node<'t>, name: &str) -> Vec<ast::Use<'t>> {
                 tree.star_token().is_some()
                     || match tree.rename().and_then(|it| it.name()) {
                         Some(alias) => alias.text() == name,
-                        None => tree.use_tree_list().is_none()
-                            && tree.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()).is_some_and(|it| it.text() == name),
+                        None => {
+                            tree.use_tree_list().is_none()
+                                && tree
+                                    .path()
+                                    .and_then(|it| it.segment())
+                                    .and_then(|it| it.name_ref())
+                                    .is_some_and(|it| it.text() == name)
+                        }
                     }
             });
             if brings {
@@ -530,7 +615,11 @@ fn written<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, range: TextRange) -> Option
 
 /// The rewrite of `item` moving every item it imports whose entry has a fix; `None` when it
 /// imports none.
-fn use_fix<'t>(cx: &Cx<'_, 't>, resolved: &Resolved, item: ast::Use<'t>) -> Result<Option<Vec<(TextRange, String)>>, String> {
+fn use_fix<'t>(
+    cx: &Cx<'_, 't>,
+    resolved: &Resolved,
+    item: ast::Use<'t>,
+) -> Result<Option<Vec<(TextRange, String)>>, String> {
     if !cx.in_file() {
         return Err("the `use` is made by a macro: write it outside the macro".to_owned());
     }
@@ -565,20 +654,26 @@ fn check_method_call<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, call: ast::Me
     let Some(f) = cx.method(call) else { return };
     if let Some(entry) = resolved.of(ModuleDef::Function(f)) {
         if on(cx, entry) && !allowed(cx, entry, call.syntax()) {
-            let fix = entry.entry.replacement.as_ref().map(|it| {
-                Err(format!("a method call: write it as a call of `{it}`"))
-            });
+            let fix = entry
+                .entry
+                .replacement
+                .as_ref()
+                .map(|it| Err(format!("a method call: write it as a call of `{it}`")));
             report(cx, entry, call.syntax(), message(entry), fix);
         }
         return;
     }
     let db = cx.db();
-    let Some(hir::AssocItemContainer::Impl(impl_)) = hir::AsAssocItem::as_assoc_item(f, db).map(|it| it.container(db)) else {
+    let Some(hir::AssocItemContainer::Impl(impl_)) =
+        hir::AsAssocItem::as_assoc_item(f, db).map(|it| it.container(db))
+    else {
         return;
     };
     let Some(adt) = impl_.self_ty(db).as_adt() else { return };
     let Some(entry) = resolved.of(ModuleDef::Adt(adt)) else { return };
-    let ported = LOCKS.iter().any(|&(from, to)| entry.entry.path == from && entry.entry.replacement.as_deref() == Some(to));
+    let ported = LOCKS.iter().any(|&(from, to)| {
+        entry.entry.path == from && entry.entry.replacement.as_deref() == Some(to)
+    });
     if !ported || !on(cx, entry) || allowed(cx, entry, call.syntax()) {
         return;
     }
@@ -591,7 +686,9 @@ fn lock_call<'t>(cx: &mut Cx<'_, 't>, entry: &Entry, call: ast::MethodCallExpr<'
     let Some(name) = call.name_ref() else { return };
     let name = name.text();
     let condvar = matches!(name, "wait" | "wait_while" | "wait_timeout" | "wait_timeout_while");
-    let poisoning = POISONING.contains(&name) || TRYING.contains(&name) || matches!(name, "is_poisoned" | "clear_poison");
+    let poisoning = POISONING.contains(&name)
+        || TRYING.contains(&name)
+        || matches!(name, "is_poisoned" | "clear_poison");
     if !condvar && !poisoning {
         return;
     }
@@ -609,28 +706,44 @@ fn lock_call<'t>(cx: &mut Cx<'_, 't>, entry: &Entry, call: ast::MethodCallExpr<'
     }
     if TRYING.contains(&name) {
         if unwrapped.is_none() {
-            let message = format!("the `TryLockResult` of `{}::{name}`, which `{to}` returns as an `Option`", entry.entry.path);
+            let message = format!(
+                "the `TryLockResult` of `{}::{name}`, which `{to}` returns as an `Option`",
+                entry.entry.path
+            );
             report(cx, entry, call.syntax(), message, Some(Err("port it by hand".to_owned())));
         }
         return;
     }
     if condvar {
         let fix = wait_fix(cx, call, name, unwrapped);
-        let message = format!("`{}::{name}` takes the guard and hands it back; `{to}` borrows it", entry.entry.path);
+        let message = format!(
+            "`{}::{name}` takes the guard and hands it back; `{to}` borrows it",
+            entry.entry.path
+        );
         report(cx, entry, call.syntax(), message, Some(fix));
         return;
     }
     match unwrapped {
         Some(unwrap) if POISONING.contains(&name) => {
-            let range = TextRange::new(call.syntax().text_range().end(), unwrap.syntax().text_range().end());
-            let fix = written(cx, unwrap.syntax(), range)
-                .map(|it| vec![(it, String::new())])
-                .ok_or_else(|| "the call is made by a macro: write it outside the macro".to_owned());
-            let message = format!("the `LockResult` of `{}::{name}`: `{to}` never poisons, and returns what it holds", entry.entry.path);
+            let range = TextRange::new(
+                call.syntax().text_range().end(),
+                unwrap.syntax().text_range().end(),
+            );
+            let fix =
+                written(cx, unwrap.syntax(), range).map(|it| vec![(it, String::new())]).ok_or_else(
+                    || "the call is made by a macro: write it outside the macro".to_owned(),
+                );
+            let message = format!(
+                "the `LockResult` of `{}::{name}`: `{to}` never poisons, and returns what it holds",
+                entry.entry.path
+            );
             report(cx, entry, unwrap.syntax(), message, Some(fix));
         }
         _ => {
-            let message = format!("the poisoning result of `{}::{name}` is used other than unwrapped", entry.entry.path);
+            let message = format!(
+                "the poisoning result of `{}::{name}` is used other than unwrapped",
+                entry.entry.path
+            );
             report(cx, entry, call.syntax(), message, Some(Err("port it by hand".to_owned())));
         }
     }
@@ -644,7 +757,9 @@ fn wait_fix<'t>(
     name: &str,
     unwrapped: Option<ast::MethodCallExpr<'t>>,
 ) -> Result<Vec<(TextRange, String)>, String> {
-    let by_hand = || "port it by hand: only `g = cv.wait(g).unwrap()` and `wait_while` are rewritten".to_owned();
+    let by_hand = || {
+        "port it by hand: only `g = cv.wait(g).unwrap()` and `wait_while` are rewritten".to_owned()
+    };
     if !matches!(name, "wait" | "wait_while") {
         return Err(by_hand());
     }
@@ -658,8 +773,11 @@ fn wait_fix<'t>(
         return Err(by_hand());
     }
     let receiver = call.receiver().ok_or_else(by_hand)?;
-    let args: Vec<ast::Expr<'t>> = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
-    let (Some(guard), rest) = (args.first(), args.get(1..).unwrap_or_default()) else { return Err(by_hand()) };
+    let args: Vec<ast::Expr<'t>> =
+        call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
+    let (Some(guard), rest) = (args.first(), args.get(1..).unwrap_or_default()) else {
+        return Err(by_hand());
+    };
     if !matches!(guard, ast::Expr::PathExpr(_)) || guard.syntax().text() != lhs.syntax().text() {
         return Err(by_hand());
     }

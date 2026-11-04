@@ -195,7 +195,8 @@ impl State {
             quiesces: config.quiesces,
         };
         let threads = [thread(0), thread(1), thread(2)];
-        let alive = threads.iter().filter(|it| it.pc == Pc::Top).fold(0, |set, it| set | bit(it.tid));
+        let alive =
+            threads.iter().filter(|it| it.pc == Pc::Top).fold(0, |set, it| set | bit(it.tid));
         State {
             new: false,
             epoch: 1,
@@ -363,7 +364,8 @@ fn thread_steps(state: &State, index: usize, config: &Config, out: &mut Vec<Stat
             let k = k as usize;
             if k == config.slots {
                 at(&mut next, index).pc = Pc::QFree(0);
-            } else if state.slots[k].state == SlotState::Online && state.slots[k].tid == thread.tid {
+            } else if state.slots[k].state == SlotState::Online && state.slots[k].tid == thread.tid
+            {
                 next.slots[k].state = SlotState::Claiming;
                 at(&mut next, index).pc = Pc::QAdoptSeen(k as u8);
             } else {
@@ -436,7 +438,8 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
         Dpc::Unlink => {
             next.new = true;
             next.daemon.unlinked = true;
-            next.daemon.pc = if config.mutation == Mutation::EarlyStart { Dpc::Births } else { Dpc::Post };
+            next.daemon.pc =
+                if config.mutation == Mutation::EarlyStart { Dpc::Births } else { Dpc::Post };
         }
         Dpc::Post => {
             next.grace = state.epoch;
@@ -444,7 +447,8 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
         }
         Dpc::Start => {
             next.epoch = state.epoch + 1;
-            next.daemon.pc = if config.mutation == Mutation::EarlyStart { Dpc::Unlink } else { Dpc::Births };
+            next.daemon.pc =
+                if config.mutation == Mutation::EarlyStart { Dpc::Unlink } else { Dpc::Births };
         }
         Dpc::Births => {
             next.daemon.births = state.births;
@@ -526,7 +530,9 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
             if index == config.slots {
                 next.daemon.pc = Dpc::Decide;
             } else {
-                if state.daemon.dead & (1 << k) != 0 && state.slots[index].state == SlotState::Online {
+                if state.daemon.dead & (1 << k) != 0
+                    && state.slots[index].state == SlotState::Online
+                {
                     next.slots[index].state = SlotState::Free;
                 }
                 next.daemon.pc = Dpc::Reap(k + 1);
@@ -586,7 +592,10 @@ fn canonical(mut state: State, config: &Config) -> State {
                 calls: 0,
                 quiesces: 0,
             };
-        } else if matches!(thread.pc, Pc::Unborn | Pc::Top | Pc::Called | Pc::Inside | Pc::XRelease | Pc::XGone) {
+        } else if matches!(
+            thread.pc,
+            Pc::Unborn | Pc::Top | Pc::Called | Pc::Inside | Pc::XRelease | Pc::XGone
+        ) {
             if thread.pc == Pc::Called {
                 thread.in_range = thread.old;
                 thread.old = false;
@@ -613,7 +622,11 @@ fn canonical(mut state: State, config: &Config) -> State {
     for (to, &from) in order[..live].iter().enumerate() {
         rename[from + 1] = to as u8 + 1;
     }
-    let set = |bits: u8| (1..=live).filter(|&tid| bits & bit(tid as u8) != 0).fold(0, |out, tid| out | bit(rename[tid]));
+    let set = |bits: u8| {
+        (1..=live)
+            .filter(|&tid| bits & bit(tid as u8) != 0)
+            .fold(0, |out, tid| out | bit(rename[tid]))
+    };
     let mut out = state;
     for (to, &from) in order[..live].iter().enumerate() {
         out.threads[to] = Thread { tid: to as u8 + 1, ..state.threads[from] };
@@ -729,7 +742,8 @@ impl Bits {
     }
 }
 
-const _: () = assert!(MOST_SLOTS == 3 && MOST_THREADS == 3, "the codes below list three slots and threads");
+const _: () =
+    assert!(MOST_SLOTS == 3 && MOST_THREADS == 3, "the codes below list three slots and threads");
 
 /// Every [`Pc`], at its code.
 const PCS: [Pc; 36] = [
@@ -1040,7 +1054,10 @@ fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
     let freed_while_running = states
         .iter()
         .map(|&it| unpack(it))
-        .filter(|it| it.daemon.pc == Dpc::Done && it.threads.iter().any(|t| !matches!(t.pc, Pc::Unborn | Pc::Dead)))
+        .filter(|it| {
+            it.daemon.pc == Dpc::Done
+                && it.threads.iter().any(|t| !matches!(t.pc, Pc::Unborn | Pc::Dead))
+        })
         .count();
     Ok(Explored { states: count, freed_while_running })
 }
@@ -1060,7 +1077,10 @@ const BASE: Config = Config {
 fn check(config: Config) {
     let explored = explore(config).unwrap_or_else(|it| panic!("{it}"));
     assert!(explored.states > 1000, "{config:?}: only {} states", explored.states);
-    assert!(explored.freed_while_running > 0, "{config:?}: the range is never freed while a thread runs");
+    assert!(
+        explored.freed_while_running > 0,
+        "{config:?}: the range is never freed while a thread runs"
+    );
 }
 
 #[test]
@@ -1103,10 +1123,19 @@ fn more_threads_than_slots() {
 
 #[test]
 fn a_thread_dies_holding_its_slot_and_its_id_comes_back() {
-    check(Config { spawn: true, reuse: true, abrupt: true, slots: 2, calls: 1, quiesces: 1, ..BASE });
+    check(Config {
+        spawn: true,
+        reuse: true,
+        abrupt: true,
+        slots: 2,
+        calls: 1,
+        quiesces: 1,
+        ..BASE
+    });
 }
 
-const THREE_THREADS_TWO_SLOTS: Config = Config { threads: 3, slots: 2, calls: 1, quiesces: 1, ..BASE };
+const THREE_THREADS_TWO_SLOTS: Config =
+    Config { threads: 3, slots: 2, calls: 1, quiesces: 1, ..BASE };
 
 #[test]
 fn three_threads_two_slots() {
@@ -1117,8 +1146,12 @@ fn three_threads_two_slots() {
 #[test]
 #[ignore = "a measurement: unbounded memory and time, run in a VM"]
 fn three_threads_two_slots_unbounded() {
-    let explored = explore_within(THREE_THREADS_TWO_SLOTS, u32::MAX as usize - 1).unwrap_or_else(|it| panic!("{it}"));
-    println!("{} states, {} freed while a thread runs", explored.states, explored.freed_while_running);
+    let explored = explore_within(THREE_THREADS_TWO_SLOTS, u32::MAX as usize - 1)
+        .unwrap_or_else(|it| panic!("{it}"));
+    println!(
+        "{} states, {} freed while a thread runs",
+        explored.states, explored.freed_while_running
+    );
 }
 
 fn caught(mutation: Mutation) {

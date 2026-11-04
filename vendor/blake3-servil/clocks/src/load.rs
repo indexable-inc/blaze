@@ -110,7 +110,10 @@ impl Reading {
 fn between(from: Reading, to: Reading) -> Window {
     assert!(to.at_ns > from.at_ns, "a window lasts some time");
     let (busy_ns, steal_ns) = imp::busy_and_steal_ns(from.machine, to.machine);
-    let milli = |ns: u64| u64::try_from(u128::from(ns) * 1000 / u128::from(to.at_ns - from.at_ns)).expect("load fits in u64");
+    let milli = |ns: u64| {
+        u64::try_from(u128::from(ns) * 1000 / u128::from(to.at_ns - from.at_ns))
+            .expect("load fits in u64")
+    };
     // Tick rounding can put the machine's busy time a little under this
     // process's own; that reads as none.
     Window {
@@ -128,7 +131,8 @@ struct State {
     windows: Vec<Window>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { last: None, last_start: None, windows: Vec::new() });
+static STATE: Mutex<State> =
+    Mutex::new(State { last: None, last_start: None, windows: Vec::new() });
 /// The [`now_ns`] at which the next tick reads the machine; u64::MAX where
 /// the platform gives no CPU times.
 static DUE_NS: AtomicU64 = AtomicU64::new(0);
@@ -155,7 +159,10 @@ fn close(state: &mut State, least_ns: u64) {
 /// Add a window, reporting it on stderr when busy.
 fn push(state: &mut State, window: Window) {
     if window.busy() {
-        eprintln!("clocks: {}; measurements in that time may read slower than this machine runs", describe_window(&window));
+        eprintln!(
+            "clocks: {}; measurements in that time may read slower than this machine runs",
+            describe_window(&window)
+        );
     }
     state.windows.push(window);
 }
@@ -249,8 +256,12 @@ fn seconds(ns: u64) -> String {
 /// "other programs kept 1.40 CPUs busy from 12.0 s to 13.0 s" (with the
 /// hypervisor's share where it took any).
 pub fn describe_window(window: &Window) -> String {
-    let mut line =
-        format!("other programs kept {} CPUs busy from {} s to {} s", cpus(window.other_milli_cpus), seconds(window.start_ns), seconds(window.end_ns));
+    let mut line = format!(
+        "other programs kept {} CPUs busy from {} s to {} s",
+        cpus(window.other_milli_cpus),
+        seconds(window.start_ns),
+        seconds(window.end_ns)
+    );
     if window.steal_milli_cpus > 0 {
         line += &format!(", the hypervisor withheld {} CPUs", cpus(window.steal_milli_cpus));
     }
@@ -276,7 +287,8 @@ pub fn describe(windows: &[Window]) -> String {
     };
     let span = windows.last().unwrap().end_ns - first.start_ns;
     let weighted = |pick: fn(&Window) -> u64| {
-        let sum: u128 = windows.iter().map(|w| u128::from(pick(w)) * u128::from(w.end_ns - w.start_ns)).sum();
+        let sum: u128 =
+            windows.iter().map(|w| u128::from(pick(w)) * u128::from(w.end_ns - w.start_ns)).sum();
         u64::try_from((sum + u128::from(span) / 2) / u128::from(span)).expect("load fits in u64")
     };
     let busy: Vec<&Window> = windows.iter().filter(|w| w.busy()).collect();
@@ -288,11 +300,19 @@ pub fn describe(windows: &[Window]) -> String {
     );
     let steal = windows.iter().map(|w| w.steal_milli_cpus).max().unwrap();
     if steal > 0 {
-        line += &format!("; the hypervisor withheld {} CPUs on average, {} at most", cpus(weighted(|w| w.steal_milli_cpus)), cpus(steal));
+        line += &format!(
+            "; the hypervisor withheld {} CPUs on average, {} at most",
+            cpus(weighted(|w| w.steal_milli_cpus)),
+            cpus(steal)
+        );
     }
     if !busy.is_empty() {
-        let list: Vec<String> = busy.iter().map(|w| format!("{}-{} s", seconds(w.start_ns), seconds(w.end_ns))).collect();
-        line += &format!("; busy in {} of {} windows ({})", busy.len(), windows.len(), list.join(", "));
+        let list: Vec<String> = busy
+            .iter()
+            .map(|w| format!("{}-{} s", seconds(w.start_ns), seconds(w.end_ns)))
+            .collect();
+        line +=
+            &format!("; busy in {} of {} windows ({})", busy.len(), windows.len(), list.join(", "));
     }
     line
 }
@@ -318,11 +338,19 @@ mod imp {
 
     pub fn read() -> Option<CpuTimes> {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        let fields: Vec<u64> =
-            stat.lines().next()?.strip_prefix("cpu ")?.split_whitespace().map(|field| field.parse().expect("/proc/stat counts are integers")).collect();
+        let fields: Vec<u64> = stat
+            .lines()
+            .next()?
+            .strip_prefix("cpu ")?
+            .split_whitespace()
+            .map(|field| field.parse().expect("/proc/stat counts are integers"))
+            .collect();
         // user nice system idle iowait irq softirq steal (guest time is inside user).
         assert!(fields.len() >= 8, "/proc/stat's cpu line has at least eight fields");
-        Some(CpuTimes { busy: fields[0] + fields[1] + fields[2] + fields[5] + fields[6], steal: fields[7] })
+        Some(CpuTimes {
+            busy: fields[0] + fields[1] + fields[2] + fields[5] + fields[6],
+            steal: fields[7],
+        })
     }
 
     pub fn busy_and_steal_ns(from: CpuTimes, to: CpuTimes) -> (u64, u64) {
@@ -376,9 +404,14 @@ mod tests {
             "not measured on this platform"
         };
         assert_eq!(describe(&[]), none);
-        let quiet = [window(0, 1_000_000_000, 100, 0), window(1_000_000_000, 4_000_000_000, 500, 0)];
-        assert_eq!(describe(&quiet), "quiet: other programs kept 0.40 CPUs busy on average, 0.50 in the busiest window");
-        let busy = [window(0, 1_000_000_000, 1400, 0), window(1_000_000_000, 2_000_000_000, 200, 300)];
+        let quiet =
+            [window(0, 1_000_000_000, 100, 0), window(1_000_000_000, 4_000_000_000, 500, 0)];
+        assert_eq!(
+            describe(&quiet),
+            "quiet: other programs kept 0.40 CPUs busy on average, 0.50 in the busiest window"
+        );
+        let busy =
+            [window(0, 1_000_000_000, 1400, 0), window(1_000_000_000, 2_000_000_000, 200, 300)];
         assert_eq!(
             describe(&busy),
             "busy: other programs kept 0.80 CPUs busy on average, 1.40 in the busiest window; \
@@ -390,8 +423,13 @@ mod tests {
     fn tail_fixture(busy: u64, steal: u64, tail_busy: u64, tail_steal: u64) -> State {
         let start = Reading { at_ns: 0, machine: imp::CpuTimes { busy: 0, steal: 0 }, own_ns: 0 };
         let last = Reading { at_ns: WINDOW_NS, machine: imp::CpuTimes { busy, steal }, own_ns: 0 };
-        let mut state = State { last: Some(last), last_start: None, windows: vec![between(start, last)] };
-        let tail = Reading { at_ns: WINDOW_NS + 400_000_000, machine: imp::CpuTimes { busy: tail_busy, steal: tail_steal }, own_ns: 0 };
+        let mut state =
+            State { last: Some(last), last_start: None, windows: vec![between(start, last)] };
+        let tail = Reading {
+            at_ns: WINDOW_NS + 400_000_000,
+            machine: imp::CpuTimes { busy: tail_busy, steal: tail_steal },
+            own_ns: 0,
+        };
         join_tail(&mut state, start, tail);
         state
     }
@@ -400,7 +438,10 @@ mod tests {
     #[test]
     fn quiet_tail_preserves_observed_other_load() {
         let state = tail_fixture(110, 0, 110, 0); // 1.10 CPUs, then no other work.
-        assert!(state.windows.iter().any(Window::busy), "a quiet tail preserves the prior busy finding");
+        assert!(
+            state.windows.iter().any(Window::busy),
+            "a quiet tail preserves the prior busy finding"
+        );
         assert!(describe(&state.windows).starts_with("busy:"));
     }
 
@@ -408,7 +449,10 @@ mod tests {
     #[test]
     fn quiet_tail_preserves_observed_steal() {
         let state = tail_fixture(0, 110, 0, 110);
-        assert!(state.windows.iter().any(Window::busy), "a quiet tail preserves the prior steal finding");
+        assert!(
+            state.windows.iter().any(Window::busy),
+            "a quiet tail preserves the prior steal finding"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -442,16 +486,26 @@ mod tests {
         for pair in windows.windows(2) {
             assert_eq!(pair[0].end_ns, pair[1].start_ns, "windows follow one another");
         }
-        assert!(windows.iter().all(|w| w.end_ns - w.start_ns >= WINDOW_NS / 2), "each window lasts half a window or more");
+        assert!(
+            windows.iter().all(|w| w.end_ns - w.start_ns >= WINDOW_NS / 2),
+            "each window lasts half a window or more"
+        );
         // The tail under half a window joined the last window: it reaches the call.
         let last = *windows.last().unwrap();
-        assert!(last.busy() || last.end_ns >= ended, "the tail is covered or the last busy finding is preserved");
+        assert!(
+            last.busy() || last.end_ns >= ended,
+            "the tail is covered or the last busy finding is preserved"
+        );
         // Once: a later call joins nothing more to it.
         let tail = now_ns();
         while now_ns() - tail < WINDOW_NS / 10 {
             crate::busy_work(10_000_000);
         }
-        assert_eq!(super::windows().last().copied(), Some(last), "a second call joins nothing more");
+        assert_eq!(
+            super::windows().last().copied(),
+            Some(last),
+            "a second call joins nothing more"
+        );
     }
 }
 

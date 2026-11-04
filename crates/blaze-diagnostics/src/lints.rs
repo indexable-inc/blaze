@@ -19,24 +19,20 @@ mod names;
 pub mod registry;
 pub(crate) mod syntax;
 
+pub use self::syntax::CheckCfg;
+pub use levels::{CommandLine, Level, LintOptions};
 pub(crate) use levels::{LevelMap, may_fire};
 pub(crate) use names::{Effective, EffectiveDef, ItemWalk, def_span};
-pub use levels::{CommandLine, Level, LintOptions};
-pub use self::syntax::CheckCfg;
 
-use blaze_items::{Fact, ItemId};
-use hir::InFile;
-use hir_def::{AdtId, ModuleDefId};
 use ::syntax::{
     SyntaxNodePtr,
     view::{self as ast, AstNode as _, HasName},
 };
+use blaze_items::{Fact, ItemId};
+use hir::InFile;
+use hir_def::{AdtId, ModuleDefId};
 
-use crate::{
-    cx::Cx,
-    lower::Found,
-    model::Diag,
-};
+use crate::{cx::Cx, lower::Found, model::Diag};
 
 /// The lints rustc gives whether or not anything before them failed: its early lint pass on
 /// the AST (`unused_parens`, ..), name resolution's (`unused_imports`, ..), the attribute and
@@ -92,7 +88,10 @@ pub(crate) fn body_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(I
             if let Some(it) = ast::Const::cast(ancestor) {
                 let def = cx.vsema.to_def2(node.with_value(it))?;
                 // alloc: the name of an unnamed const, as above
-                return Some((ItemId::Const(def.into()), name(it).unwrap_or_else(|| "_".to_owned())));
+                return Some((
+                    ItemId::Const(def.into()),
+                    name(it).unwrap_or_else(|| "_".to_owned()),
+                ));
             }
             if let Some(it) = ast::Static::cast(ancestor) {
                 let def = cx.vsema.to_def2(node.with_value(it))?;
@@ -148,7 +147,11 @@ pub(crate) fn quiet_crate(fns: usize) -> String {
 
     let mut text = String::from("//- /lib.rs crate:main edition:2021\n//! A crate.\n");
     for at in 0..fns {
-        writeln!(text, "/// Adds {at}.\npub fn add_{at}(x: u32) -> u32 {{\n    x.wrapping_add({at})\n}}").unwrap();
+        writeln!(
+            text,
+            "/// Adds {at}.\npub fn add_{at}(x: u32) -> u32 {{\n    x.wrapping_add({at})\n}}"
+        )
+        .unwrap();
     }
     text
 }

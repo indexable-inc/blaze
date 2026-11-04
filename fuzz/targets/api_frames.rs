@@ -87,7 +87,11 @@ fn cut(data: &[u8], sizes: &[usize]) -> (Vec<Vec<u8>>, Left) {
         if let Some(error) = drain(&mut frames, &mut items) {
             frames.push(&data[at..]);
             frames.push(&[0, 0, 0, 0]);
-            assert_eq!(frames.next(), Err(error.clone()), "a broken cutter stays broken past a push");
+            assert_eq!(
+                frames.next(),
+                Err(error.clone()),
+                "a broken cutter stays broken past a push"
+            );
             return (items, Left::Broken(error));
         }
     }
@@ -114,7 +118,11 @@ fn check_case(data: &[u8], case: usize) {
         }
         (items, error)
     });
-    assert!(most <= blaze_fuzz::allowed(data.len()), "cutting {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "cutting {} bytes asked for {most} at once",
+        data.len()
+    );
     assert_eq!(items, expected, "the items are the frames there are");
     assert_eq!(error.map_or(Left::Waiting, Left::Broken), left, "the cutter ends as the bytes do");
 
@@ -128,7 +136,8 @@ fn check_case(data: &[u8], case: usize) {
 fn seeds() -> Vec<Vec<u8>> {
     use blaze_api::{Envelope, Request, frames};
     let mut stream = Vec::new();
-    for (id, request) in [(1, Request::Status), (2, Request::Cancel { id: 1 }), (3, Request::Stop)] {
+    for (id, request) in [(1, Request::Status), (2, Request::Cancel { id: 1 }), (3, Request::Stop)]
+    {
         stream.extend(frames::encode(&Envelope::new(id, request)).expect("a request has a frame"));
     }
     let mut torn = stream.clone();

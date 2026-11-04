@@ -32,9 +32,7 @@ pub fn selected_crate_var(crate_name: &str) -> String {
 // Note that because we need to transmit the options to the charon driver,
 // we store them in a file before calling this driver (hence the `Serialize`,
 // `Deserialize` options).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[derive(clap::Args)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, clap::Args, Serialize, Deserialize)]
 #[clap(name = "Charon")]
 #[cfg_attr(feature = "charon_on_charon", charon::rename("cli_options"))]
 pub struct CliOpts {
@@ -411,9 +409,7 @@ pub struct CliOpts {
 
 /// The MIR stage to use. This is only relevant for the current crate: for dependencies, only mir
 /// optimized is available (or mir elaborated for consts).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize)]
 pub enum MirLevel {
     /// The MIR just after MIR lowering.
     Built,
@@ -429,9 +425,7 @@ pub enum MirLevel {
 
 /// Presets to make it easier to tweak options without breaking dependent projects. Eventually we
 /// should define semantically-meaningful presets instead of project-specific ones.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Preset {
     /// The default translation used before May 2025. After that, many passes were made optional
@@ -449,9 +443,9 @@ pub enum Preset {
 }
 
 /// How to handle constants and statics.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize,
+)]
 pub enum ConstHandling {
     /// Keep consts as calls to their initializer with `ConstantExprKind::Call`, without attempting
     /// to do any const-evaluation. This is the default.
@@ -465,9 +459,9 @@ pub enum ConstHandling {
     Bytes,
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize,
+)]
 pub enum MonomorphizeMut {
     /// Monomorphize any item instantiated with `&mut`.
     #[default]
@@ -476,9 +470,7 @@ pub enum MonomorphizeMut {
     ExceptTypes,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum SerializationFormatArg {
     Json,
     Postcard,
@@ -488,9 +480,9 @@ pub enum SerializationFormatArg {
     All,
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(ValueEnum)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize,
+)]
 pub enum SerializationFormat {
     #[default]
     Json,
@@ -630,10 +622,8 @@ impl CliOpts {
                     self.duplicate_defaulted_methods = true;
                     self.deallocate_all_locals = true;
                     self.rustc_args.push("--edition=2021".to_owned());
-                    self.rustc_args
-                        .push("-Zcrate-attr=feature(register_tool)".to_owned());
-                    self.rustc_args
-                        .push("-Zcrate-attr=register_tool(charon)".to_owned());
+                    self.rustc_args.push("-Zcrate-attr=feature(register_tool)".to_owned());
+                    self.rustc_args.push("-Zcrate-attr=register_tool(charon)".to_owned());
                     self.exclude.push("core::fmt".to_owned());
                     if self.extract_opaque_bodies {
                         self.exclude
@@ -652,11 +642,7 @@ impl CliOpts {
             self.treat_box_as_builtin = true;
             self.extract_opaque_bodies = true;
             self.consts = Some(ConstHandling::Bytes);
-            self.mir = Some(
-                self.mir
-                    .unwrap_or(MirLevel::Elaborated)
-                    .max(MirLevel::Elaborated),
-            );
+            self.mir = Some(self.mir.unwrap_or(MirLevel::Elaborated).max(MirLevel::Elaborated));
         }
     }
 
@@ -881,20 +867,14 @@ impl TranslateOptions {
             .start_from
             .iter()
             .filter_map(|path| parse_pattern(path).ok())
-            .map(|p| StartFrom::Pattern {
-                pattern: p,
-                strict: true,
-            })
+            .map(|p| StartFrom::Pattern { pattern: p, strict: true })
             .collect_vec();
         start_from.extend(
             options
                 .start_from_if_exists
                 .iter()
                 .filter_map(|path| parse_pattern(path).ok())
-                .map(|p| StartFrom::Pattern {
-                    pattern: p,
-                    strict: false,
-                }),
+                .map(|p| StartFrom::Pattern { pattern: p, strict: false }),
         );
         for attr in options.start_from_attribute.iter().cloned() {
             start_from.push(StartFrom::Attribute(attr));
@@ -986,11 +966,8 @@ impl TranslateOptions {
                 .collect()
         };
 
-        let lift_associated_types = options
-            .lift_associated_types
-            .iter()
-            .filter_map(|s| parse_pattern(s).ok())
-            .collect();
+        let lift_associated_types =
+            options.lift_associated_types.iter().filter_map(|s| parse_pattern(s).ok()).collect();
 
         TranslateOptions {
             start_from,
@@ -1048,12 +1025,8 @@ impl TranslateOptions {
         // Find the most precise pattern that matches this name. There is always one since
         // the list contains the `_` pattern. If there are conflicting settings for this item, we
         // err on the side of being more opaque.
-        let (_, opacity) = self
-            .item_opacities
-            .iter()
-            .filter(|(pat, _)| pat.matches(krate, name))
-            .max()
-            .unwrap();
+        let (_, opacity) =
+            self.item_opacities.iter().filter(|(pat, _)| pat.matches(krate, name)).max().unwrap();
         *opacity
     }
 }

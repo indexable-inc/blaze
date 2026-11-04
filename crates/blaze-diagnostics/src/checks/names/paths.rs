@@ -16,7 +16,10 @@ use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
     SyntaxKind, TextRange,
-    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    view::{
+        self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _,
+    },
 };
 
 use super::{
@@ -47,7 +50,9 @@ impl Source {
             return Source::Trait;
         }
         if ast::Impl::can_cast(parent.kind()) {
-            let is_trait = ast::Impl::cast(parent).and_then(|imp| imp.trait_()).is_some_and(|it| it.syntax() == ty.syntax());
+            let is_trait = ast::Impl::cast(parent)
+                .and_then(|imp| imp.trait_())
+                .is_some_and(|it| it.syntax() == ty.syntax());
             return if is_trait { Source::Trait } else { Source::Type };
         }
         // `<T as Trait>`: the type after `as` is the trait.
@@ -74,7 +79,10 @@ impl Source {
             Source::Type => matches!(
                 res,
                 PathResolution::Def(
-                    ModuleDef::Adt(_) | ModuleDef::Trait(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_)
+                    ModuleDef::Adt(_)
+                        | ModuleDef::Trait(_)
+                        | ModuleDef::TypeAlias(_)
+                        | ModuleDef::BuiltinType(_)
                 ) | PathResolution::TypeParam(_)
                     | PathResolution::SelfType(_)
             ),
@@ -124,7 +132,10 @@ pub(super) fn check<'db>(
     }
     let offset = usize::from(first.coloncolon_token().is_some());
     let single = offset == 0 && prefixes.len() == 1;
-    if single && source == Source::Type && (is_own_type_param(signature, path, first) || is_primitive(signature, first)) {
+    if single
+        && source == Source::Type
+        && (is_own_type_param(signature, path, first) || is_primitive(signature, first))
+    {
         return None;
     }
     let segments = || segments(first, &prefixes);
@@ -139,7 +150,9 @@ pub(super) fn check<'db>(
                 module = Some(def);
                 defs.push(def);
             }
-            Some(PathResolution::Def(def @ ModuleDef::Adt(hir::Adt::Enum(_)))) if at + 2 == prefixes.len() => {
+            Some(PathResolution::Def(def @ ModuleDef::Adt(hir::Adt::Enum(_))))
+                if at + 2 == prefixes.len() =>
+            {
                 module = Some(def);
                 defs.push(def);
             }
@@ -165,7 +178,13 @@ pub(super) fn check<'db>(
                     return Some(found(cx, diag, signature, current, name));
                 }
                 let diag = failure::diag(cx, &place, &segments, offset + at, module);
-                return Some(found(cx, diag, signature, module_of(module).unwrap_or(current), name));
+                return Some(found(
+                    cx,
+                    diag,
+                    signature,
+                    module_of(module).unwrap_or(current),
+                    name,
+                ));
             }
         }
     }
@@ -182,9 +201,7 @@ pub(super) fn check<'db>(
     {
         return None;
     }
-    let res = per_ns
-        .as_ref()
-        .and_then(|it| it.type_ns.or(it.value_ns).or(it.macro_ns));
+    let res = per_ns.as_ref().and_then(|it| it.type_ns.or(it.value_ns).or(it.macro_ns));
     if let Some(res) = &res {
         if single && is_from_outer(cx, signature, res) {
             let current = current()?;
@@ -244,12 +261,19 @@ pub(super) fn check<'db>(
                 }
                 [first] if first.name == ROOT || first.name == "crate" => {
                     // alloc: the error's text, on the error path
-                    ("", String::new(), "the crate root".to_owned(), Some(cx.krate.root_module(cx.db)))
+                    (
+                        "",
+                        String::new(),
+                        "the crate root".to_owned(),
+                        Some(cx.krate.root_module(cx.db)),
+                    )
                 }
                 _ => {
                     let prefix = match module {
                         // alloc: the error's text, on the error path
-                        Some(def) => format!("{} ", def_descr(cx, Ns::Type, def).unwrap_or("module")),
+                        Some(def) => {
+                            format!("{} ", def_descr(cx, Ns::Type, def).unwrap_or("module"))
+                        }
                         // alloc: the error's text, on the error path
                         None => String::new(),
                     };
@@ -258,7 +282,10 @@ pub(super) fn check<'db>(
             };
             (
                 // alloc: the error's text, on the error path
-                format!("cannot find {expected} `{}` in {mod_prefix}{tick}{mod_str}{tick}", last.name),
+                format!(
+                    "cannot find {expected} `{}` in {mod_prefix}{tick}{mod_str}{tick}",
+                    last.name
+                ),
                 cx.span(InFile::new(file, last.range)),
                 // alloc: the error's text, on the error path
                 format!("not found in {tick}{mod_str}{tick}"),
@@ -270,7 +297,11 @@ pub(super) fn check<'db>(
     let mut diag = Diag::error(Some(source.code(res.is_some())), message, base.clone());
     if let Some(res) = &cross {
         // alloc: the error's text, on the error path
-        diag.note(format!("{} {} named `{path_str}` exists in another namespace", res_article(cx, res), res_descr(cx, res)));
+        diag.note(format!(
+            "{} {} named `{path_str}` exists in another namespace",
+            res_article(cx, res),
+            res_descr(cx, res)
+        ));
     }
     if let Some(PathResolution::TypeParam(param)) = same
         && let Some(at) = param_span(cx, param)
@@ -284,7 +315,9 @@ pub(super) fn check<'db>(
         Some(PathResolution::Def(def)) => Some(*def),
         _ => None,
     };
-    let to_import = single.then(|| imports(cx, current, source.path(), &last.name, own)).filter(|it| !it.is_empty());
+    let to_import = single
+        .then(|| imports(cx, current, source.path(), &last.name, own))
+        .filter(|it| !it.is_empty());
     // alloc: the error's text, on the error path
     let mut suggested: Vec<String> = Vec::new();
     if to_import.is_none() && source == Source::Type {
@@ -294,7 +327,9 @@ pub(super) fn check<'db>(
     // `lookup_typo_candidate` of a longer path looks in the module its prefix names, if any.
     let lookup = if single { None } else { in_module.or(module_of(module)) };
     let typo = match lookup {
-        Some(module) => typo(cx, &mut diag, Names::Module(module), source.path(), &last.name, &at, &suggested),
+        Some(module) => {
+            typo(cx, &mut diag, Names::Module(module), source.path(), &last.name, &at, &suggested)
+        }
         None if single => cx.vsema.scope(path.syntax()).is_some_and(|scope| {
             typo(cx, &mut diag, Names::Scope(&scope), source.path(), &last.name, &at, &suggested)
         }),
@@ -320,7 +355,12 @@ pub(super) fn check<'db>(
         && single
         && let Some((insert, sugg)) = missing_parameter(cx, signature, path, &last.name)
     {
-        diag.suggestion_verbose(insert, "you might be missing a type parameter", sugg, Applicability::MaybeIncorrect);
+        diag.suggestion_verbose(
+            insert,
+            "you might be missing a type parameter",
+            sugg,
+            Applicability::MaybeIncorrect,
+        );
     }
     Some(found(cx, diag, signature, lookup.unwrap_or(current), &last.name))
 }
@@ -345,7 +385,12 @@ fn res_article(cx: &Cx<'_, '_>, res: &PathResolution<'_>) -> &'static str {
 /// after the last one of the item (rustc's `current_item`), when the name is one capital and
 /// the item a function (not `main`), struct, enum or union, or the path is in the generic
 /// arguments of another and the item has generics; not where the generics hold the path.
-fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path<'_>, name: &str) -> Option<(Span, String)> {
+fn missing_parameter(
+    cx: &Cx<'_, '_>,
+    signature: &Signature<'_>,
+    path: ast::Path<'_>,
+    name: &str,
+) -> Option<(Span, String)> {
     let segment = path.segment()?;
     if segment.generic_arg_list().is_some() || name == "Self" || name == "dyn" {
         return None;
@@ -396,14 +441,18 @@ fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path
         return Some((at(list.syntax().text_range()), format!("<{name}>")));
     };
     let end = match &param {
-        ast::GenericParam::TypeParam(it) => match it.type_bound_list().and_then(|it| it.bounds().last()) {
-            Some(bound) => bound.syntax().text_range(),
-            None => it.name()?.syntax().text_range(),
-        },
-        ast::GenericParam::LifetimeParam(it) => match it.type_bound_list().and_then(|it| it.bounds().last()) {
-            Some(bound) => bound.syntax().text_range(),
-            None => it.lifetime()?.syntax().text_range(),
-        },
+        ast::GenericParam::TypeParam(it) => {
+            match it.type_bound_list().and_then(|it| it.bounds().last()) {
+                Some(bound) => bound.syntax().text_range(),
+                None => it.name()?.syntax().text_range(),
+            }
+        }
+        ast::GenericParam::LifetimeParam(it) => {
+            match it.type_bound_list().and_then(|it| it.bounds().last()) {
+                Some(bound) => bound.syntax().text_range(),
+                None => it.lifetime()?.syntax().text_range(),
+            }
+        }
         ast::GenericParam::ConstParam(it) => match it.default_val() {
             Some(default) => default.syntax().text_range(),
             None => it.ty()?.syntax().text_range(),
@@ -413,7 +462,13 @@ fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path
     Some((at(end), format!(", {name}")))
 }
 
-fn found(cx: &Cx<'_, '_>, mut diag: Diag, signature: &Signature<'_>, module: hir::Module, name: &str) -> Found {
+fn found(
+    cx: &Cx<'_, '_>,
+    mut diag: Diag,
+    signature: &Signature<'_>,
+    module: hir::Module,
+    name: &str,
+) -> Found {
     // alloc: the error's text, on the error path
     diag.fact(cx.resolves_fact(module, name), format!("what `{name}` names in its scope"));
     signature.fact(cx, &mut diag);
@@ -424,9 +479,15 @@ fn found(cx: &Cx<'_, '_>, mut diag: Diag, signature: &Signature<'_>, module: hir
 /// rustc resolves it in (the signature's item, or the impl or trait around an associated one).
 fn is_from_outer(cx: &Cx<'_, '_>, signature: &Signature<'_>, res: &PathResolution<'_>) -> bool {
     let declared: Option<InFile<TextRange>> = match res {
-        PathResolution::TypeParam(it) => cx.vsema.source(it.merge()).map(|it| it.map(|it| it.syntax().text_range())),
-        PathResolution::ConstParam(it) => cx.vsema.source(it.merge()).map(|it| it.map(|it| it.syntax().text_range())),
-        PathResolution::SelfType(it) => cx.vsema.source(*it).map(|it| it.map(|it| it.syntax().text_range())),
+        PathResolution::TypeParam(it) => {
+            cx.vsema.source(it.merge()).map(|it| it.map(|it| it.syntax().text_range()))
+        }
+        PathResolution::ConstParam(it) => {
+            cx.vsema.source(it.merge()).map(|it| it.map(|it| it.syntax().text_range()))
+        }
+        PathResolution::SelfType(it) => {
+            cx.vsema.source(*it).map(|it| it.map(|it| it.syntax().text_range()))
+        }
         _ => return false,
     };
     let Some(declared) = declared else { return false };
@@ -458,7 +519,9 @@ pub(crate) fn is_named(segment: ast::PathSegment<'_>) -> bool {
 /// segment is known to be [`is_named`].
 pub(crate) fn segments(first: ast::PathSegment<'_>, prefixes: &[ast::Path<'_>]) -> Vec<Segment> {
     // alloc: the segments, read only for an error
-    let root = first.coloncolon_token().map(|it| Segment { name: ROOT.to_owned(), range: it.text_range() });
+    let root = first
+        .coloncolon_token()
+        .map(|it| Segment { name: ROOT.to_owned(), range: it.text_range() });
     // alloc: the segments, read only for an error
     root.into_iter().chain(prefixes.iter().filter_map(|it| segment(it.segment()?))).collect()
 }
@@ -468,7 +531,11 @@ pub(crate) fn segments(first: ast::PathSegment<'_>, prefixes: &[ast::Path<'_>]) 
 /// it to that parameter, which the place expects, and no error is given. Read from the syntax
 /// before anything is asked of Semantics; only in a file of source, where no macro's hygiene
 /// can make the name mean another.
-fn is_own_type_param(signature: &Signature<'_>, path: ast::Path<'_>, first: ast::PathSegment<'_>) -> bool {
+fn is_own_type_param(
+    signature: &Signature<'_>,
+    path: ast::Path<'_>,
+    first: ast::PathSegment<'_>,
+) -> bool {
     if signature.node.file_id.is_macro() || first.generic_arg_list().is_some() {
         return false;
     }
@@ -481,20 +548,29 @@ fn is_own_type_param(signature: &Signature<'_>, path: ast::Path<'_>, first: ast:
         list.is_some_and(|list| {
             !list.syntax().text_range().contains_range(at)
                 && list.type_or_const_params().any(|it| match it {
-                    ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+                    ast::TypeOrConstParam::Type(param) => {
+                        param.name().is_some_and(|it| it.text() == name)
+                    }
                     ast::TypeOrConstParam::Const(_) => false,
                 })
         })
     };
     let declares = |node: ast::Node<'_>| {
         ast::AnyHasGenericParams::can_cast(node.kind())
-            && names(node.child_where(ast::GenericParamList::can_cast).and_then(ast::GenericParamList::cast))
+            && names(
+                node.child_where(ast::GenericParamList::can_cast)
+                    .and_then(ast::GenericParamList::cast),
+            )
     };
     // `for<T>` (`non_lifetime_binders`, gated apart) declares `T` for what it binds.
     let binds = |node: ast::Node<'_>| {
-        node.children()
-            .filter(|it| it.kind() == SyntaxKind::FOR_BINDER)
-            .any(|binder| names(binder.child_where(ast::GenericParamList::can_cast).and_then(ast::GenericParamList::cast)))
+        node.children().filter(|it| it.kind() == SyntaxKind::FOR_BINDER).any(|binder| {
+            names(
+                binder
+                    .child_where(ast::GenericParamList::can_cast)
+                    .and_then(ast::GenericParamList::cast),
+            )
+        })
     };
     declares(item) || (inner != item && declares(inner)) || path.syntax().ancestors().any(binds)
 }
@@ -521,7 +597,9 @@ fn is_primitive(signature: &Signature<'_>, first: ast::PathSegment<'_>) -> bool 
                 .and_then(ast::GenericParamList::cast)
                 .is_some_and(|list| {
                     list.type_or_const_params().any(|it| match it {
-                        ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+                        ast::TypeOrConstParam::Type(param) => {
+                            param.name().is_some_and(|it| it.text() == name)
+                        }
                         ast::TypeOrConstParam::Const(_) => false,
                     })
                 })
@@ -561,7 +639,9 @@ fn segment(segment: ast::PathSegment<'_>) -> Option<Segment> {
         // alloc: the segments, read only for an error
         ast::PathSegmentKind::Name(it) => (it.text().to_owned(), it.syntax().text_range()),
         // alloc: the segments, read only for an error
-        ast::PathSegmentKind::SelfTypeKw => ("Self".to_owned(), segment.self_type_token()?.text_range()),
+        ast::PathSegmentKind::SelfTypeKw => {
+            ("Self".to_owned(), segment.self_type_token()?.text_range())
+        }
         // alloc: the segments, read only for an error
         ast::PathSegmentKind::SelfKw => ("self".to_owned(), segment.self_token()?.text_range()),
         // alloc: the segments, read only for an error
@@ -614,8 +694,18 @@ fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
 
 /// The path `module` imports `def` by (and whether it is from the crate root), or the path of
 /// a local item it can't see; nothing for a hidden or unreachable foreign one.
-fn import_path(cx: &Cx<'_, '_>, module: hir::Module, def: ModuleDef, local: bool) -> Option<Result<(String, bool), String>> {
-    let cfg = hir::FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
+fn import_path(
+    cx: &Cx<'_, '_>,
+    module: hir::Module,
+    def: ModuleDef,
+    local: bool,
+) -> Option<Result<(String, bool), String>> {
+    let cfg = hir::FindPathConfig {
+        prefer_no_std: false,
+        prefer_prelude: false,
+        prefer_absolute: false,
+        allow_unstable: true,
+    };
     match module.find_use_path(cx.db, hir::ItemInNs::Types(def), hir::PrefixKind::ByCrate, cfg) {
         Some(path) if local || !is_doc_hidden(cx, def) => {
             // alloc: the error's text, on the error path
@@ -637,7 +727,14 @@ fn import_path(cx: &Cx<'_, '_>, module: hir::Module, def: ModuleDef, local: bool
 /// `span`; the enums' paths, which no typo then repeats. The variants are read from the
 /// declarations of the name in the crate and its direct dependencies (`Paths::decls`, one
 /// probe), not from every enum of every module.
-fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &str, unresolved: bool, span: &Span) -> Vec<String> {
+fn variant_enums(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    module: hir::Module,
+    name: &str,
+    unresolved: bool,
+    span: &Span,
+) -> Vec<String> {
     // alloc: the error's text, on the error path
     let mut found: Vec<(String, String)> = Vec::new();
     for decl in cx.paths().decls(cx).named(name) {

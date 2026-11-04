@@ -36,7 +36,11 @@ use stdx::list::Join;
 
 /// The lints of `check_crate` over `symbols`, sorted by where each was first seen, at the
 /// crate root `krate`.
-pub(super) fn lints(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>], krate: InFile<SyntaxNodePtr>) -> Vec<Emitted> {
+pub(super) fn lints(
+    cx: &Cx<'_, '_>,
+    symbols: &[Symbol<'_>],
+    krate: InFile<SyntaxNodePtr>,
+) -> Vec<Emitted> {
     diags(cx, symbols)
         .into_iter()
         .map(|mut diag| {
@@ -60,13 +64,21 @@ fn diags(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>]) -> Vec<Diag> {
         has_non_ascii = true;
         let span = symbol.place.span(cx);
         // clone: a lint's span, for a lint found
-        out.push(Diag::lint("non_ascii_idents", "identifier contains non-ASCII characters", span.clone()));
+        out.push(Diag::lint(
+            "non_ascii_idents",
+            "identifier contains non-ASCII characters",
+            span.clone(),
+        ));
         if name.chars().all(GeneralSecurityProfile::identifier_allowed) {
             continue;
         }
         for (codepoints, kind) in uncommon(name) {
             // clone: a lint's span, for a lint found
-            let mut diag = Diag::lint("uncommon_codepoints", uncommon_message(&codepoints, kind), span.clone());
+            let mut diag = Diag::lint(
+                "uncommon_codepoints",
+                uncommon_message(&codepoints, kind),
+                span.clone(),
+            );
             diag.note(uncommon_note(codepoints.len(), kind));
             out.push(diag);
         }
@@ -95,11 +107,14 @@ fn diags(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>]) -> Vec<Diag> {
     }
     for (symbol, set, chars) in mixed_script_confusables(symbols) {
         // alloc: the lint's text, for a lint found
-        let includes: Vec<String> = chars.iter().map(|&c| format!("'{c}' (U+{:04X})", c as u32)).collect();
+        let includes: Vec<String> =
+            chars.iter().map(|&c| format!("'{c}' (U+{:04X})", c as u32)).collect();
         let mut diag = Diag::lint(
             "mixed_script_confusables",
             // alloc: the lint's text, for a lint found
-            format!("the usage of Script Group `{set}` in this crate consists solely of mixed script confusables"),
+            format!(
+                "the usage of Script Group `{set}` in this crate consists solely of mixed script confusables"
+            ),
             symbols[symbol].place.span(cx),
         );
         // alloc: the lint's text, for a lint found
@@ -161,7 +176,10 @@ fn uncommon(name: &str) -> Vec<(Vec<char>, Uncommon)> {
 }
 
 /// Takes the characters of `chars` that `take` picks out, in order (`Vec::extract_if`).
-fn extract(chars: &mut Vec<(char, Option<IdentifierType>)>, take: impl Fn(&(char, Option<IdentifierType>)) -> bool) -> Vec<char> {
+fn extract(
+    chars: &mut Vec<(char, Option<IdentifierType>)>,
+    take: impl Fn(&(char, Option<IdentifierType>)) -> bool,
+) -> Vec<char> {
     // alloc: only for an identifier `uncommon_codepoints` fires on
     let mut taken = Vec::new();
     chars.retain(|it| match take(it) {
@@ -180,7 +198,9 @@ fn uncommon_message(codepoints: &[char], kind: Uncommon) -> String {
         // alloc: the lint's text, for a lint found
         (1, Uncommon::Exclusion) => "a character from an archaic script".to_owned(),
         // alloc: the lint's text, for a lint found
-        (1, Uncommon::Technical) => "a character that is for non-linguistic, specialized usage".to_owned(),
+        (1, Uncommon::Technical) => {
+            "a character that is for non-linguistic, specialized usage".to_owned()
+        }
         // alloc: the lint's text, for a lint found
         (1, Uncommon::LimitedUse) => "a character from a script in limited use".to_owned(),
         // alloc: the lint's text, for a lint found
@@ -190,7 +210,9 @@ fn uncommon_message(codepoints: &[char], kind: Uncommon) -> String {
         // alloc: the lint's text, for a lint found
         (_, Uncommon::Exclusion) => format!("{n} characters from archaic scripts"),
         // alloc: the lint's text, for a lint found
-        (_, Uncommon::Technical) => format!("{n} characters that are for non-linguistic, specialized usage"),
+        (_, Uncommon::Technical) => {
+            format!("{n} characters that are for non-linguistic, specialized usage")
+        }
         // alloc: the lint's text, for a lint found
         (_, Uncommon::LimitedUse) => format!("{n} characters from scripts in limited use"),
         // alloc: the lint's text, for a lint found
@@ -274,7 +296,8 @@ enum Usage {
 fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScriptSet, Vec<char>)> {
     // In the order first seen, as rustc's `FxIndexMap`; Latin is always verified.
     // alloc: setup, once per crate with a non-ASCII identifier; one entry per script set
-    let mut states: Vec<(AugmentedScriptSet, Usage)> = vec![(AugmentedScriptSet::for_char('A'), Usage::Verified)];
+    let mut states: Vec<(AugmentedScriptSet, Usage)> =
+        vec![(AugmentedScriptSet::for_char('A'), Usage::Verified)];
     let mut has_suspicious = false;
     for (index, symbol) in symbols.iter().enumerate() {
         for ch in symbol.name.chars() {
@@ -351,9 +374,18 @@ mod tests {
             uncommon_message(&['ㇻ', 'ㇲ', 'ㇳ'], Uncommon::Restricted),
             "identifier contains uncommon characters: 'ㇻ', 'ㇲ', and 'ㇳ'"
         );
-        assert_eq!(uncommon_message(&['ĳ'], Uncommon::NotNfkc), "identifier contains a non normalized (NFKC) character: 'ĳ'");
-        assert_eq!(uncommon_note(1, Uncommon::NotNfkc), "this character is included in the Not_NFKC Unicode general security profile");
-        assert_eq!(uncommon_note(3, Uncommon::Restricted), "these characters are included in the Unicode general security profile");
+        assert_eq!(
+            uncommon_message(&['ĳ'], Uncommon::NotNfkc),
+            "identifier contains a non normalized (NFKC) character: 'ĳ'"
+        );
+        assert_eq!(
+            uncommon_note(1, Uncommon::NotNfkc),
+            "this character is included in the Not_NFKC Unicode general security profile"
+        );
+        assert_eq!(
+            uncommon_note(3, Uncommon::Restricted),
+            "these characters are included in the Unicode general security profile"
+        );
     }
 
     #[test]

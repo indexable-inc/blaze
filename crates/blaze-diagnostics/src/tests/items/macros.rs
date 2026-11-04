@@ -33,7 +33,10 @@ fn main() {
     //~^ ERROR cannot find macro `iamnotanextensionthatexists` in this scope
 }
 "#;
-    assert_reports(&ui("nonexistent-macro.rs", "2015", source), &[error(4, &["`iamnotanextensionthatexists`"])]);
+    assert_reports(
+        &ui("nonexistent-macro.rs", "2015", source),
+        &[error(4, &["`iamnotanextensionthatexists`"])],
+    );
 }
 
 #[test]
@@ -43,7 +46,10 @@ fn compile_error_is_an_error_at_the_call() {
     compile_error!("a very descriptive error message"); //~ ERROR: a very descriptive error message
 }
 "#;
-    assert_reports(&ui_builtins("compile_error_macro.rs", "2015", source), &[error(2, &["a very descriptive error message"])]);
+    assert_reports(
+        &ui_builtins("compile_error_macro.rs", "2015", source),
+        &[error(2, &["a very descriptive error message"])],
+    );
 }
 
 #[test]
@@ -202,7 +208,10 @@ fn main() {
     x!(!); //~ ERROR macro expansion ends with an incomplete expression: expected expression
 }
 "#;
-    assert_reports(&ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source), &[error(8, &[])]);
+    assert_reports(
+        &ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source),
+        &[error(8, &[])],
+    );
 }
 
 /// rustc's lexer glues joint punctuation, so `::`, `=>`, `..=`, `->` and `+=` are one separator

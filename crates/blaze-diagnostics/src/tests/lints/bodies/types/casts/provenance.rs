@@ -81,7 +81,12 @@ LL |     let ptr_addr_32bit = ptr as u32;
 error: aborting due to 4 previous errors
 
 "##;
-    let stderr = crate::tests::items::ui_core("lint-strict-provenance-lossy-casts.rs", "2015", "copy", source);
+    let stderr = crate::tests::items::ui_core(
+        "lint-strict-provenance-lossy-casts.rs",
+        "2015",
+        "copy",
+        source,
+    );
     assert_eq!(stderr, expected);
 }
 

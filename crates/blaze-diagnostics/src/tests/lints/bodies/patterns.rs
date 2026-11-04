@@ -32,11 +32,7 @@ fn main() {}
 "##;
     assert_reports(
         &ui("issue-14221.rs", "2015", source),
-        &[
-            error(13, &["`A`", "`E`"]),
-            error(15, &["`B`", "`E`"]),
-            error(15, &[]),
-        ],
+        &[error(13, &["`A`", "`E`"]), error(15, &["`B`", "`E`"]), error(15, &[])],
     );
 }
 
@@ -218,5 +214,14 @@ LL +     let Some(name) = case else {
 warning: 3 warnings emitted
 
 "##;
-    assert_eq!(ui_std("let-else-irrefutable.rs", "2015", "sized, fmt, option", ("pub use crate::eprintln;", std_items), source), stderr);
+    assert_eq!(
+        ui_std(
+            "let-else-irrefutable.rs",
+            "2015",
+            "sized, fmt, option",
+            ("pub use crate::eprintln;", std_items),
+            source
+        ),
+        stderr
+    );
 }

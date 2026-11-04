@@ -73,9 +73,8 @@ impl UllbcPass for Transform {
                 // Each new block jumps to the previous one after completion
                 for (dest, call) in new_calls {
                     // Const eval mustn't unwind into runtime.
-                    let unwind = body
-                        .body
-                        .push(BlockData::new_unreachable(kind.further_unwind_kind()));
+                    let unwind =
+                        body.body.push(BlockData::new_unreachable(kind.further_unwind_kind()));
                     next_block = body.body.push(BlockData {
                         statements: vec![Statement::new(
                             Span::dummy(),

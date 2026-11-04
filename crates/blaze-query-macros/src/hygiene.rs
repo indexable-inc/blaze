@@ -4,9 +4,9 @@
 // alloc: expansion time, once per annotated item; no query runs this
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
+use std::alloc::Global;
 
 pub(crate) struct Hygiene {
     used: HashSet<String, Global>,

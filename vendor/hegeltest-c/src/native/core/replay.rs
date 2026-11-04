@@ -88,11 +88,7 @@ struct LiveSet {
 
 impl LiveSet {
     fn new(count: usize) -> Self {
-        LiveSet {
-            live: alloc::vec![true; count],
-            pruned: Vec::new(),
-            divergence: None,
-        }
+        LiveSet { live: alloc::vec![true; count], pruned: Vec::new(), divergence: None }
     }
 
     fn prune(&mut self, batch: Vec<usize>) {
@@ -107,10 +103,7 @@ impl LiveSet {
 
     fn diverge(&mut self, stream: &[usize], position: usize) {
         if self.divergence.is_none() {
-            self.divergence = Some(Divergence {
-                stream: stream.to_vec(),
-                position,
-            });
+            self.divergence = Some(Divergence { stream: stream.to_vec(), position });
         }
     }
 
@@ -126,15 +119,8 @@ impl LiveSet {
 /// has agreed with so far.
 enum Pending {
     Nodes(Vec<usize>),
-    Tie {
-        node: usize,
-        edges: Vec<usize>,
-    },
-    Clone {
-        node: usize,
-        edges: Vec<usize>,
-        shared: Arc<Mutex<LiveSet>>,
-    },
+    Tie { node: usize, edges: Vec<usize> },
+    Clone { node: usize, edges: Vec<usize>, shared: Arc<Mutex<LiveSet>> },
 }
 
 /// The root stream's walk of a [`Graph`]. At each draw the
@@ -176,15 +162,10 @@ impl GraphWalk {
         let target = |node: usize, i: usize| self.graph.nodes()[node].edges[i].target;
         match &self.pending {
             Pending::Nodes(nodes) => nodes.iter().map(|&n| (None, n)).collect(),
-            Pending::Tie { node, edges } => edges
-                .iter()
-                .map(|&i| (Some((*node, i)), target(*node, i)))
-                .collect(),
-            Pending::Clone {
-                node,
-                edges,
-                shared,
-            } => {
+            Pending::Tie { node, edges } => {
+                edges.iter().map(|&i| (Some((*node, i)), target(*node, i))).collect()
+            }
+            Pending::Clone { node, edges, shared } => {
                 let live = shared.lock().live.clone();
                 edges
                     .iter()
@@ -200,10 +181,8 @@ impl GraphWalk {
     /// there; a misjoin diverges and is rescued by the graph's node of that
     /// identity, `None` when it has none.
     fn arrive(&mut self, ident: &Ident, stream: &[usize], position: usize) -> Option<usize> {
-        let found = self
-            .candidates()
-            .into_iter()
-            .find(|&(_, n)| self.graph.nodes()[n].ident == *ident);
+        let found =
+            self.candidates().into_iter().find(|&(_, n)| self.graph.nodes()[n].ident == *ident);
         match found {
             Some((edge, n)) => {
                 if let Some(edge) = edge {
@@ -227,20 +206,15 @@ impl GraphWalk {
 
     fn diverge(&mut self, stream: &[usize], position: usize) {
         if self.divergence().is_none() {
-            self.divergence = Some(Divergence {
-                stream: stream.to_vec(),
-                position,
-            });
+            self.divergence = Some(Divergence { stream: stream.to_vec(), position });
         }
     }
 
     /// The first divergence of the walk or of any child stream.
     fn divergence(&self) -> Option<Divergence> {
-        self.divergence.clone().or_else(|| {
-            self.children
-                .iter()
-                .find_map(|c| c.lock().divergence.clone())
-        })
+        self.divergence
+            .clone()
+            .or_else(|| self.children.iter().find_map(|c| c.lock().divergence.clone()))
     }
 
     /// Whether the run, ending now, ends on [`Ident::End`].
@@ -305,10 +279,7 @@ impl Replay {
     /// A replay every draw of which is decided by `resolver`.
     #[cfg(any(test, feature = "__bench"))]
     pub(crate) fn external(resolver: Box<dyn ExternalReplay>) -> Self {
-        Self::external_view(
-            Arc::new(Mutex::new(resolver)),
-            Arc::new(Mutex::new(LiveSet::new(0))),
-        )
+        Self::external_view(Arc::new(Mutex::new(resolver)), Arc::new(Mutex::new(LiveSet::new(0))))
     }
 
     fn external_view(external: External, shared: Arc<Mutex<LiveSet>>) -> Self {
@@ -340,21 +311,13 @@ impl Replay {
     #[cfg(any(test, feature = "__bench"))]
     pub(crate) fn counterexample(timelines: Vec<Vec<ChoiceValue>>) -> Self {
         let count = timelines.len();
-        Self::live_set(
-            timelines,
-            Arc::new(Mutex::new(LiveSet::new(count))),
-            Rescue::Continue,
-        )
+        Self::live_set(timelines, Arc::new(Mutex::new(LiveSet::new(count))), Rescue::Continue)
     }
 
     /// A [`Rescue::Stop`] replay of one choice sequence: the blob replay of
     /// a deterministic counterexample.
     pub(crate) fn exact(choices: Vec<ChoiceValue>) -> Self {
-        Self::live_set(
-            alloc::vec![choices],
-            Arc::new(Mutex::new(LiveSet::new(1))),
-            Rescue::Stop,
-        )
+        Self::live_set(alloc::vec![choices], Arc::new(Mutex::new(LiveSet::new(1))), Rescue::Stop)
     }
 
     fn live_set(
@@ -426,9 +389,7 @@ impl Replay {
     }
 
     fn value_at(&self, timeline: usize, position: usize) -> Option<&ChoiceValue> {
-        self.timelines[timeline]
-            .as_ref()
-            .and_then(|t| t.get(position))
+        self.timelines[timeline].as_ref().and_then(|t| t.get(position))
     }
 
     /// Resolve the draw at `position` of stream `stream`, given the draw's
@@ -523,12 +484,10 @@ impl Replay {
     ) -> Resolved<'_, V> {
         let mut set = self.shared.lock();
         if set.any_live() {
-            let hit = (0..self.timelines.len())
-                .filter(|&k| set.live[k])
-                .find_map(|k| {
-                    let stored = self.value_at(k, position)?;
-                    fits(stored).map(|v| (stored, v))
-                });
+            let hit = (0..self.timelines.len()).filter(|&k| set.live[k]).find_map(|k| {
+                let stored = self.value_at(k, position)?;
+                fits(stored).map(|v| (stored, v))
+            });
             match hit {
                 Some((stored, v)) => {
                     let batch: Vec<usize> = (0..self.timelines.len())
@@ -654,11 +613,9 @@ impl Replay {
         let shared = Arc::new(Mutex::new(LiveSet::new(records.len())));
         walk.children.push(Arc::clone(&shared));
         walk.pending = match node {
-            Some(node) if !edges.is_empty() => Pending::Clone {
-                node,
-                edges,
-                shared: Arc::clone(&shared),
-            },
+            Some(node) if !edges.is_empty() => {
+                Pending::Clone { node, edges, shared: Arc::clone(&shared) }
+            }
             _ => {
                 walk.diverge(stream, position);
                 Pending::Nodes(Vec::new())
@@ -681,17 +638,13 @@ impl Replay {
     /// Under a graph walk, the edges the run settled on (see
     /// [`GraphWalk::settled`]); empty otherwise.
     pub(crate) fn settled(&self) -> Vec<(usize, usize)> {
-        self.graph
-            .as_ref()
-            .map_or_else(Vec::new, |walk| walk.lock().settled())
+        self.graph.as_ref().map_or_else(Vec::new, |walk| walk.lock().settled())
     }
 
     /// Under a graph walk, whether the run ending now ends on
     /// [`Ident::End`]; false otherwise.
     pub(crate) fn ended_on_end(&self) -> bool {
-        self.graph
-            .as_ref()
-            .is_some_and(|walk| walk.lock().ended_on_end())
+        self.graph.as_ref().is_some_and(|walk| walk.lock().ended_on_end())
     }
 
     /// Which timelines are live, in counterexample order.
@@ -706,11 +659,7 @@ impl Replay {
         if let Some(external) = &self.external {
             return external.lock().longest();
         }
-        self.timelines
-            .iter()
-            .map(|t| t.as_ref().map_or(0, Vec::len))
-            .max()
-            .unwrap_or(0)
+        self.timelines.iter().map(|t| t.as_ref().map_or(0, Vec::len)).max().unwrap_or(0)
     }
 }
 

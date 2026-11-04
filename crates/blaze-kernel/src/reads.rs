@@ -139,6 +139,8 @@ impl Trace {
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (Read<'_>, Seen)> + Clone + '_ {
-        self.reads.iter().map(|it| (Read { kind: it.kind, key: &self.keys[it.start..it.end] }, it.seen))
+        self.reads
+            .iter()
+            .map(|it| (Read { kind: it.kind, key: &self.keys[it.start..it.end] }, it.seen))
     }
 }

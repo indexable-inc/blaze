@@ -20,7 +20,6 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup,
@@ -31,6 +30,7 @@ use hir_def::{
 use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::{ParamEnvAndCrate, next_solver::Ty};
 use intern::{Symbol, sym};
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use super::util;
@@ -68,10 +68,14 @@ pub(super) fn has_attr(db: &Db, def: FunctionId, name: &str) -> bool {
     let krate = def.krate(db);
     let attrs = def.lookup(db).source_view(db).value.attrs();
     let cfg = krate.cfg_options(db);
-    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
-        ast::Meta::PathMeta(attr) if attr.path().is1(name) => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    })
+    expand_cfg_attr_view(
+        attrs,
+        || cfg,
+        |meta, _| match meta {
+            ast::Meta::PathMeta(attr) if attr.path().is1(name) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        },
+    )
     .is_some()
 }
 
@@ -126,7 +130,9 @@ impl Inits {
             self.map.clear();
             let store = b.store();
             let binding = |pat: PatId| match store.pat(pat) {
-                Pat::Bind { id, .. } if store[id].mode == BindingAnnotation::Unannotated => Some(id),
+                Pat::Bind { id, .. } if store[id].mode == BindingAnnotation::Unannotated => {
+                    Some(id)
+                }
                 _ => None,
             };
             for &expr in b.exprs() {
@@ -155,7 +161,11 @@ impl Inits {
 
 /// rustc's `LateContext::expr_or_init`: through blocks, and from a path to a local binding to
 /// what initialized it, while there is one.
-pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId, Global>, expr: ExprId) -> ExprId {
+pub(super) fn expr_or_init(
+    b: &BodyCx<'_, '_, '_>,
+    inits: &HashMap<BindingId, ExprId, Global>,
+    expr: ExprId,
+) -> ExprId {
     let mut expr = util::peel_blocks(b, expr);
     while let Expr::Path(_) = b.store().expr(expr)
         && let Some(ValueNs::LocalBinding(id)) = util::path_value(b, expr)
@@ -169,7 +179,11 @@ pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, Ex
 /// rustc's `peel_casts`: through blocks, `as` casts, `.cast()`, `.cast_mut()`, `.cast_const()`,
 /// `ptr::from_ref`, `UnsafeCell::raw_get`, `mem::transmute` and the initializers of local
 /// bindings, to the expression the pointer comes from.
-pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId, Global>, expr: ExprId) -> ExprId {
+pub(super) fn peel_casts(
+    b: &BodyCx<'_, '_, '_>,
+    inits: &HashMap<BindingId, ExprId, Global>,
+    expr: ExprId,
+) -> ExprId {
     let mut e = expr;
     loop {
         e = util::peel_blocks(b, e);
@@ -178,7 +192,8 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, Expr
             Expr::MethodCall { receiver, args, .. }
                 if args.is_empty()
                     && method_item(b, e).is_some_and(|it| {
-                        [sym::ptr_cast, sym::const_ptr_cast, sym::ptr_cast_mut, sym::ptr_cast_const].contains(&it)
+                        [sym::ptr_cast, sym::const_ptr_cast, sym::ptr_cast_mut, sym::ptr_cast_const]
+                            .contains(&it)
                     }) =>
             {
                 receiver

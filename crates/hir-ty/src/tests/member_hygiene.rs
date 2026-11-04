@@ -209,7 +209,10 @@ fn methods_a_macro_names_are_found_by_its_expansion_alone() {
             body.exprs()
                 .filter(|(_, expr)| matches!(expr, Expr::MethodCall { .. }))
                 .map(|(id, expr)| {
-                    infer.method_resolution(id).unwrap_or_else(|| panic!("{expr:?} has no method")).0
+                    infer
+                        .method_resolution(id)
+                        .unwrap_or_else(|| panic!("{expr:?} has no method"))
+                        .0
                 })
                 .collect::<Vec<_>>()
         };
@@ -288,10 +291,8 @@ fn a_macro_a_block_defines_finds_the_items_of_the_block_and_its_module() {
         assert!(infer.diagnostics().is_empty(), "`spec_push_to`: {:?}", infer.diagnostics());
         assert!(!infer.has_type_mismatches(), "`spec_push_to`: {:?}", infer.diagnostics());
         let body = Body::of(&db, def);
-        let (field, _) = body
-            .exprs()
-            .find(|(_, it)| matches!(it, Expr::Field { .. }))
-            .expect("`buf.inner`");
+        let (field, _) =
+            body.exprs().find(|(_, it)| matches!(it, Expr::Field { .. })).expect("`buf.inner`");
         assert!(
             matches!(infer.field_resolution(field), Some(Either::Left(_))),
             "`buf.inner`: {:?}",
@@ -551,8 +552,10 @@ fn associated_items_a_macro_names_through_paths_are_found_by_its_expansion_alone
     use rustc_type_ir::TypeVisitableExt as _;
     let db = fixture::db(ASSOC_PATHS).into_db();
     blaze_query::db::attach(&db, || {
-        let mut defs: Vec<FunctionId> =
-            ["own", "bound", "caller", "caller_bound"].into_iter().map(|it| function(&db, it)).collect();
+        let mut defs: Vec<FunctionId> = ["own", "bound", "caller", "caller_bound"]
+            .into_iter()
+            .map(|it| function(&db, it))
+            .collect();
         defs.extend(impls(&db).concat());
         assert_eq!(defs.len(), 8, "four functions and the impls' four");
         for def in defs {
@@ -728,4 +731,3 @@ fn privacy_is_checked_from_the_def_site_of_the_name() {
         );
     });
 }
-

@@ -11,7 +11,7 @@
 //! ones of crates no edit reaches, which the unit's references and key name
 //! ([`super::refs::built_in`]).
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_codegen::{
     Backend,
     settings::{Panic, Spec},

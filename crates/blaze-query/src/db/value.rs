@@ -89,9 +89,15 @@ container_values!(indexmap::IndexSet<K, S>);
 // `'static`, so no memo holds a map in one: a memo outlives the task.
 unsafe impl Value for std::alloc::Global {}
 // SAFETY: every kept parameter is a `Value`, the allocator included.
-unsafe impl<K: Value, V: Value, S: Value, A: Value + std::alloc::Allocator> Value for blaze_hash::Map<K, V, S, A> {}
+unsafe impl<K: Value, V: Value, S: Value, A: Value + std::alloc::Allocator> Value
+    for blaze_hash::Map<K, V, S, A>
+{
+}
 // SAFETY: as above.
-unsafe impl<K: Value, S: Value, A: Value + std::alloc::Allocator> Value for blaze_hash::Set<K, S, A> {}
+unsafe impl<K: Value, S: Value, A: Value + std::alloc::Allocator> Value
+    for blaze_hash::Set<K, S, A>
+{
+}
 
 // SAFETY: the owned pointee is a `Value`.
 unsafe impl<T: ?Sized + Value> Value for Box<T> {}

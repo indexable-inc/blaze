@@ -76,7 +76,11 @@ impl Found {
             && let Some(at) = diagnostic.spans.iter().find(|it| it.primary)
         {
             // alloc: an error's identity, once per error of the check
-            self.errors.insert((diagnostic.code.map(str::to_owned), at.file.to_owned(), diagnostic.message.to_owned()));
+            self.errors.insert((
+                diagnostic.code.map(str::to_owned),
+                at.file.to_owned(),
+                diagnostic.message.to_owned(),
+            ));
         }
         if !self.wanted(diagnostic.code) {
             return;
@@ -86,7 +90,9 @@ impl Found {
             if replaced().next().is_none() {
                 continue;
             }
-            let whole = replaced().all(|it| it.applicability == Some(Applicability::MachineApplicable) && inside(it.file));
+            let whole = replaced().all(|it| {
+                it.applicability == Some(Applicability::MachineApplicable) && inside(it.file)
+            });
             if !whole {
                 self.left += 1;
                 continue;
@@ -112,7 +118,9 @@ impl Found {
         let mut seen: BTreeSet<&[Part]> = BTreeSet::new();
         let mut count = 0;
         for suggestion in &self.suggestions {
-            if !seen.insert(suggestion.as_slice()) || suggestion.iter().any(|part| made.iter().any(|it| it.overlaps(part))) {
+            if !seen.insert(suggestion.as_slice())
+                || suggestion.iter().any(|part| made.iter().any(|it| it.overlaps(part)))
+            {
                 continue;
             }
             made.extend(suggestion);
@@ -156,12 +164,16 @@ pub fn pin(request: &mut Request) -> Result<Pinned, String> {
     };
     let head = head.clone(); // clone: the head's name, kept for the commit
     let mut root = None;
-    observe::ask(Request::Open { view: ViewRef::Head(head.clone()) }, Start::IfMissing, |response| {
-        if let ResponseRef::Opened { root: it } = response {
-            root = Some(it);
-        }
-        Ok(())
-    })?;
+    observe::ask(
+        Request::Open { view: ViewRef::Head(head.clone()) },
+        Start::IfMissing,
+        |response| {
+            if let ResponseRef::Opened { root: it } = response {
+                root = Some(it);
+            }
+            Ok(())
+        },
+    )?;
     let root = root.ok_or("the daemon answered the checkout's open with no root")?;
     *view = ViewRef::Root(View { root });
     Ok(Pinned { root, head, targets: targets.clone() })
@@ -219,7 +231,8 @@ pub fn run(found: Found, pinned: &Pinned, root: &Path) -> Result<Fixed, String> 
     files.dedup();
     if !made.is_empty() {
         let mut rebased = None;
-        let commit = Request::Commit { ops: made.clone(), base: pinned.root, head: pinned.head.clone() };
+        let commit =
+            Request::Commit { ops: made.clone(), base: pinned.root, head: pinned.head.clone() };
         observe::ask(commit, Start::Never, |response| {
             if let ResponseRef::Committed { rebased: it, .. } = response {
                 rebased = Some(it);
@@ -245,7 +258,10 @@ pub fn run(found: Found, pinned: &Pinned, root: &Path) -> Result<Fixed, String> 
 /// suggestions of `lints` alone as in the first. A daemon's error (the ops don't apply, the
 /// check could not run) is the error.
 fn checked(pinned: &Pinned, ops: &[Op], lints: &[String]) -> Result<Found, String> {
-    let view = ViewRef::WhatIf { ops: ops.to_vec(), base: Box::new(ViewRef::Root(View { root: pinned.root })) };
+    let view = ViewRef::WhatIf {
+        ops: ops.to_vec(),
+        base: Box::new(ViewRef::Root(View { root: pinned.root })),
+    };
     let request = Request::Check { view, targets: pinned.targets.clone() };
     let mut client = match daemon::connect(Start::Never) {
         Ok(Some(client)) => client,
@@ -277,7 +293,8 @@ mod tests {
     }
 
     #[test]
-    fn a_suggestion_overlapping_one_before_it_or_given_twice_is_left_and_each_file_is_edited_from_its_end() {
+    fn a_suggestion_overlapping_one_before_it_or_given_twice_is_left_and_each_file_is_edited_from_its_end()
+     {
         let found = Found {
             lints: Vec::new(),
             suggestions: vec![
@@ -313,10 +330,17 @@ mod tests {
     #[test]
     fn each_lint_narrows_the_suggestions_made_and_none_makes_every_one() {
         let every = Found::new(&[]);
-        assert!(every.wanted(Some("unused_imports")) && every.wanted(Some("clippy::needless_return")) && every.wanted(None));
+        assert!(
+            every.wanted(Some("unused_imports"))
+                && every.wanted(Some("clippy::needless_return"))
+                && every.wanted(None)
+        );
         let lints = ["clippy::disallowed_types".to_owned(), "unused_imports".to_owned()];
         let narrowed = Found::new(&lints);
-        assert!(narrowed.wanted(Some("clippy::disallowed_types")) && narrowed.wanted(Some("unused_imports")));
+        assert!(
+            narrowed.wanted(Some("clippy::disallowed_types"))
+                && narrowed.wanted(Some("unused_imports"))
+        );
         assert!(!narrowed.wanted(Some("clippy::needless_return")) && !narrowed.wanted(None));
     }
 

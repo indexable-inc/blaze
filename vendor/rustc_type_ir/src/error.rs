@@ -5,8 +5,16 @@ use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisit
 use crate::solve::{NoSolution, NoSolutionOrRerunNonErased};
 use crate::{self as ty, Const, Interner, Region};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(TypeFoldable_Generic, TypeVisitable_Generic, GenericTypeVisitable)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    TypeFoldable_Generic,
+    TypeVisitable_Generic,
+    GenericTypeVisitable,
+)]
 pub struct ExpectedFound<T> {
     pub expected: T,
     pub found: T,

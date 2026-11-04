@@ -14,16 +14,23 @@ pub(crate) fn hand(responses: &[Response], mut on: impl FnMut(ResponseRef<'_>, b
             ok = *it;
         }
         let bytes = blaze_protocol::cbor::to_vec(response).unwrap();
-        on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(&bytes).unwrap(), at + 1 < responses.len());
+        on(
+            blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(&bytes).unwrap(),
+            at + 1 < responses.len(),
+        );
     }
     ok
 }
 
 #[test]
 fn a_response_handed_in_place_is_the_one_sent() {
-    let sent = [Response::Fetched { verb: blaze_api::FetchVerb::Updating, what: "crates.io index".to_owned() }, Response::Done {
-        ok: true,
-    }];
+    let sent = [
+        Response::Fetched {
+            verb: blaze_api::FetchVerb::Updating,
+            what: "crates.io index".to_owned(),
+        },
+        Response::Done { ok: true },
+    ];
     let mut got = Vec::new();
     assert!(hand(&sent, |response, more| got.push((response.into_owned(), more))));
     assert_eq!(got, [(sent[0].clone(), true), (sent[1].clone(), false)]);
@@ -31,7 +38,12 @@ fn a_response_handed_in_place_is_the_one_sent() {
 
 #[test]
 fn a_start_that_never_listens_names_the_socket() {
-    let said = not_listening(Path::new("/run/blaze/v2.sock"), Path::new("/c/blaze/v2/serve.log"), 41, Phase::Setup);
+    let said = not_listening(
+        Path::new("/run/blaze/v2.sock"),
+        Path::new("/c/blaze/v2/serve.log"),
+        41,
+        Phase::Setup,
+    );
     assert_eq!(
         said,
         "the daemon (`blaze serve`, pid 41) was started and did not listen at /run/blaze/v2.sock: it was \
@@ -52,7 +64,10 @@ fn the_status_for_people() {
         bugs: Vec::new(),
         settings: Vec::new(),
     };
-    assert_eq!(status_lines(&status), "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\nbugs: 0\n");
+    assert_eq!(
+        status_lines(&status),
+        "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\nbugs: 0\n"
+    );
     let idle = Status {
         pid: 7,
         requests: Vec::new(),
@@ -64,10 +79,16 @@ fn the_status_for_people() {
         bugs: Vec::new(),
         settings: Vec::new(),
     };
-    assert_eq!(status_lines(&idle), "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nbugs: 0\n");
+    assert_eq!(
+        status_lines(&idle),
+        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nbugs: 0\n"
+    );
     let told = Status {
         settings: vec![
-            blaze_api::Setting { name: "BLAZE_DAEMON_MEMORY_GB".to_owned(), value: Some("80".to_owned()) },
+            blaze_api::Setting {
+                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
+                value: Some("80".to_owned()),
+            },
             blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
         ],
         ..idle.clone()
@@ -76,9 +97,15 @@ fn the_status_for_people() {
         status_lines(&told),
         "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nsettings: BLAZE_DAEMON_MEMORY_GB=80\nbugs: 0\n"
     );
-    let failed =
-        Status { history: Some("the profile history: writing /h/0-00000003.spans.parquet: disk full".to_owned()), ..idle.clone() };
-    assert!(status_lines(&failed).ends_with("history: the profile history: writing /h/0-00000003.spans.parquet: disk full\nbugs: 0\n"));
+    let failed = Status {
+        history: Some(
+            "the profile history: writing /h/0-00000003.spans.parquet: disk full".to_owned(),
+        ),
+        ..idle.clone()
+    };
+    assert!(status_lines(&failed).ends_with(
+        "history: the profile history: writing /h/0-00000003.spans.parquet: disk full\nbugs: 0\n"
+    ));
     let bug = |count, thread: Option<&str>| blaze_api::Bug {
         kind: "AdtDef".to_owned(),
         what: "formatted with no database attached".to_owned(),
@@ -109,7 +136,11 @@ struct OfBuild {
 }
 
 impl Api for OfBuild {
-    fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, request: Request, on: F) -> Result<bool, ClientError> {
+    fn call<F: FnMut(ResponseRef<'_>, bool)>(
+        &mut self,
+        request: Request,
+        on: F,
+    ) -> Result<bool, ClientError> {
         let answer = match request {
             Request::Status => vec![
                 Response::Status(Status {
@@ -150,7 +181,11 @@ fn a_client_of_another_build_sends_the_daemon_only_its_status() {
     let mut daemon = OfBuild { build: a.clone(), asked: Vec::new(), settings: Vec::new() };
     let got = builds(&mut daemon, Path::new(SOCKET), &b.exe, &[], || Ok(b.clone())).unwrap();
     assert_eq!(got, Builds::Other { pid: 77, theirs: a, ours: b });
-    assert_eq!(daemon.asked, [Request::Status], "nothing but its Status is asked of another build's daemon");
+    assert_eq!(
+        daemon.asked,
+        [Request::Status],
+        "nothing but its Status is asked of another build's daemon"
+    );
 }
 
 /// The daemon's executable, unchanged, is this blaze: nothing is hashed.
@@ -158,7 +193,9 @@ fn a_client_of_another_build_sends_the_daemon_only_its_status() {
 fn a_daemon_of_this_very_file_is_this_build_with_nothing_hashed() {
     let a = build(1, "/opt/blaze", 10);
     let mut daemon = OfBuild { build: a.clone(), asked: Vec::new(), settings: Vec::new() };
-    let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &[], || panic!("hashed this blaze for an unchanged file"));
+    let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &[], || {
+        panic!("hashed this blaze for an unchanged file")
+    });
     assert_eq!(got.unwrap(), Builds::Same);
 }
 
@@ -179,21 +216,39 @@ fn a_daemon_of_another_file_with_the_same_bytes_is_this_build() {
 #[test]
 fn a_daemon_started_with_another_limit_is_found_before_any_request() {
     let a = build(1, "/opt/blaze", 10);
-    let theirs = crate::serve::settings::of_daemon(Some(&(80u64 << 30, "--memory-gb=80".to_owned())), |_| None);
-    let ours = crate::serve::settings::of_client(|name| (name == crate::serve::MEMORY_VAR).then(|| "100".into()));
+    let theirs = crate::serve::settings::of_daemon(
+        Some(&(80u64 << 30, "--memory-gb=80".to_owned())),
+        |_| None,
+    );
+    let ours = crate::serve::settings::of_client(|name| {
+        (name == crate::serve::MEMORY_VAR).then(|| "100".into())
+    });
     let mut daemon = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
-    let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &ours, || panic!("hashed this blaze for an unchanged file")).unwrap();
+    let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &ours, || {
+        panic!("hashed this blaze for an unchanged file")
+    })
+    .unwrap();
     let drift = vec![crate::serve::settings::Drift {
         name: crate::serve::MEMORY_VAR.to_owned(),
         theirs: Some("80".to_owned()),
         ours: "100".to_owned(),
     }];
     assert_eq!(got, Builds::Settings { pid: 77, drift });
-    assert_eq!(daemon.asked, [Request::Status], "nothing but its Status is asked before the settings agree");
+    assert_eq!(
+        daemon.asked,
+        [Request::Status],
+        "nothing but its Status is asked before the settings agree"
+    );
     for asked in [Some("80"), None] {
         let mut same = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
-        let ours = crate::serve::settings::of_client(|name| (name == crate::serve::MEMORY_VAR).then_some(asked).flatten().map(Into::into));
-        assert_eq!(builds(&mut same, Path::new(SOCKET), &a.exe, &ours, || panic!("hashed")).unwrap(), Builds::Same, "{asked:?}");
+        let ours = crate::serve::settings::of_client(|name| {
+            (name == crate::serve::MEMORY_VAR).then_some(asked).flatten().map(Into::into)
+        });
+        assert_eq!(
+            builds(&mut same, Path::new(SOCKET), &a.exe, &ours, || panic!("hashed")).unwrap(),
+            Builds::Same,
+            "{asked:?}"
+        );
     }
 }
 
@@ -202,13 +257,20 @@ fn a_daemon_started_with_another_limit_is_found_before_any_request() {
 fn a_daemon_of_another_schema_is_refused_naming_both() {
     struct OtherSchema;
     impl Api for OtherSchema {
-        fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, _: Request, _: F) -> Result<bool, ClientError> {
+        fn call<F: FnMut(ResponseRef<'_>, bool)>(
+            &mut self,
+            _: Request,
+            _: F,
+        ) -> Result<bool, ClientError> {
             Err(ClientError::Schema { theirs: blaze_api::SCHEMA - 1 })
         }
     }
     let ours = build(2, "/new/blaze", 20);
-    let why = builds(&mut OtherSchema, Path::new(SOCKET), &ours.exe, &[], || Ok(ours.clone())).unwrap_err().to_string();
-    let schemas = format!("speaks API schema {}, this blaze {}", blaze_api::SCHEMA - 1, blaze_api::SCHEMA);
+    let why = builds(&mut OtherSchema, Path::new(SOCKET), &ours.exe, &[], || Ok(ours.clone()))
+        .unwrap_err()
+        .to_string();
+    let schemas =
+        format!("speaks API schema {}, this blaze {}", blaze_api::SCHEMA - 1, blaze_api::SCHEMA);
     assert!(why.contains(SOCKET) && why.contains(&schemas), "{why}");
 }
 
@@ -227,7 +289,11 @@ fn a_stops_steps_read_with_its_done_are_the_waits() {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 64];
             _ = stream.read(&mut request).unwrap();
-            let mut burst = blaze_api::frames::encode(&blaze_api::Envelope::new(1, Response::Done { ok: true })).unwrap();
+            let mut burst = blaze_api::frames::encode(&blaze_api::Envelope::new(
+                1,
+                Response::Done { ok: true },
+            ))
+            .unwrap();
             let step = Response::Stopping { doing: "writing the daemon image".to_owned() };
             burst.extend(blaze_api::frames::encode(&blaze_api::Envelope::new(1, step)).unwrap());
             stream.write_all(&burst).unwrap();

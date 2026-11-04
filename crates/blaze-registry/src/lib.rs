@@ -140,7 +140,8 @@ impl PackageCacheLock {
             Ok(file) => file,
             Err(file) => {
                 eprintln!("    Blocking waiting for file lock on package cache");
-                stdx::file_lock::Locked::lock(file).with_context(|| format!("failed to lock `{}`", path.display()))?
+                stdx::file_lock::Locked::lock(file)
+                    .with_context(|| format!("failed to lock `{}`", path.display()))?
             }
         };
         Ok(PackageCacheLock { _file: file })

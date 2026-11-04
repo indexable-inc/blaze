@@ -15,7 +15,7 @@ cargo build -p blaze-engine --release
 ## Test
 
 ```
-cargo fmt --all -- --check
+blaze fmt --all --check
 cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax
 ```
 

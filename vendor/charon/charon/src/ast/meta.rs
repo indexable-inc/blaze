@@ -15,9 +15,21 @@ pub use names::*;
 pub use spans::*;
 
 /// How much to translate for a given item.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    EnumAsInner,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum ItemOpacity {
     /// Translate the item fully.
     Transparent,
@@ -41,8 +53,7 @@ pub enum ItemOpacity {
 }
 
 /// Meta information about an item (function, trait decl, trait impl, type decl, global).
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(stateless)]
 pub struct ItemMeta {
     #[serde_state(stateful)]
@@ -120,11 +131,6 @@ impl ItemMeta {
     /// Whether the item is unsafe to declare: if it is declared in an `extern` block (safety.unsafe-extern),
     /// or it has an unsafe attribute (safety.unsafe-attribute).
     pub fn is_unsafe_to_declare(&self) -> bool {
-        self.is_extern
-            || self
-                .attr_info
-                .attributes
-                .iter()
-                .any(|attr| attr.is_unsafe_to_apply())
+        self.is_extern || self.attr_info.attributes.iter().any(|attr| attr.is_unsafe_to_apply())
     }
 }

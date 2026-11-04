@@ -38,29 +38,18 @@ fn normalize_method_call(ctx: &TransformCtx, fn_ptr: &FnPtr) -> Option<FnPtr> {
         // Transform `Trait::default_method<X>[impl_trait_for_X]` to a direct method call.
         FnPtrKind::Fun(fun_id) => {
             let fun_decl = ctx.translated.fun_decls.get(*fun_id)?;
-            let FunSource::TraitDefault {
-                trait_ref,
-                item_id: method_id,
-            } = &fun_decl.src
-            else {
+            let FunSource::TraitDefault { trait_ref, item_id: method_id } = &fun_decl.src else {
                 return None;
             };
             // If the first trait proof (for the self clause) is a known impl.
-            impl_trait_ref = fn_ptr
-                .generics
-                .trait_refs
-                .get(TraitClauseId::ZERO)?
-                .clone()
-                .no_bound_vars();
+            impl_trait_ref =
+                fn_ptr.generics.trait_refs.get(TraitClauseId::ZERO)?.clone().no_bound_vars();
             let impl_ref = impl_trait_ref.kind.as_trait_impl()?;
             method_generics = {
                 let generics = &fn_ptr.generics;
                 let trait_generics = trait_ref.generics.as_ref();
                 GenericArgs {
-                    regions: generics
-                        .regions
-                        .clone()
-                        .split_off(trait_generics.regions.len()),
+                    regions: generics.regions.clone().split_off(trait_generics.regions.len()),
                     types: generics.types.clone().split_off(trait_generics.types.len()),
                     const_generics: generics
                         .const_generics
@@ -93,11 +82,8 @@ fn normalize_method_call(ctx: &TransformCtx, fn_ptr: &FnPtr) -> Option<FnPtr> {
 
     // Make the two levels of binding explicit: outer binder for the impl block, inner binder for
     // the method.
-    let fn_ref: Binder<Binder<FunDeclRef>> = Binder::new(
-        BinderKind::Other,
-        trait_impl.generics.clone(),
-        bound_fn.clone(),
-    );
+    let fn_ref: Binder<Binder<FunDeclRef>> =
+        Binder::new(BinderKind::Other, trait_impl.generics.clone(), bound_fn.clone());
     // Substitute the appropriate generics into the function call.
     let fn_ref = fn_ref.apply(&impl_ref.generics).apply(method_generics);
     Some(FnPtr::new(FnPtrKind::Fun(fn_ref.id), fn_ref.generics))
@@ -106,9 +92,6 @@ fn normalize_method_call(ctx: &TransformCtx, fn_ptr: &FnPtr) -> Option<FnPtr> {
 pub struct Transform;
 impl UllbcPass for Transform {
     fn transform_item(&self, ctx: &mut TransformCtx, mut item: ItemRefMut<'_>) {
-        let _ = item.drive_mut(&mut NormalizeFnPtr {
-            ctx,
-            visited_tys: Default::default(),
-        });
+        let _ = item.drive_mut(&mut NormalizeFnPtr { ctx, visited_tys: Default::default() });
     }
 }

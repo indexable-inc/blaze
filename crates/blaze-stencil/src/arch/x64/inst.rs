@@ -98,7 +98,12 @@ fn to_gpr(
 }
 
 /// `value` into XMM register `dst`.
-fn to_xmm(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst, dst: u8, value: ir::Value) -> Result<(), Error> {
+fn to_xmm(
+    cx: &mut Cx<'_, '_, X64>,
+    inst: ir::Inst,
+    dst: u8,
+    value: ir::Value,
+) -> Result<(), Error> {
     let ty = cx.func.dfg.value_type(value);
     match cx.loc(value) {
         Loc::Slot(off) => asm::xload(cx.buf, Sse::of(ty.bytes()), dst, slot(off)),
@@ -318,7 +323,10 @@ enum Callee {
 }
 
 /// The callee, signature and arguments of a call.
-fn call_of(func: &ir::Function, inst: ir::Inst) -> Result<(Callee, ir::SigRef, &[ir::Value]), Error> {
+fn call_of(
+    func: &ir::Function,
+    inst: ir::Inst,
+) -> Result<(Callee, ir::SigRef, &[ir::Value]), Error> {
     let data = &func.dfg.insts[inst];
     Ok(match data.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
         ir::instructions::CallInfo::Direct(f, args) => {
@@ -481,11 +489,8 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let frame = *cx.frame;
     let tail = func.signature.call_conv == CallConv::Tail;
     let new = abi::stack_args(sig).map_err(blame(inst))?;
-    let (base, shrink) = if tail {
-        (16 + frame.pop as i32 - new as i32, frame.pop - new)
-    } else {
-        (16, 0)
-    };
+    let (base, shrink) =
+        if tail { (16 + frame.pop as i32 - new as i32, frame.pop - new) } else { (16, 0) };
     let to = |at_: u32| at(RBP, base + at_ as i32);
 
     abi::args(sig, |i, param, place| {

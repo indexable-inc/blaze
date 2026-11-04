@@ -56,7 +56,8 @@ impl Scenario {
     /// `who` takes the session's turn, runs `during` holding it, and gives it back.
     fn call(&self, who: &'static str, during: impl FnOnce()) -> Result<&'static str, String> {
         self.note(format!("{who} asks for the session's turn"));
-        let turn = self.turns.take(session(), &mut named).map_err(|it| it.said("the test's session"))?;
+        let turn =
+            self.turns.take(session(), &mut named).map_err(|it| it.said("the test's session"))?;
         if self.in_turn.swap(true, Ordering::SeqCst) {
             return Err(format!("{who} was given the session's turn while another call held it"));
         }
@@ -108,16 +109,24 @@ fn calls_of_one_session_wait_their_turn_switched_out(workers: usize) {
     });
     let (ended, endings) = mpsc::channel();
     {
-        let (this, on, others, ended) = (Arc::clone(&scenario), Arc::clone(&pool), ended.clone(), ended.clone());
+        let (this, on, others, ended) =
+            (Arc::clone(&scenario), Arc::clone(&pool), ended.clone(), ended.clone());
         pool.submit(
             None,
             move || {
                 this.call("the holder", || {
-                    for who in ["the first other call", "the second other call"].into_iter().take(this.others) {
+                    for who in ["the first other call", "the second other call"]
+                        .into_iter()
+                        .take(this.others)
+                    {
                         this.other(&on, who, others.clone());
                     }
                     this.note("the holder waits for its expansion, switched out");
-                    let waited = wait::wait(WaitOn::Channel("the test's expansion of the holder"), None, || done.wait());
+                    let waited = wait::wait(
+                        WaitOn::Channel("the test's expansion of the holder"),
+                        None,
+                        || done.wait(),
+                    );
                     this.note(format!("the holder's expansion ended: {waited:?}"));
                 })
             },
@@ -141,20 +150,34 @@ fn calls_of_one_session_wait_their_turn_switched_out(workers: usize) {
             );
         };
         let said = || scenario.log.lock().join("\n  ");
-        ended.push(it.unwrap_or_else(|why| panic!("{why}; what happened, in order:\n  {}", said())));
+        ended
+            .push(it.unwrap_or_else(|why| panic!("{why}; what happened, in order:\n  {}", said())));
     }
     // One call at a time held the turn, the holder first: each hold is followed by the same
     // call's give-back before the next call's hold.
     let log = scenario.log.lock();
     let turns: Vec<&str> = log
         .iter()
-        .filter_map(|it| it.strip_suffix(" holds the session's turn").or_else(|| it.strip_suffix(" gives the session's turn back")))
+        .filter_map(|it| {
+            it.strip_suffix(" holds the session's turn")
+                .or_else(|| it.strip_suffix(" gives the session's turn back"))
+        })
         .collect();
     let said = log.join("\n  ");
-    assert_eq!(turns.len(), 2 * (workers + 1), "every call held the turn once; what happened, in order:\n  {said}");
-    assert_eq!(turns[0], "the holder", "the holder's turn came first; what happened, in order:\n  {said}");
+    assert_eq!(
+        turns.len(),
+        2 * (workers + 1),
+        "every call held the turn once; what happened, in order:\n  {said}"
+    );
+    assert_eq!(
+        turns[0], "the holder",
+        "the holder's turn came first; what happened, in order:\n  {said}"
+    );
     for pair in turns.chunks(2) {
-        assert_eq!(pair[0], pair[1], "a call held the turn while another had it; what happened, in order:\n  {said}");
+        assert_eq!(
+            pair[0], pair[1],
+            "a call held the turn while another had it; what happened, in order:\n  {said}"
+        );
     }
     drop(log);
     Arc::try_unwrap(pool).ok().expect("every job of the pool ended").stop(DEADLINE).unwrap();

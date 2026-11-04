@@ -97,7 +97,11 @@ impl Pinned<'_> {
     /// [`Pinned::file`], its bytes held past the pin: the tree's own, with one count taken. A
     /// walk of many directories reads each file this way under one pin, listing with
     /// [`Pinned::list`].
-    pub fn held(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    pub fn held(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         let Some((node, mode)) = self.walk(root, path) else { return Ok(None) };
         let table = self.snapshot.table();
         let shape = table.shape(node);

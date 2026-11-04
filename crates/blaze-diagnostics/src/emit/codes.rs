@@ -545,7 +545,11 @@ mod tests {
 
     #[test]
     fn a_code_has_rustcs_explanation_and_an_unknown_one_none() {
-        assert!(explanation("E0308").unwrap().starts_with("Expected type did not match the received type.\n"));
+        assert!(
+            explanation("E0308")
+                .unwrap()
+                .starts_with("Expected type did not match the received type.\n")
+        );
         assert!(explanation("E0001").unwrap().contains("no longer emitted"));
         assert_eq!(explanation("E9999"), None);
         assert_eq!(explanation("unused_variables"), None);

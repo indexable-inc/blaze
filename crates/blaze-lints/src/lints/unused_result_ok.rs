@@ -35,17 +35,23 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     let Some(range) = cx.range(expr.syntax()) else { return };
     let receiver = cx.source_of(call.receiver.syntax());
     let in_result_fn = match unwrap_in_result::owner(cx, expr.syntax()) {
-        Some(unwrap_in_result::Owner::Fn(f)) => {
-            unwrap_in_result::returns(cx, f).is_some_and(|it| utils::option_or_result(cx, &it) == Some("Result"))
-        }
+        Some(unwrap_in_result::Owner::Fn(f)) => unwrap_in_result::returns(cx, f)
+            .is_some_and(|it| utils::option_or_result(cx, &it) == Some("Result")),
         _ => false,
     };
     let span = cx.span(range);
-    let message = format!("`{receiver}.ok();` drops the error of `{receiver}`: `.ok()` only silences `#[must_use]`");
+    let message = format!(
+        "`{receiver}.ok();` drops the error of `{receiver}`: `.ok()` only silences `#[must_use]`"
+    );
     let diagnostic = cx.lint(LINT, expr.syntax(), span.clone(), message);
     if in_result_fn {
         diagnostic
-            .suggestion(span, "return the error instead", format!("{receiver}?"), Applicability::MaybeIncorrect)
+            .suggestion(
+                span,
+                "return the error instead",
+                format!("{receiver}?"),
+                Applicability::MaybeIncorrect,
+            )
             .note("the function's error type must convert from this one");
     } else {
         diagnostic.help("handle the `Err` (a `match`, `?`), or say why it may be dropped: `#[expect(clippy::unused_result_ok, reason = \"..\")]`");

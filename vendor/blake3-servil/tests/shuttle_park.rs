@@ -71,7 +71,11 @@ fn run(workers: usize, publishers: usize, each: usize) {
                         let p = published.load(Ordering::SeqCst);
                         let t = taken.load(Ordering::SeqCst);
                         if t < p {
-                            if taken.compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() && t + 1 == total {
+                            if taken
+                                .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                                && t + 1 == total
+                            {
                                 park.wake_one(); // the last task: let the rest leave too
                             }
                             if t + 1 == total {
@@ -83,7 +87,10 @@ fn run(workers: usize, publishers: usize, each: usize) {
                             return;
                         }
                         // None: park unless work shows, as the pool's worker does.
-                        let visible = || taken.load(Ordering::SeqCst) < published.load(Ordering::SeqCst) || taken.load(Ordering::SeqCst) == total;
+                        let visible = || {
+                            taken.load(Ordering::SeqCst) < published.load(Ordering::SeqCst)
+                                || taken.load(Ordering::SeqCst) == total
+                        };
                         if park.park_unless(me, visible) {
                             park.pay_owed();
                         }
@@ -215,7 +222,8 @@ fn wakes_fan_out_no_waker_makes_more_than_its_share() {
             let made = Arc::new(AtomicUsize::new(0));
             let mut threads = Vec::new();
             for me in 0..5 {
-                let (park, woken, most, made) = (park.clone(), woken.clone(), most.clone(), made.clone());
+                let (park, woken, most, made) =
+                    (park.clone(), woken.clone(), most.clone(), made.clone());
                 threads.push(thread::spawn(move || {
                     park.register(me);
                     // Woken, never by finding the work: the handshake that

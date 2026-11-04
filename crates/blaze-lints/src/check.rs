@@ -15,7 +15,6 @@ use std::{
 use base_db::{Db, EditionedFileId};
 use blaze_diagnostics::model;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
 use hir::{HasAttrs as _, HirFileId, InFile};
 use hir_def::{
@@ -26,6 +25,7 @@ use hir_def::{
 };
 use hir_expand::{AstId, MacroCallId, MacroCallKind, MacroDefKind};
 use span::{AstIdMap, Edition};
+use std::alloc::Global;
 use syntax::{
     AstPtr, FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, WalkEvent,
     view::{
@@ -73,7 +73,12 @@ pub type NameOf<'a> = &'a dyn Fn(base_db::FileId) -> Option<String>;
 /// The diagnostics of the lints of `krate`, in the order rustc would emit them. A file of the
 /// crate, or of a span a lint gives, that `name_of` does not name is the error: its lints are
 /// never left out.
-pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Vec<Found>, diag::CheckError> {
+pub fn check(
+    db: &Db,
+    krate: hir::Crate,
+    setup: &Setup,
+    name_of: NameOf<'_>,
+) -> Result<Vec<Found>, diag::CheckError> {
     blaze_query::db::attach(db, || {
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
@@ -182,7 +187,8 @@ impl<'q> Driver<'q> {
         let base = self.krate.base();
         let plan = query::lint_plan(db, base);
         for &ModuleFile { file, declared } in plan.files.iter() {
-            let name = (self.name_of)(file.file_id(db)).ok_or(diag::Unnamed { file: file.file_id(db) })?;
+            let name =
+                (self.name_of)(file.file_id(db)).ok_or(diag::Unnamed { file: file.file_id(db) })?;
             let mut place = None;
             let mut parent_of = None;
             if let Some((parent_file, range)) = declared {
@@ -223,7 +229,10 @@ impl<'q> Driver<'q> {
         Ok(())
     }
 
-    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) -> Result<(), diag::CheckError> {
+    fn lint_body(
+        &mut self,
+        BodyAt { def, file, offset, item }: BodyAt,
+    ) -> Result<(), diag::CheckError> {
         let db = self.db;
         let Some(&at) = self.by_id.get(&file) else { return Ok(()) };
         let named = &self.files[at];
@@ -272,7 +281,13 @@ impl<'q> Driver<'q> {
     }
 
     /// Takes what a query found in the file `at`, moving its ranges by `offset`.
-    fn take(&mut self, at: usize, offset: u32, lints: &Lints, hot: Option<profile::Hit>) -> Result<(), diag::CheckError> {
+    fn take(
+        &mut self,
+        at: usize,
+        offset: u32,
+        lints: &Lints,
+        hot: Option<profile::Hit>,
+    ) -> Result<(), diag::CheckError> {
         let file = &self.files[at];
         if let Some(path) = &lints.not_known {
             // clone: an error's names, once
@@ -280,11 +295,17 @@ impl<'q> Driver<'q> {
         }
         if let Some(why) = &lints.unchecked {
             // clone: an error's names, once
-            return Err(diag::CheckError::SuspendUnchecked { file: file.name.clone(), why: why.clone() });
+            return Err(diag::CheckError::SuspendUnchecked {
+                file: file.name.clone(),
+                why: why.clone(),
+            });
         }
         if let Some(why) = &lints.not_in_map {
             // clone: an error's names, once
-            return Err(diag::CheckError::NotInAstIdMap { file: file.name.clone(), why: why.clone() });
+            return Err(diag::CheckError::NotInAstIdMap {
+                file: file.name.clone(),
+                why: why.clone(),
+            });
         }
         let moved = |range: TextRange| range + TextSize::new(offset);
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
@@ -346,10 +367,13 @@ impl<'q> Driver<'q> {
         use syntax::view::HasModuleItem as _;
         let db = self.db;
         let id = self.files[file].id;
-        let Some(name) = db.file_text(id.file_id(db)).appended_root_module(db) else { return false };
+        let Some(name) = db.file_text(id.file_id(db)).appended_root_module(db) else {
+            return false;
+        };
         let Some(root) = ast::SourceFile::cast(id.parse(db).root()) else { return false };
         let Some(ast::Item::Module(module)) = root.items().last() else { return false };
-        module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(at)
+        module.name().is_some_and(|it| it.text() == name)
+            && module.syntax().text_range().contains_range(at)
     }
 
     fn sets_at(&self, file: usize, at: TextRange) -> (Vec<Set>, bool) {
@@ -386,7 +410,8 @@ impl<'q> Driver<'q> {
                 });
             }
             let name = &self.files[file].name;
-            for LintAttr { level, target, name: attr_name, range, reason } in lint_attrs(self.cfg, owner)
+            for LintAttr { level, target, name: attr_name, range, reason } in
+                lint_attrs(self.cfg, owner)
             {
                 let source = Source::Node { name: attr_name, span: Span::new(name, range), reason };
                 sets.push(Set { target, spec: Spec { level, source } });
@@ -402,7 +427,8 @@ impl<'q> Driver<'q> {
         pending.sort_by(|a, b| a.order.cmp(&b.order));
         let mut found = Vec::new();
         let mut fulfilled: HashSet<Span, Global> = HashSet::new_in(Global);
-        let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool), Global> = HashMap::new_in(Global);
+        let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool), Global> =
+            HashMap::new_in(Global);
         for Pending { lint, file, at, mut diagnostic, hot, .. } in pending {
             // The compiler's own code: what blaze appended to the root is linted at no level.
             if self.in_appended(file, at) {
@@ -412,14 +438,18 @@ impl<'q> Driver<'q> {
                 sets_of.entry((file, at)).or_insert_with(|| self.sets_at(file, at)).clone();
             // blaze's own lints add their link after their own help, as clippy's order is.
             let (asked, docs) = match lint {
-                FoundLint::Clippy(lint) => (Lint::Clippy(lint.info()), Some(lint.info().docs_url())),
+                FoundLint::Clippy(lint) => {
+                    (Lint::Clippy(lint.info()), Some(lint.info().docs_url()))
+                }
                 FoundLint::Blaze(lint) => (Lint::Blaze(lint), None),
             };
             let mut spec = levels.of(asked, &sets);
             // A perf lint in a function the profile shows hot, at no level set for it: at
             // `blaze::profile_hot`'s, when its own is `allow`; with a note saying so, when not.
             let hot = match (hot, lint) {
-                (Some(hit), FoundLint::Blaze(it)) if blaze::PROFILE_NOTES.contains(&it) && spec.source == Source::Default => {
+                (Some(hit), FoundLint::Blaze(it))
+                    if blaze::PROFILE_NOTES.contains(&it) && spec.source == Source::Default =>
+                {
                     Some(hit)
                 }
                 _ => None,
@@ -436,7 +466,9 @@ impl<'q> Driver<'q> {
                         spec = Spec { level: by.level, source: Source::Profile { file, percent } };
                     }
                 } else {
-                    hot_note = Some(format!("this function is hot per profile `{file}`: {percent} of its counts"));
+                    hot_note = Some(format!(
+                        "this function is hot per profile `{file}`: {percent} of its counts"
+                    ));
                 }
             }
             match spec.level {
@@ -478,7 +510,11 @@ impl<'q> Driver<'q> {
                 continue;
             }
             let code = Code::Lint("unfulfilled_lint_expectations".to_owned());
-            let mut diagnostic = Diag::new(written_at(spec.level), Some(code), "this lint expectation is unfulfilled");
+            let mut diagnostic = Diag::new(
+                written_at(spec.level),
+                Some(code),
+                "this lint expectation is unfulfilled",
+            );
             diagnostic.span = MultiSpan::of(expectation.span);
             if let Some(reason) = expectation.reason {
                 diagnostic.sub(Sublevel::Note, reason, MultiSpan::default(), false);
@@ -497,13 +533,19 @@ impl<'q> Driver<'q> {
         let hits = self.hits?;
         let loaded = self.conf.profile.as_ref()?;
         if hits.unmatched_hot.is_empty()
-            || matches!(levels.of(Lint::Blaze(blaze::Lint::ProfileHot), &[]).level, Level::Allow | Level::Expect)
+            || matches!(
+                levels.of(Lint::Blaze(blaze::Lint::ProfileHot), &[]).level,
+                Level::Allow | Level::Expect
+            )
         {
             return None;
         }
         let name = self.krate.display_name(self.db).map_or_else(String::new, |it| it.to_string());
-        let shown: Vec<String> =
-            hits.unmatched_hot.iter().map(|(key, hit)| format!("`{key}` ({})", hit.percent())).collect();
+        let shown: Vec<String> = hits
+            .unmatched_hot
+            .iter()
+            .map(|(key, hit)| format!("`{key}` ({})", hit.percent()))
+            .collect();
         let message = format!(
             "profile `{}` matched {} of the {} functions of `{name}`; its hot names in the crate's path that matched none: {}",
             loaded.file_name(),
@@ -518,7 +560,11 @@ impl<'q> Driver<'q> {
                 hits.ambiguous
             ));
         }
-        diagnostic.note(format!("the profile is `{}`, named in {}", loaded.settings.path.display(), loaded.settings.named_in));
+        diagnostic.note(format!(
+            "the profile is `{}`, named in {}",
+            loaded.settings.path.display(),
+            loaded.settings.named_in
+        ));
         Some(Found { diagnostic, test_only: false })
     }
 }
@@ -708,7 +754,12 @@ pub(crate) fn lint_body(db: &Db, def: DefWithBodyId, on: On, conf: &Conf) -> Lin
                 return Lints::default();
             };
             cx.root = root;
-            cx.walking = Walking { input: Some(input), call_at: Some(call_at), in_bang, ..Walking::default() };
+            cx.walking = Walking {
+                input: Some(input),
+                call_at: Some(call_at),
+                in_bang,
+                ..Walking::default()
+            };
             cx.walk(root);
             cx.done()
         }
@@ -966,7 +1017,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
 
     /// The source of `node` as written in the file, or its text in the expansion it is in.
     pub(crate) fn source_of(&self, node: ast::Node<'t>) -> Cow<'t, str> {
-        match self.range(node).and_then(|it| self.base.text.get(std::ops::Range::<usize>::from(it))) {
+        match self.range(node).and_then(|it| self.base.text.get(std::ops::Range::<usize>::from(it)))
+        {
             Some(text) => Cow::Borrowed(text),
             None => Cow::Borrowed(node.text()),
         }
@@ -1000,7 +1052,9 @@ impl<'q: 't, 't> Cx<'q, 't> {
         let mut outermost = None;
         while let HirFileId::MacroFile(call) = file {
             let loc = call.loc(db);
-            let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
+            let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else {
+                return None;
+            };
             let builtin = match loc.def.kind {
                 MacroDefKind::BuiltInAttr(_, it) => Some(it),
                 _ => None,
@@ -1010,17 +1064,19 @@ impl<'q: 't, 't> Cx<'q, 't> {
                 HirFileId::FileId(_) => None,
                 HirFileId::MacroFile(prev) => self.upmap(prev, range),
             };
-            let written = self.node_of(*ast_id).and_then(ast::AnyHasAttrs::cast).and_then(|owner| {
-                let (attr, meta) =
-                    censored_attr_ids.invoc_attr().find_attr_range_with_source_view(db, loc.krate, owner);
-                // A `cfg_attr` holds the attribute: its `Attr` is the `cfg_attr`'s.
-                let ast::Meta::TokenTreeMeta(own) = attr.meta()? else { return None };
-                if own.syntax() != meta.syntax() {
-                    return None;
-                }
-                let args = own.token_tree()?;
-                Some((at(attr.syntax().text_range())?, at(args.syntax().text_range())?))
-            });
+            let written =
+                self.node_of(*ast_id).and_then(ast::AnyHasAttrs::cast).and_then(|owner| {
+                    let (attr, meta) = censored_attr_ids
+                        .invoc_attr()
+                        .find_attr_range_with_source_view(db, loc.krate, owner);
+                    // A `cfg_attr` holds the attribute: its `Attr` is the `cfg_attr`'s.
+                    let ast::Meta::TokenTreeMeta(own) = attr.meta()? else { return None };
+                    if own.syntax() != meta.syntax() {
+                        return None;
+                    }
+                    let args = own.token_tree()?;
+                    Some((at(attr.syntax().text_range())?, at(args.syntax().text_range())?))
+                });
             calls.push(AttrCall { builtin, written });
             outermost = Some(call);
             file = ast_id.file_id;
@@ -1092,7 +1148,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
         if range.len() < TextSize::new(2) {
             return;
         }
-        let inner = TextRange::new(range.start() + TextSize::new(1), range.end() - TextSize::new(1));
+        let inner =
+            TextRange::new(range.start() + TextSize::new(1), range.end() - TextSize::new(1));
         let Some(expansion) = self.expand(call) else { return };
         self.args_in(expansion, inner, out, 0);
         out.sort_unstable_by_key(|(range, _)| (range.start(), range.end()));
@@ -1196,7 +1253,9 @@ impl<'q: 't, 't> Cx<'q, 't> {
         if self.def.is_some() {
             return Vec::new();
         }
-        let Some(attr) = self.in_sema(attr.syntax()).and_then(ast::Attr::cast) else { return Vec::new() };
+        let Some(attr) = self.in_sema(attr.syntax()).and_then(ast::Attr::cast) else {
+            return Vec::new();
+        };
         attr.meta().and_then(|meta| self.sema().resolve_derive_macro(meta)).unwrap_or_default()
     }
 
@@ -1229,14 +1288,20 @@ impl<'q: 't, 't> Cx<'q, 't> {
     /// The `macro_rules!` or `macro` item defining `mac`; `None` for a proc macro.
     pub(crate) fn macro_source(&self, mac: hir::Macro) -> Option<ast::Macro<'q>> {
         match MacroId::from(mac) {
-            MacroId::MacroRulesId(it) => self.view_of(it.lookup(self.db).id).map(ast::Macro::MacroRules),
+            MacroId::MacroRulesId(it) => {
+                self.view_of(it.lookup(self.db).id).map(ast::Macro::MacroRules)
+            }
             MacroId::Macro2Id(it) => self.view_of(it.lookup(self.db).id).map(ast::Macro::MacroDef),
             MacroId::ProcMacroId(_) => None,
         }
     }
 
     /// `name` resolved as a one-segment path in the scope at `at`.
-    pub(crate) fn resolve_name(&self, at: ast::Node<'t>, name: &str) -> Option<hir::PathResolution<'q>> {
+    pub(crate) fn resolve_name(
+        &self,
+        at: ast::Node<'t>,
+        name: &str,
+    ) -> Option<hir::PathResolution<'q>> {
         if self.def.is_some() {
             let name = hir::Name::new_symbol_root(intern::Symbol::intern(name));
             let at = InFile::new(self.file_of(at), ast::ptr(at));
@@ -1382,7 +1447,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
             let in_variant = node.ancestors().skip(1).any(|it| it.kind() == SyntaxKind::VARIANT);
             return (in_variant || visibility.is_some_and(|it| it.syntax().text() == "pub"))
                 && node.ancestors().skip(1).find_map(ast::Adt::cast).is_some_and(|adt| {
-                    self.adt_def(adt).is_some_and(|it| exported.has(db, ModuleDefId::from(AdtId::from(it))))
+                    self.adt_def(adt)
+                        .is_some_and(|it| exported.has(db, ModuleDefId::from(AdtId::from(it))))
                 });
         }
         let key = (self.file_of(node), ast::ptr(node));
@@ -1425,9 +1491,13 @@ impl<'q: 't, 't> Cx<'q, 't> {
         let mut test = false;
         for_each_meta(self.cfg, owner.attrs(), |meta| match meta {
             ast::Meta::CfgMeta(meta) => {
-                test |= meta.cfg_predicate().is_some_and(|it| names_test(&CfgExpr::parse_from_view(it)))
+                test |=
+                    meta.cfg_predicate().is_some_and(|it| names_test(&CfgExpr::parse_from_view(it)))
             }
-            _ => test |= meta.simple_name() == Some("test") && ast::Fn::can_cast(owner.syntax().kind()),
+            _ => {
+                test |=
+                    meta.simple_name() == Some("test") && ast::Fn::can_cast(owner.syntax().kind())
+            }
         });
         test
     }
@@ -1495,7 +1565,9 @@ impl<'q: 't, 't> Cx<'q, 't> {
     ) -> &mut Diag {
         let span: MultiSpan = span.into();
         let place = match self.original_range(after) {
-            Some(range) => Place::At { at: u32::from(range.end()).saturating_sub(1), then: u32::MAX },
+            Some(range) => {
+                Place::At { at: u32::from(range.end()).saturating_sub(1), then: u32::MAX }
+            }
             None => Place::At { at: span.primary_span().map_or(0, |it| it.hi), then: u32::MAX },
         };
         self.report(FoundLint::Clippy(lint), at, place, span, message)
@@ -1655,7 +1727,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
             let paths = derive_paths(attr);
             for (call, (range, path)) in calls.iter().zip(paths) {
                 let Some(call) = *call else { continue };
-                let Some(expansion) = self.expansion_of(call, MacroKind::Derive, &path, range) else {
+                let Some(expansion) = self.expansion_of(call, MacroKind::Derive, &path, range)
+                else {
                     continue;
                 };
                 walks.push((call, expansion));
@@ -1680,9 +1753,13 @@ impl<'q: 't, 't> Cx<'q, 't> {
     ) -> Option<Expansion> {
         let call_site = self.range_in_base(call_site)?;
         let db = self.db;
-        let named = |file: HirFileId, range: TextRange| Some(diag::of_file(file.file_id()?.file_id(db), range));
+        let named = |file: HirFileId, range: TextRange| {
+            Some(diag::of_file(file.file_id()?.file_id(db), range))
+        };
         let def_site = match call.loc(db).def.kind {
-            MacroDefKind::ProcMacro(id, ..) => Some(named(id.file_id, signature_range(self.view_of(id)?))?),
+            MacroDefKind::ProcMacro(id, ..) => {
+                Some(named(id.file_id, signature_range(self.view_of(id)?))?)
+            }
             MacroDefKind::Declarative(id, _)
             | MacroDefKind::BuiltIn(id, _)
             | MacroDefKind::BuiltInAttr(id, _)
@@ -1693,7 +1770,10 @@ impl<'q: 't, 't> Cx<'q, 't> {
             }
         };
         let name = name.rsplit("::").next()?.trim().to_owned();
-        let opaque = !matches!(call.loc(db).def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..));
+        let opaque = !matches!(
+            call.loc(db).def.kind,
+            MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..)
+        );
         Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site, opaque })
     }
 
@@ -1707,7 +1787,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
         // An `expect` level, written plainly or in a `cfg_attr`, is an `expect` identifier.
         let has_expect = owner.attrs().any(|it| {
             it.syntax().descendants_with_tokens().any(|it| {
-                it.as_token().is_some_and(|it| it.kind() == SyntaxKind::IDENT && it.text() == "expect")
+                it.as_token()
+                    .is_some_and(|it| it.kind() == SyntaxKind::IDENT && it.text() == "expect")
             })
         });
         if !has_expect {
@@ -1723,7 +1804,11 @@ impl<'q: 't, 't> Cx<'q, 't> {
                 _ => false,
             };
             if ours {
-                self.expects.push(Expect { name: range, reason, owner: owner.syntax().text_range() });
+                self.expects.push(Expect {
+                    name: range,
+                    reason,
+                    owner: owner.syntax().text_range(),
+                });
             }
         }
     }
@@ -1937,9 +2022,15 @@ impl<'q: 't, 't> Cx<'q, 't> {
                      calls: &[(AstId<syntax::ast::Item>, MacroCallId)]| {
             for &(_, item) in list {
                 let (at, defined) = match item {
-                    AssocItemId::FunctionId(it) => (erased(it.lookup(db).id), ModuleDefId::FunctionId(it)),
-                    AssocItemId::ConstId(it) => (erased(it.lookup(db).id), ModuleDefId::ConstId(it)),
-                    AssocItemId::TypeAliasId(it) => (erased(it.lookup(db).id), ModuleDefId::TypeAliasId(it)),
+                    AssocItemId::FunctionId(it) => {
+                        (erased(it.lookup(db).id), ModuleDefId::FunctionId(it))
+                    }
+                    AssocItemId::ConstId(it) => {
+                        (erased(it.lookup(db).id), ModuleDefId::ConstId(it))
+                    }
+                    AssocItemId::TypeAliasId(it) => {
+                        (erased(it.lookup(db).id), ModuleDefId::TypeAliasId(it))
+                    }
                 };
                 if let Some(key) = self.key(at.0, at.1) {
                     items.defs.insert(key, defined);
@@ -1958,7 +2049,11 @@ impl<'q: 't, 't> Cx<'q, 't> {
                 ModuleDefId::AdtId(AdtId::UnionId(u)) => erased(u.lookup(db).id),
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     for &(variant, _) in e.enum_variants(db).variants.values() {
-                        def(items, erased(variant.lookup(db).id), ModuleDefId::EnumVariantId(variant));
+                        def(
+                            items,
+                            erased(variant.lookup(db).id),
+                            ModuleDefId::EnumVariantId(variant),
+                        );
                     }
                     erased(e.lookup(db).id)
                 }
@@ -2019,7 +2114,8 @@ fn is_body_owner(node: ast::Node<'_>) -> bool {
 /// clippy's `is_cfg_test`: the `cfg`'s list has the word `test`, as `cfg(test)` and two `cfg`s
 /// one of which is `cfg(test)` do.
 fn names_test(cfg: &CfgExpr) -> bool {
-    let is_test = |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
+    let is_test =
+        |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
     match cfg {
         CfgExpr::All(items) => items.iter().any(is_test),
         it => is_test(it),
@@ -2092,7 +2188,8 @@ fn lint_list(tt: ast::TokenTree<'_>) -> (Vec<(String, TextRange)>, Option<String
         let (Some(first), Some(last)) = (element.first().copied(), element.last().copied()) else {
             return;
         };
-        if first.text() == "reason" && element.get(1).is_some_and(|it| it.kind() == SyntaxKind::EQ) {
+        if first.text() == "reason" && element.get(1).is_some_and(|it| it.kind() == SyntaxKind::EQ)
+        {
             reason = element
                 .get(2)
                 .and_then(|it| ast::String::cast(*it))
@@ -2216,7 +2313,9 @@ mod m { #![cfg_attr(a, cfg(test))] }
                 let (mut old, mut new) = (Vec::new(), Vec::new());
                 if attrs {
                     reference(&cfg, owner.attrs(), |it| old.push(it.syntax().text_range()));
-                    super::for_each_meta(&cfg, owner.attrs(), |it| new.push(it.syntax().text_range()));
+                    super::for_each_meta(&cfg, owner.attrs(), |it| {
+                        new.push(it.syntax().text_range())
+                    });
                 } else {
                     let inner = || ast::attrs_including_inner(&owner);
                     reference(&cfg, inner(), |it| old.push(it.syntax().text_range()));

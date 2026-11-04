@@ -34,13 +34,18 @@ fn a_release_profile_is_refused_by_name_or_level() {
     }
     // `bench` by name, whatever its level says.
     let slow = policy(OptLevel::O0, Mode::Live);
-    assert!(matches!(allow(&Purpose { profile: "bench", policy: &slow, output: None }), Err(Refused::Release { .. })));
+    assert!(matches!(
+        allow(&Purpose { profile: "bench", policy: &slow, output: None }),
+        Err(Refused::Release { .. })
+    ));
 }
 
 #[test]
 fn a_build_that_writes_an_output_is_refused_naming_it() {
     let dev = policy(OptLevel::O0, Mode::Live);
-    let refused = allow(&Purpose { profile: "dev", policy: &dev, output: Some("target/debug/app") }).unwrap_err();
+    let refused =
+        allow(&Purpose { profile: "dev", policy: &dev, output: Some("target/debug/app") })
+            .unwrap_err();
     assert!(refused.to_string().contains("target/debug/app"), "{refused}");
     let whole = policy(OptLevel::O0, Mode::Output);
     assert_eq!(
@@ -54,6 +59,7 @@ fn a_session_is_refused_for_release_and_makes_no_stubs() {
     let fast = policy(OptLevel::O3, Mode::Live);
     let plan = Plan::new(&[super::function(1)], &[], &[]).unwrap();
     let isa = Isa::X86_64 { abi: Abi::SysV, save: X86Save::Fx };
-    let made = Session::new(&Purpose { profile: "release", policy: &fast, output: None }, plan, &isa, 0);
+    let made =
+        Session::new(&Purpose { profile: "release", policy: &fast, output: None }, plan, &isa, 0);
     assert!(matches!(made, Err(SessionError::Refused(Refused::Release { .. }))));
 }

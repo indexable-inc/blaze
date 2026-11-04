@@ -18,8 +18,8 @@ use blaze_mem::Frame;
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
-    db::HirDatabase,
     consteval::try_const_usize,
+    db::HirDatabase,
     mir::{
         BasicBlockId, BorrowKind, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem,
         PlaceTy, Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, SwitchTargets,
@@ -426,12 +426,12 @@ impl<'f, 'db> MoveData<'f, 'db> {
             let Ok(value) = ctx.db.const_eval_discriminant(variant) else { return false };
             out.variants.push((hir_def::VariantId::from(variant), value as u128 & mask));
         }
-        out.children.extend(self.paths[path].children.iter().filter_map(|&(step, child)| {
-            match step {
+        out.children.extend(self.paths[path].children.iter().filter_map(
+            |&(step, child)| match step {
                 Step::Variant(variant) => Some((variant, child)),
                 _ => None,
-            }
-        }));
+            },
+        ));
         true
     }
 }
@@ -807,8 +807,7 @@ impl<'f> InitAnalysis<'f> {
     ) -> Self {
         let blocks = body.basic_blocks.len();
         let len = data.paths.len();
-        let mut entry: Vec<Option<InitState<'f>>, &'f Frame> =
-            Vec::with_capacity_in(blocks, frame);
+        let mut entry: Vec<Option<InitState<'f>>, &'f Frame> = Vec::with_capacity_in(blocks, frame);
         entry.resize_with(blocks, || None);
         let mut start = InitState::bottom(len, frame);
         start.maybe_uninit.insert_range(0..len);
@@ -862,10 +861,9 @@ impl<'f> InitAnalysis<'f> {
             // nothing, so nothing unwinds out of it. `MaybeInitializedPlaces` finds that as it
             // goes, `MaybeUninitializedPlaces` takes the drops the first found.
             let (skip_init, skip_uninit) = match &terminator.kind {
-                TerminatorKind::Drop { place, unwind: Some(_), .. } => (
-                    data.holds_nothing(ctx, place, &state),
-                    dead_unwinds.contains(block_index(id)),
-                ),
+                TerminatorKind::Drop { place, unwind: Some(_), .. } => {
+                    (data.holds_nothing(ctx, place, &state), dead_unwinds.contains(block_index(id)))
+                }
                 _ => (false, false),
             };
             for effect in effects.at(ctx, data, body, id, block.statements.len()) {

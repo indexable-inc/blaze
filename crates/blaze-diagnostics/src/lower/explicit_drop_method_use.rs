@@ -41,7 +41,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ExplicitDropMethodUse) -> Vec<Foun
                         // alloc: the suggestion's parts
                         vec![
                             // alloc: the suggestion's text
-                            (at(TextRange::new(expr_range.start(), receiver.start())), "drop(".to_owned()),
+                            (
+                                at(TextRange::new(expr_range.start(), receiver.start())),
+                                "drop(".to_owned(),
+                            ),
                             // alloc: the suggestion's text
                             (at(TextRange::new(receiver.end(), expr_range.end())), ")".to_owned()),
                         ],

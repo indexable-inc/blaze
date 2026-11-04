@@ -11,9 +11,9 @@ use blaze_api::{
     client::{Client, ClientError},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::View;
+use std::alloc::Global;
 
 use super::{api_error, log, said_or};
 use crate::service::Input;
@@ -35,7 +35,11 @@ struct Pins {
     service: crossbeam_channel::Sender<Input>,
 }
 
-pub(crate) fn run(socket: PathBuf, commands: crossbeam_channel::Receiver<Command>, service: crossbeam_channel::Sender<Input>) {
+pub(crate) fn run(
+    socket: PathBuf,
+    commands: crossbeam_channel::Receiver<Command>,
+    service: crossbeam_channel::Sender<Input>,
+) {
     let mut pins = Pins { socket, client: None, held: HashMap::new_in(Global), service };
     for command in commands {
         match command {
@@ -66,7 +70,8 @@ impl Pins {
     fn open(&mut self, view: &ViewRef) -> Result<ContentId, String> {
         for attempt in 0..2 {
             let client = self.connect()?;
-            match open(client, view.clone()) { // clone: once per pin; a root's view owns nothing
+            match open(client, view.clone()) {
+                // clone: once per pin; a root's view owns nothing
                 Ok(Ok(root)) => {
                     *self.held.entry(root).or_default() += 1;
                     return Ok(root);
@@ -102,7 +107,11 @@ impl Pins {
                     }
                 })
                 .map_err(|error| format!("the daemon at {socket}: {error}"))?; // alloc: error path
-            if ok { Ok(()) } else { Err(said_or(&said, "the daemon refused and said nothing more")) }
+            if ok {
+                Ok(())
+            } else {
+                Err(said_or(&said, "the daemon refused and said nothing more"))
+            }
         });
         if let Err(why) = result {
             // A lost connection closed every hold already.
@@ -118,7 +127,8 @@ impl Pins {
                 format!("could not reach the daemon at {}: {error}", self.socket.display())
             })?;
             // alloc: once per connection lost, the roots held again
-            let mut held: Vec<(ContentId, u32)> = self.held.iter().map(|(root, count)| (*root, *count)).collect();
+            let mut held: Vec<(ContentId, u32)> =
+                self.held.iter().map(|(root, count)| (*root, *count)).collect();
             held.sort_unstable_by_key(|&(root, _)| root);
             for (root, count) in held {
                 for _ in 0..count {
@@ -131,7 +141,8 @@ impl Pins {
                         }
                         // The counts stand: the next connection holds them again.
                         Err(error) => {
-                            return Err(format!( // alloc: error path
+                            return Err(format!(
+                                // alloc: error path
                                 "the daemon at {} hung up while its roots were held again: {error}",
                                 self.socket.display()
                             ));
@@ -147,7 +158,10 @@ impl Pins {
 
 /// [`Request::Open`] on `client`: the root, or the daemon's refusal; the outer error is the
 /// connection's.
-pub(crate) fn open(client: &mut Client, view: ViewRef) -> Result<Result<ContentId, String>, ClientError> {
+pub(crate) fn open(
+    client: &mut Client,
+    view: ViewRef,
+) -> Result<Result<ContentId, String>, ClientError> {
     let mut opened = None;
     let mut said = Vec::new(); // alloc: none until the daemon says an error
     let ok = client.call(Request::Open { view }, |response| match response {

@@ -144,7 +144,9 @@ impl<'db> RegionExt<'db> for Region<'db> {
 
     fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
         match NonZeroU32::new(index) {
-            Some(index) if REGIONS.published(index) => rustc_type_ir::Region(InternedRegion::at(index)),
+            Some(index) if REGIONS.published(index) => {
+                rustc_type_ir::Region(InternedRegion::at(index))
+            }
             _ => panic!("{index} is not the index of an interned region"),
         }
     }
@@ -349,9 +351,9 @@ mod tests {
     fn a_late_param_keeps_its_bound_var() {
         let a = BoundRegion { var: BoundVar::from_u32(0), kind: BoundRegionKind::Anon };
         let b = BoundRegion { var: BoundVar::from_u32(1), kind: BoundRegionKind::Anon };
-        let scope: SolverDefId<'static> = SolverDefId::StaticId(
-            blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)),
-        );
+        let scope: SolverDefId<'static> = SolverDefId::StaticId(blaze_query::db::FromId::from_id(
+            blaze_query::db::Id::from_u32(1),
+        ));
         let late = |kind| RegionKind::ReLateParam(LateParamRegion { scope, kind });
         assert_ne!(Region::new_without_interner(late(a)), Region::new_without_interner(late(b)));
         assert_eq!(a.get_def_id(), None);

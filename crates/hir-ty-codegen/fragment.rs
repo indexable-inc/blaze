@@ -14,7 +14,6 @@ use std::{
 
 use base_db::{Db, FileId};
 use blaze_hash::{FixedHasher, FixedState, HashMap};
-use std::alloc::Global;
 use cranelift_codegen::{
     MachReloc, RelocTarget, binemit,
     ir::{self, Signature},
@@ -27,6 +26,7 @@ use hir_def::{
     DefWithBodyId, FunctionId, StaticId, TraitId,
     hir::{BindingId, ExprId},
 };
+use std::alloc::Global;
 
 use hir_ty::{
     ParamEnvAndCrate,
@@ -84,7 +84,9 @@ impl TargetRef<'_> {
             TargetRef::Symbol(it) => FuncTarget::Symbol(it.to_owned()),
             TargetRef::Path(it) => FuncTarget::Path(it.to_owned()), // alloc: as above
             // clone: as above, refcounts
-            TargetRef::Instance(instance, env) => FuncTarget::Instance(instance.clone(), env.clone()),
+            TargetRef::Instance(instance, env) => {
+                FuncTarget::Instance(instance.clone(), env.clone())
+            }
             // alloc: as above
             TargetRef::Asm(it) => FuncTarget::Asm(it.to_owned()),
         }
@@ -167,7 +169,10 @@ pub(super) enum RelocName {
     Own(u32),
     /// A name in a namespace of its own: a body built in ([`INLINED`]) until
     /// [`inline`](super::inline) puts it there, or the body a v2 thunk calls.
-    User { namespace: u32, index: u32 },
+    User {
+        namespace: u32,
+        index: u32,
+    },
 }
 
 /// One relocation of a function's code, as [`Relocs`] gives it.
@@ -396,10 +401,9 @@ impl Relocs {
         let (name, index) = Self::encode(reloc.name)?;
         let elf = match reloc.elf_type {
             None => 0,
-            Some(elf) => u16::try_from(elf)
-                .ok()
-                .filter(|it| *it != 0)
-                .ok_or(RelocError::ElfType(elf))?,
+            Some(elf) => {
+                u16::try_from(elf).ok().filter(|it| *it != 0).ok_or(RelocError::ElfType(elf))?
+            }
         };
         let at = self.rows.len() as u32;
         let addend = match i32::try_from(reloc.addend) {
@@ -425,10 +429,13 @@ impl Relocs {
                 let at = all.iter().position(|it| *it == call).ok_or(RelocError::LibCall(call))?;
                 (NameTag::LibCall, at as u32)
             }
-            RelocName::Known(symbol) => (NameTag::Known, match symbol {
-                ir::KnownSymbol::ElfGlobalOffsetTable => 0,
-                ir::KnownSymbol::CoffTlsIndex => 1,
-            }),
+            RelocName::Known(symbol) => (
+                NameTag::Known,
+                match symbol {
+                    ir::KnownSymbol::ElfGlobalOffsetTable => 0,
+                    ir::KnownSymbol::CoffTlsIndex => 1,
+                },
+            ),
             RelocName::Own(offset) => (NameTag::Own, offset),
             RelocName::User { index, .. } => (NameTag::User, index),
         })
@@ -688,7 +695,9 @@ impl Source {
             }
             if matches!(span, MirSpan::Inlined(_)) {
                 // alloc: the error's message
-                return Err(format!("statement {at} is of an inlined scope that is its own parent"));
+                return Err(format!(
+                    "statement {at} is of an inlined scope that is its own parent"
+                ));
             }
         }
         source.spans = spans;
@@ -2048,7 +2057,9 @@ mod tests {
             let name = match was.name {
                 ModuleRelocTarget::User { namespace: 0, index } => RelocName::Func(index + 1000),
                 ModuleRelocTarget::User { namespace: 1, index } => RelocName::Data(index * 2),
-                ModuleRelocTarget::User { namespace, index } => RelocName::User { namespace, index },
+                ModuleRelocTarget::User { namespace, index } => {
+                    RelocName::User { namespace, index }
+                }
                 ref other => RelocName::of_module(other).unwrap(),
             };
             assert_eq!((row.offset, row.name, row.addend), (was.offset + 16, name, was.addend));
@@ -2129,7 +2140,10 @@ mod tests {
                     before
                 }
             };
-            assert_eq!(wants.define_data_as(blob, DataIdentity::Shared).as_u32() as usize, expected);
+            assert_eq!(
+                wants.define_data_as(blob, DataIdentity::Shared).as_u32() as usize,
+                expected
+            );
         }
     }
 
@@ -2149,8 +2163,10 @@ mod tests {
                 align: 8,
                 type_ids: Vec::new(),
             };
-            let datas: Vec<DataId> = (0..4).map(|_| DataId::from_u32(random.below(9) as u32)).collect();
-            let funcs: Vec<FuncId> = (0..4).map(|_| FuncId::from_u32(random.below(9) as u32)).collect();
+            let datas: Vec<DataId> =
+                (0..4).map(|_| DataId::from_u32(random.below(9) as u32)).collect();
+            let funcs: Vec<FuncId> =
+                (0..4).map(|_| FuncId::from_u32(random.below(9) as u32)).collect();
             let view = BlobView { blob: &blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };
             let made = view.made();
             let plain = BlobView { blob: &made, datas: None, funcs: None };

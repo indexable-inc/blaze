@@ -8,11 +8,11 @@
 //! items they are, since minicore's `Drop` is not `const`.
 
 use hir_def::{DefWithBodyId, expr_store::Body};
+use hir_expand::fixture;
 use hir_ty_mir::mir::{
     MirSpan,
     const_check::{ConstCheckKind, const_check},
 };
-use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -155,7 +155,12 @@ const C: Option<V> = {{
     let found = check("sized, copy", &src, konst("C"));
     assert_eq!(
         reported(&found),
-        [("E0493", &*destructor("Option<V>"), "mut always_returned", Some(("always_returned", false)))]
+        [(
+            "E0493",
+            &*destructor("Option<V>"),
+            "mut always_returned",
+            Some(("always_returned", false))
+        )]
     );
 }
 
@@ -189,7 +194,12 @@ const C: Option<V> = {{
     let found = check("sized, copy", &src, konst("C"));
     assert_eq!(
         reported(&found),
-        [("E0493", &*destructor("Option<V>"), "mut always_returned", Some(("always_returned", true)))]
+        [(
+            "E0493",
+            &*destructor("Option<V>"),
+            "mut always_returned",
+            Some(("always_returned", true))
+        )]
     );
 }
 

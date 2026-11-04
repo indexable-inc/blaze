@@ -14,24 +14,26 @@
 
 use std::{borrow::Cow, ptr, sync::Arc};
 
-use blaze_core::{FileName, Mapping};
-use blaze_format::{Aligned, SchemaHash};
-use blaze_ids::ContentId;
-use blaze_reclaim::Limbo;
-use crate::{
-    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold, encodings_of,
-    location,
-    disk::{self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of},
-    flags::{Flag, FlagColumns, Row},
-    index,
-    segment::{ChunkRef, Segment},
-    table::{Held, Keyed, Table},
-};
-use std::alloc::Global;
 use crate::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
+use crate::{
+    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold,
+    disk::{
+        self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of,
+    },
+    encodings_of,
+    flags::{Flag, FlagColumns, Row},
+    index, location,
+    segment::{ChunkRef, Segment},
+    table::{Held, Keyed, Table},
+};
+use blaze_core::{FileName, Mapping};
+use blaze_format::{Aligned, SchemaHash};
+use blaze_ids::ContentId;
+use blaze_reclaim::Limbo;
+use std::alloc::Global;
 
 /// Writers a store can have: a ticket names its writer's segment by number.
 pub(crate) const SEGMENTS_MOST: usize = 4096;
@@ -222,7 +224,9 @@ impl std::fmt::Display for Place {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Place::Pack(loc) => write!(f, "pack {} at {}", loc.pack, loc.offset),
-            Place::Segment(seg) => write!(f, "segment {} at {} of its chunk", seg.segment, seg.offset),
+            Place::Segment(seg) => {
+                write!(f, "segment {} at {} of its chunk", seg.segment, seg.offset)
+            }
         }
     }
 }
@@ -329,7 +333,13 @@ impl Owned {
     }
 
     /// Publishes `bytes` as the value made whole at `id`, or gives the one published first.
-    fn keep<'a>(&'a self, held: Held<'a>, id: (u64, u64), content: ContentId, bytes: Vec<u8>) -> &'a [u8] {
+    fn keep<'a>(
+        &'a self,
+        held: Held<'a>,
+        id: (u64, u64),
+        content: ContentId,
+        bytes: Vec<u8>,
+    ) -> &'a [u8] {
         let len = bytes.len() as u64;
         // alloc: the bytes made whole are the value itself, kept until the table is let go
         let decoded = Decoded { id, content, bytes: bytes.into_boxed_slice() };
@@ -422,17 +432,31 @@ impl<'a> Look<'a> {
         for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
                 if let Some((row, spot)) = table.get(self.held, key) {
-                    return Some(Ok(Found { view, tier: at, place: spot.place, at: At::Spot(table, row, spot) }));
+                    return Some(Ok(Found {
+                        view,
+                        tier: at,
+                        place: spot.place,
+                        at: At::Spot(table, row, spot),
+                    }));
                 }
             }
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
                 Some((slot, Ok(loc))) => {
-                    return Some(Ok(Found { view, tier: at, place: Place::Pack(loc), at: At::Slot(index, slot) }));
+                    return Some(Ok(Found {
+                        view,
+                        tier: at,
+                        place: Place::Pack(loc),
+                        at: At::Slot(index, slot),
+                    }));
                 }
                 Some((_, Err(what))) => {
                     // clone: the error's file name
-                    return Some(Err(Corrupt { key: *key, pack: tier.index_file.clone(), what: what.into() }));
+                    return Some(Err(Corrupt {
+                        key: *key,
+                        pack: tier.index_file.clone(),
+                        what: what.into(),
+                    }));
                 }
                 None => {}
             }
@@ -454,8 +478,16 @@ impl<'a> Look<'a> {
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
                 Some((slot, Ok(loc))) => {
-                    let found = Found { view, tier: at, place: Place::Pack(loc), at: At::Slot(index, slot) };
-                    return self.record(found, key).ok().map(|(header, _)| (header.content, Ticket::DURABLE));
+                    let found = Found {
+                        view,
+                        tier: at,
+                        place: Place::Pack(loc),
+                        at: At::Slot(index, slot),
+                    };
+                    return self
+                        .record(found, key)
+                        .ok()
+                        .map(|(header, _)| (header.content, Ticket::DURABLE));
                 }
                 Some((_, Err(_))) => return None,
                 None => {}
@@ -466,7 +498,11 @@ impl<'a> Look<'a> {
 
     /// Every record of tier `tier` a lookup finds, with where: its deltas' and its index
     /// table's they do not shadow. A slot that is not whole is in `bad`.
-    pub(crate) fn rows(self, tier: usize, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Found<'a>)> {
+    pub(crate) fn rows(
+        self,
+        tier: usize,
+        bad: &mut Vec<(Key, &'static str)>,
+    ) -> Vec<(Key, Found<'a>)> {
         let view = self.view();
         let it = &view.tiers[tier];
         // alloc: the listing is the output, for collection and checks
@@ -477,7 +513,10 @@ impl<'a> Look<'a> {
             for table in std::iter::once(&it.delta).chain(&it.prev) {
                 for (row, spot) in table.iter(self.held) {
                     if shadow.insert(spot.key) {
-                        out.push((spot.key, Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) }));
+                        out.push((
+                            spot.key,
+                            Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) },
+                        ));
                     }
                 }
             }
@@ -485,7 +524,15 @@ impl<'a> Look<'a> {
                 for (slot, key, loc) in index.table().iter() {
                     match loc {
                         Ok(_) if shadow.contains(&key) => {}
-                        Ok(loc) => out.push((key, Found { view, tier, place: Place::Pack(loc), at: At::Slot(index, slot) })),
+                        Ok(loc) => out.push((
+                            key,
+                            Found {
+                                view,
+                                tier,
+                                place: Place::Pack(loc),
+                                at: At::Slot(index, slot),
+                            },
+                        )),
                         Err(what) => bad.push((key, what)),
                     }
                 }
@@ -540,7 +587,8 @@ impl<'a> Look<'a> {
     /// The bytes of a pack, in the view the record was found in or, for a record published
     /// after it, the one published since: a view never loses a mapping a found record names.
     fn pack_bytes(self, found: Found<'a>, loc: Loc, at: u64, len: u64) -> Option<&'a [u8]> {
-        let of = |view: &'a View| view.tiers[found.tier].packs.get(loc.pack as usize)?.bytes(at, len);
+        let of =
+            |view: &'a View| view.tiers[found.tier].packs.get(loc.pack as usize)?.bytes(at, len);
         of(found.view).or_else(|| of(self.view()))
     }
 
@@ -555,20 +603,33 @@ impl<'a> Look<'a> {
         }
     }
 
-    fn dictionary(self, found: Found<'a>, number: u32) -> Option<&'a Result<Arc<cold::Prepared>, String>> {
-        let of = |view: &'a View| view.tiers[found.tier].dictionaries.get(number as usize).map(|(_, it)| it);
+    fn dictionary(
+        self,
+        found: Found<'a>,
+        number: u32,
+    ) -> Option<&'a Result<Arc<cold::Prepared>, String>> {
+        let of = |view: &'a View| {
+            view.tiers[found.tier].dictionaries.get(number as usize).map(|(_, it)| it)
+        };
         of(found.view).or_else(|| of(self.view()))
     }
 
     /// The header of a found record, checked to be of `key`, and its payload.
-    pub(crate) fn record(self, found: Found<'a>, key: &Key) -> Result<(RecordHeader, &'a [u8]), Corrupt> {
+    pub(crate) fn record(
+        self,
+        found: Found<'a>,
+        key: &Key,
+    ) -> Result<(RecordHeader, &'a [u8]), Corrupt> {
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
         let (at, header, payload) = match found.place {
             Place::Pack(loc) => {
                 let tier = &found.view.tiers[found.tier];
                 if loc.pack as usize >= tier.packs.len() {
                     // alloc: the error's message
-                    return Err(corrupt(format!("its index names pack {} its head does not have", loc.pack)));
+                    return Err(corrupt(format!(
+                        "its index names pack {} its head does not have",
+                        loc.pack
+                    )));
                 }
                 let at = loc.offset;
                 let header = self
@@ -611,7 +672,12 @@ impl<'a> Look<'a> {
 
     /// The bytes of a found record, checked against its content hash: once a record for reads
     /// and moves, every time for [`Use::Check`].
-    pub(crate) fn value(self, found: Found<'a>, key: &Key, why: Use) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
+    pub(crate) fn value(
+        self,
+        found: Found<'a>,
+        key: &Key,
+        why: Use,
+    ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
         let (header, payload) = self.record(found, key)?;
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
         let at = match found.place {
@@ -636,7 +702,10 @@ impl<'a> Look<'a> {
             Form::Zstd => {
                 let dictionary = self.dictionary(found, header.dictionary).ok_or_else(|| {
                     // alloc: the error's message
-                    corrupt(format!("it names dictionary {} the store does not have", header.dictionary))
+                    corrupt(format!(
+                        "it names dictionary {} the store does not have",
+                        header.dictionary
+                    ))
                 })?;
                 let dictionary =
                     // alloc: the error's message
@@ -650,13 +719,21 @@ impl<'a> Look<'a> {
                 for (chunk, len) in chunks.clone() {
                     if len > crate::chunk::MAX as u64 {
                         // alloc: the error's message
-                        return Err(corrupt(format!("its chunk {} is {len} bytes, longer than a chunk", chunk.0)));
+                        return Err(corrupt(format!(
+                            "its chunk {} is {len} bytes, longer than a chunk",
+                            chunk.0
+                        )));
                     }
-                    total = total.checked_add(len).ok_or_else(|| corrupt("its chunks' lengths overflow".into()))?;
+                    total = total
+                        .checked_add(len)
+                        .ok_or_else(|| corrupt("its chunks' lengths overflow".into()))?;
                 }
                 if total != header.raw {
                     // alloc: the error's message
-                    return Err(corrupt(format!("its chunks are {total} bytes, not the {} recorded", header.raw)));
+                    return Err(corrupt(format!(
+                        "its chunks are {total} bytes, not the {} recorded",
+                        header.raw
+                    )));
                 }
                 // Grown as pieces are read, at most `LIST_RESERVE` reserved once the first is:
                 // one chunk may be listed any number of times, so the lengths, which nothing has
@@ -667,10 +744,15 @@ impl<'a> Look<'a> {
                     let piece = self
                         .find(&chunk)
                         // alloc: the error's message
-                        .ok_or_else(|| corrupt(format!("its chunk {} is not in the store", chunk.0)))??;
+                        .ok_or_else(|| {
+                            corrupt(format!("its chunk {} is not in the store", chunk.0))
+                        })??;
                     if !matches!(piece.place.form(), Form::Raw | Form::Lz4 | Form::Zstd) {
                         // alloc: the error's message
-                        return Err(corrupt(format!("its chunk {} is not kept as a chunk", chunk.0)));
+                        return Err(corrupt(format!(
+                            "its chunk {} is not kept as a chunk",
+                            chunk.0
+                        )));
                     }
                     let (_, piece) = self.value(piece, &chunk, why)?;
                     if piece.len() as u64 != len {
@@ -689,11 +771,18 @@ impl<'a> Look<'a> {
                 Place::Pack(_) => match self.external(found, &header.content) {
                     Ok(bytes) => Cow::Borrowed(bytes),
                     Err(Some(file)) => {
-                        return Err(Corrupt { key: *key, pack: file, what: "it was not mapped".into() });
+                        return Err(Corrupt {
+                            key: *key,
+                            pack: file,
+                            what: "it was not mapped".into(),
+                        });
                     }
                     Err(None) => {
                         // alloc: the error's message
-                        return Err(corrupt(format!("its file {:x} is not in the head", header.content)));
+                        return Err(corrupt(format!(
+                            "its file {:x} is not in the head",
+                            header.content
+                        )));
                     }
                 },
             },
@@ -704,14 +793,21 @@ impl<'a> Look<'a> {
         };
         if bytes.len() as u64 != header.raw {
             // alloc: the error's message
-            return Err(corrupt(format!("it is {} bytes, not the {} recorded", bytes.len(), header.raw)));
+            return Err(corrupt(format!(
+                "it is {} bytes, not the {} recorded",
+                bytes.len(),
+                header.raw
+            )));
         }
         let memo = !matches!(why, Use::Check);
         if !(memo && found.at.verified()) {
             let hashed = content_of(&bytes);
             if hashed != header.content {
                 // alloc: the error's message
-                return Err(corrupt(format!("its bytes hash to {hashed:x}, not the {:x} recorded", header.content)));
+                return Err(corrupt(format!(
+                    "its bytes hash to {hashed:x}, not the {:x} recorded",
+                    header.content
+                )));
             }
             if memo {
                 found.at.set_verified();
@@ -744,8 +840,10 @@ impl<'a> Look<'a> {
     pub(crate) fn read(self, found: Found<'a>, key: &Key) -> Result<Entry<'a>, Corrupt> {
         let id = Look::owned_id(found);
         let owned = self.shared.owned(self.held);
-        if matches!(found.place.form(), Form::Zstd | Form::Chunked | Form::Lz4 | Form::Warm | Form::ColdColumns)
-            && let Some((content, bytes)) = owned.get(self.held, id)
+        if matches!(
+            found.place.form(),
+            Form::Zstd | Form::Chunked | Form::Lz4 | Form::Warm | Form::ColdColumns
+        ) && let Some((content, bytes)) = owned.get(self.held, id)
         {
             self.was_read(found);
             return Ok(Entry { key: *key, kind: found.place.kind(), content, bytes });
@@ -792,7 +890,10 @@ impl<'a> Look<'a> {
             pack: self.file_of(found),
             what: "its payload is shorter than the schema it starts with".into(),
         })?;
-        Ok(Some((Heat::Warm, Entry { key: *key, kind: header.kind, content: header.content, bytes: warm })))
+        Ok(Some((
+            Heat::Warm,
+            Entry { key: *key, kind: header.kind, content: header.content, bytes: warm },
+        )))
     }
 
     pub(crate) fn has(self, key: &Key) -> bool {
@@ -807,7 +908,9 @@ impl<'a> Look<'a> {
         let found = found?;
         let entry = self.read(found, key)?;
         let bytes = match self.mapping_holding(found, &entry) {
-            Some((mapping, start, file)) => PinnedBytes::Mapped { mapping, start, len: entry.bytes.len(), file },
+            Some((mapping, start, file)) => {
+                PinnedBytes::Mapped { mapping, start, len: entry.bytes.len(), file }
+            }
             // alloc: a value made whole and held past the task: one aligned copy per pin
             None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
         };
@@ -818,9 +921,15 @@ impl<'a> Look<'a> {
     /// one and start at a multiple of [`disk::ALIGN`]: a raw record of a pack, or a file of its
     /// own. A value made whole (decompressed, from chunks or columns) or still in a writer's
     /// segment is in none. For a file of its own, also the file, which holds the value whole.
-    fn mapping_holding(self, found: Found<'a>, entry: &Entry<'a>) -> Option<(Mapping, usize, Option<FileName>)> {
+    fn mapping_holding(
+        self,
+        found: Found<'a>,
+        entry: &Entry<'a>,
+    ) -> Option<(Mapping, usize, Option<FileName>)> {
         let Place::Pack(loc) = found.place else { return None };
-        if entry.bytes.is_empty() || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize) {
+        if entry.bytes.is_empty()
+            || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize)
+        {
             return None;
         }
         let of = |view: &'a View| -> Option<(&'a Mapping, Option<&'a FileName>)> {
@@ -865,7 +974,12 @@ pub struct Pinned {
 #[derive(Clone)]
 enum PinnedBytes {
     /// `file` is the file of its own the value is the whole of, when it is one.
-    Mapped { mapping: Mapping, start: usize, len: usize, file: Option<FileName> },
+    Mapped {
+        mapping: Mapping,
+        start: usize,
+        len: usize,
+        file: Option<FileName>,
+    },
     Copied(Arc<Aligned>),
 }
 
@@ -894,7 +1008,9 @@ impl std::ops::Deref for Pinned {
     #[inline]
     fn deref(&self) -> &[u8] {
         match &self.bytes {
-            PinnedBytes::Mapped { mapping, start, len, .. } => &mapping.bytes()[*start..*start + *len],
+            PinnedBytes::Mapped { mapping, start, len, .. } => {
+                &mapping.bytes()[*start..*start + *len]
+            }
             PinnedBytes::Copied(bytes) => bytes,
         }
     }

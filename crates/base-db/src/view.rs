@@ -20,13 +20,13 @@
 
 use std::{borrow::Cow, cell::RefCell, fmt};
 
+use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
+use blaze_hash::{FixedState, HashMap};
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
-use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
+use std::alloc::Global;
 use triomphe::Arc;
-use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     Db, FileText, Files, FxIndexMap, IncludedFile, SourceRoot, SourceRootId, content,
@@ -96,10 +96,9 @@ impl fmt::Display for ViewError {
         match self {
             ViewError::BadPath(path) => write!(f, "{path:?} is not a path of a view"),
             ViewError::Duplicate(path) => write!(f, "the view has {path} twice"),
-            ViewError::Mismatch { path, given, bytes } => write!(
-                f,
-                "{path} was given the content ID {given:x}, but its bytes are {bytes:x}"
-            ),
+            ViewError::Mismatch { path, given, bytes } => {
+                write!(f, "{path} was given the content ID {given:x}, but its bytes are {bytes:x}")
+            }
             ViewError::NoSourceRoot { path, root } => {
                 write!(f, "{path} belongs in the source root {root:?}, which the database lacks")
             }
@@ -184,7 +183,11 @@ impl ViewIndex {
 
 /// A path relative to a view's base as the view names it: `/`-separated.
 fn rel_key(rel: &str) -> Cow<'_, str> {
-    if cfg!(windows) && rel.contains('\\') { Cow::Owned(rel.replace('\\', "/")) } else { Cow::Borrowed(rel) }
+    if cfg!(windows) && rel.contains('\\') {
+        Cow::Owned(rel.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(rel)
+    }
 }
 
 /// Whether `rel` is `dir` or under it, both relative to one base; `""` is the base.
@@ -199,7 +202,8 @@ thread_local! {
 }
 
 fn sort_roots(roots: &mut [SourceRootId]) {
-    ROOT_SORT.with_borrow_mut(|scratch| radix::sort_copy_by_key_in(roots, |it| it.0, scratch.take()));
+    ROOT_SORT
+        .with_borrow_mut(|scratch| radix::sort_copy_by_key_in(roots, |it| it.0, scratch.take()));
 }
 
 fn sort_files(files: &mut [FileId]) {
@@ -242,11 +246,7 @@ impl Files {
     /// root. Bytes that are not UTF-8 are a file with no text whose bytes are kept as its input
     /// ([`Files::raw_file`]), hashed again only when they change. Every file's ID is checked
     /// against its bytes before anything is written, and a mismatch refuses the whole view.
-    pub fn set_view_root(
-        &self,
-        db: &mut Db,
-        view: ViewRoot<'_>,
-    ) -> Result<ViewChange, ViewError> {
+    pub fn set_view_root(&self, db: &mut Db, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
@@ -383,9 +383,7 @@ impl Files {
         let mut texts: Vec<Option<syntax::Text>, &Frame> =
             Vec::with_capacity_in(plan.writes.len(), frame);
         texts.extend(
-            plan.writes
-                .iter()
-                .map(|it| blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()), // clone: a count, the text holds the bytes
+            plan.writes.iter().map(|it| blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()), // clone: a count, the text holds the bytes
         );
         let mut bytes = blaze_mem::scratch::lend_bytes();
         let mut ranges = Vec::new_in(frame);
@@ -393,7 +391,8 @@ impl Files {
             if text.is_none() {
                 continue;
             }
-            let appended = self.input_of(writer, write.id).and_then(|it| it.appended_root_module(&*db));
+            let appended =
+                self.input_of(writer, write.id).and_then(|it| it.appended_root_module(&*db));
             let start = bytes.len();
             FileText::content_bytes(&view.files[write.at].id, appended, &mut bytes);
             ranges.push(start..bytes.len());
@@ -417,7 +416,9 @@ impl Files {
                 added.push(write.id);
             }
             let unchanged = match &text {
-                Some(_) => self.text_input(write.id).is_some_and(|input| input.content(&*db) == content),
+                Some(_) => {
+                    self.text_input(write.id).is_some_and(|input| input.content(&*db) == content)
+                }
                 None => self.raw_file(write.id).is_some_and(|input| input.content(&*db) == content),
             };
             if unchanged {
@@ -431,9 +432,17 @@ impl Files {
             let durability = if is_library { Durability::HIGH } else { Durability::LOW };
             let file = view.files[write.at].id;
             let text_of = text.as_ref().map(|text| (text, file));
-            self.write_aliases(writer, db, write.id, text_of, Some(durability), |alias| set.push(alias));
+            self.write_aliases(writer, db, write.id, text_of, Some(durability), |alias| {
+                set.push(alias)
+            });
             let content = match text {
-                Some(text) => self.write_text(writer, db, write.id, Some((text, file, content)), Some(durability)),
+                Some(text) => self.write_text(
+                    writer,
+                    db,
+                    write.id,
+                    Some((text, file, content)),
+                    Some(durability),
+                ),
                 None => self.write_bytes(writer, db, write.id, read, Some(durability)),
             };
             index_file(writer, write.id, content, &mut changed_roots);
@@ -524,7 +533,8 @@ impl Files {
                     }
                     let mut one_to_one = true;
                     for (id, _, path) in added {
-                        one_to_one &= files.path_for_file(id).is_none() && files.file_for_path(path).is_none();
+                        one_to_one &= files.path_for_file(id).is_none()
+                            && files.file_for_path(path).is_none();
                         // clone: an added file's path in the set.
                         files.insert_file(*id, path.clone());
                     }
@@ -602,7 +612,9 @@ fn rebuilt<'p>(
     let mut named_back = 0;
     for id in files.iter() {
         ids += 1;
-        named_back += usize::from(files.path_for_file(&id).and_then(|path| files.file_for_path(path)) == Some(&id));
+        named_back += usize::from(
+            files.path_for_file(&id).and_then(|path| files.file_for_path(path)) == Some(&id),
+        );
     }
     let one_to_one = named_back == ids && ids == files.len();
     let root = match old.is_library {

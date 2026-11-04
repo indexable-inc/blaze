@@ -63,7 +63,8 @@ pub(super) fn writable(placed: &Placed<'_>, page: u64) -> SmallVec<[(u64, u64); 
     for segment in [Segment::DataConst, Segment::Data] {
         let mut regions = placed.regions.iter().filter(|it| place(&it.class).0 == segment);
         let Some(first) = regions.next() else { continue };
-        let end = regions.fold(first.addr + first.capacity, |end, it| end.max(it.addr + it.capacity));
+        let end =
+            regions.fold(first.addr + first.capacity, |end, it| end.max(it.addr + it.capacity));
         out.push((first.addr, end.next_multiple_of(page)));
     }
     out
@@ -111,7 +112,12 @@ impl Imports {
             .ok()
             .filter(|it| *it < 1 << ORDINAL_BITS)
             // alloc: error path
-            .ok_or_else(|| error(format!("{} imports: a chained bind names fewer than 2^24", placed.imports.len())))?;
+            .ok_or_else(|| {
+                error(format!(
+                    "{} imports: a chained bind names fewer than 2^24",
+                    placed.imports.len()
+                ))
+            })?;
         if let Some(&(addr, import, _)) = binds.iter().find(|it| it.1 >= count) {
             // alloc: error path
             return Err(error(format!("a bind at {addr:#x} of no import ({import})")));
@@ -124,10 +130,16 @@ impl Imports {
         for &(addr, import, addend) in binds.iter().filter(|it| it.2 != 0) {
             let addend = i32::try_from(addend)
                 // alloc: error path
-                .map_err(|_| error(format!("a bind at {addr:#x} adds {addend}, past what a chained import holds")))?;
+                .map_err(|_| {
+                    error(format!(
+                        "a bind at {addr:#x} adds {addend}, past what a chained import holds"
+                    ))
+                })?;
             extra.push((import, addend));
         }
-        radix::sort_copy_by_key(&mut extra, |&(import, addend)| radix::pack_32(import, radix::signed_32(addend)));
+        radix::sort_copy_by_key(&mut extra, |&(import, addend)| {
+            radix::pack_32(import, radix::signed_32(addend))
+        });
         extra.dedup();
         let total = count as usize + extra.len();
         if total >= 1 << ORDINAL_BITS {
@@ -144,7 +156,8 @@ impl Imports {
             _ if addend == 0 => (import, 0),
             _ => {
                 let key = (import, addend as i32);
-                let at = self.extra.binary_search(&key).expect("every addend a bind adds has its entry");
+                let at =
+                    self.extra.binary_search(&key).expect("every addend a bind adds has its entry");
                 (self.count + at as u32, 0)
             }
         }
@@ -160,7 +173,9 @@ fn value_at(placed: &Placed<'_>, addr: u64) -> Result<u64, LinkError> {
     placed
         .u64_at(addr)
         // alloc: error path
-        .ok_or_else(|| error(format!("a pointer to slide at {addr:#x}, outside the bytes of its region")))
+        .ok_or_else(|| {
+            error(format!("a pointer to slide at {addr:#x}, outside the bytes of its region"))
+        })
 }
 
 /// The segment of `segments` holding `addr`, by its start; an error when none does.
@@ -211,7 +226,10 @@ pub(super) fn encode(placed: &Placed<'_>, page: u64) -> Result<Vec<(u64, u64)>, 
             let (at, import, addend) = binds[b];
             b += 1;
             let (entry, addend) = imports.entry(import, addend);
-            slots.push((at, BIND | u64::from(entry) | (u64::from(addend as i8 as u8) << ORDINAL_BITS)));
+            slots.push((
+                at,
+                BIND | u64::from(entry) | (u64::from(addend as i8 as u8) << ORDINAL_BITS),
+            ));
         }
     }
     for nth in 0..slots.len() {
@@ -276,7 +294,10 @@ pub(super) fn fixups<'n>(
         let first = next + slots[next..].partition_point(|it| it.0 < vmaddr);
         if first != next {
             // alloc: error path
-            return Err(error(format!("a chained slot at {:#x} is in no segment's bytes in the file", slots[next].0)));
+            return Err(error(format!(
+                "a chained slot at {:#x} is in no segment's bytes in the file",
+                slots[next].0
+            )));
         }
         let end = first + slots[first..].partition_point(|it| it.0 < vmaddr + size);
         next = end;
@@ -290,7 +311,9 @@ pub(super) fn fixups<'n>(
         let pages = size.div_ceil(PAGE) as usize;
         if pages > usize::from(u16::MAX) {
             // alloc: error path
-            return Err(error(format!("a segment at {vmaddr:#x} of {pages} chained pages, more than 65,535")));
+            return Err(error(format!(
+                "a segment at {vmaddr:#x} of {pages} chained pages, more than 65,535"
+            )));
         }
         out.put_u32((22 + 2 * pages) as u32);
         out.put_u16(PAGE as u16);
@@ -308,7 +331,8 @@ pub(super) fn fixups<'n>(
             let page = ((addr - vmaddr) / PAGE) as usize;
             if page != last {
                 let offset = ((addr - vmaddr) % PAGE) as u16;
-                out[page_starts + 2 * page..page_starts + 2 * page + 2].copy_from_slice(&offset.to_le_bytes());
+                out[page_starts + 2 * page..page_starts + 2 * page + 2]
+                    .copy_from_slice(&offset.to_le_bytes());
                 last = page;
             }
         }
@@ -336,7 +360,9 @@ pub(super) fn fixups<'n>(
                 let offset = (out.len() - start - symbols_at) as u32;
                 if offset >= 1 << NAME_BITS {
                     // alloc: error path
-                    return Err(error("the chained imports' names pass 8 MiB, which their offsets reach"));
+                    return Err(error(
+                        "the chained imports' names pass 8 MiB, which their offsets reach",
+                    ));
                 }
                 out.extend_from_slice(name(import));
                 out.push(0);
@@ -355,7 +381,15 @@ pub(super) fn fixups<'n>(
     }
 
     // `dyld_chained_fixups_header`.
-    let header = [0, (starts - start) as u32, imports_at as u32, symbols_at as u32, entries as u32, imports.format, 0];
+    let header = [
+        0,
+        (starts - start) as u32,
+        imports_at as u32,
+        symbols_at as u32,
+        entries as u32,
+        imports.format,
+        0,
+    ];
     for (nth, field) in header.into_iter().enumerate() {
         out.patch_u32(start + 4 * nth, field);
     }

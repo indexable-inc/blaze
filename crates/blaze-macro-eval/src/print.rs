@@ -260,13 +260,32 @@ enum Tok<'t> {
     /// A punctuation byte that is none of rustc's: the bridge's `Punct::new` refuses them, so
     /// one only comes from a tree blaze made; it prints as itself and glues to nothing.
     Other(u8),
-    Ident { sym: Symbol, kind: IdentKind, span: Span },
+    Ident {
+        sym: Symbol,
+        kind: IdentKind,
+        span: Span,
+    },
     /// `'` glued to an identifier.
-    Lifetime { sym: Symbol, kind: IdentKind },
+    Lifetime {
+        sym: Symbol,
+        kind: IdentKind,
+    },
     /// `symbol` without the `-` of a number the client made negative.
-    Literal { kind: LitKind, symbol: &'t str, suffix: Option<Symbol> },
-    Doc { kind: DocKind, inner: bool, data: Symbol },
-    Group { delimiter: Delimiter, stream: &'t Stream, open: Spacing },
+    Literal {
+        kind: LitKind,
+        symbol: &'t str,
+        suffix: Option<Symbol>,
+    },
+    Doc {
+        kind: DocKind,
+        inner: bool,
+        data: Symbol,
+    },
+    Group {
+        delimiter: Delimiter,
+        stream: &'t Stream,
+        open: Spacing,
+    },
 }
 
 impl Tok<'_> {
@@ -304,7 +323,9 @@ impl<'t> Cursor<'t> {
                 let text = symbol.as_str();
                 match negative(*kind, text) {
                     Some(_) if !self.minus_given => (Tok::Op(Op::Minus), Spacing::JointHidden),
-                    Some(number) => (Tok::Literal { kind: *kind, symbol: number, suffix: *suffix }, *spacing),
+                    Some(number) => {
+                        (Tok::Literal { kind: *kind, symbol: number, suffix: *suffix }, *spacing)
+                    }
                     None => (Tok::Literal { kind: *kind, symbol: text, suffix: *suffix }, *spacing),
                 }
             }
@@ -343,7 +364,9 @@ impl<'t> Cursor<'t> {
                     Some(glued) => Tok::Op(glued),
                     None => break,
                 },
-                Tok::Ident { sym, kind, .. } if op == Op::SingleQuote => Tok::Lifetime { sym, kind },
+                Tok::Ident { sym, kind, .. } if op == Op::SingleQuote => {
+                    Tok::Lifetime { sym, kind }
+                }
                 _ => break,
             };
             self.bump_one();

@@ -11,9 +11,10 @@
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
+use blaze_query::db::{Database as _, FromIdIn, Id};
 use hir_def::{
-    AdtId, AttrDefId, EnumVariantId, GenericDefId, HasModule, ItemContainerId, Lookup,
-    TypeAliasId, VariantId,
+    AdtId, AttrDefId, EnumVariantId, GenericDefId, HasModule, ItemContainerId, Lookup, TypeAliasId,
+    VariantId,
     lang_item::{LangItemEnum, lang_items},
 };
 use hir_ty::{
@@ -24,7 +25,6 @@ use hir_ty::{
         goal_store::{FactRef, GoalFacts},
     },
 };
-use blaze_query::db::{Database as _, FromIdIn, Id};
 
 use crate::{Fact, ItemId, ItemKey, facts, key, table};
 
@@ -160,9 +160,9 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
         "impl_rpitit_tys" => Some(facts::rpitit_tys(db, arg(db, key)?)),
         // The bounds of a trait method's `impl Trait`, its trait item's: those its signature
         // writes on the opaque type. An impl's item has none.
-        "rpitit_item_bounds" => {
-            signature(ItemId::Function(hir_ty::rpitit::rpitit_item_bounds_of_key(db, key)?.function))
-        }
+        "rpitit_item_bounds" => signature(ItemId::Function(
+            hir_ty::rpitit::rpitit_item_bounds_of_key(db, key)?.function,
+        )),
         // A hidden type is what its defining bodies leak, which the signature hash leaves out.
         "rpit_hidden_types" => Some(facts::hidden_types(db, ItemId::Function(arg(db, key)?))),
         "tait_hidden_types" => Some(facts::hidden_types(db, ItemId::Alias(arg(db, key)?))),

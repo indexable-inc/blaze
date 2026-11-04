@@ -81,7 +81,9 @@ impl Corpus {
 
 /// FNV-1a of an input: its file's name, the same on every machine.
 pub(crate) fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -101,7 +103,8 @@ fn hex16(hash: u64) -> [u8; 16] {
 pub(crate) fn key(name: &OsStr) -> u64 {
     let bytes = name.as_encoded_bytes();
     if let Some(digits) = bytes.strip_suffix(b".hex").filter(|it| it.len() == 16)
-        && let Some(hash) = digits.iter().try_fold(0u64, |h, &d| Some(h << 4 | (d as char).to_digit(16)? as u64))
+        && let Some(hash) =
+            digits.iter().try_fold(0u64, |h, &d| Some(h << 4 | (d as char).to_digit(16)? as u64))
     {
         return hash;
     }
@@ -121,28 +124,32 @@ fn hex_into(bytes: &[u8], text: &mut String) {
 }
 
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
-    let mut text = String::new();  // alloc: a whole file's text, at the edge
+    let mut text = String::new(); // alloc: a whole file's text, at the edge
     hex_into(bytes, &mut text);
     text
 }
 
 pub(crate) fn from_hex(text: &str) -> Result<Vec<u8>, String> {
-    let digits: Vec<u8> = text.bytes().filter(|it| !it.is_ascii_whitespace()).collect();  // alloc: reading a corpus file, at load or sync
+    let digits: Vec<u8> = text.bytes().filter(|it| !it.is_ascii_whitespace()).collect(); // alloc: reading a corpus file, at load or sync
     if digits.len() % 2 == 1 {
-        return Err(format!("{} hexadecimal digits: an odd count", digits.len()));  // alloc: error message
+        return Err(format!("{} hexadecimal digits: an odd count", digits.len())); // alloc: error message
     }
     digits
         .chunks(2)
         .map(|pair| {
-            let digit = |d: u8| (d as char).to_digit(16).ok_or_else(|| format!("{:?} is not a hexadecimal digit", d as char));  // alloc: error message
+            let digit = |d: u8| {
+                (d as char)
+                    .to_digit(16)
+                    .ok_or_else(|| format!("{:?} is not a hexadecimal digit", d as char))
+            }; // alloc: error message
             Ok((digit(pair[0])? << 4 | digit(pair[1])?) as u8)
         })
-        .collect()  // alloc: reading a corpus file, at load or sync
+        .collect() // alloc: reading a corpus file, at load or sync
 }
 
 pub(crate) fn read(path: &Path) -> Result<Vec<u8>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;  // alloc: error message
-    from_hex(&text).map_err(|e| format!("{}: {e}", path.display()))  // alloc: error message
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?; // alloc: error message
+    from_hex(&text).map_err(|e| format!("{}: {e}", path.display())) // alloc: error message
 }
 
 /// The names of the files in `dir`, in name order (none when it doesn't exist), but those
@@ -150,13 +157,14 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>, String> {
 pub(crate) fn names(dir: &Path) -> Result<Vec<OsString>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),  // alloc: none (an empty Vec), a missing directory
-        Err(e) => return Err(format!("{}: {e}", dir.display())),  // alloc: error message
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()), // alloc: none (an empty Vec), a missing directory
+        Err(e) => return Err(format!("{}: {e}", dir.display())), // alloc: error message
     };
-    let mut names = Vec::new();  // alloc: a directory listing, at load and once a second at most
+    let mut names = Vec::new(); // alloc: a directory listing, at load and once a second at most
     for entry in entries {
-        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;  // alloc: error message
-        let is_file = entry.file_type().map_err(|e| format!("{}: {e}", entry.path().display()))?.is_file();  // alloc: error message
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?; // alloc: error message
+        let is_file =
+            entry.file_type().map_err(|e| format!("{}: {e}", entry.path().display()))?.is_file(); // alloc: error message
         let name = entry.file_name();
         if is_file && !name.as_encoded_bytes().starts_with(b".") {
             names.push(name);
@@ -168,7 +176,7 @@ pub(crate) fn names(dir: &Path) -> Result<Vec<OsString>, String> {
 
 /// The inputs of every file in `dir`, in name order (none when it doesn't exist).
 pub(crate) fn read_dir(dir: &Path) -> Result<Vec<Vec<u8>>, String> {
-    names(dir)?.iter().map(|name| read(&dir.join(name))).collect()  // alloc: reading a corpus file, at load or sync
+    names(dir)?.iter().map(|name| read(&dir.join(name))).collect() // alloc: reading a corpus file, at load or sync
 }
 
 /// The buffers a file is written from: grown to the longest file and path once, then reused.
@@ -183,11 +191,17 @@ impl Scratch {
     /// Writes `bytes` to `dir/<prefix><hash>.hex` and gives the path. The file appears
     /// whole: it is written under a `.` name and renamed, so a `--jobs` worker listing `dir`
     /// never reads a part.
-    pub(crate) fn write(&mut self, dir: &Path, prefix: &str, bytes: &[u8]) -> Result<&Path, String> {
+    pub(crate) fn write(
+        &mut self,
+        dir: &Path,
+        prefix: &str,
+        bytes: &[u8],
+    ) -> Result<&Path, String> {
         let digits = hex16(hash(bytes));
         let digits = std::str::from_utf8(&digits).expect("hexadecimal digits are ASCII");
         let mut pid = [0u8; 20];
-        let pid = std::str::from_utf8(mutate::decimal(std::process::id() as u64, &mut pid)).expect("decimal digits are ASCII");
+        let pid = std::str::from_utf8(mutate::decimal(std::process::id() as u64, &mut pid))
+            .expect("decimal digits are ASCII");
         for (path, parts) in [(&mut self.path, ["", ""]), (&mut self.partial, [".", pid])] {
             let os = path.as_mut_os_string();
             os.clear();
@@ -204,9 +218,10 @@ impl Scratch {
         }
         self.text.clear();
         hex_into(bytes, &mut self.text);
-        std::fs::write(&self.partial, &self.text).map_err(|e| format!("{}: {e}", self.partial.display()))?;  // alloc: error message
+        std::fs::write(&self.partial, &self.text)
+            .map_err(|e| format!("{}: {e}", self.partial.display()))?; // alloc: error message
         std::fs::rename(&self.partial, &self.path)
-            .map_err(|e| format!("{} to {}: {e}", self.partial.display(), self.path.display()))?;  // alloc: error message
+            .map_err(|e| format!("{} to {}: {e}", self.partial.display(), self.path.display()))?; // alloc: error message
         Ok(&self.path)
     }
 }

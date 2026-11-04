@@ -191,8 +191,12 @@ where
     &memo[&unit]
 }
 
-fn fill<U, R, G>(unit: U, node: &GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>, Global>)
-where
+fn fill<U, R, G>(
+    unit: U,
+    node: &GraphUnit<U, R>,
+    graph: &G,
+    memo: &mut HashMap<U, BuildScripts<R>, Global>,
+) where
     U: Copy + Eq + Hash,
     R: Copy + Eq + Hash + Ord,
     G: Fn(&U) -> GraphUnit<U, R> + ?Sized,

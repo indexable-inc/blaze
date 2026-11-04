@@ -46,13 +46,13 @@ use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_lazy::runner::Placer;
 use blaze_lazy::stub::{self, Layout, Stubs};
 use blaze_lazy::{Session, hook};
 use blaze_mem::align::align_up_u64;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::model::{Apply, Sym};
 use crate::position::{self, LOCATION_ALIGN, LOCATION_SIZE};
@@ -77,7 +77,12 @@ pub(crate) struct Lazy {
 impl Lazy {
     /// The lazy image `session` and its region `stubs` describe, linked as `output` says
     /// (`table`: with a jump table). A lazy image is a dev run with a jump table.
-    pub fn new(output: &Output, table: bool, session: &Session, stubs: &Stubs) -> Result<Lazy, LinkError> {
+    pub fn new(
+        output: &Output,
+        table: bool,
+        session: &Session,
+        stubs: &Stubs,
+    ) -> Result<Lazy, LinkError> {
         let fail = |what: String| LinkError { function: None, what, refusal: None };
         if output.dev_run.is_none() {
             return Err(fail(
@@ -95,7 +100,10 @@ impl Lazy {
         }
         let layout = *session.layout();
         let keys = session.plan().lazy();
-        if stubs.layout != layout || stubs.bytes.len() != layout.len as usize || layout.count as usize != keys.len() {
+        if stubs.layout != layout
+            || stubs.bytes.len() != layout.len as usize
+            || layout.count as usize != keys.len()
+        {
             // alloc: error path
             return Err(fail(format!(
                 "the stub region ({} bytes, {:?}) is not the session's ({:?}, {} lazy functions)",
@@ -107,7 +115,10 @@ impl Lazy {
         }
         if (layout.len as usize) < stub::CELL as usize + 8 {
             // alloc: error path
-            return Err(fail(format!("a stub region of {} bytes, with no room for its hook cell", layout.len)));
+            return Err(fail(format!(
+                "a stub region of {} bytes, with no room for its hook cell",
+                layout.len
+            )));
         }
         Ok(Lazy {
             // alloc: once per image, its session's keys and region
@@ -119,7 +130,9 @@ impl Lazy {
 
     /// Whether this is what `session` and `stubs` describe.
     pub fn is(&self, session: &Session, stubs: &Stubs) -> bool {
-        self.layout == *session.layout() && *self.keys == *session.plan().lazy() && *self.bytes == *stubs.bytes
+        self.layout == *session.layout()
+            && *self.keys == *session.plan().lazy()
+            && *self.bytes == *stubs.bytes
     }
 }
 
@@ -265,23 +278,37 @@ impl<S: Slots> LazyPlacer<S> {
     /// ([`CodeMemory::lay_out`]), whose every run process has the image at `slide` from its
     /// linked addresses. Stores the hook's address in the region's cell, before any process
     /// runs.
-    pub fn new(image: Arc<Mutex<Image>>, memory: Arc<Mutex<CodeMemory>>, slots: S, slide: u64) -> Result<LazyPlacer<S>, LinkError> {
+    pub fn new(
+        image: Arc<Mutex<Image>>,
+        memory: Arc<Mutex<CodeMemory>>,
+        slots: S,
+        slide: u64,
+    ) -> Result<LazyPlacer<S>, LinkError> {
         let fail = |what: String| LinkError { function: None, what, refusal: None };
         {
             let image = image.lock();
             let mut memory = memory.lock();
             let Some(region) = image.lazy_stubs() else {
                 // alloc: error path
-                return Err(fail(format!("{}: not a lazy image, or not linked yet (`Image::stage_lazy`)", image.to)));
+                return Err(fail(format!(
+                    "{}: not a lazy image, or not linked yet (`Image::stage_lazy`)",
+                    image.to
+                )));
             };
             if image.cells.is_none() {
                 // alloc: error path
-                return Err(fail(format!("{}: not committed into a code memory yet (`Image::commit_into`)", image.to)));
+                return Err(fail(format!(
+                    "{}: not committed into a code memory yet (`Image::commit_into`)",
+                    image.to
+                )));
             }
             let Some(hook) = name_addr(&image, hook::SYMBOL) else {
                 let name = hook_name(image.output.format);
                 // alloc: error path
-                return Err(fail(format!("{}: `{name}`, the hook its lazy stubs call, is not in the image", image.to)));
+                return Err(fail(format!(
+                    "{}: `{name}`, the hook its lazy stubs call, is not in the image",
+                    image.to
+                )));
             };
             let cell = region + u64::from(stub::CELL);
             let Some(at) = memory.offset_of(cell) else {
@@ -295,7 +322,14 @@ impl<S: Slots> LazyPlacer<S> {
             memory.store_word(at, hook.wrapping_add(slide)).map_err(|it| fail(it.what))?;
         }
         // alloc: once per run, the placer
-        Ok(LazyPlacer { image, memory, slots, slide, placed: HashMap::new_in(Global), scratch: Scratch::default() })
+        Ok(LazyPlacer {
+            image,
+            memory,
+            slots,
+            slide,
+            placed: HashMap::new_in(Global),
+            scratch: Scratch::default(),
+        })
     }
 
     /// The slide every run process of the memory has: one whose image is elsewhere must be
@@ -317,7 +351,10 @@ impl<S: Slots> LazyPlacer<S> {
             let mut memory = memory.lock();
             if function.arch != image.output.arch {
                 // alloc: error path
-                return Err(fail(format!("compiled for {:?}, placed in an image for {:?}", function.arch, image.output.arch)));
+                return Err(fail(format!(
+                    "compiled for {:?}, placed in an image for {:?}",
+                    function.arch, image.output.arch
+                )));
             }
             if function.unwind.is_some() {
                 return Err(fail(
@@ -331,7 +368,9 @@ impl<S: Slots> LazyPlacer<S> {
             }
             let Some(index) = image.slot(&slot) else {
                 // alloc: error path
-                return Err(fail(format!("placed in the slot of {slot:?}, which the image has none of")));
+                return Err(fail(format!(
+                    "placed in the slot of {slot:?}, which the image has none of"
+                )));
             };
             let align = scratch.lay_out(image, function)?;
             let range = memory.reserve(scratch.len, align).map_err(|it| fail(it.what))?;
@@ -380,7 +419,11 @@ impl Scratch {
     /// a file name for each position the image has none for, then on AArch64 a veneer for each
     /// target in the image a `bl` reaches) and resolves every target: the range's alignment,
     /// its length in [`Scratch::len`].
-    fn lay_out(&mut self, image: &mut Image, function: &CompiledFunction) -> Result<u64, LinkError> {
+    fn lay_out(
+        &mut self,
+        image: &mut Image,
+        function: &CompiledFunction,
+    ) -> Result<u64, LinkError> {
         self.data_at.clear();
         self.resolved.clear();
         self.starts.clear();
@@ -395,7 +438,8 @@ impl Scratch {
             self.data_at.push(at);
             end = at + data.bytes.len() as u64;
         }
-        let tables = std::iter::once((&function.relocs, true)).chain(function.data.iter().map(|it| (&it.relocs, false)));
+        let tables = std::iter::once((&function.relocs, true))
+            .chain(function.data.iter().map(|it| (&it.relocs, false)));
         for (relocs, in_code) in tables {
             // alloc: reused across placements, as `data_at`
             self.starts.push(self.resolved.len());
@@ -424,7 +468,11 @@ impl Scratch {
             }
         }
         if end == 0 {
-            return Err(LinkError { function: Some(function.key), what: "no code to place".into(), refusal: None });
+            return Err(LinkError {
+                function: Some(function.key),
+                what: "no code to place".into(),
+                refusal: None,
+            });
         }
         self.len = end;
         Ok(align)
@@ -449,13 +497,21 @@ impl Scratch {
                 Some(sym) => Resolved::Sym(sym),
                 None if *key == function.key => Resolved::Own(0),
                 // alloc: error path
-                None => return Err(fail(format!("calls {key:?}, which has no slot in the image: neither linked nor lazy"))),
+                None => {
+                    return Err(fail(format!(
+                        "calls {key:?}, which has no slot in the image: neither linked nor lazy"
+                    )));
+                }
             },
             Target::Direct(key) if *key == function.key => Resolved::Own(0),
             Target::Direct(key) => match defined(symbols.find_body(key)) {
                 Some(sym) => Resolved::Sym(sym),
                 // alloc: error path
-                None => return Err(fail(format!("calls {key:?} directly, which is neither linked nor lazy"))),
+                None => {
+                    return Err(fail(format!(
+                        "calls {key:?} directly, which is neither linked nor lazy"
+                    )));
+                }
             },
             Target::Static { item, instance } => {
                 let sym = symbols
@@ -465,23 +521,39 @@ impl Scratch {
                 match defined(sym) {
                     Some(sym) => Resolved::Sym(sym),
                     // alloc: error path
-                    None => return Err(fail(format!("refers to the static {item:?} ({instance:?}), which the image has not"))),
+                    None => {
+                        return Err(fail(format!(
+                            "refers to the static {item:?} ({instance:?}), which the image has not"
+                        )));
+                    }
                 }
             }
             Target::Data(id) => match function.data.iter().position(|it| it.id == *id) {
                 Some(at) => Resolved::Own(self.data_at[at]),
-                None => match defined(symbols.find_id(id).and_then(|it| symbols.find(SymKey::Data(it)))) {
-                    Some(sym) => Resolved::Sym(sym),
-                    // alloc: error path
-                    None => return Err(fail(format!("refers to the data {id:?}, neither its own nor the image's"))),
-                },
+                None => {
+                    match defined(symbols.find_id(id).and_then(|it| symbols.find(SymKey::Data(it))))
+                    {
+                        Some(sym) => Resolved::Sym(sym),
+                        // alloc: error path
+                        None => {
+                            return Err(fail(format!(
+                                "refers to the data {id:?}, neither its own nor the image's"
+                            )));
+                        }
+                    }
+                }
             },
             Target::Extern(name) | Target::Weak(name) => {
-                match defined(symbols.find_name(name).and_then(|it| symbols.find(SymKey::Name(it)))) {
+                match defined(symbols.find_name(name).and_then(|it| symbols.find(SymKey::Name(it))))
+                {
                     Some(sym) => Resolved::Sym(sym),
                     None if matches!(target, Target::Weak(_)) => Resolved::Zero,
                     // alloc: error path
-                    None => return Err(fail(format!("refers to `{name}`, which the image does not define"))),
+                    None => {
+                        return Err(fail(format!(
+                            "refers to `{name}`, which the image does not define"
+                        )));
+                    }
                 }
             }
             Target::Position(span) => {
@@ -489,20 +561,33 @@ impl Scratch {
                 let table = anchor.and_then(|it| state.span_table(it));
                 let (Some(anchor), Some(table)) = (anchor, table) else {
                     // alloc: error path
-                    return Err(fail(format!("a position in {:?}, whose span table the image was not given", span.anchor)));
+                    return Err(fail(format!(
+                        "a position in {:?}, whose span table the image was not given",
+                        span.anchor
+                    )));
                 };
-                if let Some(sym) = symbols.find(SymKey::Position(anchor, span.index)).filter(|it| state.home(*it).is_some()) {
+                if let Some(sym) = symbols
+                    .find(SymKey::Position(anchor, span.index))
+                    .filter(|it| state.home(*it).is_some())
+                {
                     return Ok(Resolved::Sym(sym));
                 }
                 let Some(at) = table.span(span.index) else {
                     // alloc: error path
-                    return Err(fail(format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.len())));
+                    return Err(fail(format!(
+                        "span {} of {:?}, whose table has {}",
+                        span.index,
+                        span.anchor,
+                        table.len()
+                    )));
                 };
                 let file = table.file(at.file);
                 let record = align_up_u64(*end, LOCATION_ALIGN);
                 *end = record + LOCATION_SIZE;
-                let in_image =
-                    symbols.find_name(file).and_then(|it| symbols.find(SymKey::FileName(it))).and_then(|it| state.addr_of(it));
+                let in_image = symbols
+                    .find_name(file)
+                    .and_then(|it| symbols.find(SymKey::FileName(it)))
+                    .and_then(|it| state.addr_of(it));
                 let name = match in_image {
                     Some(addr) => Name::Image(addr),
                     None => {
@@ -539,7 +624,10 @@ impl Scratch {
         let fail = |what: String| LinkError { function: Some(function.key), what, refusal: None };
         let Some(linked) = memory.linked(range.offset) else {
             // alloc: error path
-            return Err(fail(format!("the arena range at {:#x} has no linked address: the code memory is not laid out", range.offset)));
+            return Err(fail(format!(
+                "the arena range at {:#x} has no linked address: the code memory is not laid out",
+                range.offset
+            )));
         };
         self.bytes.clear();
         // alloc: reused across placements; grows only for a larger function
@@ -567,13 +655,16 @@ impl Scratch {
         {
             let resolved = &self.resolved[..function.relocs.targets().len()];
             let (code, rest) = self.bytes.split_at_mut(function.code.len());
-            let mut veneers = Veneers { of: &mut self.veneers, bytes: rest, at: function.code.len() as u64 };
-            relocate(image, &function.relocs, resolved, code, linked, 0, Some(&mut veneers), slide).map_err(fail)?;
+            let mut veneers =
+                Veneers { of: &mut self.veneers, bytes: rest, at: function.code.len() as u64 };
+            relocate(image, &function.relocs, resolved, code, linked, 0, Some(&mut veneers), slide)
+                .map_err(fail)?;
         }
         for (n, (data, at)) in function.data.iter().zip(&self.data_at).enumerate() {
             let resolved = &self.resolved[self.starts[n + 1]..][..data.relocs.targets().len()];
             let field = &mut self.bytes[*at as usize..][..data.bytes.len()];
-            relocate(image, &data.relocs, resolved, field, linked, *at, None, slide).map_err(fail)?;
+            relocate(image, &data.relocs, resolved, field, linked, *at, None, slide)
+                .map_err(fail)?;
         }
         memory.write(range.offset, &self.bytes).map_err(|it| fail(it.what))?;
         memory.publish(range).map_err(|it| fail(it.what))?;
@@ -582,7 +673,12 @@ impl Scratch {
 }
 
 /// `function`'s own counter pair ([`crate::counter::placed_pair`]), at its linked address.
-fn counter(image: &mut Image, function: &CompiledFunction, of: &InstanceKey, in_code: bool) -> Result<Resolved, LinkError> {
+fn counter(
+    image: &mut Image,
+    function: &CompiledFunction,
+    of: &InstanceKey,
+    in_code: bool,
+) -> Result<Resolved, LinkError> {
     let fail = |what: String| LinkError { function: Some(function.key), what, refusal: None };
     if !in_code || *of != function.key {
         return Err(fail(
@@ -593,8 +689,12 @@ fn counter(image: &mut Image, function: &CompiledFunction, of: &InstanceKey, in_
             ),
         ));
     }
-    let Some(cells) = image.symbols.find(SymKey::Counters).and_then(|it| image.state.addr_of(it)) else {
-        return Err(fail("its code counts in tier-up counter cells, and the image has no cells reservation".into()));
+    let Some(cells) = image.symbols.find(SymKey::Counters).and_then(|it| image.state.addr_of(it))
+    else {
+        return Err(fail(
+            "its code counts in tier-up counter cells, and the image has no cells reservation"
+                .into(),
+        ));
     };
     let id = image.symbols.id(&of.0);
     let had = image.state.pairs.of(id).is_some();
@@ -618,7 +718,8 @@ impl Veneers<'_> {
     /// The offset in the range at `linked` of the veneer a `bl` by `ctx` to the code's target
     /// `target` goes through, written to jump to its target; `None` for one in reach.
     fn through(&mut self, target: u32, ctx: &Ctx, linked: u64) -> Result<Option<u64>, String> {
-        let Some(veneer) = self.of.get_mut(target as usize).filter(|it| it.at != Veneer::NONE) else {
+        let Some(veneer) = self.of.get_mut(target as usize).filter(|it| it.at != Veneer::NONE)
+        else {
             return Ok(None);
         };
         let to = ctx.s.wrapping_add(ctx.a as u64);
@@ -628,11 +729,14 @@ impl Veneers<'_> {
         match veneer.to {
             Some(it) if it != to => {
                 // alloc: error path
-                return Err(format!("{to:#x} is past a `bl`'s reach, and the veneer of its target jumps to {it:#x}"));
+                return Err(format!(
+                    "{to:#x} is past a `bl`'s reach, and the veneer of its target jumps to {it:#x}"
+                ));
             }
             Some(_) => {}
             None => {
-                let bytes = &mut self.bytes[(veneer.at - self.at) as usize..][..Veneer::LEN as usize];
+                let bytes =
+                    &mut self.bytes[(veneer.at - self.at) as usize..][..Veneer::LEN as usize];
                 for (word, insn) in bytes.chunks_exact_mut(4).zip(Veneer::CODE) {
                     word.copy_from_slice(&insn.to_le_bytes());
                 }
@@ -641,7 +745,8 @@ impl Veneers<'_> {
                 // alloc: error path
                 let fail = |it: reloc::Bad| format!("the veneer at {addr:#x} to {to:#x}: {it}");
                 reloc::apply(Apply::A64Page21, &at(addr), &mut bytes[..4]).map_err(fail)?;
-                reloc::apply(Apply::A64Lo12 { shift: 0 }, &at(addr + 4), &mut bytes[4..8]).map_err(fail)?;
+                reloc::apply(Apply::A64Lo12 { shift: 0 }, &at(addr + 4), &mut bytes[4..8])
+                    .map_err(fail)?;
                 veneer.to = Some(to);
             }
         }
@@ -667,8 +772,11 @@ fn relocate(
     let in_code = veneers.is_some();
     for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
         // alloc: error path
-        let at_fail = |what: String| format!("{:?} at {:#x} to {:?}: {what}", reloc.kind, reloc.at, reloc.target);
-        let apply = reloc::of_kind(reloc.kind, output.format, output.arch, in_code).map_err(at_fail)?;
+        let at_fail = |what: String| {
+            format!("{:?} at {:#x} to {:?}: {what}", reloc.kind, reloc.at, reloc.target)
+        };
+        let apply =
+            reloc::of_kind(reloc.kind, output.format, output.arch, in_code).map_err(at_fail)?;
         let (s, g, tp, slid) = match resolved[row.target as usize] {
             Resolved::Own(offset) if reloc::got_kind(apply).is_none() => (linked + offset, 0, None, true),
             Resolved::Own(_) => return Err(at_fail("its own code or data reached through a GOT cell, which only the image's symbols have".into())),
@@ -721,10 +829,12 @@ fn sym_value(image: &Image, sym: Sym, apply: Apply) -> Result<Parts, String> {
     let tls_base = state.tls.map_or(0, |it| it.addr);
     let tp = |s: u64| -> Result<Option<i64>, String> {
         match state.tls_at {
-            Some(at) if reloc::is_tls(apply) => match s.checked_sub(tls_base).filter(|_| state.tls.is_some()) {
-                Some(offset) => Ok(Some(at + offset as i64)),
-                None => Err("a thread-local relocation to what is not thread-local".into()),
-            },
+            Some(at) if reloc::is_tls(apply) => {
+                match s.checked_sub(tls_base).filter(|_| state.tls.is_some()) {
+                    Some(offset) => Ok(Some(at + offset as i64)),
+                    None => Err("a thread-local relocation to what is not thread-local".into()),
+                }
+            }
             _ => Ok(None),
         }
     };
@@ -735,11 +845,16 @@ fn sym_value(image: &Image, sym: Sym, apply: Apply) -> Result<Parts, String> {
             Ok((s, g, tp(s)?, false))
         }
         Value::Absolute(s) => Ok((s, g, None, false)),
-        Value::Import if reloc::is_branch(apply) => match symbols.find(SymKey::Plt(sym)).and_then(|it| state.addr_of(it)) {
-            Some(stub) => Ok((stub, g, None, true)),
-            // alloc: error path
-            None => Err(format!("{} is imported, and the image has no PLT stub of it", symbols.describe(sym))),
-        },
+        Value::Import if reloc::is_branch(apply) => {
+            match symbols.find(SymKey::Plt(sym)).and_then(|it| state.addr_of(it)) {
+                Some(stub) => Ok((stub, g, None, true)),
+                // alloc: error path
+                None => Err(format!(
+                    "{} is imported, and the image has no PLT stub of it",
+                    symbols.describe(sym)
+                )),
+            }
+        }
         Value::Import if got.is_some() => Ok((0, g, None, false)),
         // alloc: error path
         Value::Import => Err(format!(
@@ -773,7 +888,9 @@ fn def_value(image: &Image, mut sym: Sym) -> Result<Value, String> {
             Def::Piece { piece, offset } => match state.piece(piece) {
                 Some(it) => Value::Image(it.addr + offset),
                 // alloc: error path
-                None => return Err(format!("{} was removed from the image", symbols.describe(sym))),
+                None => {
+                    return Err(format!("{} was removed from the image", symbols.describe(sym)));
+                }
             },
             Def::Import(_) => Value::Import,
             Def::Absolute(value) => Value::Absolute(value),
@@ -783,11 +900,23 @@ fn def_value(image: &Image, mut sym: Sym) -> Result<Value, String> {
                 continue;
             }
             // alloc: error path
-            Def::TpOff(_) => return Err(format!("{} is a thread-local of another image", symbols.describe(sym))),
+            Def::TpOff(_) => {
+                return Err(format!(
+                    "{} is a thread-local of another image",
+                    symbols.describe(sym)
+                ));
+            }
             // alloc: error path
-            Def::Special(_) => return Err(format!("{} is made by the linker, which placed code does not reach", symbols.describe(sym))),
+            Def::Special(_) => {
+                return Err(format!(
+                    "{} is made by the linker, which placed code does not reach",
+                    symbols.describe(sym)
+                ));
+            }
             // alloc: error path
-            Def::None => return Err(format!("{} is not defined in the image", symbols.describe(sym))),
+            Def::None => {
+                return Err(format!("{} is not defined in the image", symbols.describe(sym)));
+            }
         });
     }
     // alloc: error path

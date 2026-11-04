@@ -3,9 +3,8 @@
 use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId, EnumId,
-    EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, ItemContainerId,
-    StaticId, StructId,
-    HasModule, TraitId, TypeAliasId, UnionId, VariantId,
+    EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId,
+    ItemContainerId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
         TraitSignature, TypeAliasSignature, UnionSignature,
@@ -16,11 +15,11 @@ use stdx::impl_from;
 
 use crate::{
     InferBodyId,
-    rpitit::RpititId,
     db::{
         AnonConstId, GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
     },
+    rpitit::RpititId,
 };
 
 use super::DbInterner;
@@ -55,16 +54,14 @@ pub enum SolverDefId<'db> {
 
 impl std::fmt::Debug for SolverDefId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::next_solver::interner::fmt_with_attached_db(f, "SolverDefId", |db, f| self.fmt_with_names(db, f))
+        crate::next_solver::interner::fmt_with_attached_db(f, "SolverDefId", |db, f| {
+            self.fmt_with_names(db, f)
+        })
     }
 }
 
 impl SolverDefId<'_> {
-    fn fmt_with_names(
-        &self,
-        db: &Db,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt_with_names(&self, db: &Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             SolverDefId::AdtId(AdtId::StructId(id)) => {
                 f.debug_tuple("AdtId").field(&StructSignature::of(db, id).name.as_str()).finish()

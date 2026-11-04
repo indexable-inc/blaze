@@ -12,17 +12,17 @@
 //! concurrency"). Outside a model it is the order the calls ran in. The history's own
 //! bookkeeping is `std`'s, invisible to the model: it adds no schedule point.
 
+use blaze_hash::hash_map::Entry;
 use std::{
     fmt::{self, Debug},
     hash::{BuildHasher, Hash},
     panic::Location,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
-use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::{clock::Clock, rt};
 
@@ -115,7 +115,11 @@ impl<S: Spec> History<S> {
         let before: Vec<u64> = events
             .iter()
             .map(|later| {
-                events.iter().enumerate().filter(|(_, it)| it.precedes(later)).fold(0u64, |set, (at, _)| set | 1 << at)
+                events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| it.precedes(later))
+                    .fold(0u64, |set, (at, _)| set | 1 << at)
             })
             // alloc: each operation's happens-before set, once per check
             .collect();
@@ -182,7 +186,13 @@ impl<S: Spec> Memo<S> {
 /// Whether the operations not in `done` can follow in some order allowed by the run, from the
 /// state at `state` in `memo`: `before` holds, per operation, the set of operations that must
 /// come before it.
-fn linearizable<S: Spec>(events: &[Event<S>], before: &[u64], done: u64, state: u32, memo: &mut Memo<S>) -> bool {
+fn linearizable<S: Spec>(
+    events: &[Event<S>],
+    before: &[u64],
+    done: u64,
+    state: u32,
+    memo: &mut Memo<S>,
+) -> bool {
     let all = if events.len() == MAX_OPS { u64::MAX } else { (1u64 << events.len()) - 1 };
     if done == all {
         return true;

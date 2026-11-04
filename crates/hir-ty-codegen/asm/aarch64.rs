@@ -91,13 +91,7 @@ impl Reg {
 
     /// Writes the line of the instruction that moves `size` bytes between the register and
     /// the slot.
-    fn transfer(
-        self,
-        text: &mut String,
-        load: bool,
-        size: u32,
-        offset: u32,
-    ) -> Result<(), String> {
+    fn transfer(self, text: &mut String, load: bool, size: u32, offset: u32) -> Result<(), String> {
         let narrow = match (self, size) {
             (Reg::Gpr(_), 1) => "b",
             (Reg::Gpr(_), 2) => "h",

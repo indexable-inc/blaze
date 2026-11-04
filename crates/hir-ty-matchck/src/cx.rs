@@ -6,7 +6,7 @@ use std::{
     fmt,
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId, attrs::AttrFlags,
     hir::PatId, signatures::VariantFields,
@@ -149,8 +149,7 @@ impl<'a, 'db> Cx<'a, 'db> {
             TyKind::Adt(def, _) => match def.def_id() {
                 AdtId::EnumId(id) => {
                     id.krate(self.db) != self.krate
-                        && AttrFlags::query(self.db, id.into())
-                            .contains(AttrFlags::NON_EXHAUSTIVE)
+                        && AttrFlags::query(self.db, id.into()).contains(AttrFlags::NON_EXHAUSTIVE)
                 }
                 _ => false,
             },
@@ -208,10 +207,9 @@ impl<'a, 'db> Cx<'a, 'db> {
             let fid = LocalFieldId::from_raw(idx.into());
             let ty = field_tys[fid].ty().instantiate(infcx.interner, args).skip_norm_wip();
             // As rustc's `normalize_erasing_regions`: a body checked here has no type error.
-            let ty = infcx
-                .at(&ObligationCause::dummy(), env)
-                .deeply_normalize(ty)
-                .unwrap_or_else(|_| panic!("failed to normalize field {fid:?} of {variant:?}: {ty:?}"));
+            let ty = infcx.at(&ObligationCause::dummy(), env).deeply_normalize(ty).unwrap_or_else(
+                |_| panic!("failed to normalize field {fid:?} of {variant:?}: {ty:?}"),
+            );
             (fid, ty)
         })
     }
@@ -354,9 +352,10 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
                 };
                 ConstructorSet::Integers { range_1: range, range_2: None }
             }
-            TyKind::Slice(elem) => {
-                ConstructorSet::Slice { array_len: None, subtype_is_empty: self.is_uninhabited(elem) }
-            }
+            TyKind::Slice(elem) => ConstructorSet::Slice {
+                array_len: None,
+                subtype_is_empty: self.is_uninhabited(elem),
+            },
             TyKind::Array(elem, len) => ConstructorSet::Slice {
                 // An array of a constant but unknown length is matched as a slice.
                 array_len: try_const_usize(self.db, len).map(|len| len as usize),

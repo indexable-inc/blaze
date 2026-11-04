@@ -19,7 +19,10 @@
 use blaze_mem::frame::Frame;
 use cranelift_codegen::ir::{self, BlockArg};
 
-use super::{Kind, NONE, Places, Plan, RELAYS, SCRATCH, scan::{each_use, reset}};
+use super::{
+    Kind, NONE, Places, Plan, RELAYS, SCRATCH,
+    scan::{each_use, reset},
+};
 use crate::{
     Error,
     shape::{Dst, Shape, Src},
@@ -185,7 +188,12 @@ fn release(plan: &mut Plan<'_>, func: &ir::Function, value: ir::Value, at: u32) 
 /// `try_call` a 16-byte slot for each `TryCallRet` and `TryCallExn` an edge reads. The range of
 /// [`Plan::pseudo`] to free after the instruction: a `try_call`'s, whose values only its edges
 /// read.
-fn places(plan: &mut Plan<'_>, func: &ir::Function, inst: ir::Inst, top: &mut u32) -> std::ops::Range<u32> {
+fn places(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    inst: ir::Inst,
+    top: &mut u32,
+) -> std::ops::Range<u32> {
     let first = plan.pseudo.len() as u32;
     let data = &func.dfg.insts[inst];
     let Some(table) = data.exception_table() else {
@@ -252,7 +260,13 @@ fn accumulators(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>) 
 }
 
 /// Passes `from`'s result 0 to `to` in the accumulator, if both shapes are in the library.
-fn chain(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, from: ir::Inst, to: ir::Inst) {
+fn chain(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    from: ir::Inst,
+    to: ir::Inst,
+) {
     let Some(&value) = func.dfg.inst_results(from).first() else { return };
     let (f, t) = (from.as_u32() as usize, to.as_u32() as usize);
     let producer = plan.sels[f].shape;

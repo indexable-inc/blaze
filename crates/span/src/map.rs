@@ -6,7 +6,10 @@ use std::{
     cell::RefCell,
     fmt,
     hash::Hash,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use blaze_format::Spans;
@@ -58,6 +61,58 @@ pub struct SpanMap<A: Allocator + Clone = Global> {
     /// then end; of fragments with one range (a fragment passed on whole to another macro), the
     /// innermost first.
     fragment_spans: Vec<(TextRange, Span), A>,
+    /// What [`SpanMap::count_kept`] added to [`kept_maps`], taken off again when the map is
+    /// dropped or cleared. Not part of what the map is.
+    counted: Option<Counted>,
+}
+
+/// What one kept map added to [`kept_maps`]: its heap bytes and pieces when it was counted.
+/// Kept, not read again at drop, as `by_anchor` can grow the map's heap after it is counted.
+#[derive(Clone, Copy)]
+struct Counted {
+    bytes: u64,
+    pieces: u64,
+}
+
+/// Heap bytes of every live map counted by [`SpanMap::count_kept`].
+static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Pieces of every live map counted by [`SpanMap::count_kept`].
+static KEPT_PIECES: AtomicU64 = AtomicU64::new(0);
+
+/// The heap bytes and pieces of every span map kept as a query's value
+/// ([`SpanMap::count_kept`]) and not yet dropped: the profile's `span map bytes` and `span map
+/// pieces` counters, which measure what packing the maps would save. Two relaxed loads; the
+/// two are not read at one instant.
+pub fn kept_maps() -> (u64, u64) {
+    (KEPT_BYTES.load(Ordering::Relaxed), KEPT_PIECES.load(Ordering::Relaxed))
+}
+
+impl<A: Allocator + Clone> Drop for SpanMap<A> {
+    fn drop(&mut self) {
+        self.uncount();
+    }
+}
+
+impl<A: Allocator + Clone> SpanMap<A> {
+    /// Adds the map's heap bytes and pieces to [`kept_maps`] until it is dropped: for a map
+    /// kept as a query's value. A map counted already is not counted again.
+    pub fn count_kept(&mut self) {
+        if self.counted.is_some() {
+            return;
+        }
+        let counted = Counted { bytes: self.heap_bytes() as u64, pieces: self.ends.len() as u64 };
+        KEPT_BYTES.fetch_add(counted.bytes, Ordering::Relaxed);
+        KEPT_PIECES.fetch_add(counted.pieces, Ordering::Relaxed);
+        self.counted = Some(counted);
+    }
+
+    /// Takes what [`SpanMap::count_kept`] added off [`kept_maps`].
+    fn uncount(&mut self) {
+        if let Some(Counted { bytes, pieces }) = self.counted.take() {
+            KEPT_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            KEPT_PIECES.fetch_sub(pieces, Ordering::Relaxed);
+        }
+    }
 }
 
 impl<A: Allocator + Clone> SpanMap<A> {
@@ -202,6 +257,7 @@ impl SpanMap {
             fragment_ends: Vec::new(),
             // alloc: as `fragment_starts`
             fragment_spans: Vec::new(),
+            counted: None,
         }
     }
 }
@@ -233,6 +289,7 @@ impl<A: Allocator + Clone> SpanMap<A> {
 
     /// Empties the map, keeping each column's capacity: the worker's map, filled again.
     pub fn clear(&mut self) {
+        self.uncount();
         self.ends.clear();
         self.spans.clear();
         self.by_anchor = OnceLock::new();
@@ -276,6 +333,8 @@ impl<A: Allocator + Clone> SpanMap<A> {
             fragment_starts: copy(&self.fragment_starts, &alloc),
             fragment_ends: copy(&self.fragment_ends, &alloc),
             fragment_spans: copy(&self.fragment_spans, &alloc),
+            // A copy is counted only when it is kept itself.
+            counted: None,
         }
     }
 
@@ -904,7 +963,9 @@ mod tests {
             };
             let kept = pairs
                 .iter()
-                .filter(|(start, _)| !elided.iter().any(|it| it.start() <= *start && *start < it.end()))
+                .filter(|(start, _)| {
+                    !elided.iter().any(|it| it.start() <= *start && *start < it.end())
+                })
                 .map(|&(start, ast_id)| (start - at(removed_before(u32::from(start))), ast_id))
                 .collect::<Box<[_]>>();
             let want = RealSpanMap::from_file(file(), &kept, at(end - removed_before(end)));
@@ -955,7 +1016,8 @@ mod tests {
     #[test]
     fn spans_are_written_relative_to_their_anchor() {
         let anchor = ContentId::of("blaze v2 test 1", b"an item");
-        let spans = map(10).write_spans(anchor, id(1), [range(12, 15), range(10, 40), range(30, 31)]);
+        let spans =
+            map(10).write_spans(anchor, id(1), [range(12, 15), range(10, 40), range(30, 31)]);
         assert_eq!(spans.anchor, anchor);
         let spans: Vec<_> = spans.spans.iter().map(|it| (it.start, it.len)).collect();
         assert_eq!(spans, [(2, 3), (0, 30), (20, 1)]);
@@ -1142,7 +1204,8 @@ mod tests {
                     true
                 }
             });
-            self.0.extend(other.0.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
+            self.0
+                .extend(other.0.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
             self.0.sort_unstable_by_key(|&(offset, _)| offset);
         }
     }
@@ -1161,7 +1224,10 @@ mod tests {
             let mut hint = 0;
             for offset in 0..end {
                 let range = range(offset, offset + 1);
-                std::hint::black_box((real.span_for_range_from(range, &mut hint), real.span_for_range(range)));
+                std::hint::black_box((
+                    real.span_for_range_from(range, &mut hint),
+                    real.span_for_range(range),
+                ));
             }
             let mut hint = 0;
             for offset in 0..last {
@@ -1199,7 +1265,11 @@ mod tests {
             assert_eq!(map.span_at(at(offset)), want, "at {offset}");
             assert_eq!(map.span_at_from(at(offset), &mut hint), want, "in order, at {offset}");
             let from = rng.below(pairs.0.len() as u64 + 2) as u32;
-            assert_eq!(map.span_at_from(at(offset), &mut { from }), want, "from {from}, at {offset}");
+            assert_eq!(
+                map.span_at_from(at(offset), &mut { from }),
+                want,
+                "from {from}, at {offset}"
+            );
         }
         let mut hint = u32::MAX;
         for _ in 0..50 {
@@ -1219,7 +1289,10 @@ mod tests {
         for _ in 0..50 {
             let start = rng.below(u64::from(u32::from(last))) as u32;
             let range = range(start, start + rng.below(12) as u32);
-            assert_eq!(map.spans_for_range(range).collect::<Vec<_>>(), pairs.spans_for_range(range));
+            assert_eq!(
+                map.spans_for_range(range).collect::<Vec<_>>(),
+                pairs.spans_for_range(range)
+            );
         }
         for &(_, span) in pairs.0.iter().step_by(5) {
             let exact = map.ranges_with_span_exact(span).collect::<Vec<_>>();
@@ -1294,7 +1367,8 @@ mod tests {
         assert_eq!(map.fragment_span(range(10, 14)), Some(group(1)));
         assert_eq!(map.fragment_span(range(3, 8)), Some(group(2)), "the innermost");
         assert_eq!(map.fragment_span(range(3, 20)), Some(group(4)));
-        let missing = [range(3, 7), range(3, 9), range(4, 8), range(10, 15), range(0, 0), range(30, 40)];
+        let missing =
+            [range(3, 7), range(3, 9), range(4, 8), range(10, 15), range(0, 0), range(30, 40)];
         for missing in missing {
             assert_eq!(map.fragment_span(missing), None, "{missing:?}");
         }
@@ -1324,11 +1398,10 @@ mod tests {
         map.push_fragment(range(15, 20), group(5));
         map.finish();
         let outermost = |r| map.outermost_fragments_in(r).collect::<Vec<_>>();
-        assert_eq!(outermost(range(0, 30)), [
-            (range(3, 8), group(2)),
-            (range(10, 14), group(4)),
-            (range(15, 20), group(5)),
-        ]);
+        assert_eq!(
+            outermost(range(0, 30)),
+            [(range(3, 8), group(2)), (range(10, 14), group(4)), (range(15, 20), group(5)),]
+        );
         assert_eq!(outermost(range(0, 15)), [(range(3, 8), group(2)), (range(10, 14), group(4))]);
         assert_eq!(outermost(range(4, 13)), [(range(4, 6), group(1))]);
         assert_eq!(outermost(range(16, 30)), [(range(16, 18), group(6))]);

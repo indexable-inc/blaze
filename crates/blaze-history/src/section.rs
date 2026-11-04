@@ -16,8 +16,9 @@ use blaze_image::{Builder, Corrupt, Image, Refused, SectionId, Stable};
 use crate::{Config, DecodeError, History};
 
 /// The section's schema: [`History::encode`]'s bytes, by their version.
-pub const SCHEMA: SchemaHash =
-    blaze_format::schema("blaze plane history 2: blaze_history::History::encode bytes, version blzhis01");
+pub const SCHEMA: SchemaHash = blaze_format::schema(
+    "blaze plane history 4: blaze_history::History::encode bytes, version blzhis03",
+);
 
 /// Writes `history` into `builder`'s image.
 pub fn write(history: &History, builder: &mut Builder) {
@@ -89,7 +90,12 @@ mod tests {
             let mut key = [0u8; 32];
             key[..8].copy_from_slice(&(n % 97).wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
             let key = Key(key);
-            history.observe(TaskKind((n % 300) as u32), (n % 3 != 0).then_some(&key), n * 1_013, n * 97 % 100_000);
+            history.observe(
+                TaskKind((n % 300) as u32),
+                (n % 3 != 0).then_some(&key),
+                n * 1_013,
+                n * 97 % 100_000,
+            );
         }
         history
     }
@@ -123,7 +129,8 @@ mod tests {
     #[test]
     fn a_corrupt_history_is_named_and_not_started_fresh() {
         let mut file = image_of(&learned());
-        let section = Image::open(file.clone()).unwrap().section(SectionId::PLANE_HISTORY, SCHEMA).unwrap();
+        let section =
+            Image::open(file.clone()).unwrap().section(SectionId::PLANE_HISTORY, SCHEMA).unwrap();
         file[section.at as usize + 100] ^= 4;
         let image = Image::open(file).unwrap();
         match restore(&image, config()) {
@@ -139,11 +146,16 @@ mod tests {
     #[test]
     fn an_image_of_another_blaze_starts_fresh() {
         let missing = Image::open(Builder::new().finish().unwrap()).unwrap();
-        let other_schema = image_holding(blaze_format::schema("blaze plane history 1"), &learned().encode());
+        let other_schema =
+            image_holding(blaze_format::schema("blaze plane history 1"), &learned().encode());
         let mut other_version = learned().encode();
         other_version[7] ^= 1;
         let other_version = image_holding(SCHEMA, &other_version);
-        for (what, image) in [("missing", &missing), ("another schema", &other_schema), ("another version", &other_version)] {
+        for (what, image) in [
+            ("missing", &missing),
+            ("another schema", &other_schema),
+            ("another version", &other_version),
+        ] {
             match restore(image, config()) {
                 Err(error) => assert!(error.starts_fresh(), "{what}: {error}"),
                 Ok(_) => panic!("{what}: restored"),
@@ -158,7 +170,10 @@ mod tests {
         match restore(&image_holding(SCHEMA, &bytes), config()) {
             Err(error @ HistoryError::Decode(_)) => {
                 assert!(!error.starts_fresh());
-                assert!(error.to_string().starts_with(&SectionId::PLANE_HISTORY.to_string()), "{error}");
+                assert!(
+                    error.to_string().starts_with(&SectionId::PLANE_HISTORY.to_string()),
+                    "{error}"
+                );
             }
             Err(other) => panic!("expected an undecodable history, got {other:?}"),
             Ok(_) => panic!("expected an undecodable history, got one restored"),

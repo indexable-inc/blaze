@@ -30,7 +30,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidVisibility) -> Vec<Found> {
     let diag = match d.error {
         VisibilityError::Unresolved => visibility_path_error(cx, file, path),
         VisibilityError::NotAModule { found } => {
-            let names = names_to_string(visibility_segments(cx, path).iter().map(|it| it.name.as_str()));
+            let names =
+                names_to_string(visibility_segments(cx, path).iter().map(|it| it.name.as_str()));
             // alloc: the error's text, for an error hir found
             let message = format!("expected module, found {} `{names}`", descr(found));
             // clone: on the error path, for an error hir found
@@ -38,15 +39,23 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidVisibility) -> Vec<Found> {
             diag.span_label(at, "not a module");
             diag
         }
-        VisibilityError::NotAncestor { .. } => {
-            Diag::error(Some("E0742"), "visibilities can only be restricted to ancestor modules", at)
-        }
+        VisibilityError::NotAncestor { .. } => Diag::error(
+            Some("E0742"),
+            "visibilities can only be restricted to ancestor modules",
+            at,
+        ),
         VisibilityError::Relative2018 => {
-            let message = "relative paths are not supported in visibilities in 2018 edition or later";
+            let message =
+                "relative paths are not supported in visibilities in 2018 edition or later";
             // clone: on the error path, for an error hir found
             let mut diag = Diag::error(None, message, at.clone());
             // alloc: the error's text, for an error hir found
-            diag.suggestion(at, "try", format!("crate::{}", path.syntax().text()), Applicability::MaybeIncorrect);
+            diag.suggestion(
+                at,
+                "try",
+                format!("crate::{}", path.syntax().text()),
+                Applicability::MaybeIncorrect,
+            );
             diag
         }
     };

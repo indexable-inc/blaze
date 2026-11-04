@@ -59,11 +59,10 @@ impl Command {
     ) -> io::Result<(Process, StdioPipes)> {
         const CLOEXEC_MSG_FOOTER: [u8; 4] = *b"NOEX";
 
+        // blaze: a child given `environ` whole is not a walk of it by this process: blaze's
+        // interposer sees the spawn and hands the child what it was lent, and the child's reads
+        // are its own (`crates/blaze-cargo/src/sandbox/linux_interpose.c`, `macos_interpose.c`).
         let envp = self.capture_env();
-        // blaze: the child is given `environ` whole.
-        if envp.is_none() {
-            sys::env::walked();
-        }
 
         if self.saw_nul() {
             return Err(io::const_error!(
@@ -231,11 +230,8 @@ impl Command {
     }
 
     pub fn exec(&mut self, default: Stdio) -> io::Error {
+        // blaze: as in `spawn`, the program given `environ` whole reads it itself.
         let envp = self.capture_env();
-        // blaze: the program is given `environ` whole.
-        if envp.is_none() {
-            sys::env::walked();
-        }
 
         if self.saw_nul() {
             return io::const_error!(ErrorKind::InvalidInput, "nul byte found in provided data");

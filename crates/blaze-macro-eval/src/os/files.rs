@@ -78,7 +78,8 @@ fn same_dir(path: &str, dir: &str) -> bool {
 
 /// Whether `path` is `dir` or below it.
 fn under(path: &str, dir: &str) -> bool {
-    dir == "/" || (path.starts_with(dir) && matches!(path.as_bytes().get(dir.len()), None | Some(b'/')))
+    dir == "/"
+        || (path.starts_with(dir) && matches!(path.as_bytes().get(dir.len()), None | Some(b'/')))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -338,7 +339,10 @@ impl<'a> Os<'a> {
     /// no absolute directory to start from.
     fn no_cwd(&self, what: std::fmt::Arguments<'_>) -> Stop {
         // alloc: error path
-        Stop(format!("{what}, and was given the working directory `{}`, which is not absolute", self.cwd))
+        Stop(format!(
+            "{what}, and was given the working directory `{}`, which is not absolute",
+            self.cwd
+        ))
     }
 
     /// `path` made absolute from the directory `at` names, in [`Os::given`].
@@ -423,7 +427,10 @@ impl<'a> Os<'a> {
             }
             Err(Fail::NotUtf8) => {
                 // alloc: error path
-                return Err(Stop(format!("follows the link `{}`, whose target is not UTF-8", self.real)));
+                return Err(Stop(format!(
+                    "follows the link `{}`, whose target is not UTF-8",
+                    self.real
+                )));
             }
         };
         if !self.roots.as_ref().is_some_and(|roots| roots.holding(&self.real).is_some()) {
@@ -503,7 +510,13 @@ impl<'a> Os<'a> {
         }
     }
 
-    pub(super) fn open(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (at, addr, flags): (i64, u64, i64)) -> Done {
+    pub(super) fn open(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (at, addr, flags): (i64, u64, i64),
+    ) -> Done {
         let path = match Self::path(t, g, addr)? {
             Ok(path) => path,
             Err(errno) => return fail(t, g, ret, errno),
@@ -537,7 +550,9 @@ impl<'a> Os<'a> {
             Kind::File if directory => Ok(Err(Errno::Notdir)),
             Kind::Link => Ok(Err(Errno::Loop)),
             // alloc: error path
-            Kind::Other => Err(Stop(format!("opens `{}`, which is neither a file nor a directory", self.real))),
+            Kind::Other => {
+                Err(Stop(format!("opens `{}`, which is neither a file nor a directory", self.real)))
+            }
             Kind::File | Kind::Dir => {
                 let fd = self.free_slot();
                 let slot = &mut self.fds[fd];
@@ -549,7 +564,8 @@ impl<'a> Os<'a> {
                 slot.listed = false;
                 if kind == Kind::File {
                     let _span = tracing::info_span!(target: "blaze", "proc macro reads a file", subject = %self.real).entered();
-                    let read = fs::File::open(&self.real).and_then(|mut file| file.read_to_end(&mut slot.bytes));
+                    let read = fs::File::open(&self.real)
+                        .and_then(|mut file| file.read_to_end(&mut slot.bytes));
                     if let Err(error) = read {
                         let path = std::mem::take(&mut self.real);
                         self.cant(&path, &error);
@@ -589,7 +605,12 @@ impl<'a> Os<'a> {
 
     /// The next bytes of the file `fd`, at most `len`: from `offset`, or from where the last
     /// read ended, which it moves past them.
-    pub(crate) fn read_fd(&mut self, fd: i64, len: u64, offset: Option<u64>) -> Result<&[u8], Errno> {
+    pub(crate) fn read_fd(
+        &mut self,
+        fd: i64,
+        len: u64,
+        offset: Option<u64>,
+    ) -> Result<&[u8], Errno> {
         let Some(slot) = slot_mut(&mut self.fds, fd) else { return Err(Errno::Badf) };
         if slot.open == Open::Dir {
             return Err(Errno::Isdir);
@@ -603,7 +624,13 @@ impl<'a> Os<'a> {
         Ok(&slot.bytes[start..end])
     }
 
-    pub(super) fn readv(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (fd, iov, count): (i64, u64, i64)) -> Done {
+    pub(super) fn readv(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (fd, iov, count): (i64, u64, i64),
+    ) -> Done {
         if count < 0 {
             return fail(t, g, ret, Errno::Inval);
         }
@@ -636,7 +663,13 @@ impl<'a> Os<'a> {
         Ok(())
     }
 
-    pub(super) fn lseek(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (fd, offset, whence): (i64, i64, i64)) -> Done {
+    pub(super) fn lseek(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (fd, offset, whence): (i64, i64, i64),
+    ) -> Done {
         match self.seek_fd(fd, offset, whence) {
             Ok(at) => ok(ret, at),
             Err(errno) => fail(t, g, ret, errno),
@@ -668,7 +701,13 @@ impl<'a> Os<'a> {
         }
     }
 
-    pub(super) fn fstat(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (fd, buf): (i64, u64)) -> Done {
+    pub(super) fn fstat(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (fd, buf): (i64, u64),
+    ) -> Done {
         let stat = match self.stat_fd(fd) {
             Ok(stat) => stat,
             Err(errno) => return fail(t, g, ret, errno),
@@ -696,25 +735,26 @@ impl<'a> Os<'a> {
             Ok(path) => path,
             Err(errno) => return fail(t, g, ret, errno),
         };
-        let stat = if path.is_empty() && flags & at_flags.empty_path != 0 && at_flags.empty_path != 0 {
-            if at == at_flags.fdcwd {
-                match self.look((At::Cwd, "."), true)? {
-                    Ok(stat) => stat,
-                    Err(errno) => return fail(t, g, ret, errno),
+        let stat =
+            if path.is_empty() && flags & at_flags.empty_path != 0 && at_flags.empty_path != 0 {
+                if at == at_flags.fdcwd {
+                    match self.look((At::Cwd, "."), true)? {
+                        Ok(stat) => stat,
+                        Err(errno) => return fail(t, g, ret, errno),
+                    }
+                } else {
+                    match self.stat_fd(at) {
+                        Ok(stat) => stat,
+                        Err(errno) => return fail(t, g, ret, errno),
+                    }
                 }
             } else {
-                match self.stat_fd(at) {
+                let follow = flags & at_flags.symlink_nofollow == 0;
+                match self.look((At::of(t, at), path), follow)? {
                     Ok(stat) => stat,
                     Err(errno) => return fail(t, g, ret, errno),
                 }
-            }
-        } else {
-            let follow = flags & at_flags.symlink_nofollow == 0;
-            match self.look((At::of(t, at), path), follow)? {
-                Ok(stat) => stat,
-                Err(errno) => return fail(t, g, ret, errno),
-            }
-        };
+            };
         if buf == 0 {
             return fail(t, g, ret, Errno::Fault);
         }
@@ -741,7 +781,11 @@ impl<'a> Os<'a> {
     }
 
     /// A look at what `path` names, as a `stat` says it.
-    pub(crate) fn look(&mut self, at: (At, &str), follow: bool) -> Result<Result<Stat, Errno>, Stop> {
+    pub(crate) fn look(
+        &mut self,
+        at: (At, &str),
+        follow: bool,
+    ) -> Result<Result<Stat, Errno>, Stop> {
         let (kind, size) = match self.locate(at, follow, Seen::Looked)? {
             Ok(found) => found,
             Err(errno) => return Ok(Err(errno)),
@@ -751,7 +795,10 @@ impl<'a> Os<'a> {
             Kind::Dir => 0,
             Kind::Other => {
                 // alloc: error path
-                return Err(Stop(format!("looks at `{}`, which is neither a file, a directory nor a link", self.real)));
+                return Err(Stop(format!(
+                    "looks at `{}`, which is neither a file, a directory nor a link",
+                    self.real
+                )));
             }
         };
         Ok(Ok(Stat { kind, size, ino: ino_of(self.real.as_bytes()) }))
@@ -784,7 +831,13 @@ impl<'a> Os<'a> {
         ok(ret, 0)
     }
 
-    pub(super) fn getcwd(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (buf, size): (u64, u64)) -> Done {
+    pub(super) fn getcwd(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (buf, size): (u64, u64),
+    ) -> Done {
         self.find_cwd();
         let Some(Some(cwd)) = &self.cwd_real else {
             return Err(self.no_cwd(format_args!("asks for its working directory")));
@@ -804,7 +857,13 @@ impl<'a> Os<'a> {
         ok(ret, buf)
     }
 
-    pub(super) fn realpath(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (addr, resolved): (u64, u64)) -> Done {
+    pub(super) fn realpath(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (addr, resolved): (u64, u64),
+    ) -> Done {
         let path = match Self::path(t, g, addr)? {
             Ok(path) => path,
             Err(errno) => return fail_null(t, g, ret, errno),
@@ -827,7 +886,13 @@ impl<'a> Os<'a> {
         ok(ret, resolved)
     }
 
-    pub(super) fn readlink(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (addr, buf, size): (u64, u64, u64)) -> Done {
+    pub(super) fn readlink(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (addr, buf, size): (u64, u64, u64),
+    ) -> Done {
         let path = match Self::path(t, g, addr)? {
             Ok(path) => path,
             Err(errno) => return fail(t, g, ret, errno),
@@ -843,7 +908,10 @@ impl<'a> Os<'a> {
     }
 
     /// The target of the link `path` from `at` names, `EINVAL` when it is not a link.
-    pub(crate) fn link_target(&mut self, at: (At, &str)) -> Result<Result<std::path::PathBuf, Errno>, Stop> {
+    pub(crate) fn link_target(
+        &mut self,
+        at: (At, &str),
+    ) -> Result<Result<std::path::PathBuf, Errno>, Stop> {
         match self.locate(at, false, Seen::Looked)? {
             Ok((Kind::Link, _)) => {}
             Ok(_) => return Ok(Err(Errno::Inval)),
@@ -861,7 +929,13 @@ impl<'a> Os<'a> {
         }
     }
 
-    pub(super) fn opendir(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], addr: u64) -> Done {
+    pub(super) fn opendir(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        addr: u64,
+    ) -> Done {
         let flags = t.open_flags().directory;
         let mut fd = [0; 8];
         match self.open(t, g, &mut fd, (t.at_flags().fdcwd, addr, flags))? {
@@ -875,7 +949,13 @@ impl<'a> Os<'a> {
         }
     }
 
-    pub(super) fn fdopendir(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], fd: i64) -> Done {
+    pub(super) fn fdopendir(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        fd: i64,
+    ) -> Done {
         match slot(&self.fds, fd) {
             Some(slot) if slot.open == Open::Dir => {}
             Some(_) => return fail_null(t, g, ret, Errno::Notdir),
@@ -895,7 +975,13 @@ impl<'a> Os<'a> {
         ok(ret, stream.dirent)
     }
 
-    pub(super) fn readdir(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], dir: u64) -> Done {
+    pub(super) fn readdir(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        dir: u64,
+    ) -> Done {
         let Some(at) = self.stream(dir) else { return fail_null(t, g, ret, Errno::Badf) };
         let Some(fd) = self.streams[at].fd else { return fail_null(t, g, ret, Errno::Badf) };
         let next = self.streams[at].next;
@@ -929,7 +1015,9 @@ impl<'a> Os<'a> {
             }
         }
         let slot = &self.fds[index];
-        let Some(entry) = usize::try_from(n).ok().and_then(|n| slot.entries.get(n)) else { return Ok(None) };
+        let Some(entry) = usize::try_from(n).ok().and_then(|n| slot.entries.get(n)) else {
+            return Ok(None);
+        };
         let name = &slot.names[entry.start as usize..entry.end as usize];
         Ok(Some(DirEntry { name, kind: entry.kind, ino: entry.ino }))
     }
@@ -989,7 +1077,13 @@ impl<'a> Os<'a> {
         Ok(())
     }
 
-    pub(super) fn closedir(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], dir: u64) -> Done {
+    pub(super) fn closedir(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        dir: u64,
+    ) -> Done {
         let Some(at) = self.stream(dir) else { return fail(t, g, ret, Errno::Badf) };
         let Some(fd) = self.streams[at].fd.take() else { return fail(t, g, ret, Errno::Badf) };
         if let Some(slot) = slot_mut(&mut self.fds, fd) {
@@ -998,7 +1092,13 @@ impl<'a> Os<'a> {
         ok(ret, 0)
     }
 
-    pub(super) fn dirfd(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], dir: u64) -> Done {
+    pub(super) fn dirfd(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        dir: u64,
+    ) -> Done {
         match self.stream(dir).and_then(|at| self.streams[at].fd) {
             Some(fd) => ok(ret, fd as u64),
             None => fail(t, g, ret, Errno::Badf),
@@ -1009,7 +1109,13 @@ impl<'a> Os<'a> {
     /// drops it (`debug_assert_fd_is_open`, under `ub_checks`), and `F_GETFL`, which its
     /// `File`'s `Debug` asks: every descriptor open to read, close-on-exec, as std opens it.
     /// Any other command stops the expansion.
-    pub(super) fn fcntl(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (fd, cmd): (i64, i64)) -> Done {
+    pub(super) fn fcntl(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (fd, cmd): (i64, i64),
+    ) -> Done {
         let open = (0..FIRST_FD).contains(&fd) || slot(&self.fds, fd).is_some();
         match cmd {
             F_GETFD | F_GETFL if !open => fail(t, g, ret, Errno::Badf),
@@ -1018,7 +1124,9 @@ impl<'a> Os<'a> {
             // O_RDONLY, 0 on every target the shims model.
             F_GETFL => ok(ret, 0),
             // alloc: error path
-            _ => Err(Stop(format!("calls `fcntl` on descriptor {fd} with the command {cmd}, which a proc macro's shims answer only for `F_GETFD` and `F_GETFL`"))),
+            _ => Err(Stop(format!(
+                "calls `fcntl` on descriptor {fd} with the command {cmd}, which a proc macro's shims answer only for `F_GETFD` and `F_GETFL`"
+            ))),
         }
     }
 
@@ -1034,7 +1142,9 @@ impl<'a> Os<'a> {
                 Ok(Answer::Answered)
             }
             // alloc: error path
-            None => Err(Stop(format!("frees `{addr:#x}`, which no `malloc`, `realpath` or `getcwd` gave it"))),
+            None => Err(Stop(format!(
+                "frees `{addr:#x}`, which no `malloc`, `realpath` or `getcwd` gave it"
+            ))),
         }
     }
 

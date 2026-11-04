@@ -120,7 +120,10 @@ fn a_reference_to_a_type_has_its_environment() {
         let show_trait = trait_(&db, "Show");
         let pair = trait_(&db, "Pair");
         let u8_arg = params(&db, "adts")[0].fields(&db).remove(0).1;
-        assert!(shared.impls_trait(&db, show_trait, &[]), "`impl<T: Show> Show for &T` and `T: Sub`");
+        assert!(
+            shared.impls_trait(&db, show_trait, &[]),
+            "`impl<T: Show> Show for &T` and `T: Sub`"
+        );
         assert!(u.ref_to(&db, Mutability::Shared).impls_trait(&db, show_trait, &[]));
         let u8_arg = u8_arg.without_params(&db).expect("`u8` names no parameter");
         assert!(t.impls_trait(&db, pair, &[u8_arg.clone()]));

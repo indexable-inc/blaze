@@ -53,7 +53,7 @@ empties one.
 
 ### Persistence
 
-`History::encode` writes, in a fixed order, `blzhis01`, the slot count, clock and eviction
+`History::encode` writes, in a fixed order, `blzhis03`, the slot count, clock and eviction
 count, the encoded `Estimates`, the kinds sorted, and the occupied slots in slot order: the same
 history makes the same bytes. `decode` checks every field (magic, lengths, sort orders, that
 each record sits in its bucket with no empty way before it, distinct stamps, sound records)

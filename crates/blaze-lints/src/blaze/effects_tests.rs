@@ -90,7 +90,10 @@ fn effects_of(meta: &str, main: &str) -> String {
         "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std{meta}\n{}",
         main.trim_start_matches('\n')
     );
-    lint(&fixture, "-A clippy::all --deny=blaze::nopanic --deny=blaze::noalloc --deny=blaze::nonblocking")
+    lint(
+        &fixture,
+        "-A clippy::all --deny=blaze::nopanic --deny=blaze::noalloc --deny=blaze::nonblocking",
+    )
 }
 
 /// The findings of `lint_name` in `out`.
@@ -256,7 +259,10 @@ pub fn call(job: *const dyn Job) {
     );
     let found = findings(&out, "noalloc");
     assert_eq!(found.len(), 1, "{out}");
-    assert!(found[0].contains("takes `dyn Job") && found[0].contains("whose calls the check can't see"), "{out}");
+    assert!(
+        found[0].contains("takes `dyn Job") && found[0].contains("whose calls the check can't see"),
+        "{out}"
+    );
     // The type as a person writes it, not the solver's debug form (`dyn [Binder { .. }]`).
     assert!(!found[0].contains("Binder"), "{out}");
 }

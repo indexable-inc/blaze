@@ -137,11 +137,7 @@ impl History {
             "an executed test case's clone values nest deeper than MAX_CLONE_DEPTH"
         );
         if self.seen.insert(fnv1a(&key)) {
-            let entry = HistoryEntry {
-                nodes: nodes.to_vec(),
-                spans: spans.to_vec(),
-                accept,
-            };
+            let entry = HistoryEntry { nodes: nodes.to_vec(), spans: spans.to_vec(), accept };
             self.bytes += entry_bytes(&entry);
             self.entries.push(entry);
             self.thin();
@@ -263,9 +259,7 @@ impl Counterexample {
 
     /// The incumbent as a run with the address of every draw.
     pub(crate) fn incumbent_run(&self) -> Option<Run> {
-        self.incumbent
-            .as_ref()
-            .map(|nodes| Run::from_nodes(nodes, &self.incumbent_spans))
+        self.incumbent.as_ref().map(|nodes| Run::from_nodes(nodes, &self.incumbent_spans))
     }
 
     /// A raw interesting execution: found the incumbent if the origin is
@@ -310,17 +304,14 @@ impl Counterexample {
     pub(crate) fn replay_graph(&self) -> Option<Arc<Graph>> {
         match &self.graph {
             Some(graph) => Some(Arc::clone(graph)),
-            None => self
-                .incumbent_run()
-                .map(|run| Arc::new(Graph::from_run(&run))),
+            None => self.incumbent_run().map(|run| Arc::new(Graph::from_run(&run))),
         }
     }
 
     /// The flattened length of the longest failing run known: the stored
     /// graph's, floored at the incumbent's.
     pub(crate) fn longest(&self) -> usize {
-        self.longest
-            .max(self.incumbent.as_deref().map_or(0, flattened_len))
+        self.longest.max(self.incumbent.as_deref().map_or(0, flattened_len))
     }
 
     /// The stored form under nondeterministic handling: the replay graph,
@@ -428,10 +419,7 @@ impl Counterexample {
                 "Counterexample::confirm: the origin is already confirmed"
             );
         }
-        self.standing = Standing::Confirmed {
-            anchor,
-            witness: witness.map(Box::new),
-        };
+        self.standing = Standing::Confirmed { anchor, witness: witness.map(Box::new) };
         self.graph = Some(Arc::new(graph));
         self.longest = longest;
         self.fold(evidence);
@@ -586,13 +574,7 @@ impl Counterexample {
         if !self.missed && !self.needs_confirmation() {
             return None;
         }
-        let Counterexample {
-            fails,
-            replays,
-            report_fails,
-            report_replays,
-            ..
-        } = self;
+        let Counterexample { fails, replays, report_fails, report_replays, .. } = self;
         let caveat = match self.standing {
             Standing::Confirmed { .. } => {
                 if *report_replays > 0 && *report_fails == 0 {
@@ -692,9 +674,7 @@ impl Counterexamples {
     /// Whether `origin` still has to face the discovery bar: unknown
     /// origins do.
     pub(crate) fn needs_confirmation(&self, origin: &str) -> bool {
-        self.origins
-            .get(origin)
-            .is_none_or(Counterexample::needs_confirmation)
+        self.origins.get(origin).is_none_or(Counterexample::needs_confirmation)
     }
 
     /// Origins holding an incumbent — the failures the run will shrink,
@@ -713,9 +693,7 @@ impl Counterexamples {
 
     /// The live origins, in origin order.
     pub(crate) fn live_origins(&self) -> Vec<String> {
-        self.live()
-            .map(|(origin, _)| String::from(origin))
-            .collect()
+        self.live().map(|(origin, _)| String::from(origin)).collect()
     }
 
     /// Every origin known this run with its record, in origin order.
@@ -724,9 +702,7 @@ impl Counterexamples {
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut Counterexample)> {
-        self.origins
-            .iter_mut()
-            .map(|(origin, c)| (origin.as_str(), c))
+        self.origins.iter_mut().map(|(origin, c)| (origin.as_str(), c))
     }
 
     /// Origins observed but never confirmed — bar rejects and never-barred

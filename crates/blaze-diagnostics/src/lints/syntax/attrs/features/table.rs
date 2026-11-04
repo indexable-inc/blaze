@@ -82,7 +82,9 @@ pub(crate) fn incomplete(name: &str) -> bool {
 pub(crate) fn internal(name: &str) -> bool {
     match lang(name) {
         Some(it) if it.kind.is_unstable() => it.kind == Kind::Internal,
-        _ => name == "core_intrinsics" || name.ends_with("_internal") || name.ends_with("_internals"),
+        _ => {
+            name == "core_intrinsics" || name.ends_with("_internal") || name.ends_with("_internals")
+        }
     }
 }
 
@@ -101,7 +103,9 @@ mod tests {
         assert!(lang::REMOVED.windows(2).all(|it| it[0].0 < it[1].0));
         let removed = lang::LANG.iter().filter(|it| it.1 == Kind::Removed).count();
         assert_eq!(removed, lang::REMOVED.len());
-        assert!(lang::REMOVED.iter().all(|it| lang(it.0).is_some_and(|it| it.kind == Kind::Removed)));
+        assert!(
+            lang::REMOVED.iter().all(|it| lang(it.0).is_some_and(|it| it.kind == Kind::Removed))
+        );
     }
 
     #[test]
@@ -114,14 +118,22 @@ mod tests {
         }
         assert_eq!(lang::DECLARED.len(), unstable);
         let declared: Vec<_> = unstable_declared().take(3).collect();
-        assert_eq!(declared, ["allocator_internals", "allow_internal_unsafe", "allow_internal_unstable"]);
+        assert_eq!(
+            declared,
+            ["allocator_internals", "allow_internal_unsafe", "allow_internal_unstable"]
+        );
     }
 
     #[test]
     fn a_language_feature_is_found_with_its_status_and_issue() {
         assert_eq!(
             lang("specialization"),
-            Some(Lang { name: "specialization", kind: Kind::Incomplete, since: "1.7.0", issue: Some(31844) })
+            Some(Lang {
+                name: "specialization",
+                kind: Kind::Incomplete,
+                since: "1.7.0",
+                issue: Some(31844)
+            })
         );
         assert_eq!(lang("intrinsics").map(|it| it.kind), Some(Kind::Internal));
         assert_eq!(lang("rustc_attrs").map(|it| it.kind), Some(Kind::Internal));
@@ -138,7 +150,9 @@ mod tests {
         assert!(incomplete("generic_const_exprs") && !internal("generic_const_exprs"));
         assert!(!incomplete("min_specialization") && !internal("min_specialization"));
         assert!(internal("intrinsics") && internal("lang_items") && internal("staged_api"));
-        assert!(internal("panic_internals") && internal("fmt_internals") && internal("core_intrinsics"));
+        assert!(
+            internal("panic_internals") && internal("fmt_internals") && internal("core_intrinsics")
+        );
         assert!(internal("eii_internals") && !incomplete("eii_internals"));
         assert!(!internal("unstable_test_feature") && !incomplete("unstable_test_feature"));
         assert!(!incomplete("aarch64_target_feature") && !internal("aarch64_target_feature"));
@@ -149,7 +163,10 @@ mod tests {
         assert!(!is_lang("unsized_locals"));
         assert!(is_lang("aarch64_target_feature") && is_lang("specialization"));
         assert!(!is_lang("panic_internals"));
-        assert_eq!(removed("start"), Some((Some("not portable enough and never RFC'd"), Some(134299))));
+        assert_eq!(
+            removed("start"),
+            Some((Some("not portable enough and never RFC'd"), Some(134299)))
+        );
         assert_eq!(removed("quote"), Some((None, None)));
         assert_eq!(removed("specialization"), None);
     }

@@ -14,12 +14,12 @@ use std::hash::{Hash, Hasher};
 
 use blaze_build_script::apply::{GraphUnit, to_link_in};
 use blaze_hash::{FixedHasher, HashMap};
-use std::alloc::Global;
 use blaze_ids::{bits::BitSet, radix::Csr};
 use blaze_units::{
     query::Units,
     schema::{Mode, Unit},
 };
+use std::alloc::Global;
 
 use super::error::UnitError;
 
@@ -147,7 +147,10 @@ fn flags_of(unit: &Unit) -> u8 {
     if target.is_custom_build() || target.is_proc_macro() {
         flags |= flag::FOR_HOST;
     }
-    let linkable_type = target.crate_types.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"));
+    let linkable_type = target
+        .crate_types
+        .iter()
+        .any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"));
     if target.is_lib() && linkable_type {
         flags |= flag::LINKABLE;
     }
@@ -201,7 +204,9 @@ impl Graph {
         let (up_start, up) = Csr::build(
             count,
             (0..count).flat_map(|from| {
-                deps[dep_start[from] as usize..dep_start[from + 1] as usize].iter().map(move |&dep| (dep, from as u32))
+                deps[dep_start[from] as usize..dep_start[from + 1] as usize]
+                    .iter()
+                    .map(move |&dep| (dep, from as u32))
             }),
         )
         .into_parts();
@@ -244,7 +249,10 @@ impl Graph {
 
         let mut build_time = BitSet::<u32>::new(count);
         let mut pending: Vec<u32> = (0..count as u32)
-            .filter(|at| graph.flags[*at as usize] & flag::FOR_HOST != 0 && graph.flags[*at as usize] & flag::RUN == 0)
+            .filter(|at| {
+                graph.flags[*at as usize] & flag::FOR_HOST != 0
+                    && graph.flags[*at as usize] & flag::RUN == 0
+            })
             .collect();
         for at in &pending {
             build_time.insert(*at);
@@ -268,10 +276,18 @@ impl Graph {
             false => deps
                 .iter()
                 .copied()
-                .filter(|dep| self.has(*dep, flag::RUN) && self.package[*dep as usize] == self.package[at as usize])
+                .filter(|dep| {
+                    self.has(*dep, flag::RUN)
+                        && self.package[*dep as usize] == self.package[at as usize]
+                })
                 .collect(),
         };
-        GraphUnit { deps, own_runs, for_host: self.has(at, flag::FOR_HOST), linkable: self.has(at, flag::LINKABLE) }
+        GraphUnit {
+            deps,
+            own_runs,
+            for_host: self.has(at, flag::FOR_HOST),
+            linkable: self.has(at, flag::LINKABLE),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -320,7 +336,14 @@ impl Graph {
     }
 
     /// The unit that builds `kinds` target `name` of `pkg_id` in `mode`.
-    pub(crate) fn find(&self, all: &[Unit], pkg_id: &str, name: &str, kinds: &[impl AsRef<str>], mode: Mode) -> Option<u32> {
+    pub(crate) fn find(
+        &self,
+        all: &[Unit],
+        pkg_id: &str,
+        name: &str,
+        kinds: &[impl AsRef<str>],
+        mode: Mode,
+    ) -> Option<u32> {
         let found = self.by_target.get(&target_hash(pkg_id, name, kinds, mode))?;
         found.iter().copied().find(|at| {
             let unit = &all[*at as usize];
@@ -364,7 +387,10 @@ impl Graph {
         let mut pending = vec![unit];
         while let Some(at) = pending.pop() {
             for &dep in self.deps(at) {
-                if self.has(dep, flag::LINKABLE) && !self.has(dep, flag::FOR_HOST) && inside.insert(dep) {
+                if self.has(dep, flag::LINKABLE)
+                    && !self.has(dep, flag::FOR_HOST)
+                    && inside.insert(dep)
+                {
                     pending.push(dep);
                 }
             }

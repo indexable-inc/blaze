@@ -4,12 +4,12 @@ use std::{cmp::Ordering, fmt};
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashSet};
-use std::alloc::Global;
 use blaze_ids::bits::BitSet;
 use blaze_mem::Frame;
 use hir_expand::name::Name;
 use indexmap::IndexSet;
 use span::Edition;
+use std::alloc::Global;
 use stdx::format_to;
 
 use crate::{
@@ -327,7 +327,14 @@ impl<'f> Collector<'f> {
                 if let Some(it) = per_ns.types
                     && it.vis == Visibility::Public
                 {
-                    found.visit(db, &mut worklist, name, module, ItemInNs::Types(it.def), it.import);
+                    found.visit(
+                        db,
+                        &mut worklist,
+                        name,
+                        module,
+                        ItemInNs::Types(it.def),
+                        it.import,
+                    );
                 }
                 if let Some(it) = per_ns.values
                     && it.vis == Visibility::Public
@@ -338,7 +345,14 @@ impl<'f> Collector<'f> {
                 if let Some(it) = per_ns.macros
                     && it.vis == Visibility::Public
                 {
-                    found.visit(db, &mut worklist, name, module, ItemInNs::Macros(it.def), it.import);
+                    found.visit(
+                        db,
+                        &mut worklist,
+                        name,
+                        module,
+                        ItemInNs::Macros(it.def),
+                        it.import,
+                    );
                 }
             }
         }
@@ -419,12 +433,7 @@ impl<'f> Collector<'f> {
         }
     }
 
-    fn collect_enum_variants(
-        &mut self,
-        db: &Db,
-        enum_: EnumId,
-        enum_import_info: &ImportInfo,
-    ) {
+    fn collect_enum_variants(&mut self, db: &Db, enum_: EnumId, enum_import_info: &ImportInfo) {
         for (&variant_name, &(variant, _)) in &enum_.enum_variants(db).variants {
             let attr_id = variant.into();
             let attrs = AttrFlags::query(db, attr_id);
@@ -1131,7 +1140,9 @@ mod tests {
         check_search(
             ra_fixture,
             "main",
-            &Query::new("fmt".to_owned()).fuzzy().assoc_search_mode(AssocSearchMode::AssocItemsOnly),
+            &Query::new("fmt".to_owned())
+                .fuzzy()
+                .assoc_search_mode(AssocSearchMode::AssocItemsOnly),
             &expect![[r#"
                 dep::fmt::Display::FMT_CONST (a)
                 dep::fmt::Display::format_function (a)
@@ -1309,10 +1320,10 @@ pub mod fmt {
     mod reference {
         use base_db::{Crate, Db};
         use blaze_hash::HashSet;
-        use std::alloc::Global;
         use fst::{Automaton, IntoStreamer, Streamer, raw::IndexedValue};
         use itertools::Itertools;
         use smallvec::SmallVec;
+        use std::alloc::Global;
 
         use super::super::{ImportInfo, IsTraitAssocItem, Query, SearchMode};
         use crate::{
@@ -1323,8 +1334,7 @@ pub mod fmt {
             visibility::Visibility,
         };
 
-        pub(super) type Index =
-            FxIndexMap<ItemInNs, (SmallVec<[ImportInfo; 1]>, IsTraitAssocItem)>;
+        pub(super) type Index = FxIndexMap<ItemInNs, (SmallVec<[ImportInfo; 1]>, IsTraitAssocItem)>;
 
         pub(super) struct OldImportMap {
             pub(super) map: Index,
@@ -1447,8 +1457,7 @@ pub mod fmt {
                                 matches!(item, ItemInNs::Types(_)),
                                 &import_info,
                             );
-                        } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def
-                        {
+                        } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def {
                             collect_enum_variants(db, &mut map, enum_, &import_info);
                         }
                         let (infos, _) = map
@@ -1549,14 +1558,12 @@ pub mod fmt {
                         let m = if case_sensitive {
                             name.match_indices(query_char).next()
                         } else {
-                            name.match_indices([query_char, query_char.to_ascii_uppercase()])
-                                .next()
+                            name.match_indices([query_char, query_char.to_ascii_uppercase()]).next()
                         };
                         match m {
                             Some((index, _)) => {
-                                name = name[index..]
-                                    .strip_prefix(|_: char| true)
-                                    .unwrap_or_default();
+                                name =
+                                    name[index..].strip_prefix(|_: char| true).unwrap_or_default();
                                 true
                             }
                             None => false,
@@ -1601,7 +1608,11 @@ pub mod fmt {
 
         /// The matches in the order fst finds them: dependencies in order, each one's keys in
         /// order (its own FST, no union), each key's importables in order, every occurrence.
-        pub(super) fn search_each(db: &Db, krate: Crate, query: &Query) -> Vec<(ItemInNs, Complete)> {
+        pub(super) fn search_each(
+            db: &Db,
+            krate: Crate,
+            query: &Query,
+        ) -> Vec<(ItemInNs, Complete)> {
             let mut res = Vec::new();
             for dep in krate.data(db).dependencies.iter() {
                 let map = build(db, dep.crate_id);
@@ -1710,7 +1721,11 @@ pub mod fmt {
                     "seed {seed}\n{fixture}"
                 );
                 for (row, (&item, (infos, assoc))) in old.map.iter().enumerate() {
-                    assert_eq!(new.import_info_for(item), Some(&infos[..]), "seed {seed}, {item:?}");
+                    assert_eq!(
+                        new.import_info_for(item),
+                        Some(&infos[..]),
+                        "seed {seed}, {item:?}"
+                    );
                     assert_eq!(new.is_trait_assoc_item(row), *assoc, "seed {seed}, {item:?}");
                     names.extend(infos.iter().map(|info| info.name.as_str().to_owned()));
                 }
@@ -1851,8 +1866,7 @@ pub mod fmt {
                 let query: String = (0..query_len)
                     .map(|digit| alphabet[at / alphabet.len().pow(digit) % alphabet.len()])
                     .collect();
-                let mut stream =
-                    set.search(fst::automaton::Subsequence::new(&query)).into_stream();
+                let mut stream = set.search(fst::automaton::Subsequence::new(&query)).into_stream();
                 let mut taken = Vec::new();
                 while let Some(key) = stream.next() {
                     taken.push(key.to_vec());

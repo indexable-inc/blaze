@@ -3,8 +3,8 @@ mod check_cache;
 mod closure_captures;
 mod coercion;
 mod const_effects;
-mod consteval;
 mod const_valtree;
+mod consteval;
 mod derived_impls;
 mod diagnostics;
 mod display_source_code;
@@ -28,7 +28,6 @@ mod variance;
 
 use base_db::{Crate, EditionedFileId};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use expect_test::Expect;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId, VariantId,
@@ -41,6 +40,7 @@ use hir_def::{
 use hir_expand::fixture;
 use hir_expand::{FileRange, InFile};
 use itertools::Itertools;
+use std::alloc::Global;
 use stdx::format_to;
 use syntax::{
     SyntaxNode,
@@ -268,10 +268,8 @@ fn check_impl(
                     assert_eq!(actual, expected, "type annotation differs at {:#?}", range.range);
                 }
                 if let Some(expected) = adjustments.remove(&range) {
-                    let adjustments = inference_result
-                        .expr_adjustments
-                        .get(&expr)
-                        .unwrap_or_default();
+                    let adjustments =
+                        inference_result.expr_adjustments.get(&expr).unwrap_or_default();
                     assert_eq!(
                         expected,
                         adjustments
@@ -435,7 +433,9 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     Err(SyntheticSyntax) => continue,
                 };
                 types.push((node.clone(), ty.as_ref()));
-                if let Some(mismatch) = type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(pat)) {
+                if let Some(mismatch) =
+                    type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(pat))
+                {
                     mismatches.push((node, *mismatch));
                 }
             }
@@ -449,7 +449,9 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     Err(SyntheticSyntax) => continue,
                 };
                 types.push((node.clone(), ty.as_ref()));
-                if let Some(mismatch) = type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(expr)) {
+                if let Some(mismatch) =
+                    type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(expr))
+                {
                     mismatches.push((node, *mismatch));
                 }
             }

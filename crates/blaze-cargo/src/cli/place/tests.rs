@@ -78,7 +78,10 @@ fn cargos_errors_before_a_manifest() {
     let none = tempfile::tempdir().unwrap();
     assert_eq!(
         manifest(none.path(), None, false).unwrap_err(),
-        format!("could not find `Cargo.toml` in `{}` or any parent directory", none.path().display())
+        format!(
+            "could not find `Cargo.toml` in `{}` or any parent directory",
+            none.path().display()
+        )
     );
 }
 
@@ -108,22 +111,33 @@ fn config_files_outside_the_checkout() {
     std::fs::write(home.join("credentials.toml"), "[registry]\ntoken = \"x\"\n").unwrap();
     std::fs::write(dir.path().join("extra.toml"), "[env]\n").unwrap();
     let place = find(&w.join("crates/a"), None, false).unwrap();
-    let configs = ["../../../extra.toml".to_owned(), "build.jobs=4".to_owned(), "../../.cargo/config.toml".to_owned()];
+    let configs = [
+        "../../../extra.toml".to_owned(),
+        "build.jobs=4".to_owned(),
+        "../../.cargo/config.toml".to_owned(),
+    ];
     let files = config_files(&place, &configs, Some(&home)).unwrap();
     let named: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
     let utf8 = |path: PathBuf| path.to_str().unwrap().to_owned();
-    assert_eq!(named, [
-        utf8(dir.path().join(".cargo/config.toml")),
-        utf8(home.join("config.toml")),
-        utf8(dir.path().join("extra.toml")),
-    ]);
+    assert_eq!(
+        named,
+        [
+            utf8(dir.path().join(".cargo/config.toml")),
+            utf8(home.join("config.toml")),
+            utf8(dir.path().join("extra.toml")),
+        ]
+    );
     assert_eq!(files[1].1, b"[net]\noffline = true\n");
 }
 
 #[test]
 fn the_environment_sorted_and_never_shown() {
-    let vars = [("B", "2"), ("A", "1")].map(|(name, value)| (OsString::from(name), OsString::from(value)));
-    assert_eq!(env(vars.into_iter()).unwrap(), [("A".to_owned(), "1".to_owned()), ("B".to_owned(), "2".to_owned())]);
+    let vars =
+        [("B", "2"), ("A", "1")].map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    assert_eq!(
+        env(vars.into_iter()).unwrap(),
+        [("A".to_owned(), "1".to_owned()), ("B".to_owned(), "2".to_owned())]
+    );
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt as _;
@@ -151,7 +165,10 @@ fn color_as_cargo_decides() {
     #[cfg(not(windows))]
     assert_eq!(color(None, vars(&[("TERM", "dumb")]), true), Ok(false));
     let refused = color(None, vars(&[("CARGO_TERM_COLOR", "sometimes")]), true).unwrap_err();
-    assert_eq!(refused, "argument for --color must be auto, always, or never, but found `sometimes`");
+    assert_eq!(
+        refused,
+        "argument for --color must be auto, always, or never, but found `sometimes`"
+    );
     // clap took `--color` in any case; cargo's `ColorChoice` takes lowercase only.
     let refused = color(Some("ALWAYS"), vars(&[]), true).unwrap_err();
     assert_eq!(refused, "argument for --color must be auto, always, or never, but found `ALWAYS`");

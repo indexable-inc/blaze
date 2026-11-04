@@ -77,7 +77,9 @@ pub fn stub_slot(arch: u32, stub: &[u8]) -> Option<u32> {
     let offset = match arch {
         ARCH_X86_64 => {
             let stub = stub.get(..16)?;
-            let fixed = stub[..3] == [0x4c, 0x8b, 0x1d] && stub[7..10] == [0x41, 0xff, 0xa3] && stub[14..] == [0xcc, 0xcc];
+            let fixed = stub[..3] == [0x4c, 0x8b, 0x1d]
+                && stub[7..10] == [0x41, 0xff, 0xa3]
+                && stub[14..] == [0xcc, 0xcc];
             if !fixed {
                 return None;
             }
@@ -106,7 +108,11 @@ pub fn stub_slot(arch: u32, stub: &[u8]) -> Option<u32> {
                 imm12(w[2]) << 3
             } else if is(w[2], ADD_X16_LSL12) && is(w[3], LDR_X16) && w[4] == BR_X16 {
                 imm12(w[2]) << 12 | imm12(w[3]) << 3
-            } else if is(w[2], MOVZ_X17) && is(w[3], MOVK_X17_LSL16) && w[4] == LDR_X16_X17 && w[5] == BR_X16 {
+            } else if is(w[2], MOVZ_X17)
+                && is(w[3], MOVK_X17_LSL16)
+                && w[4] == LDR_X16_X17
+                && w[5] == BR_X16
+            {
                 imm16(w[2]) | imm16(w[3]) << 16
             } else {
                 return None;

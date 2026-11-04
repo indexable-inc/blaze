@@ -30,7 +30,8 @@ fn for_const_is_a_for_expr_with_a_const_token() {
         .enumerate()
         .filter(|(i, it)| {
             *it != "CONST_KW \"const\""
-                && !(*it == "WHITESPACE \" \"" && comptime.get(i + 1).is_some_and(|n| n == "CONST_KW \"const\""))
+                && !(*it == "WHITESPACE \" \""
+                    && comptime.get(i + 1).is_some_and(|n| n == "CONST_KW \"const\""))
         })
         .map(|(_, it)| it.clone())
         .collect();
@@ -62,7 +63,17 @@ fn a_where_clause_binder_takes_bounded_type_params() {
         "fn f<T>() where for<F: Field<T>> F::Type: Hash + Eq, for<V: Variant<T>, F: Field<V>> F::Type: Debug {}",
     );
     assert!(
-        has_run(&tree, &["WHERE_PRED", "FOR_BINDER", "FOR_KW \"for\"", "GENERIC_PARAM_LIST", "L_ANGLE \"<\"", "TYPE_PARAM"]),
+        has_run(
+            &tree,
+            &[
+                "WHERE_PRED",
+                "FOR_BINDER",
+                "FOR_KW \"for\"",
+                "GENERIC_PARAM_LIST",
+                "L_ANGLE \"<\"",
+                "TYPE_PARAM"
+            ]
+        ),
         "{tree:#?}"
     );
     // `fn f<T>`'s own `T`, then the binders' `F`, `V` and `F`, in source order; the `T` and `V`
@@ -81,7 +92,9 @@ fn a_where_clause_binder_takes_bounded_type_params() {
 /// no `.` taken before an index, and the near misses stay errors.
 #[test]
 fn code_without_the_extension_parses_as_before() {
-    for text in ["fn f() { for x in [] {} }", "fn f() { x[1][2]; x.0[1]; }", "fn f() { for<'a> || (); }"] {
+    for text in
+        ["fn f() { for x in [] {} }", "fn f() { x[1][2]; x.0[1]; }", "fn f() { for<'a> || (); }"]
+    {
         let tree = clean(text);
         assert!(!tree.iter().any(|it| it == "CONST_KW \"const\""), "{text}: {tree:#?}");
         assert!(!has_run(&tree, &["DOT \".\"", "L_BRACK \"[\""]), "{text}: {tree:#?}");

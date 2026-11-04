@@ -17,8 +17,11 @@ pub struct Section {
 impl Section {
     /// `range` of `map`; `None` when it is not inside it.
     pub fn new(map: Mapping, range: Range<usize>) -> Option<Section> {
-        (range.start <= range.end && range.end <= map.bytes().len())
-            .then_some(Section { map, start: range.start, end: range.end })
+        (range.start <= range.end && range.end <= map.bytes().len()).then_some(Section {
+            map,
+            start: range.start,
+            end: range.end,
+        })
     }
 
     pub fn bytes(&self) -> &[u8] {

@@ -95,10 +95,17 @@ impl Kind {
 /// One step of a path.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Step<'a> {
-    Named { kind: Option<Kind>, name: &'a str },
+    Named {
+        kind: Option<Kind>,
+        name: &'a str,
+    },
     /// The impls whose type, and trait if any, read `ty` and `of` with whitespace removed; the
     /// `nth` of them when given.
-    Impl { ty: &'a str, of: Option<&'a str>, nth: Option<usize> },
+    Impl {
+        ty: &'a str,
+        of: Option<&'a str>,
+        nth: Option<usize>,
+    },
 }
 
 /// `path` cut at each `::` outside angle brackets (an `->`'s `>` closes none), into `parts`.
@@ -225,9 +232,11 @@ pub fn members<'t>(container: Node<'t>) -> impl Iterator<Item = Node<'t>> {
         SyntaxKind::IMPL | SyntaxKind::TRAIT => {
             container.child_where(|it| it == SyntaxKind::ASSOC_ITEM_LIST)
         }
-        SyntaxKind::STRUCT | SyntaxKind::UNION | SyntaxKind::VARIANT => container.child_where(|it| {
-            it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST
-        }),
+        SyntaxKind::STRUCT | SyntaxKind::UNION | SyntaxKind::VARIANT => {
+            container.child_where(|it| {
+                it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST
+            })
+        }
         SyntaxKind::ENUM => container.child_where(|it| it == SyntaxKind::VARIANT_LIST),
         _ => None,
     };
@@ -237,8 +246,9 @@ pub fn members<'t>(container: Node<'t>) -> impl Iterator<Item = Node<'t>> {
             _ => None,
         };
         let own = Kind::of(child.kind()).is_some().then_some(child);
-        own.into_iter()
-            .chain(externs.into_iter().flat_map(Node::children).filter(|it| Kind::of(it.kind()).is_some()))
+        own.into_iter().chain(
+            externs.into_iter().flat_map(Node::children).filter(|it| Kind::of(it.kind()).is_some()),
+        )
     })
 }
 
@@ -285,7 +295,10 @@ fn name_is(member: Node<'_>, name: &str) -> bool {
     let name = strip_raw(name);
     if member.kind() == SyntaxKind::TUPLE_FIELD {
         let Some(list) = member.parent() else { return false };
-        let at = list.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == member);
+        let at = list
+            .children()
+            .filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD)
+            .position(|it| it == member);
         return at.is_some_and(|at| is_decimal(name, at));
     }
     own_name(member).is_some_and(|it| strip_raw(it) == name)
@@ -312,16 +325,24 @@ pub fn find<'t>(root: Node<'t>, path: &str) -> Result<Node<'t>, String> {
     frame::task(Tag::Api, |temp| -> Result<Node<'t>, String> {
         let mut parts = Vec::with_capacity_in(4, temp);
         split(path, &mut parts)?;
-        let (mut frontier, mut found) = (Vec::with_capacity_in(4, temp), Vec::with_capacity_in(4, temp));
+        let (mut frontier, mut found) =
+            (Vec::with_capacity_in(4, temp), Vec::with_capacity_in(4, temp));
         frontier.push(root);
         for (at, part) in parts.iter().enumerate() {
             let step = step(part, path)?;
             found.clear();
-            found.extend(frontier.iter().flat_map(|it| members(*it)).filter(|member| matches(*member, &step)));
+            found.extend(
+                frontier
+                    .iter()
+                    .flat_map(|it| members(*it))
+                    .filter(|member| matches(*member, &step)),
+            );
             if let Step::Impl { nth: Some(nth), .. } = step {
                 let count = found.len();
                 if nth >= count {
-                    return Err(format!("`{path}` asks for impl {nth} of `{part}`, and the file has {count}")); // alloc: error path
+                    return Err(format!(
+                        "`{path}` asks for impl {nth} of `{part}`, and the file has {count}"
+                    )); // alloc: error path
                 }
                 found.swap(0, nth);
                 found.truncate(1);
@@ -330,7 +351,11 @@ pub fn find<'t>(root: Node<'t>, path: &str) -> Result<Node<'t>, String> {
             match (found.len(), &step) {
                 (0, _) => {
                     let within = parts[..at].join("::");
-                    let within = if within.is_empty() { "the file".to_owned() } else { format!("`{within}`") }; // alloc: error path
+                    let within = if within.is_empty() {
+                        "the file".to_owned()
+                    } else {
+                        format!("`{within}`")
+                    }; // alloc: error path
                     return Err(format!("no `{part}` in {within}")); // alloc: error path
                 }
                 (1, _) => {}
@@ -390,7 +415,7 @@ fn step_of<'t>(node: Node<'t>, container: Option<Node<'t>>) -> String {
     if let Some((ty, of)) = impl_of(node) {
         let text = match &of {
             Some(of) => format!("<{ty} as {of}>"), // alloc: the path `of` writes back
-            None => format!("<{ty}>"), // alloc: the path `of` writes back
+            None => format!("<{ty}>"),             // alloc: the path `of` writes back
         };
         let alike = || siblings().filter(|it| impl_is(*it, &ty, of.as_deref()));
         if alike().count() > 1 {
@@ -400,7 +425,8 @@ fn step_of<'t>(node: Node<'t>, container: Option<Node<'t>>) -> String {
         return text;
     }
     let name = name_of(node).unwrap_or_default();
-    let same = siblings().filter(|it| it.kind() != SyntaxKind::IMPL && named_exactly(*it, &name)).count();
+    let same =
+        siblings().filter(|it| it.kind() != SyntaxKind::IMPL && named_exactly(*it, &name)).count();
     match Kind::of(node.kind()) {
         Some(kind) if same > 1 => format!("{} {name}", kind.keyword()), // alloc: the path `of` writes back
         _ => name,
@@ -437,9 +463,9 @@ pub fn top_of(node: Node<'_>) -> Option<Node<'_>> {
 
 /// The module, impl or trait a top item is in, `None` for one directly in the file.
 pub fn scope_of(item: Node<'_>) -> Option<Node<'_>> {
-    item.ancestors().skip(1).find(|it| {
-        matches!(it.kind(), SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT)
-    })
+    item.ancestors()
+        .skip(1)
+        .find(|it| matches!(it.kind(), SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT))
 }
 
 #[cfg(test)]

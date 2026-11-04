@@ -45,12 +45,22 @@ fn site<'db>(cx: &Cx<'_, 'db>, site: &MissingLifetimeSite) -> Option<Site<'db>> 
         MissingLifetimeSite::Reference(ptr) => {
             let it = cx.node_view(*ptr);
             let amp = it.value.amp_token()?;
-            Site { file: it.file_id, node: it.value.syntax(), missing: Missing::ampersand(amp.text_range()), def: None }
+            Site {
+                file: it.file_id,
+                node: it.value.syntax(),
+                missing: Missing::ampersand(amp.text_range()),
+                def: None,
+            }
         }
         MissingLifetimeSite::Placeholder(ptr) => {
             let it = cx.node_view(*ptr);
             let range = it.value.syntax().text_range();
-            Site { file: it.file_id, node: it.value.syntax(), missing: Missing::underscore(range), def: None }
+            Site {
+                file: it.file_id,
+                node: it.value.syntax(),
+                missing: Missing::underscore(range),
+                def: None,
+            }
         }
         MissingLifetimeSite::Path { generics_or_segment, expected, def } => {
             let seg = Segment::of(cx, *generics_or_segment)?;
@@ -167,7 +177,8 @@ fn non_gat_assoc_type(node: ast::Node<'_>) -> Option<(ast::Impl<'_>, ast::TypeAl
 /// rustc's `in_func_body`: `node` is in a function's body.
 fn in_fn_body(node: ast::Node<'_>) -> bool {
     node.ancestors().any(|it| {
-        ast::BlockExpr::can_cast(it.kind()) && it.parent().is_some_and(|it| ast::Fn::can_cast(it.kind()))
+        ast::BlockExpr::can_cast(it.kind())
+            && it.parent().is_some_and(|it| ast::Fn::can_cast(it.kind()))
     })
 }
 
@@ -222,8 +233,10 @@ fn introduce_for_binding(cx: &Cx<'_, '_>, diag: &mut Diag, site: &Site<'_>, amp:
     let generic_const_items =
         cx.krate.is_unstable_feature_enabled(cx.db, &intern::Symbol::intern("generic_const_items"));
     for rib in ribs(site.node) {
-        if matches!(rib.kind, Binder::FnPtrType | Binder::PolyTrait | Binder::WhereBound | Binder::ImplAssocType)
-            || (rib.kind == Binder::ConstItem && !generic_const_items)
+        if matches!(
+            rib.kind,
+            Binder::FnPtrType | Binder::PolyTrait | Binder::WhereBound | Binder::ImplAssocType
+        ) || (rib.kind == Binder::ConstItem && !generic_const_items)
         {
             continue;
         }
@@ -326,7 +339,13 @@ fn trait_span(cx: &Cx<'_, '_>, tr: hir::Trait) -> Option<Span> {
 }
 
 /// `point_at_impl_lifetimes`: the impl's named lifetimes to use, or one to add to it.
-fn point_at_impl_lifetimes(cx: &Cx<'_, '_>, diag: &mut Diag, file: HirFileId, impl_: ast::Impl<'_>, amp: &Span) {
+fn point_at_impl_lifetimes(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    file: HirFileId,
+    impl_: ast::Impl<'_>,
+    amp: &Span,
+) {
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let list = impl_.generic_param_list();
     let generics = match list {
@@ -337,11 +356,18 @@ fn point_at_impl_lifetimes(cx: &Cx<'_, '_>, diag: &mut Diag, file: HirFileId, im
         },
     };
     // alloc: the error's parts, for an error hir found
-    let named: Vec<_> = list.into_iter().flat_map(|it| it.lifetime_params()).filter_map(|it| it.lifetime()).collect();
+    let named: Vec<_> = list
+        .into_iter()
+        .flat_map(|it| it.lifetime_params())
+        .filter_map(|it| it.lifetime())
+        .collect();
     if !named.is_empty() {
         let (is, s) = if named.len() == 1 { ("is a", "") } else { ("are", "s") };
         // alloc: the error's text, for an error hir found
-        diag.span_label(span(generics), format!("there {is} named lifetime{s} specified on the impl block you could use"));
+        diag.span_label(
+            span(generics),
+            format!("there {is} named lifetime{s} specified on the impl block you could use"),
+        );
         if let [lifetime] = &named[..] {
             diag.suggestion_verbose(
                 amp.shrink_to_hi(),
@@ -359,8 +385,16 @@ fn point_at_impl_lifetimes(cx: &Cx<'_, '_>, diag: &mut Diag, file: HirFileId, im
         None => impl_.trait_().and_then(|it| anon_ref(it.syntax())),
     };
     let (message, at, code) = match (in_self, in_trait) {
-        (Some(at), _) => ("add a lifetime to the impl block and use it in the self type and associated type", at, "'a "),
-        (None, Some(at)) => ("add a lifetime to the impl block and use it in the trait and associated type", at, "'a"),
+        (Some(at), _) => (
+            "add a lifetime to the impl block and use it in the self type and associated type",
+            at,
+            "'a ",
+        ),
+        (None, Some(at)) => (
+            "add a lifetime to the impl block and use it in the trait and associated type",
+            at,
+            "'a",
+        ),
         (None, None) => {
             diag.span_label(
                 span(generics),

@@ -6,11 +6,7 @@ pub fn encode_exponent(biased_exp: u64) -> u64 {
     if biased_exp == 2047 {
         return 2047;
     }
-    if biased_exp >= 1023 {
-        biased_exp - 1023
-    } else {
-        2046 - biased_exp
-    }
+    if biased_exp >= 1023 { biased_exp - 1023 } else { 2046 - biased_exp }
 }
 
 /// Decode a lex rank back to a biased exponent.
@@ -126,11 +122,7 @@ pub fn simplest_in_range(lo: f64, hi: f64) -> Result<f64, InternalError> {
     let m_best = if unbiased >= 52 {
         m_min
     } else {
-        let n_frac = if unbiased <= 0 {
-            52
-        } else {
-            (52 - unbiased) as u32
-        };
+        let n_frac = if unbiased <= 0 { 52 } else { (52 - unbiased) as u32 };
         let low_mask = (1u64 << n_frac) - 1;
         let h = m_min >> n_frac;
         hegel_internal_debug_assert_eq!(m_max >> n_frac, h);

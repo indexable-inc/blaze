@@ -5,10 +5,7 @@
 //! `harness/answers.py --write` when the pin moves). A question this does not understand whole
 //! is answered `None`, and fails.
 
-use std::{
-    ffi::OsString,
-    path::Path,
-};
+use std::{ffi::OsString, path::Path};
 
 use blaze_units::stdlib::target;
 
@@ -247,7 +244,12 @@ const UNSET: [&str; 2] = ["RUSTC_OVERRIDE_VERSION_STRING", "RUST_TARGET_PATH"];
 /// (`nightly`), and the features of `-C target-feature` neither rustc nor LLVM has of it, which
 /// change nothing and which rustc warns of, in order. `None` for what `target_cfg` refuses, and
 /// for a feature rustc warns of in words blaze does not have.
-fn cfg_printed(given: &Given<'_>, tuple: &str, host: &str, nightly: bool) -> Option<(Vec<String>, Vec<String>)> {
+fn cfg_printed(
+    given: &Given<'_>,
+    tuple: &str,
+    host: &str,
+    nightly: bool,
+) -> Option<(Vec<String>, Vec<String>)> {
     let host_cpu = match given.target_cpu {
         // LLVM's host CPU, for any target of the host's architecture.
         Some("native") => {
@@ -263,7 +265,11 @@ fn cfg_printed(given: &Given<'_>, tuple: &str, host: &str, nightly: bool) -> Opt
         panic: given.panic.map(str::to_owned),
         target_cpu: given.target_cpu.map(str::to_owned),
         host_cpu,
-        target_features: given.features.iter().map(|&(enable, name)| (enable, name.to_owned())).collect(),
+        target_features: given
+            .features
+            .iter()
+            .map(|&(enable, name)| (enable, name.to_owned()))
+            .collect(),
         cfgs: given.cfgs.iter().map(|it| (*it).to_owned()).collect(),
         proc_macro: given.crate_types.contains(&"proc-macro"),
         sanitizer: None,
@@ -331,7 +337,9 @@ impl Vars<'_> {
                 Some((_, value)) => value.clone(),
                 None => std::env::var_os(name),
             },
-            Vars::Only(set) => set.iter().find(|(it, _)| *it == name).map(|(_, value)| OsString::from(*value)),
+            Vars::Only(set) => {
+                set.iter().find(|(it, _)| *it == name).map(|(_, value)| OsString::from(*value))
+            }
         }
     }
 }
@@ -370,7 +378,11 @@ pub fn answered(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Answe
             // read `release:` and `host:`, which stay rustc's. A process handed no identity has
             // no answer.
             let code = hir_ty_codegen::v2::code().ok()?;
-            format!("{}blaze-identity: {:x}\n", target::rustc_verbose_version(toolchain.host), code.0)
+            format!(
+                "{}blaze-identity: {:x}\n",
+                target::rustc_verbose_version(toolchain.host),
+                code.0
+            )
         } else {
             format!("rustc {}\n", target::rustc_version())
         };
@@ -481,7 +493,8 @@ mod tests {
     #[test]
     fn cfgs_given() {
         let printed = |cfg: &str| {
-            let args: Vec<OsString> = ["--print", "cfg", "--cfg", cfg].iter().map(OsString::from).collect();
+            let args: Vec<OsString> =
+                ["--print", "cfg", "--cfg", cfg].iter().map(OsString::from).collect();
             answered(&args, &[], Vars::Only(&[]))
                 .map(|it| String::from_utf8(it.stdout).unwrap().lines().any(|line| line == cfg))
         };
@@ -504,13 +517,22 @@ mod tests {
     #[test]
     fn a_feature_the_target_lacks_is_warned_of() {
         let plain = told("--print cfg --target x86_64-unknown-linux-gnu").expect("an answer");
-        let unknown = told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted")
-            .expect("an answer with a warning");
+        let unknown =
+            told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted")
+                .expect("an answer with a warning");
         assert_eq!(unknown.stdout, plain.stdout);
         let warning = target::unknown_feature_warning("blazeunlisted").unwrap();
-        assert_eq!(String::from_utf8(unknown.stderr).unwrap(), format!("{warning}warning: 1 warning emitted\n\n"));
-        assert!(told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+64bit").is_none());
-        let hidden = told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted -A warnings");
+        assert_eq!(
+            String::from_utf8(unknown.stderr).unwrap(),
+            format!("{warning}warning: 1 warning emitted\n\n")
+        );
+        assert!(
+            told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+64bit")
+                .is_none()
+        );
+        let hidden = told(
+            "--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted -A warnings",
+        );
         assert_eq!(hidden.map(|it| (it.stdout, it.stderr)), Some((plain.stdout, Vec::new())));
     }
 
@@ -525,7 +547,10 @@ mod tests {
         assert_eq!(given.cfgs, ["foo"]);
         assert_eq!(given.debug_assertions, None);
         assert!(Given::of(&["-O"]).is_some_and(|it| it.opt_level == Some("2")));
-        assert!(Given::of(&["-C", "debug_assertions=off"]).is_some_and(|it| it.debug_assertions == Some(false)));
+        assert!(
+            Given::of(&["-C", "debug_assertions=off"])
+                .is_some_and(|it| it.debug_assertions == Some(false))
+        );
         assert!(Given::of(&["-C", "debug-assertions=maybe"]).is_none());
         // The features and the CPU, in order, which `target_cfg` answers from rustc's.
         let given =
@@ -662,7 +687,10 @@ mod tests {
         let said = answered(&[OsString::from("-vV")], &[], Vars::Only(&[])).expect("an answer");
         let said = String::from_utf8(said.stdout).unwrap();
         let rustc = target::rustc_verbose_version(Toolchain::ours().unwrap().host);
-        assert_eq!(said, format!("{rustc}blaze-identity: {:x}\n", crate::serve::TEST_CODEGEN_CODE.0));
+        assert_eq!(
+            said,
+            format!("{rustc}blaze-identity: {:x}\n", crate::serve::TEST_CODEGEN_CODE.0)
+        );
     }
 
     /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
@@ -702,7 +730,8 @@ mod tests {
     #[test]
     fn a_spec_the_hosts_agree_on_is_answered_on_any_host() {
         let spec = |triple: &str, host: &str| target::target_spec_json(triple, host).unwrap();
-        let windows = spec("wasm32-wasip1", "x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
+        let windows =
+            spec("wasm32-wasip1", "x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
         assert_eq!(Some(windows), spec("wasm32-wasip1", "aarch64-apple-darwin"));
         assert_eq!(spec("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"), None);
     }

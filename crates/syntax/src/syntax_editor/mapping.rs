@@ -3,8 +3,8 @@
 //! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use itertools::Itertools;
+use std::alloc::Global;
 
 use crate::{SyntaxElement, SyntaxNode};
 
@@ -196,7 +196,10 @@ impl SyntaxMappingBuilder {
         Self { parent_node, node_mappings: vec![] }
     }
 
-    #[allow(clippy::needless_pass_by_value, reason = "the factory's builders hand over owned handles; goes with the handles")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the factory's builders hand over owned handles; goes with the handles"
+    )]
     pub fn map_node(&mut self, input: SyntaxNode, output: SyntaxNode) {
         debug_assert_eq!(output.parent().as_ref(), Some(&self.parent_node));
         self.node_mappings.push((input, output.index() as u32));

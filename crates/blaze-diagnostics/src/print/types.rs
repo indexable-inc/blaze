@@ -60,7 +60,10 @@ pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
         TyKind::FnPtr(..) => "fn pointer",
         TyKind::Dynamic(preds, _) if let Some(principal) = preds.principal() => {
             // alloc: a type's sort printed, the edge
-            return format!("`dyn {}`", path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode));
+            return format!(
+                "`dyn {}`",
+                path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode)
+            );
         }
         TyKind::Dynamic(..) => "trait object",
         TyKind::Closure(..) => "closure",
@@ -75,7 +78,12 @@ pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
         // hir's types as inference had them at an error hold an undecided literal's as these.
         TyKind::Infer(InferTy::FreshIntTy(_)) => "integer",
         TyKind::Infer(InferTy::FreshFloatTy(_)) => "floating-point number",
-        TyKind::Alias(_, alias) if matches!(alias.kind, AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }) => {
+        TyKind::Alias(_, alias)
+            if matches!(
+                alias.kind,
+                AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }
+            ) =>
+        {
             "associated type"
         }
         // alloc: a type's sort printed, the edge
@@ -147,7 +155,9 @@ pub(super) fn prefix_string(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
 /// Whether an opaque type is bounded by `Future`: rustc's `is_impl_trait_future`.
 fn is_future(cx: &Cx<'_, '_>, id: InternedOpaqueTyId<'_>) -> bool {
     let db = cx.db;
-    let Some(future) = hir_def::lang_item::lang_items(db, cx.krate.into()).Future else { return false };
+    let Some(future) = hir_def::lang_item::lang_items(db, cx.krate.into()).Future else {
+        return false;
+    };
     id.self_predicates(db).skip_binder().iter().any(|clause| {
         matches!(clause.kind().skip_binder(), ClauseKind::Trait(it) if it.def_id().0 == future)
     })

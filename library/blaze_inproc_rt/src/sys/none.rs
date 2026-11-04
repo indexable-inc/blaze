@@ -193,7 +193,12 @@ impl Errno {
     }
 }
 
-pub fn send_objects(_: &mut Channel, _: u32, _: &[u8], _: &[(&Object, Rights)]) -> Result<Remote, Error> {
+pub fn send_objects(
+    _: &mut Channel,
+    _: u32,
+    _: &[u8],
+    _: &[(&Object, Rights)],
+) -> Result<Remote, Error> {
     unsupported()
 }
 

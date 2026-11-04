@@ -202,12 +202,7 @@ pub(crate) struct RngDraws<'a> {
 impl<'a> RngDraws<'a> {
     /// A source sampling from `rng`, shaping its integer draws by `params`.
     pub(crate) fn new(rng: &'a mut EngineRng, params: IntegerGenerationParameters) -> Self {
-        RngDraws {
-            rng,
-            params,
-            narrow_ranges: NarrowRanges::default(),
-            status: None,
-        }
+        RngDraws { rng, params, narrow_ranges: NarrowRanges::default(), status: None }
     }
 
     /// The status the draws concluded with, or `None` while none has.
@@ -231,9 +226,7 @@ impl Draws for RngDraws<'_> {
             "Invalid range [{min_value:?}, {max_value:?}]"
         );
         let (lo, hi) = (i128::from(min_value), i128::from(max_value));
-        let narrow = is_narrow(lo, hi)
-            .then(|| self.narrow_ranges.get(lo, hi))
-            .transpose()?;
+        let narrow = is_narrow(lo, hi).then(|| self.narrow_ranges.get(lo, hi)).transpose()?;
         let sample =
             biased_i64_sample(min_value, max_value, narrow.as_ref(), self.rng, self.params);
         Ok(sample?)
@@ -263,12 +256,7 @@ impl Draws for RngDraws<'_> {
         min_size: usize,
         max_size: usize,
     ) -> Result<String, EngineError> {
-        let kind = StringChoice {
-            intervals,
-            min_size,
-            max_size,
-            constraint: None,
-        };
+        let kind = StringChoice { intervals, min_size, max_size, constraint: None };
         let codepoints = biased_string_sample(&kind, self.rng)?;
         Ok(codepoints_to_string(&codepoints))
     }
@@ -353,12 +341,7 @@ impl Draws for SimplestDraws {
         min_size: usize,
         max_size: usize,
     ) -> Result<String, EngineError> {
-        let kind = StringChoice {
-            intervals,
-            min_size,
-            max_size,
-            constraint: None,
-        };
+        let kind = StringChoice { intervals, min_size, max_size, constraint: None };
         Ok(codepoints_to_string(&kind.simplest()?))
     }
 

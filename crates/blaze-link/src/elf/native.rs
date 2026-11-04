@@ -4,14 +4,29 @@
 use blaze_codegen::Arch;
 use object::elf;
 
-pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
+pub(crate) fn apply(
+    arch: Arch,
+    r_type: u32,
+    bytes: &mut [u8],
+    p: u64,
+    s: u64,
+    addend: i64,
+) -> Result<(), String> {
     let abs = s.wrapping_add(addend as u64) as i64;
     let rel = abs.wrapping_sub(p as i64);
     match (arch, elf::RelocationType(r_type)) {
-        (Arch::X86_64, elf::R_X86_64_8) => put(bytes, &uint_or_int(abs, 8, "R_X86_64_8")?.to_le_bytes()[..1]),
-        (Arch::X86_64, elf::R_X86_64_16) => put(bytes, &uint_or_int(abs, 16, "R_X86_64_16")?.to_le_bytes()[..2]),
-        (Arch::X86_64, elf::R_X86_64_PC8) => put(bytes, &int(rel, 8, "R_X86_64_PC8")?.to_le_bytes()[..1]),
-        (Arch::X86_64, elf::R_X86_64_PC16) => put(bytes, &int(rel, 16, "R_X86_64_PC16")?.to_le_bytes()[..2]),
+        (Arch::X86_64, elf::R_X86_64_8) => {
+            put(bytes, &uint_or_int(abs, 8, "R_X86_64_8")?.to_le_bytes()[..1])
+        }
+        (Arch::X86_64, elf::R_X86_64_16) => {
+            put(bytes, &uint_or_int(abs, 16, "R_X86_64_16")?.to_le_bytes()[..2])
+        }
+        (Arch::X86_64, elf::R_X86_64_PC8) => {
+            put(bytes, &int(rel, 8, "R_X86_64_PC8")?.to_le_bytes()[..1])
+        }
+        (Arch::X86_64, elf::R_X86_64_PC16) => {
+            put(bytes, &int(rel, 16, "R_X86_64_PC16")?.to_le_bytes()[..2])
+        }
         (Arch::Aarch64, elf::R_AARCH64_ABS16) => {
             put(bytes, &uint_or_int(abs, 16, "R_AARCH64_ABS16")?.to_le_bytes()[..2])
         }
@@ -26,23 +41,39 @@ pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, a
         (Arch::Aarch64, elf::R_AARCH64_LD_PREL_LO19) => {
             if rel & 3 != 0 {
                 // alloc: error path
-                return Err(format!("R_AARCH64_LD_PREL_LO19 to {rel:#x} from the place: not 4-aligned"));
+                return Err(format!(
+                    "R_AARCH64_LD_PREL_LO19 to {rel:#x} from the place: not 4-aligned"
+                ));
             }
             int(rel, 21, "R_AARCH64_LD_PREL_LO19")?;
             insn(bytes, !(0x7_ffff << 5), (((rel >> 2) as u32) & 0x7_ffff) << 5)
         }
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G0) => smovw(bytes, abs, 0, true, "R_AARCH64_MOVW_SABS_G0"),
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G1) => smovw(bytes, abs, 1, true, "R_AARCH64_MOVW_SABS_G1"),
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G2) => smovw(bytes, abs, 2, true, "R_AARCH64_MOVW_SABS_G2"),
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G0) => smovw(bytes, rel, 0, true, "R_AARCH64_MOVW_PREL_G0"),
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G0) => {
+            smovw(bytes, abs, 0, true, "R_AARCH64_MOVW_SABS_G0")
+        }
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G1) => {
+            smovw(bytes, abs, 1, true, "R_AARCH64_MOVW_SABS_G1")
+        }
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_SABS_G2) => {
+            smovw(bytes, abs, 2, true, "R_AARCH64_MOVW_SABS_G2")
+        }
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G0) => {
+            smovw(bytes, rel, 0, true, "R_AARCH64_MOVW_PREL_G0")
+        }
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G0_NC) => smovw(bytes, rel, 0, false, ""),
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G1) => smovw(bytes, rel, 1, true, "R_AARCH64_MOVW_PREL_G1"),
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G1) => {
+            smovw(bytes, rel, 1, true, "R_AARCH64_MOVW_PREL_G1")
+        }
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G1_NC) => smovw(bytes, rel, 1, false, ""),
-        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G2) => smovw(bytes, rel, 2, true, "R_AARCH64_MOVW_PREL_G2"),
+        (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G2) => {
+            smovw(bytes, rel, 2, true, "R_AARCH64_MOVW_PREL_G2")
+        }
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G2_NC) => smovw(bytes, rel, 2, false, ""),
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G3) => smovw(bytes, rel, 3, false, ""),
         // alloc: error path
-        _ => Err(format!("relocation type {r_type} is not one the ELF writer applies for {arch:?}")),
+        _ => {
+            Err(format!("relocation type {r_type} is not one the ELF writer applies for {arch:?}"))
+        }
     }
 }
 
@@ -79,7 +110,13 @@ fn insn(bytes: &mut [u8], keep: u32, set: u32) -> Result<(), String> {
 /// 16 bits of `value` at `group * 16` into a `MOVZ`, `MOVN` or `MOVK`; a `MOVZ` or `MOVN`
 /// becomes `MOVN` of the inverted bits when the value is negative (lld's `writeSMovWImm`).
 /// `checked` groups must hold the whole value: 17, 33 or 49 signed bits.
-fn smovw(bytes: &mut [u8], value: i64, group: u32, checked: bool, what: &str) -> Result<(), String> {
+fn smovw(
+    bytes: &mut [u8],
+    value: i64,
+    group: u32,
+    checked: bool,
+    what: &str,
+) -> Result<(), String> {
     if checked {
         int(value, 17 + 16 * group, what)?;
     }

@@ -43,14 +43,18 @@ pub(crate) fn describe(db: &Db, error: &MirEvalError<'_>) -> String {
         }
         MirEvalError::OverBudget { spent, at } => {
             match spent {
-                Budget::Steps(steps) => _ = write!(
-                    out,
-                    "the expansion ran {steps} steps (basic blocks), all one expansion may, without finishing"
-                ),
-                Budget::Memory(bytes) => _ = write!(
-                    out,
-                    "the expansion would use more than {bytes} bytes of memory, all one expansion may"
-                ),
+                Budget::Steps(steps) => {
+                    _ = write!(
+                        out,
+                        "the expansion ran {steps} steps (basic blocks), all one expansion may, without finishing"
+                    )
+                }
+                Budget::Memory(bytes) => {
+                    _ = write!(
+                        out,
+                        "the expansion would use more than {bytes} bytes of memory, all one expansion may"
+                    )
+                }
             }
             if let Some((owner, span)) = *at {
                 _ = write!(out, "; it was in `{}`", owner_path(db, owner));
@@ -68,7 +72,12 @@ pub(crate) fn describe(db: &Db, error: &MirEvalError<'_>) -> String {
                 None => out.push_str("\n  in a closure"),
             }
             if !matches!(span, MirSpan::Unknown) {
-                _ = write!(out, ", called from `{}` at {}", owner_path(db, caller), place(db, caller, span));
+                _ = write!(
+                    out,
+                    ", called from `{}` at {}",
+                    owner_path(db, caller),
+                    place(db, caller, span)
+                );
             }
         }
     }

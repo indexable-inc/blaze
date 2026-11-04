@@ -53,10 +53,7 @@ pub(crate) struct hegel_string_t {
 
 impl Default for hegel_string_t {
     fn default() -> Self {
-        Self {
-            data: std::ptr::null(),
-            len: 0,
-        }
+        Self { data: std::ptr::null(), len: 0 }
     }
 }
 

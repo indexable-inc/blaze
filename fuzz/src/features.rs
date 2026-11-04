@@ -35,7 +35,7 @@ pub(crate) struct Seen {
 
 impl Seen {
     pub(crate) fn new(features: usize) -> Self {
-        Seen { bits: vec![0; features.div_ceil(64)], count: 0 }  // alloc: the seen set, once per process
+        Seen { bits: vec![0; features.div_ceil(64)], count: 0 } // alloc: the seen set, once per process
     }
 
     /// How many of `features` (each once) are new; they are seen from now on.

@@ -113,9 +113,11 @@ impl Method {
 
 /// The `proc_macro` crate `krate` is built against: its dependency of the standard library's.
 pub(crate) fn proc_macro_of(db: &Db, krate: Crate) -> Option<Crate> {
-    krate.transitive_deps(db).iter().copied().find(|it| {
-        matches!(it.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::ProcMacro))
-    })
+    krate
+        .transitive_deps(db)
+        .iter()
+        .copied()
+        .find(|it| matches!(it.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::ProcMacro)))
 }
 
 /// Whether the bridge of `proc_macro`, a crate in `db`, is the one blaze's server speaks:
@@ -129,7 +131,9 @@ pub(crate) fn check(db: &Db, proc_macro: Crate) -> Result<(), String> {
                 // alloc: setup, once per file per load: the path as text.
                 let path = path.to_string();
                 let tail = path.strip_suffix(name);
-                tail.is_some_and(|it| it.ends_with("/src/bridge/") || it.ends_with("\\src\\bridge\\"))
+                tail.is_some_and(|it| {
+                    it.ends_with("/src/bridge/") || it.ends_with("\\src\\bridge\\")
+                })
             })
         });
         let Some(file) = found else {
@@ -139,7 +143,8 @@ pub(crate) fn check(db: &Db, proc_macro: Crate) -> Result<(), String> {
                  server speaks"
             ));
         };
-        let same = db.has_file_text(file) && AsRef::<str>::as_ref(db.file_text(file).text(db)) == text;
+        let same =
+            db.has_file_text(file) && AsRef::<str>::as_ref(db.file_text(file).text(db)) == text;
         if !same {
             // alloc: error path
             return Err(format!(
@@ -190,7 +195,9 @@ mod tests {
         assert!(module.contains("enum Option<T> {\n        Some(t),\n        None,\n    }"));
         assert!(module.contains("enum Result<T, E> {\n        Ok(t),\n        Err(e),\n    }"));
         assert!(module.contains("Included(x),\n        Excluded(x),\n        Unbounded,"));
-        assert!(rpc.contains("#[cfg(target_pointer_width = \"64\")]\nrpc_encode_decode!(le usize);"));
+        assert!(
+            rpc.contains("#[cfg(target_pointer_width = \"64\")]\nrpc_encode_decode!(le usize);")
+        );
         // A narrower client's `usize` is padded to eight bytes, so every client's is eight.
         assert!(rpc.contains("const MAX_USIZE_SIZE: usize = 8;"));
         assert!(rpc.contains("*r = &r[MAX_USIZE_SIZE..];"));

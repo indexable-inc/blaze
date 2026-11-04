@@ -132,12 +132,20 @@ pub enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::Clock(why) => write!(f, "the wall clock is before 1970, so no certificate can be dated: {why}"),
+            StartError::Clock(why) => {
+                write!(f, "the wall clock is before 1970, so no certificate can be dated: {why}")
+            }
             StartError::Cert(why) => write!(f, "{why}"),
-            StartError::Runtime(why) => write!(f, "the explorer's tokio runtime did not start: {why}"),
-            StartError::Bind(why) => write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}"),
+            StartError::Runtime(why) => {
+                write!(f, "the explorer's tokio runtime did not start: {why}")
+            }
+            StartError::Bind(why) => {
+                write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}")
+            }
             StartError::Thread(why) => write!(f, "the explorer's thread did not start: {why}"),
-            StartError::Config(why) => write!(f, "the explorer's QUIC idle timeout was refused: {why}"),
+            StartError::Config(why) => {
+                write!(f, "the explorer's QUIC idle timeout was refused: {why}")
+            }
         }
     }
 }
@@ -201,7 +209,9 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
         }
         Err(_) => {
             _ = thread.join();
-            Err(StartError::Thread(std::io::Error::other("the explorer's thread ended before it listened")))
+            Err(StartError::Thread(std::io::Error::other(
+                "the explorer's thread ended before it listened",
+            )))
         }
     }
 }
@@ -261,7 +271,10 @@ fn rotate(endpoint: &Endpoint<Server>, shared: &Shared, rotation: &mut Rotation)
     match served {
         Ok(cert) => {
             rotation.rotated(validity);
-            shared.cert.send_replace(Arc::new(Current { hash: cert.hash, not_after_s: validity.not_after_s }));
+            shared.cert.send_replace(Arc::new(Current {
+                hash: cert.hash,
+                not_after_s: validity.not_after_s,
+            }));
         }
         Err(why) => eprintln!(
             "blaze explore: the certificate was not made anew ({why}); the one served expires at {} (Unix \
@@ -309,8 +322,13 @@ async fn hello(shared: &Shared, connection: &Connection) -> bool {
     loop {
         let Ok((mut send, mut recv)) = connection.accept_bi().await else { return false };
         let refused = match read(&mut recv).await {
-            Ok(Request::Hello { token }) => return said_hello(shared, connection, &mut send, &token).await,
-            Ok(_) => WireError::new(Kind::Unauthenticated, "the first request of a session is hello with the link's token"),
+            Ok(Request::Hello { token }) => {
+                return said_hello(shared, connection, &mut send, &token).await;
+            }
+            Ok(_) => WireError::new(
+                Kind::Unauthenticated,
+                "the first request of a session is hello with the link's token",
+            ),
             Err(why) => why,
         };
         send_bytes(&mut send, &error_bytes(&refused)).await;
@@ -318,12 +336,20 @@ async fn hello(shared: &Shared, connection: &Connection) -> bool {
 }
 
 /// Answers `hello` with `token`: `true` when it was the token.
-async fn said_hello(shared: &Shared, connection: &Connection, send: &mut SendStream, token: &str) -> bool {
+async fn said_hello(
+    shared: &Shared,
+    connection: &Connection,
+    send: &mut SendStream,
+    token: &str,
+) -> bool {
     if shared.token.matches(token) {
         send_bytes(send, &hello_bytes(shared)).await;
         return true;
     }
-    let refused = WireError::new(Kind::BadToken, "the token is not this daemon's: run `blaze explore` for its link");
+    let refused = WireError::new(
+        Kind::BadToken,
+        "the token is not this daemon's: run `blaze explore` for its link",
+    );
     send_bytes(send, &error_bytes(&refused)).await;
     connection.close(VarInt::from_u32(CLOSE_BAD_TOKEN), b"bad_token");
     false
@@ -343,7 +369,8 @@ fn hello_bytes(shared: &Shared) -> Vec<u8> {
         ("source", source_descriptor()),
     ];
     // alloc: once a session
-    let header: Map<String, Value> = header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+    let header: Map<String, Value> =
+        header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
     let mut out = Vec::new();
     encode_head(&mut out, &header);
     out
@@ -387,7 +414,8 @@ async fn stream(
     // Dropped as the stream ends however it ends (answered, stopped by the page, the session
     // gone, the server stopping): the sender gone kills a DuckDB query still under way.
     let (_stop, stopping) = crossbeam_channel::bounded::<()>(0);
-    let work = tokio::task::spawn_blocking(move || encode(ops::answer(&cx, request, &stopping), started));
+    let work =
+        tokio::task::spawn_blocking(move || encode(ops::answer(&cx, request, &stopping), started));
     let bytes = tokio::select! {
         done = work => match done {
             Ok(bytes) => bytes,
@@ -400,7 +428,8 @@ async fn stream(
 
 async fn refuse(mut send: SendStream, recv: RecvStream) {
     recv.stop(VarInt::from_u32(0));
-    let message = format!("the session has {MAX_IN_FLIGHT} requests in flight: wait for one to end");
+    let message =
+        format!("the session has {MAX_IN_FLIGHT} requests in flight: wait for one to end");
     let refused = WireError::new(Kind::Overloaded, message).with("in_flight", MAX_IN_FLIGHT);
     send_bytes(&mut send, &error_bytes(&refused)).await;
 }
@@ -419,7 +448,12 @@ async fn read(recv: &mut RecvStream) -> Result<Request, WireError> {
                 // alloc: a request, at most MAX_REQUEST
                 Ok(Some(n)) => bytes.extend_from_slice(&chunk[..n]),
                 Ok(None) => return Ok(()),
-                Err(why) => return Err(WireError::new(Kind::BadArgs, format!("the request was not read whole: {why}"))),
+                Err(why) => {
+                    return Err(WireError::new(
+                        Kind::BadArgs,
+                        format!("the request was not read whole: {why}"),
+                    ));
+                }
             }
         }
     };
@@ -428,7 +462,10 @@ async fn read(recv: &mut RecvStream) -> Result<Request, WireError> {
         Ok(Err(why)) => Err(why),
         Err(_) => Err(WireError::new(
             Kind::BadArgs,
-            format!("no whole request in {} s: write one JSON object, then close the stream's side", REQUEST_WAIT.as_secs()),
+            format!(
+                "no whole request in {} s: write one JSON object, then close the stream's side",
+                REQUEST_WAIT.as_secs()
+            ),
         )),
     }
 }
@@ -452,8 +489,9 @@ fn encode(answer: Result<ops::Answer, WireError>, started: Instant) -> Vec<u8> {
         answer.header.insert("elapsed_ns".to_owned(), (started.elapsed().as_nanos() as u64).into());
         encode_head(&mut out, &answer.header);
         if let Some(table) = &answer.table {
-            frame::ipc(&mut out, &table.schema, &table.batches)
-                .map_err(|why| WireError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}")))?;
+            frame::ipc(&mut out, &table.schema, &table.batches).map_err(|why| {
+                WireError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}"))
+            })?;
         }
         Ok(())
     });
@@ -557,7 +595,12 @@ fn sends(table: &str, rows: usize, open_shown: bool) -> Emit {
 
 /// Writes a frame of each of `frame`'s tables that has rows, and of `open` once when it
 /// empties (`open_shown`: the page shows a non-empty set); `false` when the page is gone.
-async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Frame, open_shown: &mut bool) -> bool {
+async fn live_tables(
+    send: &mut SendStream,
+    out: &mut Vec<u8>,
+    frame: &live::Frame,
+    open_shown: &mut bool,
+) -> bool {
     let tables = [
         ("spans", frame.spans_rows, &frame.spans),
         ("counters", frame.counters_rows, &frame.counters),
@@ -578,7 +621,8 @@ async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Fra
             ("lost", frame.lost.into()),
         ];
         // alloc: a live frame's header, at most 12 a second
-        let header: Map<String, Value> = header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+        let header: Map<String, Value> =
+            header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
         if !live_frame(send, out, &header, ipc).await {
             return false;
         }
@@ -589,7 +633,12 @@ async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Fra
     true
 }
 
-async fn live_frame(send: &mut SendStream, out: &mut Vec<u8>, header: &Map<String, Value>, ipc: &[u8]) -> bool {
+async fn live_frame(
+    send: &mut SendStream,
+    out: &mut Vec<u8>,
+    header: &Map<String, Value>,
+    ipc: &[u8],
+) -> bool {
     out.clear();
     frame::live_head(out, header, ipc.len()).expect("a JSON map always serializes");
     send.write_all(out).await.is_ok() && send.write_all(ipc).await.is_ok()
@@ -615,7 +664,8 @@ mod tests {
     }
 
     fn client(explorer: &Explorer) -> Endpoint<Client> {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
+        let raw =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
         let digest = Sha256Digest::new(raw.try_into().unwrap());
         let config = ClientConfig::builder()
             .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -624,8 +674,14 @@ mod tests {
         Endpoint::client(config).unwrap()
     }
 
-    async fn connect(client: &Endpoint<Client>, explorer: &Explorer, path: &str, origin: Option<&str>) -> Result<Connection, ConnectingError> {
-        let mut options = ConnectOptions::builder(format!("https://127.0.0.1:{}{path}", explorer.port()));
+    async fn connect(
+        client: &Endpoint<Client>,
+        explorer: &Explorer,
+        path: &str,
+        origin: Option<&str>,
+    ) -> Result<Connection, ConnectingError> {
+        let mut options =
+            ConnectOptions::builder(format!("https://127.0.0.1:{}{path}", explorer.port()));
         if let Some(origin) = origin {
             options = options.add_header("origin", origin);
         }
@@ -660,7 +716,10 @@ mod tests {
         blaze_profile::plot(blaze_profile::Plot::Queued, 7);
         let explorer = explorer();
         let link = explorer.link();
-        assert!(link.starts_with(&format!("https://ix.dev/explore#127.0.0.1:{}/", explorer.port())), "{link}");
+        assert!(
+            link.starts_with(&format!("https://ix.dev/explore#127.0.0.1:{}/", explorer.port())),
+            "{link}"
+        );
         assert!(link.ends_with(&format!("/{}", explorer.certhash())), "{link}");
         let token = token_of(&link);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -673,15 +732,20 @@ mod tests {
                 ("/elsewhere", Some(link::ORIGIN)),
             ] {
                 let refused = connect(&client, &explorer, path, origin).await;
-                assert!(matches!(refused, Err(ConnectingError::SessionRejected)), "{path} {origin:?}: {refused:?}");
+                assert!(
+                    matches!(refused, Err(ConnectingError::SessionRejected)),
+                    "{path} {origin:?}: {refused:?}"
+                );
             }
 
-            let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
+            let connection =
+                connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
             let (header, ipc) = ask(&connection, r#"{"op":"views"}"#).await;
             assert_eq!(header["error"]["kind"], "unauthenticated", "{header}");
             assert!(ipc.is_empty());
 
-            let (header, _) = ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#)).await;
+            let (header, _) =
+                ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#)).await;
             assert_eq!(header["op"], "hello", "{header}");
             assert_eq!(header["schema"], schema::VERSION);
             assert_eq!(header["certhash"], explorer.certhash().as_str());
@@ -692,7 +756,10 @@ mod tests {
             assert_eq!(header["op"], "views", "{header}");
             assert_eq!(header["rows"], blaze_profile::views::VIEWS.len());
             let batches = live::decode(&ipc).unwrap();
-            assert_eq!(batches.iter().map(|it| it.num_rows()).sum::<usize>(), blaze_profile::views::VIEWS.len());
+            assert_eq!(
+                batches.iter().map(|it| it.num_rows()).sum::<usize>(),
+                blaze_profile::views::VIEWS.len()
+            );
 
             let (header, _) = ask(&connection, r#"{"op":"frobnicate"}"#).await;
             assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
@@ -706,27 +773,45 @@ mod tests {
                 loop {
                     let n = live.read(&mut chunk).await.unwrap().unwrap();
                     first.extend_from_slice(&chunk[..n]);
-                    if first.len() >= 4 && first.len() >= 4 + u32::from_le_bytes(first[..4].try_into().unwrap()) as usize {
+                    if first.len() >= 4
+                        && first.len()
+                            >= 4 + u32::from_le_bytes(first[..4].try_into().unwrap()) as usize
+                    {
                         break;
                     }
                 }
             };
-            tokio::time::timeout(Duration::from_secs(5), read).await.expect("a live frame within 5 s");
+            tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .expect("a live frame within 5 s");
             let body_len = u32::from_le_bytes(first[..4].try_into().unwrap()) as usize;
             let body = &first[4..4 + body_len];
             let head_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-            assert_eq!((4 + head_len) % frame::ALIGN, 0, "a live frame's IPC is 8-aligned in its body");
+            assert_eq!(
+                (4 + head_len) % frame::ALIGN,
+                0,
+                "a live frame's IPC is 8-aligned in its body"
+            );
             let header: Value = serde_json::from_slice(&body[4..4 + head_len]).unwrap();
             assert_eq!(header["op"], "live", "{header}");
             assert!(header["rows"].as_u64().unwrap() > 0, "{header}");
             let batches = live::decode(&body[4 + head_len..]).unwrap();
-            assert_eq!(batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(), header["rows"].as_u64().unwrap());
+            assert_eq!(
+                batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(),
+                header["rows"].as_u64().unwrap()
+            );
 
             let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
-            let wrong = if token.starts_with('0') { token.replacen('0', "1", 1) } else { format!("0{}", &token[1..]) };
+            let wrong = if token.starts_with('0') {
+                token.replacen('0', "1", 1)
+            } else {
+                format!("0{}", &token[1..])
+            };
             let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#)).await;
             assert_eq!(header["error"]["kind"], "bad_token", "{header}");
-            tokio::time::timeout(Duration::from_secs(5), other.closed()).await.expect("bad_token closes the session");
+            tokio::time::timeout(Duration::from_secs(5), other.closed())
+                .await
+                .expect("bad_token closes the session");
             let (header, _) = ask(&connection, r#"{"op":"views"}"#).await;
             assert_eq!(header["op"], "views", "another session's bad token leaves this one open");
         });
@@ -735,7 +820,8 @@ mod tests {
     #[test]
     fn a_session_from_the_dev_server_is_taken_only_when_asked() {
         let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
-        let explorer = start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
+        let explorer =
+            start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let client = client(&explorer);

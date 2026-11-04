@@ -5,17 +5,20 @@ use super::super::target::{self, CfgArgs, cargo_cfg_env, target_cfg};
 use super::*;
 
 const LIBRARY: &str = "/rustc/16d1ffac17ad8b739e32483ac2e65fe7e1804977/library/";
-const BUILTINS_DIR: &str = "/rustc/16d1ffac17ad8b739e32483ac2e65fe7e1804977/library/compiler-builtins/compiler-builtins";
+const BUILTINS_DIR: &str =
+    "/rustc/16d1ffac17ad8b739e32483ac2e65fe7e1804977/library/compiler-builtins/compiler-builtins";
 
 /// The checkout's `library/`, where a path named under [`LIBRARY`] is read from.
 fn checkout(path: &str) -> Result<Vec<u8>, String> {
-    let rest = path.strip_prefix(LIBRARY).ok_or_else(|| format!("{path} is not under the library"))?;
+    let rest =
+        path.strip_prefix(LIBRARY).ok_or_else(|| format!("{path} is not under the library"))?;
     let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library").join(rest);
     std::fs::read(&at).map_err(|error| format!("{}: {error}", at.display()))
 }
 
 fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-    let mut vars: Vec<(OsString, OsString)> = pairs.iter().map(|(name, value)| (name.into(), value.into())).collect();
+    let mut vars: Vec<(OsString, OsString)> =
+        pairs.iter().map(|(name, value)| (name.into(), value.into())).collect();
     vars.sort_by(|a, b| a.0.cmp(&b.0));
     vars.dedup_by(|later, first| later.0 == first.0);
     vars
@@ -68,7 +71,11 @@ fn every_pinned_file_is_the_checkouts() {
     for (script, package, files) in PINNED {
         for (path, want) in files {
             let bytes = checkout(&format!("{LIBRARY}{path}")).unwrap();
-            assert_eq!(&blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes)), want, "library/{path}");
+            assert_eq!(
+                &blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes)),
+                want,
+                "library/{path}"
+            );
         }
         let root = format!("{LIBRARY}{}", files[0].0);
         assert_eq!(identify(package, &root, checkout), Ok(script));
@@ -87,7 +94,10 @@ fn a_script_of_other_bytes_is_refused_naming_its_hash() {
     };
     let error = identify("compiler_builtins", &root, changed).unwrap_err();
     assert!(error.contains("compiler-builtins/libm/configure.rs has BLAKE3 hash"), "{error}");
-    assert!(error.contains("dd98992599d656cec2ccfc9bcb85116b3eaa698d1109e19b49c89431b4d064c9"), "{error}");
+    assert!(
+        error.contains("dd98992599d656cec2ccfc9bcb85116b3eaa698d1109e19b49c89431b4d064c9"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -121,7 +131,10 @@ fn std_prints_what_its_script_prints() {
         ("CARGO_CFG_TARGET_ENV", ""),
     ];
     let got = lines(Script::Std, &bare);
-    assert_eq!(got[3..5], ["cargo:rustc-check-cfg=cfg(restricted_std)", "cargo:rustc-cfg=restricted_std"]);
+    assert_eq!(
+        got[3..5],
+        ["cargo:rustc-check-cfg=cfg(restricted_std)", "cargo:rustc-cfg=restricted_std"]
+    );
     assert!(got.contains(&"cargo:rustc-env=STD_ENV_ARCH=arm".to_owned()));
     let synthetic = lines(Script::Std, &with(&bare, &[("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET", "1")]));
     assert!(!synthetic.iter().any(|it| it == "cargo:rustc-cfg=restricted_std"));
@@ -146,7 +159,10 @@ fn std_prints_what_its_script_prints() {
     assert_eq!(old.last().unwrap(), "cargo:rustc-cfg=vxworks_lt_25_09");
     let new = lines(Script::Std, &with(&vxworks, &[("WIND_RELEASE_ID", "25.09")]));
     assert_eq!(new.last().unwrap(), "cargo:rustc-check-cfg=cfg(vxworks_lt_25_09)");
-    assert_eq!(lines(Script::Std, &vxworks).last().unwrap(), "cargo:rustc-check-cfg=cfg(vxworks_lt_25_09)");
+    assert_eq!(
+        lines(Script::Std, &vxworks).last().unwrap(),
+        "cargo:rustc-check-cfg=cfg(vxworks_lt_25_09)"
+    );
 
     let error = refused(Script::Std, &APPLE[1..]);
     assert!(error.contains("`CARGO_CFG_TARGET_ARCH` is not set"), "{error}");
@@ -170,7 +186,10 @@ fn the_restricted_targets_are_std_scripts() {
 fn object_prints_what_its_script_prints_of_blazes_rustc() {
     let minor: u32 = target::rustc_version().split('.').nth(1).unwrap().parse().unwrap();
     assert!(minor >= 81, "{}", target::rustc_version());
-    assert_eq!(lines(Script::Object, &APPLE), ["cargo:rustc-cfg=core_error", "cargo:rustc-check-cfg=cfg(core_error)"]);
+    assert_eq!(
+        lines(Script::Object, &APPLE),
+        ["cargo:rustc-cfg=core_error", "cargo:rustc-check-cfg=cfg(core_error)"]
+    );
     let error = refused(Script::Object, &APPLE[..5]);
     assert!(error.contains("`RUSTC` is not set"), "{error}");
 }
@@ -224,14 +243,12 @@ const LIBC_CHECK_CFG: [&str; 26] = [
 ];
 
 fn libc_expected(head: &[&str], cfgs: &[&str]) -> Vec<String> {
-    let mut want: Vec<String> = [
-        "cargo:rerun-if-changed=build.rs",
-        "cargo:rerun-if-env-changed=LIBC_BUILD_VERBOSE",
-    ]
-    .iter()
-    .chain(head)
-    .map(|it| (*it).to_owned())
-    .collect();
+    let mut want: Vec<String> =
+        ["cargo:rerun-if-changed=build.rs", "cargo:rerun-if-env-changed=LIBC_BUILD_VERBOSE"]
+            .iter()
+            .chain(head)
+            .map(|it| (*it).to_owned())
+            .collect();
     want.push("cargo:rerun-if-env-changed=RUST_LIBC_UNSTABLE_FREEBSD_VERSION".to_owned());
     want.extend(LIBC_CHECK_CFG.iter().map(|it| (*it).to_owned()));
     want.extend(cfgs.iter().map(|it| format!("cargo:rustc-cfg={it}")));
@@ -265,7 +282,8 @@ fn libc_prints_what_its_script_prints() {
         lines(Script::Libc, &time64),
         libc_expected(&[], &["linux_time_bits64", "gnu_file_offset_bits64", "gnu_time_bits64"])
     );
-    let error = refused(Script::Libc, &with(&i686, &[("CARGO_CFG_LIBC_UNSTABLE_GNU_TIME_BITS", "48")]));
+    let error =
+        refused(Script::Libc, &with(&i686, &[("CARGO_CFG_LIBC_UNSTABLE_GNU_TIME_BITS", "48")]));
     assert!(error.contains("Must be 32, 64, or unset"), "{error}");
 
     let musl32 = [
@@ -278,7 +296,10 @@ fn libc_prints_what_its_script_prints() {
     ];
     assert_eq!(
         lines(Script::Libc, &musl32),
-        libc_expected(&[], &["linux_time_bits64", "musl_v1_2", "musl32_time64", "musl_redir_time64"])
+        libc_expected(
+            &[],
+            &["linux_time_bits64", "musl_v1_2", "musl32_time64", "musl_redir_time64"]
+        )
     );
 
     let freebsd = [
@@ -288,8 +309,12 @@ fn libc_prints_what_its_script_prints() {
         ("RUSTC", "/blaze/tools/rustc"),
     ];
     assert_eq!(lines(Script::Libc, &freebsd), libc_expected(&[], &["freebsd12"]));
-    let pinned = lines(Script::Libc, &with(&freebsd, &[("CARGO_CFG_LIBC_UNSTABLE_FREEBSD_VERSION", "14")]));
-    assert!(pinned.contains(&"cargo:warning=setting FreeBSD version to 14".to_owned()), "{pinned:?}");
+    let pinned =
+        lines(Script::Libc, &with(&freebsd, &[("CARGO_CFG_LIBC_UNSTABLE_FREEBSD_VERSION", "14")]));
+    assert!(
+        pinned.contains(&"cargo:warning=setting FreeBSD version to 14".to_owned()),
+        "{pinned:?}"
+    );
     assert_eq!(pinned.last().unwrap(), "cargo:rustc-cfg=freebsd14");
     let error = refused(Script::Libc, &with(&freebsd, &[("LIBC_CI", "1")]));
     assert!(error.contains("freebsd-version"), "{error}");
@@ -303,7 +328,10 @@ fn libc_prints_what_its_script_prints() {
 
     let error = refused(Script::Libc, &with(&linux, &[("RUSTC_WRAPPER", "/usr/bin/sccache")]));
     assert!(error.contains("RUSTC_WRAPPER"), "{error}");
-    assert_eq!(lines(Script::Libc, &with(&linux, &[("RUSTC_WRAPPER", "")])), libc_expected(&[], &["linux_time_bits64"]));
+    assert_eq!(
+        lines(Script::Libc, &with(&linux, &[("RUSTC_WRAPPER", "")])),
+        libc_expected(&[], &["linux_time_bits64"])
+    );
     let error = refused(Script::Libc, &linux[..5]);
     assert!(error.contains("missing RUSTC env"), "{error}");
 }
@@ -325,7 +353,8 @@ fn builtins_env(triple: &str, arch: &str, os: &str, opt: &str) -> Vec<(&'static 
 }
 
 fn builtins(pairs: &[(&'static str, String)]) -> Result<Vec<String>, String> {
-    let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(name, value)| (*name, value.as_str())).collect();
+    let borrowed: Vec<(&str, &str)> =
+        pairs.iter().map(|(name, value)| (*name, value.as_str())).collect();
     let printed = printed(Script::CompilerBuiltins, &vars(&borrowed), Path::new(BUILTINS_DIR))?;
     Ok(String::from_utf8(printed).unwrap().lines().map(str::to_owned).collect())
 }
@@ -351,12 +380,22 @@ fn compiler_builtins_prints_what_its_script_prints() {
     ];
     assert_eq!(got[..head.len()], head);
     // 24 of compiler-rt's optimized C, 20 `cas` and 80 more of aarch64's atomics.
-    let optimized: Vec<&String> = got.iter().filter(|it| it.ends_with("values(\"optimized-c\"))")).collect();
+    let optimized: Vec<&String> =
+        got.iter().filter(|it| it.ends_with("values(\"optimized-c\"))")).collect();
     assert_eq!(optimized.len(), 124);
     assert_eq!(optimized[0], "cargo::rustc-check-cfg=cfg(__ashldi3, values(\"optimized-c\"))");
-    assert_eq!(optimized[24], "cargo::rustc-check-cfg=cfg(__aarch64_cas1_relax, values(\"optimized-c\"))");
-    assert_eq!(optimized[43], "cargo::rustc-check-cfg=cfg(__aarch64_cas16_acq_rel, values(\"optimized-c\"))");
-    assert_eq!(optimized[123], "cargo::rustc-check-cfg=cfg(__aarch64_swp8_acq_rel, values(\"optimized-c\"))");
+    assert_eq!(
+        optimized[24],
+        "cargo::rustc-check-cfg=cfg(__aarch64_cas1_relax, values(\"optimized-c\"))"
+    );
+    assert_eq!(
+        optimized[43],
+        "cargo::rustc-check-cfg=cfg(__aarch64_cas16_acq_rel, values(\"optimized-c\"))"
+    );
+    assert_eq!(
+        optimized[123],
+        "cargo::rustc-check-cfg=cfg(__aarch64_swp8_acq_rel, values(\"optimized-c\"))"
+    );
     let tail = [
         "cargo::rustc-check-cfg=cfg(target_feature, values(\"vis3\"))".to_owned(),
         format!("cargo:compiler-rt={BUILTINS_DIR}/compiler-rt"),
@@ -371,7 +410,12 @@ fn compiler_builtins_prints_what_its_script_prints() {
     wasm.push(("CARGO_CFG_TARGET_HAS_RELIABLE_F16", String::new()));
     wasm.push(("CARGO_CFG_TARGET_HAS_RELIABLE_F128", String::new()));
     let got = builtins(&wasm).unwrap();
-    for line in ["cargo:rustc-cfg=optimizations_enabled", "cargo:rustc-cfg=f16_enabled", "cargo:rustc-cfg=f128_enabled", "cargo:rustc-cfg=feature=\"mem\""] {
+    for line in [
+        "cargo:rustc-cfg=optimizations_enabled",
+        "cargo:rustc-cfg=f16_enabled",
+        "cargo:rustc-cfg=f128_enabled",
+        "cargo:rustc-cfg=feature=\"mem\"",
+    ] {
         assert!(got.iter().any(|it| it == line), "{line} in {got:?}");
     }
     assert!(!got.iter().any(|it| it == "cargo:rustc-cfg=mem_unaligned"));
@@ -385,13 +429,20 @@ fn compiler_builtins_prints_what_its_script_prints() {
     let got = builtins(&thumb).unwrap();
     assert_eq!(got[1], "cargo:warning=feature `compiler-builtins` enabled");
     assert_eq!(got[2], "cargo:warning=feature `unmangled-names` enabled");
-    let thumb1 = ["cargo:rustc-check-cfg=cfg(thumb1_only)", "cargo:warning=setting config `thumb1_only`", "cargo:rustc-cfg=thumb1_only"];
+    let thumb1 = [
+        "cargo:rustc-check-cfg=cfg(thumb1_only)",
+        "cargo:warning=setting config `thumb1_only`",
+        "cargo:rustc-cfg=thumb1_only",
+    ];
     assert!(got.windows(3).any(|it| it == thumb1), "{got:?}");
 
     let mut openbsd = builtins_env("x86_64-unknown-openbsd", "x86_64", "openbsd", "0");
     openbsd.push(("CARGO_FEATURE_C", String::new()));
     let got = builtins(&openbsd).unwrap();
-    assert_eq!(got[got.len() - 2..], ["cargo:rustc-link-search=native=/usr/lib", "cargo:rustc-link-lib=compiler_rt"]);
+    assert_eq!(
+        got[got.len() - 2..],
+        ["cargo:rustc-link-search=native=/usr/lib", "cargo:rustc-link-lib=compiler_rt"]
+    );
     let mut c = builtins_env("x86_64-unknown-linux-gnu", "x86_64", "linux", "0");
     c.push(("CARGO_FEATURE_C", String::new()));
     let error = builtins(&c).unwrap_err();
@@ -405,7 +456,8 @@ fn compiler_builtins_prints_what_its_script_prints() {
 fn every_known_target_runs_each_port() {
     for triple in target::triples() {
         let env = cargo_env(triple);
-        let pairs: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let pairs: Vec<(&str, &str)> =
+            env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
         let vars = vars(&pairs);
         let cwd = Path::new(BUILTINS_DIR);
         for script in [Script::Std, Script::Object, Script::CompilerBuiltins, Script::Test] {

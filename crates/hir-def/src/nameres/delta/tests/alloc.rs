@@ -82,15 +82,23 @@ fn warm_reads_of_published_scopes_allocate_nothing() {
     }
     let at_root = names(&["local", "a", "wide", "other", "C", "Renamed", "g", "Tr", "missing"]);
     // alloc: test setup, outside the measure
-    let in_wide: Vec<Name> = (0..12).map(|i| name(&format!("W{i}"))).chain([name("missing")]).collect();
+    let in_wide: Vec<Name> =
+        (0..12).map(|i| name(&format!("W{i}"))).chain([name("missing")]).collect();
     assert!(
-        crate_def_map(&loaded.db, krate).module(&loaded.db, module_at(&loaded.db, krate, &["wide"])).scope(&loaded.db).entries().count() > 8,
+        crate_def_map(&loaded.db, krate)
+            .module(&loaded.db, module_at(&loaded.db, krate, &["wide"]))
+            .scope(&loaded.db)
+            .entries()
+            .count()
+            > 8,
         "`wide` does not reach the scope's index"
     );
 
     let wide = module_at(&loaded.db, krate, &["wide"]);
     reads(&loaded.db, krate, wide, &at_root, &in_wide);
-    assert_at_most(0, "warm reads of published scopes", || reads(&loaded.db, krate, wide, &at_root, &in_wide));
+    assert_at_most(0, "warm reads of published scopes", || {
+        reads(&loaded.db, krate, wide, &at_root, &in_wide)
+    });
 
     // Another module edited: the root's and `wide`'s inputs are as they were.
     let other = loaded.file("/other.rs");

@@ -33,7 +33,7 @@ use hir_def::{
     },
 };
 use hir_ty::{
-    GenericPredicates, SpecializationMode, Span,
+    GenericPredicates, Span, SpecializationMode,
     db::HirDatabase as _,
     display::{DisplayTarget, HirDisplay as _},
     next_solver::{
@@ -180,8 +180,8 @@ pub fn rules_of(db: &Db, impl_id: ImplId) -> Option<Rules> {
 
 /// The specialization errors of `impl_id`, a trait impl; none for an inherent impl.
 pub fn check_impl(db: &Db, impl_id: ImplId) -> Vec<SpecializationError> {
-    let _span = tracing::info_span!(target: "blaze", "specialization_check", impl_ = ?impl_id)
-        .entered();
+    let _span =
+        tracing::info_span!(target: "blaze", "specialization_check", impl_ = ?impl_id).entered();
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let mut found = Vec::new_in(frame);
         Check { db, frame, impl_id, found: &mut found }.run();
@@ -256,7 +256,9 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         for (name, item) in &self.impl_id.impl_items(db).items {
             let what = match *item {
                 AssocItemId::TypeAliasId(it)
-                    if TypeAliasSignature::of(db, it).flags.contains(TypeAliasFlags::IS_DEFAULT) =>
+                    if TypeAliasSignature::of(db, it)
+                        .flags
+                        .contains(TypeAliasFlags::IS_DEFAULT) =>
                 {
                     "type"
                 }
@@ -570,17 +572,20 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         let db = self.db;
         let this = self.impl_text(self.impl_id);
         let against = match parent {
-            Some(Parent::Impl(parent)) => format!(", which specializes `{}`", self.impl_text(parent)),
+            Some(Parent::Impl(parent)) => {
+                format!(", which specializes `{}`", self.impl_text(parent))
+            }
             Some(Parent::Trait(trait_)) => format!(
                 ", checked against the always-applicable trait `{}`",
-                TraitSignature::of(db, trait_).name.display(db, self.impl_id.krate(db).data(db).edition)
+                TraitSignature::of(db, trait_)
+                    .name
+                    .display(db, self.impl_id.krate(db).data(db).edition)
             ),
             None => String::new(),
         };
         let extension = if rule.is_blaze_extension() { "blaze extension, " } else { "" };
         // alloc: the error's own text, once per refused rule
-        let message =
-            format!("{message} (in `{this}`{against}; {extension}rule: {})", rule.name());
+        let message = format!("{message} (in `{this}`{against}; {extension}rule: {})", rule.name());
         self.found.push(SpecializationError {
             impl_: self.impl_id,
             parent,
@@ -621,8 +626,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                 let impl_default =
                     ImplSignature::of(db, ancestor).flags.contains(ImplFlags::DEFAULT);
                 let theirs = ancestor.impl_items(db).items.iter().find(|(other, it)| {
-                    *other == name
-                        && std::mem::discriminant(it) == std::mem::discriminant(&item)
+                    *other == name && std::mem::discriminant(it) == std::mem::discriminant(&item)
                 });
                 match theirs {
                     Some(&(_, it)) if !impl_default && !item_is_default(db, it) => {
@@ -645,7 +649,9 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                 Rule::NotMarkedDefault.name()
             );
             let note = match ancestor.krate(db) == self.impl_id.krate(db) {
-                true => format!("to specialize, `{name}` in the parent `impl` must be marked `default`"),
+                true => {
+                    format!("to specialize, `{name}` in the parent `impl` must be marked `default`")
+                }
                 false => format!(
                     "parent implementation is in crate `{}`",
                     ancestor
@@ -672,8 +678,12 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
 /// Whether an impl's item is written `default`.
 fn item_is_default(db: &Db, item: AssocItemId) -> bool {
     match item {
-        AssocItemId::FunctionId(it) => hir_def::signatures::FunctionSignature::of(db, it).is_default(),
-        AssocItemId::ConstId(it) => ConstSignature::of(db, it).flags.contains(ConstFlags::IS_DEFAULT),
+        AssocItemId::FunctionId(it) => {
+            hir_def::signatures::FunctionSignature::of(db, it).is_default()
+        }
+        AssocItemId::ConstId(it) => {
+            ConstSignature::of(db, it).flags.contains(ConstFlags::IS_DEFAULT)
+        }
         AssocItemId::TypeAliasId(it) => {
             TypeAliasSignature::of(db, it).flags.contains(TypeAliasFlags::IS_DEFAULT)
         }
@@ -801,11 +811,14 @@ fn wf_clauses<'db>(
                     .map(|it| it.skip_norm_wip()),
             );
             for OutlivesClause(arg, region) in hir_ty_wfcheck::Inferred::default().of(db, adt) {
-                let OutlivesClause(arg, region) = EarlyBinder::bind(interner, OutlivesClause(arg, region))
-                    .instantiate(interner, adt_args)
-                    .skip_norm_wip();
+                let OutlivesClause(arg, region) =
+                    EarlyBinder::bind(interner, OutlivesClause(arg, region))
+                        .instantiate(interner, adt_args)
+                        .skip_norm_wip();
                 match arg.kind() {
-                    GenericArgKind::Type(ty) => out.push(OutlivesClause(ty, region).upcast(interner)),
+                    GenericArgKind::Type(ty) => {
+                        out.push(OutlivesClause(ty, region).upcast(interner))
+                    }
                     GenericArgKind::Lifetime(longer) => {
                         out.push(OutlivesClause(longer, region).upcast(interner))
                     }

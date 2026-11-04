@@ -223,7 +223,11 @@ impl Sim {
 /// `//~ ERROR: /write access through .* is forbidden/` is `"write access through"`), and
 /// returns it.
 #[track_caller]
-pub(crate) fn expect_ub<T: std::fmt::Debug>(r: R<T>, kind: AliasErrorKind, title: &str) -> AliasError {
+pub(crate) fn expect_ub<T: std::fmt::Debug>(
+    r: R<T>,
+    kind: AliasErrorKind,
+    title: &str,
+) -> AliasError {
     match r {
         Ok(v) => panic!("expected `{title}...`, got Ok({v:?})"),
         Err(e) => {

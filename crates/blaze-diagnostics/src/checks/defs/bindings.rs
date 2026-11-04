@@ -7,7 +7,6 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::{EditionedFileId, InFile, Name};
 use hir_def::{
@@ -16,6 +15,7 @@ use hir_def::{
     hir::{Pat, PatId},
     nameres::demand::every_body,
 };
+use std::alloc::Global;
 use syntax::{
     SyntaxNodePtr, TextSize, ast as tag,
     view::{self as ast, AstNode as _, HasName as _},
@@ -50,7 +50,12 @@ struct Scratch {
 
 /// The patterns of one body, each walked as rustc walks it: the parameters of a function or
 /// closure share one product context, every other pattern starts its own.
-fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, scratch: &mut Scratch, found: &mut Vec<Found>) {
+fn check_body(
+    cx: &Cx<'_, '_>,
+    owner: DefWithBodyId,
+    scratch: &mut Scratch,
+    found: &mut Vec<Found>,
+) {
     let (body, map) = Body::with_source_map(cx.db, owner);
     let source = |pat: PatId| map.pat_syntax(pat).ok();
     let Scratch { parent, seen, roots, lists, ctxs } = scratch;
@@ -79,7 +84,9 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, scratch: &mut Scratch, foun
             Some(node.with_value(ast::ptr(list)))
         });
         let at = node.map(|node| {
-            let at = node.with_value(node.value.syntax().text_range()).original_node_file_range_rooted(cx.db);
+            let at = node
+                .with_value(node.value.syntax().text_range())
+                .original_node_file_range_rooted(cx.db);
             (at.file_id, at.range.start())
         });
         roots.push(Root { pat, list, at });
@@ -93,7 +100,15 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, scratch: &mut Scratch, foun
         hir::DefWithBody::Const(it) => hir::ModuleDef::Const(it),
         hir::DefWithBody::EnumVariant(it) => hir::ModuleDef::EnumVariant(it),
     };
-    let mut walk = Walk { cx, body: &body.store, source: &source, item, owner, ctxs: std::mem::take(ctxs), found };
+    let mut walk = Walk {
+        cx,
+        body: &body.store,
+        source: &source,
+        item,
+        owner,
+        ctxs: std::mem::take(ctxs),
+        found,
+    };
     for root in roots.iter() {
         walk.ctxs.clear();
         match root.list {

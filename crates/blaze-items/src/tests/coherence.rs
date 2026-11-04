@@ -9,6 +9,7 @@ use hir_def::{
         EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature, UnionSignature,
     },
 };
+use hir_expand::fixture;
 use hir_ty::{
     InferenceResult, check_orphan_rules,
     drop::is_freeze,
@@ -22,7 +23,6 @@ use rustc_type_ir::{
     UintTy,
     inherent::{GenericArgs as _, IntoKind as _},
 };
-use hir_expand::fixture;
 
 use super::db::TestDB;
 
@@ -197,7 +197,9 @@ fn an_alias_without_impl_trait_infers_no_body() {
     let db = fx.into_db();
     let plain = type_alias_named(&db, crate_named(&db, "main"), "Plain");
     let executed = db.log_executed(|| {
-        blaze_query::db::attach(&db, || assert_eq!(tait_hidden_types(&db, plain).values().count(), 0))
+        blaze_query::db::attach(&db, || {
+            assert_eq!(tait_hidden_types(&db, plain).values().count(), 0)
+        })
     });
     assert_eq!(runs(&executed, "infer_body_query"), 0, "{executed:#?}");
 }
@@ -210,10 +212,8 @@ fn an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body() {
     let opaque = type_alias_named(&db, crate_named(&db, "main"), "Opaque");
     let executed = db.log_executed(|| {
         blaze_query::db::attach(&db, || {
-            let hidden: Vec<_> = tait_hidden_types(&db, opaque)
-                .values()
-                .map(|it| it.get().skip_binder())
-                .collect();
+            let hidden: Vec<_> =
+                tait_hidden_types(&db, opaque).values().map(|it| it.get().skip_binder()).collect();
             assert_eq!(hidden.len(), 1, "{hidden:?}");
             assert!(matches!(hidden[0].kind(), TyKind::Uint(UintTy::U32)), "{hidden:?}");
         })
@@ -241,17 +241,22 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let impls = impls(&db, crate_named(&db, "main"));
-    let answers: Vec<bool> =
-        blaze_query::db::attach(&db, || impls.iter().map(|&it| check_orphan_rules(&db, it)).collect());
+    let answers: Vec<bool> = blaze_query::db::attach(&db, || {
+        impls.iter().map(|&it| check_orphan_rules(&db, it)).collect()
+    });
     assert_eq!(answers, [true, true, true, false]);
 
     let fx = fixture::db(ORPHAN);
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let impls = self::impls(&db, crate_named(&db, "main"));
-    let plain = db.log_executed(|| blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[2]))));
+    let plain = db.log_executed(|| {
+        blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[2])))
+    });
     assert_eq!(runs(&plain, "trait_environment_query"), 0, "{plain:#?}");
-    let alias = db.log_executed(|| blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[1]))));
+    let alias = db.log_executed(|| {
+        blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[1])))
+    });
     assert!(runs(&alias, "trait_environment_query") >= 1, "{alias:#?}");
 }
 

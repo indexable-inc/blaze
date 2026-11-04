@@ -4,10 +4,10 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_mem::frame::Frame;
 use hashbrown::hash_map::Entry;
 use intern::Symbol;
+use std::alloc::Global;
 
 use crate::{
     AssocItemId, AttrDefId, HasModule, ModuleDefId, ModuleId,

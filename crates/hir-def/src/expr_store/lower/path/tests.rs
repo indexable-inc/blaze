@@ -1,11 +1,11 @@
 use expect_test::{Expect, expect};
+use hir_expand::fixture;
 use span::Edition;
 use syntax::{
     AstPtr,
     ast::{self as tag, make},
     view::{self as ast, AstNode as _},
 };
-use hir_expand::fixture;
 
 use crate::{
     expr_store::{
@@ -139,8 +139,7 @@ fn a_warm_plain_path_lookup_allocates_nothing() {
     let module = crate_def_map(&db, krate).root_module_id();
     with_path("a::b::C", |path| {
         let lookup = || {
-            let mut ctx =
-                ExprCollector::new(&db, module, file_id.into(), crate::LoweringMode::Ide);
+            let mut ctx = ExprCollector::new(&db, module, file_id.into(), crate::LoweringMode::Ide);
             std::hint::black_box(ctx.lower_path_view(path, &mut ImplTraitLowering::Opaque));
         };
         lookup();

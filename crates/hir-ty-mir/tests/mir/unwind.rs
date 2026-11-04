@@ -6,8 +6,8 @@
 //! runs on Linux x86-64 under [`Plain`] with minicore, which has no `#[panic_handler]`, so a
 //! panic is the evaluator's own (a failed bounds check here).
 
-use hir_ty_mir::mir::{Plain, run_function};
 use hir_expand::fixture;
+use hir_ty_mir::mir::{Plain, run_function};
 
 use crate::function;
 

@@ -273,10 +273,17 @@ impl Table {
             let stamp = slot.words[1].load(Relaxed);
             hit = if slot.holds(kind, key) { at } else { hit };
             empty = if seen { empty } else { at };
-            (oldest, oldest_at) = if seen & (stamp < oldest) { (stamp, at) } else { (oldest, oldest_at) };
+            (oldest, oldest_at) =
+                if seen & (stamp < oldest) { (stamp, at) } else { (oldest, oldest_at) };
         }
         let held = hit < WAYS;
-        let at = if held { hit } else if empty < WAYS { empty } else { oldest_at };
+        let at = if held {
+            hit
+        } else if empty < WAYS {
+            empty
+        } else {
+            oldest_at
+        };
         Way { at: first + at, held, evicts: !held & (empty == WAYS) }
     }
 }

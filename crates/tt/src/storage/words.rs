@@ -121,13 +121,11 @@ impl<'a> TokenTreesView<'a> {
             }
             _ => words.at[last as usize] + 1,
         };
-        let first_fragment_counts = match words
-            .fragment_starts
-            .binary_search_by_key(&first, |&(word, _)| word)
-        {
-            Ok(found) => words.fragment_starts[found].1 >= self.start,
-            Err(_) => true,
-        };
+        let first_fragment_counts =
+            match words.fragment_starts.binary_search_by_key(&first, |&(word, _)| word) {
+                Ok(found) => words.fragment_starts[found].1 >= self.start,
+                Err(_) => true,
+            };
         ViewWords {
             rest: &words.words[first as usize..],
             len: (end - first) as usize,

@@ -31,7 +31,9 @@
 use base_db::Db;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, CallableDefId, FunctionId, ItemContainerId, StaticId,
-    attrs::AttrFlags, builtin_derive::BuiltinDeriveImplMethod, lang_item::lang_items,
+    attrs::AttrFlags,
+    builtin_derive::BuiltinDeriveImplMethod,
+    lang_item::lang_items,
     signatures::{FunctionSignature, StaticFlags, StaticSignature},
 };
 use hir_ty::{
@@ -39,8 +41,8 @@ use hir_ty::{
     db::{HirDatabase as _, InternedClosureId},
     drop::{DropGlue, destructor, has_drop_glue, is_freeze},
     intrinsic::Intrinsic,
-    mir::{CastKind, MirBody, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind},
     mir::{BinOp, StoredPlace, TerminatorKind},
+    mir::{CastKind, MirBody, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind},
     next_solver::{
         DbInterner, GenericArg, GenericArgs, ParamEnv, StoredGenericArgs, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt as _, InferCtxt},
@@ -180,7 +182,9 @@ impl Why {
             Culprit::Intrinsic(f) => {
                 format!("calls the intrinsic `{}`, whose effects blaze has no rule for", name(f))
             }
-            Culprit::Dyn(f) => format!("calls `{}` through `dyn`, whose impl is not known", name(f)),
+            Culprit::Dyn(f) => {
+                format!("calls `{}` through `dyn`, whose impl is not known", name(f))
+            }
             Culprit::Generic(f) => {
                 format!("calls `{}` for a type parameter, whose impl is not known", name(f))
             }
@@ -618,8 +622,8 @@ fn intrinsic_effects<'db>(
                             _ => deep(0),
                         };
                         out.writes = spread(summary.writes);
-                        out.returns = spread(summary.returns)
-                            | summary.returns & (STATIC | FRESH | UNKNOWN);
+                        out.returns =
+                            spread(summary.returns) | summary.returns & (STATIC | FRESH | UNKNOWN);
                     }
                     _ => return Effects::unknown(Culprit::Intrinsic(f)),
                 },
@@ -868,7 +872,10 @@ pub(crate) fn drop_summary<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, ty: Ty<
 }
 
 pub(crate) fn infer_ctxt(db: &Db, krate: base_db::Crate) -> InferCtxt<'_> {
-    DbInterner::new_with(db, krate).with_regions().infer_ctxt().build(TypingMode::non_body_analysis())
+    DbInterner::new_with(db, krate)
+        .with_regions()
+        .infer_ctxt()
+        .build(TypingMode::non_body_analysis())
 }
 
 /// Whether reading the static `id` reads state that changes: a `static mut`, a thread-local, a
@@ -1015,9 +1022,8 @@ impl<'a, 'db> Frame<'a, 'db> {
                 self.memory(place)
             }
             Rvalue::CopyForDeref(place) => self.value(place),
-            Rvalue::BinaryOp(BinOp::Offset, it, _) | Rvalue::CheckedBinaryOp(BinOp::Offset, it, _) => {
-                self.operand(it)
-            }
+            Rvalue::BinaryOp(BinOp::Offset, it, _)
+            | Rvalue::CheckedBinaryOp(BinOp::Offset, it, _) => self.operand(it),
             Rvalue::BinaryOp(..) | Rvalue::CheckedBinaryOp(..) => 0,
             Rvalue::Aggregate(_, operands) => {
                 operands.iter().fold(0, |sum, it| sum | self.operand(it))
@@ -1142,7 +1148,8 @@ impl<'a, 'db> Frame<'a, 'db> {
                     }
                 }
                 TerminatorKind::Assert { .. } => self.out.kinds |= Effect::Panic.bit(),
-                TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
+                TerminatorKind::Drop { place, .. }
+                | TerminatorKind::DropAndReplace { place, .. } => {
                     let infcx = infer_ctxt(db, env.krate);
                     let ty = place.as_ref().ty(body, &infcx, env.param_env).ty;
                     let mut dropped = Effects::NONE;

@@ -283,14 +283,18 @@ mod tests {
 
     #[test]
     fn the_gear_table_is_the_format() {
-        assert_eq!(GEAR[..3], [0x2db9_8404_6906_f47e, 0x9400_e56a_1a4e_6d5d, 0x7873_de3b_2d33_0196]);
+        assert_eq!(
+            GEAR[..3],
+            [0x2db9_8404_6906_f47e, 0x9400_e56a_1a4e_6d5d, 0x7873_de3b_2d33_0196]
+        );
         let mut stream = rng::SplitMix64::new(0x626c_617a_6520_7632);
         assert!(GEAR.iter().all(|&word| word == stream.next_u64()));
     }
 
     #[test]
     fn chunks_cover_everything_within_bounds() {
-        for (len, seed) in [(0, 1), (1, 2), (MIN, 3), (MIN + 1, 4), (3 << 20, 5), (MAX * 3 + 7, 6)] {
+        for (len, seed) in [(0, 1), (1, 2), (MIN, 3), (MIN + 1, 4), (3 << 20, 5), (MAX * 3 + 7, 6)]
+        {
             let bytes = noise(len, seed);
             let chunks = chunks(&bytes);
             let mut at = 0;

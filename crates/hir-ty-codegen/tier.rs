@@ -26,10 +26,10 @@ use std::{sync::Arc, time::Duration};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cranelift_codegen::ir::{self, InstBuilder, Opcode, types};
 use hir_def::{FunctionId, HasModule, attrs::AttrFlags};
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 
@@ -353,7 +353,9 @@ pub(super) struct Inlining {
     /// The bodies built so far, by what they are of: `None` for one that is not built in.
     built: HashMap<
         (InstanceDef, StoredGenericArgs, bool),
-        Option<Arc<super::fragment::Inlinable>>, Global>,
+        Option<Arc<super::fragment::Inlinable>>,
+        Global,
+    >,
     /// The size of a body that was built and then found too large, which a build of it with
     /// more room only adds to: it is not built again for a call that allows no more. A body
     /// built while its callees found no room is not kept in [`Inlining::built`], and what it
@@ -1118,7 +1120,9 @@ fn produce(
     _: Option<&Weights>,
 ) -> Result<super::fragment::Code> {
     // alloc: the error's message
-    Err(CodegenError::Unsupported("blaze was built without LLVM (blaze-engine's `native` feature)".to_owned()))
+    Err(CodegenError::Unsupported(
+        "blaze was built without LLVM (blaze-engine's `native` feature)".to_owned(),
+    ))
 }
 
 #[cfg(test)]

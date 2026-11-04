@@ -73,13 +73,20 @@ pub fn take_carried<T: Default + 'static>(
 /// # Panics
 ///
 /// Where that thread's slot holds a value: another job's would be lost (it stays in place).
-pub fn put_carried<T: Default + 'static>(slot: &'static LocalKey<RefCell<T>>, is_default: fn(&T) -> bool, taken: NonZeroUsize) {
+pub fn put_carried<T: Default + 'static>(
+    slot: &'static LocalKey<RefCell<T>>,
+    is_default: fn(&T) -> bool,
+    taken: NonZeroUsize,
+) {
     // SAFETY: `taken` is what `take_carried` of this slot gave, so a boxed `T`, handed to this
     // one put once.
     let value = unsafe { unboxed::<T>(taken) };
     slot.with(move |slot| {
         let mut slot = slot.borrow_mut();
-        assert!(is_default(&*slot), "a job's thread-local put back on a thread that holds another's");
+        assert!(
+            is_default(&*slot),
+            "a job's thread-local put back on a thread that holds another's"
+        );
         *slot = value;
     });
 }
@@ -113,7 +120,11 @@ pub fn take_carried_cell<T: Default + 'static>(
 /// # Panics
 ///
 /// As [`put_carried`].
-pub fn put_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>, is_default: fn(&T) -> bool, taken: NonZeroUsize) {
+pub fn put_carried_cell<T: Default + 'static>(
+    slot: &'static LocalKey<Cell<T>>,
+    is_default: fn(&T) -> bool,
+    taken: NonZeroUsize,
+) {
     // SAFETY: as in `put_carried`.
     let value = unsafe { unboxed::<T>(taken) };
     slot.with(move |slot| {
@@ -249,7 +260,11 @@ mod tests {
                 *held = on(&workers[(at + 1 + round as usize) % 2].0, move || {
                     let worker = take();
                     put(taken);
-                    assert_eq!(SLOT.with_borrow(|it| it.as_ref().map(|it| it[0])), Some(100 + mine), "a job came on to another's value");
+                    assert_eq!(
+                        SLOT.with_borrow(|it| it.as_ref().map(|it| it[0])),
+                        Some(100 + mine),
+                        "a job came on to another's value"
+                    );
                     push(round);
                     let job = take();
                     put(worker);
@@ -269,7 +284,11 @@ mod tests {
         }
         for (at, (tx, thread)) in workers.into_iter().enumerate() {
             drop(tx);
-            assert_eq!(thread.join().unwrap(), Some(vec![900 + at as u32]), "a thread lost its own value");
+            assert_eq!(
+                thread.join().unwrap(),
+                Some(vec![900 + at as u32]),
+                "a thread lost its own value"
+            );
         }
     }
 
@@ -312,9 +331,11 @@ mod tests {
         assert!(HELD.with_borrow(|it| it.0.is_some()), "the held value was lost");
 
         HELD_CELL.set(Counted(Some(std::rc::Rc::clone(&drops))));
-        let taken = super::take_carried_cell(&HELD_CELL, is_default).expect("a held value is taken");
+        let taken =
+            super::take_carried_cell(&HELD_CELL, is_default).expect("a held value is taken");
         HELD_CELL.set(Counted(Some(std::rc::Rc::new(std::cell::Cell::new(0)))));
-        let refused = panic::catch_unwind(|| super::put_carried_cell(&HELD_CELL, is_default, taken));
+        let refused =
+            panic::catch_unwind(|| super::put_carried_cell(&HELD_CELL, is_default, taken));
         assert!(refused.is_err(), "a put onto a held cell refuses");
         assert_eq!(drops.get(), 2, "the refused cell value was not dropped");
         let held = HELD_CELL.take();

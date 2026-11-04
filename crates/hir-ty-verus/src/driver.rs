@@ -31,7 +31,7 @@ use vir::{
 
 use crate::{
     Config, Counterexample, Obligation, Outcome, ProofKey, RLIMIT_PER_SECOND, Refutation, SEED,
-    Unknown, UnknownWhy, Unsupported, VERUS_COMMIT, VerifyError, Value, Z3_VERSION,
+    Unknown, UnknownWhy, Unsupported, VERUS_COMMIT, Value, VerifyError, Z3_VERSION,
     commands::{self, Op, QueryOp},
     lower::{Lowered, Origin, vir_err_text},
 };
@@ -139,17 +139,31 @@ pub(crate) fn prove(lowered: &Lowered, config: &Config) -> Outcome {
                 .unwrap_or_else(|| "a panic with no message".to_owned()); // alloc: error message
             let reported = diags.text();
             let message = if reported.is_empty() { what } else { format!("{what} ({reported})") };
-            Outcome::Error(VerifyError { function: lowered.display.clone(), stage: "panic", message })
+            Outcome::Error(VerifyError {
+                function: lowered.display.clone(),
+                stage: "panic",
+                message,
+            })
         }
     }
 }
 
-fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Outcome, VerifyError> {
+fn prove_inner(
+    lowered: &Lowered,
+    config: &Config,
+    diags: &Collect,
+) -> Result<Outcome, VerifyError> {
     let function = &lowered.display;
-    let error = |stage: &'static str, message: String| VerifyError { function: function.clone(), stage, message };
+    let error = |stage: &'static str, message: String| VerifyError {
+        function: function.clone(),
+        stage,
+        message,
+    };
     let vir = |stage: &'static str| move |err: VirErr| error(stage, vir_err_text(&err));
     let virs = |stage: &'static str| {
-        move |errs: Vec<VirErr>| error(stage, errs.iter().map(vir_err_text).collect::<Vec<_>>().join("; "))
+        move |errs: Vec<VirErr>| {
+            error(stage, errs.iter().map(vir_err_text).collect::<Vec<_>>().join("; "))
+        }
     };
     let blocking = |stage: &'static str, errs: Vec<VirErr>| match errs.is_empty() {
         true => Ok(()),
@@ -166,7 +180,8 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
     let mut without_funs = (**krate).clone();
     without_funs.functions = Vec::new(); // alloc: VIR
     let without_funs = Arc::new(without_funs);
-    let merged_traits = vir::traits::merge_external_traits(&without_funs, &[]).map_err(vir("vir"))?;
+    let merged_traits =
+        vir::traits::merge_external_traits(&without_funs, &[]).map_err(vir("vir"))?;
     let demote = vir::traits::DemoteTraitLookup::new(&without_funs, &[], &stubs);
     let (initial, non_blocking, _) = vir::well_formed::check_crate_initial(
         &without_funs,
@@ -186,7 +201,8 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
     let mut dyn_checks = vec![initial.dyn_compatability_checks]; // alloc: VIR
     let mut resolution = HashMap::new(); // alloc: VIR's own map
     for f in &krate.functions {
-        let f = vir::traits::demote_external_traits_function_calls(&demote, f).map_err(vir("vir"))?;
+        let f =
+            vir::traits::demote_external_traits_function_calls(&demote, f).map_err(vir("vir"))?;
         let (wf, non_blocking, _) = vir::well_formed::check_function(
             &without_funs,
             stubs.clone(),
@@ -211,7 +227,8 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
     }
     vir::traits::set_krate_dyn_compatibility(&Vec::new(), &mut kratex); // alloc: VIR
     let mut krate = vir::ast_sort::sort_krate(&Arc::new(kratex));
-    Arc::make_mut(&mut krate).arch = vir::ast_simplify::krate_merge_arch(&krate, &[]).map_err(vir("vir"))?;
+    Arc::make_mut(&mut krate).arch =
+        vir::ast_simplify::krate_merge_arch(&krate, &[]).map_err(vir("vir"))?;
     let (check, _) = vir::well_formed::check_crate_final(&krate, &warning_ctx);
     check.map_err(vir("vir"))?;
     vir::well_formed::finish_dyn_compatability_checks(&krate, dyn_checks).map_err(virs("vir"))?;
@@ -219,7 +236,8 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
     // The merged crate (`_compute_merged_crate`): blaze merges no other crate yet (vstd and
     // callees join with calls).
     let mine = krate.clone();
-    let unpruned = vir::ast_simplify::merge_krates(vec![krate], &merged_traits).map_err(vir("vir"))?; // alloc: VIR
+    let unpruned =
+        vir::ast_simplify::merge_krates(vec![krate], &merged_traits).map_err(vir("vir"))?; // alloc: VIR
     let (krate, _) = vir::prune::prune_krate_for_module_or_krate(
         &unpruned,
         &lowered.crate_id,
@@ -229,10 +247,13 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
         false,
         false,
     );
-    let krate = vir::traits::demote_external_traits(diags, &warning_ctx, &krate, &demote).map_err(vir("vir"))?;
+    let krate = vir::traits::demote_external_traits(diags, &warning_ctx, &krate, &demote)
+        .map_err(vir("vir"))?;
     let mut warning_ctx = warning_ctx.clone();
-    let krate = vir::traits::inherit_default_bodies(&krate, &mut warning_ctx).map_err(vir("vir"))?;
-    let krate = vir::resolution_inference::krate_infer_resolution(&krate, &resolution).map_err(virs("vir"))?;
+    let krate =
+        vir::traits::inherit_default_bodies(&krate, &mut warning_ctx).map_err(vir("vir"))?;
+    let krate = vir::resolution_inference::krate_infer_resolution(&krate, &resolution)
+        .map_err(virs("vir"))?;
     vir::well_formed::check_crate_merged(&krate).map_err(vir("vir"))?;
 
     // The verifier (`verify_crate_inner`, then `verify_bucket` for the function's module).
@@ -293,8 +314,8 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
         return Err(error("vir", "pruning for the module left out the function itself".to_owned())); // alloc: error message
     }
     let bucket_set: HashSet<Fun> = bucket.iter().cloned().collect(); // alloc: VIR's own set
-    let krate_sst =
-        vir::ast_to_sst_crate::ast_to_sst_krate(&mut ctx, diags, &bucket_set, &pruned).map_err(vir("sst"))?;
+    let krate_sst = vir::ast_to_sst_crate::ast_to_sst_krate(&mut ctx, diags, &bucket_set, &pruned)
+        .map_err(vir("sst"))?;
     let krate_sst = vir::poly::poly_krate_for_module(&mut ctx, &krate_sst);
 
     // The solver (`new_air_context_with_prelude`).
@@ -310,15 +331,25 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
     let observer: Rc<RefCell<dyn QueryResultObserver>> = capture.clone();
     air.set_observers(None, Some(observer));
 
-    let feed_all = |air: &mut Context, commands: &[air::ast::Command], what: &str| -> Result<(), VerifyError> {
+    let feed_all = |air: &mut Context,
+                    commands: &[air::ast::Command],
+                    what: &str|
+     -> Result<(), VerifyError> {
         for command in commands {
             match air.command(&*msg, diags, command, Default::default()) {
                 ValidityResult::Valid(_) => {}
-                ValidityResult::TypeError(err) => return Err(error("air", format!("{what}: {err}"))),
+                ValidityResult::TypeError(err) => {
+                    return Err(error("air", format!("{what}: {err}")));
+                }
                 ValidityResult::UnexpectedOutput(out) => {
                     return Err(error("solver", format!("{what}: Z3 answered `{out}`")));
                 }
-                _ => return Err(error("air", format!("{what}: a declaration was answered as a query"))),
+                _ => {
+                    return Err(error(
+                        "air",
+                        format!("{what}: a declaration was answered as a query"),
+                    ));
+                }
             }
         }
         Ok(())
@@ -393,7 +424,9 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
                             });
                             break;
                         }
-                        ValidityResult::TypeError(err) => return Err(error("air", format!("a query: {err}"))),
+                        ValidityResult::TypeError(err) => {
+                            return Err(error("air", format!("a query: {err}")));
+                        }
                         ValidityResult::UnexpectedOutput(out) => {
                             return Err(error("solver", format!("a query: Z3 answered `{out}`")));
                         }
@@ -411,7 +444,10 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
                         break;
                     }
                     let Some((obligation, message)) = classified else {
-                        return Err(error("air", "a refuted query with no message naming what failed".to_owned())); // alloc: error message
+                        return Err(error(
+                            "air",
+                            "a refuted query with no message naming what failed".to_owned(),
+                        )); // alloc: error message
                     };
                     let model = capture.borrow_mut().model.take().unwrap_or_default();
                     refutations.push(Refutation {
@@ -427,10 +463,13 @@ fn prove_inner(lowered: &Lowered, config: &Config, diags: &Collect) -> Result<Ou
                     if probes > MAX_PROBES {
                         return Err(error(
                             "air",
-                            format!("asked Z3 for {MAX_PROBES} more failing assertions of one query, and it kept finding them"),
+                            format!(
+                                "asked Z3 for {MAX_PROBES} more failing assertions of one query, and it kept finding them"
+                            ),
                         ));
                     }
-                    result = air.check_valid_again(diags, probes >= MORE_ERRORS, Default::default());
+                    result =
+                        air.check_valid_again(diags, probes >= MORE_ERRORS, Default::default());
                 }
                 air.finish_query();
             }

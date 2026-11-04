@@ -68,11 +68,16 @@ pub fn value_edges(db: &Db, of: ValueOf) -> Result<Vec<Hashed>, String> {
         .edges
         .iter()
         .map(|edge| match *edge {
-            Edge::Vtable(concrete, dyn_ty) => {
-                Hashed::Vtable { concrete: erased(cx.interner, concrete).store(), dyn_ty: erased(cx.interner, dyn_ty).store() }
+            Edge::Vtable(concrete, dyn_ty) => Hashed::Vtable {
+                concrete: erased(cx.interner, concrete).store(),
+                dyn_ty: erased(cx.interner, dyn_ty).store(),
+            },
+            Edge::Call(func, args) => {
+                Hashed::Call { func, args: erased(cx.interner, args).store() }
             }
-            Edge::Call(func, args) => Hashed::Call { func, args: erased(cx.interner, args).store() },
-            Edge::Closure(body, parent) => Hashed::Closure { body, parent: erased(cx.interner, parent).store() },
+            Edge::Closure(body, parent) => {
+                Hashed::Closure { body, parent: erased(cx.interner, parent).store() }
+            }
             Edge::Drop(ty) => Hashed::Drop(erased(cx.interner, ty).store()),
         })
         .collect()) // alloc: test support, the edges handed out

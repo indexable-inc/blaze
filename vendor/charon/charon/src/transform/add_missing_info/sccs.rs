@@ -97,10 +97,7 @@ pub fn ordered_scc<Id: NodeTrait + Debug, O: Ord>(
     }
 
     // Output the fully reordered SCCs.
-    reordered_sccs_ids
-        .into_iter()
-        .map(|scc_id| mem::take(&mut sccs[scc_id.0]))
-        .collect()
+    reordered_sccs_ids.into_iter().map(|scc_id| mem::take(&mut sccs[scc_id.0])).collect()
 }
 
 #[cfg(test)]

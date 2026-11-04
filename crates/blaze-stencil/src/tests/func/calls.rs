@@ -19,20 +19,28 @@ const I64: ir::Type = types::I64;
 
 /// `(x, y) -> 3x - y`.
 fn triple(mk: &Mk, index: u32, cc: CallConv) -> ir::Function {
-    mk.func(index, mk.sig_in(cc, &[ir::AbiParam::new(I64); 2], &[ir::AbiParam::new(I64)]), |b, p| {
-        let three = b.ins().imul_imm(p[0], 3);
-        let out = b.ins().isub(three, p[1]);
-        b.ins().return_(&[out]);
-    })
+    mk.func(
+        index,
+        mk.sig_in(cc, &[ir::AbiParam::new(I64); 2], &[ir::AbiParam::new(I64)]),
+        |b, p| {
+            let three = b.ins().imul_imm(p[0], 3);
+            let out = b.ins().isub(three, p[1]);
+            b.ins().return_(&[out]);
+        },
+    )
 }
 
 /// `(x, y) -> rotl(x, y) ^ y`.
 fn rotate(mk: &Mk, index: u32, cc: CallConv) -> ir::Function {
-    mk.func(index, mk.sig_in(cc, &[ir::AbiParam::new(I64); 2], &[ir::AbiParam::new(I64)]), |b, p| {
-        let rotated = b.ins().rotl(p[0], p[1]);
-        let out = b.ins().bxor(rotated, p[1]);
-        b.ins().return_(&[out]);
-    })
+    mk.func(
+        index,
+        mk.sig_in(cc, &[ir::AbiParam::new(I64); 2], &[ir::AbiParam::new(I64)]),
+        |b, p| {
+            let rotated = b.ins().rotl(p[0], p[1]);
+            let out = b.ins().bxor(rotated, p[1]);
+            b.ins().return_(&[out]);
+        },
+    )
 }
 
 fn pair(mk: &Mk) -> ir::Signature {
@@ -129,7 +137,9 @@ pub fn tail(mk: &Mk) -> Family {
 /// `tail` functions whose stack arguments grow and shrink: u0 (2 arguments)
 /// `return_call`s u1 (12, past the registers), which `return_call`s u2 (3).
 pub fn tail_stack(mk: &Mk) -> Family {
-    let sig = |n: usize| mk.sig_in(CallConv::Tail, &vec![ir::AbiParam::new(I64); n], &[ir::AbiParam::new(I64)]);
+    let sig = |n: usize| {
+        mk.sig_in(CallConv::Tail, &vec![ir::AbiParam::new(I64); n], &[ir::AbiParam::new(I64)])
+    };
     let entry = mk.func(0, sig(2), |b, p| {
         let wide = import(b, FUNCS, 1, sig(12), false);
         let mut args = Vec::with_capacity(12);

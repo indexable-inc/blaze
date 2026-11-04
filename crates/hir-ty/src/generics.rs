@@ -8,8 +8,8 @@
 //!
 //! where parent follows the same scheme.
 
-use base_db::Db;
 use arrayvec::ArrayVec;
+use base_db::Db;
 use hir_def::{
     ConstParamId, GenericDefId, GenericParamId, ItemContainerId, LifetimeParamId, Lookup,
     TypeOrConstParamId, TypeParamId,

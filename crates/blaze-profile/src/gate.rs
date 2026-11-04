@@ -106,7 +106,10 @@ pub enum GateError {
     /// A view the gate reads would not render.
     View(ViewError),
     /// The history has no `builds` row for the build asked for (`None`: for any build).
-    NoBuild { history: PathBuf, build: Option<u64> },
+    NoBuild {
+        history: PathBuf,
+        build: Option<u64>,
+    },
 }
 
 impl fmt::Display for GateError {
@@ -115,7 +118,11 @@ impl fmt::Display for GateError {
             GateError::Sql(error) => write!(f, "the profile's gate: {error}"),
             GateError::View(error) => write!(f, "the profile's gate: {error}"),
             GateError::NoBuild { history, build: Some(build) } => {
-                write!(f, "the profile's gate: {} has no builds row for build {build}", history.display())
+                write!(
+                    f,
+                    "the profile's gate: {} has no builds row for build {build}",
+                    history.display()
+                )
             }
             GateError::NoBuild { history, build: None } => {
                 write!(f, "the profile's gate: {} has no build that ended", history.display())
@@ -219,7 +226,9 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
 fn i64s(batches: &[RecordBatch], at: usize) -> Vec<i64> {
     batches
         .iter()
-        .flat_map(|it| it.column(at).as_primitive::<Int64Type>().iter().map(Option::unwrap_or_default))
+        .flat_map(|it| {
+            it.column(at).as_primitive::<Int64Type>().iter().map(Option::unwrap_or_default)
+        })
         // alloc: a check's answer
         .collect()
 }
@@ -227,7 +236,9 @@ fn i64s(batches: &[RecordBatch], at: usize) -> Vec<i64> {
 fn f64s(batches: &[RecordBatch], at: usize) -> Vec<f64> {
     batches
         .iter()
-        .flat_map(|it| it.column(at).as_primitive::<Float64Type>().iter().map(Option::unwrap_or_default))
+        .flat_map(|it| {
+            it.column(at).as_primitive::<Float64Type>().iter().map(Option::unwrap_or_default)
+        })
         // alloc: a check's answer
         .collect()
 }
@@ -236,7 +247,9 @@ fn strings(batches: &[RecordBatch], at: usize) -> Vec<String> {
     batches
         .iter()
         // alloc: a check's answer
-        .flat_map(|it| it.column(at).as_string::<i32>().iter().map(|it| it.unwrap_or("?").to_owned()))
+        .flat_map(|it| {
+            it.column(at).as_string::<i32>().iter().map(|it| it.unwrap_or("?").to_owned())
+        })
         // alloc: a check's answer
         .collect()
 }
@@ -260,7 +273,12 @@ mod tests {
             build: 24,
             tree: Some("9f2c".into()),
             blaze: None,
-            uncovered: vec![Uncovered { thread: 7, thread_name: "blaze-work-3".into(), seconds: 77.0, pct: 28.1 }],
+            uncovered: vec![Uncovered {
+                thread: 7,
+                thread_name: "blaze-work-3".into(),
+                seconds: 77.0,
+                pct: 28.1,
+            }],
             raw: vec![RawBlock {
                 thread: 9,
                 t_ns: 55_000_000_000,
@@ -274,7 +292,14 @@ mod tests {
         assert!(said.contains("blaze_codegen::flight::Flights::wait > __psynch_cvwait"), "{said}");
         assert!(said.contains("3 wait spans"), "{said}");
         assert!(said.contains("build 24 (tree 9f2c, blaze not recorded)"), "{said}");
-        let clean = Verdict { build: 25, tree: None, blaze: None, uncovered: vec![], raw: vec![], unsaid_waits: 0 };
+        let clean = Verdict {
+            build: 25,
+            tree: None,
+            blaze: None,
+            uncovered: vec![],
+            raw: vec![],
+            unsaid_waits: 0,
+        };
         assert!(clean.passed());
         assert!(clean.to_string().contains("accounted for"));
     }
@@ -285,15 +310,21 @@ mod tests {
     #[test]
     #[ignore = "needs a profiled self-build and the pinned DuckDB: BLAZE_PROFILE_FIXTURE=<state>/profile BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn a_profiled_self_build_has_no_worker_outside_spans_and_no_block_unsaid() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         let history = PathBuf::from(
-            std::env::var_os("BLAZE_PROFILE_FIXTURE").expect("BLAZE_PROFILE_FIXTURE names a profiled build's history"),
+            std::env::var_os("BLAZE_PROFILE_FIXTURE")
+                .expect("BLAZE_PROFILE_FIXTURE names a profiled build's history"),
         );
         let build = std::env::var("BLAZE_PROFILE_FIXTURE_BUILD")
             .ok()
             .map(|it| it.parse().expect("BLAZE_PROFILE_FIXTURE_BUILD is a build's number"));
         let verdict = check(&duckdb, &history, build).unwrap_or_else(|error| panic!("{error}"));
         assert!(verdict.passed(), "{verdict}");
-        assert!(verdict.tree.is_some() && verdict.blaze.is_some(), "a measurement names its tree and binary: {verdict}");
+        assert!(
+            verdict.tree.is_some() && verdict.blaze.is_some(),
+            "a measurement names its tree and binary: {verdict}"
+        );
     }
 }

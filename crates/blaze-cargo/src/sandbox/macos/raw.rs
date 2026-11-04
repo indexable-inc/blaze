@@ -88,7 +88,9 @@ pub(super) fn wait_unreaped(pid: pid_t) -> c_int {
     // bytes are a valid value.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a live, exclusive `siginfo_t` for the call to fill, and nothing else.
-    unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) }
+    unsafe {
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+    }
 }
 
 /// `waitpid`, with the status written to `status`.

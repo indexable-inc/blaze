@@ -28,7 +28,9 @@ use hir_expand::{
     attrs::{AstKeyValueMetaExt as _, AstPathExt as _, expand_cfg_attr_view},
     builtin::EagerExpander,
 };
-use hir_ty::next_solver::{CallableIdWrapper, DbInterner, Ty, TyKind, infer::select::EvaluationResult};
+use hir_ty::next_solver::{
+    CallableIdWrapper, DbInterner, Ty, TyKind, infer::select::EvaluationResult,
+};
 use rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_type_ir::inherent::IntoKind as _;
 use span::FileId;
@@ -39,7 +41,7 @@ use syntax::{
 
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set,
+        BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set,
         types::util::{self, Solver},
     },
     lower::{Found, Phase},
@@ -47,8 +49,7 @@ use crate::{
 };
 
 const LINT: &str = "non_fmt_panics";
-const MORE: &str =
-    "for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/panic-macro-consistency.html>";
+const MORE: &str = "for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/panic-macro-consistency.html>";
 
 #[derive(Default)]
 pub(crate) struct NonPanicFmt {
@@ -70,14 +71,18 @@ impl LatePass for NonPanicFmt {
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args: &[arg] } = b.store().expr(expr) else { return };
-        let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(def)), _) = b.infer.expr_ty(callee).kind() else {
+        let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(def)), _) =
+            b.infer.expr_ty(callee).kind()
+        else {
             return;
         };
         let db = b.db();
         let lang = DbInterner::new_with(db, b.owner.krate(db)).lang_items();
         let item = AttrFlags::diagnostic_item(db, AttrDefId::FunctionId(def));
         let item = item.as_ref().map(|it| it.as_str());
-        let is_panic = lang.BeginPanic == Some(def) || lang.Panic == Some(def) || item == Some("panic_str_2015");
+        let is_panic = lang.BeginPanic == Some(def)
+            || lang.Panic == Some(def)
+            || item == Some("panic_str_2015");
         if !is_panic && item != Some("unreachable_display") {
             return;
         }
@@ -89,7 +94,9 @@ impl LatePass for NonPanicFmt {
                 self.check_panic(b, expr, &f, arg, out);
             }
         } else if from.as_deref() == Some("unreachable_2015_macro") {
-            let Expr::Ref { expr: arg, rawness: Rawness::Ref, .. } = b.store().expr(arg) else { return };
+            let Expr::Ref { expr: arg, rawness: Rawness::Ref, .. } = b.store().expr(arg) else {
+                return;
+            };
             self.check_panic(b, expr, &f, arg, out);
         }
     }
@@ -98,7 +105,14 @@ impl LatePass for NonPanicFmt {
 impl NonPanicFmt {
     /// rustc's `check_panic`: the call `call` of `f` made by a 2015 panic macro, with the
     /// message `arg`.
-    fn check_panic(&mut self, b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, out: &mut Vec<Found>) {
+    fn check_panic(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        call: ExprId,
+        f: &At,
+        arg: ExprId,
+        out: &mut Vec<Found>,
+    ) {
         if let Some(Literal::String(fmt)) = util::literal(b, arg) {
             out.extend(check_panic_str(b, call, f, arg, fmt.as_str()));
             return;
@@ -118,7 +132,8 @@ impl NonPanicFmt {
             arg_span = site;
         }
         let traits = *self.traits.get_or_insert_with(|| FmtTraits::of(b));
-        let message = NotLiteral { arg, arg_span, span, arg_macro, panic: panic.as_deref(), symbol: &symbol };
+        let message =
+            NotLiteral { arg, arg_span, span, arg_macro, panic: panic.as_deref(), symbol: &symbol };
         let diag = message.diag(b, traits);
         let Some(at) = b.expr_node(call) else { return };
         out.push(b.lint(diag, Phase::Late, at));
@@ -126,7 +141,13 @@ impl NonPanicFmt {
 }
 
 /// rustc's `check_panic_str`: the message is the string literal `arg`, `fmt` unescaped.
-fn check_panic_str(b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &str) -> Option<Found> {
+fn check_panic_str(
+    b: &BodyCx<'_, '_, '_>,
+    call: ExprId,
+    f: &At,
+    arg: ExprId,
+    fmt: &str,
+) -> Option<Found> {
     if !fmt.contains(['{', '}']) {
         return None;
     }
@@ -162,7 +183,12 @@ fn check_panic_str(b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, fm
                 1 => "add the missing argument",
                 _ => "add the missing arguments",
             };
-            diag.suggestion(arg_span.shrink_to_hi(), missing, ", ...", Applicability::HasPlaceholders);
+            diag.suggestion(
+                arg_span.shrink_to_hi(),
+                missing,
+                ", ...",
+                Applicability::HasPlaceholders,
+            );
             diag.suggestion(
                 arg_span.shrink_to_lo(),
                 "or add a \"{}\" format string to use the message literally",
@@ -172,13 +198,14 @@ fn check_panic_str(b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, fm
         }
         diag
     } else {
-        let brace_spans: Option<Vec<Span>> = snippet.filter(|it| it.starts_with('"') || it.starts_with("r#")).map(|it| {
-            it.char_indices()
-                .filter(|&(_, c)| c == '{' || c == '}')
-                .map(|(i, _)| inner(b, &fmt_span, i, i + 1))
-                // alloc: the lint's diagnostic
-                .collect()
-        });
+        let brace_spans: Option<Vec<Span>> =
+            snippet.filter(|it| it.starts_with('"') || it.starts_with("r#")).map(|it| {
+                it.char_indices()
+                    .filter(|&(_, c)| c == '{' || c == '}')
+                    .map(|(i, _)| inner(b, &fmt_span, i, i + 1))
+                    // alloc: the lint's diagnostic
+                    .collect()
+            });
         // Without the snippet, any number but one.
         let count = brace_spans.as_ref().map_or(2, Vec::len);
         let message = match count {
@@ -224,7 +251,9 @@ impl NotLiteral<'_> {
         // clone: a span, for the lint's diagnostic
         let mut diag = Diag::lint(LINT, "panic message is not a string literal", shown.clone());
         // alloc: the lint's diagnostic
-        diag.note(format!("this usage of `{symbol}!()` is deprecated; it will be a hard error in Rust 2021"));
+        diag.note(format!(
+            "this usage of `{symbol}!()` is deprecated; it will be a hard error in Rust 2021"
+        ));
         diag.note(MORE);
         if !is_arg_inside_call(arg_span, span) {
             // Where the argument comes from is not known.
@@ -242,7 +271,10 @@ impl NotLiteral<'_> {
                     // alloc: the lint's diagnostic
                     "remove the `format!(..)` macro call",
                     // alloc: the lint's diagnostic
-                    vec![(inner(b, arg_span, 0, open + 1), String::new()), (inner(b, arg_span, close, len), String::new())],
+                    vec![
+                        (inner(b, arg_span, 0, open + 1), String::new()),
+                        (inner(b, arg_span, close, len), String::new()),
+                    ],
                     Applicability::MachineApplicable,
                 );
             }
@@ -253,21 +285,29 @@ impl NotLiteral<'_> {
         let lang = DbInterner::new_with(db, b.owner.krate(db)).lang_items();
         // A `&str` or a `String` is a message to show with `"{}", `.
         let is_str = matches!(ty.kind(), TyKind::Ref(_, inner, _) if inner.is_str())
-            || ty.as_adt().is_some_and(|(adt, _)| lang.String.is_some_and(|it| AdtId::StructId(it) == adt));
+            || ty
+                .as_adt()
+                .is_some_and(|(adt, _)| lang.String.is_some_and(|it| AdtId::StructId(it) == adt));
         let solver = Solver::of(b);
         // alloc: the lint's diagnostic
         let mut checked = Vec::new();
         let mut implements = |name: &'static str, it: Option<TraitId>| {
             let Some(it) = it else { return false };
             checked.push((name, it));
-            !matches!(solver.infcx.type_implements_trait(it, [ty], solver.env), EvaluationResult::EvaluatedToErr)
+            !matches!(
+                solver.infcx.type_implements_trait(it, [ty], solver.env),
+                EvaluationResult::EvaluatedToErr
+            )
         };
         let suggest_display = is_str || implements("Display", traits.display);
         let suggest_debug = !suggest_display && implements("Debug", traits.debug);
         let suggest_panic_any = !is_str && panic == Some("std_panic_macro");
         // With `panic_any` to suggest, a format string is not the only way.
-        let applicability =
-            if suggest_panic_any { Applicability::MaybeIncorrect } else { Applicability::MachineApplicable };
+        let applicability = if suggest_panic_any {
+            Applicability::MaybeIncorrect
+        } else {
+            Applicability::MachineApplicable
+        };
 
         if suggest_display {
             diag.suggestion_verbose(
@@ -280,7 +320,10 @@ impl NotLiteral<'_> {
             diag.suggestion_verbose(
                 shown.shrink_to_lo(),
                 // alloc: the lint's diagnostic
-                format!("add a \"{{:?}}\" format string to use the `Debug` implementation of `{}`", b.ty(ty)),
+                format!(
+                    "add a \"{{:?}}\" format string to use the `Debug` implementation of `{}`",
+                    b.ty(ty)
+                ),
                 "\"{:?}\", ",
                 applicability,
             );
@@ -311,11 +354,19 @@ impl NotLiteral<'_> {
 
 /// Records on `diag` whether the message's type implements each of the traits it was checked
 /// for.
-fn trait_facts<'db>(b: &BodyCx<'_, '_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'db>, checked: &[(&str, TraitId)]) {
+fn trait_facts<'db>(
+    b: &BodyCx<'_, '_, 'db>,
+    diag: &mut Diag,
+    arg: ExprId,
+    ty: Ty<'db>,
+    checked: &[(&str, TraitId)],
+) {
     if checked.is_empty() {
         return;
     }
-    let Some(written) = util::syntax(b, arg).and_then(|it| ast::Expr::cast(it.value)) else { return };
+    let Some(written) = util::syntax(b, arg).and_then(|it| ast::Expr::cast(it.value)) else {
+        return;
+    };
     let Some(of) = b.cx.vsema.type_of_expr(written) else { return };
     let ty = of.original.derived_from_next_solver(ty);
     let printed = b.cx.ty(&ty);
@@ -336,7 +387,10 @@ impl FmtTraits {
             for (_, module) in crate_def_map(db, krate).modules(db) {
                 for def in module.scope(db).declarations() {
                     let ModuleDefId::TraitId(it) = def else { continue };
-                    match AttrFlags::diagnostic_item(db, AttrDefId::TraitId(it)).as_ref().map(|it| it.as_str()) {
+                    match AttrFlags::diagnostic_item(db, AttrDefId::TraitId(it))
+                        .as_ref()
+                        .map(|it| it.as_str())
+                    {
                         Some("Display") => traits.display = Some(it),
                         Some("Debug") => traits.debug = Some(it),
                         _ => continue,
@@ -486,7 +540,11 @@ fn panic_call(b: &BodyCx<'_, '_, '_>, f: &At) -> Option<(At, Option<SmolStr>, St
         let Some(name) = macro_item(db, parent.loc(db).def) else { break };
         let is_panic = matches!(
             name.as_str(),
-            "core_panic_macro" | "std_panic_macro" | "assert_macro" | "debug_assert_macro" | "unreachable_macro"
+            "core_panic_macro"
+                | "std_panic_macro"
+                | "assert_macro"
+                | "debug_assert_macro"
+                | "unreachable_macro"
         );
         if !is_panic {
             break;
@@ -526,13 +584,19 @@ fn macro_item(db: &Db, def: MacroDefId) -> Option<SmolStr> {
         MacroDefKind::ProcMacro(id, ..) => id.to_view(db).attrs(),
     };
     let cfg = def.krate.cfg_options(db);
-    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
-        ast::Meta::KeyValueMeta(attr) if attr.path().is1("rustc_diagnostic_item") => match attr.value_string() {
-            Some(name) => ControlFlow::Break(name),
-            None => ControlFlow::Continue(()),
+    expand_cfg_attr_view(
+        attrs,
+        || cfg,
+        |meta, _| match meta {
+            ast::Meta::KeyValueMeta(attr) if attr.path().is1("rustc_diagnostic_item") => {
+                match attr.value_string() {
+                    Some(name) => ControlFlow::Break(name),
+                    None => ControlFlow::Continue(()),
+                }
+            }
+            _ => ControlFlow::Continue(()),
         },
-        _ => ControlFlow::Continue(()),
-    })
+    )
 }
 
 /// rustc's `is_arg_inside_call`: the argument is written inside the call, and is not spanned

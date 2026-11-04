@@ -75,8 +75,9 @@ fn check_case(trie: &[u8], case: usize) {
         let dylib = with_trie(cpu, command, trie);
         let (aligned, at) = copy_at(&dylib, 0);
         let aligned = &aligned[at..][..dylib.len()];
-        let (largest, read) =
-            blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned));
+        let (largest, read) = blaze_fuzz::largest_allocation(|| {
+            blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned)
+        });
         assert!(
             largest <= bound,
             "allocation bound: a {arch:?} read of a {}-byte trie asked for {largest} bytes at once, past {bound}",
@@ -134,7 +135,13 @@ fn name16(out: &mut Vec<u8>, name: &str) {
     out.extend_from_slice(&field);
 }
 
-fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
+fn segment(
+    name: &str,
+    vmaddr: u64,
+    fileoff: u64,
+    filesize: u64,
+    sections: &[(&str, u64, u64, u32)],
+) -> Vec<u8> {
     let mut out = Vec::new();
     u32le(&mut out, macho::LC_SEGMENT_64.0);
     u32le(&mut out, 72 + 80 * sections.len() as u32);
@@ -170,7 +177,10 @@ fn with_trie(cpu: u32, command: u32, trie: &[u8]) -> Vec<u8> {
             0x4000,
             0x4000,
             0,
-            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
+            &[
+                ("__data", 0x4000, 0x100, 0),
+                ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0),
+            ],
         ),
     ];
     let path = "/usr/lib/libfoo.dylib";
@@ -198,7 +208,16 @@ fn with_trie(cpu: u32, command: u32, trie: &[u8]) -> Vec<u8> {
     commands.push(trie_command);
 
     let mut out = Vec::new();
-    for value in [macho::MH_MAGIC_64, cpu, 0, macho::MH_DYLIB.0, commands.len() as u32, sizeofcmds as u32, 0, 0] {
+    for value in [
+        macho::MH_MAGIC_64,
+        cpu,
+        0,
+        macho::MH_DYLIB.0,
+        commands.len() as u32,
+        sizeofcmds as u32,
+        0,
+        0,
+    ] {
         u32le(&mut out, value);
     }
     for command in commands {
@@ -303,14 +322,20 @@ fn reexport(flags: u64, ordinal: u64, import: &str) -> Vec<u8> {
 fn sample_trie() -> Vec<u8> {
     let foo = Node {
         terminal: info(0, &[0x1010]),
-        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
+        children: vec![(
+            "bar",
+            leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])),
+        )],
     };
     let fo = Node {
         terminal: Vec::new(),
         children: vec![
             ("o", foo),
             ("b", leaf(reexport(0, 1, "_bob"))),
-            ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
+            (
+                "_tls",
+                leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100])),
+            ),
         ],
     };
     let underscore = Node {
@@ -361,7 +386,9 @@ fn random_node(rng: &mut Rng, depth: usize) -> Node {
     let children = if depth > 4 { 0 } else { rng.below(4) };
     Node {
         terminal: random_info(rng),
-        children: (0..children).map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1))).collect(),
+        children: (0..children)
+            .map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1)))
+            .collect(),
     }
 }
 
@@ -392,7 +419,10 @@ mod tests {
     fn sample_trie_reads() {
         for command in [macho::LC_DYLD_INFO_ONLY.0, macho::LC_DYLD_EXPORTS_TRIE.0] {
             let dylib = with_trie(macho::CPU_TYPE_ARM64.0, command, &sample_trie());
-            assert!(blaze_link::fuzz_read(Format::MachO, Arch::Aarch64, SHARED, &dylib), "command {command:#x}");
+            assert!(
+                blaze_link::fuzz_read(Format::MachO, Arch::Aarch64, SHARED, &dylib),
+                "command {command:#x}"
+            );
         }
         assert_eq!(blaze_link::fuzz_trie_differential(&sample_trie()), Ok(true));
     }

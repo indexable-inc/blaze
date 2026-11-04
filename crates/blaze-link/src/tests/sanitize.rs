@@ -10,15 +10,18 @@ use blaze_items::ItemKey;
 use object::read::elf::{Rela as _, SectionHeader as _};
 use object::write::{Object as Builder, StandardSection, Symbol as Def, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, SectionFlags, SectionKind, SymbolFlags,
-    SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, SectionFlags,
+    SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
-use super::{CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, covered, function, id, key, name, output, rel32, returns, section_of};
+use super::{
+    CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, covered, function, id, key, name,
+    output, rel32, returns, section_of,
+};
 use crate::model::Apply;
 use crate::sanitize::{
-    self, BEG, GLOBAL, HEADER, MAX_REDZONE, MIN_REDZONE, MODULE_NAME, NAME, ODR_INDICATOR, SIZE, SIZE_WITH_REDZONE,
-    instruments_section, redzone,
+    self, BEG, GLOBAL, HEADER, MAX_REDZONE, MIN_REDZONE, MODULE_NAME, NAME, ODR_INDICATOR, SIZE,
+    SIZE_WITH_REDZONE, instruments_section, redzone,
 };
 use crate::{Format, Output};
 
@@ -57,7 +60,11 @@ fn native<'a>(bytes: &'a Arc<[u8]>, kind: NativeKind) -> Native<'a> {
 /// Which of [`runtime`]'s functions is at `addr`.
 fn runtime_fn(linked: &Linked, addr: u64) -> u8 {
     let code = linked.at(addr, 6);
-    assert_eq!((code[0], &code[2..]), (0xb8, &[0, 0, 0, 0xc3][..]), "a runtime function at {addr:#x}");
+    assert_eq!(
+        (code[0], &code[2..]),
+        (0xb8, &[0, 0, 0, 0xc3][..]),
+        "a runtime function at {addr:#x}"
+    );
     code[1]
 }
 
@@ -105,12 +112,25 @@ fn entry(linked: &Linked, header: u64, n: u64) -> (u64, u64, u64) {
 
 #[test]
 fn redzones_follow_llvms_formula() {
-    for (size, zone) in [(1, 31), (8, 24), (16, 16), (17, 47), (32, 32), (100, 60), (1000, 248), (1 << 30, MAX_REDZONE)] {
+    for (size, zone) in [
+        (1, 31),
+        (8, 24),
+        (16, 16),
+        (17, 47),
+        (32, 32),
+        (100, 60),
+        (1000, 248),
+        (1 << 30, MAX_REDZONE),
+    ] {
         assert_eq!(redzone(size), zone, "the redzone after {size} bytes");
     }
     for size in 1..4096 {
         let zone = redzone(size);
-        assert_eq!((size + zone) % MIN_REDZONE, 0, "{size} bytes and their redzone end on a granule");
+        assert_eq!(
+            (size + zone) % MIN_REDZONE,
+            0,
+            "{size} bytes and their redzone end on a granule"
+        );
         assert!((MIN_REDZONE / 2..=MAX_REDZONE + MIN_REDZONE).contains(&zone), "{size}: {zone}");
     }
 }
@@ -136,7 +156,11 @@ fn asan_skips_the_sections_llvm_skips() {
     let tls = Static { thread_local: true, ..global(1, 8) };
     assert_eq!(sanitize::instrumented_static(Format::Elf, &tls), None, "a thread-local");
     let aligned = Static { align: 64, ..global(1, 8) };
-    assert_eq!(sanitize::instrumented_static(Format::Elf, &aligned), None, "aligned past a granule");
+    assert_eq!(
+        sanitize::instrumented_static(Format::Elf, &aligned),
+        None,
+        "aligned past a granule"
+    );
     let empty = Static { init: Init::Zeroed { size: 0 }, ..global(1, 8) };
     assert_eq!(sanitize::instrumented_static(Format::Elf, &empty), None, "empty");
     assert_eq!(sanitize::instrumented_static(Format::Elf, &global(1, 8)), Some(8));
@@ -154,7 +178,11 @@ fn every_constructor_field_is_inside_its_code_on_both_architectures() {
             let at = (base + field.at) as usize;
             assert!(at + width(field.apply) <= code.len(), "{what}: {field:?} past its code");
             match arch {
-                Arch::X86_64 => assert_eq!(code[at..at + 4], [0; 4], "{what}: {field:?} is an empty displacement"),
+                Arch::X86_64 => assert_eq!(
+                    code[at..at + 4],
+                    [0; 4],
+                    "{what}: {field:?} is an empty displacement"
+                ),
                 _ => assert_eq!(at % 4, 0, "{what}: {field:?} on an instruction"),
             }
         }
@@ -162,7 +190,11 @@ fn every_constructor_field_is_inside_its_code_on_both_architectures() {
     for arch in [Arch::X86_64, Arch::Aarch64] {
         let register = sanitize::register(arch).unwrap();
         check("register", register.code, register.fields, 0, arch);
-        assert_eq!(register.fields.iter().map(|it| it.target).max(), Some(1), "the array and the callee");
+        assert_eq!(
+            register.fields.iter().map(|it| it.target).max(),
+            Some(1),
+            "the array and the callee"
+        );
         let at_exit = sanitize::at_exit(arch).unwrap();
         check("at exit", at_exit.code, at_exit.fields, 0, arch);
         assert_eq!(at_exit.fields.iter().map(|it| it.target).max(), Some(4));
@@ -199,7 +231,11 @@ fn asan_registers_each_global_with_its_redzone_and_descriptor() {
     let linked = Linked::of(disk.file(TO));
     let at = linked.rel32(linked.symbol("start") + 3);
     assert_eq!(at % MIN_REDZONE, 0, "an instrumented global is aligned to a granule");
-    assert_eq!(linked.at(at, 32), [vec![10; 8], vec![0; 24]].concat(), "its bytes, then its redzone");
+    assert_eq!(
+        linked.at(at, 32),
+        [vec![10; 8], vec![0; 24]].concat(),
+        "its bytes, then its redzone"
+    );
 
     let ctor = only_pointer(&linked, ".init_array");
     let register = sanitize::register(Arch::X86_64).unwrap();
@@ -234,7 +270,10 @@ fn asan_registers_each_global_with_its_redzone_and_descriptor() {
 
 #[test]
 fn a_relink_that_adds_a_static_adds_its_descriptor() {
-    let (start, g) = (function(1, &CALLER, vec![rel32(1, Target::Function(key(2)))]), function(2, &LEA, vec![rel32(3, of(10))]));
+    let (start, g) = (
+        function(1, &CALLER, vec![rel32(1, Target::Function(key(2)))]),
+        function(2, &LEA, vec![rel32(3, of(10))]),
+    );
     let (one, two) = (global(10, 8), global(11, 40));
     let rt = runtime(&["__asan_register_globals", "__asan_unregister_globals"]);
     let mut image = Image::new(name(TO), sanitized(asan(), true)).unwrap();
@@ -287,9 +326,17 @@ fn msan_options_are_read_only_i32s_only_when_set() {
     let start = function(
         1,
         &TWO_LEAS,
-        vec![rel32(3, Target::Extern("__msan_track_origins".into())), rel32(10, Target::Extern("__msan_keep_going".into()))],
+        vec![
+            rel32(3, Target::Extern("__msan_track_origins".into())),
+            rel32(10, Target::Extern("__msan_keep_going".into())),
+        ],
     );
-    let msan = Sanitize { sanitizers: Sanitizers::MEMORY, recover: Sanitizers::MEMORY, track_origins: 2, ..Sanitize::default() };
+    let msan = Sanitize {
+        sanitizers: Sanitizers::MEMORY,
+        recover: Sanitizers::MEMORY,
+        track_origins: 2,
+        ..Sanitize::default()
+    };
     let mut image = Image::new(name(TO), sanitized(msan, false)).unwrap();
     let mut disk = Disk::default();
     let change = Change {
@@ -311,20 +358,38 @@ fn msan_options_are_read_only_i32s_only_when_set() {
             .find(|it| it.address() <= addr && addr + 4 <= it.address() + it.size())
             .unwrap_or_else(|| panic!("{addr:#x} in no section"));
         let SectionFlags::Elf { sh_flags, .. } = section.flags() else { panic!("ELF flags") };
-        assert_eq!(sh_flags & elf::SHF_WRITE, elf::SectionFlags(0), "{addr:#x} is read-only, in {:?}", section.name());
+        assert_eq!(
+            sh_flags & elf::SHF_WRITE,
+            elf::SectionFlags(0),
+            "{addr:#x} is read-only, in {:?}",
+            section.name()
+        );
     }
 
     // Each option alone: the other is the one undefined name, so the error names it whatever
     // order the symbol table's hashes put the two in.
-    let only_origins = Sanitize { sanitizers: Sanitizers::MEMORY, track_origins: 2, ..Sanitize::default() };
-    let only_recover = Sanitize { sanitizers: Sanitizers::MEMORY, recover: Sanitizers::MEMORY, ..Sanitize::default() };
-    for (sanitize, missing, defined) in
-        [(only_origins, "__msan_keep_going", "__msan_track_origins"), (only_recover, "__msan_track_origins", "__msan_keep_going")]
-    {
+    let only_origins =
+        Sanitize { sanitizers: Sanitizers::MEMORY, track_origins: 2, ..Sanitize::default() };
+    let only_recover = Sanitize {
+        sanitizers: Sanitizers::MEMORY,
+        recover: Sanitizers::MEMORY,
+        ..Sanitize::default()
+    };
+    for (sanitize, missing, defined) in [
+        (only_origins, "__msan_keep_going", "__msan_track_origins"),
+        (only_recover, "__msan_track_origins", "__msan_keep_going"),
+    ] {
         let mut image = Image::new(name(TO), sanitized(sanitize, false)).unwrap();
-        let change = Change { added: vec![&start], names: vec![("_start".into(), Target::Direct(key(1)))], ..Change::default() };
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            ..Change::default()
+        };
         let error = image.stage(change).unwrap_err();
-        assert!(error.what.contains(missing) && !error.what.contains(defined), "no option without its setting: {error}");
+        assert!(
+            error.what.contains(missing) && !error.what.contains(defined),
+            "no option without its setting: {error}"
+        );
     }
 }
 
@@ -332,8 +397,11 @@ fn msan_options_are_read_only_i32s_only_when_set() {
 fn coverage_init_calls_only_the_sections_there_are_with_their_bounds() {
     let start = covered(1, 0, 0, Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1)] });
     let rt = runtime(&["__sanitizer_cov_8bit_counters_init", "__sanitizer_cov_pcs_init"]);
-    let coverage = Coverage { level: 1, flags: Coverage::INLINE_8BIT_COUNTERS | Coverage::PC_TABLE };
-    let mut image = Image::new(name(TO), sanitized(Sanitize { coverage, ..Sanitize::default() }, false)).unwrap();
+    let coverage =
+        Coverage { level: 1, flags: Coverage::INLINE_8BIT_COUNTERS | Coverage::PC_TABLE };
+    let mut image =
+        Image::new(name(TO), sanitized(Sanitize { coverage, ..Sanitize::default() }, false))
+            .unwrap();
     let mut disk = Disk::default();
     let change = Change {
         added: vec![&start],
@@ -357,7 +425,9 @@ fn coverage_init_calls_only_the_sections_there_are_with_their_bounds() {
     }
     assert_eq!(linked.at(ctor + 1 + 19 * 2, 2), [0x58, 0xc3], "two calls, then `pop rax; ret`");
 
-    let mut image = Image::new(name(TO), sanitized(Sanitize { coverage, ..Sanitize::default() }, false)).unwrap();
+    let mut image =
+        Image::new(name(TO), sanitized(Sanitize { coverage, ..Sanitize::default() }, false))
+            .unwrap();
     let plain = function(1, &returns(0), Vec::new());
     let change = Change {
         added: vec![&plain],
@@ -380,7 +450,9 @@ fn a_runtimes_got_and_general_dynamic_tls_references_link() {
     let tls = b.section_id(StandardSection::Tls);
     let tls_at = b.append_section_data(tls, &[9; 8], 8);
     let param = "__msan_param_tls";
-    for (name, section, value, size, kind) in defs.into_iter().chain([(param, tls, tls_at, 8, SymbolKind::Tls)]) {
+    for (name, section, value, size, kind) in
+        defs.into_iter().chain([(param, tls, tls_at, 8, SymbolKind::Tls)])
+    {
         b.add_symbol(Def {
             name: name.as_bytes().to_vec(),
             value,
@@ -397,8 +469,17 @@ fn a_runtimes_got_and_general_dynamic_tls_references_link() {
 
     // `mov rax, [rip + option@GOTPCREL]; lea rdi, [rip + param@TLSGD]; ret`
     let code = [0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xc3];
-    let reloc = |at, kind, name: &str| blaze_codegen::Relocation { at, kind, target: Target::Extern(name.into()), addend: -4 };
-    let start = function(1, &code, vec![reloc(3, RelocKind::GotPcRel32, option), reloc(10, RelocKind::TlsGd32, param)]);
+    let reloc = |at, kind, name: &str| blaze_codegen::Relocation {
+        at,
+        kind,
+        target: Target::Extern(name.into()),
+        addend: -4,
+    };
+    let start = function(
+        1,
+        &code,
+        vec![reloc(3, RelocKind::GotPcRel32, option), reloc(10, RelocKind::TlsGd32, param)],
+    );
     let mut image = Image::new(name(TO), sanitized(Sanitize::default(), false)).unwrap();
     let mut disk = Disk::default();
     let change = Change {
@@ -412,13 +493,20 @@ fn a_runtimes_got_and_general_dynamic_tls_references_link() {
     let linked = Linked::of(disk.file(TO));
     let s = linked.symbol("start");
     let cell = linked.rel32(s + 3);
-    assert_eq!(linked.at(linked.u64_at(cell), 4), [7, 0, 0, 0], "the GOT cell holds the runtime's option");
+    assert_eq!(
+        linked.at(linked.u64_at(cell), 4),
+        [7, 0, 0, 0],
+        "the GOT cell holds the runtime's option"
+    );
     let pair = linked.rel32(s + 10);
     let file = linked.elf();
     let endian = file.endian();
-    let (_, rela) = file.elf_section_table().section_by_name(endian, b".rela.dyn").expect(".rela.dyn");
+    let (_, rela) =
+        file.elf_section_table().section_by_name(endian, b".rela.dyn").expect(".rela.dyn");
     let (relas, _) = rela.rela(endian, linked.bytes()).unwrap().expect("relocations");
-    let at = |offset: u64, r_type: elf::RelocationType| relas.iter().any(|it| it.r_offset(endian) == offset && it.r_type(endian, false) == r_type);
+    let at = |offset: u64, r_type: elf::RelocationType| {
+        relas.iter().any(|it| it.r_offset(endian) == offset && it.r_type(endian, false) == r_type)
+    };
     assert!(at(pair, elf::R_X86_64_DTPMOD64), "the pair's module");
     assert!(at(pair + 8, elf::R_X86_64_DTPOFF64), "the pair's offset");
 }
@@ -426,7 +514,9 @@ fn a_runtimes_got_and_general_dynamic_tls_references_link() {
 /// A GNU-format archive of `members` (name, bytes, the symbols it defines), with its symbol
 /// index.
 fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
-    let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644);
+    let header = |name: &str, size: usize| {
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+    };
     let names: Vec<&str> = members.iter().flat_map(|it| it.2.iter().copied()).collect();
     let index_len = 4 + 4 * names.len() + names.iter().map(|it| it.len() + 1).sum::<usize>();
     let mut offsets = Vec::new();

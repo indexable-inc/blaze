@@ -50,10 +50,19 @@ pub(super) fn check_fn<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
             _ => format!("counts {} of its counts in it, below `profile-cold-percent`", hit.percent()),
         };
         let span = cx.span(range);
-        cx.blaze(Lint::StaleHotMarker, at, span, format!("`fn {name}` is marked hot (`{marker}`), and profile `{file}` {counted}"))
-            .note(format!("the profile is `{}`, named in {}", loaded.settings.path.display(), loaded.settings.named_in))
-            .help(Lint::StaleHotMarker.help())
-            .help(format!("for further information visit {}", Lint::StaleHotMarker.docs_url()));
+        cx.blaze(
+            Lint::StaleHotMarker,
+            at,
+            span,
+            format!("`fn {name}` is marked hot (`{marker}`), and profile `{file}` {counted}"),
+        )
+        .note(format!(
+            "the profile is `{}`, named in {}",
+            loaded.settings.path.display(),
+            loaded.settings.named_in
+        ))
+        .help(Lint::StaleHotMarker.help())
+        .help(format!("for further information visit {}", Lint::StaleHotMarker.docs_url()));
     }
     if cx.on_blaze(Lint::HotMarkedCold)
         && hit.hot

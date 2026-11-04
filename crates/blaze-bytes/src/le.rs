@@ -52,15 +52,21 @@ mod tests {
 
     /// The checked copies (`syntax`, `syntax-tree`, `base-db`'s `trees.rs`).
     fn old_get_u32(bytes: &[u8], at: usize) -> Option<u32> {
-        Some(std::primitive::u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+        Some(std::primitive::u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
     }
 
     fn old_get_u16(bytes: &[u8], at: usize) -> Option<u16> {
-        Some(std::primitive::u16::from_le_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?))
+        Some(std::primitive::u16::from_le_bytes(
+            bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+        ))
     }
 
     fn old_get_u64(bytes: &[u8], at: usize) -> Option<u64> {
-        Some(std::primitive::u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?))
+        Some(std::primitive::u64::from_le_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
     }
 
     #[test]
@@ -86,7 +92,10 @@ mod tests {
     fn a_u128_is_two_u64s() {
         let bytes: Vec<u8> = (0..16).collect();
         let (low, high) = (u64(&bytes, 0), u64(&bytes, 8));
-        assert_eq!(u128(&bytes, 0), std::primitive::u128::from(low) | std::primitive::u128::from(high) << 64);
+        assert_eq!(
+            u128(&bytes, 0),
+            std::primitive::u128::from(low) | std::primitive::u128::from(high) << 64
+        );
         assert_eq!(get_u128(&bytes, 1), None);
     }
 

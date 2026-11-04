@@ -110,10 +110,17 @@ fn read_frames(mut from: impl Read, frames: &[&[u8]], end: &End, allowed: usize)
     let mut read = 0;
     let ended = loop {
         let (most, next) = blaze_fuzz::largest_allocation(|| blaze_protocol::read_frame(&mut from));
-        assert!(most <= allowed, "a read of a frame asked for {most} bytes at once, past {allowed}");
+        assert!(
+            most <= allowed,
+            "a read of a frame asked for {most} bytes at once, past {allowed}"
+        );
         match next {
             Ok(Some(item)) => {
-                assert_eq!(frames.get(read), Some(&&item[..]), "read_frame reads the frames there are");
+                assert_eq!(
+                    frames.get(read),
+                    Some(&&item[..]),
+                    "read_frame reads the frames there are"
+                );
                 read += 1;
             }
             Ok(None) => break End::Clean,
@@ -131,10 +138,17 @@ fn read_frames_into(mut from: impl Read, frames: &[&[u8]], end: &End, allowed: u
         let (most, next) = blaze_fuzz::largest_allocation(|| {
             blaze_protocol::read_frame_into(&mut from, &mut item)
         });
-        assert!(most <= allowed, "a read of a frame asked for {most} bytes at once, past {allowed}");
+        assert!(
+            most <= allowed,
+            "a read of a frame asked for {most} bytes at once, past {allowed}"
+        );
         match next {
             Ok(true) => {
-                assert_eq!(frames.get(read), Some(&&item[..]), "read_frame_into reads the frames there are");
+                assert_eq!(
+                    frames.get(read),
+                    Some(&&item[..]),
+                    "read_frame_into reads the frames there are"
+                );
                 read += 1;
             }
             Ok(false) => break End::Clean,
@@ -165,13 +179,25 @@ fn check_case(data: &[u8], case: usize) {
     for frame in &frames {
         let received = blaze_protocol::receive::<Message<IgnoredAny>>(&mut from);
         match (received, cbor::from_slice::<Message<IgnoredAny>>(frame)) {
-            (Ok(Some(message)), Ok(decoded)) => assert_eq!(message, decoded, "receive reads what from_slice does"),
-            (Err(error), Err(decoded)) => {
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "receive refuses an item as InvalidData");
-                let inner = error.get_ref().and_then(|it| it.downcast_ref::<cbor::Error>());
-                assert_eq!(inner, Some(&decoded), "receive refuses an item with the decoder's error");
+            (Ok(Some(message)), Ok(decoded)) => {
+                assert_eq!(message, decoded, "receive reads what from_slice does")
             }
-            (received, decoded) => panic!("receive gave {received:?} where from_slice gave {decoded:?}"),
+            (Err(error), Err(decoded)) => {
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData,
+                    "receive refuses an item as InvalidData"
+                );
+                let inner = error.get_ref().and_then(|it| it.downcast_ref::<cbor::Error>());
+                assert_eq!(
+                    inner,
+                    Some(&decoded),
+                    "receive refuses an item with the decoder's error"
+                );
+            }
+            (received, decoded) => {
+                panic!("receive gave {received:?} where from_slice gave {decoded:?}")
+            }
         }
     }
     match blaze_protocol::receive::<IgnoredAny>(&mut from) {
@@ -182,7 +208,8 @@ fn check_case(data: &[u8], case: usize) {
 
     let mut written = Vec::new();
     for frame in &frames {
-        blaze_protocol::write_frame(&mut written, frame).expect("a frame that was read can be written");
+        blaze_protocol::write_frame(&mut written, frame)
+            .expect("a frame that was read can be written");
     }
     assert_eq!(written, data[..written.len()], "write_frame writes back the frames read");
 }
@@ -191,10 +218,12 @@ fn check_case(data: &[u8], case: usize) {
 fn seeds() -> Vec<Vec<u8>> {
     let mut stream = Vec::new();
     blaze_protocol::send(&mut stream, &Message::new(1, "Status")).expect("a message has a frame");
-    blaze_protocol::send(&mut stream, &Message::new(2, vec![1u64, 2, 3])).expect("a message has a frame");
+    blaze_protocol::send(&mut stream, &Message::new(2, vec![1u64, 2, 3]))
+        .expect("a message has a frame");
     blaze_protocol::send(&mut stream, &Message::new(u64::MAX, ())).expect("a message has a frame");
     let mut big = Vec::new();
-    blaze_protocol::send(&mut big, &Message::new(3, "x".repeat(300))).expect("a message has a frame");
+    blaze_protocol::send(&mut big, &Message::new(3, "x".repeat(300)))
+        .expect("a message has a frame");
     let mut wrong = Vec::new();
     blaze_protocol::write_frame(&mut wrong, &[0x18, 0x01]).expect("a frame of two bytes");
     let mut seeds = vec![Vec::new(), stream.clone(), big, wrong];

@@ -8,16 +8,16 @@
 //! as a rank per node. Edges are collected flat while building and laid out once as CSR per
 //! node and edge kind, sorted by rank and deduplicated in the same pass.
 
-use std::cmp::Ordering;
 use blaze_hash::hash_map::Entry;
+use std::cmp::Ordering;
 use std::ops::Range;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_resolve::resolver::{CliFeatures, CompileKind, FeaturesFor, ResolvedFeatures};
 use blaze_resolve::{
     DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary,
 };
+use std::alloc::Global;
 
 use super::packages::{Pkg, Table};
 use super::{Kinds, Options, Target};
@@ -227,14 +227,20 @@ impl<'a> Graph<'a> {
             raw: Vec::with_capacity(edges),
             sorted: Vec::with_capacity(edges),
             counts: Vec::with_capacity(TAGS * nodes + 1),
-            edges: Edges { offsets: Vec::with_capacity(TAGS * nodes + 1), targets: Vec::with_capacity(edges) },
+            edges: Edges {
+                offsets: Vec::with_capacity(TAGS * nodes + 1),
+                targets: Vec::with_capacity(edges),
+            },
             cli_features: Bits::new(if graph_features { nodes } else { 0 }),
             graph_features,
             dep_ranges: Vec::with_capacity(if graph_features { nodes } else { 0 }),
             dep_names: Vec::with_capacity(names),
             slots,
             stride,
-            feature_index: HashMap::with_capacity_in(if graph_features { nodes } else { 0 }, Global),
+            feature_index: HashMap::with_capacity_in(
+                if graph_features { nodes } else { 0 },
+                Global,
+            ),
             live: None,
         }
     }
@@ -310,7 +316,13 @@ impl<'a> Graph<'a> {
     /// Adds a feature node between two nodes, `from -tag-> name -feature-> to`.
     ///
     /// Returns `(missing, index)`: whether the feature node is new, and its index.
-    fn add_feature(&mut self, name: InternedString, from: Option<NodeId>, tag: Tag, to: Edge) -> (bool, NodeId) {
+    fn add_feature(
+        &mut self,
+        name: InternedString,
+        from: Option<NodeId>,
+        tag: Tag,
+        to: Edge,
+    ) -> (bool, NodeId) {
         // `to` *must* point to a package node.
         assert!(matches!(self.node(to.node()), Node::Package { .. }));
         let next = NodeId(self.nodes.len() as u32);
@@ -426,16 +438,24 @@ impl<'a> Graph<'a> {
     /// Cargo's order of two package nodes of the same package.
     fn package_cmp(&self, a: NodeId, b: NodeId, kinds: &Kinds) -> Ordering {
         match (self.node(a), self.node(b)) {
-            (Node::Package { features: fa, kind: ka, .. }, Node::Package { features: fb, kind: kb, .. }) => {
-                self.features(fa).cmp(self.features(fb)).then_with(|| kinds.cmp_kinds(ka, kb))
-            }
+            (
+                Node::Package { features: fa, kind: ka, .. },
+                Node::Package { features: fb, kind: kb, .. },
+            ) => self.features(fa).cmp(self.features(fb)).then_with(|| kinds.cmp_kinds(ka, kb)),
             _ => unreachable!("a feature node among the packages"),
         }
     }
 
     /// Lays `raw` out as [`Edges`].
     fn lay_out(&mut self) {
-        lay_out(self.nodes.len(), &self.rank, &mut self.raw, &mut self.sorted, &mut self.counts, &mut self.edges);
+        lay_out(
+            self.nodes.len(),
+            &self.rank,
+            &mut self.raw,
+            &mut self.sorted,
+            &mut self.counts,
+            &mut self.edges,
+        );
     }
 
     /// Lays the graph's edges out again, each `from -> to` of a node `keep` keeps, turned
@@ -451,7 +471,11 @@ impl<'a> Graph<'a> {
                 for &to in &self.edges.targets[self.edges.range(from, tag..tag + 1)] {
                     self.raw.push(match invert {
                         false => Raw { from, to, tag: tag as Tag },
-                        true => Raw { from: to.node(), to: Edge::new(from, to.public()), tag: tag as Tag },
+                        true => Raw {
+                            from: to.node(),
+                            to: Edge::new(from, to.public()),
+                            tag: tag as Tag,
+                        },
                     });
                 }
             }
@@ -530,9 +554,10 @@ impl<'a> Graph<'a> {
         let run = &dupes[start..];
         let more = match (run.first(), run.last()) {
             (Some(&first), Some(&last)) => match (self.node(first), self.node(last)) {
-                (Node::Package { pkg: a, features: fa, .. }, Node::Package { pkg: b, features: fb, .. }) => {
-                    a != b || self.features(fa) != self.features(fb)
-                }
+                (
+                    Node::Package { pkg: a, features: fa, .. },
+                    Node::Package { pkg: b, features: fb, .. },
+                ) => a != b || self.features(fa) != self.features(fb),
                 _ => unreachable!("a feature node among the packages"),
             },
             _ => false,
@@ -555,7 +580,13 @@ fn lay_out(
     edges: &mut Edges,
 ) {
     let groups = len * TAGS;
-    counting_sort(raw, sorted, 2 * len, |it| rank[it.to.node().index()] as usize * 2 + it.to.public() as usize, counts);
+    counting_sort(
+        raw,
+        sorted,
+        2 * len,
+        |it| rank[it.to.node().index()] as usize * 2 + it.to.public() as usize,
+        counts,
+    );
     counting_sort(sorted, raw, groups, Raw::group, counts);
     edges.offsets.clear();
     edges.offsets.resize(groups + 1, 0);
@@ -576,7 +607,13 @@ fn lay_out(
 }
 
 /// A stable counting sort of `src` into `dst` by `key`, which is under `buckets`.
-fn counting_sort(src: &[Raw], dst: &mut Vec<Raw>, buckets: usize, key: impl Fn(Raw) -> usize, counts: &mut Vec<u32>) {
+fn counting_sort(
+    src: &[Raw],
+    dst: &mut Vec<Raw>,
+    buckets: usize,
+    key: impl Fn(Raw) -> usize,
+    counts: &mut Vec<u32>,
+) {
     counts.clear();
     counts.resize(buckets + 1, 0);
     for &it in src {
@@ -678,7 +715,9 @@ impl<'g> Builder<'g, '_> {
         let package_id = self.graph.packages.id(pkg);
         // Written into the pool in place, and taken back off it when the node is another's.
         let start = self.graph.features.len();
-        self.graph.features.extend(self.resolved_features.activated_features_iter(package_id, features_for));
+        self.graph
+            .features
+            .extend(self.resolved_features.activated_features_iter(package_id, features_for));
         if node_kind == Kind::HOST {
             // A package built for the host as a host dependency and as a normal one is one
             // node when its features are the same.
@@ -693,7 +732,8 @@ impl<'g> Builder<'g, '_> {
                 return same;
             }
         }
-        let features = Span { start: start as u32, len: (self.graph.features.len() - start) as u32 };
+        let features =
+            Span { start: start as u32, len: (self.graph.features.len() - start) as u32 };
         let from_index = self.graph.add_node(Node::Package { pkg, kind: node_kind, features });
         self.graph.slots[slot] = from_index;
 
@@ -709,7 +749,9 @@ impl<'g> Builder<'g, '_> {
         }
         // Each package's dependencies in order, those of one package by kind and name.
         self.deps[deps_start..].sort_unstable_by(|(a, x), (b, y)| {
-            a.cmp(b).then_with(|| x.kind().cmp(&y.kind())).then_with(|| x.name_in_toml().cmp(&y.name_in_toml()))
+            a.cmp(b)
+                .then_with(|| x.kind().cmp(&y.kind()))
+                .then_with(|| x.name_in_toml().cmp(&y.name_in_toml()))
         });
         let deps_end = self.deps.len();
         let names_start = self.pending.len();
@@ -720,7 +762,9 @@ impl<'g> Builder<'g, '_> {
             // dependencies for the dependent's platform, build dependencies for the host.
             let dep_features_for = match features_for {
                 FeaturesFor::HostDep => FeaturesFor::HostDep,
-                FeaturesFor::NormalOrDev if dep.is_build() || self.graph.packages.any_proc_macro(dep_pkg) => {
+                FeaturesFor::NormalOrDev
+                    if dep.is_build() || self.graph.packages.any_proc_macro(dep_pkg) =>
+                {
                     FeaturesFor::HostDep
                 }
                 FeaturesFor::NormalOrDev => FeaturesFor::NormalOrDev,
@@ -730,7 +774,11 @@ impl<'g> Builder<'g, '_> {
             let new_edge = Edge::new(dep_index, dep.is_public());
             if self.graph.graph_features {
                 // Add the dependency node with feature nodes in-between.
-                self.pending.push(DepName { name: dep.name_in_toml(), node: dep_index, optional: dep.is_optional() });
+                self.pending.push(DepName {
+                    name: dep.name_in_toml(),
+                    node: dep_index,
+                    optional: dep.is_optional(),
+                });
                 if dep.uses_default_features() {
                     self.graph.add_feature(self.default, Some(from_index), tag, new_edge);
                 }
@@ -767,7 +815,9 @@ impl<'g> Builder<'g, '_> {
             (_, DepKind::Normal | DepKind::Development) => node_kind,
         };
         // Filter out inactivated targets.
-        if !self.show_all_targets && !dep.platform().is_none_or(|platform| self.kinds.activated_kind(platform, kind)) {
+        if !self.show_all_targets
+            && !dep.platform().is_none_or(|platform| self.kinds.activated_kind(platform, kind))
+        {
             return false;
         }
         if self.edge_mask & (1 << dep_tag(dep.kind())) == 0 {
@@ -780,12 +830,18 @@ impl<'g> Builder<'g, '_> {
             return false;
         }
         // An optional dependency the feature resolver does not enable is not used.
-        !dep.is_optional() || self.resolved_features.is_dep_activated(package_id, features_for, dep.name_in_toml())
+        !dep.is_optional()
+            || self.resolved_features.is_dep_activated(package_id, features_for, dep.name_in_toml())
     }
 
     /// Adds nodes for the features the command line asks of the member, as roots: they come
     /// from the outside world, and usually only appear with `--invert`.
-    fn add_cli_features(&mut self, package_index: NodeId, cli_features: &CliFeatures, feature_map: &FeatureMap) {
+    fn add_cli_features(
+        &mut self,
+        package_index: NodeId,
+        cli_features: &CliFeatures,
+        feature_map: &FeatureMap,
+    ) {
         // Recursive enabling of features is handled by add_internal_features. Sorted and
         // deduplicated, as cargo's `BTreeSet` of them.
         let mut values = std::mem::take(&mut self.values);
@@ -815,7 +871,8 @@ impl<'g> Builder<'g, '_> {
                         let DepName { node: dep_index, optional, .. } = self.graph.dep_names[i];
                         if optional {
                             // Activate the optional dep on self.
-                            let index = self.graph.add_feature(dep_name, None, FEATURE, to_package).1;
+                            let index =
+                                self.graph.add_feature(dep_name, None, FEATURE, to_package).1;
                             self.graph.cli_features.insert_growing(index.index());
                         }
                         let dep_edge = Edge::new(dep_index, true);
@@ -842,7 +899,13 @@ impl<'g> Builder<'g, '_> {
 
     /// Recursively add feature nodes for all features enabled by the given feature. `from` is
     /// the node that enables it, `package_index` the package node it is of.
-    fn add_feature_rec(&mut self, feature_name: InternedString, package_id: PackageId, from: NodeId, package_index: NodeId) {
+    fn add_feature_rec(
+        &mut self,
+        feature_name: InternedString,
+        package_id: PackageId,
+        from: NodeId,
+        package_index: NodeId,
+    ) {
         let resolve = self.resolve;
         let feature_map = resolve.summary(package_id).features();
         let Some(fvs) = feature_map.get(&feature_name) else {
@@ -852,7 +915,8 @@ impl<'g> Builder<'g, '_> {
         for fv in fvs {
             match *fv {
                 FeatureValue::Feature(dep_name) => {
-                    let (missing, feat_index) = self.graph.add_feature(dep_name, Some(from), FEATURE, to_package);
+                    let (missing, feat_index) =
+                        self.graph.add_feature(dep_name, Some(from), FEATURE, to_package);
                     // Don't recurse if the edge already exists, to deal with cycles.
                     if missing {
                         self.add_feature_rec(dep_name, package_id, feat_index, package_index);
@@ -872,7 +936,8 @@ impl<'g> Builder<'g, '_> {
                             self.graph.add_feature(dep_name, Some(from), FEATURE, to_package);
                         }
                         let dep_edge = Edge::new(dep_index, true);
-                        let (missing, feat_index) = self.graph.add_feature(dep_feature, Some(from), FEATURE, dep_edge);
+                        let (missing, feat_index) =
+                            self.graph.add_feature(dep_feature, Some(from), FEATURE, dep_edge);
                         if missing {
                             self.add_feature_rec(dep_feature, dep_pkg_id, feat_index, dep_index);
                         }

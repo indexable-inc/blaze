@@ -11,7 +11,6 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
 use hir_def::{
@@ -32,6 +31,7 @@ use hir_ty::{
 };
 use parking_lot::Mutex;
 use rustc_type_ir::fast_reject::SimplifiedType;
+use std::alloc::Global;
 
 use crate::{
     reads::{self, RULES, Rule},
@@ -98,7 +98,9 @@ fn items_fact(fact: Fact) -> FactRef {
     let (subject, object) = match fact {
         Fact::Method { self_ty, name } => (self_ty.0, FactObject::Id(name.0)),
         Fact::Implements { trait_, self_ty } => (trait_.0, FactObject::Id(self_ty.0)),
-        Fact::Signature(it) | Fact::ConstValue(it) | Fact::AutoTraits(it) => (it.0, FactObject::None),
+        Fact::Signature(it) | Fact::ConstValue(it) | Fact::AutoTraits(it) => {
+            (it.0, FactObject::None)
+        }
         other => panic!("no test builds a {other:?}"),
     };
     FactRef { kind: fact.kind(), subject, object }
@@ -126,8 +128,10 @@ const PRELUDE: &str = "//- minicore: sized, copy, clone, add, send, sync\n";
 fn check(pairs: &[Pair]) {
     for pair in pairs {
         // alloc: test fixtures, once per pair.
-        let (before, after) =
-            (db_of(&format!("{PRELUDE}{}", pair.before)), db_of(&format!("{PRELUDE}{}", pair.after)));
+        let (before, after) = (
+            db_of(&format!("{PRELUDE}{}", pair.before)),
+            db_of(&format!("{PRELUDE}{}", pair.after)),
+        );
         let fact = (pair.of)(&before);
         let was = values::value(&before, local_crate(&before), fact);
         let is = values::value(&after, local_crate(&after), (pair.of)(&after));
@@ -347,7 +351,12 @@ fn items_facts_change_through_value() {
                     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
                     pub struct S; impl T for S { fn f(&self) -> I { I } }",
             changes: true,
-            of: |db| items_fact(Fact::Signature(key::item_key(db, ItemId::Function(impl_method(db, "f"))))),
+            of: |db| {
+                items_fact(Fact::Signature(key::item_key(
+                    db,
+                    ItemId::Function(impl_method(db, "f")),
+                )))
+            },
         },
         Pair {
             what: "the impl method's hidden type changed, the trait's `impl Trait` as written",
@@ -356,7 +365,12 @@ fn items_facts_change_through_value() {
             after: "pub trait T { fn f(&self) -> impl Sized; }\n\
                     pub struct S; impl T for S { fn f(&self) -> impl Sized { 1u16 } }",
             changes: false,
-            of: |db| items_fact(Fact::Signature(key::item_key(db, ItemId::Function(impl_method(db, "f"))))),
+            of: |db| {
+                items_fact(Fact::Signature(key::item_key(
+                    db,
+                    ItemId::Function(impl_method(db, "f")),
+                )))
+            },
         },
         Pair {
             what: "an opaque type's hidden type changed, still Send",
@@ -371,9 +385,14 @@ fn items_facts_change_through_value() {
 #[test]
 fn a_fact_of_this_crates_kind_that_names_nothing_has_no_value() {
     let db = db_of("pub struct S;");
-    let unused = FactRef { kind: blaze_query::QueryKind(0x180f), subject: ContentId([1; 32]), object: FactObject::None };
+    let unused = FactRef {
+        kind: blaze_query::QueryKind(0x180f),
+        subject: ContentId([1; 32]),
+        object: FactObject::None,
+    };
     assert_eq!(values::value(&db, local_crate(&db), unused), None);
-    let with_object = FactRef { object: FactObject::Field(0), ..values::fields(&db, named(&db, "S")) };
+    let with_object =
+        FactRef { object: FactObject::Field(0), ..values::fields(&db, named(&db, "S")) };
     assert_eq!(values::value(&db, local_crate(&db), with_object), None);
     let gone = FactRef { subject: ContentId([2; 32]), ..values::fields(&db, named(&db, "S")) };
     assert_eq!(values::value(&db, local_crate(&db), gone), Some(values::absent(kinds::FIELDS)));
@@ -525,7 +544,11 @@ struct Seen {
 impl BodyFacts for Probe {
     fn identity(&self, _: &Db, def: DefWithBodyId) -> Option<ContentId> {
         // alloc: test identity, once per lookup.
-        Some(Hasher::new("blaze v2 item-hash classify test").part(format!("{def:?}").as_bytes()).finish())
+        Some(
+            Hasher::new("blaze v2 item-hash classify test")
+                .part(format!("{def:?}").as_bytes())
+                .finish(),
+        )
     }
 
     fn classify(
@@ -550,7 +573,12 @@ impl BodyFacts for Probe {
         crate::keys::def_key(db, body, def)
     }
 
-    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>> {
         crate::keys::def_of(db, body, key)
     }
 }
@@ -581,9 +609,14 @@ impl ImageStore for Memory {
 fn steps_seen() -> (Db, Vec<Seen>) {
     let db = db_of(STEPS);
     let probe = Arc::new(Probe { seen: Mutex::default() });
-    let installed =
-        body_store::install(&db, Arc::new(Memory::default()), probe.clone(), ContentId([7; 32]), Mode::Serve)
-            .expect("an item store for the test database");
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
     let bodies = crate_body_owners(&db, local_crate(&db));
     for &def in &bodies {
         let _ = InferenceResult::of(&db, def);
@@ -622,8 +655,10 @@ fn every_read_of_the_steps_is_covered_a_fact_or_a_listed_refusal() {
 #[test]
 fn a_read_the_table_names_by_name_is_found_by_its_file() {
     let (db, seen) = steps_seen();
-    let named: Vec<&Seen> =
-        seen.iter().filter(|it| RULES.iter().any(|&(name, _, _)| reads::cmp_listed(name, it.name).is_eq())).collect();
+    let named: Vec<&Seen> = seen
+        .iter()
+        .filter(|it| RULES.iter().any(|&(name, _, _)| reads::cmp_listed(name, it.name).is_eq()))
+        .collect();
     assert!(!named.is_empty(), "no read of the steps is of an ingredient the table names");
     for it in named {
         assert!(
@@ -643,13 +678,21 @@ fn leak_reads_are_lane_items_facts() {
     for it in &seen {
         let want = match it.name {
             "rpit_hidden_types" | "tait_hidden_types" => Some(blaze_items::kinds::HIDDEN_TYPES),
-            "const_eval_static_query" | "const_eval_discriminant_variant" => Some(blaze_items::kinds::CONST_VALUE),
+            "const_eval_static_query" | "const_eval_discriminant_variant" => {
+                Some(blaze_items::kinds::CONST_VALUE)
+            }
             _ => None,
         };
         if let Some(kind) = want {
-            let Classified::Fact(fact) = it.class else { panic!("{}: {:?}, not a fact", it.name, it.class) };
+            let Classified::Fact(fact) = it.class else {
+                panic!("{}: {:?}, not a fact", it.name, it.class)
+            };
             assert_eq!(fact.kind, kind, "{}", it.name);
-            assert!(values::value(&db, local_crate(&db), fact).is_some(), "{}: {fact:?} has a value", it.name);
+            assert!(
+                values::value(&db, local_crate(&db), fact).is_some(),
+                "{}: {fact:?} has a value",
+                it.name
+            );
         }
         if it.name == "fact_value" {
             assert!(matches!(it.class, Classified::Fact(_)), "fact_value: {:?}", it.class);
@@ -822,7 +865,8 @@ fn classifying_again_allocates_nothing() {
 
 #[test]
 fn hashing_this_crates_facts_again_allocates_nothing() {
-    let db = db_of(&format!("{PRELUDE}{}", "pub struct S { pub a: u32 } pub trait T { fn m(&self); }"));
+    let db =
+        db_of(&format!("{PRELUDE}{}", "pub struct S { pub a: u32 } pub trait T { fn m(&self); }"));
     let facts = [
         values::fields(&db, named(&db, "S")),
         values::fields(&db, named(&db, "T")),

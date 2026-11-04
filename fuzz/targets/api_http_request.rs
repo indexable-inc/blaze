@@ -64,7 +64,11 @@ fn drain(parser: &mut RequestParser, requests: &mut Vec<HttpRequest>) -> Option<
             Ok(Some(request)) => requests.push(request),
             Ok(None) => return None,
             Err(error) => {
-                assert_eq!(parser.next(), Err(error.clone()), "a failed parser gives its error again");
+                assert_eq!(
+                    parser.next(),
+                    Err(error.clone()),
+                    "a failed parser gives its error again"
+                );
                 return Some(error);
             }
         }
@@ -86,7 +90,11 @@ fn parse_bytewise(data: &[u8], most_body: usize) -> (Vec<HttpRequest>, Option<Ht
         parser.push(&data[at..at + 1]);
         if let Some(error) = drain(&mut parser, &mut requests) {
             parser.push(&data[at + 1..]);
-            assert_eq!(parser.next(), Err(error.clone()), "a failed parser stays failed past a push");
+            assert_eq!(
+                parser.next(),
+                Err(error.clone()),
+                "a failed parser stays failed past a push"
+            );
             return (requests, Some(error));
         }
     }
@@ -109,14 +117,21 @@ fn well_formed(request: &HttpRequest, most_body: usize) {
         request.path
     );
     for (name, value) in &request.headers {
-        assert!(!name.is_empty() && name.bytes().all(is_tchar), "a header name is a token: {name:?}");
+        assert!(
+            !name.is_empty() && name.bytes().all(is_tchar),
+            "a header name is a token: {name:?}"
+        );
         assert!(!value.contains(['\r', '\n']), "a header value is on one line: {value:?}");
         assert!(
             !value.starts_with([' ', '\t']) && !value.ends_with([' ', '\t']),
             "a header value is trimmed: {value:?}"
         );
     }
-    assert!(request.body.len() <= most_body, "a body of {} bytes past the bound of {most_body}", request.body.len());
+    assert!(
+        request.body.len() <= most_body,
+        "a body of {} bytes past the bound of {most_body}",
+        request.body.len()
+    );
 }
 
 /// `request` written again by `http::request` parses back to it, alone.
@@ -159,7 +174,11 @@ fn check(data: &[u8]) {
 fn check_case(data: &[u8], case: usize) {
     let most_body = BODIES[case];
     let (most, (requests, error)) = blaze_fuzz::largest_allocation(|| parse_whole(data, most_body));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "parsing {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "parsing {} bytes asked for {most} at once",
+        data.len()
+    );
     let (bytewise, bytewise_error) = parse_bytewise(data, most_body);
     assert_eq!(bytewise, requests, "a byte at a time the parser gives the same requests");
     assert_eq!(bytewise_error, error, "a byte at a time the parser fails alike");

@@ -136,18 +136,19 @@ fn format_project<T: FormatHandler>(
     };
 
     let mut context = FormatContext::new(&krate, report, psess, config, handler);
-    let files = modules::ModResolver::new(
+    let (files, unresolved) = modules::ModResolver::new(
         &context.psess,
         directory_ownership.unwrap_or(DirectoryOwnership::UnownedViaBlock),
         !input_is_stdin && !config.skip_children(),
     )
-    .visit_crate(&krate)?
-    .into_iter()
-    .filter(|(path, module)| {
-        input_is_stdin
-            || !should_skip_module(config, &context, input_is_stdin, &main_file, path, module)
-    })
-    .collect::<Vec<_>>();
+    .visit_crate(&krate);
+    let files = files
+        .into_iter()
+        .filter(|(path, module)| {
+            input_is_stdin
+                || !should_skip_module(config, &context, input_is_stdin, &main_file, path, module)
+        })
+        .collect::<Vec<_>>();
 
     timer = timer.done_parsing();
 
@@ -162,6 +163,12 @@ fn format_project<T: FormatHandler>(
         context.format_file(path, &module, is_macro_def)?;
     }
     timer = timer.done_formatting();
+
+    // blaze: the modules that resolved are formatted; each that did not is an error naming its
+    // `mod` and the file it points at, all of them at once.
+    if let Some(unresolved) = unresolved {
+        return Err(ErrorKind::ModuleResolutionError(unresolved));
+    }
 
     should_emit_verbose(input_is_stdin, config, || {
         println!(
