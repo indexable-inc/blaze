@@ -157,8 +157,9 @@ pub struct Link {
     /// The write half of each attach stream, by session id.
     streams: Arc<Mutex<HashMap<u64, (u64, UnixStream)>>>,
     poke: Sender<()>,
-    /// The run output being followed: a generation its reader threads check, so a new watch ends the old one.
-    run_watch: Arc<AtomicU64>,
+    /// The run outputs being followed, by (run, stage): a generation each one's reader threads check, so an unwatch (or a
+    /// new watch of the same output) ends the old readers.
+    run_watch: Arc<Mutex<HashMap<(u64, Option<u32>), u64>>>,
 }
 
 impl Link {
@@ -302,16 +303,20 @@ impl Link {
     }
 
     /// Follow run `r{run}`'s output (its stage `stage`, or the caller-visible streams) from the start, read-only, until
-    /// the run is done and read to the end, or another watch (or [`Link::unwatch_run`]) replaces it. One thread
+    /// the run is done and read to the end, or [`Link::unwatch_run`] (or another watch of it) ends it. Each pane that
+    /// shows a run has its own watch. One thread
     /// long-polls `run_read` with stream "ordered" (stdout and stderr in the order they were written, from the daemon's
     /// chunk index); a run from before the index (or an older daemon) is read as two streams, each on its own thread.
     pub fn watch_run(&self, run: u64, stage: Option<u32>) {
-        let generation = self.run_watch.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, wake, current) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
+        static GEN: AtomicU64 = AtomicU64::new(1);
+        let generation = GEN.fetch_add(1, Ordering::Relaxed);
+        self.run_watch.lock().unwrap().insert((run, stage), generation);
+        let (tx, wake, watches) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
+        let current = move || watches.lock().unwrap().get(&(run, stage)) == Some(&generation);
         std::thread::Builder::new()
             .name(format!("harness-run-r{run}"))
             .spawn(move || {
-                let live = || current.load(Ordering::Relaxed) == generation;
+                let live = || current();
                 let send = |err: bool, data: &str| {
                     if !data.is_empty() {
                         let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
@@ -328,7 +333,7 @@ impl Link {
                 let err_side = {
                     let (tx, wake, current) = (tx.clone(), wake.clone(), current.clone());
                     std::thread::spawn(move || {
-                        follow(run, stage, "err", &|| current.load(Ordering::Relaxed) == generation, |v| {
+                        follow(run, stage, "err", &current, |v| {
                             let data = v["data"].as_str().unwrap_or("");
                             if !data.is_empty() {
                                 let _ = tx.send(Msg::RunData { run, stage, err: true, bytes: data.as_bytes().to_vec() });
@@ -343,9 +348,9 @@ impl Link {
             .expect("run reader thread");
     }
 
-    /// Stop following run output.
-    pub fn unwatch_run(&self) {
-        self.run_watch.fetch_add(1, Ordering::Relaxed);
+    /// Stop following run `r{run}`'s output (of its stage `stage`).
+    pub fn unwatch_run(&self, run: u64, stage: Option<u32>) {
+        self.run_watch.lock().unwrap().remove(&(run, stage));
     }
 
     pub fn kill(&self, id: u64) {

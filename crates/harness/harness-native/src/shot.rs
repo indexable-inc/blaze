@@ -16,9 +16,11 @@ pub fn run(path: &str) -> Result<(), String> {
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
-    // A session id, or a run (`r12`) or one of its stages (`r12.0`).
+    // A session id, a run (`r12`) or one of its stages (`r12.0`), or a group of runs by its key (`g:repl:<id>`, `g:other`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
-        if let Some(run) = s.strip_prefix('r') {
+        if let Some(key) = s.strip_prefix("g:") {
+            app.select_group(key);
+        } else if let Some(run) = s.strip_prefix('r') {
             let (n, k) = run.split_once('.').map_or((run, None), |(n, k)| (n, k.parse().ok()));
             if let Ok(n) = n.parse() {
                 app.select_run(n, k);
@@ -26,6 +28,14 @@ pub fn run(path: &str) -> Result<(), String> {
         } else if let Ok(sid) = s.parse() {
             app.select_session(sid);
         }
+    }
+    // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
+    // bar and its subtitle show; HARNESS_NATIVE_SHOT_UNFOCUSED: drawn as a window that is not key (the title dimmed).
+    if let Some(c) = std::env::var("HARNESS_NATIVE_SHOT_CHROME").ok().map(|s| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 2) {
+        app.set_chrome(crate::app::Chrome { strip: c[0], title_x: c[1] });
+    }
+    if std::env::var_os("HARNESS_NATIVE_SHOT_UNFOCUSED").is_some() {
+        app.focused = false;
     }
     // HARNESS_NATIVE_SHOT_ZOOM: steps of cmd-= (negative: cmd--) from the default zoom.
     let zoom: i32 = std::env::var("HARNESS_NATIVE_SHOT_ZOOM").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
