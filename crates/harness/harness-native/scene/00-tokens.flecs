@@ -120,7 +120,7 @@ export const tone_select = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
-export const tone_seam = Fill: {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.08}}
+export const tone_seam = Fill: {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
 // Nothing: a node that paints no fill.
 export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.
