@@ -78,7 +78,11 @@ fn variations_of(font: &SystemFont, size: f32) -> Vec<Variation> {
 /// The instance `system` is shaped as, read on first use; none when its tables cannot be read.
 fn instance(fonts: &mut super::Fonts, system: &SystemFont) -> Option<Rc<Instance>> {
     let id = fonts.register(system);
-    let key = (id, system.features());
+    let mut feats = system.features();
+    if fonts.look.plain {
+        feats.extend([(u32::from_be_bytes(*b"liga"), 0), (u32::from_be_bytes(*b"calt"), 0)]);
+    }
+    let key = (id, feats);
     if let Some(i) = fonts.shaper.instances.get(&key) {
         return i.clone();
     }

@@ -11,6 +11,10 @@ build = "build.rs"
 harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-api = { path = "../harness-native-api" }
 harness-native-blaze = { path = "../harness-native-blaze" }
+harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
+tree-sitter-highlight = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter = "0.25"
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
 harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-layout = { path = "../harness-native-ui-layout" }

@@ -136,7 +136,8 @@ impl Stage {
                 "{path}: Video {video:?} is {pw}x{ph} pixels; yuv420p needs whole, even sides"
             ));
         }
-        let mut painter = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
+        let mut painter =
+            Painter::new(TypeLook { code_scale: 1.0, plain: true, ..TypeLook::default() });
         painter.media = Some(dir.to_path_buf());
         Ok(Self { world, painter, video })
     }

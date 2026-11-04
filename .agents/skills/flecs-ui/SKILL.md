@@ -52,6 +52,7 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`); the tree's inertia (harness-native-scroll-physics), knob and edge fades are in `harness-native/src/app/sidebar.rs` |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
 | Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
+| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens) |
 | Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
 | Clip | `Clip` (the sidebar fold lays out at full width and clips; never relayout at in-between widths) |
 

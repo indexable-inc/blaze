@@ -67,12 +67,36 @@ pub struct Cue {
     pub ease: Ease,
 }
 
+/// A node's words arriving glyph by glyph: each rises `by` points into place and fades in over `dur` seconds on `ease`,
+/// glyph `i` (in reading order) starting at `at + i * per`. The paint pass reads it against the frame clock; layout keeps
+/// every glyph's room from the start, so nothing moves as they arrive.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GlyphsIn {
+    pub at: f32,
+    pub per: f32,
+    pub dur: f32,
+    pub by: f32,
+    pub ease: Ease,
+}
+
+impl GlyphsIn {
+    /// Glyph `i`'s opacity and how far it still sits below its place (points) at frame time `time`.
+    #[must_use]
+    pub fn of(&self, i: usize, time: f32) -> (f32, f32) {
+        let t = (time - self.at - i as f32 * self.per) / self.dur.max(1e-6);
+        let p = self.ease.at(t);
+        (t.clamp(0.0, 1.0).powf(0.6), self.by * (1.0 - p))
+    }
+}
+
 hyperion_api_layouts::api_layouts! {
     "Cue" => alias Cue,
+    "GlyphsIn" => alias GlyphsIn,
     Ease,
 }
 
 /// Register the timeline's components before any scene resolves them.
 pub fn register(world: &World) {
     world.component::<Cue>().writable();
+    world.component::<GlyphsIn>().writable();
 }

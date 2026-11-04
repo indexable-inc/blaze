@@ -51,12 +51,25 @@ prefab Plate {
 // ---- the video's own ----
 // Type, in points of a 960 by 540 frame drawn at 2x (1920 by 1080). Big: most people watch it on a phone, a 1080p
 // frame shrunk to a fifth of its width.
-export const size_hero = 30
-export const line_hero = 38
-export const size_lead = 19
-export const line_lead = 26
-export const size_code = 21
+// All of it in the code face, as the mark's own home (a terminal) sets it.
+export const size_hero = 25
+export const line_hero = 34
+export const size_lead = 16
+export const line_lead = 24
+export const size_code = 19
 export const line_code = 28
 
 // The fire mark: 43 by 23 cells (harness-native-blaze), each this many points.
 export const mark_cell = 12
+
+// Syntax colours, by tree-sitter capture name (harness-native-render's highlight.rs), from the mark's fire.
+export const fire_1: Rgba = {0.878, 0.275, 0.102, 1}
+export const fire_2: Rgba = {1.0, 0.561, 0.122, 1}
+export const fire_3: Rgba = {1.0, 0.831, 0.231, 1}
+@tree ChildOf
+code_ink {
+  function { Fill: {dark: $fire_2, light: $fire_2} }
+  constant { Fill: {dark: $fire_3, light: $fire_3} }
+  operator { Fill: {dark: $fire_1, light: $fire_1} }
+  string { Fill: {dark: $fire_3, light: $fire_3} }
+}

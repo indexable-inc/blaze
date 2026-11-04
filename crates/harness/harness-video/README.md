@@ -27,6 +27,10 @@ from PATH, with the soundtrack as AAC.
   indexable-inc/anim): its letters drop in from the top of the frame at `start`, the fire catches, and from `exit` the
   letters burn into embers. Its soundtrack (the landings climbing to A major, the physically modelled fire, the burn) is
   synthesised offline from the same times and is the video's sound; a scene without a `BlazeMark` is silent.
+- Words: `GlyphsIn: {at, per, dur, by, ease}` brings them in glyph by glyph (each rises and fades, `per` seconds after
+  the one before); `Highlight: {file}` colours them by their grammar (tree-sitter; shell so far) in the `code_ink.*`
+  tokens; `Caret: {at, until, blink, ink}` puts a block caret after the last glyph shown (pair it with a `Pose.cut`
+  cue to type them on). Videos set every character as its own glyph (no ligatures).
 - `Picture: {handle}` with `Pixelated` draws pixel art from a PNG under the scene's directory; `Frames: {count, fps}`
   plays a sheet of frames stacked downwards. Pictures and the mark are textures whose texels are fetched, never
   filtered: crisp, with no seam between cells, at any size or mid-animation scale.

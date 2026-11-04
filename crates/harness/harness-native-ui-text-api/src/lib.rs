@@ -84,6 +84,16 @@ pub struct BlazeMark {
     pub exit: f32,
 }
 
+/// A block caret after the last glyph a node's words show (a `Pose.cut` types them on), in `ink`, from `at` to `until`
+/// seconds on the frame clock: solid while glyphs are arriving, then blinking, on for half of every `blink` seconds.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Caret {
+    pub at: f32,
+    pub until: f32,
+    pub blink: f32,
+    pub ink: harness_native_ui_look_api::Rgba,
+}
+
 /// Words that are code from `file` (a path or a name: its kind says the language): the host colours each stretch in its
 /// role's ink, as it colours a code card.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
@@ -119,6 +129,7 @@ hyperion_api_layouts::api_layouts! {
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
+    "Caret" => alias Caret,
     "Highlight" => alias Highlight,
     "LineNumbers" => alias LineNumbers,
     "TextRange" => alias TextRange,
@@ -137,6 +148,7 @@ pub fn register(world: &World) {
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
+    world.component::<Caret>().writable();
     world.component::<Highlight>().writable();
     world.component::<LineNumbers>().writable();
     world.component::<TextRange>().writable();

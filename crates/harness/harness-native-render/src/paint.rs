@@ -16,12 +16,14 @@ use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, S
 use harness_native_ui_motion_api::Pose;
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Frames, Mark, OneLine, Picture, Pixelated, Text, Truncate, TruncateMode,
+    BlazeMark, Caret, Frames, Highlight, Mark, OneLine, Picture, Pixelated, Text, Truncate,
+    TruncateMode,
 };
+use harness_native_ui_timeline_api::GlyphsIn;
 
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::pack::{GlyphInst, ImageInst, PanelInst};
-use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
+use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, SUBPX, Style, TypeLook};
 
 /// The atlas uploader a frame is drawn with: `(x, y, w, h, bytes)` into the glyph atlas.
 pub type Upload<'a> = dyn FnMut(u32, u32, u32, u32, &[u8]) + 'a;
@@ -41,6 +43,7 @@ pub struct Painter {
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
+    highlight: crate::highlight::Highlighter,
     /// Where a `Picture`'s handle is a path under (the scene's directory); None: this host draws no pictures.
     pub media: Option<PathBuf>,
 }
@@ -68,6 +71,25 @@ pub fn set_of(s: &TextStyle) -> Style {
 #[must_use]
 pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
+}
+
+/// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in the dark ink.
+fn code_ink(w: WorldRef<'_>) -> Vec<(String, [f32; 4])> {
+    fn walk(e: EntityView<'_>, prefix: &str, out: &mut Vec<(String, [f32; 4])>) {
+        e.each_child(|c| {
+            let name = if prefix.is_empty() { c.name() } else { format!("{prefix}.{}", c.name()) };
+            if let Some(f) = c.try_cloned::<&Fill>() {
+                out.push((name.clone(), rgba(f.dark)));
+            }
+            walk(c, &name, out);
+        });
+    }
+    let mut out = Vec::new();
+    if let Some(root) = w.try_lookup("code_ink") {
+        walk(root, "", &mut out);
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// den's `panel_from`: a plate of `fill` with `edge` and `shape` at `alpha`.
@@ -101,24 +123,47 @@ pub fn emit_layout(
     fonts: &Fonts,
     cache: &mut GlyphCache,
     lay: &Layout,
-    (ox, oy): (f32, f32),
+    at: (f32, f32),
     ink: [f32; 4],
     alpha: f32,
     sc: f32,
     limit: usize,
     upload: &mut Upload<'_>,
 ) {
+    emit_glyphs(d, fonts, cache, lay, at, sc, upload, &mut |n, _| {
+        (n < limit).then_some((ink, alpha, 0.0))
+    });
+}
+
+/// A layout's glyphs at `(ox, oy)`, each as `look(n, glyph)` says (its ink, opacity and how far below its place it sits,
+/// points), stopping at the first it gives None. Glyphs in place snap to the device pixel grid with den's subpixel steps;
+/// one still moving is drawn where it is. Where the pen stands after the last one drawn (x, its line's top and height),
+/// in points, if any was.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_glyphs(
+    d: &mut Draw,
+    fonts: &Fonts,
+    cache: &mut GlyphCache,
+    lay: &Layout,
+    (ox, oy): (f32, f32),
+    sc: f32,
+    upload: &mut Upload<'_>,
+    look: &mut dyn FnMut(usize, &Glyph) -> Option<([f32; 4], f32, f32)>,
+) -> Option<(f32, f32, f32)> {
     let asz = cache.size as f32;
-    let mut col = ink;
-    col[3] *= alpha;
     let mut n = 0usize;
+    let mut pen = None;
     for line in &lay.lines {
-        for g in &line.glyphs {
-            if n >= limit {
-                return;
-            }
+        for (k, g) in line.glyphs.iter().enumerate() {
+            let Some((ink, alpha, dy)) = look(n, g) else { return pen };
             n += 1;
-            let base_px = ((oy + line.baseline - g.y) * sc).round();
+            let next_x = line.glyphs.get(k + 1).map_or(line.width, |h| h.x);
+            pen = Some((ox + next_x, oy + line.top, line.height));
+            if alpha <= 0.002 {
+                continue;
+            }
+            let base = (oy + line.baseline - g.y) * sc;
+            let base_px = if dy == 0.0 { base.round() } else { base + dy * sc };
             let xp = (ox + g.x) * sc;
             let ix = xp.floor();
             let sub = (((xp - ix) * SUBPX as f32).floor() as u32).min(SUBPX - 1);
@@ -126,6 +171,8 @@ pub fn emit_layout(
             if e.w == 0 {
                 continue;
             }
+            let mut col = ink;
+            col[3] *= alpha;
             d.glyph(GlyphInst {
                 rect: [
                     (ix + e.left as f32) / sc,
@@ -147,6 +194,7 @@ pub fn emit_layout(
             });
         }
     }
+    pen
 }
 
 impl Painter {
@@ -158,6 +206,7 @@ impl Painter {
             layouts: HashMap::new(),
             sheets: HashMap::new(),
             marks: HashMap::new(),
+            highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
     }
@@ -318,18 +367,68 @@ impl Painter {
                 let total: usize = lay.lines.iter().map(|l| l.glyphs.len()).sum();
                 let cut = e.try_cloned::<&Pose>().map_or(0.0, |p| p.cut.clamp(0.0, 1.0));
                 let limit = ((total as f32) * (1.0 - cut)).round() as usize;
-                emit_layout(
+                let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+                let inks = match e.try_cloned::<&Highlight>() {
+                    Some(h) => {
+                        let tokens = code_ink(e.world());
+                        let names: Vec<String> = tokens.iter().map(|(n, _)| n.clone()).collect();
+                        let spans = self
+                            .highlight
+                            .spans(h.file.as_str(), text.s.as_str(), &names)
+                            .map_err(|err| format!("{}: {err}", e.path()))?;
+                        Some((tokens, spans))
+                    }
+                    None => None,
+                };
+                let arrive = e.try_cloned::<&GlyphsIn>();
+                let mut look = |n: usize, g: &Glyph| {
+                    if n >= limit {
+                        return None;
+                    }
+                    let col = inks
+                        .as_ref()
+                        .and_then(|(tokens, spans)| {
+                            spans
+                                .iter()
+                                .find(|s| (s.start..s.end).contains(&g.idx))
+                                .map(|s| tokens[s.name].1)
+                        })
+                        .unwrap_or(ink);
+                    let (a, dy) = arrive.map_or((1.0, 0.0), |m| m.of(n, time));
+                    Some((col, p.alpha * a, dy))
+                };
+                let pen = emit_glyphs(
                     d,
                     &self.fonts,
                     &mut self.cache,
                     &lay,
                     (laid.x, laid.y),
-                    ink,
-                    p.alpha,
                     sc,
-                    limit,
                     upload,
+                    &mut look,
                 );
+                if let Some(c) =
+                    e.try_cloned::<&Caret>().filter(|c| (c.at..c.until).contains(&time))
+                {
+                    // Solid while glyphs arrive (a cue on Pose.cut is running), then blinking.
+                    let typing = limit < total;
+                    let on = typing || c.blink <= 0.0 || ((time - c.at) / c.blink).fract() < 0.5;
+                    if on {
+                        let line = lay.lines.first().map_or(set_of(&style).line, |l| l.height);
+                        let (x, top, h) = pen.unwrap_or((laid.x, laid.y, line));
+                        let w = (style.size * 0.6 * sc).round() / sc;
+                        let hh = (h * 0.82 * sc).round() / sc;
+                        let y = ((top + (h - hh) * 0.5) * sc).round() / sc;
+                        let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                        d.panel(panel_from(
+                            rgba(c.ink),
+                            [0.0; 4],
+                            square,
+                            [(x * sc).round() / sc, y, w, hh],
+                            p.alpha,
+                        ));
+                    }
+                }
             }
             PaintKind::Icon => {
                 // A ui.Symbol: its glyph (a Nerd Font icon) centred in its rect, 14 in a 16 box as SF Symbols sit in a row.

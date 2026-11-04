@@ -6,6 +6,7 @@ pub mod atlas;
 pub mod boxdraw;
 pub mod draw;
 pub mod gpu;
+pub mod highlight;
 pub mod icons;
 pub mod pack;
 pub mod paint;

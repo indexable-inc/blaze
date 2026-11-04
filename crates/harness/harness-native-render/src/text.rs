@@ -41,6 +41,9 @@ pub struct TypeLook {
     pub item: f32,
     pub indent: f32,
     pub heading_tracking: f32,
+    /// Every character its own glyph: no ligatures or contextual alternates (`liga`, `calt` off), so code's `//` and `->`
+    /// read as typed. Off in the app (its fonts' own way); on in videos.
+    pub plain: bool,
 }
 
 /// Identity of a (font, size) pair, stable across layouts: the PostScript name and the size.
