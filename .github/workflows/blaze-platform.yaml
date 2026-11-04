@@ -212,6 +212,10 @@ jobs:
       # with their features and profile (harness/unittests.py), so that its libraries are the
       # ones the tests job's programs are built on. Every one of them is a dependency of
       # blaze-engine, and each has the features it has in blaze-engine's build alone.
+      # The profile history's files the build writes are told from those the runner had (an ix
+      # runner's snapshot keeps earlier runs') by being newer than this file.
+      - if: env.BLAZE == 'true' && inputs.harnesses == ''
+        run: touch "$RUNNER_TEMP/profile-since"
       - name: blaze build --release, of what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
@@ -219,6 +223,26 @@ jobs:
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
         run: blaze stop
+      # The self-build's profile history (blaze's root, docs/profiling.md), for the profile-gate
+      # job. After the stop, which flushes and merges the last of it. A build that wrote none
+      # hands over its list alone, and the gate says it found no build.
+      - id: profile
+        if: always() && env.BLAZE == 'true' && inputs.harnesses == '' && steps.blaze.outcome == 'success'
+        run: |
+          src="${BLAZE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/blaze}/v2/profile"
+          dir="$RUNNER_TEMP/profile"
+          mkdir -p "$dir"
+          find "$src" -maxdepth 1 -name '*.parquet' ! -name 'schema.*' -newer "$RUNNER_TEMP/profile-since" -exec cp -p {} "$dir/" \; || true
+          ls "$dir" > "$dir/copied.txt"
+          echo "$(($(wc -l < "$dir/copied.txt") - 1)) profile history files, $(du -sh "$dir" | cut -f1), for the profile gate" | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always() && steps.profile.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
       # What the build added to the store, for the tests job (`needs: build`), which pulls the
       # same keys; a hard link each, since the store and the runner's temporary directory are
       # one disk. packs.txt lists them, so that a build that added none still hands over a list.
@@ -279,6 +303,70 @@ jobs:
         run: |
           parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
+
+  # The profile's gate (crates/blaze-profile/src/gate.rs, docs/profiling.md "The gate") over the
+  # history the build job's self-build wrote, run by the blaze this tree built and held to
+  # harness/profile-gate-known.toml, and each of its fixtures failing its own check
+  # (harness/profile_gate.py). It uploads the build's per-build summary, named by platform,
+  # runner class, commit, tree and blaze, for profile-nightly.yaml. No secret and no
+  # environment: a fork's pull request runs it as it is.
+  profile-gate:
+    name: profile gate
+    needs: build
+    if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The class of machine the self-build ran on: a summary compares only with its own class's.
+      RUNNER_CLASS: ${{ inputs.ix-cpu != '' && format('ix-{0}-{1}', inputs.ix-arch, inputs.ix-cpu) || inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned DuckDB (flake.nix), which `blaze debug gate` runs: blaze never links one.
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - id: duckdb
+        run: echo "path=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/blaze
+      - uses: actions/download-artifact@v8
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+      - working-directory: ${{ runner.temp }}/blaze
+        run: tar -xf blaze.tar
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: blaze debug gate, over the self-build and the fixtures
+        env:
+          DUCKDB: ${{ steps.duckdb.outputs.path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg duckdb "$DUCKDB" --arg history "$RUNNER_TEMP/profile" \
+            --arg platform "$PLATFORM" --arg runner "$RUNNER_CLASS" --arg commit "$GITHUB_SHA" --arg out "$RUNNER_TEMP/profile-gate" \
+            '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
+            > "$RUNNER_TEMP/profile-gate.json"
+          uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      - id: summary
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/profile-gate"
+          if [ -f "$out/report.md" ]; then cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f "$out/artifact" ] && [ -f "$out/summary.parquet" ]; then echo "name=$(cat "$out/artifact")" >> "$GITHUB_OUTPUT"; fi
+      - if: always() && steps.summary.outputs.name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.summary.outputs.name }}
+          path: |
+            ${{ runner.temp }}/profile-gate/summary.parquet
+            ${{ runner.temp }}/profile-gate/identity.json
+            ${{ runner.temp }}/profile-gate/verdict.json
+          retention-days: 90
+          if-no-files-found: error
 
   harness:
     name: harness (${{ matrix.part }})

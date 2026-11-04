@@ -1,7 +1,8 @@
 //! The macOS sampler (arm64): each tick, every thread that holds a ring is stopped, its
 //! registers read and its frame pointers walked inside its own stack, and let go. A thread
-//! that is not running is sampled too, marked off the CPU: what it blocks in, and whether a
-//! wait span says so, is what the raw-block gate reads.
+//! that is not running is sampled too when it is inside a span, marked off the CPU: what it
+//! blocks in, and whether a wait span says so, is what the raw-block gate reads. A blocked
+//! thread outside every span is not, as on Linux (`linux.rs`), where sampling it would wake it.
 
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
-pub(super) const HOW: &str = "each thread that records spans, running or blocked, stopped (thread_suspend) and its frame pointers walked";
+pub(super) const HOW: &str = "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked";
 
 /// How often the samples taken are kept.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
@@ -44,8 +45,7 @@ const STATE_COUNT: libc::mach_msg_type_number_t =
     (size_of::<State>() / size_of::<libc::natural_t>()) as _;
 const _: () = assert!(STATE_COUNT == 68);
 
-/// User addresses on arm64 macOS are below 2^47; above are tag bits.
-const ADDRESS: u64 = (1 << 47) - 1;
+use crate::stack::ADDRESS;
 
 /// A thread the sampler may stop: its port and stack, set by the thread itself as it takes a
 /// ring and cleared as it leaves, under the ring's lock, which the sampler holds while the
@@ -148,6 +148,11 @@ fn running(thread: &Thread) -> bool {
 /// while it is stopped, since it may hold the allocator's or any other.
 fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     let on_cpu = running(thread);
+    if !on_cpu && ring.innermost() == 0 {
+        // Blocked outside every span: no span to blame its wait on, and Linux cannot sample
+        // it without waking it, so neither system does.
+        return None;
+    }
     let at = Instant::now();
     let mut sample =
         Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
@@ -175,7 +180,8 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
 }
 
 /// The stopped thread's PC, then the return address of each frame record from its frame
-/// pointer up, each record inside its stack `[low, high)` and above the one before.
+/// pointer up ([`crate::stack::walk`]), each record inside its stack `[low, high)` and above the
+/// one before.
 fn walk(state: &State, low: u64, high: u64, sample: &mut Sample) {
     let mut push = |pc: u64| {
         let pc = pc & ADDRESS;
@@ -187,20 +193,13 @@ fn walk(state: &State, low: u64, high: u64, sample: &mut Sample) {
         true
     };
     push(state.pc);
-    let mut fp = state.fp & ADDRESS;
-    while fp >= low && fp % 16 == 0 && fp.saturating_add(16) <= high {
-        let record = fp as *const u64;
-        // SAFETY: `fp` is 16-aligned and its 16 bytes are inside the stopped thread's stack,
-        // which is mapped for as long as the thread lives (it cannot leave: the caller holds the
-        // lock it takes to), and nothing writes it while it is stopped.
-        let next = unsafe { record.read_volatile() } & ADDRESS;
-        // SAFETY: as above, the second word of the record.
-        let ret = unsafe { record.wrapping_add(1).read_volatile() };
-        if !push(ret) || next <= fp {
-            break;
-        }
-        fp = next;
-    }
+    let mut read = |fp: u64| {
+        // SAFETY: the record lies inside the stopped thread's stack `[low, high)`, which is
+        // mapped for as long as it lives (it cannot leave: the caller holds the lock it takes
+        // to), and nothing writes it while it is stopped; `walk` checked its alignment.
+        (fp >= low && fp.saturating_add(16) <= high).then(|| unsafe { crate::stack::load(fp) })
+    };
+    crate::stack::walk(state.fp, &mut read, &mut push);
 }
 
 #[cfg(test)]

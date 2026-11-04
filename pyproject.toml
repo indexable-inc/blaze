@@ -41,8 +41,10 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
-  "harness/netbench.py",
   "harness/own_inputs.py",
+  "harness/profile_fixtures.py",
+  "harness/profile_gate.py",
+  "harness/profile_trend.py",
   "harness/storelib.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
@@ -54,6 +56,7 @@ include = [
   "tools/similar",
   "tools/typed-input",
   "tools/v2",
+  "tools/vendor",
 ]
 
 # These harnesses arrange their sibling imports after computing HERE. Their runtime
@@ -81,8 +84,10 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
-  "harness/netbench.py",
   "harness/own_inputs.py",
+  "harness/profile_fixtures.py",
+  "harness/profile_gate.py",
+  "harness/profile_trend.py",
   "harness/storelib.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
@@ -93,6 +98,7 @@ include = [
   "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",
+  "tools/vendor",
 ]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"

@@ -29,5 +29,5 @@ pub mod server;
 pub mod tiles;
 pub mod wire;
 
-pub use ops::History;
+pub use ops::{Flush, History};
 pub use server::{Config, Explorer, StartError, start};

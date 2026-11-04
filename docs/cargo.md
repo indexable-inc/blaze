@@ -984,16 +984,6 @@ to use them. The socket is 0600, and a connection from another user is refused b
 request is read. `blaze serve --http ADDR` listens on TCP as well, only with a bearer token in
 `BLAZE_API_TOKEN`.
 
-Every panic in the daemon carries its stack, whatever `RUST_BACKTRACE` says: `serve.log` has
-it after std's panic message, and the daemon appends each panic, synced before the panic goes
-on, as one JSON line to `panics.jsonl` beside `serve.log` (`unix_ns`, `pid`, `thread`,
-`location`, `message`, `trace`, and `unwritten_before`, how many panics before it could not be
-written; nothing is written past 16 MiB). That line survives a panic that aborts the daemon
-(unwinding fails, a panic while panicking, a panic outside any job). A task's panic that fails a
-build is also an `errors` row of kind `daemon-panic` in the profile history, its stack the
-row's `detail` ([profiling.md](profiling.md)). `blaze explain` and the profile import do not
-read `panics.jsonl` yet; read it with `jq`.
-
 In a project, the daemon writes the programs and test executables where cargo would in the
 workspace's build directory, under `<profile>/` there.
 

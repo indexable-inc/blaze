@@ -21,6 +21,20 @@ pub struct Reveal {
     pub scale0: f32,
 }
 
+/// Where a node stands off its laid-out place, as the draw pass folds it into the node and everything under it: moved by
+/// `dx`, `dy` (points), scaled about its middle by `1 - shrink`, faded by `fade` (0 opaque, 1 gone), and, for words, the
+/// share `cut` of their glyphs from the end not drawn yet (typed on). Every field is 0 at rest, so a script that writes
+/// only some of them leaves the rest still. Layout never reads it: posing a node never moves its neighbours. A timeline's
+/// `Cue`s animate it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pose {
+    pub dx: f32,
+    pub dy: f32,
+    pub shrink: f32,
+    pub fade: f32,
+    pub cut: f32,
+}
+
 /// The width (points) a node with a Motion widens to as it shows: its Place `w` eased to this by how shown it is.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Expand {
@@ -174,6 +188,7 @@ hyperion_api_layouts::api_layouts! {
     FromEdge,
     "Motion" => alias Motion,
     "Reveal" => alias Reveal,
+    "Pose" => alias Pose,
     "Expand" => alias Expand,
     "ShownWhen" => alias ShownWhen,
     "Shown" => alias Shown,
@@ -184,6 +199,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Motion>().writable();
     world.component::<Reveal>().writable();
+    world.component::<Pose>().writable();
     world.component::<Expand>().writable();
     world.component::<ShownWhen>().writable();
     world.component::<Shown>();

@@ -17,16 +17,11 @@
 
 use std::{
     alloc::Global,
-    backtrace::{Backtrace, BacktraceStatus},
     cell::Cell,
     collections::{BTreeMap, VecDeque},
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -41,7 +36,6 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use parking_lot::Mutex;
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
@@ -353,7 +347,7 @@ fn task_name(kind: TaskKind) -> blaze_profile::span::Name {
     blaze_profile::span::Name::of(&text)
 }
 
-/// A thread task's panic: what it was raised with, where, and the stack it was raised on.
+/// A thread task's panic: what it was raised with, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Panic {
     /// `None` for a payload that is no text.
@@ -362,12 +356,6 @@ pub struct Panic {
     /// `None` where no hook records them, as under the simulation; a task's panic re-raised
     /// from a pool's thread (rayon's) is where it was first raised.
     pub at: Option<String>,
-    /// The stack it was raised on, as plain text, the frames of the capture and of std's panic
-    /// machinery above the one that panicked cut ([`rendered`]). Captured by [`record_panics`]'
-    /// hook for every panic, whatever `RUST_BACKTRACE` says; rendered there once, as the hook
-    /// writes it to the log and to `panics.jsonl`, and shared from then on. `None` where no hook
-    /// records it, and for an unwind the query engine raised with a typed payload.
-    pub trace: Option<Arc<str>>,
 }
 
 impl fmt::Display for Panic {
@@ -383,179 +371,20 @@ impl fmt::Display for Panic {
     }
 }
 
-/// A panic the hook saw and no task took yet.
-struct Raised {
-    message: Option<String>,
-    /// `file:line:column on thread T`; `None` for a panic std gave no location.
-    at: Option<String>,
-    trace: Arc<str>,
-}
-
-/// The panics the hook saw and no task took yet, oldest first.
-static RAISED: Mutex<VecDeque<Raised>> = Mutex::new(VecDeque::new());
-
-/// How many panics [`RAISED`] holds: a panic no task catches (a thread's own) is dropped
-/// once this many are newer.
-const RAISED_KEPT: usize = 64;
-
-/// The file in the daemon's state directory (beside `serve.log` and the profile history) the
-/// hook appends each panic to as one JSON line ([`PanicLine`]), synced before the panic goes
-/// on: a panic that then aborts the process (unwinding fails, a panic while panicking) loses
-/// everything in memory, and this line is what is left of it.
-pub const PANICS_FILE: &str = "panics.jsonl";
-
-/// Past this many bytes [`PANICS_FILE`] is not written to: a daemon panicking in a loop does
-/// not fill the disk. The panics not written are counted ([`PANICS_UNWRITTEN`]).
-const PANICS_KEPT_BYTES: u64 = 16 << 20;
-
-/// How many panics the hook could not append to [`PANICS_FILE`] (a write failed, or the file
-/// was full): each line says how many before it were lost.
-static PANICS_UNWRITTEN: AtomicU64 = AtomicU64::new(0);
-
-/// One line of [`PANICS_FILE`].
-#[derive(serde::Serialize)]
-struct PanicLine<'a> {
-    /// When, on the wall's clock: nanoseconds since the Unix epoch.
-    unix_ns: Option<u64>,
-    pid: u32,
-    thread: &'a str,
-    /// `file:line:column`.
-    location: Option<&'a str>,
-    message: Option<&'a str>,
-    /// The stack it was raised on ([`rendered`]).
-    trace: &'a str,
-    /// How many panics before this one the hook could not write ([`PANICS_UNWRITTEN`]).
-    unwritten_before: u64,
-}
-
 /// Whether a task of `kind` is a part of a program's build: admitted by that program's own
 /// measure, and alone until it has one ([`Plane::push_program`]).
 const fn of_program(kind: TaskKind) -> bool {
     matches!(kind, kinds::PROGRAM | kinds::PROGRAM_LINK)
 }
 
-/// Has every panic of the process recorded where it was raised and the stack it was raised
-/// on, for the task that catches it ([`Panic::at`], [`Panic::trace`]), appended to `panics`
-/// ([`PANICS_FILE`] in the daemon's state directory; `None` writes no file), then printed as
-/// before with its stack after it, whatever `RUST_BACKTRACE` says. Once, as the daemon starts;
-/// a later call does nothing, so the hook never wraps itself and records each panic once
-/// (tests call it each).
-pub fn record_panics(panics: Option<PathBuf>) {
-    static RECORDING: std::sync::Once = std::sync::Once::new();
-    RECORDING.call_once(|| set_recording_hook(panics));
-}
-
-fn set_recording_hook(panics: Option<PathBuf>) {
-    let printed = std::panic::take_hook();
-    // std's own hook prints a stack only when `RUST_BACKTRACE` asks for one: this hook prints
-    // the one it captured when std's does not, so the log has each panic's stack once.
-    let std_prints_stack = std::env::var_os("RUST_BACKTRACE").is_some_and(|it| it != "0");
-    // alloc: the process's one panic hook
-    std::panic::set_hook(Box::new(move |info| {
-        let trace = Backtrace::force_capture();
-        let thread = std::thread::current();
-        let thread = thread.name().unwrap_or("<unnamed>");
-        let location = info.location().map(ToString::to_string); // alloc: a panic, once
-        let message = info.payload_as_str();
-        let trace: Arc<str> = Arc::from(rendered(&trace)); // alloc: a panic, once
-        if let Some(path) = &panics {
-            let line = PanicLine {
-                unix_ns: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|it| u64::try_from(it.as_nanos()).ok()),
-                pid: std::process::id(),
-                thread,
-                location: location.as_deref(),
-                message,
-                trace: &trace,
-                unwritten_before: PANICS_UNWRITTEN.load(Ordering::Relaxed),
-            };
-            if append_panic(path, &line).is_err() {
-                PANICS_UNWRITTEN.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        {
-            let at = location.as_deref().map(|it| format!("{it} on thread {thread}")); // alloc: a panic, once
-            let message = message.map(str::to_owned); // alloc: a panic, once
-            let mut raised = RAISED.lock();
-            if raised.len() == RAISED_KEPT {
-                raised.pop_front();
-            }
-            // clone: a reference count
-            raised.push_back(Raised { message, at, trace: Arc::clone(&trace) });
-        }
-        printed(info);
-        if !std_prints_stack {
-            use std::io::Write as _;
-            // A failed write to the log loses the stack, never panics inside the hook.
-            _ = writeln!(std::io::stderr().lock(), "stack backtrace (blaze records every panic's):\n{trace}");
-        }
-    }));
-}
-
-/// [`PanicLine`] appended to `path` as one line and synced: an error, the hook's to count, when
-/// the file is past [`PANICS_KEPT_BYTES`] or any step fails. One `write` of the whole line, so
-/// two threads' panics do not interleave.
-fn append_panic(path: &Path, line: &PanicLine<'_>) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    if file.metadata()?.len() > PANICS_KEPT_BYTES {
-        return Err(std::io::Error::other(format!("{} is past {PANICS_KEPT_BYTES} bytes", path.display()))); // alloc: a panic, once
-    }
-    let mut bytes = serde_json::to_vec(line).map_err(std::io::Error::other)?; // alloc: a panic, once
-    bytes.push(b'\n');
-    file.write_all(&bytes)?;
-    file.sync_data()
-}
-
-/// What a frame's line names in the frames a panic's stack begins with that are the capture's
-/// and std's panic machinery, not the code that panicked ([`rendered`] cuts them).
-const MACHINERY: [&str; 11] = [
-    "std::backtrace",
-    "set_recording_hook",
-    "core::ops::function::Fn",
-    "std::panicking::",
-    "core::panicking::",
-    "rust_begin_unwind",
-    "__rust_end_short_backtrace",
-    "std::panic::panic_any",
-    "core::option::unwrap_failed",
-    "core::option::expect_failed",
-    "core::result::unwrap_failed",
-];
-
-/// `trace` as plain text, std's own lines (`  N: symbol` then `at file:line:column`), from the
-/// first frame that is not [`MACHINERY`]: the run of frames at its top that are the capture's,
-/// this hook's and std's panic machinery is cut, nothing below it. A stack whose every frame
-/// reads as machinery (symbols unresolved), or that was not captured, is kept whole.
-fn rendered(trace: &Backtrace) -> String {
-    let mut text = trace.to_string(); // alloc: a panic, once
-    if trace.status() != BacktraceStatus::Captured {
-        return text;
-    }
-    let mut at = 0;
-    let mut cut = None;
-    for line in text.split_inclusive('\n') {
-        let start = at;
-        at += line.len();
-        let Some(symbol) = frame_symbol(line) else { continue };
-        if !MACHINERY.iter().any(|it| symbol.contains(it)) {
-            cut = Some(start);
-            break;
-        }
-    }
-    if let Some(cut) = cut {
-        text.drain(..cut);
-    }
-    text
-}
-
-/// The symbol of a frame's first line in std's rendering of a stack, `  12: crate::item`;
-/// `None` for any other line (its `at file:line:column`).
-fn frame_symbol(line: &str) -> Option<&str> {
-    let (index, symbol) = line.trim_start().split_once(": ")?;
-    (!index.is_empty() && index.bytes().all(|it| it.is_ascii_digit())).then_some(symbol)
+/// Has every panic of the process recorded as it is raised, then printed as before: the one
+/// record of panics, `blaze_profile::panics`, whose ring the task that catches one reads where
+/// it was raised from ([`Panic::at`]) and the history writes as `panics` rows, each with its
+/// stack and whether a job caught it ([`in_a_job`]). Once, as the daemon starts; a later call
+/// does nothing, so the hook never wraps itself and records each panic once (tests call it
+/// each).
+pub fn record_panics() {
+    blaze_profile::panics::record(in_a_job);
 }
 
 /// Has an allocation the allocator could not make panic, naming its size, instead of aborting
@@ -623,8 +452,7 @@ fn alloc_failed(layout: std::alloc::Layout) {
     );
 }
 
-/// The panic `payload` caught, with where the hook saw the newest one of its message raised
-/// and the stack it was raised on.
+/// The panic `payload` caught, with where the hook saw the newest one of its message raised.
 /// An unwind the query engine raised with a typed payload (a query past its bound, out of
 /// fuel) is named by its own text: it reaches no hook, and has no `panic!` text.
 // dyn: a panic payload, read once per panicked task
@@ -632,13 +460,8 @@ pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     let message = stdx::panic_text(payload)
         .map(str::to_owned) // alloc: a panic, once
         .or_else(|| blaze_query::db::unwind_text(payload));
-    let mut raised = RAISED.lock();
-    let seen = raised
-        .iter()
-        .rposition(|it| it.message == message)
-        .and_then(|place| raised.remove(place));
-    let (at, trace) = seen.map_or((None, None), |it| (it.at, Some(it.trace)));
-    Panic { message, at, trace }
+    let at = blaze_profile::panics::claim(message.as_deref());
+    Panic { message, at }
 }
 
 fn post_work<W: Work>(
@@ -1761,7 +1584,7 @@ mod tests {
 
     #[test]
     fn a_task_that_panics_ends_with_its_message_and_where_it_was_raised_on_another_thread() {
-        record_panics(None);
+        record_panics();
         let work = Arc::new(Each(|_| -> Option<Did<u32>> {
             let raised = std::thread::Builder::new()
                 .name("plane-test-raiser".to_owned())
@@ -1797,10 +1620,6 @@ mod tests {
             "{at}"
         );
         assert_eq!(panic.to_string(), format!("panicked at {at}: plane-test: the task's panic"));
-        // Captured whatever RUST_BACKTRACE says, its machinery cut: it begins at a frame.
-        let trace = panic.trace.as_deref().expect("the hook captured the stack");
-        assert!(trace.lines().next().and_then(frame_symbol).is_some(), "{trace}");
-        assert!(!trace.contains("set_recording_hook"), "{trace}");
     }
 
     /// coord-98: a block blaze-mem's used-up size class could not give aborted the daemon, and
@@ -1809,7 +1628,7 @@ mod tests {
     /// living to check them is the proof that nothing aborted.
     #[test]
     fn an_allocation_that_fails_fails_its_task_alone_and_the_rest_finish() {
-        record_panics(None);
+        record_panics();
         record_alloc_failures();
         let work = Arc::new(Each(|arg| -> Option<Did<u32>> {
             if arg == 2 {

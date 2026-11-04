@@ -2,7 +2,7 @@
 //! header and at most one table. Everything here may wait (DuckDB runs as a process, Flecs
 //! answers on its own thread), so the server calls it on tokio's blocking pool.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -22,6 +22,26 @@ pub struct History {
     pub duckdb: Option<PathBuf>,
     /// The history's directory (`blaze_profile::history::dir_in` of the daemon's state).
     pub dir: PathBuf,
+    /// Run before every query, so it reads each row the daemon recorded before it was asked.
+    pub flush: Flush,
+}
+
+/// Has the daemon that writes the history flush it (the same flush a CLI reader asks for with
+/// `blaze_api::Request::Flush`), answering the flush's number once it committed, or why it
+/// failed. The daemon gives it ([`crate::Config`]); a query whose flush fails is not run.
+#[derive(Clone)]
+pub struct Flush(Arc<dyn Fn() -> Result<u64, String> + Send + Sync>);
+
+impl Flush {
+    pub fn new(flush: impl Fn() -> Result<u64, String> + Send + Sync + 'static) -> Flush {
+        Flush(Arc::new(flush))
+    }
+}
+
+impl fmt::Debug for Flush {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Flush")
+    }
 }
 
 /// What every answer reads.
@@ -162,7 +182,16 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
                        `blaze explore` passes the one `nix run .#duckdb` pins";
         return Err(WireError::new(Kind::Sql, message).with("query", sql));
     };
-    let query = sql::Query { duckdb, history: &cx.history.dir, sql };
+    (cx.history.flush.0)().map_err(|why| {
+        WireError::new(
+            Kind::Flush,
+            format!(
+                "the history was not flushed before the query, so it would miss recent rows: {why}"
+            ),
+        )
+        .with("query", sql)
+    })?;
+    let query = sql::Query { duckdb, history: &cx.history.dir, scope: sql::Scope::All, sql };
     sql::run_with(&query, stop).map_err(|error| {
         let kind = match (&error, error.kind()) {
             (sql::SqlError::Stopped, _) => Kind::Cancelled,
@@ -290,7 +319,14 @@ mod tests {
     }
 
     fn cx() -> Context {
-        Context { history: History { duckdb: None, dir: PathBuf::from("/nowhere") }, world: None }
+        Context {
+            history: History {
+                duckdb: None,
+                dir: PathBuf::from("/nowhere"),
+                flush: Flush::new(|| Ok(0)),
+            },
+            world: None,
+        }
     }
 
     #[test]

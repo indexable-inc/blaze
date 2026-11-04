@@ -28,6 +28,7 @@ pub mod args;
 pub mod baselines;
 pub mod cache;
 pub mod clean;
+pub mod client_rows;
 pub mod daemon;
 pub mod doc;
 pub mod fetch_url;
@@ -102,7 +103,7 @@ Commands:
     explore [--dev] [--print]      The explorer: the daemon's builds and spans at https://ix.dev/explore
     debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
     debug live                     The daemon's threads as they run
-    debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
+    debug sql QUERY                SQL over the profile history, flushed first (every row recorded so far)
     explain RULE|PACKAGE|VIEW      A rule's long text, the last failure of PACKAGE with all it blocks, or a history view
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
@@ -117,6 +118,22 @@ Options:
 Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 ";
 
+/// What this client recorded of its build, sent to the daemon's history, and with
+/// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
+/// `err` as a warning naming the step and the build, and the command's own outcome stands.
+fn sent_client_rows(err: &mut impl Write, color: bool) {
+    let said = match client_rows::send() {
+        Ok(None) => return,
+        Ok(Some(path)) => format!(
+            "{}: the build's trace (ui.perfetto.dev): {}\n",
+            client_rows::PROFILE,
+            path.display()
+        ),
+        Err(why) => say::warning(&why, color),
+    };
+    _ = err.write_all(said.as_bytes());
+}
+
 /// The `blaze` program, and `cargo-blaze`, which cargo runs for `cargo blaze` as
 /// `cargo-blaze blaze <command> ...`.
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
@@ -128,7 +145,9 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     if !trampoline && let Err(code) = cores() {
         return ended(code);
     }
-    // The client and `blaze serve` both: with `BLAZE_PROFILE` each records from here on.
+    // The client and `blaze serve` both record into the flight recorder from here on: the
+    // daemon writes its history, and the client sends its rows there as its request ends
+    // (`client_rows`), which `BLAZE_PROFILE` then exports as the build's trace.
     blaze_profile::install();
     _ = blaze_profile::flight::count_frame_copies(|| {
         let it = blaze_mem::tag::copied_on_thread();
@@ -452,10 +471,7 @@ fn cargo(asked: &Invocation) -> i32 {
         let then = live::drive(&mut client, asked, &place, request, shown, started);
         // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
         let closed = client.close();
-        if blaze_profile::on() {
-            blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
-            blaze_profile::finish();
-        }
+        sent_client_rows(&mut io::stderr().lock(), color);
         if let Err(error) = closed {
             return refused(&format!("closing the connection to the build engine: {error}"), color);
         }
@@ -481,11 +497,7 @@ fn cargo(asked: &Invocation) -> i32 {
     );
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
-    // The daemon wrote its part before its last response, so every part is in by now.
-    if blaze_profile::on() {
-        blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
-        blaze_profile::finish();
-    }
+    sent_client_rows(&mut err, color);
     if let Err(error) = closed {
         let _ = err.write_all(
             say::error(&format!("closing the connection to the build engine: {error}"), color)
@@ -604,6 +616,9 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             if let Some(found) = &mut found {
                 found.add(diagnostic);
             }
+        }
+        if let ResponseRef::Work(worked) = &response {
+            client_rows::heard(worked.build_id);
         }
         let printed = match response {
             ResponseRef::Documented(documented) => {

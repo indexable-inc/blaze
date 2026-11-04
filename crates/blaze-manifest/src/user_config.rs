@@ -4,7 +4,7 @@
 //! [`UserConfigError::setting`]:
 //!
 //! - `[update]`: blaze's own updates (crates/blaze-engine/src/update.rs).
-//! - `[net]`, `[net.http3-hosts]`: the HTTP client's HTTP/3 (crates/blaze-registry/src/http/settings.rs).
+//! - `[terminal]`: what stderr's terminal does (crates/blaze-cargo/src/cli/terminal.rs).
 //!
 //! Not `home::root`: that is where the daemon keeps its state and the build directories
 //! (`$BLAZE_HOME`, else a cache directory), which a user may delete; this is where what blaze

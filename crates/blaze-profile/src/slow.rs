@@ -50,7 +50,9 @@ pub use render::{text, thread_line};
 /// past which only unended spans are read is the bound, so no build is refused for its size); a
 /// park whose wait span was under the floor is classed `<kind> wait under the read floor`, not an
 /// unnamed wait; the workers' CPU counts every span, read or not.
-pub const VERSION: u32 = 5;
+/// 6: `build.panics`, the build's panics and its daemon's fatal signal, each with its stack's
+/// top frames.
+pub const VERSION: u32 = 6;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -67,6 +69,29 @@ pub struct BuildFacts {
     pub misses: Option<u64>,
     /// How its daemon died during it: it has no end row, and is reported to that daemon's last.
     pub died: Option<Died>,
+    /// The daemon process's user and system CPU over the build, from getrusage; `None` in the
+    /// rows of a blaze before them, and while it runs.
+    pub daemon_user_ns: Option<i64>,
+    pub daemon_system_ns: Option<i64>,
+    /// Its panics, and the fatal signal its daemon died of, oldest first (`panics` rows).
+    pub panics: Vec<PanicFacts>,
+}
+
+/// A panic of a build, or the fatal signal its daemon died of: a `panics` row
+/// ([`crate::schema::PANICS`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PanicFacts {
+    /// `panic` or `signal`.
+    pub kind: String,
+    /// A job's boundary caught it: that job failed, the build went on.
+    pub caught: bool,
+    pub message: Option<String>,
+    pub location: Option<String>,
+    pub thread: Option<String>,
+    pub signal: Option<String>,
+    /// The frames a person reads first, innermost first, past the panic machinery's
+    /// ([`crate::panics::top_frames`]).
+    pub top: Vec<String>,
 }
 
 /// The death of a build's daemon ([`BuildFacts::died`]), and what it was running then.
@@ -116,6 +141,9 @@ pub struct Facts {
     /// The build's misses rows, by step and cause.
     pub misses: Vec<MissGroup>,
     pub query_counts: Vec<QueryCount>,
+    /// The commonest sampled stacks inside the build's spans by span name, on and off the CPU,
+    /// at most [`STACKS`] of each, sorted by name, then on before off, then most taken first.
+    pub span_stacks: Vec<SpanStack>,
     /// Each thread's spans' CPU in the build's window, counted in DuckDB over every span.
     pub thread_cpu: Vec<ThreadCpu>,
     pub memory: Memory,
@@ -139,7 +167,8 @@ pub struct ThreadCpu {
 }
 
 /// What the flight recorder itself dropped or summed over the build's window, from its own
-/// counters (`profile spans lost`, `profile rows skipped`, `profile rows skipped behind`) and the
+/// counters (`profile spans lost`, `profile rows skipped`, `profile rows skipped behind`, `profile
+/// cost ns`, `profile spans made`, `profile cpu reads`) and the
 /// `folded` table; `None` where the record has none (a blaze before them).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Recorder {
@@ -151,6 +180,12 @@ pub struct Recorder {
     /// Short spans summed into `folded` rows instead of a row each, and their time.
     pub folded_spans: Option<i64>,
     pub folded_ns: Option<i64>,
+    /// The recorder's own measured cost over the window (`profile cost ns`): sampled hook time
+    /// plus every thread-CPU read, and the spans (`profile spans made`) and CPU reads
+    /// (`profile cpu reads`) it covers.
+    pub cost_ns: Option<i64>,
+    pub spans_made: Option<i64>,
+    pub cpu_reads: Option<i64>,
 }
 
 impl Recorder {
@@ -296,6 +331,46 @@ pub struct Finding {
     pub owner: Option<String>,
     pub title: String,
     pub evidence: Vec<String>,
+    /// For a finding about a span name: the stacks the build's CPU samples inside its spans
+    /// found most often, on and off the CPU, so it says where the time went inside them.
+    #[serde(skip_serializing_if = "Stacks::is_empty")]
+    pub stacks: Stacks,
+}
+
+/// The commonest sampled stacks inside a finding's spans ([`SpanStack`]), the most taken
+/// first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Stacks {
+    /// Of samples on a CPU (running or runnable): where it computed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub on_cpu: Vec<StackSeen>,
+    /// Of samples off it (blocked inside the span): what it waited in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub off_cpu: Vec<StackSeen>,
+}
+
+impl Stacks {
+    pub fn is_empty(&self) -> bool {
+        self.on_cpu.is_empty() && self.off_cpu.is_empty()
+    }
+}
+
+/// A stack and how many samples found it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StackSeen {
+    /// Outermost first, each frame a function (inlined ones their own frames), never an offset.
+    pub frames: Vec<String>,
+    pub samples: u64,
+}
+
+/// One of the commonest stacks of the samples inside the spans of one name in the build, on or
+/// off the CPU ([`Facts::span_stacks`]): what [`Stacks`] is made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpanStack {
+    pub name: String,
+    pub on_cpu: bool,
+    pub frames: Vec<String>,
+    pub samples: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -458,6 +533,7 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     ctx.missed(&mut findings);
     ctx.shed(&mut findings);
     ctx.blind_spots(&mut blind);
+    attach_stacks(&mut findings, &facts.span_stacks);
 
     let cut_ns = (model.bounds.wall_ns() / 100).max(MIN_SAVES_NS);
     let before = findings.len();
@@ -483,6 +559,28 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
         summary: ctx.summary(smaller, cut_ns),
         findings,
         blind_spots: blind,
+    }
+}
+
+/// The most stacks on and off the CPU a finding lists.
+pub const STACKS: usize = 3;
+
+/// Gives each finding about a span name (its subject) the commonest stacks sampled inside
+/// those spans. Findings about anything else (a query, a kind of wait, the workers) get none.
+fn attach_stacks(findings: &mut [Finding], stacks: &[SpanStack]) {
+    if stacks.is_empty() {
+        return;
+    }
+    for finding in findings {
+        let at = stacks.partition_point(|it| it.name.as_str() < finding.subject.as_str());
+        for it in stacks[at..].iter().take_while(|it| it.name == finding.subject) {
+            let side =
+                if it.on_cpu { &mut finding.stacks.on_cpu } else { &mut finding.stacks.off_cpu };
+            if side.len() < STACKS {
+                // clone: a stack, once a finding it is attached to
+                side.push(StackSeen { frames: it.frames.clone(), samples: it.samples });
+            }
+        }
     }
 }
 
@@ -670,6 +768,7 @@ impl<'a> Ctx<'a> {
             let subject = name.to_owned();
             if counted && own_running >= JUDGED_NS && ratio < STARVED_RATIO {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Starved,
                     fix: Fix::GiveCpu,
                     saves_ns: (group.ns as f64 * (1.0 - ratio)) as i64,
@@ -685,6 +784,7 @@ impl<'a> Ctx<'a> {
                 });
             } else if busy < 0.5 * workers as f64 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Serial,
                     fix: Fix::Parallelise,
                     saves_ns: (group.ns as f64 * (1.0 - busy / workers as f64)) as i64,
@@ -781,6 +881,7 @@ impl<'a> Ctx<'a> {
             evidence.push("none of the critical path ran on them".to_owned());
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::StarvedWorkers,
             fix: Fix::GiveCpu,
             saves_ns: saves as i64,
@@ -975,6 +1076,7 @@ impl<'a> Ctx<'a> {
                 .owner(WAIT_SPAN, &name)
                 .or_else(|| owners.first().and_then(|it| file_in(&it.0)));
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Wait,
                 fix: Fix::ShortenWait,
                 saves_ns: saves,
@@ -1024,6 +1126,7 @@ impl<'a> Ctx<'a> {
             return;
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::Queued,
             fix: Fix::WakeWorkers,
             saves_ns: on_path,
@@ -1091,6 +1194,7 @@ impl<'a> Ctx<'a> {
         for (name, (keys, extra, ns, mut examples)) in by_query {
             let examples = top(&mut examples);
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Redone,
                 fix: Fix::KeyForReuse,
                 saves_ns: (ns as f64 / parallelism) as i64,
@@ -1138,6 +1242,7 @@ impl<'a> Ctx<'a> {
             );
             if it.evicted_asked > 0 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Evicted,
                     fix: Fix::KeepInMemory,
                     saves_ns: cost(it.evicted_asked),
@@ -1158,6 +1263,7 @@ impl<'a> Ctx<'a> {
             }
             if it.reran > 0 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Reran,
                     fix: Fix::KeyForReuse,
                     saves_ns: cost(it.reran),
@@ -1175,6 +1281,7 @@ impl<'a> Ctx<'a> {
             if it.rereads() {
                 let ratio = it.reads_recorded as f64 / it.reads_kept.max(1) as f64;
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Reread,
                     fix: Fix::ReadOnce,
                     saves_ns: 0,
@@ -1206,6 +1313,7 @@ impl<'a> Ctx<'a> {
                 evidence.push(format!("the commonest reason: {what}"));
             }
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Missed,
                 fix: Fix::ExplainMiss,
                 saves_ns: 0,
@@ -1234,6 +1342,7 @@ impl<'a> Ctx<'a> {
             return;
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::Shed,
             fix: Fix::KeepAcrossBuilds,
             saves_ns: 0,
@@ -1336,14 +1445,40 @@ impl<'a> Ctx<'a> {
             if uncounted > 0 {
                 evidence.push(format!("{uncounted} spans have no CPU (closed under another job's clock, or not counted)"));
             }
-            evidence.push("the profile records no OS CPU for the process, so the spans' total can't be checked against it".to_owned());
+            let fix = match (self.facts.build.daemon_user_ns, self.facts.build.daemon_system_ns) {
+                (Some(user), Some(system)) => {
+                    let os = user + system;
+                    evidence.push(format!(
+                        "the OS says the daemon spent {} of CPU over the build ({} user, {} system); spans counted {:.0}% of it",
+                        s(os),
+                        s(user),
+                        s(system),
+                        pct(cpu, os)
+                    ));
+                    match cpu * 2 < os {
+                        true => {
+                            "the OS saw CPU no span counted: find the threads or jobs whose spans don't fill `self_cpu_ns` (a span closed on another job's clock, a thread with no ring)"
+                        }
+                        false => {
+                            "the spans count most of what the OS saw: the rest of the switches' running time is starvation (see starved workers), not CPU"
+                        }
+                    }
+                }
+                _ => {
+                    evidence.push("the build's row has no OS CPU for the daemon (a blaze before `daemon_user_ns`), so the spans' total can't be checked against it".to_owned());
+                    "a blaze that writes `builds.daemon_user_ns` checks the spans' sum against the OS; the rest is starvation (see starved workers) or CPU outside spans"
+                }
+            };
             out.push(BlindSpot {
                 kind: BlindKind::CpuGap,
                 hidden_ns: (running - cpu).max(0),
                 subject: "self_cpu_ns".to_owned(),
-                title: format!("workers ran {} that no span counted CPU for", s((running - cpu).max(0))),
+                title: format!(
+                    "workers ran {} that no span counted CPU for",
+                    s((running - cpu).max(0))
+                ),
                 evidence,
-                fix: "record the process's OS CPU (getrusage) per build beside the spans' sum; the rest is starvation (see starved workers) or CPU outside spans".to_owned(),
+                fix: fix.to_owned(),
             });
         }
         let jobs = report::job_totals(model);

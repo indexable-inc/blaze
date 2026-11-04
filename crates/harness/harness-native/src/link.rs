@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,7 +35,9 @@ pub const PAGE: usize = 100;
 const RUN_WAIT_MS: u64 = 1000;
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HARNESS_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".harness"))
+    std::env::var_os("HARNESS_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".harness")
+    })
 }
 
 pub fn sock() -> PathBuf {
@@ -88,7 +90,9 @@ fn harness_bin() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|d| d.join("harness")).find(|p| p.is_file()))
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).map(|d| d.join("harness")).find(|p| p.is_file())
+    })
 }
 
 /// Connect, or start the daemon and wait for its socket (100 tries 50 ms apart, as the CLI does).
@@ -96,11 +100,21 @@ pub fn ensure_daemon() -> Result<(), String> {
     if UnixStream::connect(sock()).is_ok() {
         return Ok(());
     }
-    let bin = harness_bin().ok_or("no harness binary: build it (cargo build -p harness --release) or set HARNESS_BIN")?;
+    let bin = harness_bin().ok_or(
+        "no harness binary: build it (cargo build -p harness --release) or set HARNESS_BIN",
+    )?;
     std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(home().join("daemon.log")).map_err(|e| e.to_string())?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home().join("daemon.log"))
+        .map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("daemon").env("HARNESS_NO_OPEN", "1").stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?).stderr(log);
+    cmd.arg("daemon")
+        .env("HARNESS_NO_OPEN", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log);
     // SAFETY: setsid in the child before exec only; it touches no state of this process.
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -140,10 +154,18 @@ fn watch_feed() -> Option<UnixStream> {
 /// Long-poll `run_read` on one `stream` of run `r{run}` from the start, handing each answer to `got`, while `live()`;
 /// until the run is done and read to the end. False when the daemon refused the stream (no chunk index for
 /// "ordered"), so the caller reads it another way.
-fn follow(run: u64, stage: Option<u32>, stream: &str, live: &dyn Fn() -> bool, mut got: impl FnMut(&Value)) -> bool {
+fn follow(
+    run: u64,
+    stage: Option<u32>,
+    stream: &str,
+    live: &dyn Fn() -> bool,
+    mut got: impl FnMut(&Value),
+) -> bool {
     let mut offset = 0u64;
     while live() {
-        let v = match request(&json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS})) {
+        let v = match request(
+            &json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS}),
+        ) {
             Ok(v) if v.get("error").is_none() => v,
             Ok(v) => {
                 if stream != "ordered" {
@@ -217,7 +239,10 @@ impl Link {
                         Ok(v) => {
                             rtt_us.store(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
                             if up != Some(LinkState::Up) {
-                                let p = request(&json!({"op": "info"})).ok().and_then(|v| v["pid"].as_u64()).unwrap_or(0);
+                                let p = request(&json!({"op": "info"}))
+                                    .ok()
+                                    .and_then(|v| v["pid"].as_u64())
+                                    .unwrap_or(0);
                                 pid.store(p as u32, Ordering::Relaxed);
                             }
                             let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
@@ -225,7 +250,9 @@ impl Link {
                             // The recent shell runs, beside the sessions they ran in.
                             match request(&json!({"op": "runs", "limit": RUNS})) {
                                 Ok(v) if v.get("error").is_none() => {
-                                    let _ = tx.send(Msg::Runs(v["runs"].as_array().cloned().unwrap_or_default()));
+                                    let _ = tx.send(Msg::Runs(
+                                        v["runs"].as_array().cloned().unwrap_or_default(),
+                                    ));
                                 }
                                 Ok(v) => eprintln!("harness-native: runs: {v}"),
                                 Err(e) => eprintln!("harness-native: runs: {e}"),
@@ -315,7 +342,13 @@ impl Link {
             return;
         }
         let Ok(mut s) = UnixStream::connect(sock()) else { return };
-        if write_frame(&mut s, T_JSON, json!({"op": "attach", "id": id, "cols": cols, "rows": rows}).to_string().as_bytes()).is_err() {
+        if write_frame(
+            &mut s,
+            T_JSON,
+            json!({"op": "attach", "id": id, "cols": cols, "rows": rows}).to_string().as_bytes(),
+        )
+        .is_err()
+        {
             return;
         }
         let Ok(w) = s.try_clone() else { return };
@@ -342,7 +375,10 @@ impl Link {
                             let _ = tx.send(Msg::Data { id, bytes: body });
                         }
                         T_EXIT => {
-                            let code = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["code"].as_i64()).unwrap_or(0);
+                            let code = serde_json::from_slice::<Value>(&body)
+                                .ok()
+                                .and_then(|v| v["code"].as_i64())
+                                .unwrap_or(0);
                             let _ = tx.send(Msg::Exit { id, code: code as i32 });
                         }
                         _ => {}
@@ -377,22 +413,37 @@ impl Link {
 
     pub fn resize(&self, id: u64, cols: u16, rows: u16) {
         if let Some((_, s)) = self.streams.lock().unwrap().get_mut(&id) {
-            let _ = write_frame(s, T_RESIZE, json!({"cols": cols, "rows": rows}).to_string().as_bytes());
+            let _ = write_frame(
+                s,
+                T_RESIZE,
+                json!({"cols": cols, "rows": rows}).to_string().as_bytes(),
+            );
         }
     }
 
     /// A new object of `kind` in `cwd`; `then` gets its id.
-    pub fn spawn(&self, kind: &str, cwd: Option<String>, cols: u16, rows: u16, then: impl FnOnce(u64) + Send + 'static) {
+    pub fn spawn(
+        &self,
+        kind: &str,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+        then: impl FnOnce(u64) + Send + 'static,
+    ) {
         let (kind, poke) = (kind.to_owned(), self.poke.clone());
-        std::thread::spawn(move || match request(&json!({"op": "spawn", "kind": kind, "cwd": cwd, "cols": cols, "rows": rows})) {
-            Ok(v) => match v["id"].as_u64() {
-                Some(id) => {
-                    let _ = poke.send(());
-                    then(id);
-                }
-                None => eprintln!("harness-native: spawn {kind}: {v}"),
-            },
-            Err(e) => eprintln!("harness-native: spawn {kind}: {e}"),
+        std::thread::spawn(move || {
+            match request(
+                &json!({"op": "spawn", "kind": kind, "cwd": cwd, "cols": cols, "rows": rows}),
+            ) {
+                Ok(v) => match v["id"].as_u64() {
+                    Some(id) => {
+                        let _ = poke.send(());
+                        then(id);
+                    }
+                    None => eprintln!("harness-native: spawn {kind}: {v}"),
+                },
+                Err(e) => eprintln!("harness-native: spawn {kind}: {e}"),
+            }
         });
     }
 
@@ -415,7 +466,12 @@ impl Link {
                 let send = |err: bool, data: &str| {
                     if !data.is_empty() {
                         counted.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
+                        let _ = tx.send(Msg::RunData {
+                            run,
+                            stage,
+                            err,
+                            bytes: data.as_bytes().to_vec(),
+                        });
                         wake();
                     }
                 };
@@ -432,7 +488,12 @@ impl Link {
                         follow(run, stage, "err", &current, |v| {
                             let data = v["data"].as_str().unwrap_or("");
                             if !data.is_empty() {
-                                let _ = tx.send(Msg::RunData { run, stage, err: true, bytes: data.as_bytes().to_vec() });
+                                let _ = tx.send(Msg::RunData {
+                                    run,
+                                    stage,
+                                    err: true,
+                                    bytes: data.as_bytes().to_vec(),
+                                });
                                 wake();
                             }
                         });
@@ -454,7 +515,9 @@ impl Link {
         let (tx, wake) = (self.tx.clone(), self.wake.clone());
         std::thread::spawn(move || {
             let runs = match request(&json!({"op": "runs", "limit": PAGE, "before": before})) {
-                Ok(v) if v.get("error").is_none() => v["runs"].as_array().cloned().unwrap_or_default(),
+                Ok(v) if v.get("error").is_none() => {
+                    v["runs"].as_array().cloned().unwrap_or_default()
+                }
                 Ok(v) => {
                     eprintln!("harness-native: runs before r{before}: {v}");
                     Vec::new()
@@ -474,15 +537,13 @@ impl Link {
     /// up to [`PAGE`]): they come as `Msg::RunsFound`.
     pub fn runs_search(&self, q: &str) {
         let (tx, wake, q) = (self.tx.clone(), self.wake.clone(), q.to_owned());
-        std::thread::spawn(move || {
-            match request(&json!({"op": "runs", "limit": PAGE, "q": q})) {
-                Ok(v) if v.get("error").is_none() => {
-                    let _ = tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
-                    wake();
-                }
-                Ok(v) => eprintln!("harness-native: runs matching {q:?}: {v}"),
-                Err(e) => eprintln!("harness-native: runs matching {q:?}: {e}"),
+        std::thread::spawn(move || match request(&json!({"op": "runs", "limit": PAGE, "q": q})) {
+            Ok(v) if v.get("error").is_none() => {
+                let _ = tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
+                wake();
             }
+            Ok(v) => eprintln!("harness-native: runs matching {q:?}: {v}"),
+            Err(e) => eprintln!("harness-native: runs matching {q:?}: {e}"),
         });
     }
 

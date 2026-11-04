@@ -140,7 +140,10 @@ impl Chord {
     pub fn of(code: u16, unshifted: Option<char>, m: crate::term::Mods) -> Option<Self> {
         let key = match named(code) {
             Some(n) => n.to_owned(),
-            None => unshifted.filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))?.to_lowercase().collect(),
+            None => unshifted
+                .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))?
+                .to_lowercase()
+                .collect(),
         };
         Some(Self { key, cmd: m.cmd, shift: m.shift, opt: m.alt, ctrl: m.ctrl })
     }
@@ -169,7 +172,13 @@ impl Chord {
     }
 
     fn of_bind(k: &Keybind) -> Self {
-        Self { key: k.key.as_str().to_lowercase(), cmd: k.cmd != 0, shift: k.shift != 0, opt: k.opt != 0, ctrl: k.ctrl != 0 }
+        Self {
+            key: k.key.as_str().to_lowercase(),
+            cmd: k.cmd != 0,
+            shift: k.shift != 0,
+            opt: k.opt != 0,
+            ctrl: k.ctrl != 0,
+        }
     }
 
     /// The modifiers as `term::Mods`.
@@ -182,7 +191,12 @@ impl Chord {
     #[must_use]
     pub fn hint(&self) -> String {
         let mut s = String::new();
-        for (on, g) in [(self.ctrl, '\u{2303}'), (self.opt, '\u{2325}'), (self.shift, '\u{21E7}'), (self.cmd, '\u{2318}')] {
+        for (on, g) in [
+            (self.ctrl, '\u{2303}'),
+            (self.opt, '\u{2325}'),
+            (self.shift, '\u{21E7}'),
+            (self.cmd, '\u{2318}'),
+        ] {
             if on {
                 s.push(g);
             }
@@ -275,7 +289,12 @@ pub fn find<'b>(binds: &'b [Bind], chord: &Chord, active: &[u64]) -> Option<&'b 
         }
         b.ctxs.iter().filter_map(|c| active.iter().position(|a| a == c)).min()
     };
-    binds.iter().filter(|b| &b.chord == chord).filter_map(|b| rank(b).map(|r| (r, b))).min_by(|(ra, a), (rb, b)| ra.cmp(rb).then(b.seq.cmp(&a.seq))).map(|(_, b)| b)
+    binds
+        .iter()
+        .filter(|b| &b.chord == chord)
+        .filter_map(|b| rank(b).map(|r| (r, b)))
+        .min_by(|(ra, a), (rb, b)| ra.cmp(rb).then(b.seq.cmp(&a.seq)))
+        .map(|(_, b)| b)
 }
 
 /// Whether binding `b` is shadowed: a later one has the same keys in the same contexts.
@@ -316,7 +335,9 @@ impl Keymap {
                 if let Some(base) = a.target(flecs::IsA::ID, 0) {
                     names.push(base.name());
                 }
-                let menu = a.try_cloned::<&MenuItem>().map(|mi| (mi.bar.as_str().to_owned(), mi.title.as_str().to_owned(), mi.sep != 0));
+                let menu = a.try_cloned::<&MenuItem>().map(|mi| {
+                    (mi.bar.as_str().to_owned(), mi.title.as_str().to_owned(), mi.sep != 0)
+                });
                 let selector = a.try_cloned::<&Selector>().map(|s| s.sel.as_str().to_owned());
                 m.acts.push(Act { id: *a.id(), names, menu, selector });
             });
@@ -331,14 +352,21 @@ impl Keymap {
                     return;
                 };
                 if action.parent().map(|p| *p.id()) != act_root {
-                    problems.push(format!("key.{name} does {}, which is not an act.X", action.name()));
+                    problems
+                        .push(format!("key.{name} does {}, which is not an act.X", action.name()));
                     return;
                 }
                 let mut ctxs = Vec::new();
                 k.each_target(When::id(), |c| ctxs.push(*c.id()));
                 ctxs.sort_unstable();
                 let seq = m.binds.len();
-                m.binds.push(Bind { name, chord: Chord::of_bind(&kb), ctxs, action: *action.id(), seq });
+                m.binds.push(Bind {
+                    name,
+                    chord: Chord::of_bind(&kb),
+                    ctxs,
+                    action: *action.id(),
+                    seq,
+                });
             });
         }
         for p in problems {
@@ -362,7 +390,10 @@ impl Keymap {
     /// menu bar and the palette show for it.
     #[must_use]
     pub fn primary(&self, id: u64) -> Option<&Chord> {
-        self.binds.iter().find(|b| b.action == id && b.ctxs.is_empty() && !shadowed(&self.binds, b)).map(|b| &b.chord)
+        self.binds
+            .iter()
+            .find(|b| b.action == id && b.ctxs.is_empty() && !shadowed(&self.binds, b))
+            .map(|b| &b.chord)
     }
 
     /// [`primary`](Self::primary)'s hint for the action named `name`, or nothing.
@@ -377,7 +408,13 @@ mod tests {
     use super::*;
 
     fn b(seq: usize, chord: &str, ctxs: &[u64], action: u64) -> Bind {
-        Bind { name: format!("b{seq}"), chord: Chord::parse(chord).unwrap(), ctxs: ctxs.to_vec(), action, seq }
+        Bind {
+            name: format!("b{seq}"),
+            chord: Chord::parse(chord).unwrap(),
+            ctxs: ctxs.to_vec(),
+            action,
+            seq,
+        }
     }
 
     #[test]
@@ -394,7 +431,9 @@ mod tests {
             // A user override after the defaults: same keys, same (no) context; it wins.
             b(5, "cmd+n", &[], 6),
         ];
-        let at = |c: &str, active: &[u64]| find(&binds, &Chord::parse(c).unwrap(), active).map(|b| b.action);
+        let at = |c: &str, active: &[u64]| {
+            find(&binds, &Chord::parse(c).unwrap(), active).map(|b| b.action)
+        };
         // Later wins a tie.
         assert_eq!(at("cmd+n", &[TERM]), Some(6));
         assert!(shadowed(&binds, &binds[0]));

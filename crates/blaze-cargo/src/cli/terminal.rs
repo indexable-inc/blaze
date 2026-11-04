@@ -1,32 +1,20 @@
 //! What stderr's terminal does, worked out once a command for the one renderer
 //! ([`blaze_report::terminal`]): from `[terminal]` of blaze's `config.toml`, the file the
-//! launcher's `[update]` is in (`$BLAZE_HOME/config.toml`, else `~/.blaze/config.toml`), and the
-//! environment. The driver of [`blaze_report::terminal::detect`], which is pure: this reads the
-//! file, the variables and whether stderr is a terminal.
+//! launcher's `[update]` is in (found by `blaze_manifest::user_config`), and the environment.
+//! The driver of [`blaze_report::terminal::detect`], which is pure: this reads the file, the
+//! variables and whether stderr is a terminal.
 
-use std::{
-    io::IsTerminal as _,
-    path::{Path, PathBuf},
-};
+use std::io::IsTerminal as _;
 
 use blaze_report::terminal::{Color, Config, Terminal};
-
-/// blaze's `config.toml`: under `$BLAZE_HOME`, else `~/.blaze`; `None` when neither says.
-pub fn config_file(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    match var("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        Some(home) => Some(Path::new(&home).join("config.toml")),
-        None => var("HOME")
-            .filter(|it| !it.is_empty())
-            .map(|home| Path::new(&home).join(".blaze").join("config.toml")),
-    }
-}
 
 /// `[terminal]` of blaze's `config.toml`, its defaults where there is no file. A file that can't
 /// be read, or that says what `[terminal]` does not take, is an error naming it.
 pub fn config() -> Result<Config, String> {
-    let Some(file) = config_file(|name| std::env::var(name).ok()) else {
+    let Some(home) = blaze_manifest::user_config::home() else {
         return Ok(Config::DEFAULT);
     };
+    let file = blaze_manifest::user_config::file(&home);
     match std::fs::read_to_string(&file) {
         Ok(text) => Config::from_toml(&text).map_err(|why| format!("{}: {why}", file.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::DEFAULT),

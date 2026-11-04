@@ -32,9 +32,10 @@ served it from its `blaze-work` line: `daemon, patched` or `daemon, placed` (how
 linked), or `NOT SERVED` when it printed none.
 
 Every warm `blaze build` (no-op and edits) runs with BLAZE_PROFILE, and the row keeps
-where the time of its median run went: the client's breakdown of its wall time into steps of
-the client and the daemon, plus the time outside the client (cargo, process
-start). `--table FILE` prints the results table and that breakdown table.
+where the time of its median run went: the build's critical path from the trace BLAZE_PROFILE
+exports from the daemon's history (`blaze debug time --trace`'s), summed by the kind of each
+link, plus the time of the command outside that path (cargo, process start, the client).
+`--table FILE` prints the results table and that breakdown table.
 
 Results go to WORK/realbench.json (rows replaced per project) and a table on stdout.
 """
@@ -143,17 +144,25 @@ def how_built(stdout):
 
 async def traced(argv, cwd, env, step, trace):
     """Runs a `blaze build` with BLAZE_PROFILE in the directory `trace`; the result is
-    run()'s and where its time went, from the profile's trace: the client's breakdown (ms,
-    adding up to its wall time) and the time outside the client (cargo before and after it,
-    process start)."""
+    run()'s and where its time went, from the exported trace's critical path: each kind of
+    link's time (ms), and the command's time outside the path (cargo before and after it,
+    process start, the client)."""
     took, rc, out, err = await run(argv, cwd, dict(env, BLAZE_PROFILE=trace), step)
     try:
-        ours = json.load(open(os.path.join(trace, "trace.json")))["blaze"]
+        events = json.load(open(os.path.join(trace, "trace.json")))["traceEvents"]
         shutil.rmtree(trace)
     except (OSError, ValueError, KeyError):
         return took, rc, out, err, None
-    rows = [[name, round(us / 1000, 1)] for name, us in ours["breakdown"]]
-    rows.append(["outside the client", round(took * 1000 - ours["total_us"] / 1000, 1)])
+    tracks = {(e["pid"], e["tid"]) for e in events
+              if e.get("ph") == "M" and e.get("name") == "thread_name" and e.get("args", {}).get("name") == "critical path"}
+    by_kind = {}
+    for e in events:
+        if e.get("ph") == "X" and (e.get("pid"), e.get("tid")) in tracks:
+            by_kind[e["cat"]] = by_kind.get(e["cat"], 0) + e["dur"]
+    if not tracks:
+        return took, rc, out, err, None
+    rows = [[kind, round(us / 1000, 1)] for kind, us in by_kind.items()]
+    rows.append(["outside the critical path", round(took * 1000 - sum(by_kind.values()) / 1000, 1)])
     return took, rc, out, err, rows
 
 
@@ -324,8 +333,8 @@ def table(rows):
 
 
 def breakdown_table(rows, top=7):
-    """Where the time of each warm row's median run went: its biggest steps, then what no step
-    covers and what is outside the client, in ms. The steps add up to the run's time."""
+    """Where the time of each warm row's median run went: its critical path's biggest kinds of
+    link, then the time outside the path, in ms. The steps add up to the run's time."""
     lines = ["| Project | Step | blaze (median run) | Where the time went (ms) |", "|---|---|---:|---|"]
     for name, row in rows.items():
         label = f"{name} {row.get('tag', '')}".strip()
@@ -334,7 +343,7 @@ def breakdown_table(rows, top=7):
             b = (part or {}).get("breakdown")
             if not b:
                 continue
-            fixed = ("unaccounted", "outside the client")
+            fixed = ("outside the critical path",)
             steps = sorted((s for s in b["steps"] if s[0] not in fixed), key=lambda s: -s[1])
             shown = [f"{n} {ms:.1f}" for n, ms in steps[:top]]
             rest = sum(ms for _, ms in steps[top:])

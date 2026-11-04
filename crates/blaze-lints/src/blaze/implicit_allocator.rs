@@ -37,7 +37,9 @@ use base_db::Db;
 use blaze_hash::HashMap;
 use hir::HirDisplay as _;
 use hir_def::{AdtId, HasModule as _, hir::Expr};
-use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use hir_ty::next_solver::{
+    AliasTyKind, DbInterner, OpaqueTyIdWrapper, Ty, TyKind, ensure_sufficient_stack,
+};
 use rustc_type_ir::{
     TypeSuperVisitable as _, TypeVisitable as _, TypeVisitor, inherent::IntoKind as _,
 };
@@ -172,15 +174,49 @@ struct Collect<'a, 'db> {
     db: &'db Db,
     allocators: &'a Allocators,
     walk: Walk,
-    /// Opaque types walked, so a bound that names its own opaque type ends.
-    opaque: Vec<Ty<'db>>,
+    /// The types whose `impl Trait` bounds were walked, each walked once: a bound names the
+    /// type it bounds (`impl Iterator`'s `Self: Iterator`), so without this a walk of the
+    /// bounds walks them again, forever, as rustc's opaque-type walks keep a set of the
+    /// opaque types they have seen.
+    expanded: Vec<Expanded<'db>>,
     found: Vec<(Ty<'db>, Implicit)>,
+}
+
+/// What a walk of `impl Trait` bounds is keyed by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Expanded<'db> {
+    /// An opaque type (`-> impl Trait`, an RPITIT), by its definition, not its arguments: its
+    /// bounds can name it again with other arguments (a recursive `impl Trait` through an
+    /// associated type), and its arguments are walked as the type's own parts anyway.
+    Opaque(OpaqueTyIdWrapper<'db>),
+    /// An argument-position `impl Trait` parameter, or a coroutine: by the type itself.
+    Ty(Ty<'db>),
+}
+
+impl<'db> Expanded<'db> {
+    fn of(ty: Ty<'db>) -> Expanded<'db> {
+        match ty.kind() {
+            TyKind::Alias(_, alias) => match alias.kind {
+                AliasTyKind::Opaque { def_id } => Expanded::Opaque(def_id),
+                _ => Expanded::Ty(ty),
+            },
+            _ => Expanded::Ty(ty),
+        }
+    }
 }
 
 impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, 'db> {
     type Result = ();
 
     fn visit_ty(&mut self, ty: Ty<'db>) {
+        // A walk goes as deep as the type is nested: on a fiber's stack, grow it rather than
+        // run into its guard page, which takes the whole daemon down, not one job.
+        ensure_sufficient_stack(|| self.visit_ty_here(ty));
+    }
+}
+
+impl<'db> Collect<'_, 'db> {
+    fn visit_ty_here(&mut self, ty: Ty<'db>) {
         if let Some(it) = self.allocators.implicit(self.db, ty) {
             self.found.push((ty, it));
         }
@@ -201,13 +237,11 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, 'db> {
             Walk::Owned if behind => {}
             Walk::Owned => ty.super_visit_with(self),
             Walk::Written => {
-                if matches!(ty.kind(), TyKind::Alias(..)) {
-                    if self.opaque.contains(&ty) {
-                        return;
-                    }
-                    self.opaque.push(ty);
-                }
-                if let Some(bounds) = ty.impl_trait_bounds(self.db) {
+                let key = Expanded::of(ty);
+                if !self.expanded.contains(&key)
+                    && let Some(bounds) = ty.impl_trait_bounds(self.db)
+                {
+                    self.expanded.push(key);
                     bounds.visit_with(self);
                 }
                 ty.super_visit_with(self);
@@ -224,7 +258,7 @@ fn collect<'db>(
     walk: Walk,
 ) -> Vec<(Ty<'db>, Implicit)> {
     // alloc: a lint's walk of one type, dropped when it returns
-    let mut it = Collect { db, allocators, walk, opaque: Vec::new(), found: Vec::new() };
+    let mut it = Collect { db, allocators, walk, expanded: Vec::new(), found: Vec::new() };
     ty.visit_with(&mut it);
     it.found
 }

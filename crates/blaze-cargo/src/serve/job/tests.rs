@@ -85,8 +85,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         links: Vec::new(),
         linked: Vec::new(),
         misses: Vec::new(),
-        panics: Vec::new(),
-        profiled: false,
+        test_runs: Vec::new(),
+        opened_cpu: None,
         opened_ns: 0,
         opened_unix_ns: None,
         leases: Arc::default(),
@@ -190,34 +190,6 @@ fn cargos_own_invocation_is_kept_whole() {
     assert_eq!(made.args, vec!["--workspace".to_owned()]);
     assert_eq!(made.cwd, "/w/a");
     assert_eq!(made.env, vec![("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned())]);
-}
-
-/// A job is profiled when its cargo command line's environment names a directory in
-/// `BLAZE_PROFILE`; an empty value, an agent's request and work of no targets are not.
-#[test]
-fn a_job_is_profiled_when_its_command_line_names_a_directory() {
-    let with = |env: Vec<(String, String)>| {
-        let mut targets = targets();
-        targets.cargo = Some(blaze_api::Cargo {
-            command: "build".into(),
-            args: Vec::new(),
-            root: "/w".into(),
-            cwd: "/w".into(),
-            env,
-            files: Vec::new(),
-            color: false,
-            width: None,
-            verbose: 0,
-            refused: Some(16),
-        });
-        Work::Build(targets)
-    };
-    let named = vec![("BLAZE_PROFILE".into(), "/tmp/p".into()), ("PATH".into(), "/bin".into())];
-    assert_eq!(profile_dir(&with(named)), Some("/tmp/p"));
-    assert_eq!(profile_dir(&with(vec![("BLAZE_PROFILE".into(), String::new())])), None);
-    assert_eq!(profile_dir(&with(vec![("PATH".into(), "/bin".into())])), None);
-    assert_eq!(profile_dir(&Work::Build(targets())), None);
-    assert_eq!(profile_dir(&Work::Snapshot), None);
 }
 
 #[test]

@@ -65,7 +65,7 @@ Both backends run one blaze, `BLAZE_BIN`, which has LLVM as every native blaze d
 is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the release profile
 (`--release`), on both sides.
 """
-import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, counters, memory, storelib
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed
@@ -628,22 +628,12 @@ def cold_steps(out):
     return {name: round(s, 3) for name, s in work_steps(out, 1e-6).items()}
 
 
-# The steps of compiling one function, as the profile's spans name them.
-COMPILE_STEPS = ("infer", "mir", "monomorphize", "translate", "describe", "store read", "store write")
-
-
-def thread_steps(text, profile=None):
-    """With the directory of a build's profile (BLAZE_PROFILE), what the daemon's threads
-    spent on each step of compiling a function: seconds summed over the threads. v1's
-    `backend:` lines of each producer were its workers' logs, which v2 has none of."""
+def thread_steps(text):
+    """What the daemon's threads spent on each producer in `text`: seconds summed over the
+    threads. v1's `backend:` lines of each producer were its workers' logs, which v2 has none
+    of, so this is empty until v2 says it."""
     del text
-    steps = {}
-    phases = os.path.join(profile, "phases.tsv") if profile else None
-    if phases and os.path.exists(phases):
-        for row in csv.DictReader(open(phases), delimiter="\t"):
-            if row["phase"] in COMPILE_STEPS:
-                steps[row["phase"]] = round(float(row["wall_ms"]) / 1000, 3)
-    return steps
+    return {}
 
 
 def compiled(out):

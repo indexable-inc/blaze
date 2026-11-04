@@ -23,6 +23,7 @@
 //!   span its `job` span names as its `creator` (a job given by a thread on no fiber, the
 //!   daemon's loop): the critical path crosses from a job's start to it.
 
+pub mod cpu;
 pub mod html;
 pub mod load;
 pub mod path;
@@ -59,6 +60,9 @@ pub struct SwitchIn {
     pub began_as: Option<u64>,
     /// `switches.queued_ns`: how long a `started` or `ran` job waited for a core before it began.
     pub queued_ns: Option<i64>,
+    /// `switches.cpu_ns`: the thread's CPU time read at the switch ([`cpu`]); `None` when not
+    /// read.
+    pub cpu_ns: Option<i64>,
 }
 
 impl SwitchIn {
@@ -84,6 +88,7 @@ impl SwitchIn {
             since_ns: None,
             began_as: None,
             queued_ns: None,
+            cpu_ns: None,
         }
     }
 }
@@ -218,8 +223,8 @@ pub struct SpanIn {
     pub creator: Option<u64>,
     pub start_ns: i64,
     pub dur_ns: i64,
-    /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
-    /// when not counted.
+    /// `spans.self_cpu_ns`: its CPU while it was the innermost span its thread was inside
+    /// ([`cpu`]); `None` when not counted.
     pub self_cpu_ns: Option<i64>,
     /// `spans.folded_ns`: its children too short for a row each ([`crate::flight::FOLD_BELOW`]),
     /// summed; 0 when none was. They ran inside it, so its uncovered time leaves them out.
@@ -329,20 +334,44 @@ impl SpanIn {
     }
 }
 
-/// An event as the model takes it: the columns of `events` it reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An event as the model takes it: the columns of `events` it reads, and its rows of
+/// `event_fields`. A profiled process's part keeps its events so too.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct EventIn {
     pub process: u32,
     pub thread: u32,
     pub t_ns: i64,
+    /// The build it was part of.
+    #[serde(default)]
+    pub build: Option<u64>,
     /// The job running on the thread, as a switch's `job` names it.
     pub job: Option<u64>,
     pub level: String,
     pub target: String,
     pub name: String,
+    /// Its message alone.
     pub message: Option<String>,
     /// The span it happened in, as a span's `span_id`.
     pub span: Option<u64>,
+    /// Its id in its process, as `events.event_id`.
+    #[serde(default)]
+    pub event_id: u64,
+    /// Its fields other than its message, in the order it recorded them: each key and value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, crate::logs::Value)>,
+}
+
+impl EventIn {
+    /// Its message, then each field as `key=value`: a label.
+    pub fn said(&self) -> String {
+        let message = self.message.as_deref().unwrap_or("(its text was let go)");
+        match self.fields.is_empty() {
+            // alloc: a label, once an event a report
+            true => message.to_owned(),
+            // alloc: a label, once an event a report
+            false => format!("{message} {}", crate::logs::fields_text(&self.fields)),
+        }
+    }
 }
 
 /// A build's rows.
@@ -379,6 +408,7 @@ impl Input {
                     since_ns: it.since_ns,
                     began_as: it.began_as,
                     queued_ns: it.queued_ns,
+                    cpu_ns: it.cpu_ns.map(|it| it as i64),
                 })
             })
             // alloc: the dump's switches, once a dump
@@ -407,6 +437,19 @@ impl Input {
                 folded_ns: it.folded_ns,
             });
         }
+        // alloc: the dump's fields by event, once a dump
+        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> =
+            HashMap::new_in(Global);
+        for it in &read.fields {
+            let key = flight::meta(it.site)
+                .and_then(|meta| meta.fields().iter().nth(usize::from(it.index)))
+                .map_or("?", |it| it.name());
+            // alloc: a field, once a field a dump
+            fields
+                .entry(it.event_id)
+                .or_default()
+                .push((key.to_owned(), crate::logs::Value::of(it.value)));
+        }
         let events = read
             .events
             .iter()
@@ -416,6 +459,7 @@ impl Input {
                     process,
                     thread: it.thread,
                     t_ns: it.t_ns,
+                    build: (it.build != 0).then_some(u64::from(it.build)),
                     job: (it.job != 0).then_some(it.job),
                     // alloc: an event's labels, once an event a dump
                     level: meta.map_or("?", |it| it.level().as_str()).to_owned(),
@@ -423,6 +467,8 @@ impl Input {
                     name: meta.map_or("?", |it| it.name()).to_owned(),
                     message: text(it.message),
                     span: (it.span != 0).then_some(it.span),
+                    event_id: it.event_id,
+                    fields: fields.remove(&it.event_id).unwrap_or_default(),
                 }
             })
             // alloc: the dump's events, once a dump
@@ -462,6 +508,9 @@ pub enum TimeError {
     },
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
+    /// The rows of a daemon that died could not be read back from its flight recorder's
+    /// mapping, or written into the history ([`crate::history::recover_dead`]).
+    Postmortem(crate::history::HistoryError),
     Io {
         path: std::path::PathBuf,
         doing: &'static str,
@@ -516,6 +565,9 @@ impl fmt::Display for TimeError {
             }
             TimeError::History(error) => {
                 write!(f, "writing a derived table into the history: {error}")
+            }
+            TimeError::Postmortem(error) => {
+                write!(f, "reading back the last rows of a daemon that died: {error}")
             }
             TimeError::Io { path, doing, error } => {
                 write!(f, "{doing} {}: {error}", path.display())

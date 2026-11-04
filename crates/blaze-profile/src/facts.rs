@@ -7,6 +7,11 @@
 //! computed again, and why (`misses`), is noted with [`crate::history::History::missed`], the
 //! parts of each such key (`key_parts`) with [`crate::history::History::keyed`], and why the
 //! query engine ran each run (`provenance`) with [`crate::history::History::ran`].
+//!
+//! Every child process a driver reaped (`processes`) comes through [`observe_children`]: the
+//! driver's reap hands it to [`reaped`] on whatever thread reaped it, which queues it in
+//! [`CHILDREN`] for the next flush to take ([`take_processes`]). The tests a build ran
+//! (`test_runs`) come with its end, as its links do ([`crate::history::History::tests_ran`]).
 
 use arrow_array::{
     ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
@@ -166,6 +171,180 @@ pub struct MissRow {
     pub changed: Option<u32>,
     pub of: Option<u32>,
     pub since: Option<u64>,
+}
+
+/// A row of the schema's `processes` table: one child process blaze spawned and reaped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessRow {
+    /// The build it worked for, 0 for none.
+    pub build_id: u64,
+    pub pid: u32,
+    /// `build_script`, `test`, `run`, `proc_macro_host`, `linker`, `wrapper`, or `unlabelled`.
+    pub kind: &'static str,
+    pub unit: Option<String>,
+    pub program: String,
+    /// The span it was spawned inside, 0 for none.
+    pub parent_span: u64,
+    /// On the schema's clock ([`crate::clock::mono_ns`]).
+    pub spawned_ns: i64,
+    pub exec_ns: Option<i64>,
+    pub exited_ns: i64,
+    pub sandbox_ns: Option<i64>,
+    pub user_ns: i64,
+    pub system_ns: i64,
+    pub peak_rss: Option<u64>,
+    pub minor_faults: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub voluntary_switches: Option<u64>,
+    pub involuntary_switches: Option<u64>,
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+/// How a test ended, as `test_runs.outcome` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestOutcome {
+    Passed,
+    Failed,
+    Ignored,
+    TimedOut,
+    /// A signal ended it, or it could not be run or its result had.
+    Crashed,
+}
+
+impl TestOutcome {
+    pub const fn name(self) -> &'static str {
+        match self {
+            TestOutcome::Passed => "passed",
+            TestOutcome::Failed => "failed",
+            TestOutcome::Ignored => "ignored",
+            TestOutcome::TimedOut => "timed_out",
+            TestOutcome::Crashed => "crashed",
+        }
+    }
+}
+
+/// A row of the schema's `test_runs` table: one test the test queue finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestRunRow {
+    pub build_id: u64,
+    pub test: String,
+    pub krate: Option<String>,
+    pub binary: String,
+    pub outcome: TestOutcome,
+    pub dur_ns: i64,
+    /// Attempts after the first.
+    pub retries: u32,
+    /// When the queue took its outcome, on the schema's clock.
+    pub ended_ns: i64,
+}
+
+/// The children reaped since the last flush took them: pushed by whichever thread reaped one,
+/// taken by the history's flush. Unbounded as a queue, bounded in practice by the children a
+/// flush interval reaps; a process with no history never installs the observer that fills it.
+static CHILDREN: crossbeam_queue::SegQueue<ProcessRow> = crossbeam_queue::SegQueue::new();
+
+/// Has every child a driver reaps from now on queued as a `processes` row, each label naming
+/// the build this thread works for and the span it is inside ([`crate::flight::current_build`],
+/// [`crate::flight::giving_span`]). Once a process; called by [`crate::install`].
+pub fn observe_children() {
+    blaze_core::reaped::observe(context, reaped);
+}
+
+fn context() -> (u64, u64) {
+    (u64::from(crate::flight::current_build()), crate::flight::giving_span())
+}
+
+/// A child reaped, as its row, queued for the next flush.
+pub fn reaped(child: &blaze_core::reaped::Reaped<'_>) {
+    CHILDREN.push(process_row(child));
+}
+
+/// The row of `child`, its instants on the schema's clock.
+pub fn process_row(child: &blaze_core::reaped::Reaped<'_>) -> ProcessRow {
+    let ns = |it: std::time::Duration| i64::try_from(it.as_nanos()).unwrap_or(i64::MAX);
+    let (kind, unit, build_id, parent_span) = match &child.label {
+        // clone: the unit's name, once per reaped child
+        Some(label) => (label.kind, label.unit.clone(), label.build, label.span),
+        None => ("unlabelled", None, 0, 0),
+    };
+    ProcessRow {
+        build_id,
+        pid: child.pid,
+        kind,
+        unit,
+        program: child.program.display().to_string(), // alloc: the program's path, once per reaped child
+        parent_span,
+        spawned_ns: crate::clock::mono_of(child.spawned),
+        exec_ns: Some(crate::clock::mono_of(child.executed)),
+        exited_ns: crate::clock::mono_of(child.exited),
+        sandbox_ns: child.sandbox.map(ns),
+        user_ns: ns(child.user),
+        system_ns: ns(child.system),
+        peak_rss: Some(child.peak_rss),
+        minor_faults: Some(child.minor_faults),
+        major_faults: Some(child.major_faults),
+        voluntary_switches: Some(child.voluntary_switches),
+        involuntary_switches: Some(child.involuntary_switches),
+        code: child.code,
+        signal: child.signal,
+    }
+}
+
+/// Every child queued since the last take, oldest first, into `into`.
+pub fn take_processes(into: &mut Vec<ProcessRow>) {
+    while let Some(row) = CHILDREN.pop() {
+        into.push(row);
+    }
+}
+
+/// The `processes` rows of `rows`, all reaped by the process `pid`.
+pub fn processes(rows: &[ProcessRow], pid: u32) -> Result<RecordBatch, ArrowError> {
+    let int =
+        |of: fn(&ProcessRow) -> Option<i64>| column(Int64Array::from_iter(rows.iter().map(of)));
+    let count =
+        |of: fn(&ProcessRow) -> Option<u64>| column(UInt64Array::from_iter(rows.iter().map(of)));
+    let word = |it: Option<i32>| it.map(|it| it as u32);
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        count(|it| (it.build_id != 0).then_some(it.build_id)),
+        column(UInt32Array::from_value(pid, rows.len())),
+        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.pid))),
+        dict(rows.iter().map(|it| Some(it.kind))),
+        column(StringArray::from_iter(rows.iter().map(|it| it.unit.as_deref()))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.program.as_str()))),
+        count(|it| (it.parent_span != 0).then_some(it.parent_span)),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.spawned_ns))),
+        int(|it| it.exec_ns),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.exited_ns))),
+        int(|it| it.sandbox_ns),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.user_ns))),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.system_ns))),
+        count(|it| it.peak_rss),
+        count(|it| it.minor_faults),
+        count(|it| it.major_faults),
+        count(|it| it.voluntary_switches),
+        count(|it| it.involuntary_switches),
+        column(UInt32Array::from_iter(rows.iter().map(|it| word(it.code)))),
+        column(UInt32Array::from_iter(rows.iter().map(|it| word(it.signal)))),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::PROCESSES), columns)
+}
+
+/// The `test_runs` rows of `rows`.
+pub fn test_runs(rows: &[TestRunRow]) -> Result<RecordBatch, ArrowError> {
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.test.as_str()))),
+        dict(rows.iter().map(|it| it.krate.as_deref())),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.binary.as_str()))),
+        dict(rows.iter().map(|it| Some(it.outcome.name()))),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.dur_ns))),
+        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.retries))),
+        column(Int64Array::from_iter_values(rows.iter().map(|it| it.ended_ns))),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::TEST_RUNS), columns)
 }
 
 /// The `links` rows of `rows`.

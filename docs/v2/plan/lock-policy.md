@@ -118,7 +118,7 @@ What each entry means, and the choices made:
 - `crates/blaze-units/src/load/invocation.rs`: `--no-locked`, `CI`/`TF_BUILD` (read apart from
   the variables cargo reads, since cargo's `CI` changes `incremental`), `BLAZE_LOCK`, the
   running release (`BuildConfig::blaze`).
-- `crates/blaze-api`: `Request::Lock` and `Work::Lock` (schema 37); `crates/blaze-cargo`'s job
+- `crates/blaze-api`: `Request::Lock` and `Work::Lock` (schema 39); `crates/blaze-cargo`'s job
   writes the lock files and ends the job after the load, so `blaze lock` resolves, writes and
   stops, checking nothing.
 - Harnesses: `BLAZE_LOCK=write` where children start (`harness/ci.py` `run_one`,

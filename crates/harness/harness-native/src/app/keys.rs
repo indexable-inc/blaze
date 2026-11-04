@@ -2,8 +2,8 @@
 //! reloaded when the user's file changes), a key matched against their bindings in the active contexts
 //! ([`crate::keys::find`]), and the matched action run by the handler registered under its name. The menu bar and the
 //! palette's hints are read from the same keymap.
-use super::*;
 use super::archive::SearchEdit;
+use super::*;
 use crate::keys::{self, Chord, Keymap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,15 +28,23 @@ type Handler = fn(&mut App, u64, Option<&Chord>);
 /// The handlers, by action name (an action without one of its own runs its base's: `SpawnClaude` runs `Spawn`'s).
 const HANDLERS: &[(&str, Handler)] = &[
     ("Spawn", |a, act, _| {
-        let kind = a.world.entity_from_id(act).try_cloned::<&keys::SpawnKind>().map(|k| k.kind.as_str().to_owned()).unwrap_or_else(|| "shell".into());
+        let kind = a
+            .world
+            .entity_from_id(act)
+            .try_cloned::<&keys::SpawnKind>()
+            .map(|k| k.kind.as_str().to_owned())
+            .unwrap_or_else(|| "shell".into());
         a.spawn(&kind);
     }),
     ("Archive", |a, _, _| a.kill()),
     ("SelectAll", |a, _, _| a.select_all()),
     ("ToggleSidebar", |a, _, _| a.toggle_sidebar()),
-    ("Palette", |a, _, _| a.palette = if a.palette.is_some() { None } else { Some(Palette::new()) }),
+    ("Palette", |a, _, _| {
+        a.palette = if a.palette.is_some() { None } else { Some(Palette::new()) }
+    }),
     ("Zoom", |a, act, _| {
-        let step = a.world.entity_from_id(act).try_cloned::<&keys::ZoomStep>().map_or(1, |z| z.step);
+        let step =
+            a.world.entity_from_id(act).try_cloned::<&keys::ZoomStep>().map_or(1, |z| z.step);
         a.step_zoom(step.signum());
     }),
     ("ZoomReset", |a, _, _| a.step_zoom(0)),
@@ -89,7 +97,12 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("SearchErase", |a, _, _| a.archive_search(SearchEdit::Erase)),
     ("ArchiveOpenFirst", |a, _, _| a.archive_open_first()),
     ("SendBytes", |a, act, _| {
-        let bytes = a.world.entity_from_id(act).try_cloned::<&keys::Bytes>().map(|b| keys::caret(b.bytes.as_str())).unwrap_or_default();
+        let bytes = a
+            .world
+            .entity_from_id(act)
+            .try_cloned::<&keys::Bytes>()
+            .map(|b| keys::caret(b.bytes.as_str()))
+            .unwrap_or_default();
         // Typing into the terminal: the tree gives the keyboard back.
         a.tree_focus = false;
         a.typed();
@@ -145,7 +158,10 @@ impl App {
         let user = std::fs::read_to_string(&self.key_file.path).ok();
         match self.run_keys(user.as_deref()) {
             Err(e) if user.is_some() => {
-                eprintln!("harness-native: {}: {e}; using the default keys", self.key_file.path.display());
+                eprintln!(
+                    "harness-native: {}: {e}; using the default keys",
+                    self.key_file.path.display()
+                );
                 self.run_keys(None)?;
             }
             r => r?,
@@ -182,7 +198,10 @@ impl App {
     pub(super) fn reload_keys_if_changed(&mut self) {
         if self.key_file.changed.swap(false, Ordering::AcqRel) {
             match self.load_keys() {
-                Ok(()) => eprintln!("harness-native: keys reloaded ({} bindings)", self.keymap.binds.len()),
+                Ok(()) => eprintln!(
+                    "harness-native: keys reloaded ({} bindings)",
+                    self.keymap.binds.len()
+                ),
                 Err(e) => eprintln!("harness-native: keys: {e}"),
             }
         }
@@ -208,7 +227,9 @@ impl App {
     /// Run the binding `chord` matches in the active contexts, if one does.
     pub fn dispatch(&mut self, chord: &Chord) -> Outcome {
         let active = self.active_contexts();
-        let Some(action) = keys::find(&self.keymap.binds, chord, &active).map(|b| b.action) else { return Outcome::None };
+        let Some(action) = keys::find(&self.keymap.binds, chord, &active).map(|b| b.action) else {
+            return Outcome::None;
+        };
         self.run_action(action, Some(chord))
     }
 
@@ -219,7 +240,8 @@ impl App {
         if let Some(sel) = &act.selector {
             return Outcome::Selector(sel.clone());
         }
-        let handler = act.names.iter().find_map(|n| HANDLERS.iter().find(|(h, _)| h == n).map(|(_, f)| *f));
+        let handler =
+            act.names.iter().find_map(|n| HANDLERS.iter().find(|(h, _)| h == n).map(|(_, f)| *f));
         match handler {
             Some(f) => {
                 f(self, id, chord);

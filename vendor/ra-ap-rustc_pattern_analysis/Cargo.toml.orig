@@ -1,0 +1,32 @@
+[dependencies]
+rustc-hash = "2.0.0"
+rustc_apfloat = "0.2.0"
+tracing = "0.1"
+
+[dependencies.rustc_index]
+default-features = false
+package = "ra-ap-rustc_index"
+version = "0.179.0"
+
+[dependencies.smallvec]
+features = ["union"]
+version = "1.8.1"
+
+[dev-dependencies]
+tracing-tree = "0.4.1"
+
+[dev-dependencies.tracing-subscriber]
+default-features = false
+features = ["fmt", "env-filter", "ansi"]
+version = "0.3.3"
+
+[features]
+rustc = []
+
+[package]
+description = "\nAutomatically published version of the package `rustc_pattern_analysis`\nin the rust-lang/rust repository from commit dc44e7f2c436b6041742e138b9c2176f093196d5\n\nThe publishing script for this crate lives at:\nhttps://github.com/rust-analyzer/rustc-auto-publish\n"
+edition = "2024"
+license = "MIT / Apache-2.0"
+name = "ra-ap-rustc_pattern_analysis"
+repository = "https://github.com/rust-lang/rust"
+version = "0.179.0"

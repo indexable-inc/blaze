@@ -11,7 +11,9 @@
 # Style never turns this red: what blaze fmt changes is committed. It fails only when formatting
 # itself cannot run on a file (a `mod` whose file is missing, a parse error, a rustfmt.toml
 # option blaze fmt does not run), and then blaze fmt names each such file, all in one run, and
-# what it could format is still committed.
+# what it could format is still committed. It also fails, pushing nothing, when a second run
+# of blaze fmt changes the first's output: the formatter is not idempotent, and the file it
+# names is a blaze fmt bug.
 name: fmt
 on:
   push:
@@ -47,6 +49,21 @@ jobs:
         id: fmt
         continue-on-error: true
         run: blaze fmt --all
+      # A second run changes nothing, or nothing is pushed: a formatter that moves its own output
+      # again commits `fmt` on every run, each push starting the next (it did on 2026-11-04, on an
+      # attribute inside a macro_rules! body). The first run's output is staged, so what the
+      # second run changes is the worktree's diff from it. The second run's exit status is the
+      # first's again (the step above and the last step report it), so it is not checked here.
+      - name: a second blaze fmt --all changes nothing
+        run: |
+          git add -u
+          blaze fmt --all || true
+          if ! git diff --quiet; then
+            echo "::error::blaze fmt is not idempotent: a second run changed $(git diff --name-only | paste -sd ' ' -); nothing is pushed"
+            git diff --stat
+            exit 1
+          fi
+          git reset -q
       - name: commit and push
         run: |
           git diff --quiet && { echo "formatted already"; exit 0; }

@@ -87,15 +87,17 @@ https://ix.dev/explore#127.0.0.1:<port>/<token>/<certhash>
 The certificate is self-signed ECDSA P-256 with SHA-256, made with rcgen (the `ring` backend),
 for `127.0.0.1` and `localhost`, with the CN `blaze explore`. It is made when the server starts
 and is valid for 13 days, starting 60 s before it was made: 13 days and 60 s in all, under the
-14 days that WebTransport's `serverCertificateHashes` allows. wtransport's client checks the same
-rules (P-256, at most 14 days, now inside the validity), so the session test proves the page
-will accept it.
+14 days that WebTransport's `serverCertificateHashes` allows. blaze-http's HTTP/3 client
+(`blaze_http::h3::check_pinned`) checks the same rules (P-256, at most 14 days, now inside the
+validity), so the session test proves the page will accept it as far as those rules go; a real
+Chrome against the probe is the check of the rest (docs/v2/plan/observe/http3-sans-io.md).
 
 `cert::Rotation` is the rotation rule alone, with the time as an argument. A new certificate is
 due 12 days after the current one began, a day before it expires, or at once if the clock went
 back to before it began. The server asks every 10 minutes of the wall clock, so a machine that
 slept past the day is caught within minutes of waking. The new identity goes in with
-`Endpoint::reload_config(.., rebind: false)`: same socket, same port. A certificate that fails to
+`Driver::set_identity` (blaze-http's h3 driver): same socket, same port; open sessions keep
+theirs. A certificate that fails to
 be made is reported on the daemon's log with when the current one expires, and is tried again at
 the next check. The current one keeps being served until it expires, and is never swapped for
 anything weaker.
@@ -141,7 +143,12 @@ so a build that doesn't exist answers `no_such_build`, not zero rows.
 **Error kinds:** `unknown_op`, `bad_args`, `bad_token`, `unauthenticated`, `sql`
 (DuckDB's message and the query in the detail), `no_such_build`, `no_such_view`, `no_world`,
 `world` (Flecs answered something other than 200 JSON), `overloaded`, `encode` (Arrow
-refused a result), and `cancelled` (the request was stopped and DuckDB killed).
+refused a result), `cancelled` (the request was stopped and DuckDB killed), and `flush` (the
+daemon could not flush the history before the query, so it was not run).
+
+Every query first has the daemon flush the history (the flush a CLI reader asks for with
+`Request::Flush`), so it reads every row recorded before it was asked; queries waiting at once
+share one flush.
 
 **Limits:** 16 requests in flight per session, a 17th is answered `overloaded`. A request is at
 most 1 MiB and must arrive whole within 10 s.
@@ -165,7 +172,15 @@ reads the session's own `live::Feed`, a cursor into the flight recorder's rings,
 pool. It sends one frame for each table that has rows: `spans`, `counters`, then `open`. A frame
 is a `u32` LE length, then a body shaped like an answer: the header
 `{"op":"live","table","rows","at_ns","skipped","lost"}` padded so the IPC is 8-aligned counting
-from the body's first byte, then the table's IPC stream. When the open set empties, one `open` frame with `rows: 0` and no IPC follows, so the page
+from the body's first byte, then the next bytes of the table's IPC stream. Each table is one
+long-lived Arrow IPC stream for the session (`live::Encoder`, 2026-11-04): its first frame
+carries the schema and each dictionary's values, and each later frame only its record batch,
+preceded by a delta dictionary (`isDelta`) of the values it names first. The page keeps one
+stream reader a table and feeds it every frame with rows, in order; a frame with no rows has no
+IPC, so skipping it loses nothing. When the stream's dictionaries pass `live::Cap::LIVE`
+(65,536 values or 1 MiB), the next frame with rows starts with the IPC end-of-stream marker
+(`FFFFFFFF 00000000`) and then a new stream: schema and fresh dictionaries. The page drops its
+reader at the marker and starts another on the rest. When the open set empties, one `open` frame with `rows: 0` and no IPC follows, so the page
 clears what it shows (`open` replaces, the others append). An idle daemon sends nothing. A
 certificate rotation sends a `cert` frame, and a frame that failed to encode sends
 `{"op":"live","error":{..}}`.
@@ -173,7 +188,8 @@ certificate rotation sends a `cert` frame, and a frame that failed to encode sen
 **The bound for a slow page:** each session holds one feed frame. While a write waits on the
 page (QUIC flow control: the browser's stream window), ticks are skipped, not queued, and the
 next read takes everything since this session's previous one. Memory per session is therefore
-one frame's buffers plus at most one read of the rings: 1 MiB of rows per recording thread at
+one frame's buffers, its streams' dictionaries (at most `live::Cap::LIVE` a table plus one
+frame's new values), plus at most one read of the rings: 1 MiB of rows per recording thread at
 most, 64 MiB with 64 recording threads, and in practice a few frames' worth. A page that falls
 further behind than the rings hold loses the oldest rows. The next frame's `skipped` counts
 them, and nothing waits on the page.
@@ -268,4 +284,4 @@ and read the daemon's CPU time on the `blaze-explore` thread and its blocking po
 | Tiles: `busy_ns` never exceeds the bucket, counts add up, brute-force property, column types, refusals | `tiles::tests` |
 | Certificate rotation on a virtual clock, the P-256 OIDs in the DER | `cert::tests` |
 | Each op without a transport: views, view errors, no DuckDB, ranges, `no_world` | `ops::tests` |
-| An in-process session with wtransport's client: path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |
+| An in-process session with blaze-http's h3 client (pinning the hash): path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |

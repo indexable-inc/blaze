@@ -56,7 +56,8 @@ blaze-manifest.workspace = true
 blaze-global.workspace = true
 blaze-graph.workspace = true
 blaze-history.workspace = true
-# `BLAZE_PROFILE`: the client puts the profile together, the daemon writes its part of each build.
+# The flight recorder in both; the daemon writes the history, the client sends its rows and
+# exports `BLAZE_PROFILE`'s trace from it.
 blaze-profile.workspace = true
 # `blaze pprof`: the reader, views, reports and exports of .ixprof and pprof files.
 ix-prof.workspace = true
@@ -153,7 +154,7 @@ default = ["native"]
 # leaves out, as one switch: LLVM as a code producer and the stencils it makes at build time
 # (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
 # (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
-# wtransport), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
+# blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
 # test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze serve`
 # with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
 # (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one

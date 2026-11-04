@@ -10,7 +10,7 @@ use crate::rewrite::{Rewrite, RewriteContext, RewriteError, RewriteResult};
 use crate::shape::Shape;
 use crate::source_map::LineRangeUtils;
 use crate::spanned::Spanned;
-use crate::utils::semicolon_for_stmt;
+use crate::utils::{semicolon_for_expr, semicolon_for_stmt};
 
 pub(crate) struct Stmt<'a> {
     inner: &'a ast::Stmt,
@@ -134,7 +134,17 @@ fn format_stmt(
                 ""
             };
 
-            let shape = shape.sub_width(suffix.len(), ex.span())?;
+            // `format_expr` already keeps a column for the `;` of a statement-position
+            // `return`, `break` or `continue` (for a match arm's body, wrapped in a block with
+            // that `;`); taking the suffix off again counted it twice, so a `return x;` exactly
+            // `max_width` wide was broken while the arm body that became it was not, and a
+            // second run changed the first's output. (Upstream rustfmt counts it twice.)
+            let reserved = expr_type == ExprType::Statement && semicolon_for_expr(context, ex);
+            let shape = if reserved {
+                shape
+            } else {
+                shape.sub_width(suffix.len(), ex.span())?
+            };
             format_expr(ex, expr_type, context, shape).map(|s| s + suffix)
         }
         ast::StmtKind::MacCall(..) | ast::StmtKind::Item(..) | ast::StmtKind::Empty => {

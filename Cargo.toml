@@ -48,6 +48,10 @@ exclude = [
     "vendor/libzstd-rs-sys",
     # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
     "vendor/corosensei",
+    # Patched below, without `tracing` (docs/v2/plan/observe/no-tracing.md, 6.2); each is its own
+    # workspace for its tests, whose dev-dependencies stay out of blaze's lock (vendor/*/PATCHES.md).
+    "vendor/quinn-proto",
+    "vendor/ra-ap-rustc_pattern_analysis",
 ]
 resolver = "2"
 
@@ -272,6 +276,12 @@ rsasm = { path = "vendor/rsasm" }
 # For one release: its trampolines assembled from .S by cc, not `global_asm!`, which stage 0 drops
 # (#1659); removed when stage 0 is a release built after 8498b0dfc1 (vendor/corosensei/SOURCE.md).
 corosensei = { path = "vendor/corosensei" }
+# Upstream with every `tracing` site deleted, as patch series tools/vendor/sync.py replays on each
+# bump (docs/v2/plan/observe/no-tracing.md, 6.2; vendor/<crate>/PATCHES.md). quinn, quinn-udp and
+# wtransport are out of the graph: blaze-http's h3 core drives quinn-proto itself
+# (docs/v2/plan/observe/http3-sans-io.md).
+quinn-proto = { path = "vendor/quinn-proto" }
+ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
 
 [workspace.dependencies]
 # local crates
@@ -343,6 +353,8 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
+# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
@@ -452,15 +464,19 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-# The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a
-# self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;
-# no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).
-wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+# QUIC under blaze-http's h3 core (the explorer's WebTransport on 127.0.0.1): quinn-proto's
+# sans-IO endpoint, on rustls with ring, the crypto rustls already uses here; no `log`, no
+# `bloom` (no 0-RTT or Retry tokens to remember).
+quinn-proto = { version = "0.11.19", default-features = false, features = ["rustls-ring"] }
+# quinn-proto's buffer types, as h3 hands it datagrams.
+bytes = "1.11.1"
 # The explorer's ECDSA P-256 certificate, made at start and rotated before it expires.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 # blaze's own profiler (crates/blaze-profile): the schema's Arrow types, the live feed's IPC
 # batches and the Parquet history. Pure Rust; DuckDB stays outside blaze (`blaze debug sql`).
 arrow-array = { version = "60.1.0", default-features = false }
+# The live feed's client feeds its long-lived IPC streams to `StreamDecoder` as `Buffer`s.
+arrow-buffer = { version = "60.1.0", default-features = false }
 arrow-ipc = { version = "60.1.0", default-features = false, features = ["zstd"] }
 arrow-schema = { version = "60.1.0", default-features = false }
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "simdutf8"] }
@@ -511,7 +527,7 @@ text-size = "1.1.1"
 toml = "1.1.8"
 # Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
 # recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
-tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_info"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_debug"] }
 tracing-tree = "0.4.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "registry",
@@ -579,23 +595,10 @@ foldhash = "0.2.0"
 fst = { version = "0.4.7", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 glob = "0.3.4"
-http-body-util = "0.1.5"
-# A request's method, status and header names, hyper's own (blaze-registry, with or without `net`).
+# A request's method, status and header names (blaze-http, and blaze-registry with or without `net`).
 http = "1.5.0"
-hyper = { version = "1.12.0", default-features = false }
-hyper-rustls = { version = "0.27.10", default-features = false }
-hyper-util = { version = "0.1.21", default-features = false }
-# HTTP/3 for blaze-registry's one HTTP client (`net.http3`, docs/networking.md): QUIC by quinn on
-# the rustls/ring provider the rest of blaze uses (quinn is under wtransport already), HTTP/3 by h3.
-quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-# The `Buf` an HTTP/3 body comes in.
-bytes = "1.11.1"
-# The DNS HTTPS records (RFC 9460) that say a host serves HTTP/3. Addresses stay with the
-# system's getaddrinfo: hickory's macOS configuration reads only the global resolvers, not the
-# scoped ones a VPN's split DNS adds (docs/networking.md, "DNS").
-hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+# blaze-http's parsing of an answer's head.
+httparse = "1.10.1"
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }

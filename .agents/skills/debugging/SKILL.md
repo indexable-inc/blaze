@@ -38,11 +38,15 @@ after from the same query.
 
 - The history directory is `<state>/profile`. `<state>` is `$BLAZE_HOME/v2` when `BLAZE_HOME`
   is set, else `$XDG_CACHE_HOME/blaze/v2`, else `~/.cache/blaze/v2`.
-- Each flush writes `<n>.<table>.parquet` per table. Every directory also holds an empty
-  `schema.<table>.parquet` of each table, so a glob always finds every column.
+- Each flush writes `<build>-<seq>.<table>.parquet` per table, and merges fold them into
+  `<build>-<first>-<last>-<level>.<table>.parquet`. `manifest.json` lists the files that are
+  the history, by table. A file on disk it does not list (a merge's retired input, held for a
+  reader's pin) is not part of it: a glob over the directory can read rows twice. Every
+  directory also holds an empty `schema.<table>.parquet` of each table, which has every column.
 - `owner.lock` names the daemon that writes there.
 - Files carry `blaze.schema` in their Arrow metadata. Schema 4 added `provenance` rows,
-  `key_parts` and the `query_counts.ran_*` causes. Older files read them as null.
+  `key_parts` and the `query_counts.ran_*` causes, and schema 5 `event_fields`. Older files read
+  them as null.
 
 ## Running DuckDB
 
@@ -53,16 +57,18 @@ both, run `nix run .#duckdb` (DuckDB 1.5.5, pinned in `flake.nix`) or set
 
 - `blaze debug sql "<query>"` runs one query over the history with every table and view of
   `crates/blaze-profile/sql/views.sql` defined. `--json` prints rows as JSON for a script or a
-  CI gate. `--live` also reads the recorder's last `--last N` seconds.
+  CI gate. It asks the daemon to flush first, so it sees every row recorded before it asked.
 - `blaze explain <view> [name=value ...] [--json]` runs a named query from
   `crates/blaze-profile/sql/examples.sql`. With no arguments it lists them. Each view whose
   arguments all have defaults is also a DuckDB view of that name inside `blaze debug sql`, for
   the last build: `blaze debug sql "SELECT * FROM what_reran"`.
 - `blaze slow [--build N]` is the one-screen answer to "what made it slow". `blaze why [ITEM]`
   says what the daemon computed again and why, item by item.
-- For files outside a daemon (a CI artifact, another machine's home), call DuckDB directly:
-  `$BLAZE_DUCKDB -c "SELECT ... FROM read_parquet('<dir>/*.provenance.parquet', union_by_name =
-  true)"`.
+- For files outside a daemon (a CI artifact, another machine's home), call DuckDB directly on
+  the files the manifest lists, never a glob: `files=$(jq -r '.tables.provenance // {} | keys |
+  map("<dir>/" + .) | tojson' <dir>/manifest.json)`, then `$BLAZE_DUCKDB -c "SELECT ... FROM
+  read_parquet($files, union_by_name = true)"`. A glob is right only for a copy of the
+  directory with no retired files (the manifest's `retired` list empty).
 
 ## The tables that answer "why"
 
@@ -151,7 +157,8 @@ FROM a FULL JOIN b ON a.step = b.step AND a.item = b.item AND a.part IS NOT DIST
 WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 ```
 
-  Run it with `$BLAZE_DUCKDB -c "..."`. Build numbers differ across homes, so pick each side's
+  Run it with `$BLAZE_DUCKDB -c "..."`, on copies whose manifests retire nothing (else list the
+  files from `manifest.json` as above). Build numbers differ across homes, so pick each side's
   build first.
 
 **Memory by task.**

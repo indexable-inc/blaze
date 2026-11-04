@@ -9,9 +9,9 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    UInt16Array, UInt32Array, UInt64Array,
-    builder::{ListBuilder, StringDictionaryBuilder},
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch,
+    StringArray, UInt16Array, UInt32Array, UInt64Array,
+    builder::{ListBuilder, StringDictionaryBuilder, UInt64Builder},
     types::UInt32Type,
 };
 use arrow_schema::{ArrowError, DataType, SchemaRef};
@@ -19,7 +19,10 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, CounterRow, EventRow, FoldRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
+    flight::{
+        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, Read, SpanRow, SwitchRow,
+        ThreadNow, WaitedOn,
+    },
     sampler::Sample,
     schema::{self, Table},
     span,
@@ -124,13 +127,14 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         Vec::with_capacity(rows),
     );
     for row in spans {
-        let meta = flight::meta(row.site);
-        let name = meta.map_or("?", |it| it.name());
+        // A site of this process, or of a dead one whose rows a postmortem read back.
+        let meta = flight::site_text(row.site);
+        let name = meta.map_or("?", |it| it.name);
         thread_keys.push(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
         }));
         name_keys.push(names.key(u64::from(row.site), || name));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
         // A rust-analyzer query's span is named for its query.
         kind_keys.push(name.ends_with("_query").then(|| kinds.key(u64::from(row.site), || name)));
     }
@@ -264,31 +268,46 @@ pub fn open(
     RecordBatch::try_new(schema_of(&schema::OPEN), columns)
 }
 
-/// The `samples` rows of `samples`, each frame named by `names` (which has every address in
-/// them), all from `process`. `at` is one reading of both clocks: an `Instant` and the schema's
-/// nanoseconds then ([`crate::clock::mono_ns`]).
+/// The `samples` rows of `samples`, each frame named by `frames` (the frames of every address
+/// in them, by the address each is looked up at: [`crate::symbols::frames`]), all from
+/// `process`. `at` is one reading of both clocks: an `Instant` and the schema's nanoseconds then
+/// ([`crate::clock::mono_ns`]).
 pub(crate) fn samples(
     samples: &[Sample],
-    names: &HashMap<u64, String, Global>,
+    frames: &HashMap<u64, Vec<String>, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<RecordBatch, ArrowError> {
     let rows = samples.len();
     let schema = schema_of(&schema::SAMPLES);
-    let stack =
-        schema::SAMPLES.column("stack").unwrap_or_else(|| unreachable!("samples has a stack"));
-    let DataType::List(frame) = schema.field(stack).data_type() else {
-        unreachable!("a stack is a list (arrow.rs)")
+    let list_field = |name: &str| {
+        let at = schema::SAMPLES.column(name).unwrap_or_else(|| unreachable!("samples has {name}"));
+        let DataType::List(item) = schema.field(at).data_type() else {
+            unreachable!("{name} is a list (arrow.rs)")
+        };
+        // clone: an `Arc` of the schema's field, once a batch
+        item.clone()
     };
-    // clone: an `Arc` of the schema's field, once a batch
-    let mut stacks =
-        ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(frame.clone());
+    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new())
+        .with_field(list_field("stack"));
+    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
     for sample in samples {
+        let stack = &sample.pcs[..usize::from(sample.depth)];
         // Outermost first; the sampler keeps the innermost first.
-        for pc in sample.pcs[..usize::from(sample.depth)].iter().rev() {
-            stacks.values().append_value(names.get(pc).map_or("?", String::as_str));
+        for (i, pc) in stack.iter().enumerate().rev() {
+            // Every address has its frames ([`crate::symbols::frames`]): `?` only for a caller
+            // that named fewer.
+            let named = frames.get(&crate::symbols::lookup(i, *pc)).map_or(&[][..], Vec::as_slice);
+            for name in named {
+                stacks.values().append_value(name);
+            }
+            if named.is_empty() {
+                stacks.values().append_value("?");
+            }
+            pcs.values().append_value(*pc);
         }
         stacks.append(true);
+        pcs.append(true);
     }
     let t_ns = |it: &Sample| at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64;
     // alloc: a batch's list of columns, once a read
@@ -300,8 +319,52 @@ pub(crate) fn samples(
         column(stacks.finish()),
         column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
         dict(samples.iter().map(|it| if it.on_cpu { "on" } else { "off" })),
+        column(pcs.finish()),
     ];
     RecordBatch::try_new(schema, columns)
+}
+
+/// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]), or
+/// a recovered crash's ([`crate::crash::Crash::image`]).
+#[derive(Debug)]
+pub(crate) struct ImageRow {
+    pub(crate) path: String,
+    pub(crate) build_id: Option<String>,
+    /// The BLAKE3 of its file, hex, or why it was not hashed.
+    pub(crate) blake3: Result<String, String>,
+    pub(crate) base: u64,
+    pub(crate) size: u64,
+    pub(crate) slide: u64,
+    /// How its frames were named: dwarf, symbols, exports or none.
+    pub(crate) names: &'static str,
+}
+
+/// The `images` rows of `images`, all from `process` in the machine's boot `boot`, written at
+/// `seen_ns`.
+pub(crate) fn images(
+    images: &[ImageRow],
+    boot: Option<&str>,
+    seen_ns: i64,
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    let rows = images.len();
+    // alloc: a batch's list of columns, once a flush with new images
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt32Array::from_value(process.pid, rows)),
+        constant(boot, rows)?,
+        column(Int64Array::from_value(seen_ns, rows)),
+        column(StringArray::from_iter_values(images.iter().map(|it| it.path.as_str()))),
+        column(StringArray::from_iter(images.iter().map(|it| it.build_id.as_deref()))),
+        column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_deref().ok()))),
+        column(StringArray::from_iter(
+            images.iter().map(|it| it.blake3.as_ref().err().map(String::as_str)),
+        )),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.base))),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.size))),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.slide))),
+        dict(images.iter().map(|it| it.names)),
+    ];
+    RecordBatch::try_new(schema_of(&schema::IMAGES), columns)
 }
 
 /// The `switches` rows of `switches`, all from `process`.
@@ -338,6 +401,7 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
         column(Int64Array::from_iter(switches.iter().map(|it| it.since_ns))),
         column(UInt64Array::from_iter(switches.iter().map(|it| it.began_as))),
         column(Int64Array::from_iter(switches.iter().map(|it| it.queued_ns))),
+        column(Int64Array::from_iter(switches.iter().map(|it| it.cpu_ns.map(|it| it as i64)))),
     ];
     RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
 }
@@ -355,14 +419,13 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
         Vec::with_capacity(rows),
     );
     for row in events {
-        let meta = flight::meta(row.site);
+        let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
         }));
-        level_keys
-            .push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level().as_str())));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
+        level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level)));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
     }
     // alloc: a batch's messages, once a read
     let messages: Vec<Option<std::sync::Arc<str>>> =
@@ -380,8 +443,61 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
         names.finish(UInt32Array::from(name_keys))?,
         column(StringArray::from_iter(messages.iter().map(|it| it.as_deref()))),
         column(UInt64Array::from_iter(events.iter().map(|it| (it.span != 0).then_some(it.span)))),
+        column(UInt64Array::from_iter_values(events.iter().map(|it| it.event_id))),
     ];
     RecordBatch::try_new(schema_of(&schema::EVENTS), columns)
+}
+
+/// The `event_fields` rows of `fields`, all from `process`: a field's key is its callsite's
+/// name for it, looked up once a batch for each site and place.
+pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+    let rows = fields.len();
+    let (mut keys, mut kinds) = (Dict::new(), Dict::new());
+    // alloc: a batch's keys, once a read
+    let (mut key_keys, mut kind_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in fields {
+        key_keys.push(keys.key(u64::from(row.site) << 8 | u64::from(row.index), || {
+            flight::meta(row.site)
+                .and_then(|it| it.fields().iter().nth(usize::from(row.index)))
+                .map_or("?", |it| it.name())
+        }));
+        kind_keys.push(kinds.key(row.value.kind(), || row.value.kind_name()));
+    }
+    // alloc: a batch's texts, once a read
+    let texts: Vec<Option<std::sync::Arc<str>>> = fields
+        .iter()
+        .map(|it| match it.value {
+            FieldValue::Str(sym) => flight::name(sym),
+            _ => None,
+        })
+        .collect();
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(fields.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt64Array::from_iter_values(fields.iter().map(|it| it.event_id))),
+        column(UInt16Array::from_iter_values(fields.iter().map(|it| it.ordinal))),
+        keys.finish(UInt32Array::from(key_keys))?,
+        kinds.finish(UInt32Array::from(kind_keys))?,
+        column(Int64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::I64(it) => Some(it),
+            _ => None,
+        }))),
+        column(UInt64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::U64(it) => Some(it),
+            _ => None,
+        }))),
+        column(Float64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::F64(it) => Some(it),
+            _ => None,
+        }))),
+        column(BooleanArray::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::Bool(it) => Some(it),
+            _ => None,
+        }))),
+        column(StringArray::from_iter(texts.iter().map(|it| it.as_deref()))),
+    ];
+    RecordBatch::try_new(schema_of(&schema::EVENT_FIELDS), columns)
 }
 
 /// The `folded` rows of a read: its sums of short spans.
@@ -396,18 +512,18 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
     let (mut parent_keys, mut parent_target_keys) =
         (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
-        let meta = flight::meta(row.site);
+        let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
         }));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
-        let parent = (row.parent_site != 0).then(|| flight::meta(row.parent_site));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        let parent = (row.parent_site != 0).then(|| flight::site_text(row.parent_site));
         parent_keys.push(parent.map(|meta| {
-            parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name()))
+            parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name))
         }));
         parent_target_keys.push(parent.map(|meta| {
-            parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target()))
+            parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target))
         }));
     }
     // alloc: a batch's list of columns, once a read
@@ -486,29 +602,64 @@ mod tests {
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
     }
 
+    /// A sample's row: its stack named outermost first, each address by the frames it is looked
+    /// up at (a return address at the call before it, an inlined function's frames together),
+    /// its raw addresses outermost first in `stack_pcs`, and the span and build it was taken in.
     #[test]
-    fn a_samples_stack_is_outermost_first_and_named() {
+    fn a_sample_row_carries_its_stack_addresses_span_and_build() {
         let now = Instant::now();
         let mut pcs = [0; crate::sampler::DEPTH];
-        pcs[..3].copy_from_slice(&[0x30, 0x20, 0x10]);
-        let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 0, build: 0, on_cpu: true };
-        let names: HashMap<u64, String, Global> =
-            [(0x10, "main"), (0x20, "build"), (0x30, "typeck")]
-                .into_iter()
-                .map(|(pc, it)| (pc, it.to_owned()))
-                .collect();
+        // Innermost first: 0x10 is where the thread was, 0x21 and 0x31 return addresses.
+        pcs[..3].copy_from_slice(&[0x10, 0x21, 0x31]);
+        let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 41, build: 9, on_cpu: false };
+        let frames: HashMap<u64, Vec<String>, Global> = [
+            (0x10, &["typeck", "typeck::inlined"][..]),
+            (0x20, &["build"][..]),
+            (0x30, &["main"][..]),
+        ]
+        .into_iter()
+        .map(|(pc, it)| (pc, it.iter().map(|it| (*it).to_owned()).collect()))
+        .collect();
         let process = Process { pid: 7, name: "blaze serve", commit: None };
-        let batch = samples(&[sample], &names, (now, 1_000), process).unwrap();
+        let batch = samples(&[sample], &frames, (now, 1_000), process).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        let stack =
-            batch.column(schema::SAMPLES.column("stack").unwrap()).as_list::<i32>().value(0);
-        let frames = stack.as_dictionary::<UInt32Type>();
-        let values = frames.values().as_string::<i32>();
+        let column = |name: &str| batch.column(schema::SAMPLES.column(name).unwrap());
+        let stack = column("stack").as_list::<i32>().value(0);
+        let named = stack.as_dictionary::<UInt32Type>();
+        let values = named.values().as_string::<i32>();
         let named: Vec<&str> =
-            frames.keys().values().iter().map(|it| values.value(*it as usize)).collect();
-        assert_eq!(named, ["main", "build", "typeck"]);
-        let t_ns = batch.column(schema::SAMPLES.column("t_ns").unwrap());
+            named.keys().values().iter().map(|it| values.value(*it as usize)).collect();
+        assert_eq!(named, ["main", "build", "typeck", "typeck::inlined"]);
+        let raw = column("stack_pcs").as_list::<i32>().value(0);
+        assert_eq!(
+            raw.as_primitive::<arrow_array::types::UInt64Type>().values().as_ref(),
+            [0x31, 0x21, 0x10]
+        );
+        assert_eq!(column("span_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 41);
+        assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 9);
+        let cpu = column("cpu").as_dictionary::<UInt32Type>();
+        assert_eq!(cpu.values().as_string::<i32>().value(cpu.keys().value(0) as usize), "off");
+        let t_ns = column("t_ns");
         assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
+    }
+
+    /// A sample outside any span and build has those columns null, not 0.
+    #[test]
+    fn a_sample_outside_any_span_has_no_span_or_build() {
+        let now = Instant::now();
+        let sample = Sample {
+            at: now,
+            tid: 1,
+            depth: 0,
+            pcs: [0; crate::sampler::DEPTH],
+            span: 0,
+            build: 0,
+            on_cpu: true,
+        };
+        let process = Process { pid: 7, name: "blaze serve", commit: None };
+        let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
+        assert!(batch.column(schema::SAMPLES.column("span_id").unwrap()).is_null(0));
+        assert!(batch.column(schema::SAMPLES.column("build_id").unwrap()).is_null(0));
     }
 
     #[test]

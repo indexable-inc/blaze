@@ -16,7 +16,7 @@ use std::{
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use tokio::sync::mpsc;
@@ -251,9 +251,7 @@ fn fetch_from(
         release.megabytes()
     );
     let start = Instant::now();
-    // The client has no flight recorder: the download is its own step in the client's part of
-    // a `BLAZE_PROFILE` profile and the table it prints, and a span wherever spans are recorded.
-    let step = format!("toolchain download {} ({} bytes)", release.version, release.bytes()); // alloc: once per download
+    // A span in the client's flight recorder, which the client's rows take to the history.
     let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));
     let staging = parent.join(format!(".{name}.unpacking"));
@@ -269,7 +267,6 @@ fn fetch_from(
         remove_dir(&downloads)?;
         anyhow::Ok(())
     })();
-    blaze_profile::note(&step, blaze_profile::CLIENT, start);
     if let Err(e) = fetched {
         _ = remove_dir(&staging);
         return Err(match e.downcast_ref::<NotPublished>() {

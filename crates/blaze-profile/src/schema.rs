@@ -22,8 +22,61 @@ use crate::span;
 /// (`blaze_query::db::take_log_in`), one row a run that was not a first and one an untracked read,
 /// with the read that changed (`cause_key`, `cause_kind`) or the untracked read's name (`what`)
 /// and the database view; its never-written `dur_ns`, `unit` and `crate` are gone, and
-/// `outcome` says `ran` or `untracked read` (no file before 4 has a `provenance` row).
-pub const VERSION: u32 = 4;
+/// `outcome` says `ran` or `untracked read` (no file before 4 has a `provenance` row). At 5: `events.message` is the message alone (it
+/// was the message, then each other field as `name=value`); an event's other fields are rows of
+/// `event_fields`, joined on `process` and `events.event_id`. A file of version 4 or older has no
+/// `event_id` and its fields are in its `message`.
+pub const VERSION: u32 = 5;
+
+/// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
+/// them so takes.
+#[derive(Debug)]
+pub struct Upgrade {
+    pub from: u32,
+    /// What changes between `from` and the next version, and why reading as the next is right.
+    pub how: &'static str,
+}
+
+/// Each older version a reader reads, oldest last, with no rewrite. 4 reads as 5: its `events`
+/// have no `event_id`, which the views read through the table's schema file as null, and the
+/// loaders take a null `event_id` as an event with no `event_fields` rows; its fields stay in its
+/// `message` as `name=value`, as 4 wrote them. 3 reads as 5 as 4 does, and its `query_counts`
+/// have none of 4's `written` and `ran_*` columns, read as null (not counted, as each column
+/// says); it has no `provenance` row (no blaze before 4 wrote one) and no `key_parts`. 2 reads as
+/// 5 as 3 does and also has no `folded_ns`, read as null, which every reader takes as 0, right
+/// as no blaze before 3 folded. 1 does not: its `spans.owner` and `switches.wait_value` name a
+/// job by its slot + 1, and its generation, which 2's `generation << 32 | slot` needs, was never
+/// written.
+pub const UPGRADES: &[Upgrade] = &[
+    Upgrade {
+        from: 4,
+        how: "no `events.event_id` column: read through the schema file as null, an event with no `event_fields` rows; its fields stay in its `message`",
+    },
+    Upgrade {
+        from: 3,
+        how: "as 4, and no `query_counts` `written` or `ran_*` columns (read as null: not counted), no `provenance` rows and no `key_parts` table",
+    },
+    Upgrade {
+        from: 2,
+        how: "as 3, and no `folded_ns` column: read through the schema file as null, which reads as 0; no blaze before 3 folded",
+    },
+];
+
+/// Whether a file of `version` reads as [`VERSION`]'s: `Err` says why not, for the reader's
+/// refusal naming the file.
+pub fn readable(version: u32) -> Result<(), &'static str> {
+    if version == VERSION || UPGRADES.iter().any(|it| it.from == version) {
+        return Ok(());
+    }
+    if version > VERSION {
+        return Err(
+            "it is of a newer schema than this blaze reads: read it with the blaze that wrote it",
+        );
+    }
+    Err(
+        "it is of a schema this blaze has no upgrade from: its rows mean something no reader can say (version 1 named jobs without their generation); delete it, or the history",
+    )
+}
 
 /// The name of the clock the `*_ns` instants count on, as `hello` says it.
 #[cfg(target_os = "linux")]
@@ -40,11 +93,15 @@ pub enum Type {
     U64,
     I64,
     F64,
+    Bool,
     Utf8,
     /// A string from a small set (names, kinds): dictionary-encoded, `u32` keys.
     Dict,
     /// A call stack, outermost frame first, each frame a [`Type::Dict`] string.
     Stack,
+    /// A call stack as raw return addresses, outermost first, each a `u64`: what the image the
+    /// row names (its hash and load base) can name again later.
+    Pcs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,7 +166,7 @@ const SPAN_HEAD: [Column; 17] = [
     opt(
         "self_cpu_ns",
         Type::I64,
-        "the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job",
+        "its CPU time while it was the innermost span its thread was inside (its job's alone, less the spans under it; a wait's is about 0, as other jobs run while it parks): the thread's CPU clock is read at switches, waits and gaps between root spans and each stretch's CPU is shared among the spans by the time each was innermost in it, so it is off by at most the off-CPU time of the stretches it ran in (`time::cpu`); null when the binary counts no CPU (`flight::count_cpu`) or a read failed",
     ),
     opt("alloc_bytes", Type::U64, "bytes its thread allocated while it was open"),
     opt("allocs", Type::U64, "allocations its thread made while it was open"),
@@ -250,14 +307,20 @@ pub const SWITCHES: Table = Table {
             Type::I64,
             "for started and ran, how long the job waited for a core: from its pool's submit to `since_ns`; null when the pool did not say when it was given",
         ),
+        opt(
+            "cpu_ns",
+            Type::I64,
+            "the thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`) read at the switch, which ends a stretch of `spans.self_cpu_ns`: two of a thread's rows give the CPU it had between them; null for ready, when the binary counts no CPU, and in files before 2026-11-04",
+        ),
     ],
 };
 
-/// One row a `tracing` event the recorder keeps (`blaze_profile::keeps`): a `warn!`, `error!` or
-/// `info!` of a `blaze` target, on the thread it happened on.
+/// One row a `tracing` event the recorder keeps (`blaze_profile::logs::keeps_event`) and the
+/// history writes (`blaze_profile::logs::Hold`), on the thread it happened on. Its fields other
+/// than its message are rows of [`EVENT_FIELDS`].
 pub const EVENTS: Table = Table {
     name: "events",
-    doc: "one row a tracing event kept (info and above, of a blaze target), on the thread it happened on",
+    doc: "one row a tracing event kept (error and warn of any target; info of a blaze target; debug of the target blaze, written when its build failed or stalled or the history is set to debug), on the thread it happened on",
     columns: &[
         BUILD_ID,
         PROCESS,
@@ -269,7 +332,7 @@ pub const EVENTS: Table = Table {
             Type::U64,
             "the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job",
         ),
-        col("level", Type::Dict, "ERROR, WARN or INFO"),
+        col("level", Type::Dict, "ERROR, WARN, INFO or DEBUG"),
         col(
             "target",
             Type::Dict,
@@ -279,9 +342,47 @@ pub const EVENTS: Table = Table {
         opt(
             "message",
             Type::Utf8,
-            "its message, then each other field as `name=value`; null when its text was let go before a reader read it",
+            "its message alone (tracing's `message` field); its other fields are rows of `event_fields`; null when it has none or its text was let go before a reader read it",
         ),
         opt("span_id", Type::U64, "the span it happened in, as `spans.span_id`; null outside any"),
+        col(
+            "event_id",
+            Type::U64,
+            "unique in its process for the process's life (its thread's ring << 48 | the row's place in that ring): what `event_fields` rows name it by, with `process`",
+        ),
+    ],
+};
+
+/// One row a field of an [`EVENTS`] row other than its message, typed as the event recorded
+/// it: a field's key is its callsite's (callsites are static), and its value sits in the one
+/// value column its `kind` names, the others null.
+pub const EVENT_FIELDS: Table = Table {
+    name: "event_fields",
+    doc: "one row a field of a kept tracing event other than its message, its value in the column its kind names",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        col("event_id", Type::U64, "the event, as `events.event_id` names it in its process"),
+        col(
+            "ordinal",
+            Type::U16,
+            "the field's place among its event's fields, in the order the event recorded them, from 0",
+        ),
+        col("key", Type::Dict, "the field's name, as its callsite writes it"),
+        col(
+            "kind",
+            Type::Dict,
+            "which value column holds it: i64, u64, f64, bool or str (a `&str`, or anything else recorded through `Display` or `Debug`, as text)",
+        ),
+        opt("value_i64", Type::I64, "for kind i64: a signed integer (an i128 that fits)"),
+        opt("value_u64", Type::U64, "for kind u64: an unsigned integer (a u128 that fits)"),
+        opt("value_f64", Type::F64, "for kind f64: a float"),
+        opt("value_bool", Type::Bool, "for kind bool"),
+        opt(
+            "value_str",
+            Type::Utf8,
+            "for kind str: its text; null when the text was let go before a reader read it",
+        ),
     ],
 };
 
@@ -343,7 +444,11 @@ pub const BUILDS: Table = Table {
         col("started_ns", Type::I64, "when the daemon took it"),
         opt("dur_ns", Type::I64, "how long it ran; null while it runs"),
         opt("started_unix_ns", Type::I64, "when it was taken, on the wall clock"),
-        col("outcome", Type::Dict, "ok, failed, cancelled, stalled or running"),
+        col(
+            "outcome",
+            Type::Dict,
+            "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)",
+        ),
         opt("hits", Type::U64, "nodes the memo settled without running them"),
         opt("misses", Type::U64, "nodes that ran their task"),
         opt("joined", Type::U64, "nodes that took a task another node ran"),
@@ -357,6 +462,26 @@ pub const BUILDS: Table = Table {
             "process",
             Type::U32,
             "the daemon's process id: a build's row with outcome running and no row after it is one its daemon never ended, which died if that process no longer writes the history; null in rows of a blaze before it",
+        ),
+        opt(
+            "client_started_ns",
+            Type::I64,
+            "when the client process that asked for it started, on the history's clock (`started_ns`'s): the client's own start-up before it reached the daemon is `started_ns - client_started_ns`; null until the client sent its rows, and for a build no client asked for",
+        ),
+        opt(
+            "client_ended_ns",
+            Type::I64,
+            "when that client had the answer and sent its rows, on the same clock: what the client spent after the daemon ended the build is `client_ended_ns - started_ns - dur_ns`",
+        ),
+        opt(
+            "daemon_user_ns",
+            Type::I64,
+            "the daemon process's user CPU over the build, from getrusage(RUSAGE_SELF) at its start and end: what the OS saw the daemon spend, set beside the spans' `self_cpu_ns` sum to show CPU no span covers. Process-wide, so of two builds that overlap each has the other's share; null while it runs",
+        ),
+        opt(
+            "daemon_system_ns",
+            Type::I64,
+            "the daemon process's system CPU over the build, as `daemon_user_ns`",
         ),
     ],
 };
@@ -375,10 +500,19 @@ pub const SAMPLES: Table = Table {
         opt(
             "cpu",
             Type::Dict,
-            "`on` when its thread was on a CPU; `off` when blocked (sampled on macOS), so what it blocked in shows",
+            "`on` when its thread was running or runnable as it was sampled, `off` when blocked inside a span, so what it blocked in shows; the same on Linux and macOS",
         ),
+        STACK_PCS,
     ],
 };
+
+/// The raw addresses of a sample's stack, kept beside its names so a reader can name them
+/// again (`images` says which file each is in) or join two runs by code, not by name.
+const STACK_PCS: Column = opt(
+    "stack_pcs",
+    Type::Pcs,
+    "the stack's addresses, outermost first, one a frame of the unwind (an inlined function's frames in `stack` share one): the last is where the thread was, each other a return address, so the call is the address before it; null in rows of a blaze before it",
+);
 
 /// Why the query engine ran what it ran: its run log (`blaze_query::db::take_log_in`), taken as
 /// a build ends while the daemon keeps a history. One row a run that was not a first one (a
@@ -488,6 +622,56 @@ pub const ALLOC_SAMPLES: Table = Table {
         col("bytes", Type::U64, "the bytes the sample stands for (the sampling interval)"),
         col("stack", Type::Stack, "the call stack, outermost first"),
         opt("span_id", Type::U64, "the innermost span its thread was inside"),
+        STACK_PCS,
+    ],
+};
+
+/// One row a code image (the executable, a shared library) holding an address a flush's
+/// samples wrote in `stack_pcs`, once a process: what names those addresses after the process
+/// is gone.
+pub const IMAGES: Table = Table {
+    name: "images",
+    doc: "one row a code image of a process that `stack_pcs` addresses are in: its file, identity and where it was loaded",
+    columns: &[
+        PROCESS,
+        opt(
+            "boot",
+            Type::Dict,
+            "the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one; null for the executable of a fatal signal recovered after its process died, as its `panics` row",
+        ),
+        col("seen_ns", Type::I64, "when it was written"),
+        col("path", Type::Utf8, "the file it was loaded from"),
+        opt(
+            "build_id",
+            Type::Utf8,
+            "its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none",
+        ),
+        opt(
+            "blake3",
+            Type::Utf8,
+            "the BLAKE3 of its file, hex; null when it was not hashed, `unhashed` says why",
+        ),
+        opt(
+            "unhashed",
+            Type::Utf8,
+            "why `blake3` is null: the file is gone, changed (its build id no longer matches) or not on disk (macOS's shared cache)",
+        ),
+        col("base", Type::U64, "the address its code starts at in the process"),
+        col(
+            "size",
+            Type::U64,
+            "the bytes of code from `base`: an address in [base, base + size) is in it",
+        ),
+        col(
+            "slide",
+            Type::U64,
+            "how far it was loaded from the addresses its file gives: a file address is an address less this",
+        ),
+        col(
+            "names",
+            Type::Dict,
+            "how blaze named its frames: dwarf (functions and inlined ones), symbols (no DWARF), exports (a shared library's exported symbols) or none",
+        ),
     ],
 };
 
@@ -573,7 +757,7 @@ pub const ERRORS: Table = Table {
         col(
             "kind",
             Type::Dict,
-            "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic (a daemon task's panic: `detail` the stack it was raised on, `file` and `line` where), blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded",
+            "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded",
         ),
         opt(
             "function",
@@ -958,8 +1142,145 @@ pub const PERF_FUNCTIONS: Table = Table {
     ],
 };
 
+/// One row a panic or a fatal signal of a blaze process, with the stack it was raised on
+/// (`crate::panics`, `crate::crash`). A panic is recorded by the process's panic hook as it is
+/// raised, into a fixed ring the history drains at each flush. A fatal signal (SIGSEGV, SIGBUS,
+/// SIGILL, SIGFPE, SIGABRT) is recorded by a signal handler into `<history>/crash.<pid>`, a file
+/// mapped into the process, which the next daemon to open the history turns into a row of kind
+/// `signal` and deletes. One table for both: each is a thread that failed at a stack, and "what
+/// failed in build N" is one query; the columns only one of them fills are null in the other.
+pub const PANICS: Table = Table {
+    name: "panics",
+    doc: "one row a panic or a fatal signal of a blaze process, with its stack and the spans its thread was inside",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        THREAD,
+        THREAD_NAME,
+        col("t_ns", Type::I64, "when it was raised"),
+        col(
+            "kind",
+            Type::Dict,
+            "panic, or signal (a fatal signal, recovered from the process's crash file after it died)",
+        ),
+        opt(
+            "job",
+            Type::U64,
+            "the job running on the thread, as `switches.job` names it; null on no job and for a signal",
+        ),
+        opt(
+            "span_id",
+            Type::U64,
+            "the innermost span its thread was inside, as `spans.span_id`; null outside any",
+        ),
+        opt(
+            "message",
+            Type::Utf8,
+            "a panic's text (cut at 1 KiB, ending in `...`), null for a payload that is no text; for a signal its name and what it means, then the thread's last panic when it had one (an abort after a panic)",
+        ),
+        opt(
+            "location",
+            Type::Utf8,
+            "a panic's `file:line:column`; for a signal, the location of the thread's last panic, if any",
+        ),
+        col(
+            "stack",
+            Type::Stack,
+            "the call stack, outermost first, each frame named by function (and those inlined there) as `samples.stack`, the panic machinery's own frames included",
+        ),
+        col(
+            "stack_pcs",
+            Type::Pcs,
+            "the stack's addresses, outermost first, one a frame of the unwind: named again after the process is gone through the `images` row of the same `process` and `boot` that holds each",
+        ),
+        col(
+            "caught",
+            Type::U32,
+            "1 when a job's boundary catches it (a plane task's or a pool job's on its fiber), so only that job failed and the daemon kept serving; 0 for a panic nothing catches (the thread ends) and for a signal",
+        ),
+        col(
+            "open_spans",
+            Type::Stack,
+            "the names of the spans its thread was inside, outermost first (the first 16)",
+        ),
+        opt(
+            "signal",
+            Type::Dict,
+            "for a signal: its name (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT); null for a panic",
+        ),
+        opt(
+            "fault_addr",
+            Type::U64,
+            "for a signal: the address it is about (`si_addr`: the faulting access for SIGSEGV and SIGBUS); null for a panic",
+        ),
+        opt(
+            "boot",
+            Type::Dict,
+            "the machine's boot the process ran in, as `images.boot`: with `process` the key of the `images` rows naming `stack_pcs`; null for a signal (recovered after the process died, perhaps after a restart) and where it can't be read",
+        ),
+    ],
+};
+
+/// One row a child process blaze spawned and reaped: a build script, a native proc-macro host,
+/// a linker, a test binary, a wrapper (`crate::facts::ProcessRow`). The times are on the
+/// history's clock (`clock::mono_ns`); the costs are the child's own, from its `rusage`.
+pub const PROCESSES: Table = Table {
+    name: "processes",
+    doc: "one row a child process blaze spawned, with what the OS says it cost",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        col("pid", Type::U32, "the child's process id"),
+        col(
+            "kind",
+            Type::Dict,
+            "what it was: build_script, test, run, proc_macro_host, linker, wrapper, or unlabelled for a spawn no caller named",
+        ),
+        opt("unit", Type::Utf8, "the unit or test binary it ran for, as the spawner names it"),
+        col("program", Type::Utf8, "the program it ran, as given to spawn"),
+        opt("parent_span", Type::U64, "the span it was spawned inside, as `spans.span_id`"),
+        col("spawned_ns", Type::I64, "when blaze asked for it"),
+        opt(
+            "exec_ns",
+            Type::I64,
+            "when the spawn call returned, the child having exec'd (vfork and posix_spawn return after exec)",
+        ),
+        col("exited_ns", Type::I64, "when blaze reaped it"),
+        opt(
+            "sandbox_ns",
+            Type::I64,
+            "how long making its sandbox took, before the spawn; null for a child run with none",
+        ),
+        col("user_ns", Type::I64, "its user CPU"),
+        col("system_ns", Type::I64, "its system CPU"),
+        opt("peak_rss", Type::U64, "its peak resident set, in bytes"),
+        opt("minor_faults", Type::U64, "page faults it served without IO"),
+        opt("major_faults", Type::U64, "page faults that read from disk"),
+        opt("voluntary_switches", Type::U64, "times it gave up the CPU to wait"),
+        opt("involuntary_switches", Type::U64, "times the kernel took the CPU from it"),
+        opt("code", Type::U32, "its exit code as an unsigned word; null when a signal ended it"),
+        opt("signal", Type::U32, "the signal that ended it; null for an exit"),
+    ],
+};
+
+/// One row a test the test queue finished (`crate::facts::TestRunRow`).
+pub const TEST_RUNS: Table = Table {
+    name: "test_runs",
+    doc: "one row a test a build ran, and how it ended",
+    columns: &[
+        BUILD_ID,
+        col("test", Type::Utf8, "the test's name, as libtest names it"),
+        opt("crate", Type::Dict, "the package its binary is of"),
+        col("binary", Type::Utf8, "the test binary that ran it"),
+        col("outcome", Type::Dict, "passed, failed, ignored, timed_out or crashed"),
+        col("dur_ns", Type::I64, "how long its last attempt ran"),
+        col("retries", Type::U32, "attempts after the first"),
+        col("ended_ns", Type::I64, "when the queue took its outcome, on the history's clock"),
+    ],
+};
+
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 24] = [
+pub const TABLES: [&Table; 29] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -983,6 +1304,11 @@ pub const TABLES: [&Table; 24] = [
     &PERF_FUNCTIONS,
     &OPEN,
     &FOLDED,
+    &PANICS,
+    &EVENT_FIELDS,
+    &PROCESSES,
+    &TEST_RUNS,
+    &IMAGES,
     &KEY_PARTS,
 ];
 
