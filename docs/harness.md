@@ -71,7 +71,9 @@ goes over as a bundle, the release of blaze `vm.blaze` names (else `.github/blaz
 installed by `site/install.sh`, and the project's out directory comes back under `vm/<name>/`.
 `realprojects.yaml` runs every workspace daily (and by hand with a list), one job each on the
 stage 0 blaze (`.github/actions/blaze`), then merges them and diffs against the last scheduled
-run's result.
+run's result. A workspace whose job sends no result (it hit the runner's limit) is an error in
+the merged report, never left out; one whose lock is the harness's runs there once that lock is
+committed.
 
 ## What runs against v2 today
 

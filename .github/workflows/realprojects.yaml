@@ -41,15 +41,29 @@ jobs:
         run: |
           if [ -n "$PROJECTS" ]; then
             echo "projects=$(echo "$PROJECTS" | jq -c .)" >> "$GITHUB_OUTPUT"
-          else
-            echo "projects=$(jq -c '[.workspaces[].name]' harness/v2/corpus.json)" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # A workspace whose lock is the harness's runs once that lock is committed
+          # (harness/v2/pins.py); until then it would only stop at its lock step.
+          chosen=()
+          for name in $(jq -r '.workspaces[] | select(.lock == "committed") | .name' harness/v2/corpus.json); do
+            chosen+=("$name")
+          done
+          for name in $(jq -r '.workspaces[] | select(.lock == "harness") | .name' harness/v2/corpus.json); do
+            if [ -f "harness/v2/locks/$name.Cargo.lock" ]; then
+              chosen+=("$name")
+            else
+              echo "::warning::$name: no harness/v2/locks/$name.Cargo.lock committed yet, so it does not run"
+            fi
+          done
+          echo "projects=$(printf '%s\n' "${chosen[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
 
   project:
     needs: plan
     name: ${{ matrix.project }}
     runs-on: ubuntu-24.04
-    # A hosted runner's limit; bevy, polars and wasmtime may need a larger runner.
+    # A hosted runner's limit; bevy, polars and wasmtime may need a larger runner. A job killed
+    # here sends no result, which `report` names as an error (`expected`).
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -84,7 +98,7 @@ jobs:
           if-no-files-found: ignore
 
   report:
-    needs: project
+    needs: [plan, project]
     if: always() && needs.project.result != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -107,14 +121,16 @@ jobs:
       - name: realprojects.py merge
         env:
           SCHEDULED: ${{ github.event_name == 'schedule' }}
+          EXPECTED: ${{ needs.plan.outputs.projects }}
         run: |
           results=$(find "$RUNNER_TEMP/results" -name result.json | sort | jq -Rsc 'split("\n") | map(select(. != ""))')
           baseline="$GITHUB_WORKSPACE/.realprojects-baseline/result.json"
           next=""
           [ "$SCHEDULED" = true ] && next="$baseline"
           [ -f "$baseline" ] || baseline=""
-          input=$(jq -cn --argjson r "$results" --arg out "$RUNNER_TEMP/realprojects" --arg b "$baseline" --arg n "$next" \
-            '{results: $r, out: $out, baseline: $b, write_baseline: $n}')
+          # Each planned workspace with no result.json (its job hit the runner's limit) is an error.
+          input=$(jq -cn --argjson r "$results" --argjson e "$EXPECTED" --arg out "$RUNNER_TEMP/realprojects" \
+            --arg b "$baseline" --arg n "$next" '{results: $r, expected: $e, out: $out, baseline: $b, write_baseline: $n}')
           status=0
           uv run --frozen --no-dev python harness/v2/realprojects.py merge "$input" || status=$?
           cat "$RUNNER_TEMP/realprojects/report.md" >> "$GITHUB_STEP_SUMMARY" || true

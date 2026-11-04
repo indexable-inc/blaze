@@ -79,7 +79,7 @@ sys.path[:0] = [str(HERE), str(HERE.parent)]
 import blake3
 import pins
 from pins import Workspace
-from typed_input import InputError, fail, parse
+from typed_input import fail, parse
 
 SCRIPT = "realprojects.py"
 SCHEMA = 1
@@ -90,6 +90,8 @@ SMALL_MINUTES = 10
 TAIL = 3000
 # A line of `--message-format=json` can be long (a unit's every file, a rendered diagnostic).
 LINE_LIMIT = 64 << 20
+# How long the output of a command that exited is still read, for what is in the pipe.
+DRAIN_SECS = 30
 # What the caller's environment may carry that would change what a blaze command builds or how
 # it prints, none of which a real project's build is given.
 SCRUBBED = (
@@ -164,10 +166,12 @@ class Run:
 @dataclass(frozen=True)
 class Merge:
     """`merge`'s input: the result.json of each run, the directory the merged result and report
-    are written to, and the baseline as in `Run`."""
+    are written to, the projects that were to run (each one no result has is an error), and the
+    baseline as in `Run`."""
 
     results: tuple[str, ...]
     out: str
+    expected: tuple[str, ...] = ()
     baseline: str = ""
     write_baseline: str = ""
     strict: bool = False
@@ -177,7 +181,7 @@ class Merge:
 # The result (result.json), read back by `merge` and as a baseline with typed_input.
 
 type Outcome = Literal["passed", "failed", "ignored"]
-type StepName = Literal["fetch", "lock", "tree", "build", "test", "write lock", "vm"]
+type StepName = Literal["fetch", "lock", "tree", "build", "test", "write lock", "stop", "vm"]
 
 
 @dataclass(frozen=True)
@@ -318,10 +322,12 @@ def package_name(package_id: str) -> str:
     return package_id.split(" ")[0]
 
 
-def exe_label(target: str, path: str) -> str:
-    """A test executable as `<crate> (<target>)`: `nu_path (unittests src/lib.rs)`."""
+def exe_label(target: str, path: str, packages: Mapping[str, str]) -> str:
+    """A test executable as `<package>/<crate> (<target>)`: `nu-path/nu_path (unittests
+    src/lib.rs)`; without its package when the build named no executable at that path."""
     stem = HASHED.sub("", Path(path).stem)
-    return f"{stem} ({target})"
+    package = packages.get(Path(path).name)
+    return f"{package}/{stem} ({target})" if package else f"{stem} ({target})"
 
 
 @dataclass
@@ -351,6 +357,9 @@ class Reader:
     tests: list[TestOutcome] = field(default_factory=list[TestOutcome])
     test_failures: list[Failure] = field(default_factory=list[Failure])
     exe: Executable | None = None
+    # Each test executable's file name to its package, from `compiler-artifact`'s `executable`:
+    # two packages' `tests/it.rs` are two executables named `it`.
+    packages: dict[str, str] = field(default_factory=dict[str, str])
 
     def feed(self, raw: str) -> None:
         line = ANSI.sub("", raw.rstrip("\n").rstrip("\r"))
@@ -368,6 +377,9 @@ class Reader:
         reason = message.get("reason")
         if reason == "compiler-artifact":
             self.units_built += 1
+            executable = message.get("executable")
+            if isinstance(executable, str) and executable:
+                self.packages[Path(executable).name] = package_name(str(message.get("package_id") or "?"))
         elif reason == "compiler-message":
             self.compiler_message(message)
         elif reason == "blaze-unchecked":
@@ -419,8 +431,14 @@ class Reader:
                     self.test_failures.append(Failure(unit, cluster, detail))
 
     def text(self, line: str) -> None:
+        exe = self.exe
+        if exe is not None and not exe.ended and exe.section is not None:
+            # A failed test's captured output is its own, whatever it looks like (a test that runs
+            # `cargo test` prints `Running` and `test result:` lines of its own).
+            self.test_text(exe, line)
+            return
         if m := RUNNING.match(line):
-            self.start(exe_label(m.group(1), m.group(2)))
+            self.start(exe_label(m.group(1), m.group(2), self.packages))
             return
         if m := DOC_TESTS.match(line):
             self.start(f"{m.group(1)} (doc-tests)")
@@ -437,15 +455,6 @@ class Reader:
             self.build_failures.append(Failure("(the build)", f"{code} {normalized(m.group(2))}".strip(), line))
 
     def test_text(self, exe: Executable, line: str) -> None:
-        if RUNNING_TESTS.match(line):
-            exe.started = True
-            return
-        if m := RESULT_LINE.match(line):
-            exe.ended = True
-            return
-        if m := CRASHED.search(line):
-            exe.crashed = m.group(1)
-            return
         if m := SECTION.match(line):
             name = m.group(1)
             exe.section = name
@@ -453,17 +462,27 @@ class Reader:
             exe.in_list = False
             return
         if line == "failures:":
+            # libtest prints it before the failures' output and again before their list.
             exe.section = None
-            exe.in_list = bool(exe.sections) or exe.in_list
+            exe.in_list = True
             return
-        if exe.in_list and exe.section is None:
+        if exe.section is not None:
+            exe.sections[exe.section].append(line)
+            return
+        if exe.in_list:
             if m := LISTED.match(line):
                 exe.listed.append(m.group(1).strip())
                 return
             if line.strip():
                 exe.in_list = False
-        if exe.section is not None:
-            exe.sections[exe.section].append(line)
+        if RUNNING_TESTS.match(line):
+            exe.started = True
+            return
+        if RESULT_LINE.match(line):
+            exe.ended = True
+            return
+        if m := CRASHED.search(line):
+            exe.crashed = m.group(1)
             return
         if m := TEST_LINE.match(line):
             name, status = m.group(1), m.group(2).strip()
@@ -490,8 +509,11 @@ class Reader:
             return
         self.exe = None
         failed = set(exe.listed) | {name for name, it in exe.outcomes.items() if it == "failed"}
+        crashed = exe.started and not exe.ended
         for name in exe.pending:
-            exe.outcomes.setdefault(name, "failed" if name in failed else "passed")
+            # In an executable that crashed, a test with no outcome is the one it crashed in (one
+            # thread prints `test x ... ` before running x).
+            exe.outcomes.setdefault(name, "failed" if name in failed or crashed else "passed")
         for name in sorted(failed):
             exe.outcomes[name] = "failed"
         for name in sorted(exe.outcomes):
@@ -501,7 +523,7 @@ class Reader:
                 self.test_failures.append(
                     Failure(f"{exe.label} :: {name}", panic_cluster(lines), "\n".join(lines[:12]))
                 )
-        if exe.started and not exe.ended:
+        if crashed:
             why = exe.crashed or "no `test result:` line"
             self.test_failures.append(Failure(exe.label, f"crashed: {normalized(why)}", why))
         elif exe.crashed and not failed:
@@ -559,7 +581,7 @@ async def run(
     held = 0
     out_file = stdout.open("wb") if stdout is not None else None
     in_file = stdin.open("rb") if stdin is not None else None
-    log_file = log.open("ab") if log is not None else None
+    log_file = log.open("ab") if log is not None else None  # a step's commands share its log
     try:
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -575,20 +597,36 @@ async def run(
         except OSError as e:
             raise StepFailed(f"{step}: `{command}` in {cwd} did not start: {e}") from None
         stream = proc.stderr if out_file is not None else proc.stdout
+
+        async def read() -> None:
+            nonlocal held
+            if stream is None:
+                return
+            async for raw in stream:
+                if log_file is not None:
+                    log_file.write(raw)
+                line = raw.decode(errors="replace")
+                tail.append(line)
+                held += len(line)
+                while held > TAIL * 2 and len(tail) > 1:
+                    held -= len(tail.pop(0))
+                if each is not None:
+                    each(line)
+
+        reader = asyncio.create_task(read())
         try:
             async with asyncio.timeout(minutes * 60):
-                if stream is not None:
-                    async for raw in stream:
-                        if log_file is not None:
-                            log_file.write(raw)
-                        line = raw.decode(errors="replace")
-                        tail.append(line)
-                        held += len(line)
-                        while held > TAIL * 2 and len(tail) > 1:
-                            held -= len(tail.pop(0))
-                        if each is not None:
-                            each(line)
                 status = await proc.wait()
+            # The command ended; a process it left behind (a test's server) may still hold the
+            # pipe open. What is in the pipe is read for a bounded time, then the group is ended.
+            try:
+                async with asyncio.timeout(DRAIN_SECS):
+                    await asyncio.shield(reader)
+            except TimeoutError:
+                kill_group(proc.pid)
+                tail.append(f"\n[realprojects: a process {command!r} started still held its output "
+                            f"{DRAIN_SECS} s after it exited; its process group was killed]\n")
+                reader.cancel()
         except TimeoutError:
             # The whole group: the tests and build scripts the command started too.
             kill_group(proc.pid)
@@ -596,6 +634,20 @@ async def run(
             raise StepFailed(
                 f"{step}: `{command}` in {cwd} ran past {minutes:g} minutes; its last lines:\n{''.join(tail)[-TAIL:]}"
             ) from None
+        except BaseException:
+            # Cancelled (another project's harness bug) or anything else: nothing is left running.
+            kill_group(proc.pid)
+            raise
+        finally:
+            if not reader.done():
+                reader.cancel()
+            try:
+                await reader
+            except asyncio.CancelledError:
+                pass
+            except ValueError as e:
+                # A line longer than LINE_LIMIT.
+                raise StepFailed(f"{step}: `{command}` in {cwd} printed a line past {LINE_LIMIT} bytes: {e}") from None
     finally:
         for f in (out_file, in_file, log_file):
             if f is not None:
@@ -759,7 +811,7 @@ async def step(project: Project, name: StepName, argv: Sequence[str], body: Call
     log = f"logs/{project.ws.name}/{name.replace(' ', '-')}.log" if logged else ""
     try:
         status = await body()
-    except (StepFailed, OSError, InputError) as e:
+    except Exception as e:  # noqa: BLE001 - a harness bug fails its project, not the run (rule panics-fail-one-job)
         message = str(e) if isinstance(e, StepFailed) else f"{project.ws.name}: {name}: {type(e).__name__}: {e}"
         project.errors.append(message)
         project.steps.append(StepResult(name, tuple(argv), None, round(time.monotonic() - began, 2), log, message))
@@ -776,7 +828,8 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     logs = out / "logs" / ws.name
-    logs.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(logs, ignore_errors=True)
+    logs.mkdir(parents=True)
     checkout = root / "ws"
     home = work / "home" if args.home == "shared" else root / "home"
     env = blaze_env(home, ws.env)
@@ -831,15 +884,20 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
         return [str(blaze), "test", "--workspace", "--no-fail-fast", "--message-format=json", *locked, *ws.test_args]
 
     async def build() -> int:
-        ran = await run(f"{ws.name}: build", build_argv(), cwd=checkout, env=env, minutes=ws.minutes,
-                        log=logs / "build.log", check=False, each=project.build.feed)
-        project.build.finish()
+        try:
+            ran = await run(f"{ws.name}: build", build_argv(), cwd=checkout, env=env, minutes=ws.minutes,
+                            log=logs / "build.log", check=False, each=project.build.feed)
+        finally:
+            project.build.finish()
         return ran.status
 
     async def test() -> int:
-        ran = await run(f"{ws.name}: test", test_argv(), cwd=checkout, env=env, minutes=ws.minutes,
-                        log=logs / "test.log", check=False, each=project.test.feed)
-        project.test.finish()
+        try:
+            ran = await run(f"{ws.name}: test", test_argv(), cwd=checkout, env=env, minutes=ws.minutes,
+                            log=logs / "test.log", check=False, each=project.test.feed)
+        finally:
+            # A run that timed out still says the tests that ended, and the one it hung in.
+            project.test.finish()
         return ran.status
 
     async def write_lock() -> int:
@@ -891,11 +949,15 @@ def linked_toolchains(home: Path, given: str) -> None:
 async def stop_daemon(project: Project, blaze: Path, checkout: Path, env: Mapping[str, str]) -> None:
     if not checkout.is_dir():
         return
+    # Recorded as a step of its own, not the project's error: a daemon that is not running (it
+    # was never started, or it ended) may say so with a status other than 0.
+    began = time.monotonic()
+    argv = (str(blaze), "stop")
     try:
-        await run(f"{project.ws.name}: stopping the daemon", [str(blaze), "stop"], cwd=checkout, env=env,
-                  minutes=5, check=True)
+        ran = await run(f"{project.ws.name}: stopping the daemon", argv, cwd=checkout, env=env, minutes=5, check=False)
+        project.steps.append(StepResult("stop", argv, ran.status, round(ran.seconds, 2), "", ""))
     except StepFailed as e:
-        project.errors.append(str(e))
+        project.steps.append(StepResult("stop", argv, None, round(time.monotonic() - began, 2), "", str(e)))
 
 
 def summary_line(p: ProjectResult) -> str:
@@ -944,9 +1006,11 @@ async def run_in_vm(ws: Workspace, args: Run, out: Path, scratch: Path) -> Path:
         await run(step, ["git", "-C", str(ROOT), "update-ref", "-d", ref], cwd=ROOT, minutes=SMALL_MINUTES, log=log)
     release = args.vm.blaze or (ROOT / ".github" / "blaze-version").read_text().strip()
     vm = args.vm
-    await run(step, ["ix", "new", "--name", name, "--no-shell", "--cpus", str(vm.cpus), "--memory", str(vm.memory),
-                     "--memory-commit", "--arch", vm.arch, "--ttl", vm.ttl], cwd=scratch, minutes=SMALL_MINUTES, log=log)
     try:
+        # Inside the `try`: an `ix new` that timed out may have made the VM all the same.
+        await run(step, ["ix", "new", "--name", name, "--no-shell", "--cpus", str(vm.cpus), "--memory", str(vm.memory),
+                         "--memory-commit", "--arch", vm.arch, "--ttl", vm.ttl], cwd=scratch, minutes=SMALL_MINUTES,
+                  log=log)
         shell = ["ix", "shell", name, "--"]
         await run(step, [*shell, "bash", "-c", f"cat > /root/src.bundle && git clone -q -b {name} /root/src.bundle /root/blaze"],
                   cwd=scratch, minutes=FETCH_MINUTES, log=log, stdin=bundle)
@@ -962,9 +1026,14 @@ async def run_in_vm(ws: Workspace, args: Run, out: Path, scratch: Path) -> Path:
                   cwd=scratch, minutes=ws.minutes * 2 + 60, log=log, check=False)
         archive = scratch / f"{name}.tar"
         await run(step, [*shell, "tar", "-C", "/root/out", "-c", "."], cwd=scratch, minutes=FETCH_MINUTES, stdout=archive)
-        if args.write_locks and ws.lock == "harness":
-            await run(step, [*shell, "cat", f"/root/blaze/harness/v2/locks/{ws.name}.Cargo.lock"], cwd=scratch,
-                      minutes=SMALL_MINUTES, stdout=ws.lock_file(), check=False)
+        if args.write_locks and ws.lock == "harness" and not ws.lock_file().is_file():
+            fetched_lock = scratch / f"{name}.Cargo.lock"
+            got = await run(step, [*shell, "cat", f"/root/blaze/harness/v2/locks/{ws.name}.Cargo.lock"], cwd=scratch,
+                            minutes=SMALL_MINUTES, stdout=fetched_lock, check=False)
+            # Only a lock the VM wrote: none there leaves none here, never an empty one.
+            if got.status == 0 and fetched_lock.stat().st_size > 0:
+                pins.LOCKS.mkdir(parents=True, exist_ok=True)
+                shutil.move(fetched_lock, ws.lock_file())
     finally:
         if not args.keep:
             await run(step, ["ix", "rm", name, "--force"], cwd=scratch, minutes=SMALL_MINUTES, log=log, check=False)
@@ -983,8 +1052,10 @@ async def run_in_vm(ws: Workspace, args: Run, out: Path, scratch: Path) -> Path:
     return result
 
 
-def vm_error(ws: Workspace, message: str, where: str) -> ProjectResult:
-    step = StepResult("vm", (), None, 0.0, f"../../logs/{ws.name}/vm.log", message)
+def missing(ws: Workspace, at: StepName, message: str, where: str = "") -> ProjectResult:
+    """The result of a project the harness has no result of: an error at step `at`."""
+    log = f"logs/{ws.name}/vm.log" if at == "vm" else ""
+    step = StepResult(at, (), None, 0.0, log, f"{ws.name}: {at}: {message}")
     return ProjectResult(ws.name, ws.repo, ws.tag, Tree(ws.rev, ws.tree, "", ""), Host("", "", 0, where), "error",
                          (step,), 0, 0, (), (), ())
 
@@ -1005,6 +1076,10 @@ class Changes:
     new_tests: int = 0
     units_broke: tuple[str, ...] = ()
     units_fixed: tuple[str, ...] = ()
+    # Test executables that newly crashed, exited other than 0 or never built (a `harness =
+    # false` target has no tests of its own to say it), and those that no longer do.
+    exes_broke: tuple[str, ...] = ()
+    exes_fixed: tuple[str, ...] = ()
 
 
 def changes(now: ProjectResult, before: ProjectResult | None) -> Changes:
@@ -1025,14 +1100,26 @@ def changes(now: ProjectResult, before: ProjectResult | None) -> Changes:
     broke = sorted(name(k) for k, o in now_.items() if o == "failed" and was.get(k) == "passed")
     fixed = sorted(name(k) for k, o in now_.items() if o == "passed" and was.get(k) == "failed")
     gone = sorted(name(k) for k, o in was.items() if o == "passed" and k not in now_)
-    units_was = {f.where for f in before.build_failures}
-    units_now = {f.where for f in now.build_failures}
+    units_was, units_now = failed_units(before), failed_units(now)
+    exes_was, exes_now = failed_exes(before), failed_exes(now)
     return Changes(True, "", tuple(broke), tuple(fixed), tuple(gone), len(set(now_) - set(was)),
-                   tuple(sorted(units_now - units_was)), tuple(sorted(units_was - units_now)))
+                   tuple(sorted(units_now - units_was)), tuple(sorted(units_was - units_now)),
+                   tuple(sorted(exes_now - exes_was)), tuple(sorted(exes_was - exes_now)))
+
+
+def failed_units(p: ProjectResult) -> set[str]:
+    """Each unit that failed to build; an error no unit was named for (a plain `error:` line) by
+    its cluster, so a new one is not hidden behind an old one."""
+    return {f"{f.where}: {f.cluster}" if f.where == "(the build)" else f.where for f in p.build_failures}
+
+
+def failed_exes(p: ProjectResult) -> set[str]:
+    """Each test executable that failed as a whole, with how (its cluster)."""
+    return {f"{f.where}: {f.cluster}" for f in p.test_failures if " :: " not in f.where}
 
 
 def newly_broken(c: Changes) -> bool:
-    return bool(c.broke or c.gone or c.units_broke)
+    return bool(c.broke or c.gone or c.units_broke or c.exes_broke)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1073,8 +1160,9 @@ def report(result: Result, compared: Mapping[str, Changes], baseline: str) -> st
         build, test = step_of(p, "build"), step_of(p, "test")
         c = compared.get(p.name)
         against = "" if c is None else (
-            f"{len(c.broke) + len(c.gone)} broke, {len(c.fixed)} fixed, {len(c.units_broke)} units broke, "
-            f"{len(c.units_fixed)} fixed" if c.compared else c.why)
+            f"{len(c.broke) + len(c.gone)} tests broke, {len(c.fixed)} fixed; {len(c.units_broke)} units broke, "
+            f"{len(c.units_fixed)} fixed; {len(c.exes_broke)} executables broke, {len(c.exes_fixed)} fixed"
+            if c.compared else c.why)
         lines.append(
             f"| {p.name} | `{p.tree.rev[:12]}` | {p.verdict} | {p.units_built} | {len({f.where for f in p.build_failures})} "
             f"| {counts['passed']} | {counts['failed']} | {counts['ignored']} "
@@ -1102,10 +1190,13 @@ def report(result: Result, compared: Mapping[str, Changes], baseline: str) -> st
             lines += ["", f"Test failures ({len(p.test_failures)}):", "", "| Tests | Failure | Tests |", "|---:|---|---|"]
             lines += [f"| {n} | {cell(key)} | {cell(', '.join(where))} |" for key, n, where in clusters(p.test_failures, 10)]
         c = compared.get(p.name)
-        if c is not None and c.compared and (c.broke or c.gone or c.fixed or c.units_broke or c.units_fixed):
+        listed = (("Newly failing", c.broke), ("Passed before, did not run", c.gone), ("Fixed", c.fixed),
+                  ("Units newly failing", c.units_broke), ("Units fixed", c.units_fixed),
+                  ("Test executables newly failing", c.exes_broke), ("Test executables fixed", c.exes_fixed)
+                  ) if c is not None and c.compared else ()
+        if any(names for _, names in listed):
             lines.append("")
-            for label, names in (("Newly failing", c.broke), ("Passed before, did not run", c.gone),
-                                 ("Fixed", c.fixed), ("Units newly failing", c.units_broke), ("Units fixed", c.units_fixed)):
+            for label, names in listed:
                 if names:
                     shown = ", ".join(f"`{n}`" for n in names[:20])
                     lines.append(f"- {label} ({len(names)}): {shown}{', ...' if len(names) > 20 else ''}")
@@ -1172,7 +1263,8 @@ async def run_all(args: Run) -> int:
     try:
         if args.where == "ix":
             results = await vm_runs(workspaces, order, args, out, work, gate)
-            return merge_results(results, out, args.baseline, args.write_baseline, args.strict)
+            return merge_results(results, out, args.baseline, args.write_baseline, args.strict,
+                                 [w.name for w in workspaces])
         try:
             blaze, identity = await blaze_of(args.blaze, work)
         except StepFailed as e:
@@ -1211,7 +1303,7 @@ async def vm_runs(workspaces: list[Workspace], order: list[int], args: Run, out:
                 lone = out / "vm" / ws.name / "result.json"
                 lone.parent.mkdir(parents=True, exist_ok=True)
                 identity = Blaze("", "", "", f"the release {args.vm.blaze or 'of .github/blaze-version'}")
-                result = Result(SCHEMA, "", identity, (vm_error(ws, str(e), f"ix {args.vm.arch}"),))
+                result = Result(SCHEMA, "", identity, (missing(ws, "vm", str(e), f"ix {args.vm.arch}"),))
                 lone.write_text(encoded(result))
                 paths[i] = str(lone)
 
@@ -1221,12 +1313,16 @@ async def vm_runs(workspaces: list[Workspace], order: list[int], args: Run, out:
     return [paths[i] for i in range(len(workspaces))]
 
 
-def merge_results(paths: Sequence[str], out: Path, baseline: str, write_baseline: str, strict: bool) -> int:
-    """One result of several, each project's logs named from `out`. Results of two blazes are
-    refused: one report is the verdict on one blaze."""
+def merge_results(paths: Sequence[str], out: Path, baseline: str, write_baseline: str, strict: bool,
+                  expected: Sequence[str] = ()) -> int:
+    """One result of several, each one's logs copied under `out`. Each project of `expected` that
+    no result has (its job was killed before it wrote one) is an error, never left out. Results
+    of two blazes are refused: one report is the verdict on one blaze."""
     results = [(Path(p).resolve(), load_result(p)) for p in paths]
-    if not results:
+    if not results and not expected:
         fail(SCRIPT, "results: none given")
+    out = out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
     measured = {r.blaze.blake3 for _, r in results if r.blaze.blake3}
     if len(measured) > 1:
         fail(SCRIPT, f"results: of {len(measured)} blazes ({', '.join(sorted(h[:12] for h in measured))}); "
@@ -1234,15 +1330,23 @@ def merge_results(paths: Sequence[str], out: Path, baseline: str, write_baseline
     projects: list[ProjectResult] = []
     seen: set[str] = set()
     for path, r in results:
-        rel = os.path.relpath(path.parent, out.resolve())
+        if path.parent != out and (path.parent / "logs").is_dir():
+            shutil.copytree(path.parent / "logs", out / "logs", dirs_exist_ok=True)
         for p in r.projects:
             if p.name in seen:
                 fail(SCRIPT, f"results: {p.name} is in two of them")
             seen.add(p.name)
-            steps = tuple(dataclasses.replace(s, log=os.path.normpath(os.path.join(rel, s.log)) if s.log else "")
-                          for s in p.steps)
-            projects.append(dataclasses.replace(p, steps=steps))
-    identity = next((r.blaze for _, r in results if r.blaze.blake3), results[0][1].blaze)
+            projects.append(p)
+    known = {w.name: w for w in pins.load_corpus(script=SCRIPT).workspaces}
+    for name in expected:
+        if name not in seen:
+            ws = known.get(name)
+            if ws is None:
+                fail(SCRIPT, f"expected: corpus.json has no workspace {name}")
+            projects.append(missing(ws, "vm" if (out / "logs" / name / "vm.log").is_file() else "test",
+                                    "no result.json came back for it (its job or VM ended before the harness wrote one)"))
+    blank = Blaze("", "", "", "")
+    identity = next((r.blaze for _, r in results if r.blaze.blake3), results[0][1].blaze if results else blank)
     started = min((r.started for _, r in results if r.started), default="")
     return finish(Result(SCHEMA, started, identity, tuple(projects)), out, baseline, write_baseline, strict)
 
@@ -1251,7 +1355,7 @@ def merge_results(paths: Sequence[str], out: Path, baseline: str, write_baseline
 # selftest
 
 TRANSCRIPT = """\
-{"reason":"compiler-artifact","package_id":"path+file:///w#a@0.1.0","target":{"kind":["lib"],"name":"a"}}
+{"reason":"compiler-artifact","package_id":"path+file:///w#a@0.1.0","target":{"kind":["lib"],"name":"a"},"executable":"/r/build/w-1/debug/deps/a-0123456789abcdef"}
 {"reason":"compiler-artifact","package_id":"path+file:///w#b@0.1.0","target":{"kind":["lib"],"name":"b"}}
 {"reason":"compiler-message","package_id":"path+file:///w/c#0.1.0","target":{"kind":["lib"],"name":"c"},"message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types at 17","rendered":"error[E0308]: mismatched types\\n --> src/lib.rs:17:5"}}
 {"reason":"compiler-message","package_id":"path+file:///w/c#0.1.0","target":{"kind":["lib"],"name":"c"},"message":{"level":"error","code":null,"message":"aborting due to 1 previous error","rendered":""}}
@@ -1273,6 +1377,8 @@ thread 'x::fails' (42) panicked at src/lib.rs:9:5:
 assertion `left == right` failed
   left: 1
  right: 2
+     Running unittests src/lib.rs (/tmp/inner/debug/deps/inner-0123456789abcdef)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 
@@ -1286,7 +1392,7 @@ error: test failed, to rerun pass `-p a --lib`
 
 running 2 tests
 test one ... ok
-error: test failed, to rerun pass `-p a --test it`
+test two ... error: test failed, to rerun pass `-p a --test it`
 Caused by:
   process didn't exit successfully: `/r/build/w-1/debug/deps/it-fedcba9876543210` (signal: 11, SIGSEGV: invalid memory reference)
    Doc-tests a
@@ -1314,17 +1420,19 @@ def test_reader() -> None:
                      ("(the build)", "blaze cannot compile `core::intrinsics::foo` in `b::bar`: no lowering for N operands")], units
     got = {(t.exe, t.name): t.outcome for t in r.tests}
     assert got == {
-        ("a (unittests src/lib.rs)", "x::passes"): "passed",
-        ("a (unittests src/lib.rs)", "x::ignored"): "ignored",
-        ("a (unittests src/lib.rs)", "x::prints"): "passed",
-        ("a (unittests src/lib.rs)", "x::fails"): "failed",
+        ("a/a (unittests src/lib.rs)", "x::passes"): "passed",
+        ("a/a (unittests src/lib.rs)", "x::ignored"): "ignored",
+        ("a/a (unittests src/lib.rs)", "x::prints"): "passed",
+        ("a/a (unittests src/lib.rs)", "x::fails"): "failed",
         ("it (tests/it.rs)", "one"): "passed",
+        ("it (tests/it.rs)", "two"): "failed",
         ("a (doc-tests)", "src/lib.rs - f (line 3)"): "passed",
     }, got
     failures = [(f.where, f.cluster) for f in r.test_failures]
     assert failures == [
         ('c (test "t")', "never built: its library failed"),
-        ("a (unittests src/lib.rs) :: x::fails", "panic: assertion `left == right` failed"),
+        ("a/a (unittests src/lib.rs) :: x::fails", "panic: assertion `left == right` failed"),
+        ("it (tests/it.rs) :: two", "failed, printing nothing"),
         ("it (tests/it.rs)", "crashed: signal: N, SIGSEGV: invalid memory reference"),
     ], failures
 
@@ -1338,7 +1446,9 @@ def test_normalized() -> None:
     assert package_name("path+file:///w/c#0.1.0") == "c"
     assert package_name("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0") == "serde"
     assert package_name("serde 1.0.0 (registry+https://...)") == "serde"
-    assert exe_label("unittests src/lib.rs", "/x/deps/nu_path-0123456789abcdef") == "nu_path (unittests src/lib.rs)"
+    exe = "/x/deps/nu_path-0123456789abcdef"
+    assert exe_label("unittests src/lib.rs", exe, {}) == "nu_path (unittests src/lib.rs)"
+    assert exe_label("unittests src/lib.rs", exe, {Path(exe).name: "nu-path"}) == "nu-path/nu_path (unittests src/lib.rs)"
 
 
 def project(name: str, tests: Sequence[tuple[str, Outcome]], units: Sequence[str] = (), rev: str = "r" * 40,
@@ -1357,6 +1467,10 @@ def test_changes() -> None:
     c = changes(now, before)
     assert c.compared and c.broke == ("e :: a",) and c.fixed == ("e :: b",) and c.gone == ("e :: c",), c
     assert c.new_tests == 1 and c.units_broke == ("u2",) and c.units_fixed == ("u1",), c
+    crashed = dataclasses.replace(before, test_failures=(*before.test_failures, Failure("e2", "crashed: x", "")))
+    c = changes(crashed, before)
+    assert c.exes_broke == ("e2: crashed: x",) and newly_broken(c), c
+    assert changes(before, crashed).exes_fixed == ("e2: crashed: x",)
     assert newly_broken(c)
     assert not newly_broken(changes(before, before))
     assert changes(now, None).why == "not in the baseline"
@@ -1374,7 +1488,10 @@ def test_round_trip() -> None:
         out = Path(tmp) / "merged"
         status = merge_results([str(path)], out, str(path), "", False)
         merged = load_result(str(out / "result.json"))
-        assert status == 0 and merged.projects[0].steps[0].log == "../logs/x/build.log", merged.projects[0].steps
+        assert status == 0 and merged.projects[0].steps[0].log == "logs/x/build.log", merged.projects[0].steps
+        assert merge_results([str(path)], Path(tmp) / "m2", "", "", False, ("p", "ripgrep")) == 1, "a missing project passed"
+        gone = load_result(str(Path(tmp) / "m2" / "result.json")).projects[1]
+        assert (gone.name, gone.verdict) == ("ripgrep", "error"), gone
         text = (out / "report.md").read_text()
         assert "| p |" in text and "E0308 x" in text and "panic: x" in text, text
 
@@ -1450,7 +1567,7 @@ def main() -> None:
             sys.exit(asyncio.run(run_all(parse(Run, text, SCRIPT))))
         case ["merge", text]:
             it = parse(Merge, text, SCRIPT)
-            sys.exit(merge_results(it.results, Path(it.out).resolve(), it.baseline, it.write_baseline, it.strict))
+            sys.exit(merge_results(it.results, Path(it.out), it.baseline, it.write_baseline, it.strict, it.expected))
         case _:
             fail(SCRIPT, f"usage: {SCRIPT} run JSON | merge JSON | selftest\n\n{__doc__}")
 
