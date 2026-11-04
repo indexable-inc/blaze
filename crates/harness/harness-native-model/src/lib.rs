@@ -79,7 +79,7 @@ pub struct Running;
 pub struct Exited;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Lost;
-/// A run ended by a signal.
+/// A run or a session ended by a signal.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Killed;
 /// A stage that has not started yet.
@@ -672,6 +672,7 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         }
         let status = match (s["status"].as_str(), s["exit"].as_i64()) {
             (Some("lost"), _) => *w.component_id::<Lost>(),
+            (Some("killed"), _) => *w.component_id::<Killed>(),
             (_, Some(_)) => *w.component_id::<Exited>(),
             (Some("exited"), _) => *w.component_id::<Exited>(),
             _ => *w.component_id::<Running>(),
@@ -697,10 +698,8 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         if e.try_cloned::<&Cwd>().is_none_or(|n| n.s.as_str() != cwd) {
             e.set(Cwd { s: cwd.into() });
         }
-        let created = Created { ms: s["created_ms"].as_u64().unwrap_or(0) };
-        if e.try_cloned::<&Created>() != Some(created) {
-            e.set(created);
-        }
+        // When it ended (the daemon's `ended_ms`): where the Archive files it.
+        set_times(e, s["created_ms"].as_u64(), s["ended_ms"].as_u64());
     }
     for s in sessions {
         let Some(e) = s["id"].as_u64().and_then(|id| by_id.get(&id)).map(|&e| w.entity_from_id(e)) else { continue };

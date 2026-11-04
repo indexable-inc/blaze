@@ -239,22 +239,35 @@ pub fn session_start(s: &SessionRow) {
     log("session_start", r);
 }
 
-pub fn session_end(id: u64, code: i32, ended_ms: u64) {
+/// A PTY session ended: `status` is `exited` or `killed` (by a signal).
+pub fn session_end(id: u64, code: i32, status: &str, ended_ms: u64) {
     let oid = format!("s{id}");
     let c = conn();
     log(
         "session_end",
         c.execute(
-            "update objects set status = 'exited', exit_code = ?2, ended_ms = ?3 where id = ?1",
-            params![oid, code, ended_ms as i64],
+            "update objects set status = ?4, exit_code = ?2, ended_ms = ?3 where id = ?1",
+            params![oid, code, ended_ms as i64, status],
         ),
     );
     log("session_end bytes", c.execute("update streams set bytes = ?2 where object = ?1 and stream = 'pty'", params![oid, size(&object_dir(&oid).join("pty"))]));
 }
 
-/// At startup nothing is running yet: sessions the last daemon left open died with it.
+/// At startup nothing is running yet: sessions the last daemon left open died with it, last heard from when their pty
+/// stream was last written (else now).
 pub fn mark_lost_sessions() {
-    log("mark_lost", conn().execute("update objects set status = 'lost' where status = 'running' and kind not in ('proc', 'stage', 'repl')", []));
+    let c = conn();
+    let r = (|| {
+        let mut st = c.prepare("select id from objects where status = 'running' and kind not in ('proc', 'stage', 'repl')")?;
+        let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+            let heard = std::fs::metadata(object_dir(&id).join("pty")).and_then(|m| m.modified()).ok();
+            let ms = heard.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or_else(crate::runs::now_ms, |d| d.as_millis() as u64);
+            c.execute("update objects set status = 'lost', ended_ms = coalesce(ended_ms, ?2) where id = ?1", params![id, ms as i64])?;
+        }
+        Ok(())
+    })();
+    log("mark_lost", r);
 }
 
 /// PTY sessions in the shape of daemon::Session::info (for `list` with all: true).
