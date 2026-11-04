@@ -615,7 +615,11 @@ impl App {
         let Some(sid) = self.session_of(e) else { return };
         let laid = self.world.entity_from_id(self.ids.term).try_cloned::<&Laid>();
         let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { return };
-        let rect = [l.x + TERM_PAD.0, l.y + TERM_PAD.1, l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1];
+        // The grid's origin on a whole device pixel, so every cell does (cells are whole pixels).
+        let sc = self.grid.scale;
+        let snap = |v: f32| (v * sc).round() / sc;
+        let (x0, y0) = (snap(l.x + TERM_PAD.0), snap(l.y + TERM_PAD.1));
+        let rect = [x0, y0, snap(l.x + l.w - TERM_PAD.0) - x0, snap(l.y + l.h - TERM_PAD.1) - y0];
         self.term_rect = Some(rect);
         let (cols, rows) = self.grid.fit(rect[2], rect[3]);
         let o = self.world.entity_from_id(e);
@@ -744,6 +748,10 @@ impl App {
         drop(map);
         let paint = term::Paint { origin: (rect[0], rect[1]), scale: sc, focused: self.focused && self.palette.is_none(), sel: self.sel, scroll, theme: &term::DARK, time: self.time };
         term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
+        if self.grid.animating {
+            // The cursor fades on the app clock: keep drawing.
+            self.poke();
+        }
     }
 
     // ---- input ----
