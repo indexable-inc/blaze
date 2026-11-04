@@ -12,8 +12,16 @@ pub fn run(path: &str) -> Result<(), String> {
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
-    if let Some(sid) = std::env::var("HARNESS_NATIVE_SHOT_SELECT").ok().and_then(|s| s.parse().ok()) {
-        app.select_session(sid);
+    // A session id, or a run (`r12`) or one of its stages (`r12.0`).
+    if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
+        if let Some(run) = s.strip_prefix('r') {
+            let (n, k) = run.split_once('.').map_or((run, None), |(n, k)| (n, k.parse().ok()));
+            if let Ok(n) = n.parse() {
+                app.select_run(n, k);
+            }
+        } else if let Ok(sid) = s.parse() {
+            app.select_session(sid);
+        }
     }
     let secs = std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
     let start = Instant::now();

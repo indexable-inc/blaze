@@ -4,6 +4,10 @@
 //!   Connecting | Down)`.
 //! - An [`Object`] is one of its sessions: `(Kind, Claude | Codex | ...)`, `(Status, Running | Exited | Lost)`, [`Name`],
 //!   [`Title`], [`Cwd`], [`ExitCode`] once it ended, and flecs's own `ChildOf` to its parent object or its device.
+//! - A shell run (`r12`) is an entity with [`Run`], `(Kind, Proc)`, [`Name`] (its command), `(Status, Running | Exited |
+//!   Killed | Lost)`, [`ExitCode`], [`Created`] / [`Ended`], and `ChildOf` its session (or the device). A run split into
+//!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
+//! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
 //! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
@@ -65,6 +69,15 @@ pub struct Running;
 pub struct Exited;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Lost;
+/// A run ended by a signal.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Killed;
+/// A stage that has not started yet.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Pending;
+/// A stage its run ended without starting (`&&` / `||`).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Skipped;
 
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Name {
@@ -86,6 +99,31 @@ pub struct Cwd {
 pub struct ExitCode {
     pub code: i32,
 }
+
+/// A daemon shell run (`r12`), by its number.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Run {
+    pub n: u64,
+}
+
+/// A pipeline stage of the run it is a child of, by its index there (`r12.0`).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageNo {
+    pub k: u32,
+}
+
+/// When it ended (ms since the epoch).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Ended {
+    pub ms: u64,
+}
+
+/// On a session or the device: the tree shows all its runs, not only the last [`KEEP_RUNS`].
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Unfolded;
+
+/// Finished runs a parent shows while folded (running ones always show).
+pub const KEEP_RUNS: usize = 3;
 
 /// When it was made (ms since the epoch): the tree's order among siblings.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -130,6 +168,10 @@ pub enum Msg {
     Exit { id: u64, code: i32 },
     /// The attach stream ended.
     Detached { id: u64 },
+    /// The daemon's recent shell runs, as its `runs` op returns them (newest first).
+    Runs(Vec<serde_json::Value>),
+    /// Output of run `r{run}` (of its stage `stage`, or the caller-visible streams), as `run_read` returned it.
+    RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +193,10 @@ pub fn register(world: &World) {
     world.component::<Cwd>().writable();
     world.component::<ExitCode>().writable();
     world.component::<Created>().writable();
+    world.component::<Run>().writable();
+    world.component::<StageNo>().writable();
+    world.component::<Ended>().writable();
+    world.component::<Unfolded>();
     world.component::<Viewing>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
     world.component::<Inbox>().writable();
@@ -170,6 +216,9 @@ fn for_tags(world: &World) {
     world.component::<Running>();
     world.component::<Exited>();
     world.component::<Lost>();
+    world.component::<Killed>();
+    world.component::<Pending>();
+    world.component::<Skipped>();
 }
 
 /// The kind tag's id for the daemon's kind string.
@@ -193,26 +242,37 @@ pub fn nz(n: u16) -> std::num::NonZeroU16 {
 /// The local device: the one daemon on this machine.
 pub const LOCAL: &str = "devices::local";
 
-/// Make the local device and install the inbox: each frame it drains `rx` into the world. Returns the terminal parsers.
-pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> Terms {
+/// Make the local device and install the inbox: each frame it drains `rx` into the world. Returns the terminal parsers:
+/// the sessions' (by session id) and the runs' and stages' (by entity id).
+pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> (Terms, Terms) {
     let dev = world.entity_named(LOCAL);
     dev.set(Device { host: host.into(), sock: sock.into() });
     dev.add((Link::id(), Connecting::id()));
     let dev = *dev.id();
     let terms: Terms = Rc::default();
-    let parsers = terms.clone();
-    let mut by_id: HashMap<u64, u64> = HashMap::new();
+    let run_terms: Terms = Rc::default();
+    let parsers = (terms.clone(), run_terms.clone());
+    let mut idx = Index::default();
     world.system_named::<&mut Inbox>("DaemonInbox").each_iter(move |it, _, inbox| {
         let w = it.world();
         for msg in rx.try_iter() {
             inbox.applied = inbox.applied.wrapping_add(1);
-            apply(w, dev, &mut by_id, &parsers, msg);
+            apply(w, dev, &mut idx, &parsers, msg);
         }
     });
-    terms
+    (terms, run_terms)
 }
 
-fn apply(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, terms: &Terms, msg: Msg) {
+/// Daemon ids to entities: sessions by id, runs by number, stages by (run number, index).
+#[derive(Default)]
+struct Index {
+    sessions: HashMap<u64, u64>,
+    runs: HashMap<u64, u64>,
+    stages: HashMap<(u64, u32), u64>,
+}
+
+fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms, Terms), msg: Msg) {
+    let by_id = &mut idx.sessions;
     match msg {
         Msg::Link(s) => {
             let tag = match s {
@@ -241,7 +301,182 @@ fn apply(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, terms: &Terms
         // The stream ended (the program exited, or the daemon went): the last screen stays to read; the host attaches
         // again (on a fresh parser) when it wants the live one.
         Msg::Detached { .. } => {}
+        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs),
+        Msg::RunData { run, stage, err, bytes } => {
+            let ent = match stage {
+                Some(k) => idx.stages.get(&(run, k)),
+                None => idx.runs.get(&run),
+            };
+            let Some(e) = ent.map(|&e| w.entity_from_id(e)).filter(|e| e.is_alive()) else { return };
+            let mut t = e.try_cloned::<&Term>().unwrap_or(Term { cols: 80, rows: 24, scroll: 0, seq: 0 });
+            let mut map = run_terms.borrow_mut();
+            let p = map.entry(*e.id()).or_insert_with(|| {
+                // Read-only output: no cursor.
+                let mut p = harness_vt::Term::new(t.cols, t.rows, SCROLLBACK);
+                p.feed(b"\x1b[?25l");
+                p
+            });
+            p.feed(&plain_output(&bytes, err));
+            t.seq = t.seq.wrapping_add(1);
+            e.set(t);
+        }
     }
+}
+
+/// A run's output for a terminal parser: it is a program's plain output, not a terminal's, so a bare newline also
+/// returns the carriage; stderr is tinted red.
+fn plain_output(bytes: &[u8], err: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 32);
+    if err {
+        out.extend_from_slice(b"\x1b[38;2;235;107;107m");
+    }
+    let mut prev = 0u8;
+    for &b in bytes {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    if err {
+        out.extend_from_slice(b"\x1b[39m");
+    }
+    out
+}
+
+/// Set the exclusive `(rel, tag)` when it is not already the target.
+fn set_pair(e: EntityView<'_>, rel: u64, tag: u64) {
+    if e.target(rel, 0).is_none_or(|t| *t.id() != tag) {
+        e.add((rel, tag));
+    }
+}
+
+fn set_name(e: EntityView<'_>, name: &str) {
+    if e.try_cloned::<&Name>().is_none_or(|n| n.s.as_str() != name) {
+        e.set(Name { s: name.into() });
+    }
+}
+
+fn set_times(e: EntityView<'_>, start: Option<u64>, end: Option<u64>) {
+    let created = Created { ms: start.unwrap_or(0) };
+    if e.try_cloned::<&Created>() != Some(created) {
+        e.set(created);
+    }
+    match end {
+        Some(ms) => {
+            if e.try_cloned::<&Ended>() != Some(Ended { ms }) {
+                e.set(Ended { ms });
+            }
+        }
+        None => {
+            if e.has(Ended::id()) {
+                e.remove(Ended::id());
+            }
+        }
+    }
+}
+
+fn set_code(e: EntityView<'_>, code: Option<i64>) {
+    match code {
+        Some(c) => {
+            if e.try_cloned::<&ExitCode>() != Some(ExitCode { code: c as i32 }) {
+                e.set(ExitCode { code: c as i32 });
+            }
+        }
+        None => {
+            if e.has(ExitCode::id()) {
+                e.remove(ExitCode::id());
+            }
+        }
+    }
+}
+
+/// Bring the runs in line with the daemon's `runs` answer: each a child of its session (or the device), its stages
+/// children of it when it was split into more than one.
+fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json::Value]) {
+    let (kind, status) = (*w.component_id::<Kind>(), *w.component_id::<Status>());
+    let proc_ = *w.component_id::<Proc>();
+    let stage_kind = *w.component_id::<Stage>();
+    let tag = |s: &str| match s {
+        "running" => *w.component_id::<Running>(),
+        "killed" => *w.component_id::<Killed>(),
+        "lost" | "unknown" => *w.component_id::<Lost>(),
+        "pending" => *w.component_id::<Pending>(),
+        "skipped" => *w.component_id::<Skipped>(),
+        _ => *w.component_id::<Exited>(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut seen_stages = std::collections::HashSet::new();
+    for r in runs {
+        let Some(n) = r["id"].as_str().and_then(|s| s.strip_prefix('r')).and_then(|s| s.parse::<u64>().ok()) else { continue };
+        seen.insert(n);
+        let e = match idx.runs.get(&n).map(|&e| w.entity_from_id(e)).filter(|e| e.is_alive()) {
+            Some(e) => e,
+            None => {
+                let e = w.entity();
+                e.set(Run { n });
+                idx.runs.insert(n, *e.id());
+                e
+            }
+        };
+        set_pair(e, kind, proc_);
+        set_pair(e, status, tag(r["status"].as_str().unwrap_or("")));
+        set_code(e, r["exit_code"].as_i64());
+        set_name(e, r["cmd"].as_str().unwrap_or("").trim());
+        let cwd = r["cwd"].as_str().unwrap_or("");
+        if e.try_cloned::<&Cwd>().is_none_or(|c| c.s.as_str() != cwd) {
+            e.set(Cwd { s: cwd.into() });
+        }
+        set_times(e, r["start_ms"].as_u64(), r["end_ms"].as_u64());
+        let parent = r["session"].as_u64().and_then(|s| idx.sessions.get(&s).copied()).filter(|&p| w.entity_from_id(p).is_alive()).unwrap_or(dev);
+        if e.parent().is_none_or(|p| *p.id() != parent) {
+            e.child_of(parent);
+        }
+        let stages = r["stages"].as_array().map(Vec::as_slice).unwrap_or_default();
+        if stages.len() < 2 {
+            continue;
+        }
+        for (k, s) in stages.iter().enumerate() {
+            let k = k as u32;
+            seen_stages.insert((n, k));
+            let c = match idx.stages.get(&(n, k)).map(|&c| w.entity_from_id(c)).filter(|c| c.is_alive()) {
+                Some(c) => c,
+                None => {
+                    let c = w.entity();
+                    c.set(StageNo { k });
+                    c.child_of(*e.id());
+                    idx.stages.insert((n, k), *c.id());
+                    c
+                }
+            };
+            set_pair(c, kind, stage_kind);
+            set_pair(c, status, tag(s["status"].as_str().unwrap_or("")));
+            set_code(c, s["exit_code"].as_i64());
+            set_name(c, s["text"].as_str().unwrap_or("").trim());
+            set_times(c, s["start_ms"].as_u64(), s["end_ms"].as_u64());
+        }
+    }
+    // Gone runs go with their stages (ChildOf deletes them).
+    idx.runs.retain(|n, e| {
+        let keep = seen.contains(n);
+        if !keep {
+            let e = w.entity_from_id(*e);
+            if e.is_alive() {
+                e.destruct();
+            }
+        }
+        keep
+    });
+    idx.stages.retain(|key, c| {
+        let keep = seen_stages.contains(key);
+        if !keep {
+            let c = w.entity_from_id(*c);
+            if c.is_alive() {
+                c.destruct();
+            }
+        }
+        keep
+    });
 }
 
 /// Bring the objects in line with the daemon's list: new sessions made, gone ones deleted, each one's components and
@@ -343,6 +578,96 @@ pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
         walk(world, dev, 0, &mut out);
     }
     out
+}
+
+/// A row of the sidebar's tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    /// A session, run or stage at its depth under the device.
+    Obj { e: u64, depth: usize },
+    /// `parent`'s folded runs: how many are hidden, or (`unfolded`) the row that folds them again.
+    More { parent: u64, hidden: usize, depth: usize, unfolded: bool },
+}
+
+/// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index). A parent
+/// without [`Unfolded`] shows its running runs and its last [`KEEP_RUNS`] ones (and the selected one), the rest behind
+/// one [`Row::More`]; a run's stages show while it runs or while it (or one of its stages) is selected.
+#[must_use]
+pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
+    struct Walk<'a> {
+        w: WorldRef<'a>,
+        sel: Option<u64>,
+        sel_parent: Option<u64>,
+        running: u64,
+        out: Vec<Row>,
+    }
+    impl Walk<'_> {
+        fn is_run(&self, id: u64) -> bool {
+            self.w.entity_from_id(id).has(Run::id())
+        }
+        fn is_running(&self, id: u64) -> bool {
+            self.w.entity_from_id(id).target(Status::id(), 0).is_some_and(|t| *t.id() == self.running)
+        }
+        fn picked(&self, id: u64) -> bool {
+            self.sel == Some(id) || self.sel_parent == Some(id)
+        }
+        fn walk(&mut self, e: EntityView<'_>, depth: usize) {
+            let mut kids: Vec<(u64, u64, u64)> = Vec::new();
+            e.each_child(|c| {
+                if c.target(Kind::id(), 0).is_some() {
+                    let key = match c.try_cloned::<&StageNo>() {
+                        Some(s) => u64::from(s.k),
+                        None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
+                    };
+                    kids.push((key, *c.id(), 0));
+                }
+            });
+            kids.sort_unstable();
+            let runs: Vec<u64> = kids.iter().map(|k| k.1).filter(|&id| self.is_run(id)).collect();
+            let unfolded = e.has(Unfolded::id());
+            let cut = runs.len().saturating_sub(KEEP_RUNS);
+            let hidden: std::collections::HashSet<u64> =
+                if unfolded { Default::default() } else { runs[..cut].iter().copied().filter(|&r| !self.is_running(r) && !self.picked(r)).collect() };
+            let mut more = !hidden.is_empty() || (unfolded && cut > 0);
+            for (_, k, _) in kids {
+                if more && self.is_run(k) {
+                    more = false;
+                    self.out.push(Row::More { parent: *e.id(), hidden: if unfolded { cut } else { hidden.len() }, depth, unfolded });
+                }
+                if hidden.contains(&k) {
+                    continue;
+                }
+                self.out.push(Row::Obj { e: k, depth });
+                if !self.is_run(k) || self.is_running(k) || self.picked(k) {
+                    let ke = self.w.entity_from_id(k);
+                    self.walk(ke, depth + 1);
+                }
+            }
+        }
+    }
+    let sel = selected(world);
+    let mut walk = Walk {
+        w: world,
+        sel: sel.map(|s| *s.id()),
+        sel_parent: sel.and_then(|s| s.parent()).map(|p| *p.id()),
+        running: *world.component_id::<Running>(),
+        out: Vec::new(),
+    };
+    let dev = world.lookup(LOCAL);
+    if dev.is_alive() && *dev.id() != 0 {
+        walk.walk(dev, 0);
+    }
+    walk.out
+}
+
+/// Fold or unfold `parent`'s runs.
+pub fn toggle_fold(world: WorldRef<'_>, parent: u64) {
+    let e = world.entity_from_id(parent);
+    if e.has(Unfolded::id()) {
+        e.remove(Unfolded::id());
+    } else {
+        e.add(Unfolded::id());
+    }
 }
 
 /// The selected object, if any.

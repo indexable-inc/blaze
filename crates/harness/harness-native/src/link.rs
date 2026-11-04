@@ -24,6 +24,12 @@ pub const T_EXIT: u8 = 4;
 
 const POLL: Duration = Duration::from_millis(400);
 
+/// How many of the newest shell runs the poll asks for.
+const RUNS: usize = 100;
+
+/// How long one `run_read` waits for new output.
+const RUN_WAIT_MS: u64 = 1000;
+
 pub fn home() -> PathBuf {
     std::env::var_os("HARNESS_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".harness"))
 }
@@ -120,12 +126,14 @@ pub struct Link {
     /// The write half of each attach stream, by session id.
     streams: Arc<Mutex<HashMap<u64, (u64, UnixStream)>>>,
     poke: Sender<()>,
+    /// The run output being followed: a generation its reader threads check, so a new watch ends the old one.
+    run_watch: Arc<AtomicU64>,
 }
 
 impl Link {
     pub fn start(tx: Sender<Msg>, wake: Wake) -> Self {
         let (poke, poked) = std::sync::mpsc::channel::<()>();
-        let link = Self { tx: tx.clone(), wake: wake.clone(), streams: Arc::default(), poke };
+        let link = Self { tx: tx.clone(), wake: wake.clone(), streams: Arc::default(), poke, run_watch: Arc::default() };
         std::thread::Builder::new()
             .name("harness-list".into())
             .spawn(move || {
@@ -135,6 +143,14 @@ impl Link {
                         Ok(v) => {
                             let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
                             let _ = tx.send(Msg::List(sessions));
+                            // The recent shell runs, beside the sessions they ran in.
+                            match request(&json!({"op": "runs", "limit": RUNS})) {
+                                Ok(v) if v.get("error").is_none() => {
+                                    let _ = tx.send(Msg::Runs(v["runs"].as_array().cloned().unwrap_or_default()));
+                                }
+                                Ok(v) => eprintln!("harness-native: runs: {v}"),
+                                Err(e) => eprintln!("harness-native: runs: {e}"),
+                            }
                             LinkState::Up
                         }
                         Err(_) => {
@@ -252,6 +268,53 @@ impl Link {
             },
             Err(e) => eprintln!("harness-native: spawn {kind}: {e}"),
         });
+    }
+
+    /// Follow run `r{run}`'s output (its stage `stage`, or the caller-visible streams) from the start, read-only: one
+    /// thread per stream long-polls `run_read` and sends `Msg::RunData` until the run is done and read to the end, or
+    /// another watch (or [`Link::unwatch_run`]) replaces it.
+    pub fn watch_run(&self, run: u64, stage: Option<u32>) {
+        let generation = self.run_watch.fetch_add(1, Ordering::Relaxed) + 1;
+        for err in [false, true] {
+            let (tx, wake, current) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
+            let stream = if err { "err" } else { "out" };
+            std::thread::Builder::new()
+                .name(format!("harness-run-r{run}-{stream}"))
+                .spawn(move || {
+                    let mut offset = 0u64;
+                    while current.load(Ordering::Relaxed) == generation {
+                        let v = match request(&json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS})) {
+                            Ok(v) if v.get("error").is_none() => v,
+                            Ok(v) => {
+                                eprintln!("harness-native: run_read r{run} {stream}: {v}");
+                                return;
+                            }
+                            Err(_) => {
+                                std::thread::sleep(Duration::from_millis(500));
+                                continue;
+                            }
+                        };
+                        if current.load(Ordering::Relaxed) != generation {
+                            return;
+                        }
+                        let data = v["data"].as_str().unwrap_or("");
+                        if !data.is_empty() {
+                            let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
+                            wake();
+                        }
+                        offset = v["next_offset"].as_u64().unwrap_or(offset);
+                        if v["done"].as_bool() == Some(true) && v["eof"].as_bool() == Some(true) {
+                            return;
+                        }
+                    }
+                })
+                .expect("run reader thread");
+        }
+    }
+
+    /// Stop following run output.
+    pub fn unwatch_run(&self) {
+        self.run_watch.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn kill(&self, id: u64) {
