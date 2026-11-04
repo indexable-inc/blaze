@@ -1787,6 +1787,28 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// A kind of short values (debug info, a few hundred bytes each) fills the samples kept,
+/// [`cold::SAMPLES_MOST`], before their bytes reach [`cold::TRAIN_BYTES`]: it is trained then,
+/// not left raw for good. A failed training waits for twice its samples, which a full set
+/// never gets.
+#[test]
+fn a_kind_of_short_values_trains_once_its_samples_are_full() {
+    let short = (cold::TRAIN_BYTES / cold::SAMPLES_MOST as u64 / 2).max(1);
+    let kept = |samples: usize, after: usize| Training {
+        samples: vec![Vec::new(); samples],
+        bytes: samples as u64 * short,
+        after,
+    };
+    assert!(!kept(cold::TRAIN_VALUES, 0).ready(), "too few bytes, and samples to keep");
+    assert!(!kept(cold::SAMPLES_MOST - 1, 0).ready());
+    assert!(kept(cold::SAMPLES_MOST, 0).ready(), "the samples kept are full");
+    assert!(!kept(cold::SAMPLES_MOST, cold::SAMPLES_MOST * 2).ready(), "it failed on these samples");
+    let long =
+        Training { samples: vec![Vec::new(); cold::TRAIN_VALUES], bytes: cold::TRAIN_BYTES, after: 0 };
+    assert!(long.ready(), "values and bytes enough");
+    assert!(!Training { samples: vec![Vec::new(); cold::TRAIN_VALUES - 1], ..long }.ready());
+}
+
 #[test]
 fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     let mut sim = Sim::new(9, quiet());

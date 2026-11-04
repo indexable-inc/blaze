@@ -96,7 +96,9 @@ const PACK_MOST: u64 = 1 << 30;
 #[cfg(test)]
 const PACK_MOST: u64 = 256 << 10;
 
-/// A value shorter than this stays as it is: compressing it saves less than its index slot costs.
+/// A value shorter than this stays as it is: compressing it saves less than its index slot
+/// costs. A cold kind's value is the exception once its kind has a dictionary: values of one
+/// kind share most of their bytes, which the dictionary takes out of even a short one.
 const DEMOTE_FROM: u64 = 4 << 10;
 
 /// One [`Store::settle`] moves or copies at most this many bytes, so it stays a short step.
@@ -1045,6 +1047,25 @@ struct Training {
     after: usize,
 }
 
+impl Training {
+    /// Whether to train on the samples kept: [`cold::TRAIN_VALUES`] of them (or twice as many
+    /// as a training that failed had) and [`cold::TRAIN_BYTES`] of them, or as many samples as
+    /// are ever kept ([`cold::SAMPLES_MOST`]). Without the last, a kind whose values are
+    /// shorter than `TRAIN_BYTES / SAMPLES_MOST` on average (debug info, a few hundred bytes a
+    /// function) never reaches `TRAIN_BYTES`, as no sample is kept past `SAMPLES_MOST`, and is
+    /// never trained nor compressed.
+    fn ready(&self) -> bool {
+        self.samples.len() >= cold::TRAIN_VALUES.max(self.after)
+            && (self.bytes >= cold::TRAIN_BYTES || self.full())
+    }
+
+    /// Whether no more samples are kept: [`cold::SAMPLES_MOST`] of them, or
+    /// [`cold::SAMPLE_BYTES_MOST`] bytes.
+    fn full(&self) -> bool {
+        self.samples.len() >= cold::SAMPLES_MOST || self.bytes >= cold::SAMPLE_BYTES_MOST
+    }
+}
+
 /// One group commit: each pack cut to what is committed, appended to, synced; new externals
 /// and a new index table written; then the head.
 struct Commit {
@@ -1437,6 +1458,10 @@ impl Store {
             let kind = group[0].1.kind;
             if self.dictionary_of(kind).is_none() {
                 for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
+                    // Full samples that did not train failed on them: copying more keeps none.
+                    if self.training[kind.code() as usize].full() {
+                        break;
+                    }
                     let pack = &self.tiers[0].packs[loc.pack as usize];
                     let payload = loc.offset.checked_add(RECORD_HEADER);
                     // alloc: a settle (idle), until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
@@ -1465,12 +1490,20 @@ impl Store {
                 }
             };
             for &(key, loc, row) in group {
-                if spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST {
+                // A short cold record without its kind's dictionary would not compress enough
+                // and be marked tried, never moved once the dictionary is trained: it waits.
+                if loc.raw < DEMOTE_FROM && number.is_none() {
+                    continue;
+                }
+                // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
+                // settle of many short records stays a short step too.
+                let cost = loc.raw.max(DEMOTE_FROM);
+                if spent > 0 && spent.saturating_add(cost) > SETTLE_MOST {
                     settled.more = true;
                     break 'kinds;
                 }
                 let Some((content, bytes)) = self.movable(key, loc) else { continue };
-                spent += loc.raw;
+                spent += cost;
                 if let Some(columns) = encodings_of(&encodings, &bytes) {
                     match colder_columns(columns, loc, &bytes) {
                         Ok(Some((form, payload))) => {
@@ -1558,7 +1591,10 @@ impl Store {
         for (key, found) in rows {
             let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
-            if pack.removed || pack.retiring || loc.raw < DEMOTE_FROM {
+            // A short cold record is a candidate to go colder (`settle` moves it only once its
+            // kind has a dictionary), never to come back hot.
+            let short = loc.raw < DEMOTE_FROM;
+            if pack.removed || pack.retiring || (short && !loc.kind.cold()) {
                 continue;
             }
             let flag = |flag| found.at.get(flag);
@@ -1574,7 +1610,7 @@ impl Store {
                 {
                     demote.push((key, loc, found.at.row()));
                 }
-                Form::Zstd | Form::Warm | Form::ColdColumns if read && before => {
+                Form::Zstd | Form::Warm | Form::ColdColumns if read && before && !short => {
                     promote.push((key, loc, found.at.row()));
                 }
                 _ => {}
@@ -3103,14 +3139,12 @@ impl Store {
 
     fn sample(&mut self, kind: Kind, bytes: &[u8]) {
         let training = &mut self.training[kind.code() as usize];
-        if training.samples.len() < cold::SAMPLES_MOST && training.bytes < cold::SAMPLE_BYTES_MOST {
+        if !training.full() {
             // alloc: a training sample, at most `SAMPLES_MOST` a kind and only before its dictionary is trained
             training.samples.push(bytes.to_vec());
             training.bytes += bytes.len() as u64;
         }
-        if training.samples.len() >= cold::TRAIN_VALUES.max(training.after)
-            && training.bytes >= cold::TRAIN_BYTES
-        {
+        if training.ready() {
             self.train(kind);
         }
     }
