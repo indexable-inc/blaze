@@ -103,12 +103,20 @@ pub fn events(model: &Model, us: impl Fn(i64) -> f64) -> Vec<Value> {
     out
 }
 
-/// An event as an instant on the track `tid`: `WARN no unit's step ended for 60 s`.
-fn instant(it: &super::EventIn, tid: u64, ts: f64) -> Value {
-    let message = it.message.as_deref().unwrap_or("(its text was let go)");
+/// An event as an instant on the track `tid`: `WARN no unit's step ended for 60 s unit=serde`,
+/// its fields typed in its args beside what correlates it (build, job, span, its id).
+pub(crate) fn instant(it: &super::EventIn, tid: u64, ts: f64) -> Value {
+    // alloc: an event's fields, once an event a trace
+    let fields: serde_json::Map<String, Value> = it
+        .fields
+        .iter()
+        // clone: a field's key, once an event a trace
+        .map(|(key, value)| (key.clone(), value.json()))
+        .collect();
     // alloc: an instant's name, once an event a trace
-    json!({"ph": "i", "s": "t", "name": format!("{} {message}", it.level), "cat": "event", "pid": it.process, "tid": tid, "ts": ts,
-        "args": {"level": it.level, "target": it.target, "callsite": it.name, "message": it.message, "job": it.job, "span": it.span}})
+    json!({"ph": "i", "s": "t", "name": format!("{} {}", it.level, it.said()), "cat": "event", "pid": it.process, "tid": tid, "ts": ts,
+        "args": {"level": it.level, "target": it.target, "callsite": it.name, "message": it.message, "fields": fields,
+            "build": it.build, "job": it.job, "span": it.span, "event_id": it.event_id}})
 }
 
 /// The fiber tracks of a flight read, for `trace.json` beside its threads' spans, with its

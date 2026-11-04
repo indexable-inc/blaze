@@ -60,6 +60,7 @@ pub mod hot;
 pub mod identity;
 pub mod live;
 pub mod panics;
+pub mod logs;
 pub mod perf;
 pub mod reading;
 pub mod sampler;
@@ -459,6 +460,8 @@ struct Recorded {
     tid: u64,
     thread: String,
     events: Vec<Event>,
+    /// The `tracing` events the thread logged, with what correlates them.
+    logs: Vec<Log>,
     phases: HashMap<&'static str, Cost, Global>,
     subjects: HashMap<(&'static str, Box<str>), Cost, Global>,
     passes: HashMap<&'static str, Cost, Global>,
@@ -474,6 +477,51 @@ struct Event {
     dur_us: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cpu_us: Option<u64>,
+}
+
+/// A `tracing` event a profiled process logged ([`logged`]): on its thread's track at a moment,
+/// as the flight recorder's `events` and `event_fields` rows have it, with the build, job, span
+/// and process that correlate it with the spans of every other process.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Log {
+    tid: u64,
+    at_us: u64,
+    event: time::EventIn,
+}
+
+/// While profiling, keeps the event `evented` of `meta` for the thread's part: a worker's or
+/// a build script's, which no daemon's history holds.
+fn logged(meta: &'static tracing::Metadata<'static>, evented: flight::Evented) {
+    let fields = meta.fields();
+    let event = time::EventIn {
+        process: std::process::id(),
+        thread: sampler::os_tid() as u32,
+        t_ns: clock::mono_ns(),
+        build: (evented.build != 0).then_some(u64::from(evented.build)),
+        job: (evented.job != 0).then_some(evented.job),
+        // alloc: a profile's record, only while BLAZE_PROFILE is on
+        level: meta.level().as_str().to_owned(),
+        // alloc: a profile's record, only while BLAZE_PROFILE is on
+        target: meta.target().to_owned(),
+        // alloc: a profile's record, only while BLAZE_PROFILE is on
+        name: meta.name().to_owned(),
+        // alloc: a profile's record, only while BLAZE_PROFILE is on
+        message: flight::name(evented.logged.message).map(|it| it.to_string()),
+        span: (evented.span != 0).then_some(evented.span),
+        event_id: evented.event_id,
+        // alloc: a profile's record, only while BLAZE_PROFILE is on
+        fields: evented
+            .logged
+            .fields()
+            .iter()
+            .map(|&(index, value)| {
+                let key = fields.iter().nth(usize::from(index)).map_or("?", |it| it.name());
+                // alloc: a profile's record, only while BLAZE_PROFILE is on
+                (key.to_owned(), logs::Value::of(value))
+            })
+            .collect(),
+    };
+    recorded(|it| it.logs.push(Log { tid: it.tid, at_us: us_of(Instant::now()), event }));
 }
 
 /// How often something ran, its wall time (each run's whole, the runs under it too) and its
@@ -560,10 +608,14 @@ pub fn thread_cpu() -> Option<u64> {
 struct Recorder;
 
 impl Recorder {
-    /// A span or an event is kept by one rule: an event's name (`event <file>:<line>`) is no
-    /// query's, so its target decides.
+    /// A span is kept at [`LEVEL`] or above by [`keeps`]; an event by [`logs::keeps_event`]:
+    /// WARN and ERROR of any target, INFO by `keeps`, DEBUG of a `blaze` target that opts in.
     fn wanted(meta: &tracing::Metadata<'_>) -> bool {
-        (meta.is_span() || meta.is_event()) && *meta.level() <= LEVEL && keeps(meta.target(), meta.name())
+        if meta.is_event() {
+            logs::keeps_event(meta.target(), meta.name(), *meta.level())
+        } else {
+            meta.is_span() && *meta.level() <= LEVEL && keeps(meta.target(), meta.name())
+        }
     }
 }
 
@@ -571,14 +623,15 @@ impl Recorder {
 /// path unless it names one, so a span outside a `blaze*` crate writes `target: "blaze"`.
 pub const TARGET: &str = "blaze";
 
-/// The least severe level of a span kept.
+/// The least severe level of a span kept. An event's levels are [`logs::keeps_event`]'s.
 pub const LEVEL: tracing::Level = tracing::Level::INFO;
 
 /// Whether a span or event of `target` named `name`, at a level [`keeps_level`] keeps, is kept: a
 /// `blaze` one (its target starts with [`TARGET`]) or a rust-analyzer query's span (`*_query`;
 /// an event's name, `event <file>:<line>`, is never one). Every other one costs its call and is
-/// never seen, as `blaze::unrecorded_span` says where it is written. A kept event is a row of
-/// the `events` table.
+/// never seen, as `blaze::unrecorded_span` says where it is written. An event's rule is
+/// [`logs::keeps_event`], which asks this one for an INFO event; a kept event is a row of the
+/// `events` table.
 pub fn keeps(target: &str, name: &str) -> bool {
     target.starts_with(TARGET) || name.ends_with("_query")
 }
@@ -664,7 +717,9 @@ impl tracing::Subscriber for Recorder {
     }
 
     fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::from_level(LEVEL))
+        // DEBUG for the events of `blaze` targets that opt in ([`logs::keeps_event`]); each
+        // callsite's interest decides the rest once.
+        Some(tracing::level_filters::LevelFilter::DEBUG)
     }
 
     fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
@@ -687,8 +742,11 @@ impl tracing::Subscriber for Recorder {
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
-        if let Some(site) = flight::site(event.metadata()) {
-            flight::evented(event, site);
+        if let Some(site) = flight::site(event.metadata())
+            && let Some(evented) = flight::evented(event, site)
+            && on()
+        {
+            logged(event.metadata(), evented);
         }
     }
 
@@ -882,6 +940,9 @@ struct Part {
     /// their parks and the wakes between them. Only the flight recorder's part has them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fibers: Vec<serde_json::Value>,
+    /// The `tracing` events its threads logged while profiling ([`logged`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    logs: Vec<Log>,
 }
 
 /// A [`Plot`]'s value at a moment, on the thread that gave it.
@@ -916,7 +977,7 @@ fn take() -> Part {
     }
     for thread in threads {
         let mut it = lock(&thread);
-        if !it.events.is_empty() || !it.phases.is_empty() || !it.passes.is_empty() {
+        if !it.events.is_empty() || !it.logs.is_empty() || !it.phases.is_empty() || !it.passes.is_empty() {
             let name = match it.thread.is_empty() {
                 // alloc: writing the profile, once a build
                 true => format!("thread {}", it.tid),
@@ -926,6 +987,7 @@ fn take() -> Part {
             part.threads.push((it.tid, name));
         }
         part.events.append(&mut it.events);
+        part.logs.append(&mut it.logs);
         // alloc: writing the profile, once a build
         part.phases.extend(it.phases.drain().map(|(name, cost)| (name.to_owned(), cost)));
         let subjects = it.subjects.drain();
@@ -964,7 +1026,7 @@ fn command() -> String {
 pub fn write_part() {
     let Some(dir) = dir().filter(|_| on()) else { return };
     let part = take();
-    if part.events.is_empty() && part.phases.is_empty() && part.passes.is_empty() {
+    if part.events.is_empty() && part.logs.is_empty() && part.phases.is_empty() && part.passes.is_empty() {
         return;
     }
     static WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -1265,6 +1327,9 @@ fn chrome(
         for it in &part.fibers {
             // clone: writing the profile, on demand
             put(&mut *out, it.clone())?;
+        }
+        for it in &part.logs {
+            put(&mut *out, time::trace::instant(&it.event, it.tid, it.at_us as f64))?;
         }
     }
     for it in spans {

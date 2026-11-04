@@ -315,9 +315,14 @@ impl Keeper {
     }
 }
 
-/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on;
-/// a history that does not open is the error, which fails `blaze serve`.
-pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling, Keeper), String> {
+/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on,
+/// writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]); a history that does not
+/// open is the error, which fails `blaze serve`.
+pub fn keep_history(
+    state: &Path,
+    duckdb: Option<PathBuf>,
+    events: blaze_profile::logs::Policy,
+) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
     let owner = claim(&dir).map_err(|it| it.to_string())?;
     let (ended, rows) = crossbeam_channel::unbounded();
@@ -335,6 +340,7 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             let _owner = owner;
             match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
                 Ok(mut history) => {
+                    history.events_policy(events);
                     // The daemon's own panics go to its history, and a fatal signal of it to
                     // `crash.<pid>` beside it, which the next daemon's history turns into a row.
                     history.record_panics();
@@ -506,6 +512,8 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                     tracing::error!("{error}");
                     _ = failed.send(error);
                 }
+                // Builds still under way as the daemon stops write the DEBUG events held for them.
+                history.release_held();
                 (history.flush(None), true)
             }
         });
@@ -1099,7 +1107,7 @@ mod tests {
     #[test]
     fn a_flush_past_its_deadline_fails_naming_the_history_thread() {
         let dir = tempfile::tempdir().unwrap();
-        let (profiling, _keeper) = keep_history(dir.path(), None).unwrap();
+        let (profiling, _keeper) = keep_history(dir.path(), None, blaze_profile::logs::Policy::default()).unwrap();
         let mut observe = Observe::new(Some(profiling));
         let mut out = Vec::new();
         let at = Duration::from_secs(1);

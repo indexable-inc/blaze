@@ -498,7 +498,7 @@ text-size = "1.1.1"
 toml = "1.1.8"
 # Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
 # recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
-tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_info"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_debug"] }
 tracing-tree = "0.4.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "registry",

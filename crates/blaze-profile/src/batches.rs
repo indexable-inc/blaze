@@ -10,7 +10,7 @@ use std::{
 
 use arrow_array::{
     builder::{ListBuilder, StringDictionaryBuilder},
-    Array, ArrayRef, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
     UInt32Array, UInt64Array, types::UInt32Type,
 };
 use arrow_schema::{ArrowError, DataType, SchemaRef};
@@ -18,7 +18,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, CounterRow, EventRow, FoldRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
+    flight::{self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
     sampler::Sample,
     schema::{self, Table},
     span,
@@ -338,8 +338,61 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
         names.finish(UInt32Array::from(name_keys))?,
         column(StringArray::from_iter(messages.iter().map(|it| it.as_deref()))),
         column(UInt64Array::from_iter(events.iter().map(|it| (it.span != 0).then_some(it.span)))),
+        column(UInt64Array::from_iter_values(events.iter().map(|it| it.event_id))),
     ];
     RecordBatch::try_new(schema_of(&schema::EVENTS), columns)
+}
+
+/// The `event_fields` rows of `fields`, all from `process`: a field's key is its callsite's
+/// name for it, looked up once a batch for each site and place.
+pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+    let rows = fields.len();
+    let (mut keys, mut kinds) = (Dict::new(), Dict::new());
+    // alloc: a batch's keys, once a read
+    let (mut key_keys, mut kind_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in fields {
+        key_keys.push(keys.key(u64::from(row.site) << 8 | u64::from(row.index), || {
+            flight::meta(row.site)
+                .and_then(|it| it.fields().iter().nth(usize::from(row.index)))
+                .map_or("?", |it| it.name())
+        }));
+        kind_keys.push(kinds.key(row.value.kind(), || row.value.kind_name()));
+    }
+    // alloc: a batch's texts, once a read
+    let texts: Vec<Option<std::sync::Arc<str>>> = fields
+        .iter()
+        .map(|it| match it.value {
+            FieldValue::Str(sym) => flight::name(sym),
+            _ => None,
+        })
+        .collect();
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(fields.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt64Array::from_iter_values(fields.iter().map(|it| it.event_id))),
+        column(UInt16Array::from_iter_values(fields.iter().map(|it| it.ordinal))),
+        keys.finish(UInt32Array::from(key_keys))?,
+        kinds.finish(UInt32Array::from(kind_keys))?,
+        column(Int64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::I64(it) => Some(it),
+            _ => None,
+        }))),
+        column(UInt64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::U64(it) => Some(it),
+            _ => None,
+        }))),
+        column(Float64Array::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::F64(it) => Some(it),
+            _ => None,
+        }))),
+        column(BooleanArray::from_iter(fields.iter().map(|it| match it.value {
+            FieldValue::Bool(it) => Some(it),
+            _ => None,
+        }))),
+        column(StringArray::from_iter(texts.iter().map(|it| it.as_deref()))),
+    ];
+    RecordBatch::try_new(schema_of(&schema::EVENT_FIELDS), columns)
 }
 
 /// The `folded` rows of a read: its sums of short spans.

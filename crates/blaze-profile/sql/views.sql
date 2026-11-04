@@ -43,6 +43,50 @@ SELECT * FROM read_parquet(@switches, union_by_name = true);
 CREATE OR REPLACE VIEW events AS
 SELECT * FROM read_parquet(@events, union_by_name = true);
 
+-- One row a field of a kept event other than its message, its value in the column `kind` names
+-- (i64, u64, f64, bool or str); `process` and `event_id` name its event, as in `events`. A file
+-- of schema version 3 or older has no rows here: its fields are in its events' `message`.
+CREATE OR REPLACE VIEW event_fields AS
+SELECT * FROM read_parquet(@event_fields, union_by_name = true);
+
+-- `event_fields` with every value as text (`value_text`) and an integer one, i64 or u64, as one
+-- HUGEINT (`value_int`): what a filter on a field reads without knowing its kind.
+CREATE OR REPLACE VIEW event_values AS
+SELECT
+    build_id, process, event_id, ordinal, key, kind, value_i64, value_u64, value_f64, value_bool, value_str,
+    coalesce(CAST(value_i64 AS HUGEINT), CAST(value_u64 AS HUGEINT)) AS value_int,
+    coalesce(CAST(value_i64 AS VARCHAR), CAST(value_u64 AS VARCHAR), CAST(value_f64 AS VARCHAR),
+        CAST(value_bool AS VARCHAR), value_str) AS value_text
+FROM event_fields;
+
+-- `events` with each one's fields beside it: `fields` all of them as `key=value` text in the
+-- order the event recorded them (null for none), then the keys blaze's events say most as
+-- columns of their own, as text (null where the event has no field of that key). Every other
+-- key is in `event_values`.
+CREATE OR REPLACE VIEW events_wide AS
+SELECT
+    events.*, said.fields, said.unit, said.image, said.path, said.dir, said.what, said.why,
+    said.error, said.outcome, said.step, said.bytes
+FROM events
+LEFT JOIN (
+    SELECT
+        process, event_id,
+        string_agg(key || '=' || coalesce(value_text, '?'), ' ' ORDER BY ordinal) AS fields,
+        max(value_text) FILTER (WHERE key = 'unit') AS unit,
+        max(value_text) FILTER (WHERE key = 'image') AS image,
+        max(value_text) FILTER (WHERE key = 'path') AS path,
+        max(value_text) FILTER (WHERE key = 'dir') AS dir,
+        max(value_text) FILTER (WHERE key = 'what') AS what,
+        max(value_text) FILTER (WHERE key = 'why') AS why,
+        max(value_text) FILTER (WHERE key = 'error') AS error,
+        max(value_text) FILTER (WHERE key = 'outcome') AS outcome,
+        max(value_text) FILTER (WHERE key = 'step') AS step,
+        max(value_int) FILTER (WHERE key = 'bytes') AS bytes
+    FROM event_values
+    GROUP BY process, event_id
+) AS said
+    ON said.process = events.process AND said.event_id = events.event_id;
+
 CREATE OR REPLACE VIEW errors AS
 SELECT * FROM read_parquet(@errors, union_by_name = true);
 

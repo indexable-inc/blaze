@@ -18,8 +18,11 @@ use crate::span;
 /// `folded` rows a parent's site and site, and a span's self time is its duration less its
 /// children's rows and its `folded_ns`. A file of version 2 or older has no `folded_ns` column
 /// and folded nothing (no blaze before 3 turned folding on), so a null `folded_ns` reads as
-/// 0 and its spans' self time stays right.
-pub const VERSION: u32 = 3;
+/// 0 and its spans' self time stays right. At 4: `events.message` is the message alone (it was
+/// the message, then each other field as `name=value`); an event's other fields are rows of
+/// `event_fields`, joined on `process` and `events.event_id`. A file of version 3 or older has no
+/// `event_id` and its fields are in its `message`.
+pub const VERSION: u32 = 4;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
 /// them so takes.
@@ -30,15 +33,23 @@ pub struct Upgrade {
     pub how: &'static str,
 }
 
-/// Each older version a reader reads, oldest last. 2 reads as 3 with no rewrite: its files
-/// have no `folded_ns`, which the views read through the table's schema file, all nulls,
-/// and every reader takes a null `folded_ns` as 0, right as no blaze before 3 folded. 1 does
-/// not: its `spans.owner` and `switches.wait_value` name a job by its slot + 1, and its
+/// Each older version a reader reads, oldest last, with no rewrite. 3 reads as 4: its `events`
+/// have no `event_id`, which the views read through the table's schema file as null, and the
+/// loaders take a null `event_id` as an event with no `event_fields` rows; its fields stay in its
+/// `message` as `name=value`, as 3 wrote them. 2 reads as 4 as 3 does and also has no
+/// `folded_ns`, read as null, which every reader takes as 0, right as no blaze before 3 folded.
+/// 1 does not: its `spans.owner` and `switches.wait_value` name a job by its slot + 1, and its
 /// generation, which 2's `generation << 32 | slot` needs, was never written.
-pub const UPGRADES: &[Upgrade] = &[Upgrade {
-    from: 2,
-    how: "no `folded_ns` column: read through the schema file as null, which reads as 0; no blaze before 3 folded",
-}];
+pub const UPGRADES: &[Upgrade] = &[
+    Upgrade {
+        from: 3,
+        how: "no `events.event_id` column: read through the schema file as null, an event with no `event_fields` rows; its fields stay in its `message`",
+    },
+    Upgrade {
+        from: 2,
+        how: "as 3, and no `folded_ns` column: read through the schema file as null, which reads as 0; no blaze before 3 folded",
+    },
+];
 
 /// Whether a file of `version` reads as [`VERSION`]'s: `Err` says why not, for the reader's
 /// refusal naming the file.
@@ -67,6 +78,7 @@ pub enum Type {
     U64,
     I64,
     F64,
+    Bool,
     Utf8,
     /// A string from a small set (names, kinds): dictionary-encoded, `u32` keys.
     Dict,
@@ -275,11 +287,12 @@ pub const SWITCHES: Table = Table {
     ],
 };
 
-/// One row a `tracing` event the recorder keeps (`blaze_profile::keeps`): a `warn!`, `error!` or
-/// `info!` of a `blaze` target, on the thread it happened on.
+/// One row a `tracing` event the recorder keeps (`blaze_profile::logs::keeps_event`) and the
+/// history writes (`blaze_profile::logs::Hold`), on the thread it happened on. Its fields other
+/// than its message are rows of [`EVENT_FIELDS`].
 pub const EVENTS: Table = Table {
     name: "events",
-    doc: "one row a tracing event kept (info and above, of a blaze target), on the thread it happened on",
+    doc: "one row a tracing event kept (error and warn of any target; info of a blaze target; debug of the target blaze, written when its build failed or stalled or the history is set to debug), on the thread it happened on",
     columns: &[
         BUILD_ID,
         PROCESS,
@@ -291,15 +304,45 @@ pub const EVENTS: Table = Table {
             Type::U64,
             "the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job",
         ),
-        col("level", Type::Dict, "ERROR, WARN or INFO"),
+        col("level", Type::Dict, "ERROR, WARN, INFO or DEBUG"),
         col("target", Type::Dict, "its tracing target: the module path it was written in, unless it names one"),
         col("name", Type::Dict, "its callsite, as tracing names it: `event <file>:<line>`"),
         opt(
             "message",
             Type::Utf8,
-            "its message, then each other field as `name=value`; null when its text was let go before a reader read it",
+            "its message alone (tracing's `message` field); its other fields are rows of `event_fields`; null when it has none or its text was let go before a reader read it",
         ),
         opt("span_id", Type::U64, "the span it happened in, as `spans.span_id`; null outside any"),
+        col(
+            "event_id",
+            Type::U64,
+            "unique in its process for the process's life (its thread's ring << 48 | the row's place in that ring): what `event_fields` rows name it by, with `process`",
+        ),
+    ],
+};
+
+/// One row a field of an [`EVENTS`] row other than its message, typed as the event recorded
+/// it: a field's key is its callsite's (callsites are static), and its value sits in the one
+/// value column its `kind` names, the others null.
+pub const EVENT_FIELDS: Table = Table {
+    name: "event_fields",
+    doc: "one row a field of a kept tracing event other than its message, its value in the column its kind names",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        col("event_id", Type::U64, "the event, as `events.event_id` names it in its process"),
+        col("ordinal", Type::U16, "the field's place among its event's fields, in the order the event recorded them, from 0"),
+        col("key", Type::Dict, "the field's name, as its callsite writes it"),
+        col(
+            "kind",
+            Type::Dict,
+            "which value column holds it: i64, u64, f64, bool or str (a `&str`, or anything else recorded through `Display` or `Debug`, as text)",
+        ),
+        opt("value_i64", Type::I64, "for kind i64: a signed integer (an i128 that fits)"),
+        opt("value_u64", Type::U64, "for kind u64: an unsigned integer (a u128 that fits)"),
+        opt("value_f64", Type::F64, "for kind f64: a float"),
+        opt("value_bool", Type::Bool, "for kind bool"),
+        opt("value_str", Type::Utf8, "for kind str: its text; null when the text was let go before a reader read it"),
     ],
 };
 
@@ -800,7 +843,7 @@ pub const PANICS: Table = Table {
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 24] = [
+pub const TABLES: [&Table; 25] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -825,6 +868,7 @@ pub const TABLES: [&Table; 24] = [
     &OPEN,
     &FOLDED,
     &PANICS,
+    &EVENT_FIELDS,
 ];
 
 /// The tables that are results, made on request and not kept.

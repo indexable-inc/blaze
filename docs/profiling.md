@@ -75,11 +75,14 @@ blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-p
 
 Defined once, in `crates/blaze-profile/src/schema.rs`. The Arrow schema of each table, the
 Parquet files, the live feed, the DuckDB views and this page all come from it. Schema version
-3 (`schema::VERSION`). Each Arrow schema's metadata carries `blaze.table`, `blaze.schema` (the
-version) and `blaze.clock`, and each file's manifest entry says its version. A reader reads a
-file of version 3 as it is and one of version 2 as 3 (its absent `folded_ns` reads as null, which
-every reader takes as 0; `schema::UPGRADES`), and refuses any other, naming the file: version 1
-named a job by its slot alone, and the generation version 2 needs was never written.
+4 (`schema::VERSION`; at 4 `events.message` became the message alone, the other fields rows of
+`event_fields`). Each Arrow schema's metadata carries `blaze.table`, `blaze.schema` (the version)
+and `blaze.clock`, and each file's manifest entry says its version. A reader reads a file of
+version 4 as it is, one of version 3 as 4 (its absent `events.event_id` reads as null: an event
+with no `event_fields` rows, its fields still in its `message`) and one of version 2 as 4 as well
+(its absent `folded_ns` also reads as null, which every reader takes as 0; `schema::UPGRADES`),
+and refuses any other, naming the file: version 1 named a job by its slot alone, and the
+generation version 2 needs was never written.
 
 **Time.** Every `*_ns` instant is in nanoseconds on the machine's monotonic clock: Linux
 `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW` (`mach_absolute_time`). It is the same clock in
@@ -424,27 +427,94 @@ count or time spans by name or query kind from it, not from `spans` alone.
 | thread_name | dict | the thread's name |
 | t_ns | i64 | when |
 | job | u64? | the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job |
-| level | dict | `ERROR`, `WARN` or `INFO` |
+| level | dict | `ERROR`, `WARN`, `INFO` or `DEBUG` |
 | target | dict | its target: the module path it was written in (`blaze_cargo::serve::daemon`), unless it names one |
 | name | dict | its callsite, as `tracing` names it: `event crates/blaze-cargo/src/serve/daemon.rs:1102` |
-| message | utf8? | its message, then each other field as `name=value`; null when its text was let go before a reader read it |
+| message | utf8? | its message alone (`tracing`'s `message` field); null when it has none or its text was let go before a reader read it |
 | span_id | u64? | the span it happened in, as `spans.span_id`; null outside any |
+| event_id | u64 | unique in its process for the process's life (its ring's number << 48, then its row's place in that ring): what its `event_fields` rows name it by, with `process` |
 
-The recorder keeps an event by the rule it keeps a span by (`blaze_profile::keeps`): INFO or
-above, and a target that starts with `blaze` (a `blaze*` crate's `warn!` needs no target). Every
-other event costs its call and is never seen, so the lint `blaze::unrecorded_span` finds one
-outside a `blaze*` crate and names `target: "blaze"`. An event is one ring row: its message and
-fields are interned as one name, so a message that changes each time (a count, a path) costs a
-name each time. `blaze debug time --trace` shows each event as an instant on its job's fiber
-track (its span's lane when it names no job, its thread's otherwise), and `--html` lists the
-build's first 500.
+### `event_fields`: one row a field of an event other than its message, typed as the event recorded it
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | its event's build |
+| process | u32 | the process id |
+| event_id | u64 | its event, as `events.event_id` |
+| ordinal | u16 | its place among its event's fields, in the order the event recorded them, from 0 |
+| key | dict | the field's name, as its callsite writes it |
+| kind | dict | which value column holds it: `i64`, `u64`, `f64`, `bool` or `str` (a `&str`, or anything recorded through `Display` or `Debug`, as text) |
+| value_i64 | i64? | for `i64`: a signed integer (an `i128` that fits) |
+| value_u64 | u64? | for `u64`: an unsigned integer (a `u128` that fits) |
+| value_f64 | f64? | for `f64` |
+| value_bool | bool? | for `bool` |
+| value_str | utf8? | for `str`: its text; null when it was let go before a reader read it |
+
+Two views over them: `event_values` adds `value_int` (an `i64` or `u64` as one HUGEINT) and
+`value_text` (any value as text) to each field, so a filter need not know a field's kind; and
+`events_wide` is `events` with `fields` (every field as `key=value`, in order, the text the
+message held before version 4) and the keys blaze's events say most as columns of their own:
+`unit`, `image`, `path`, `dir`, `what`, `why`, `error`, `outcome`, `step` (text) and `bytes`
+(an integer). A history written before version 4 has no `event_id` and no `event_fields`: its
+fields are in its events' `message`.
+
+```sql
+-- every event of build 12 that names the unit serde, with its fields
+SELECT t_ns, level, message, fields FROM events_wide WHERE build_id = 12 AND unit = 'serde';
+-- the events whose field bytes passed 1 MiB, of any key's kind
+SELECT e.message, v.key, v.value_int FROM events AS e
+JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+WHERE v.key = 'bytes' AND v.value_int > 1048576;
+```
+
+**What is kept** (`blaze_profile::logs::keeps_event`, the recorder's one rule for events):
+
+| level | kept in the ring |
+|---|---|
+| ERROR, WARN | every event, of any target: a dependency's warning is seen too |
+| INFO | a target that starts with `blaze` (a `blaze*` crate's `info!` needs no target), as spans are kept (`blaze_profile::keeps`) |
+| DEBUG | only a target that is `blaze` or starts with `blaze::` (`debug!(target: "blaze::store", ..)`): an opt-in, so a `blaze*` crate's `debug!` under its module path costs no row in a hot path |
+| TRACE | never; release builds compile it out (`tracing`'s `release_max_level_debug`) |
+
+Every other event costs its call and is never seen, so the lint `blaze::unrecorded_span` finds
+an INFO one outside a `blaze*` crate and names `target: "blaze"`.
+
+**What the history writes** (`blaze_profile::logs::Hold`, run on each flush's rows before they
+are written). Every ERROR, WARN and INFO row is written. A DEBUG row is written by the policy
+`BLAZE_HISTORY_LEVEL` names, read once as `blaze serve` starts (a value that is neither stops the
+daemon, naming it):
+- `info` (the default): a build's DEBUG rows are held in the daemon until the build ends, and
+  written when it failed or stalled, when an ERROR event of that build was read, or when the
+  history closes before the build ended (the daemon stopping under it). They are dropped when it
+  ended ok or cancelled; rows of no build are dropped. At most 16,384 DEBUG events a build and 8 builds
+  are held, the oldest going first. The flush's `Flushed` counts `events_held` and
+  `events_dropped`.
+- `debug`: every DEBUG row the ring kept.
+
+The rule reads only the rows and the builds' ends in the order the history was told them, never
+a clock, so the same build writes the same rows. A daemon that crashes loses what it held; the
+ring still has the build's recent DEBUG rows, which a stall dump (`flight::dump`) and
+`blaze debug sql --live` (the ring's last seconds, every row it holds) read.
+
+An event is one ring row (its message interned) and a row for every five fields after it, each
+value a word: a number is kept as itself with no allocation, and text is interned (a `Debug`
+value formatted once into a thread's buffer). Up to 32 fields an event are kept; past them, and a
+field whose `Debug` itself logs, are counted (`flight::fields_lost`). `blaze debug time --trace`
+shows each event as an instant on its job's fiber track (its span's lane when it names no job,
+its thread's otherwise), its fields typed in its args beside its build, job, span and id, and
+`--html` lists the build's first 500 with their fields.
+
+A process profiled under `BLAZE_PROFILE` (a worker, a build script) keeps its events in its part
+too, with the same build, job, span, process and id, and `trace.json` shows them as instants on
+their threads' tracks.
 
 Each link says its image's shape as events (crates/blaze-link/src/shape.rs), once a stage after
 its layout: `link region`, one a region with its `addr`, `size` (bytes placed), `capacity` (the
 range kept), `section` and `class`; and `link code`, the code's pieces and bytes `by=backend`
 (stencil, cranelift, llvm, native, linker, unsaid) and `by=crate` (the 16 largest, then the
 rest). `blaze explain link_regions` lists each image's regions by address with the bytes unused
-before each, and `blaze explain link_code` its code by backend and crate. A link refused for
+before each, and `blaze explain link_code` its code by backend and crate, both from the events'
+typed fields (`event_values`). A link refused for
 reach or room (`OutOfReach`, `NoRoom`, a field a value does not fit) shows the same regions in
 its message, the reach's two ends marked.
 
@@ -842,7 +912,7 @@ query. Since 2026-11-04:
 ## The flight recorder
 
 Every blaze process keeps a fixed ring per thread, holding that thread's recent spans, counter
-values, switches and events as `spans`, `counters`, `switches` and `events` rows. Recording allocates nothing and does no I/O. A
+values, switches and events as `spans`, `counters`, `switches`, `events` and `event_fields` rows. Recording allocates nothing and does no I/O. A
 span's fields (`crate`, `function`, `unit`, `awaits`) are interned the first time each value
 is seen, in generations of 16,384 names a shard: a full one becomes the previous and the one
 before it is let go, so a daemon's thousandth build names its keys as its first did. (Until
@@ -947,6 +1017,6 @@ waits for progress carries its own bound (fuel, depth or a deadline).
 ## `BLAZE_PROFILE` and `BLAZE_STATS`
 
 `BLAZE_PROFILE=<dir> blaze build` writes, for every process of the build, its spans with each
-`blaze` span's own CPU time. At the end they are merged into `<dir>/trace.json` (a Chrome
-trace), `phases.tsv`, `functions.tsv` and `passes.tsv`. `BLAZE_STATS=1` prints the build's wall
+`blaze` span's own CPU time, and its kept `tracing` events with their fields. At the end they
+are merged into `<dir>/trace.json` (a Chrome trace), `phases.tsv`, `functions.tsv` and `passes.tsv`. `BLAZE_STATS=1` prints the build's wall
 time by step.

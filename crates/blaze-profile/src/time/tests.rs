@@ -715,12 +715,15 @@ fn event(thread: u32, t_ns: i64, job: Option<u64>, span: Option<u64>, message: &
         process: P,
         thread,
         t_ns,
+        build: None,
         job,
         level: "WARN".to_owned(),
         target: "blaze_cargo::serve::daemon".to_owned(),
         name: "event daemon.rs:1".to_owned(),
         message: Some(message.to_owned()),
         span,
+        event_id: t_ns as u64,
+        fields: Vec::new(),
     }
 }
 
