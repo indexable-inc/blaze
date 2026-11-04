@@ -480,6 +480,10 @@ fn encode_head(out: &mut Vec<u8>, header: &Map<String, Value>) {
 /// session's own place in the rings (and an `open` frame of no rows when the open set empties);
 /// and a `cert` frame when the certificate is made anew.
 ///
+/// Each table's frames are the session's one long-lived Arrow IPC stream of it
+/// ([`live::Encoder`]): the page keeps a reader per table and must take every frame with rows,
+/// in order. A frame with no rows has no bytes, so skipping it loses nothing.
+///
 /// A page that reads slower than the frames come falls behind by at most one frame: while a
 /// write waits on the page, ticks are skipped, not queued, and the next read takes everything
 /// since this session's last one. What the rings dropped meanwhile is counted in `skipped`.
@@ -719,7 +723,15 @@ mod tests {
             let header: Value = serde_json::from_slice(&body[4..4 + head_len]).unwrap();
             assert_eq!(header["op"], "live", "{header}");
             assert!(header["rows"].as_u64().unwrap() > 0, "{header}");
-            let batches = live::decode(&body[4 + head_len..]).unwrap();
+            // The session's first frame of a table starts its stream: schema, dictionaries, batch.
+            let table = match header["table"].as_str() {
+                Some("spans") => &schema::SPANS,
+                Some("counters") => &schema::COUNTERS,
+                Some("open") => &schema::OPEN,
+                other => panic!("a live frame of no table the feed sends: {other:?}"),
+            };
+            let mut batches = Vec::new();
+            live::Decoder::new(table).decode(&body[4 + head_len..], &mut batches).unwrap();
             assert_eq!(batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(), header["rows"].as_u64().unwrap());
 
             let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();

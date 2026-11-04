@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blaze-core.workspace = true

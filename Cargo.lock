@@ -1532,6 +1532,7 @@ name = "blaze-profile"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "blaze-core",

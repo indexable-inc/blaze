@@ -14,7 +14,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
 use blaze_core::exit::Exit;
 use blaze_profile::{
-    history, live, slow, sql,
+    history, live, schema, slow, sql,
     time::{load, report::By},
     views,
 };
@@ -346,12 +346,16 @@ fn watch() -> Result<(), Refusal> {
     let width = super::place::stderr_columns().map_or(100, usize::from);
     let mut top = live::Top::default();
     let mut text = String::new();
+    // Each table is one stream across the frames: its decoder keeps the schema and dictionaries.
+    let mut decoders = [&schema::SPANS, &schema::COUNTERS, &schema::OPEN].map(live::Decoder::new);
+    let mut tables: [Vec<RecordBatch>; 3] = Default::default();
     ask(Request::Live, Start::Never, |response| {
         let ResponseRef::Live(frame) = response else { return Ok(()) };
-        let decoded = |what: &str, bytes: &[u8]| live::decode(bytes).map_err(|error| format!("the live feed's {what}: {error}"));
-        let (spans, counters, open) =
-            (decoded("spans", frame.spans)?, decoded("counters", frame.counters)?, decoded("open spans", frame.open)?);
-        top.take(frame.at_ns, frame.skipped, frame.lost, &spans, &counters, &open)
+        for ((decoder, bytes), batches) in decoders.iter_mut().zip([frame.spans, frame.counters, frame.open]).zip(&mut tables) {
+            decoder.decode(bytes, batches).map_err(|error| format!("the live feed: {error}"))?;
+        }
+        let [spans, counters, open] = &tables;
+        top.take(frame.at_ns, frame.skipped, frame.lost, spans, counters, open)
             .map_err(|error| format!("the live feed: {error}"))?;
         top.render(width, &mut text);
         let mut out = std::io::stdout().lock();

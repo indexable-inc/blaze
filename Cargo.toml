@@ -446,6 +446,8 @@ rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 # blaze's own profiler (crates/blaze-profile): the schema's Arrow types, the live feed's IPC
 # batches and the Parquet history. Pure Rust; DuckDB stays outside blaze (`blaze debug sql`).
 arrow-array = { version = "60.1.0", default-features = false }
+# The live feed's client feeds its long-lived IPC streams to `StreamDecoder` as `Buffer`s.
+arrow-buffer = { version = "60.1.0", default-features = false }
 arrow-ipc = { version = "60.1.0", default-features = false, features = ["zstd"] }
 arrow-schema = { version = "60.1.0", default-features = false }
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "simdutf8"] }
