@@ -15,7 +15,7 @@ mod config;
 mod files;
 mod invocation;
 mod manifest;
-mod native;
+pub(crate) mod native;
 mod plan;
 mod resolve;
 mod sandbox;
@@ -110,8 +110,14 @@ pub(crate) struct Spec {
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,
-    /// `--locked` or `--frozen`: the lock file is never written.
-    pub locked: Option<&'static str>,
+    /// `--locked`, `--frozen`, `--no-locked` and whether the build runs on CI: with the
+    /// workspace's `lock = "required"`, whether a lock file may change ([`crate::lock::policy`]).
+    pub lock: crate::lock::LockAsk,
+    /// The release of the blaze that serves the build ([`crate::lock::Inputs::running`]); none
+    /// for a build of the tree, and for a foreign workspace, which has no `blaze.lock`.
+    pub blaze: Option<String>,
+    /// `BLAZE_IGNORE_PIN_FOR`, the root manifest `--ignore-pin` was given for.
+    pub ignore_pin_for: Option<String>,
     /// `--offline` or `--frozen` (`net.offline` is read with the config).
     pub offline: Option<&'static str>,
     pub require_optional_deps: bool,
@@ -226,7 +232,9 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         features: asked.features.clone(),
         all_features: asked.all_features,
         no_default_features: asked.no_default_features,
-        locked: asked.locked_flag(),
+        lock: asked.lock_ask(),
+        blaze: crate::lock::is_version(&asked.blaze).then(|| asked.blaze.clone()),
+        ignore_pin_for: asked.ignore_pin_for.clone(),
         offline: asked.offline_flag(false),
         require_optional_deps: true,
         intent,
@@ -273,7 +281,10 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         features: ask.features.clone(),
         all_features: false,
         no_default_features: true,
-        locked: ask.locked.then_some("--locked"),
+        // The standard library's own lock file, never written: no `CI`, no `blaze.lock`.
+        lock: crate::lock::LockAsk { flag: ask.locked.then_some("--locked"), no_locked: false, ci: false, env_writes: false },
+        blaze: None,
+        ignore_pin_for: None,
         offline: Some("--offline"),
         require_optional_deps: false,
         intent: Intent::Build,
@@ -331,7 +342,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 7");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 8");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -438,7 +449,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 7");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 8");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 

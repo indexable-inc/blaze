@@ -64,9 +64,14 @@ pub struct Asked<'a> {
     /// The release of the rustc that builds, as `rustc -vV` says it (`1.101.0-nightly`): the
     /// Rust version a resolve that honours `rust-version` prefers when no member names one.
     pub rustc_version: Option<&'a str>,
+    /// What decides whether the resolve may write the lock files and what it says when it does
+    /// (`--locked`, `--frozen`, `--no-locked`, `CI`, the running release): blaze-units'
+    /// [`blaze_units::lock::after_resolve`], as every build's.
+    pub lock: blaze_units::lock::Inputs<'a>,
 }
 
 /// The members a `cargo build` builds, as its flags select them.
+#[derive(Clone, Copy)]
 pub struct Build<'a> {
     /// `-p`: the members by name.
     pub packages: &'a [String],
@@ -77,6 +82,7 @@ pub struct Build<'a> {
     pub dev_units: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct TargetPlatform<'a> {
     pub triple: &'a str,
     pub cfg: &'a [Cfg],
@@ -218,8 +224,16 @@ pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
 /// --locked` reads one: a lock file the manifests no longer agree with is cargo's
 /// `--locked` error. The standard library's workspace in a toolchain is read so.
 pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
-    let relock =
-        Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
+    // `--locked` through the one decision ([`blaze_units::lock::after_resolve`]): no
+    // `--no-locked` or `BLAZE_LOCK` of the caller's lets this read write a lock file.
+    let ask = blaze_units::lock::LockAsk { flag: Some("--locked"), ..Default::default() };
+    // clone: the caller's variables, once per read of a toolchain's workspace.
+    let asked = &Asked {
+        env: asked.env.clone(),
+        lock: blaze_units::lock::Inputs { ask, ..asked.lock },
+        ..*asked
+    };
+    let relock = Relock { command: "metadata", respect_source_config: true };
     let made =
         resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
             described(asked, &resolved, serialized, ids)
@@ -564,11 +578,11 @@ fn made(asked: &Asked<'_>) -> Result<Made> {
 }
 
 /// Resolves the workspace of `asked` again after its manifests changed, as `cargo remove`
-/// does, every version it can keep being the one the lock file locks; writes the lock file
-/// if the resolve changed it, unless `locked` (`--locked` or `--frozen`) forbids it. Returns
-/// the packages `[patch]` names that the resolve did not use.
-pub fn relock(asked: &Asked<'_>, command: &str, locked: Option<&str>) -> Result<Vec<PackageId>> {
-    let relock = Relock { command, locked, respect_source_config: true };
+/// does, every version it can keep being the one the lock file locks; writes the lock files
+/// if the resolve changed them and `asked.lock` lets it ([`blaze_units::lock::after_resolve`]).
+/// Returns the packages `[patch]` names that the resolve did not use.
+pub fn relock(asked: &Asked<'_>, command: &str) -> Result<Vec<PackageId>> {
+    let relock = Relock { command, respect_source_config: true };
     resolving_with(asked, as_asked(asked), Some(relock), |_, _, _, unused| Ok(unused.to_vec()))
 }
 
@@ -576,7 +590,6 @@ pub fn relock(asked: &Asked<'_>, command: &str, locked: Option<&str>) -> Result<
 #[derive(Clone, Copy)]
 struct Relock<'a> {
     command: &'a str,
-    locked: Option<&'a str>,
     /// Whether `[source]` replaces the sources it names; `cargo vendor` reads around it.
     respect_source_config: bool,
 }
@@ -752,19 +765,28 @@ fn resolving_with<R>(
         ids.push(id);
         reads.insert(id, read);
     }
-    let locked = relock.and_then(|it| it.locked).map(|flag| lockfile::Locked {
-        flag,
-        path: &lock_path,
-        path_deps: &path_deps,
-    });
-    if let Some(text) = lockfile::lockfile_to_write(
+    // The lock files as a build's load decides them: one rule for both.
+    let write = blaze_units::lock::after_resolve(
+        ctx.files(),
+        &ws,
+        asked.lock,
         &mut whole,
+        lock.as_ref(),
         lock_text.as_deref(),
         lowest_rust_version.as_ref(),
-        locked,
-    )? {
-        std::fs::write(&lock_path, text)
-            .with_context(|| format!("failed to write {}", lock_path.display()))?;
+        &path_deps,
+    )
+    .map_err(|error| anyhow::anyhow!("{}", error.what))?;
+    if let Some(write) = write {
+        for file in &write.files {
+            std::fs::write(&file.path, &file.text)
+                .with_context(|| format!("failed to write {}", file.path))?;
+        }
+        // What a build says of the lock files it wrote, on the command's stderr: a write is never
+        // silent (docs/cargo.md, "Lock files").
+        for line in &write.said {
+            eprintln!("note: {line}");
+        }
     }
     let unused_patches = whole.unused_patches().to_vec();
     let manifests: HashMap<PackageId, &Manifest, Global> = ws
@@ -1071,16 +1093,12 @@ pub struct Vendored {
 }
 
 /// Every package of the workspace's lock file, as `cargo vendor` reads them: the workspace
-/// resolved again first, writing the lock file if that changes it (unless `locked`, the flag
-/// that forbids it), and each registry package fetched, `[source]` replacing none unless
+/// resolved again first, writing the lock files if that changes them and `asked.lock` lets it,
+/// and each registry package fetched, `[source]` replacing none unless
 /// `respect_source_config`. A git package is refused: it is vendored with its manifest as
 /// `cargo package` writes it, which blaze does not write yet.
-pub fn vendored(
-    asked: &Asked<'_>,
-    respect_source_config: bool,
-    locked: Option<&str>,
-) -> Result<Vec<Vendored>> {
-    let relock = Relock { command: "vendor", locked, respect_source_config };
+pub fn vendored(asked: &Asked<'_>, respect_source_config: bool) -> Result<Vec<Vendored>> {
+    let relock = Relock { command: "vendor", respect_source_config };
     resolving_with(asked, as_asked(asked), Some(relock), |_, _, _, _| Ok(()))?;
     let read = with_lock(asked, "vendor", |ctx, _, lock| {
         let offline = asked.offline || ctx.config.net_config()?.offline.unwrap_or(false);

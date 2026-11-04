@@ -10,12 +10,16 @@
 //! release does, saying so in one line. `--ignore-pin` runs this blaze, release or not,
 //! whatever the workspace pins ([`choose`]).
 //!
-//! Asked before every command (`program.rs`), so it stays small and quick: std and `toml` only.
+//! Asked before every command (`program.rs`), so it stays small and quick: std, `toml` and blaze-units' version rule only.
 
 use std::{
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
+
+/// Whether a version is a release's (`0.YYYYMMDD.N`): one rule, blaze-units', which
+/// `blaze.lock` asks too.
+use blaze_units::lock::is_version;
 
 /// The variable the launcher sets for the blaze it runs: the manifest that pinned it. A blaze
 /// started with it in that workspace is the pinned one, and runs no other; every process under
@@ -274,20 +278,6 @@ pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
     }
     let age = std::fs::metadata(file).ok()?.modified().ok()?.elapsed();
     Some((version, age.is_ok_and(|age| age < CHANNEL_FRESH)))
-}
-
-/// Whether `version` is a release's version, `0.YYYYMMDD.N`: `0`, a date of eight digits and
-/// a number, so that it names a directory and an asset and nothing else, and its date is always
-/// there to read (`versions::has_b3sums`).
-pub(crate) fn is_version(version: &str) -> bool {
-    let digits = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit());
-    let mut parts = version.split('.');
-    let (Some("0"), Some(date), Some(n), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    date.len() == 8 && digits(date) && digits(n)
 }
 
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in

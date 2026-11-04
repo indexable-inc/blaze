@@ -22,7 +22,7 @@ use crate::{
     ViewRef, Worked,
 };
 
-const REQUESTS: usize = 34;
+const REQUESTS: usize = 35;
 const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
@@ -325,6 +325,7 @@ impl Gen {
                 most_bytes: if self.yes() { Some(self.wide()) } else { None },
                 out: self.maybe_text(),
             },
+            34 => Request::Lock { view: self.view(0), targets: self.targets() },
             _ => Request::Stop,
         }
     }
@@ -940,6 +941,7 @@ fn request_index(request: &Request) -> usize {
         Request::Launch { .. } => 31,
         Request::FetchUrl { .. } => 32,
         Request::Stop => 33,
+        Request::Lock { .. } => 34,
     }
 }
 

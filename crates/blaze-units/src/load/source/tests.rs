@@ -190,6 +190,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)], mounts: Vec<Mount
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: SOURCES.to_owned(),
+        blaze: String::new(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }

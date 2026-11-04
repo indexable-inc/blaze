@@ -29,6 +29,7 @@ use std::alloc::Global;
 use super::files::Snap;
 use super::source::{Index, Located, Sources};
 use super::{Select, Spec, Staged, load_error};
+use crate::lock;
 use crate::query::{Fetch, LoadError, LockWrite};
 use crate::read::{
     self as summary, Package, Read, feature_unification, manifest_source, path_packages,
@@ -285,16 +286,24 @@ pub(crate) fn resolved<'r, 'db, R>(
         Staged::Failed(error) => return Ok(Staged::Failed(error)),
     }
 
-    let locked =
-        spec.locked.map(|flag| lockfile::Locked { flag, path: &lock_path, path_deps: &path_deps });
-    let lock_write = match lockfile::lockfile_to_write(
+    let inputs = lock::Inputs {
+        ask: spec.lock,
+        running: spec.blaze.as_deref(),
+        ignore_pin_for: spec.ignore_pin_for.as_deref(),
+        foreign: spec.foreign.is_some(),
+    };
+    let lock_write = match lock::after_resolve(
+        &files,
+        ws,
+        inputs,
         &mut whole,
+        lock.as_ref(),
         lock_text.as_deref(),
         lowest_rust_version.as_ref(),
-        locked,
+        &path_deps,
     ) {
-        Ok(text) => text.map(|text| LockWrite { path: lock_path.display().to_string(), text }),
-        Err(error) => return Ok(fail(error)),
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
     };
 
     let feature_members =

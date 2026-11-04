@@ -261,36 +261,8 @@ pub(crate) fn needed<F: Files>(
         }
         targets.sort_unstable();
         targets.dedup_by(|a, b| a.0 == b.0);
-        let pin_path = Path::new(&input.pin);
-        let at = Some(input.pin.clone());
-        let bad = |what: String| LoadError {
-            what: format!(
-                "the pin of native input `{}` ({TABLE} in {}), {}: {what}",
-                input.name,
-                manifest.display(),
-                input.pin
-            ),
-            at: at.clone(),
-        };
-        let bytes = files.read(pin_path).map_err(|error| bad(format!("can't be read: {error}")))?;
-        let shape = "JSON with `release` and `targets` of `name` and `sha256`";
-        let pin: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)
-            .map_err(|error| bad(format!("is not {shape}: {error}")))?;
-        let release = pin
-            .get("release")
-            .and_then(|it| it.as_str())
-            .ok_or_else(|| bad(format!("has no `release` string ({shape})")))?;
-        let archives: BTreeMap<String, PinTarget> = pin
-            .get("targets")
-            .map(BTreeMap::<String, PinTarget>::deserialize)
-            .transpose()
-            .map_err(|error| bad(format!("`targets` is not {shape}: {error}")))?
-            .ok_or_else(|| bad(format!("has no `targets` ({shape})")))?;
-        let release_raw = release;
-        let release = release.trim_end_matches('/');
-        if !release.starts_with("https://") || release.len() == "https://".len() {
-            return Err(bad(format!("`release` is `{release_raw}`, not an `https://` URL")));
-        }
+        let bad = bad_pin(input, manifest);
+        let (release, archives) = read_pin(files, input, manifest)?;
         for (target, package) in targets {
             let Some(archive) = archives.get(target) else {
                 return Err(bad(format!(
@@ -298,22 +270,6 @@ pub(crate) fn needed<F: Files>(
                     archives.keys().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ")
                 )));
             };
-            let one_part = !archive.name.is_empty()
-                && archive.name != "."
-                && archive.name != ".."
-                && !archive.name.contains(['/', '\\', '?', '#', '%', '\0']);
-            if !one_part {
-                return Err(bad(format!(
-                    "target `{target}`'s `name` is `{}`, not one file name",
-                    archive.name
-                )));
-            }
-            if !is_sha256(&archive.sha256) {
-                return Err(bad(format!(
-                    "target `{target}`'s `sha256` is `{}`, not 64 lowercase hex digits",
-                    archive.sha256
-                )));
-            }
             out.push(NativeInput {
                 name: input.name.clone(),
                 target: target.to_owned(),
@@ -326,5 +282,74 @@ pub(crate) fn needed<F: Files>(
         }
     }
     out.sort();
+    Ok(out)
+}
+
+/// How an error about the pin of `input` (declared in `manifest`) says it.
+fn bad_pin<'a>(input: &'a Declared, manifest: &'a Path) -> impl Fn(String) -> LoadError + 'a {
+    move |what: String| LoadError {
+        what: format!("the pin of native input `{}` ({TABLE} in {}), {}: {what}", input.name, manifest.display(), input.pin),
+        at: Some(input.pin.clone()),
+    }
+}
+
+/// The pin file of `input` read through `files`: its `release` URL without a trailing `/`, and
+/// each target's archive, every one checked (one file name, a sha256).
+fn read_pin<F: Files>(
+    files: &F,
+    input: &Declared,
+    manifest: &Path,
+) -> Result<(String, BTreeMap<String, PinTarget>), LoadError> {
+    let bad = bad_pin(input, manifest);
+    let bytes = files.read(Path::new(&input.pin)).map_err(|error| bad(format!("can't be read: {error}")))?;
+    let shape = "JSON with `release` and `targets` of `name` and `sha256`";
+    let pin: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&bytes).map_err(|error| bad(format!("is not {shape}: {error}")))?;
+    let release_raw =
+        pin.get("release").and_then(|it| it.as_str()).ok_or_else(|| bad(format!("has no `release` string ({shape})")))?;
+    let archives: BTreeMap<String, PinTarget> = pin
+        .get("targets")
+        .map(BTreeMap::<String, PinTarget>::deserialize)
+        .transpose()
+        .map_err(|error| bad(format!("`targets` is not {shape}: {error}")))?
+        .ok_or_else(|| bad(format!("has no `targets` ({shape})")))?;
+    let release = release_raw.trim_end_matches('/');
+    if !release.starts_with("https://") || release.len() == "https://".len() {
+        return Err(bad(format!("`release` is `{release_raw}`, not an `https://` URL")));
+    }
+    for (target, archive) in &archives {
+        let one_part = !archive.name.is_empty()
+            && archive.name != "."
+            && archive.name != ".."
+            && !archive.name.contains(['/', '\\', '?', '#', '%', '\0']);
+        if !one_part {
+            return Err(bad(format!("target `{target}`'s `name` is `{}`, not one file name", archive.name)));
+        }
+        if !is_sha256(&archive.sha256) {
+            return Err(bad(format!("target `{target}`'s `sha256` is `{}`, not 64 lowercase hex digits", archive.sha256)));
+        }
+    }
+    Ok((release.to_owned(), archives)) // alloc: a URL, once per pin read
+}
+
+/// Every input the root manifest at `manifest` (its `[workspace.metadata]` is `metadata`)
+/// declares, with every target its pin file names, as `blaze.lock` pins them: whatever this
+/// build needs, so the lock does not depend on what was built. Each pin is named relative to
+/// `root`, the workspace's root, when it is under it.
+pub(crate) fn locked_pins<F: Files>(
+    files: &F,
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+    root: &Path,
+) -> Result<Vec<crate::lock::NativePin>, LoadError> {
+    let declared = declared(metadata, manifest)?;
+    let mut out = Vec::with_capacity(declared.len()); // alloc: a manifest's few inputs, once a load
+    for input in &declared {
+        let (_, archives) = read_pin(files, input, manifest)?;
+        let pin = Path::new(&input.pin);
+        let pin = pin.strip_prefix(root).unwrap_or(pin).display().to_string();
+        let targets = archives.into_iter().map(|(target, archive)| (target, archive.sha256)).collect();
+        out.push(crate::lock::NativePin { name: input.name.clone(), pin, targets });
+    }
     Ok(out)
 }

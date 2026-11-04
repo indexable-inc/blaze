@@ -1305,6 +1305,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
+        blaze: String::new(),
     };
     blaze_lower::lower(blaze_lower::Lower {
         units: &units,
@@ -1618,6 +1619,7 @@ fn script_front_for(
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
+        blaze: String::new(),
     };
     let lower = blaze_lower::Lower {
         units: &units,
@@ -1973,6 +1975,7 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
+        blaze: String::new(),
     };
     blaze_lower::lower(blaze_lower::Lower {
         units: &units,
@@ -2104,6 +2107,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
+        blaze: String::new(),
     };
     let lowered = blaze_lower::lower(blaze_lower::Lower {
         units: &units,

@@ -91,6 +91,9 @@ pub enum Work {
     /// (`blaze_intent::ahead::plan`), chosen once the view's proc macros and build scripts'
     /// runs are built and applied. Runs no test. Started only through [`Builder::speculate`].
     Ahead { targets: Targets, filter: Vec<String> },
+    /// [`crate::Request::Lock`]: the view's plan made, which writes its lock files, and the job
+    /// over; nothing lowered, checked or built.
+    Lock(Targets),
 }
 
 /// The daemon's build, as the session drives it.
