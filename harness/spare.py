@@ -54,7 +54,7 @@ def started(side, label):
         took, ran, used = memory.run(side.argv("build"), side.ws, side.env, 7200, sampler=sampler)
         if ran.returncode != 0:
             raise SystemExit(f"{label}: `blaze build` failed:\n{ran.stderr[-3000:]}")
-    return took, took, max(sampler.peak_mb, used["largest_mb"]), how_built(ran.stderr)
+    return took, took, max(sampler.peak_mb, used["largest_mb"]), how_built(ran)
 
 
 def sequence(name, spec, source, variant, work):

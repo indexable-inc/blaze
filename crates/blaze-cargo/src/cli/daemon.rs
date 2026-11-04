@@ -884,16 +884,31 @@ fn answers(socket: &Path) -> Result<bool, DaemonError> {
     }
 }
 
-/// `blaze status`: what the daemon is doing, on stdout.
+/// `blaze status`: what the daemon is doing, on stdout; with `json`, one JSON object
+/// ([`status_json`]), with `"daemon": null` when none is running.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
 pub fn status(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     color: bool,
+    json: bool,
 ) -> anyhow::Result<i32> {
+    // What this blaze knows without a daemon, read before connecting: a home blaze can't name
+    // is the error, as it is for every command.
+    let place = match json {
+        true => Some(StatusPlace {
+            home: crate::serve::root()?,
+            state: crate::serve::state()?,
+            socket: crate::serve::socket()?,
+        }),
+        false => None,
+    };
     let Some(mut client) = connect(Start::Never)? else {
-        writeln!(out, "no daemon is running")?;
+        match &place {
+            Some(place) => out.write_all(status_json(place, None)?.as_bytes())?,
+            None => writeln!(out, "no daemon is running")?,
+        }
         return Ok(0);
     };
     let mut status = None;
@@ -907,10 +922,89 @@ pub fn status(
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
-    if let Some(status) = status {
-        out.write_all(status_lines(&status).as_bytes())?;
+    match (status, &place) {
+        (Some(status), Some(place)) if ok => {
+            out.write_all(status_json(place, Some(&status))?.as_bytes())?;
+        }
+        (Some(status), None) => out.write_all(status_lines(&status).as_bytes())?,
+        // A failed answer is said on stderr above; stdout stays empty under `--json`, so a
+        // reader never takes a partial object for the daemon's.
+        _ => {}
     }
     Ok(if ok { 0 } else { super::Exit::Failed.code() })
+}
+
+/// Where this blaze keeps its state, for `blaze status --json`: blaze's root (`BLAZE_HOME`, or
+/// `blaze` in the user's cache directory), the daemon's state directory under it, and the
+/// socket the CLI connects to.
+pub struct StatusPlace {
+    pub home: PathBuf,
+    pub state: PathBuf,
+    pub socket: PathBuf,
+}
+
+/// `blaze status --json`'s object, as docs/cargo.md ("The daemon") names its fields. Its
+/// fields are always all present, `null` where there is no daemon.
+#[derive(serde::Serialize)]
+struct StatusJson<'a> {
+    /// The JSON's own shape: a new number when a field changes meaning or goes.
+    format: u32,
+    /// This blaze's version line (`blaze --version`).
+    version: String,
+    /// The daemon API schema this blaze speaks ([`blaze_api::SCHEMA`]).
+    api_schema: u32,
+    home: &'a Path,
+    state: &'a Path,
+    socket: &'a Path,
+    daemon: Option<DaemonJson<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct DaemonJson<'a> {
+    pid: u32,
+    /// The hash of the daemon's executable as it started ([`blaze_api::Build::id`]), in hex.
+    build: String,
+    exe: &'a str,
+    uptime_ms: u64,
+    memory_bytes: u64,
+    budget_bytes: u64,
+    /// The bugs it went on past, summed over every site ([`Status::bugs`]).
+    bugs: u64,
+    requests: &'a [u64],
+    views: u32,
+    history: Option<&'a str>,
+    settings: std::collections::BTreeMap<&'a str, Option<&'a str>>,
+}
+
+/// The [`StatusJson`] of `place` and the daemon's `status` (`None`: no daemon runs), one
+/// line, newline ended.
+pub fn status_json(place: &StatusPlace, status: Option<&Status>) -> anyhow::Result<String> {
+    let daemon = status.map(|status| DaemonJson {
+        pid: status.pid,
+        build: format!("{:x}", status.build.id), // alloc: the CLI's answer, once
+        exe: &status.build.exe.path,
+        uptime_ms: status.uptime_ms,
+        memory_bytes: status.memory_bytes,
+        budget_bytes: status.budget_bytes,
+        bugs: status.bugs.iter().map(|it| it.count).sum(),
+        requests: &status.requests,
+        views: status.views,
+        history: status.history.as_deref(),
+        settings: status.settings.iter().map(|it| (&*it.name, it.value.as_deref())).collect(), // alloc: as above
+    });
+    let json = StatusJson {
+        format: 1,
+        version: crate::version(),
+        api_schema: blaze_api::SCHEMA,
+        home: &place.home,
+        state: &place.state,
+        socket: &place.socket,
+        daemon,
+    };
+    use anyhow::Context as _;
+    let mut line = serde_json::to_string(&json).context("`blaze status --json`'s answer as JSON")?;
+    line.push('\n');
+    Ok(line)
 }
 
 /// `blaze daemon install`: a running daemon stopped, then the launchd agent or systemd units
@@ -993,6 +1087,7 @@ pub fn stop(_: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
 pub fn status(
     _: &mut dyn std::io::Write,
     _: &mut dyn std::io::Write,
+    _: bool,
     _: bool,
 ) -> anyhow::Result<i32> {
     anyhow::bail!("blaze status: {NO_DAEMON}")

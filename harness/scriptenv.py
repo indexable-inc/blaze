@@ -69,7 +69,10 @@ def main():
         base.pop("SDK_DIR", None)
         base.pop("VENDOR_DIR", None)
         written(ws, files)
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=ws, env=base, capture_output=True)
+        locked = blaze("lock")
+        if locked.returncode != 0:
+            raise SystemExit(f"FAIL {name}: `blaze lock` in {ws} exited {locked.returncode}: "
+                             f"{locked.stderr.strip()[-1500:]}")
 
     def blaze(*args, **env):
         ran = subprocess.run(["blaze", *args], cwd=ws, env=dict(base, **env),

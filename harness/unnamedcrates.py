@@ -9,7 +9,7 @@ usage: unnamedcrates.py    (BLAZE_BIN names the blaze built; blaze is found next
 
 `noisy` is a library with a constructor that prints. Each program depends on it and names it
 in one way or none, and is built by `blaze run`, dev and `--release`: it has to print what
-cargo's build of the same source prints, the constructor's line or not.
+`PROGRAMS` says, the constructor's line or not, as rustc's rule for loading crates has it.
 
 Linux and macOS. Python 3, stdlib only.
 """
@@ -84,14 +84,9 @@ def main():
         for flags in ([], ["--release"]):
             for program, (_, prints) in PROGRAMS.items():
                 named = " ".join(["`blaze run -p", program, *flags]) + "`"
-                reference = subprocess.run(["cargo", "run", "-q", "-p", program, *flags], cwd=ws,
-                                           env=dict(env, CARGO_TARGET_DIR=os.path.join(root, "ref")),
-                                           capture_output=True, text=True, timeout=TIMEOUT)
-                check(f"`cargo run -p {program}` prints {prints!r}", reference.stdout == prints,
-                      f"{reference.stdout!r}\n{reference.stderr}")
                 ran = subprocess.run(["blaze", "run", "-q", "-p", program, *flags], cwd=ws, env=env,
                                      capture_output=True, text=True, timeout=TIMEOUT)
-                check(f"{named} prints the same", (ran.returncode, ran.stdout) == (0, reference.stdout),
+                check(f"{named} prints {prints!r}", (ran.returncode, ran.stdout) == (0, prints),
                       f"exit {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
                 check("  ... and building with cargo is not what ran", "building with cargo" not in ran.stderr,
                       ran.stderr)

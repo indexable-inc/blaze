@@ -54,6 +54,8 @@ pub struct Daemon<'a> {
     pub settings: &'a [crate::Setting],
     pub memory_bytes: u64,
     pub budget_bytes: u64,
+    /// How long the daemon has run, on its driver's clock, for [`Status::uptime_ms`].
+    pub uptime_ms: u64,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
     /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
     pub memory: fn() -> Snapshot,
@@ -761,6 +763,7 @@ impl Session {
                     history: cx.history.map(str::to_owned),
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
+                    uptime_ms: cx.uptime_ms,
                     bugs: (cx.bugs)(),
                 };
                 answer(out, req, Response::Status(status));

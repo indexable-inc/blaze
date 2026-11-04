@@ -42,11 +42,14 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import blake3
+
+if TYPE_CHECKING:
+    from storelib import BuildFinished
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
@@ -134,6 +137,9 @@ class Ran:
     returncode: int
     stdout: str
     stderr: str
+    # Its `build-finished` line read (harness/storelib.py), where the engine asked for one and
+    # cut `stdout` to what came after it (`V1.build`); None otherwise.
+    finished: "BuildFinished | None" = None
 
     def said(self, tail: int = 3000) -> str:
         return (self.stdout + self.stderr)[-tail:]
@@ -395,10 +401,12 @@ def first_difference_by(proof: Path, a: Path, b: Path) -> str:
     return f"one ends at byte {at:#x}"
 
 
-def toolchain_identity(env: dict[str, str]) -> str:
-    """What the pinned toolchain says it is (`rustc -vV`, `cargo -vV`), for a result to name."""
-    said = [run(f"`{tool} -vV`", [tool, "-vV"], ROOT, env, 300, check=True).stdout for tool in ("rustc", "cargo")]
-    return "\n".join(said)
+def toolchain_identity(blaze: Path, env: dict[str, str]) -> str:
+    """What blaze says its toolchain is (`blaze toolchain --json`: name, nightly, `rustc -V`'s
+    line, commit, host, sysroot), for a result to name. blaze answers; no rustc or cargo runs.
+    Downloads blaze's Rust once when it is not there yet."""
+    return run(f"`{blaze} toolchain --json`", [str(blaze), "toolchain", "--json"], ROOT, env, 900,
+               check=True).stdout.strip()
 
 
 class Engine(ABC):
@@ -516,13 +524,31 @@ class V1(Engine):
     def not_blazes(self, ran: Ran) -> str | None:
         import blaze_cli
 
-        how_built: Callable[[str], str] = getattr(blaze_cli, "how_built")
-        how = how_built(ran.stderr)
-        if how == "daemon" or how.startswith("unchanged"):
+        # Reads `ran.finished`, which `build` filled from the `build-finished` line.
+        how_built: Callable[[Ran], str] = getattr(blaze_cli, "how_built")
+        how = how_built(ran)
+        if how == "daemon":
             return None
-        # `how_built` now says "daemon" or "failed: <error>", never "cargo", and blaze_cli's
-        # `by_rustc` (the check of a refused build that went to cargo) is gone (queue 01087).
+        # `how_built` says "daemon", "served <how>, not by the daemon" or "failed: <error>",
+        # never "cargo", and blaze_cli's `by_rustc` (the check of a refused build that went to
+        # cargo) is gone (queue 01087).
         return how
+
+    def command(self, step: str, command: str, args: list[str], ws: Path, env: dict[str, str],
+                timeout: float = 7200) -> Ran:
+        """`blaze COMMAND ARGS` in `ws`; a command that builds runs with the format its build is
+        read by (`blaze_cli.machine_format`), its `build-finished` line goes to `Ran.finished` and
+        its `stdout` is what came after the line: the program's or the tests' own output."""
+        import blaze_cli
+        import storelib
+
+        machine_format: Callable[[str, Sequence[str]], list[str]] = getattr(blaze_cli, "machine_format")
+        added = machine_format(command, args)
+        ran = run(step, [str(self.blaze), command, *added, *args], ws, env, timeout)
+        if not added:
+            return ran
+        finished, rest = storelib.split_build_output(ran.stdout)
+        return replace(ran, stdout=rest, finished=finished) if finished is not None else ran
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
