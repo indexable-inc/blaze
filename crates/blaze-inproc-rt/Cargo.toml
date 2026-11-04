@@ -1,0 +1,41 @@
+[package]
+name = "blaze-inproc-rt"
+description = "blaze's dev runtime built in blaze's workspace: the run process's side of a dev run and the wire both sides share, from library/blaze_inproc_rt's source (which the standard library's build links into every dev executable)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The source is the standard library's crate (library/blaze_inproc_rt): one source, two builds.
+# This one is the daemon's (`blaze-inproc` names its modules as its own) and runs the tests.
+[lib]
+name = "blaze_inproc_rt"
+path = "../../library/blaze_inproc_rt/src/lib.rs"
+doctest = false
+
+[features]
+# The image tests' helpers (`image::testing`), for `blaze-inproc`'s tests; only its dev
+# dependency turns it on.
+testing = []
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+blaze-ids.workspace = true
+blaze-radix.workspace = true
+blaze-spin.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

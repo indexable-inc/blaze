@@ -65,7 +65,7 @@ the effects.
   ([journal/tree.md](journal/tree.md) once written), `crates/blaze-vfs/src/{image,store,tree}.rs`.
 - **The daemon's hooks** are lane cargo's: `heads.rs` filters the new completions
   (`Done::Journaled`, `Done::Entries`) and passes `&Vfs` to `Watcher::start`. The request is in
-  `v2/requests/cargo.md`, "frontend-journal: checkouts resume from the OS's journal". The
+  `docs/v2/requests/cargo.md`, "frontend-journal: checkouts resume from the OS's journal". The
   image's start and stop hooks for the VFS sections are `frontend-journal-tree`'s request.
 
 ## Speed of light

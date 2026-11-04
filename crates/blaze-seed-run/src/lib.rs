@@ -1,5 +1,5 @@
 //! The bootstrap seed's runner: runs `blaze-seed.wasm`, blaze compiled to wasm64 (memory64),
-//! under Wasmtime (todo/bootstrap/plan.md).
+//! under Wasmtime (docs/future/bootstrap.md).
 //!
 //! - **WASI** is `blaze_wasi`'s, the one implementation macros also run under, at 64-bit
 //!   pointers (`wasi_snapshot_preview1_64`), over the host's files, stdio and clocks

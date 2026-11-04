@@ -53,7 +53,7 @@ Queue side (`test/queue.rs`), per test:
   - each call sends each server one `Effect::Send`, then its timers;
   - a job is found by its index (`job_index`), with no name lookup.
 - What is still paid per test: the common lines are cloned into each test's `Trace::Lines`,
-  and `trace::assemble` hashes them. A request in `v2/requests/usercode.md` would let
+  and `trace::assemble` hashes them. A request in `docs/v2/requests/usercode.md` would let
   `assemble` take any iterator of `&Line`, so a trace can share them with an `Arc`.
 
 Tests:
@@ -115,7 +115,7 @@ Take R read paths (all granted by an earlier run) and W write directories holdin
 - **Test:** a read that is seen covered without the lock is one a grant would not add to, for a
   directory and for a file.
 
-Proposed, not applied (in `v2/requests/usercode-sandbox.md`, section 6):
+Proposed, not applied (in `docs/v2/requests/usercode-sandbox.md`, section 6):
 
 - A write capability derived from the directory, so write ACEs stay between runs and no run
   rewrites or propagates a DACL. This changes the sandbox's security argument.

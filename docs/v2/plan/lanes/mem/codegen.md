@@ -11,11 +11,11 @@ code before and after and the budget test that holds it:
 
 | crates | requests | written by |
 |---|---|---|
-| `hir-ty-codegen`, `blaze-codegen` | `v2/requests/mem-codegen-unit.md` | `mem-codegen-unit` |
-| `hir-ty-mir` | `v2/requests/mem-codegen-mir.md` | `mem-codegen-mir` |
-| `blaze-engine` | `v2/requests/mem-codegen-engine.md` | `mem-codegen-engine` |
-| `blaze-stencil`, `blaze-premap`, `blaze-global`, `blaze-intent`, `blaze-history` | `v2/requests/mem-codegen-stencil.md` | `mem-codegen-stencil` |
-| `blaze-usercode`, `blaze-build-script` (and the `Inputs` implementations in `blaze-expand`, `blaze-macro-wasm`, `blaze-testsel`) | `v2/requests/mem-codegen.md` | `mem-codegen` |
+| `hir-ty-codegen`, `blaze-codegen` | `docs/v2/requests/mem-codegen-unit.md` | `mem-codegen-unit` |
+| `hir-ty-mir` | `docs/v2/requests/mem-codegen-mir.md` | `mem-codegen-mir` |
+| `blaze-engine` | `docs/v2/requests/mem-codegen-engine.md` | `mem-codegen-engine` |
+| `blaze-stencil`, `blaze-premap`, `blaze-global`, `blaze-intent`, `blaze-history` | `docs/v2/requests/mem-codegen-stencil.md` | `mem-codegen-stencil` |
+| `blaze-usercode`, `blaze-build-script` (and the `Inputs` implementations in `blaze-expand`, `blaze-macro-wasm`, `blaze-testsel`) | `docs/v2/requests/mem-codegen.md` | `mem-codegen` |
 
 `blaze-lazy` and `blaze-tier` are mem-backend's (docs/v2/plan/lanes/mem/backend.md).
 
@@ -52,10 +52,10 @@ Each warm path has a `blaze-alloc-count` test that measures the second run on on
 | a fresh rerun check | `apply/tests.rs` `a_fresh_run_is_checked_without_allocating` | 0, with no caller buffer |
 | a check of a kept run's shape | `blaze-usercode` `index.rs` `a_warm_check_of_a_shape_allocates_nothing` | 0 (Unix) |
 | a package walk and a listing | `trace.rs` `a_warm_walk_allocates_nothing` | 0 (Unix) |
-| a codegen unit's re-emit | `v2/requests/mem-codegen-unit.md` | 0 |
-| a MIR pass over a body | `v2/requests/mem-codegen-mir.md` | 0 |
-| a unit re-driven by the engine, a no-op rebuild's walk | `v2/requests/mem-codegen-engine.md` | 0 |
-| a stencil emit | `v2/requests/mem-codegen-stencil.md` | 0 |
+| a codegen unit's re-emit | `docs/v2/requests/mem-codegen-unit.md` | 0 |
+| a MIR pass over a body | `docs/v2/requests/mem-codegen-mir.md` | 0 |
+| a unit re-driven by the engine, a no-op rebuild's walk | `docs/v2/requests/mem-codegen-engine.md` | 0 |
+| a stencil emit | `docs/v2/requests/mem-codegen-stencil.md` | 0 |
 
 Off Unix a name has no safe packed form (`OsStr::from_encoded_bytes_unchecked` is unsafe, and
 `blaze-usercode` forbids unsafe code), so `Names` keeps an `OsString` per name there. This is
@@ -108,6 +108,6 @@ the same split `trace::os_bytes` and `os_in` already make. The two usercode zero
 
 ## State
 
-Every request is written (`v2/requests/mem-codegen.md` and its four children's files), and each
+Every request is written (`docs/v2/requests/mem-codegen.md` and its four children's files), and each
 owner has been told. Nothing is applied yet: the owners apply the requests, or the coordinator
 does once the owners' lanes are done.

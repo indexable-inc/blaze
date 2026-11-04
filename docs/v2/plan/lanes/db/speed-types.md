@@ -46,8 +46,8 @@ hashing them in order.
 - `VTableMap::id` does one hash with the `Entry` API, where it did two.
 - `VTableMap::FIRST_ID` and `tys()` give the types in id order. Callers that probed ids upward
   from 0 until a miss (`form.rs`, `facts.rs`, hir-ty's `vtable_types`) can read them directly.
-  This was requested in `v2/requests/items.md` (items-facts has done it) and
-  `v2/requests/db-ty.md`.
+  This was requested in `docs/v2/requests/items.md` (items-facts has done it) and
+  `docs/v2/requests/db-ty.md`.
 
 ## Left
 

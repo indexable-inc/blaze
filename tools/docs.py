@@ -40,7 +40,7 @@ SPAN = re.compile(r"(`+)(.+?)\1")
 HTML_ID = re.compile(r"<a\s+(?:name|id)=\"([^\"]+)\"")
 # Not checked for the docs they name: docs/ itself (its links are), the history, others' code
 # (the standard library's own docs/, vendored crates) and skills about other projects.
-NOT_OURS = ("docs/", "CHANGELOG.md", "library/", "vendor/", ".agents/")
+NOT_OURS = ("docs/", "library/", "vendor/", ".agents/")
 
 
 @dataclass(frozen=True)

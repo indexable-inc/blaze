@@ -11,7 +11,7 @@ siblings' (`nameres*`, `item_scope.rs`, `resolver.rs`, `per_ns.rs`, `visibility.
 `find_path.rs`, `dyn_map.rs`). That leaves `signatures.rs`, `attrs.rs` and `attrs/`,
 `lang_item.rs`, `import_map.rs`, `diagnostic_item.rs`, `upvars.rs`, `macro_reach.rs`, `src.rs`,
 `deps/`, `lib.rs` and the rest of the top level. Every change is a request:
-`v2/requests/mem-db-def-items.md` (sections I0 to I12) has the exact code. This note gives the
+`docs/v2/requests/mem-db-def-items.md` (sections I0 to I12) has the exact code. This note gives the
 design and the reasons.
 
 ## The design

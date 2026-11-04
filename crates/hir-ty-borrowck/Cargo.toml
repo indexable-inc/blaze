@@ -41,8 +41,5 @@ hir-expand = { workspace = true, features = ["fixture"] }
 blaze-alloc-count.workspace = true
 blaze-format.workspace = true
 
-[features]
-in-rust-tree = ["hir-ty/in-rust-tree"]
-
 [lints]
 workspace = true

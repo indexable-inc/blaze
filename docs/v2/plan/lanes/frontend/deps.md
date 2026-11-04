@@ -192,15 +192,15 @@ In `crates/hir-def/src/deps/tests.rs`:
 
 - db: the signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)).
 - cargo-daemon: the `ImageStore` adapter over `blaze-cas`, `serve` once inputs are final,
-  `store` after the build, a daily `Mode::Check` run (`v2/requests/cargo.md`).
-- db-expand (`v2/requests/db-expand.md`): `ProcMacroExpander::code`, `ExpansionReads`,
+  `store` after the build, a daily `Mode::Check` run (`docs/v2/requests/cargo.md`).
+- db-expand (`docs/v2/requests/db-expand.md`): `ProcMacroExpander::code`, `ExpansionReads`,
   `report_reads`, and `proc_macro_expansion` with `MacroCallId::expansion_reads`. `deps/key.rs`
   and `deps/reads.rs` compile once they land.
-- usercode (`v2/requests/usercode.md`): applied (`Kept::code`, `report_reads`,
+- usercode (`docs/v2/requests/usercode.md`): applied (`Kept::code`, `report_reads`,
   `index::find_reads`, `blaze_expand::reads_now`). It builds once db-expand's half lands.
   `ExpressionStoreRef::decode_in` (mem-format-hir-apply) and `Frozen.bytes: PartBytes`
   (db-expand-names) have landed, and neither is built yet.
-- cargo (`v2/requests/cargo.md`, amended): the adapter over `Reader::pinned`, `reads_now`, and
+- cargo (`docs/v2/requests/cargo.md`, amended): the adapter over `Reader::pinned`, `reads_now`, and
   `ReadThrough` once the global adapter exists.
-- fastcompile (`v2/requests/fastcompile.md`): a public proof for dependency-image keys and an
+- fastcompile (`docs/v2/requests/fastcompile.md`): a public proof for dependency-image keys and an
   `ImageStore` over the global client.

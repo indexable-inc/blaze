@@ -37,21 +37,10 @@ pub mod slots;
 
 pub use slots::{Live, Outcome};
 
-/// The counters that code the daemon compiled to count its branches adds to. That code finds
-/// them by calling this, by name (`hir_ty_codegen::tier::COUNTERS`).
-// SAFETY: the `blaze_live_` prefix is this crate's, so no other item of a program exports
-// `blaze_live_counters`; a second one would fail the link or bind the daemon's code to the
-// wrong counters.
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn blaze_live_counters() -> *mut u64 {
-    COUNTERS.as_ptr() as *mut u64
-}
-
-/// [`blaze_live_counters`]'s: an `AtomicU64` is a `u64` in memory. The daemon's code must add
-/// to them atomically (relaxed is enough).
-static COUNTERS: [std::sync::atomic::AtomicU64; format::COUNTERS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS];
+/// The counters that code the daemon compiled to count its branches adds to, and the function
+/// that code finds them by: the dev runtime's (`blaze_inproc_rt::live`), so every dev executable
+/// has them whatever it depends on.
+pub use blaze_inproc_rt::live::blaze_live_counters;
 
 /// What the daemon says of the tiers of this program: the functions it spends its time in, the
 /// level each is compiled at, and what the daemon did of late. `None` while the daemon tiers

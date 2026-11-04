@@ -25,7 +25,7 @@ The names (docs/rename.md has the reasons):
   rowan                    syntax-tree (crates/syntax-tree, `syntax_tree::`)
   ra-ap-rustc_abi, ...     rustc_abi, rustc_type_ir, rustc_next_trait_solver
 
-CHANGELOG.md keeps its history, and this script and docs/rename.md the old names they map.
+docs/CHANGELOG.md keeps its history, and this script and docs/rename.md the old names they map.
 """
 
 import argparse
@@ -36,7 +36,7 @@ import sys
 
 # Kept as they are: history and the map itself.
 SKIPPED = {
-    "CHANGELOG.md",
+    "docs/CHANGELOG.md",
     "tools/rename.py",
     "docs/rename.md",
     # What blaze says of the old names, which it has to name.

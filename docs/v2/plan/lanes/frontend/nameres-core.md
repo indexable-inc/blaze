@@ -310,7 +310,7 @@ memoizes below the crate.
 ## 9. The active set
 
 A round after round 0 runs only over the modules it can change (request §1 of
-`v2/requests/frontend-nameres.md`). Same facts, same results: the assembled `DefMap` does not
+`docs/v2/requests/frontend-nameres.md`). Same facts, same results: the assembled `DefMap` does not
 change, only which queries run.
 
 **What `round_modules(r)` knows before the fixed point.** Per module, `RoundModules` holds:
@@ -382,7 +382,7 @@ reads, and `RoundModules`' `O(m)` copy of its columns.
 ## 10. Frames
 
 What a query makes and drops within its run goes in a `blaze_mem` frame. What it returns, and
-what one query carries to the next, stays owned and exact (`v2/requests/mem-db-def-collect.md`,
+what one query carries to the next, stays owned and exact (`docs/v2/requests/mem-db-def-collect.md`,
 Part C).
 
 **Who opens a frame.** Each tracked fn in `queries.rs` that has temporaries opens its own

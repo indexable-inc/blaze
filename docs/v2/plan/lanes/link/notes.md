@@ -447,7 +447,7 @@ Ahead:
 Behind:
 
 - A full link copies the image twice: into the region buffers, then into the write runs.
-  mold and wild write once, into the mapping. `v2/requests/link.md` item 13 (a write of
+  mold and wild write once, into the mapping. `docs/v2/requests/link.md` item 13 (a write of
   shared bytes) removes the second copy.
 - `Placed` hands writers contiguous slices. So a changed list is copied whole (O(list)
   `memcpy` per incremental link), and `file::finish` makes each region with a written page

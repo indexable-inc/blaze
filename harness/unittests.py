@@ -10,9 +10,9 @@ CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` wh
 `max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
 and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
 
-Runs `blaze test --release --no-fail-fast` of CRATES with FEATURES (blaze tests blaze, AGENTS.md
-rule blaze-builds-blaze; `"cargo": true`: plain `cargo test` without them, on Windows, which has
-no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
+Runs `blaze test --release --no-fail-fast` of CRATES with their default features, blaze-engine's
+`native` (LLVM among them) included (blaze tests blaze, AGENTS.md rule blaze-builds-blaze;
+`"cargo": true`: plain `cargo test`, on Windows, which has no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
 `"build": true` is CI's build job: `blaze build` of the same packages with the same profile and
 features, so that each library it compiles has the key the test build asks for (a crate of the
 workspace is keyed by its features, by whether it is of a package named, `CARGO_PRIMARY_PACKAGE`,
@@ -37,8 +37,6 @@ CRATES = [
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "blaze-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
-# What the build job ships blaze with: LLVM as a second code producer.
-FEATURES = ["blaze-engine/llvm"]
 
 # The failures known, each with its owner and cause: harness/known-failures.toml (failures.py).
 
@@ -283,7 +281,7 @@ def main():
         command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
     else:
         verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
-        command = ["blaze", *verb, "--release", "--locked", "--features", ",".join(FEATURES), *packages, *args]
+        command = ["blaze", *verb, "--release", "--locked", *packages, *args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the

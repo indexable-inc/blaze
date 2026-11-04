@@ -74,7 +74,7 @@ pub fn main() -> ExitCode {
             Ok(0)
         }
         _ => {
-            #[cfg(feature = "mimalloc")]
+            #[cfg(feature = "native")]
             if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
                 return failed(&format!("{error:#}"));
             }

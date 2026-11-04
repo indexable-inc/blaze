@@ -1,5 +1,7 @@
 //! An edit that changes no name, visibility or import of a crate leaves its `DefMap` equal (the
-//! same frozen bytes), so the def maps of the crates that depend on it are not run again.
+//! same frozen bytes, but for the content IDs of the files they name, which move with every
+//! edit: [`frozen::encode_without_contents`]), so the def maps of the crates that depend on it
+//! are not run again.
 
 use base_db::{Crate, all_crates};
 use hir_expand::fixture;
@@ -53,8 +55,8 @@ fn edit_lib(edited: &str) -> Edited {
     let lib = crate_named(&db, "lib");
     let main = crate_named(&db, "main");
     crate_def_map(&db, main);
-    let lib_before = frozen::encode(&db, lib).unwrap();
-    let main_before = frozen::encode(&db, main).unwrap();
+    let lib_before = frozen::encode_without_contents(&db, lib).unwrap();
+    let main_before = frozen::encode_without_contents(&db, main).unwrap();
 
     db.keep_maintained(true);
     let mut maintained = Vec::new();
@@ -68,8 +70,8 @@ fn edit_lib(edited: &str) -> Edited {
         .filter(|it| it.maintainer == "nameres" && it.krate == main && it.work.region > 0)
         .count();
     Edited {
-        lib_bytes: (lib_before, frozen::encode(&db, lib).unwrap()),
-        main_bytes: (main_before, frozen::encode(&db, main).unwrap()),
+        lib_bytes: (lib_before, frozen::encode_without_contents(&db, lib).unwrap()),
+        main_bytes: (main_before, frozen::encode_without_contents(&db, main).unwrap()),
         main_ran,
     }
 }

@@ -15,7 +15,7 @@ Updated at each checkpoint from the lanes' reports. Latest first.
 - The docs moved under `plan.md` and `plan/{goals,design,lanes,process,reference}/`.
 - 70 agent windows; the front-end lanes (db, db-ty, format, format-hir) and cargo were asked
   to split into more children.
-- Next: apply the pending requests in `v2/requests/` (26 files).
+- Next: apply the pending requests in `docs/v2/requests/` (26 files).
 
 ## 2026-10-29 17:00
 

@@ -23,7 +23,6 @@
 pub use self::imp::*;
 
 /// A syntax context describes a hierarchy tracking order of macro definitions.
-#[cfg(feature = "query")]
 mod imp {
     use std::{fmt, num::NonZeroU32};
 
@@ -286,46 +285,6 @@ mod imp {
             } else {
                 write!(f, "{}", self.0.get())
             }
-        }
-    }
-
-    impl fmt::Debug for SyntaxContext {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            if f.alternate() {
-                fmt::Display::fmt(self, f)
-            } else {
-                f.debug_tuple("SyntaxContext").field(&self.0).finish()
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "query"))]
-mod imp {
-    use std::{fmt, num::NonZeroU32};
-
-    #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-    pub struct SyntaxContext(NonZeroU32);
-
-    impl SyntaxContext {
-        #[inline]
-        pub fn into_u32(self) -> u32 {
-            self.0.get() - 1
-        }
-
-        /// Panics on `u32::MAX`, which no context has.
-        #[inline]
-        pub fn from_u32(u32: u32) -> Self {
-            match u32.checked_add(1).and_then(NonZeroU32::new) {
-                Some(it) => Self(it),
-                None => panic!("invalid SyntaxContext({u32})"),
-            }
-        }
-    }
-
-    impl fmt::Display for SyntaxContext {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0.get())
         }
     }
 

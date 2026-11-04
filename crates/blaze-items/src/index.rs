@@ -904,7 +904,7 @@ impl ScopeNames {
                 let items = run(starts);
                 // clone: a range, two indexes.
                 let keys = keys[items.clone()].iter().copied();
-                // alloc: `ScopeEntry` owns its items; see v2/requests/mem-backend-items.md.
+                // alloc: `ScopeEntry` owns its items; see docs/v2/requests/mem-backend-items.md.
                 ScopeEntry::Assoc(keys.zip(visibilities[items].iter().copied()).collect())
             }
         }

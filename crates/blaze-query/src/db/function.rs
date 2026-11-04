@@ -209,43 +209,92 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
 /// Records a read of a row's current value into the running query, if any.
 #[inline(always)]
 fn read(storage: &Storage, header: &Header) {
-    let over = local::with(|local| {
+    let note = local::with(|local| {
         if local.frames.is_empty() {
-            return false;
+            return local::Note::Fine;
         }
         let node = header.node.load(Ordering::Relaxed);
         local.read(storage, node, header.durability(), header.changed.load(Ordering::Relaxed))
     });
-    if over {
-        super::runaway_reads(storage);
-    }
+    super::noted(storage, note);
 }
 
 /// A read of a provisional row of the cycle headed at stack index `head`.
 fn read_provisional(storage: &Storage, header: &Header, head: u32) {
-    let over = local::with(|local| {
+    let note = local::with(|local| {
         let node = header.node.load(Ordering::Relaxed);
         let changed = header.changed.load(Ordering::Relaxed);
-        let over = local.read(storage, node, header.durability(), changed);
+        let note = local.read(storage, node, header.durability(), changed);
         if let Some(frame) = local.recording(storage) {
             frame.head = frame.head.min(head);
             frame.unshareable = true;
         }
-        over
+        note
     });
-    if over {
-        super::runaway_reads(storage);
+    super::noted(storage, note);
+}
+
+/// The most bytes of a key's text [`write_key`] writes: a key's `Debug` can run to gigabytes (a
+/// name-resolution key's macro scope did, 2026-11-03), and its text goes into errors and the
+/// daemon's memory line, so the text stops here, marked as cut.
+pub(crate) const KEY_TEXT_MOST: usize = 1024;
+
+/// A writer that takes at most [`KEY_TEXT_MOST`] bytes, then refuses the rest, so a huge
+/// `Debug` stops at once instead of being written out and thrown away.
+struct Capped<'a> {
+    out: &'a mut String,
+    left: usize,
+    cut: bool,
+}
+
+impl std::fmt::Write for Capped<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if s.len() <= self.left {
+            self.out.push_str(s);
+            self.left -= s.len();
+            return Ok(());
+        }
+        let mut end = self.left;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.out.push_str(&s[..end]);
+        self.left = 0;
+        self.cut = true;
+        Err(std::fmt::Error)
     }
 }
 
-/// [`Vtable::write_key`] of `F`: its key `id` as [`Function::write_key`] shows it, its ID when
-/// `id` is not a key of `F`'s in `storage` or its `Debug` fails.
-fn write_key<F: Function>(storage: &Storage, id: Id, out: &mut String) {
+/// Writes a key's text with `write` onto `out`, cut at [`KEY_TEXT_MOST`] bytes and marked
+/// with `id` when cut. False when `write` failed on its own (its `Debug` failed), with `out`
+/// left as it was.
+pub(crate) fn write_key_text(
+    out: &mut String,
+    id: Id,
+    write: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result,
+) -> bool {
     use std::fmt::Write as _;
     let start = out.len();
-    let written = F::Key::from_id_in(storage, id).map(|key| F::write_key(key, &mut *out));
-    if !matches!(written, Some(Ok(()))) {
+    let mut capped = Capped { out: &mut *out, left: KEY_TEXT_MOST, cut: false };
+    let written = write(&mut capped);
+    if capped.cut {
+        _ = write!(out, "... (cut at {KEY_TEXT_MOST} bytes; {id:?})");
+        return true;
+    }
+    if written.is_err() {
         out.truncate(start);
+        return false;
+    }
+    true
+}
+
+/// [`Vtable::write_key`] of `F`: its key `id` as [`Function::write_key`] shows it
+/// ([`write_key_text`]), its ID when `id` is not a key of `F`'s in `storage` or its `Debug`
+/// fails.
+fn write_key<F: Function>(storage: &Storage, id: Id, out: &mut String) {
+    use std::fmt::Write as _;
+    let written = F::Key::from_id_in(storage, id).is_some_and(|key| write_key_text(out, id, |out| F::write_key(key, out)));
+    if !written {
         _ = write!(out, "{id:?}");
     }
 }
@@ -888,15 +937,24 @@ fn durability_of(done: &Ran) -> u32 {
     if done.untracked { 0 } else { u32::from(done.durability.min(Durability::HIGH.0)) }
 }
 
-/// Stores the run's edges as the row's, forgetting its old ones.
+/// Stores the run's edges as the row's, forgetting its old ones, and counts its reads to its
+/// query ([`counts::reads`]): those it recorded, those the row keeps, and those it held at its
+/// end. Counted here, once a run, so a read costs nothing more.
 fn store_edges(storage: &Storage, header: &Header, at: u32) {
-    let span = local::with(|local| {
+    let (span, ingredient, reads, note) = local::with(|local| {
         debug_assert_eq!(at as usize + 1, local.frames.len(), "a run's edges are stored while it is the top frame");
+        let (most, note) = local.note_peak(at as usize);
         let frame = &local.frames[at as usize];
         let (start, owner) = (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
+        let recorded = (local.edges.len() - start) as u64 + frame.dropped;
         local.dedup_from(start);
-        storage.push_edges(&local.edges[start..], owner)
+        let kept = (local.edges.len() - start) as u64;
+        let reads = counts::Reads { recorded, kept, most };
+        (storage.push_edges(&local.edges[start..], owner), owner.0, reads, note)
     });
+    // The run is still on top: a new mark names it.
+    super::noted(storage, note);
+    counts::reads(ingredient, reads);
     let old = header.edges.swap(span, Ordering::Relaxed);
     storage.forget_edges(old);
 }
@@ -1106,7 +1164,9 @@ fn head_round<F: Function>(
         iteration: round,
     });
     next_round(storage, done.members);
-    local::with(|local| {
+    let note = local::with(|local| {
+        // Its most over the rounds: this round's reads are cut below.
+        let (_, note) = local.note_peak(at as usize);
         let edges = local.edges.len();
         let frame = &mut local.frames[at as usize];
         let start = frame.edges_start as usize;
@@ -1118,10 +1178,14 @@ fn head_round<F: Function>(
         frame.changed = 0;
         frame.summary = [0; 2];
         frame.dedup_floor = frame.edges_start;
+        frame.dropped = 0;
+        frame.dedup_at = local::next_dedup(start, 0);
         debug_assert!(edges >= start);
         local.truncate_edges(start);
         local.renew_serial(at);
+        note
     });
+    super::noted(storage, note);
     false
 }
 

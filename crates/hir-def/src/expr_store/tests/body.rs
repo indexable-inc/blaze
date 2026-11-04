@@ -89,7 +89,7 @@ fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect
 
     let module = db.module_at_position(position);
     let actual = blaze_query::db::attach(&db, || format!("{module:#?}"));
-    expect.assert_eq(&actual);
+    expect.assert_eq(&fixture::stable_ids(&actual));
 }
 
 fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
@@ -184,6 +184,9 @@ fn every_variant_pretty_prints() {
                 let _ = (2, -x, !true, *r, &mut x, &raw x, x as u8, �, );
                 let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, include_bytes!(_), );
                 let _ = (builtin#wrap_binder(x), builtin#unwrap_binder(x, u8), );
+                for const f in x {
+                    let _ = s.[f];
+                }
                 let _ = [
                     1, 2,
                 ];
@@ -1506,6 +1509,8 @@ trait T {
 /// precondition through `contract_check_requires(|| ..)`, the postcondition built once and every
 /// return (the tail, `return`, a `?`) through `contract_check_ensures`, but not a closure's, all
 /// behind the literal `cfg(contract_checks)`: off, the clauses are still there to type-check.
+/// The fixture declares the three lang items itself, so it enables `lang_items`, as rustc asks
+/// of any `#[lang]` (E0658) and `crate_lang_items` does.
 #[test]
 fn contract_clauses_lower_as_nightly_off_and_on() {
     let body = |cfg: &str| {
@@ -1513,7 +1518,7 @@ fn contract_clauses_lower_as_nightly_off_and_on() {
             r#"
 //- minicore: option, try, fn
 //- /main.rs {cfg}
-#![feature(contracts)]
+#![feature(contracts, lang_items)]
 #[rustc_builtin_macro]
 pub macro contracts_requires($item:item) {{}}
 #[rustc_builtin_macro]
@@ -1563,7 +1568,9 @@ fn f(x: u32) -> Option<u32> {{
 
 /// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): the path resolves to
 /// `core::blaze::contract_test` without a `blaze` crate, and the function is kept beside a test
-/// `f_contract` that assumes the `requires`, calls `f` and checks the `ensures`.
+/// `f_contract` that assumes the `requires`, calls `f` and checks the `ensures`. `main` has
+/// `core` and no `std`, so the fixture makes it `no_std` and it imports
+/// `core::prelude::rust_2024`, which the fixture's `core` has, as the real one does.
 #[test]
 fn contract_test_expands_to_a_test_of_the_clauses() {
     let db = fixture::db(
@@ -1577,6 +1584,9 @@ pub mod prelude {
     pub mod v1 {
         #[rustc_builtin_macro]
         pub macro test($item:item) {}
+    }
+    pub mod rust_2024 {
+        pub use super::v1::*;
     }
 }
 //- /hegel.rs crate:hegel

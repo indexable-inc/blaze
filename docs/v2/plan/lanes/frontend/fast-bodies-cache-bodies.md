@@ -14,7 +14,7 @@ Costs are counted from the code as of 2026-10-29, not measured: nothing builds y
 Code: `crates/hir-ty/src/check_cache.rs` (the API), `check_cache/ids.rs` (relocation and the
 portable form of each id), `check_cache/part.rs` (the part), `check_cache/tests.rs`, and
 `crates/hir-ty-borrowck/src/served.rs` (MIR and the gate, which hir-ty cannot reach). Edits to
-files of other lanes are requests: `v2/requests/db.md` and `v2/requests/frontend-deps.md`, each
+files of other lanes are requests: `docs/v2/requests/db.md` and `docs/v2/requests/frontend-deps.md`, each
 under `## frontend-fast-bodies-cache-bodies: ...`.
 
 ## Relocation in hir-ty's codecs

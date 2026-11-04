@@ -79,9 +79,6 @@ crossbeam-channel.workspace = true
 expect-test.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
-[features]
-in-rust-tree = ["hir-expand/in-rust-tree"]
-
 # The impls of a trait for a type in a crate of many dependencies, read from the crates that
 # can name both against the walk over every crate; prints both and whether it gains.
 [[bench]]

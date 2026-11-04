@@ -24,8 +24,5 @@ base-db.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 
-[features]
-in-rust-tree = ["hir-ty/in-rust-tree"]
-
 [lints]
 workspace = true

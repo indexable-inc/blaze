@@ -72,7 +72,7 @@ compared with a model over seeded trees in `flat.rs`'s tests.
   conversion where the transmute costs the compare it makes anyway. Tested over every value and
   one past the last.
 - **Untrusted input: source text.** The lexer and parser read any file of any dependency. A fuzz
-  target `syntax_parse` is filed with safety (`v2/requests/safety.md`, "From
+  target `syntax_parse` is filed with safety (`docs/v2/requests/safety.md`, "From
   speed-unsafe-front-syntax"; queue 00798): tokens tile the text, the fast path lexes as
   `rustc_lexer` alone, the tree gives back the text, bounded allocation, seeded with the parser's
   test files. For it, `parser` has a `fuzz` feature with `LexedStr::lexes_alike`.

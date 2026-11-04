@@ -82,7 +82,7 @@ pub struct Profile {
     /// `codegen-backend = "stencil"` on the profile: every function of the build, the standard
     /// library's and build-time code's too, is copy-and-patch stencils whatever its opt-level,
     /// compiled as at opt-level 1. The build asks for it by name; nothing turns it on for a
-    /// blaze that lacks LLVM (rule 3). What the seed builds with (todo/bootstrap/plan.md, "std
+    /// blaze that lacks LLVM (rule 3). What the seed builds with (docs/future/bootstrap.md, "std
     /// and assembly in the seed"), whose output only has to be correct. Left out of the
     /// serialized form when off, so [`Policy::id`] of every other build is the one it had.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -101,6 +101,20 @@ pub enum Origin {
     BuildTime(Package),
     /// A crate of the standard library's.
     Std,
+}
+
+impl Origin {
+    /// Its part of a hash: a tag for its kind, then its package's name, length first. What
+    /// tells one instance compiled for two origins apart in an ID ([`crate::driver::subject`]).
+    pub fn hash_into(&self, hasher: &mut Hasher) {
+        let (tag, package) = match self {
+            Origin::Member(it) => (0u8, it.as_str()),
+            Origin::Dependency(it) => (1, it.as_str()),
+            Origin::BuildTime(it) => (2, it.as_str()),
+            Origin::Std => (3, ""),
+        };
+        hasher.update(&[tag]).update(&(package.len() as u64).to_le_bytes()).update(package.as_bytes());
+    }
 }
 
 /// A package's name, interned once a process: [`Copy`], equal exactly when the names are,
@@ -256,7 +270,8 @@ impl std::fmt::Display for PlanError {
             PlanError::NoLlvm { origin, level } => write!(
                 f,
                 "{origin:?} is compiled at opt-level {level:?}, which needs LLVM, and this blaze \
-                 was built without it (`--features llvm`): build with a blaze that has LLVM, or \
+                 was built without it (the seed, without blaze-engine's `native` feature): build \
+                 with a blaze that has LLVM, or \
                  ask for stencils at every level with `codegen-backend = \"stencil\"` on the profile"
             ),
             PlanError::NoStencils { origin, level, target } => write!(

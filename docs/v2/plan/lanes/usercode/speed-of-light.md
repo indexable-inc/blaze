@@ -87,7 +87,7 @@ UTF-8, and dispatch each directive.
   the output reads it with its own `Sink` and copies nothing else (`watched_in` does). An
   `Output` held as one buffer with spans would remove them; that changes every caller of
   `Output`'s fields in blaze-cargo and blaze-usercode, so it is asked for in
-  `v2/requests/usercode-fast-scripts.md` (request 7), not done here.
+  `docs/v2/requests/usercode-fast-scripts.md` (request 7), not done here.
 
 ### The environment (`env`)
 
@@ -291,7 +291,7 @@ nothing (the worst case for overhead) or runs about 100 µs to 1 ms (the common 
   the descriptors the program had when its server started (no program code runs in the server
   after, so everything else is the server's). That is usually one gap, so 4 calls in the child
   whatever `k` is. The exact edits, with a test of the ranges against a model, are in
-  `v2/requests/usercode-fast-tests.md` ("speed-link-edge-sol-usercode 1"), since the code is
+  `docs/v2/requests/usercode-fast-tests.md` ("speed-link-edge-sol-usercode 1"), since the code is
   usercode-fast-tests' while it runs. Tests still see exactly the descriptors they saw before.
   macOS has no `close_range` and keeps the loop.
 - **Where it is with that:** 17 calls, 5 µs: an empty test at 65 µs, **at the bound**. Not
@@ -329,7 +329,7 @@ then a fork per test.
   is sans-IO, driven from one thread, with no lock and nothing shared. About 0.5 µs a test with
   its 8 allocations, **under 1% of the fork**.
 - **What is left:** the 8 allocations, each owned by the result past the queue, go to 0 with a
-  run's results in its request arena (`v2/requests/usercode-fast-tests.md`, 13), which needs
+  run's results in its request arena (`docs/v2/requests/usercode-fast-tests.md`, 13), which needs
   cargo. The fork wall of one server is removed by replicas (next section).
 
 ### Replicas of a fork server
@@ -415,7 +415,7 @@ The design:
   rate.
 - **Nothing is allocated, and the shape is not copied:** see notes.md, Speed.
 - **In the way: a `stat` per outside path** until the daemon drives `blaze_vfs::Outside`
-  (v2/requests/requests-outside.md, 2, cargo's). That is 50 × 0.4 µs = 20 µs, 5 to 8× the
+  (docs/v2/requests/requests-outside.md, 2, cargo's). That is 50 × 0.4 µs = 20 µs, 5 to 8× the
   bound. When the daemon drives it, a check is three loads.
 
 ## Checking an outside path: `inputs::Files::file`
@@ -627,7 +627,7 @@ driver's side waits on lane core, below):
     its 22 paths again, the 110 calls of before, once.
   - A volume that can't be watched (some network shares) is checked every run.
 
-**The three known obstacles** (`v2/requests/usercode-sandbox.md` section 6):
+**The three known obstacles** (`docs/v2/requests/usercode-sandbox.md` section 6):
 - **Item 3, write grants rewritten every run:** partly removed.
   - The temporary directory's grant and revoke are gone, and so is the grant of a writable
     directory the launcher makes.
@@ -642,7 +642,7 @@ driver's side waits on lane core, below):
 - **Item 4, `CreateAppContainerProfile` every run:** removed. The lead applied it: the SID is
   derived when the profile's folder is there. The folder check is now one `GetFileAttributesW`.
 - **Item 5, two process creations a run:** removed on the sandbox's side, by the warm launcher
-  above. The driver's side waits on lane core (`v2/requests/usercode-win-launcher.md`, 1 and 2),
+  above. The driver's side waits on lane core (`docs/v2/requests/usercode-win-launcher.md`, 1 and 2),
   and the daemon on Windows still needs to run the IOCP driver (3 there, cargo's). The lead
   declined running the launcher inside the daemon, because a launcher fault would end the daemon,
   the job objects and console handler would be the daemon's, and `confine` would stop being one
@@ -653,7 +653,7 @@ driver's side waits on lane core, below):
     DACL changed, and starts each program with one `CreateProcessW`. It is the same warm
     launcher the section above asks for on Linux and macOS.
   - It needs `Confine` to hand a spec to a running process rather than return a `Command`, which
-    is the driver's API and the lead's. That is asked in `v2/requests/usercode.md`
+    is the driver's API and the lead's. That is asked in `docs/v2/requests/usercode.md`
     ("speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows").
   - With it, a run is within 10% of the bound.
 
@@ -691,7 +691,7 @@ The design:
 - **A miss to a warm server:** a socket round trip (2 × 5 µs), the macro's own work, and the
   trace record read with one `pread` (applied 2026-10-29).
 - **Change 20** moves this to fastcompile's evaluator. The keys, the store and the trace are the
-  same (v2/requests/usercode-bridge.md).
+  same (docs/v2/requests/usercode-bridge.md).
 
 ## A run's `OUT_DIR`: `run::collect`, `run::restore` (speed-sol2-usercode)
 

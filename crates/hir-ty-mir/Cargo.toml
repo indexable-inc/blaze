@@ -60,14 +60,11 @@ expect-test.workspace = true
 hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 blaze-format.workspace = true
-blaze-units = { workspace = true, features = ["query"] }
+blaze-units.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 parking_lot.workspace = true
 test-utils.workspace = true
-
-[features]
-in-rust-tree = ["hir-ty/in-rust-tree"]
 
 [lints]
 workspace = true

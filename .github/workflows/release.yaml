@@ -3,7 +3,7 @@ name: release
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
 # Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
 # the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
-# notes (what CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
+# notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
 # is on a commit of main as it is: no release commits a version to main, whose Cargo.toml stays
 # at `0.0.0`. The build is told which release it is by `BLAZE_RELEASE`, the tag, which only
@@ -92,8 +92,8 @@ jobs:
       # library from the release's assets (the step `Standard library` below; shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # No build cache: release binaries come from a clean build. With the `llvm` feature, so
-      # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
+      # No build cache: release binaries come from a clean build. With LLVM, as every native
+      # blaze has (blaze-engine's default `native`), so every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile tools/pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
       # since the pgo workflow last ran).
@@ -105,7 +105,7 @@ jobs:
       - name: Archive
         run: |
           mkdir "$NAME"
-          cp LICENSE-APACHE LICENSE-MIT README.md CHANGELOG.md "$NAME"
+          cp LICENSE-APACHE LICENSE-MIT README.md docs/CHANGELOG.md "$NAME"
           cp shipped/* "$NAME"
           "$NAME/blaze-engine" --version | tee /dev/stderr | sed -n 1p | grep -E "^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$"
           # `blaze` runs the one beside it.
@@ -166,13 +166,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          # GitHub refuses a release body over 125,000 characters; the full section stays in CHANGELOG.md.
+          # GitHub refuses a release body over 125,000 characters; the full section stays in docs/CHANGELOG.md.
           python3 - <<'EOF'
           import os
           p = "out/notes.md"; text = open(p).read(); cap = 120_000
           if len(text) > cap:
-              url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['GITHUB_REF_NAME']}/CHANGELOG.md"
-              text = text[: text.rfind("\n", 0, cap)] + f"\n\n... The full notes are in [CHANGELOG.md]({url}).\n"
+              url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['GITHUB_REF_NAME']}/docs/CHANGELOG.md"
+              text = text[: text.rfind("\n", 0, cap)] + f"\n\n... The full notes are in [docs/CHANGELOG.md]({url}).\n"
               open(p, "w").write(text)
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \

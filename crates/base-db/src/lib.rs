@@ -1,12 +1,8 @@
 //! The front end's one database, [`Db`], and the query inputs it holds: files, source
 //! roots and the crate graph.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
-
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 
 mod change;
 mod content;

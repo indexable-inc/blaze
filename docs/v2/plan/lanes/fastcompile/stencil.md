@@ -12,7 +12,7 @@ function is then copying the stencils of its instructions into one buffer and pa
 holes. Hot functions are recompiled with Cranelift or LLVM and patched into their slots.
 
 Owned here: `crates/blaze-stencil/` and this file. Hooks in other lanes are requests in
-`v2/requests/fastcompile.md` (`fastcompile-stencil 1` and on).
+`docs/v2/requests/fastcompile.md` (`fastcompile-stencil 1` and on).
 
 ## The input: Cranelift IR after ABI lowering
 

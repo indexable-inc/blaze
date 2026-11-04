@@ -179,8 +179,10 @@ text-size.opt-level = 3
 serde.opt-level = 3
 dissimilar.opt-level = 3
 miniz_oxide.opt-level = 3
-# fence::model's three_threads_two_slots explores ~2^24 states, too many for an unoptimized build.
+# fence::model's three_threads_two_slots explores ~2^24 states, too many for an unoptimized build
+# (the model is blaze-inproc-rt's now; blaze-inproc's own tests run the same fences).
 blaze-inproc.opt-level = 3
+blaze-inproc-rt.opt-level = 3
 # blaze-engine's build script hashes the code generator's sources (blaze-codegen-code), which
 # reruns on every edit of them: optimized, as a build dependency is not by default.
 blake3.opt-level = 3
@@ -246,7 +248,7 @@ macros = { path = "crates/macros", version = "0.0.0" }
 base-db = { path = "crates/base-db", version = "0.0.0" }
 blaze-live = { path = "crates/blaze-live" }
 blaze-build-script = { path = "crates/blaze-build-script" }
-cfg = { path = "crates/cfg", version = "0.0.0", features = ["tt", "syntax"] }
+cfg = { path = "crates/cfg", version = "0.0.0" }
 hir = { path = "crates/hir", version = "0.0.0" }
 hir-def = { path = "crates/hir-def", version = "0.0.0" }
 hir-expand = { path = "crates/hir-expand", version = "0.0.0" }
@@ -321,6 +323,7 @@ blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
+blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lints = { path = "crates/blaze-lints" }
 blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
@@ -334,7 +337,7 @@ blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
 # WASI preview 1 for wasm guests at both pointer widths, and the bootstrap seed's runner
-# (todo/bootstrap/plan.md).
+# (docs/future/bootstrap.md).
 blaze-wasi = { path = "crates/blaze-wasi" }
 blaze-seed-run = { path = "crates/blaze-seed-run" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
@@ -380,8 +383,9 @@ arrayvec = "0.7.8"
 bitflags = "2.13.2"
 # Official BLAKE3: `blaze_ids::b3`'s backend where blake3-servil doesn't build (Windows, x86-64
 # macOS), and the reference beside it. `neon`: aarch64 picks NEON at compile time; x86_64
-# detects AVX-512 at run time without a feature.
-blake3 = { version = "1.8", default-features = false, features = ["std", "neon"] }
+# detects AVX-512 at run time without a feature. `wasm32_simd`: its SIMD128 code (Rust, no C) on
+# wasm32, the seed's; it does nothing on any other target.
+blake3 = { version = "1.8", default-features = false, features = ["std", "neon", "wasm32_simd"] }
 # BLAKE3-Servil (johnservil/BLAKE3 `servil`, 0.8.0 on official 1.8.7): `blaze_ids::b3`'s
 # backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan/process/decisions.md).
 # Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
@@ -575,8 +579,6 @@ tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tikv-jemalloc-ctl = "0.7.0"
-tikv-jemalloc-sys = "0.7.1"
 tokio = "1.54.1"
 toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"

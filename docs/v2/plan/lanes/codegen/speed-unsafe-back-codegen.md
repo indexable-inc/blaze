@@ -65,7 +65,7 @@ another process, and none maps executable memory:
 - template blobs: the store checks each against its key before `blob::decode*` sees it
   (`blaze-cas` `Reader::get`), and the decoders are safe, bounds-checked Rust that refuse
   short counts and lengths (`blob.rs` tests). Fuzz target `fuzz/targets/codegen_blob.rs` is
-  filed with the coordinator (`v2/requests/codegen.md`, "From codegen (lead)").
+  filed with the coordinator (`docs/v2/requests/codegen.md`, "From codegen (lead)").
 - assembled `asm!` blocks: `asm::Assembled::from_bytes`, safe, fuzzed by
   `fuzz/targets/codegen_asm.rs`.
 - object files LLVM writes are read back in the same process (`emitted.rs`, through `object`'s

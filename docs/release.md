@@ -84,9 +84,9 @@ and the train run too. It cuts when
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
 main's gate built, as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
 `blaze --version` and the archives' names are the tag's, and writes the notes (`canary.py
-notes`): the lines CHANGELOG.md's [Unreleased] gained since the previous release and the title
+notes`): the lines docs/CHANGELOG.md's [Unreleased] gained since the previous release and the title
 of each change merged since then. [Unreleased] is never emptied: a release's notes are in its
-GitHub release, not in a section of CHANGELOG.md.
+GitHub release, not in a section of docs/CHANGELOG.md.
 
 `release-cut.yaml` (by hand, on main) or the release train's `release` job cuts a release of
 main's HEAD the same way (`train_release.py`): a tag through the API and release.yaml on it,

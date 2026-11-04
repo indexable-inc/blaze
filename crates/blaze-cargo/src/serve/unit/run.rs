@@ -33,14 +33,23 @@ pub(crate) enum Launch {
     /// From its executable as linked: a profile compiled whole (a release one, as
     /// `blaze_lazy::allow` decides), or a run under `target.<triple>.runner`, which takes a file.
     File,
+    /// On the daemon's code memory (docs/v2/plan/lanes/fastcompile/inproc.md): a dev
+    /// executable ([`inproc::runs_in_process`]), linked with the start hook's reservations and
+    /// held by the daemon ([`inproc::DevRuns`]), started from the file its memory writes and
+    /// overlaid by the memory before `main`. Its code is compiled whole, as a live build
+    /// (`Mode::Live`); lazily compiled functions (blaze-lazy's runner, `Launch::Lazy`) and tiers
+    /// are not wired yet, and nothing here pretends they are.
+    InProcess,
 }
 
-/// What a dev profile's process needs of blaze that it does not have yet.
-pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, \
-    compiled lazily and tiered (docs/v2/plan/lanes/fastcompile/inproc.md, lazy.md), and this \
-    blaze can't yet: its code generator has no lazy build (`Build::run` with `later`, \
-    `Build::compile_one`) or tiered mode (`Mode::Tiered`, `Backend::Stencil`), and its linker has \
-    no lazy placement";
+/// How blaze gives a dev profile's process its start hook, and where it can't, said after the
+/// reason a unit is not a dev executable ([`inproc::not_in_process`]).
+pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, never \
+    from its file (docs/v2/plan/lanes/fastcompile/inproc.md): the program's start hook \
+    (`blaze_inproc_start`, blaze's dev runtime) lays the daemon's code memory over its code before \
+    `main`. blaze links that runtime into every binary and test of a dev build of this machine's \
+    own target as it links std (library/blaze_inproc_rt), on Linux (x86_64, AArch64) and macOS \
+    (AArch64); a program of another platform has none, and does not run";
 
 /// How the process of unit `unit` starts; `runner` says it runs under a
 /// `target.<triple>.runner`. What a `run` and a test binary both start through.
@@ -50,16 +59,38 @@ pub(crate) fn launch(job: &Job, unit: usize, runner: bool) -> Result<Launch, Str
     }
     let u = job.unit(unit).map_err(|it| it.what)?;
     let policy = codegen::policy(job, unit, codegen::toolchain(job, unit)?)?;
-    launch_of(&u.profile.name, &u.target.name, &policy)
+    // Only a build not made live asks why: a live one is a dev executable.
+    let why = match policy.mode {
+        BuildMode::Live => None,
+        _ => inproc::not_in_process(job, unit)?,
+    };
+    launch_of(&u.profile.name, &u.target.name, &policy, why.as_deref())
 }
 
 /// How a process of `target` built as `policy` under profile `profile` starts, with no runner.
 /// A profile that may compile lazily (a process the daemon runs, writing no output) runs in
-/// process, and while blaze can't, that is an error naming what it lacks: never a quiet start
-/// from a file.
-pub(crate) fn launch_of(profile: &str, target: &str, policy: &Policy) -> Result<Launch, String> {
+/// process: on the daemon's code memory when its build is live, a dev executable
+/// ([`codegen::policy`] makes it so exactly when [`inproc::runs_in_process`]), and otherwise an
+/// error naming why it is not one (`not_in_process`, [`inproc::not_in_process`]) and what blaze
+/// lacks: never a quiet start from a file.
+pub(crate) fn launch_of(
+    profile: &str,
+    target: &str,
+    policy: &Policy,
+    not_in_process: Option<&str>,
+) -> Result<Launch, String> {
     match allows_live(profile, policy) {
-        Ok(()) => Err(format!("`{target}` runs under profile `{profile}`: {NOT_IN_PROCESS}")),
+        Ok(()) => match (policy.mode, not_in_process) {
+            (BuildMode::Live, _) => Ok(Launch::InProcess),
+            (_, Some(why)) => Err(format!(
+                "`{target}` runs under profile `{profile}`, so on the daemon's code memory, and can't: {why}. \
+                 {NOT_IN_PROCESS}"
+            )),
+            (mode, None) => Err(format!(
+                "`{target}` runs under profile `{profile}`, so on the daemon's code memory, and is a dev executable, \
+                 yet its build is {mode:?}, not live: the policy and the launch disagree"
+            )),
+        },
         Err(Refused::Release { .. }) => Ok(Launch::File),
         Err(refused) => Err(refused.to_string()),
     }
@@ -156,6 +187,35 @@ pub(crate) struct Program {
     command: Option<Command>,
     tag: Tag,
     running: bool,
+    /// A dev executable's run ([`Launch::InProcess`]): its code memory and the start, told
+    /// when the process has ended so no fence waits for it.
+    loaded: Option<(Arc<inproc::Loaded>, blaze_inproc::host::Started)>,
+}
+
+impl Program {
+    /// The process ended: its code memory is told, and what its run failed with outside its
+    /// own output (a start hook that never attached, an ask refused) is given for its stderr.
+    fn ended(&mut self) -> Vec<String> {
+        match self.loaded.take() {
+            Some((loaded, started)) => {
+                loaded.exited(started);
+                loaded.failures()
+            }
+            None => Vec::new(), // alloc: none, empty
+        }
+    }
+}
+
+/// `stderr` with `failures` after it, a line each.
+fn with_failures(mut stderr: Vec<u8>, failures: &[String]) -> Vec<u8> {
+    for failure in failures {
+        if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(failure.as_bytes());
+        stderr.push(b'\n');
+    }
+    stderr
 }
 
 pub(crate) fn start(
@@ -193,9 +253,7 @@ pub(crate) fn start(
         .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", target.name), None))? as usize;
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;
-    match launch(job, at, !chosen.runner.is_empty()).map_err(|what| ApiError::new(what, None))? {
-        Launch::File => {}
-    }
+    let launch = launch(job, at, !chosen.runner.is_empty()).map_err(|what| ApiError::new(what, None))?;
     let config = &job.input.config;
     let env = process_env(&config.invocation.env, chosen, std::env::consts::OS);
     // cargo's `target.<triple>.runner`: the runner, its arguments, then the program's.
@@ -225,7 +283,21 @@ pub(crate) fn start(
         sandbox,
         memory: None,
     };
-    Ok(Program { command: Some(command), tag: Tag(tags), running: false })
+    let (command, loaded) = match launch {
+        Launch::File => (command, None),
+        // The file is written from the code memory when it is not its file yet, and the start
+        // hook's variable is set (`Program::command`).
+        Launch::InProcess => {
+            let loaded = job
+                .shared
+                .dev_runs
+                .loaded(&command.program.to_string_lossy())
+                .map_err(|what| ApiError::new(what, None))?;
+            let (command, started) = loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
+            (command, Some((loaded, started)))
+        }
+    };
+    Ok(Program { command: Some(command), tag: Tag(tags), running: false, loaded })
 }
 
 impl Runs<Real> for Program {
@@ -255,19 +327,23 @@ impl Runs<Real> for Program {
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         self.running = false;
+        let failures = self.ended();
         match completion.done {
             Done::Exited(exit) => {
-                let ok = exit.code == Some(0);
-                out.push(Response::Ran { code: exit.code, stdout: exit.stdout, stderr: exit.stderr });
+                let ok = exit.code == Some(0) && failures.is_empty();
+                let stderr = with_failures(exit.stderr, &failures);
+                out.push(Response::Ran { code: exit.code, stdout: exit.stdout, stderr });
                 Some(ok)
             }
             Done::Failed(error) => {
-                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: error.0.into_bytes() });
+                let stderr = with_failures(error.0.into_bytes(), &failures);
+                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr });
                 Some(false)
             }
             other => {
                 let what = UnitError::RunEnded { how: format!("{other:?}") }.to_string();
-                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: what.into_bytes() });
+                let stderr = with_failures(what.into_bytes(), &failures);
+                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr });
                 Some(false)
             }
         }
@@ -281,6 +357,7 @@ impl Runs<Real> for Program {
             }
             false => {
                 self.command = None;
+                self.ended();
                 Some(false)
             }
         }

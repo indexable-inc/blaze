@@ -62,5 +62,5 @@ Tests (`crates/blaze-vfs/src/outside/tests.rs`):
 
 `Watcher::pending` (`crates/blaze-vfs/src/watch.rs`, frontend-journal's) is an
 `FxHashMap<Tag, Pending>` of looks that come and go. They belong in a `blaze_mem::Slab`, the
-tag's offset being the slot: requested exactly in `v2/requests/mem-backend.md` items 2 (lane mem:
+tag's offset being the slot: requested exactly in `docs/v2/requests/mem-backend.md` items 2 (lane mem:
 `Slab::handle_at`) and 3 (frontend-journal: the change and its budget test).

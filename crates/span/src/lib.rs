@@ -1,11 +1,7 @@
 //! File and span related types.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![deny(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
-
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 
 use std::fmt::{self, Write};
 
@@ -78,7 +74,6 @@ impl Span {
         }
         // Differing context, we can't merge these so prefer the one that's root
         if self.ctx != other.ctx {
-            #[cfg(feature = "query")]
             if self.ctx.is_root() {
                 return Some(other);
             } else if other.ctx.is_root() {
@@ -246,14 +241,7 @@ impl EditionedFileId {
     }
 }
 
-#[cfg(feature = "query")]
 use blaze_query::db as query;
-
-#[cfg(not(feature = "query"))]
-mod query {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-    pub struct Id(u32);
-}
 
 /// Input to the analyzer is a set of files, where each file is identified by
 /// `FileId` and contains source code. However, another source of source code in

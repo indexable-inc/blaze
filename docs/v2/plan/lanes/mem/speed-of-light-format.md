@@ -9,7 +9,7 @@ The machine and the bar are those of `speed-of-light.md` in this directory: a 4 
 L1 hit 4 to 5 cycles, an L2 hit about 14, a miss to memory about 80 ns, an uncontended atomic
 read-modify-write 10 to 20 cycles, a global `malloc`/`free` pair 20 to 50 ns warm and a page
 fault on first touch about 0.25 µs. All numbers are to be checked by the coordinator's
-benchmarks once everything builds. The changes are in `v2/requests/mem-format.md` and the
+benchmarks once everything builds. The changes are in `docs/v2/requests/mem-format.md` and the
 children's request files; the notes are in `format.md`.
 
 ## An interner hit (`intern`)

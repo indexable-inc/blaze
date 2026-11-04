@@ -10,8 +10,9 @@
  *    snapshot.
  * 3. site.wasm loads it and renders every page without comments, anonymous, into dist/; it also lists the pages and
  *    the discussable blocks.
- * 4. Bundles client/*.ts, concatenates styles/, copies static/, puts the chat translator's ONNX Runtime in dist/ort/
- *    (`ortFiles`) and the anonymous readers' animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
+ * 4. Bundles client/*.ts, concatenates styles/, copies static/, builds the code graph page (graph/build.ts: dist/graph.html
+ *    and dist/graph/), puts the chat translator's ONNX Runtime in dist/ort/ (`ortFiles`) and the anonymous readers'
+ *    animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
  *
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
@@ -27,12 +28,13 @@
  * SITE_WASM_DIR names another directory holding site.wasm and site-snapshot.wasm (default renderer/target/site/).
  *
  *   bun gen/build.ts           # once
- *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/
+ *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/, static/, graph/
  */
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { buildGraphPage } from '../graph/build';
 import { Site, snapshot, type Page, type SnapshotInput } from '../worker/site-wasm';
 import { ANIMALS, ROBOT, sprite, symbolId } from './animals';
 import { benchScript } from './bench';
@@ -263,9 +265,11 @@ async function build() {
 	}
 	writeFileSync(path.join(dist, 'site.css'), STYLES.map((s) => readFileSync(path.join(root, 'styles', s), 'utf8')).join('\n'));
 	cpSync(path.join(root, 'static'), dist, { recursive: true });
-	// The installer, at <base>/install.sh, from the repo root; the worker also answers <base>/ with it for curl
+	// The code graph page, at <base>/graph, standalone (graph/README.md).
+	await buildGraphPage(dist);
+	// The installer, at <base>/install.sh, from site/; the worker also answers <base>/ with it for curl
 	// (`curl -fsSL https://ix.dev/blaze | sh`).
-	cpSync(path.join(root, '..', 'install.sh'), path.join(dist, 'install.sh'));
+	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));
 
 	write(path.join(gen, 'site.cbor'), snap);
 	cpSync(path.join(modules, 'site.wasm'), path.join(gen, 'site.wasm'));
@@ -288,7 +292,7 @@ async function build() {
 await build();
 if (process.argv.includes('--watch')) {
 	let timer: Timer | undefined;
-	for (const dir of ['content', 'gen', 'client', 'styles', 'static']) {
+	for (const dir of ['content', 'gen', 'client', 'styles', 'static', 'graph']) {
 		if (!existsSync(path.join(root, dir))) continue;
 		watch(path.join(root, dir), { recursive: true }, () => {
 			clearTimeout(timer);

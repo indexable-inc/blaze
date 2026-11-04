@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: mem-db-checks' plan to put the borrow checker's and item well-formedness's per-run temporaries on blaze-mem frames, keep only the owned memo on the global heap, and hold both to budget tests; the changes are requests, filed in v2/requests/mem-db-checks.md and its two children's files.
+summary: mem-db-checks' plan to put the borrow checker's and item well-formedness's per-run temporaries on blaze-mem frames, keep only the owned memo on the global heap, and hold both to budget tests; the changes are requests, filed in docs/v2/requests/mem-db-checks.md and its two children's files.
 date: 2026-10-29
 ---
 # mem-db-checks: borrowck and wfcheck onto frames
@@ -11,9 +11,9 @@ its file, its line, the code before and after, and why:
 
 | part | request file |
 |---|---|
-| setup, containers, entry points, the analyses, wfcheck, per-call buffers, budget tests | `v2/requests/mem-db-checks.md` (B0-B5, W, S, T) |
-| `regions.rs` (the constraint graph, SCCs, region errors) | `v2/requests/mem-db-checks-regions.md` |
-| `check.rs`, `explain.rs` (the checks and their diagnostics) | `v2/requests/mem-db-checks-check.md` |
+| setup, containers, entry points, the analyses, wfcheck, per-call buffers, budget tests | `docs/v2/requests/mem-db-checks.md` (B0-B5, W, S, T) |
+| `regions.rs` (the constraint graph, SCCs, region errors) | `docs/v2/requests/mem-db-checks-regions.md` |
+| `check.rs`, `explain.rs` (the checks and their diagnostics) | `docs/v2/requests/mem-db-checks-check.md` |
 
 ## The design
 

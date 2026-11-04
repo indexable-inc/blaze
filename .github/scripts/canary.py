@@ -15,7 +15,7 @@
         release.yaml is running: the next push, or the hourly run, cuts it then. Without
         `push`, what it would tag is shown and nothing leaves the checkout.
     canary.py notes '{"tag": "v0.YYYYMMDD.N", "notes": "<file>"}'
-        release.yaml's notes job: the release notes, CHANGELOG.md's [Unreleased] lines added since
+        release.yaml's notes job: the release notes, docs/CHANGELOG.md's [Unreleased] lines added since
         the previous release and the title of each change merged since then, and the step output
         `version`, the tag's. Nothing in the checkout changes: the build is told the release by
         `BLAZE_RELEASE` (crates/blaze-engine/build.rs), never by a version written into the tree.
@@ -237,11 +237,19 @@ def cut(args):
     summary(f"tagged {tag} at main {head[:10]} (since {base}) and dispatched release.yaml")
 
 
+def changelog_at(rev):
+    """Where the changelog is at `rev`: docs/CHANGELOG.md, or CHANGELOG.md before it moved there."""
+    found = run("git", "ls-tree", "--name-only", rev, "--", "docs/CHANGELOG.md", "CHANGELOG.md").split()
+    if not found:
+        sys.exit(f"canary.py: {rev} has neither docs/CHANGELOG.md nor CHANGELOG.md")
+    return "docs/CHANGELOG.md" if "docs/CHANGELOG.md" in found else found[0]
+
+
 def unreleased(changelog):
-    """The body of CHANGELOG.md's [Unreleased] section."""
+    """The body of docs/CHANGELOG.md's [Unreleased] section."""
     head = re.search(r"^## \[Unreleased\][^\n]*\n", changelog, re.M)
     if not head:
-        sys.exit("canary.py: CHANGELOG.md has no '## [Unreleased]' heading")
+        sys.exit("canary.py: docs/CHANGELOG.md has no '## [Unreleased]' heading")
     rest = changelog[head.end():]
     end = re.search(r"^(## |\[[^\]]+\]: )", rest, re.M)
     return rest[: end.start() if end else len(rest)].strip()
@@ -327,8 +335,8 @@ def notes(args):
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     since = f" since [{base}]({server}/{REPO}/compare/{base}...{args.tag})" if base else ""
     body = [f"main at {head[:10]}, as it is.", ""]
-    now = unreleased((ROOT / "CHANGELOG.md").read_text())
-    then = unreleased(run("git", "show", f"{base}:CHANGELOG.md")) if base else ""
+    now = unreleased((ROOT / "docs" / "CHANGELOG.md").read_text())
+    then = unreleased(run("git", "show", f"{base}:{changelog_at(base)}")) if base else ""
     if new := added(now, then):
         body += [new, ""]
     body += [f"### Merged{since}", "", merged, ""]

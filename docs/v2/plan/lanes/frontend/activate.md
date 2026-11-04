@@ -45,7 +45,7 @@ on the corpus's biggest workspace.
   quotes and XML entities are escaped. `install` and `uninstall` are lists of `Step`s that
   `run` executes in order, stopping at the first failure and naming it. `installed` reads the
   main file back to tell `Yes`, `No` or `Elsewhere(socket)`.
-- **The CLI** (requested of cargo, `v2/requests/cargo.md`, "frontend-activate"):
+- **The CLI** (requested of cargo, `docs/v2/requests/cargo.md`, "frontend-activate"):
   - `blaze daemon install|uninstall`;
   - `blaze serve --activated`;
   - `connect` never spawns where a unit serves the socket: a dead activated socket is an

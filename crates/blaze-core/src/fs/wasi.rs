@@ -1,5 +1,5 @@
 //! The file calls of [`super`] that WASI (wasm32-wasip1, the seed's target:
-//! todo/bootstrap/plan.md) makes its own way, or has none of.
+//! docs/future/bootstrap.md) makes its own way, or has none of.
 //!
 //! Stamps are made from std's `stat`, one name after another: there are no threads to sweep
 //! with. WASI files have no owner and no permission bits, and WASI has no call that shares

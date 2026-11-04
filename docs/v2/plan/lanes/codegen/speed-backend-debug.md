@@ -87,7 +87,7 @@ alone.
   allocation. Test: against a full search over 200 seeded functions, with backward jumps.
 - **Still missing**: `v2/unwind.rs::convert` (the adapter's) writes a CIE and a whole
   `.eh_frame` through gimli and parses it back for every function, and copies the CIE bytes,
-  which are the same for every function of the ISA. Filed: `v2/requests/codegen-adapter.md`,
+  which are the same for every function of the ISA. Filed: `docs/v2/requests/codegen-adapter.md`,
   "From speed-backend-debug" 2 (compute the CIE half once per process; keep only the FDE).
   That closes the gap to mold's model.
 
@@ -100,7 +100,7 @@ alone.
   `enable_alias_analysis`, never runs, so there is nothing more to turn off. Optimizing code no
   edit reaches (std's non-generic code, devspeed's requests 8 and 14) needs a level in
   `blaze_codegen::Backend::Cranelift` so it is in the key: filed with the lead
-  (`v2/requests/codegen.md`, "From speed-backend-debug" 2).
+  (`docs/v2/requests/codegen.md`, "From speed-backend-debug" 2).
 - `regalloc_algorithm`: backtracking, and `single_pass` above `mod.rs`'s `SINGLE_PASS` (50 000
   instructions); `mod.rs` gives the measured trade-off. Left as it is.
 - **Target features**: x86-64's baseline is SSE2, as rustc's `x86-64` CPU is (tested).
@@ -109,7 +109,7 @@ alone.
   as LLVM's code of it is. The CPU is in the unit's key (`Toolchain::cpu`, compared in v2's
   `check_spec`), and blaze's code identity covers the mapping. The host's features for dev
   builds (hardware.md) need the plan to fill `Toolchain::features` and the adapter to accept
-  them; filed (`v2/requests/codegen.md` 1, `v2/requests/codegen-adapter.md` 4), and the
-  sibling request for an ISA per `#[target_feature]` set (`v2/requests/speed.md`,
+  them; filed (`docs/v2/requests/codegen.md` 1, `docs/v2/requests/codegen-adapter.md` 4), and the
+  sibling request for an ISA per `#[target_feature]` set (`docs/v2/requests/speed.md`,
   speed-backend-intrinsics 1) lands in the same place. The `target.rs` side (rustc feature
   names to Cranelift's `has_*` settings) is written when one of those has a caller.

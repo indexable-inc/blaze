@@ -15,7 +15,7 @@ name: bench-readme
 on:
   push:
     branches: ["main"]
-    paths-ignore: ["README.md", "CHANGELOG.md", "docs/**", "site/**"]
+    paths-ignore: ["README.md", "docs/**", "site/**"]
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
@@ -92,18 +92,15 @@ jobs:
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      # The Cranelift tier is measured with blaze as it is installed and released, without
-      # the `llvm` feature: on Linux a binary that links libLLVM spends about 6 ms loading it
-      # each time it starts, which every `blaze` does.
-      - name: Build blaze (as released, and with the llvm feature)
+      # One blaze for both tiers: every native blaze links LLVM, and the profile picks the backend.
+      - name: Build blaze
         run: |
           mkdir -p "$BENCH_HOME"
           CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p blaze-engine --release
-          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p blaze-engine --release --features llvm
       - name: Bench
         id: bench
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/blaze-engine"
+          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine"
           export BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:-$BENCH_HOME/work}
           rm -rf "$work" "$BENCH_HOME/reference"

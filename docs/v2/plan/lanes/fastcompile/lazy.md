@@ -175,7 +175,7 @@ inside the hook's ask. That waits on inproc's signal-safe asks (fastcompile-lazy
   each compiled once and answered; prefetches wake sleeping workers; a close ends spinning and
   sleeping workers at once.
 
-## Hooks (v2/requests/fastcompile.md)
+## Hooks (docs/v2/requests/fastcompile.md)
 
 - fastcompile-lazy 1 (inproc): concurrent, allocation-free, signal-safe asks.
 - fastcompile-lazy 2 (inproc): a run channel split into a reader and a shared sender.

@@ -156,8 +156,8 @@ what breaks otherwise. Because of that child module, `fncache.rs` can't forbid `
 ## What other lanes have to land
 
 The crate does not build until the callers of `Code::relocs` move. The exact edits are in:
-- `v2/requests/speed-backend-lower.md` (`mod.rs`)
-- `v2/requests/speed-backend-llvm.md` (`llvm.rs`, `llvm/emitted.rs`)
-- `v2/requests/codegen-adapter.md` (`v2/convert.rs`, `v2/shape.rs`, `v2/backend.rs`, the
+- `docs/v2/requests/speed-backend-lower.md` (`mod.rs`)
+- `docs/v2/requests/speed-backend-llvm.md` (`llvm.rs`, `llvm/emitted.rs`)
+- `docs/v2/requests/codegen-adapter.md` (`v2/convert.rs`, `v2/shape.rs`, `v2/backend.rs`, the
   convert tests, and `hashbrown` in hir-ty-codegen's `Cargo.toml`)
-- `v2/requests/speed-backend.md` (`cached.rs`, v1)
+- `docs/v2/requests/speed-backend.md` (`cached.rs`, v1)

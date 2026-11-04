@@ -8,7 +8,7 @@ date: 2026-10-29
 Design notes for [the db lane](../db.md), as written on 2026-10-29. The code is
 `crates/hir-ty/src/next_solver/interner/tls_cache.rs` and `crates/hir-ty/src/next_solver/fulfill.rs`.
 The search graph and its `GlobalCache` are in `vendor/rustc_type_ir/src/search_graph/`. Requests
-are in `v2/requests/db-ty-solver.md`.
+are in `docs/v2/requests/db-ty-solver.md`.
 
 ## The benchmark: rustc's next trait solver
 

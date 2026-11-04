@@ -160,7 +160,7 @@ fn a_build_with_warnings_as_cargo_prints_it() {
         err,
         format!(
             "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}warning: `foo` (lib) generated 2 warnings (1 duplicate) \
-             (run `cargo fix --lib -p foo` to apply 1 suggestion)\n    Finished `dev` profile \
+             (run `blaze check --fix --lib -p foo` to apply 1 suggestion)\n    Finished `dev` profile \
              [unoptimized + debuginfo] target(s) in 1.23s\n"
         )
     );
@@ -170,6 +170,10 @@ fn a_build_with_warnings_as_cargo_prints_it() {
 
     let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, true);
     assert_eq!(quiet, UNUSED);
+
+    // `check --fix` makes the suggestions it would hint at.
+    let (_, fixing) = printed(Shown { fixing: true, ..Shown::default() }, &responses, true);
+    assert!(fixing.contains("warning: `foo` (lib) generated 2 warnings (1 duplicate)\n"), "{fixing}");
 }
 
 #[test]

@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8) under `mem-db`
 (`docs/v2/plan/lanes/mem/db.md`). The exact changes, each with its before and after code, are in
-`v2/requests/mem-db-infer-ctx.md`; the files are lane db's, so none is edited here.
+`docs/v2/requests/mem-db-infer-ctx.md`; the files are lane db's, so none is edited here.
 
 ## What changes
 

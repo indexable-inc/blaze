@@ -12,7 +12,7 @@ mbe, syntax-bridge), `mem-format-tree` (syntax, syntax-tree, hir-def's item tree
 ## interners and span (mem-format)
 
 None of these crates was free, so each change is written out, code and budget tests, in
-`v2/requests/mem-format.md` for its owner. Speed of light: `speed-of-light-format.md`.
+`docs/v2/requests/mem-format.md` for its owner. Speed of light: `speed-of-light-format.md`.
 
 - **`blaze-mem` (to mem, section 1).** `Column::claim(count) -> Block` and `Column::fill(&mut
   Block, value)`: a writer claims a run of indices with one `fetch_add` and fills them in
@@ -53,7 +53,7 @@ None of these crates was free, so each change is written out, code and budget te
     `Binding` 12, `Name` 4.
 - **`intern`'s `Bump` stays.** It is not an `ArenaLocal`: under `blaze_check`, `blaze_mem::Arena`
   reaches the chunk cache, whose links are model atomics in process-wide statics. Answered in
-  `v2/requests/mem.md`.
+  `docs/v2/requests/mem.md`.
 
 Memo values (`AstIdMap`, `SpanMap`, `ItemTree`, expression stores) stay global-allocator blocks
 per lane mem's answer, until memos live in the image.
@@ -61,7 +61,7 @@ per lane mem's answer, until memos live in the image.
 ## tokens (mem-format-tokens)
 
 All four crates are frontend-tokens', so each change is written out, code and budget tests, in
-`v2/requests/mem-format-tokens.md`. A memoized `tt::TopSubtree` stays global-allocator blocks
+`docs/v2/requests/mem-format-tokens.md`. A memoized `tt::TopSubtree` stays global-allocator blocks
 (lane mem's answer); only per-call scratch moves.
 
 - **Lexer (`parser/src/lexed_str.rs`).** The token and checkpoint columns are `lend_u32s`,
@@ -91,7 +91,7 @@ All four crates are frontend-tokens', so each change is written out, code and bu
 ## tree (mem-format-tree)
 
 Syntax side (`crates/syntax`, `crates/syntax-tree`). Not free when written, so every change is
-in `v2/requests/mem-format-tree.md`; the item tree is `## tree items (mem-format-tree-items)`.
+in `docs/v2/requests/mem-format-tree.md`; the item tree is `## tree items (mem-format-tree-items)`.
 
 - **An unchanged file's parse.** `SourceFile::parse_file` of the same text is a kept parse
   handed out again: two `Parse` clones and two drops, all counts of a tree the kept slot holds.
@@ -131,7 +131,7 @@ in `v2/requests/mem-format-tree.md`; the item tree is `## tree items (mem-format
 - **Applied 2026-10-29** under frontend-tree's grant: `syntax-tree`'s `Cargo.toml`, `lib.rs`,
   `flat.rs` and `flat/block.rs`, and `syntax`'s `Cargo.toml`, `parsing.rs` and
   `parsing/reparsing.rs`. Not yet built or tested (this lane's brief forbids it).
-- **The bits dedup is folded in** (`v2/requests/format.md`, "dedup: bits: syntax-tree flat.rs
+- **The bits dedup is folded in** (`docs/v2/requests/format.md`, "dedup: bits: syntax-tree flat.rs
   ..."). `rank_in`, `BitSlice`/`BitSliceMut` and `or_range_at` from `blaze_ids::bits` replace the
   local `rank_in` and `append_bits`. `Ranked`/`ranks_of` are not used, because their boxes would
   be allocations beyond the block. The ranks are filled into the block in place.
@@ -139,7 +139,7 @@ in `v2/requests/mem-format-tree.md`; the item tree is `## tree items (mem-format
 ## hir (mem-format-hir)
 
 hir-def's expression store and HIR (`expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`). The
-changes were written as exact requests in `v2/requests/mem-format-hir.md` while
+changes were written as exact requests in `docs/v2/requests/mem-format-hir.md` while
 speed-hir-store held the paths, and applied once it was done (see the end of this section).
 This section is the design those requests implement.
 
@@ -154,7 +154,7 @@ This section is the design those requests implement.
 | encode's gathered columns | one encode | the per-thread `EncodeScratch` (`expr_store/persist.rs`) |
 | encode's words and names | one encode | per-thread spares of `Words` (`hir/persist.rs`, held: see below) |
 
-A store, a body and a source map are memo values. Lane mem's ruling (`v2/requests/mem.md`) is
+A store, a body and a source map are memo values. Lane mem's ruling (`docs/v2/requests/mem.md`) is
 that a memo value has no revision-arena lifetime: salsa drops each one on its own when it is
 recomputed. So they are owned, made once at their exact size, and their `Copy` columns are
 packed into one block. Nothing here uses a revision arena or a task frame:
@@ -215,13 +215,13 @@ Five of the six requests are in the tree (2026-10-29):
 `Words` on per-thread spares (`hir/persist.rs`) is held. frontend-deps-sigs, which owned that
 file, is done, and the request waits on lane db's ok. hir-def has the `blaze-alloc-count`
 dev-dependency and the test `#[global_allocator]` now. The adaptations are noted under each
-section of `v2/requests/mem-format-hir.md`.
+section of `docs/v2/requests/mem-format-hir.md`.
 
 ### forwarded sections (mem-format-fwd)
 
 Lane `requests` forwarded 24 sections to mem-format, plus two later ones. Each now has a
 `> mem-format-fwd` note under it. Applied (2026-10-29):
-- **The store keeps its macro calls** (`v2/requests/codegen.md`, for hir-ty-mir's
+- **The store keeps its macro calls** (`docs/v2/requests/codegen.md`, for hir-ty-mir's
   `failed_expansion`, `location.rs` and `type_name.rs`).
   - `ExpressionStore::macro_calls()` gives each call in lowering order, recorded whether or
     not the source map is.
@@ -231,7 +231,7 @@ Lane `requests` forwarded 24 sections to mem-format, plus two later ones. Each n
     and body schemas 6), because dependency signature stores are decoded and their anon
     consts reach MIR.
   - Moving the column through a dependency image's relocation table is
-    `v2/requests/mem-format-fwd.md` F1 (`deps/signatures/table.rs`).
+    `docs/v2/requests/mem-format-fwd.md` F1 (`deps/signatures/table.rs`).
   - Test: `tests/body.rs` `round_trip`, for every fixture, checks the store's calls against
     the source map's.
 - **`BindingPats::from_pushed` is `blaze_ids::radix::csr::group_into`** (`speed-hir-store.md`).
@@ -248,7 +248,7 @@ overtaken, or not mem-format's.
 
 ## tree items (mem-format-tree-items)
 
-Filed as `v2/requests/mem-format-tree-items.md` (paths held by `frontend-deps-items`, which is
+Filed as `docs/v2/requests/mem-format-tree-items.md` (paths held by `frontend-deps-items`, which is
 applying F of speed-hir-sol-items, and `frontend-tree`); needs `mem-db-def.md` H1 to H3 for
 hir-def first.
 
@@ -277,7 +277,7 @@ hir-def first.
 ## expand (mem-format-expand)
 
 `mem-db-def-expand`'s F1 to F9 (format's types for hir-expand), settled on 2026-10-29 in
-`v2/requests/mem-format-expand.md` and marked under each F. None was applied here: `crates/span`
+`docs/v2/requests/mem-format-expand.md` and marked under each F. None was applied here: `crates/span`
 is held whole by `frontend-tree-span`, and `tt`, `mbe` and `syntax-bridge` by `frontend-tokens`.
 `frontend-tree-span` has applied the span half (2b, 3a, 4, in `map.rs`); the `tt`, `mbe` and
 `syntax-bridge` half (1, 2a, 3b, 5 and the F7 addendum) is with `frontend-tokens`.

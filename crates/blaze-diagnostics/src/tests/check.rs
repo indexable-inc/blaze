@@ -186,3 +186,35 @@ pub mod __appended {
     assert_eq!(unsafe_code(checked(fixture).messages()), 1, "the module written in the file is linted");
     assert_eq!(unsafe_code(checked_appending(fixture, "__appended").messages()), 0, "the appended module is not");
 }
+
+/// fixspan: a span in the module blaze appends to a crate root (a test harness) is of the root's
+/// text with the module, which is not the file on disk: its file is named with that text's
+/// identity, shown by the root's path, so it is placed in the text it was made against and
+/// never read through the path. `blaze check --fix --all-targets` once placed the harness's
+/// E0463 in the file on disk: "a diagnostic's span at byte 329 of `src/lib.rs`, which is 137
+/// bytes long".
+#[test]
+fn a_span_in_the_module_the_compiler_appends_names_the_text_it_is_of() {
+    let fixture = r#"
+//- /lib.rs crate:main
+pub fn f() {}
+pub mod __appended {
+    extern crate missing;
+}
+"#;
+    let named = |checked: &super::Checked| {
+        let diag = checked.diags.iter().find(|it| it.message == "can't find crate for `missing`").expect("the E0463 of `missing`");
+        diag.span.primary[0].file.clone()
+    };
+    assert_eq!(named(&checked(fixture)), "lib.rs", "a root that is the file on disk is named by its path");
+    let appending = checked_appending(fixture, "__appended");
+    let file = named(&appending);
+    assert_ne!(file, "lib.rs", "a root with an appended module is not the file at its path");
+    assert_eq!(crate::emit::shown(&file), "lib.rs");
+    assert!(crate::emit::names_text(&file));
+    let sources = appending.sources();
+    for diag in &appending.diags {
+        assert_eq!(sources.check(diag), Ok(()), "{}", diag.message);
+    }
+    assert!(appending.stderr().contains("--> lib.rs:3:5"), "{}", appending.stderr());
+}

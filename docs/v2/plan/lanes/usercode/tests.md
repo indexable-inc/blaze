@@ -6,7 +6,7 @@ date: 2026-10-29
 # Tests
 
 Part of [usercode](../usercode.md). Code: `crates/blaze-usercode/src/test.rs` and
-`crates/blaze-usercode/src/test/`. Requests: `v2/requests/usercode-fast-tests.md`.
+`crates/blaze-usercode/src/test/`. Requests: `docs/v2/requests/usercode-fast-tests.md`.
 
 A request's tests go through one sans-IO queue (`test/queue.rs`) over every test binary.
 Each binary starts once, in its sandbox or outside it ([below](#in-the-sandbox-or-outside)), as
@@ -157,7 +157,7 @@ same server.
 Tests run outside any sandbox, as cargo runs them, unless the workspace opts into the
 `sandboxed-tests` experiment or the package says `tests = true` under
 `[package.metadata.blaze.sandbox]` (docs/cargo.md, "Sandboxed tests"). `test::Binary::sandboxed`
-says which, and cargo sets it (`v2/requests/usercode-tests-off.md`). It is `false` by default,
+says which, and cargo sets it (`docs/v2/requests/usercode-tests-off.md`). It is `false` by default,
 and `false` for a package with `tests = false` and for every binary under `BLAZE_SANDBOX=off`.
 
 - **Outside**, the binary is spawned with `Sandbox::Off`: no record is made or read, and no

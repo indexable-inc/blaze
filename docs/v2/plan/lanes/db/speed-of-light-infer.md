@@ -60,7 +60,7 @@ cost:
 - `unwind_if_revision_cancelled`, about 10 cycles (two dependent loads to salsa's flag);
 - `ensure_sufficient_stack`, about 5 cycles;
 - `#[instrument]`'s callsite check, about 5 cycles (no compile-time level cap, see
-  `v2/requests/db-ty.md`);
+  `docs/v2/requests/db-ty.md`);
 - `insert_type_vars_shallow`, `write_expr_ty` (an `ArenaMap` insert that may grow), and the
   `resolve_vars_with_obligations(ty).is_never()` test, about 15 cycles together.
 

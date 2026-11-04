@@ -20,15 +20,15 @@ use crate::{
     plan::Mode,
 };
 
-pub const FN_ID_DOMAIN: &str = "blaze v2 exec fn id 1";
+pub const FN_ID_DOMAIN: &str = "blaze v2 exec fn id 3";
 
-/// What an instance is across versions, test selection's `FnId`: its identity
-/// ([`crate::backend::Described::identity`]) with the settings it is compiled with, as one
-/// instance compiled two ways (asked for by a member and by a dependency) is two functions of
-/// a binary. An edit of a body keeps both.
-pub fn fn_id(identity: ContentId, settings: Settings) -> ContentId {
+/// What an instance is across versions, test selection's `FnId`: its subject
+/// ([`crate::driver::subject`]: its identity and whose code it is compiled as) with the
+/// settings it is compiled with, as one instance compiled two ways is two functions of a
+/// binary. An edit of a body keeps both.
+pub fn fn_id(subject: ContentId, settings: Settings) -> ContentId {
     let mut hasher = Hasher::new(FN_ID_DOMAIN);
-    hasher.id(&identity).id(&settings.0);
+    hasher.id(&subject).id(&settings.0);
     hasher.finish()
 }
 

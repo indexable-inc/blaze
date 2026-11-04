@@ -39,8 +39,8 @@ use super::{
     instance_serial, root_serial,
 };
 
-/// The symbol of the function that hands out the counters, which `blaze-live` defines in
-/// every program that takes edits.
+/// The symbol of the function that hands out the counters, which blaze's dev runtime
+/// (`blaze_inproc_rt::live`) defines in every dev executable.
 pub const COUNTERS: &str = "blaze_live_counters";
 
 /// How many counters a function's own begin on a multiple of: 128 bytes, the pair of cache
@@ -1118,7 +1118,7 @@ fn produce(
     _: Option<&Weights>,
 ) -> Result<super::fragment::Code> {
     // alloc: the error's message
-    Err(CodegenError::Unsupported("blaze was built without `--features llvm`".to_owned()))
+    Err(CodegenError::Unsupported("blaze was built without LLVM (blaze-engine's `native` feature)".to_owned()))
 }
 
 #[cfg(test)]

@@ -211,7 +211,7 @@ Work: walk the body's syntax once and write one row per HIR node.
 - **Design:** exactly those loads and a `match` on the kind, so it is at the bound by
   construction. A whole-store scan reads \(5n\) bytes plus `extra`. The id-only scans
   (`expr_ids()`) read nothing, and borrowck's seven scans per body are filed to become one
-  (`v2/requests/db.md`).
+  (`docs/v2/requests/db.md`).
 
 ### `finish`: scratch to the store's columns
 
@@ -244,7 +244,7 @@ Work: walk the body's syntax once and write one row per HIR node.
   (`StoreBytes::InPlace`, most signature stores) could borrow its `Copy` columns instead.
   `Col` is the column type that can hold such a count, and `follow` already checks each
   `Slice`'s alignment. What's missing is the image's owner reaching `deps/signatures.rs` `read`
-  as an `Arc` (frontend-deps-sigs, requested in `v2/requests/speed-hir-store.md`). Check also fuses into the hash
+  as an `Arc` (frontend-deps-sigs, requested in `docs/v2/requests/speed-hir-store.md`). Check also fuses into the hash
   pass, a 16 KiB block at a time, so the bytes are read from memory once.
 
 ### Expression scopes (`expr_store/scope.rs`)
@@ -270,7 +270,7 @@ Work: walk the body's syntax once and write one row per HIR node.
   - Since 2026-10-29 it is one BLAKE3 pass (`body.rs` `subtree_hash`): about 0.6 cycles a byte
     over a large anchor, so about **70 µs** for the same file. A single-function anchor under
     1 KiB gains little (one chunk, about 1.5 cycles a byte).
-  - Signatures hash their trees the same way, filed in `v2/requests/speed-hir.md`.
+  - Signatures hash their trees the same way, filed in `docs/v2/requests/speed-hir.md`.
 - **Carried hashes:** `FlatTree::subtree_hash` keeps the hash of every node that costs 4 KiB
   or more to hash, made the first time it is asked for, and an incremental reparse carries it
   for the subtrees the edit does not change. So an unchanged anchor's `tree_hash` (`body.rs`)
@@ -556,7 +556,7 @@ error path (checked 2026-10-29), including the new `PolarityAndModifiers` messag
 ### What stands in the way, in order
 
 1. **The kind test's overhead, about 10 of its 12 instructions** (`parser.rs`, `input.rs`; not
-   format-grammar's, filed in `v2/requests/format.md`, "format-grammar: the parser's speed of
+   format-grammar's, filed in `docs/v2/requests/format.md`, "format-grammar: the parser's speed of
    light"):
    - Count steps where a stuck loop must pass (`start`, `error`, `err_recover`, the
      `expect` failures), not in `nth`. Every grammar loop that fails to consume either starts
@@ -802,7 +802,7 @@ and nothing is copied per element: at its bound, nothing to change.
   is a single kind; a `debug_assert` checks the kind against `AstNode::kind`.
 - **What stands in the way:** the walk builds a `SyntaxNode` handle for every node, and a
   check casts with a cursor clone. Walking `(FlatTree, index)` directly is speed-syntax's
-  typed views (`v2/requests/format.md`).
+  typed views (`docs/v2/requests/format.md`).
 - **Corrected (speed-sol2-format, 2026-10-30, from the code):** that is done. `validate` and
   `validate_outline` walk `view::Node<'_>`, the tree and a number, with no handle a node, so
   the walk is the step bound of the flat tree's section. `validate_outline` compares a range
@@ -998,7 +998,7 @@ analyses that touch thousands of trees, which `proof` measures.
 
 Layout and history: [speed-hir-items.md](speed-hir-items.md) (9 bytes an item plus a payload
 record, a reused per-worker builder). The files are `frontend-deps`' while it builds dependency
-images, so every change below is an exact edit in `v2/requests/frontend-deps.md`
+images, so every change below is an exact edit in `docs/v2/requests/frontend-deps.md`
 ("speed-hir-sol-items"), A to F. The file is frontend-deps-reparse's example
 ([frontend/speed-of-light.md](../frontend/speed-of-light.md), "frontend-deps-reparse"): \(I\) =
 500 top-level items, 50 KB of text, about 10 KB of it signatures (bodies left out), \(A\) =
@@ -1188,7 +1188,7 @@ lowering above, plus that search. The expansion's parse costs more than its tree
   of their text. That helps large `macro_rules!` and macro calls.
 - **Budgets** (edit D): on a warm builder, lowering a file allocates at most once per non-empty
   column. An attribute with an input allocates its `Box<AttrInput>` too (hir-expand's; shared
-  inputs are requested in `v2/requests/db-expand.md`), so the fixture has none.
+  inputs are requested in `docs/v2/requests/db-expand.md`), so the fixture has none.
 - **Corrected (speed-sol2-format, 2026-10-30):** edits A to D are in the code. A: no sort of
   the attribute owners (`lower.rs`: they are pushed in order). B: `Scoped::seal` pops a table
   much larger than its entries (`len * 16 < capacity`). C: `AttrBlock`, 16 bytes per 64 items.
@@ -1220,7 +1220,7 @@ brief said item-hash-identity was live on it.
 - **The gap** is the body walk's: a view step a child, and interning. A signature is a few
   dozen rows, so the fixed costs dominate: one salsa query, `finish`'s allocations (one slab
   for the `Copy` columns, plus up to 12 boxes for the path columns: the store section's
-  "`finish`"), and hashing the tree (`subtree_hash`, filed in `v2/requests/speed-hir.md`).
+  "`finish`"), and hashing the tree (`subtree_hash`, filed in `docs/v2/requests/speed-hir.md`).
 - **What `proof` should measure:** `ExpressionStore` lowering for signatures, per row and per
   signature, on a crate with many small items.
 

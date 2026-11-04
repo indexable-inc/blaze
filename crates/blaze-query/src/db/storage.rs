@@ -493,7 +493,8 @@ impl Storage {
         // Process-wide, not this storage's, and no bytes held now (so not in `held_bytes`): the
         // most one run's reads and one task's pending rows reached as their stacks grew, what
         // the query stack bounds are set against (`local::RUN_READS`, `local::PENDING_FLOOR`).
-        let (most_reads, most_pending) = super::local::high_water();
+        let super::local::HighWater { run_reads: most_reads, pending: most_pending, .. } =
+            super::local::high_water();
         let stacks = [
             ("query stack reads (most one run held)", most_reads),
             ("query stack pending rows (most one task held)", most_pending),

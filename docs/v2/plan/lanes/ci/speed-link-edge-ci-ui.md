@@ -94,5 +94,5 @@ old bytes exactly.
 
 ## Requests
 
-- lane cargo (`v2/requests/cargo.md`): `client.rs` `exchange` and `say.rs` `Shown` collect one
+- lane cargo (`docs/v2/requests/cargo.md`): `client.rs` `exchange` and `say.rs` `Shown` collect one
   read's records and call `Live::records_into` once, with one write.

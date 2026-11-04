@@ -21,7 +21,7 @@ triomphe.workspace = true
 base-db.workspace = true
 blaze-ids.workspace = true
 blaze-query.workspace = true
-blaze-units = { workspace = true, features = ["query"] }
+blaze-units.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true
 hir-def.workspace = true

@@ -8,7 +8,7 @@ date: 2026-10-29
 Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md), for
 `crates/blaze-diagnostics/src/lints/names/items.rs` and `items/`. Child of
 [tree-move-diag-lints](tree-move-diag-lints.md). Every file is held by `diagnostics-lints-names`:
-each move is a request in `v2/requests/diagnostics-lints-names.md`.
+each move is a request in `docs/v2/requests/diagnostics-lints-names.md`.
 
 ## The item walk on views (`items/walk.rs`)
 

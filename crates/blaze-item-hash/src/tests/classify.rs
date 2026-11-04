@@ -692,6 +692,61 @@ pub fn copies<M: Make>(m: M) { let a = m.make(); let b = wants(a); let _ = (a, b
     assert!(kept_out.is_empty(), "goals kept out by reads that stand for no fact: {kept_out:?}");
 }
 
+/// An impl method that returns its own `impl Trait` for the trait method's (wasmtime 50's
+/// `WasmTyList::valtypes` and `AccessorTask::run`): `impl_rpitit_tys` of it proves the trait's
+/// bounds of the impl's opaque type (`Opaque(valtypes, 0): Iterator<Item = u32>`), which reads
+/// that opaque's bounds, the impl method's `Signature` fact. With the goal store installed it
+/// hashes that fact as it offers the goal; were the method's types for the trait's
+/// `impl Trait`s in its signature, that hash would read `impl_rpitit_tys` of it again, a cycle
+/// (`impl_rpitit_tys -> fact_value -> signature_of -> signature_form`). They are their own
+/// fact (`blaze_items::Fact::RpititTys`), which a caller's read stands for.
+#[test]
+fn an_impl_methods_own_impl_trait_for_the_trait_methods_hashes_no_cycle() {
+    let db = db_of(
+        r#"
+//- minicore: sized, copy, clone, iterator, option
+pub struct Once(u32);
+impl Iterator for Once { type Item = u32; fn next(&mut self) -> Option<u32> { None } }
+pub trait List { fn valtypes() -> impl Iterator<Item = u32>; }
+impl List for (u32,) { fn valtypes() -> impl Iterator<Item = u32> { Once(1) } }
+pub trait Make { fn make(self) -> impl Copy; }
+impl Make for u32 { fn make(self) -> impl Copy { self } }
+pub fn first<L: List>() -> Option<u32> { L::valtypes().next() }
+pub fn concrete() -> Option<u32> { let _ = 5u32.make(); <(u32,) as List>::valtypes().next() }
+"#,
+    );
+    let installed = hir_ty::next_solver::goal_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        Arc::new(blaze_items::goals::Goals),
+        ContentId([7; 32]),
+    )
+    .expect("a goal store for the test database");
+    let krate = local_crate(&db);
+    // The impl's types first, as the outermost query, as wasmtime's check reached them.
+    for name in ["valtypes", "make"] {
+        let method = impl_method(&db, name);
+        let values = hir_ty::rpitit::impl_rpitit_tys(&db, method);
+        assert!(
+            values.len() == 1 && values.iter().all(Result::is_ok),
+            "`{name}` gives its `impl Trait` a type"
+        );
+        let fact = FactRef {
+            kind: blaze_items::kinds::RPITIT_TYS,
+            subject: key::item_key(&db, ItemId::Function(method)).0,
+            object: FactObject::None,
+        };
+        assert!(values::value(&db, krate, fact).is_some(), "`{name}`: {fact:?} has a value");
+    }
+    for &def in &crate_body_owners(&db, krate) {
+        let _ = InferenceResult::of(&db, def);
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    let flushed = installed.flush().expect("the test goal store flushes");
+    // Goals were offered and kept, so their facts were hashed where the cycle was.
+    assert!(flushed.written > 0, "no goal was stored: {flushed:?}");
+}
+
 /// A read keyed by several arguments (request 00827) is the fact of what its first names: a
 /// crate's table its `Crate` fact, refused for the body's own; an impl's or trait's item of a
 /// name its `Fields`; a const evaluated as itself its `ConstValue`.

@@ -54,7 +54,7 @@ never per token, segment or expression.
 
 ## What the lint misses
 
-`tools/v2/hot_lint.py` (requests in `v2/requests/dedyn.md`): its `crates` filter crashes
+`tools/v2/hot_lint.py` (requests in `docs/v2/requests/dedyn.md`): its `crates` filter crashes
 (`list[str]`); it never lints `hir-ty-codegen` (sources at the crate root) or
 `blaze-diagnostics`; `dyn\s+[A-Z]` misses path-qualified traits (`&dyn ast::HasAttrs`, about 25
 lines); and it flags modules declared `#[cfg(test)]` in their parent.

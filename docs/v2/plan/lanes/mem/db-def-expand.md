@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of mem-db-def's plan (`docs/v2/plan/lanes/mem/db-def.md`), against mem-db's contract
 (`docs/v2/plan/lanes/mem/db.md`, "The contract"). hir-expand belongs to `db-expand-macros`, so
-every change is a request: `v2/requests/mem-db-def-expand.md` (E1 to E14 in hir-expand, M the
+every change is a request: `docs/v2/requests/mem-db-def-expand.md` (E1 to E14 in hir-expand, M the
 memo table, T1 and T2 the budget tests, F1 to F9 of lane format's crates, X1 and X2 outside).
 
 ## Where each allocation goes

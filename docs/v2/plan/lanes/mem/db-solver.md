@@ -9,7 +9,7 @@ This is part of `mem-db`. It programs against the contract in `docs/v2/plan/lane
 - **Paths:** `crates/hir-ty/src/next_solver/` (except `interner/tls_cache.rs`, which is mem-db's),
   `vendor/rustc_type_ir/` and `vendor/rustc_next_trait_solver/`.
 - **Changes:** they all belong to lane db and its children, so each is a request in
-  `v2/requests/mem-db-solver.md`. That file has the file, line, before and after for each.
+  `docs/v2/requests/mem-db-solver.md`. That file has the file, line, before and after for each.
   This note gives the design and the bound.
 
 ## Design: recycle, don't bump

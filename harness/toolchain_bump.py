@@ -30,7 +30,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
-    commit in install.sh, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
+    commit in site/install.sh, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
  6. installs the nightly with rustup.
@@ -75,7 +75,7 @@ HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-li
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
               "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
-MENTIONS = ["install.sh", "crates/rustc_lexer/Cargo.toml"]
+MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
@@ -269,8 +269,8 @@ blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
     then commit crates/blaze-units/src/stdlib/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
-  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM (`nix develop -c ...`,
-    a blaze built with `--features llvm`: the release profile is LLVM's);
+  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM (`nix develop -c ...`;
+    the release profile is LLVM's, which every native blaze has);
   - the full tier (the train and the crates' own test suites) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 

@@ -209,19 +209,19 @@ jobs:
       # blaze-engine, and each has the features it has in blaze-engine's build alone. On
       # Windows, which has no Nix, the build is against the static C runtime, and names
       # libraries of the SDK that the linker is not otherwise shown.
-      - name: blaze build --release --features blaze-engine/llvm, of what the unit tests are built on
+      - name: blaze build --release, of what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
-      - name: cargo build -p blaze-engine --release --features llvm
+      - name: cargo build -p blaze-engine --release
         if: env.BLAZE != 'true'
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
             sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
             export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-            cargo build -p blaze-engine --release --features llvm --locked
+            cargo build -p blaze-engine --release --locked
           else
-            nix develop --command cargo build -p blaze-engine --release --features llvm --locked
+            nix develop --command cargo build -p blaze-engine --release --locked
           fi
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'

@@ -51,112 +51,25 @@ use super::{
     exec::{Header, Tables},
     hook,
 };
-use crate::patch::{
-    ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
-    PatchView, exec,
-};
+use crate::patch::{Answer, MessageView, PatchView, exec};
 
 /// How many generations are kept to roll back to, as Relax keeps.
 pub(crate) const KEPT: usize = 64;
-/// How many tables of its own a switch writes generations into, reused oldest first. A
-/// table is written while the cell points at another, and a thread that loaded the cell
-/// before it left this one reads each slot whole, of the generation it was in or the one
-/// it is brought to, both code that is written and never written again ([`Lasting`]).
-///
-/// Right after each switch, the table the cell left longest ago is brought to the new
-/// generation ([`Switch::ready`]), or a new one copied while the pool isn't full, so the
-/// next patch stores only its own cells before its switch.
-pub(crate) const POOL: usize = 4;
-const MOST_SLOTS: u64 = 1 << 26;
-
-/// [`Descriptor::arch`] of what this program runs on; none matches elsewhere.
-pub(crate) const HOST_ARCH: u32 = if cfg!(target_arch = "x86_64") {
-    ARCH_X86_64
-} else if cfg!(target_arch = "aarch64") {
-    ARCH_AARCH64
-} else {
-    u32::MAX
-};
-
-/// What an image's descriptor says, with its slide. Addresses are as linked unless a method
-/// slides them. 80 bytes, made once at start.
-#[derive(Debug)]
-pub(crate) struct Layout {
-    pub(crate) id: [u8; 16],
-    /// The generation the image was linked at.
-    pub(crate) generation: u64,
-    pub(crate) slide: u64,
-    /// The cell holding the current table's address.
-    pub(crate) table: u64,
-    pub(crate) slots: u64,
-    pub(crate) code: Range<u64>,
-    pub(crate) data: Range<u64>,
-}
-
-impl Layout {
-    /// The layout of the descriptor found in memory at `at`.
-    pub(crate) fn new(descriptor: &Descriptor, at: u64) -> Result<Layout, String> {
-        if descriptor.version != DESCRIPTOR_VERSION {
-            // alloc: error path
-            return Err(format!(
-                "{DESCRIPTOR} is of version {}, where this blaze-live reads {DESCRIPTOR_VERSION}",
-                descriptor.version
-            ));
-        }
-        if descriptor.arch != HOST_ARCH {
-            // alloc: error path
-            return Err(format!(
-                "{DESCRIPTOR} is for architecture {}, where this program runs on {}",
-                descriptor.arch,
-                std::env::consts::ARCH
-            ));
-        }
-        let [code_start, code_end] = descriptor.patch_code;
-        let [data_start, data_end] = descriptor.patch_data;
-        if code_start > code_end || data_start > data_end {
-            // alloc: error path
-            return Err(format!(
-                "{DESCRIPTOR} has a patch region that ends before it starts: code {code_start:#x}..\
-                 {code_end:#x}, data {data_start:#x}..{data_end:#x}"
-            ));
-        }
-        if descriptor.slots > MOST_SLOTS {
-            // alloc: error path
-            return Err(format!("{DESCRIPTOR} has {} slots", descriptor.slots));
-        }
-        let slide = at.wrapping_sub(descriptor.this);
-        if !descriptor.table.wrapping_add(slide).is_multiple_of(8) {
-            // alloc: error path
-            return Err(format!(
-                "{DESCRIPTOR}'s table cell at {:#x} is not aligned",
-                descriptor.table
-            ));
-        }
-        Ok(Layout {
-            id: descriptor.id,
-            generation: descriptor.generation,
-            slide,
-            table: descriptor.table,
-            slots: descriptor.slots,
-            code: code_start..code_end,
-            data: data_start..data_end,
-        })
-    }
-
-    pub(crate) fn slid(&self, address: u64) -> u64 {
-        address.wrapping_add(self.slide)
-    }
-
-    /// Where the patch code region is in memory.
-    pub(crate) fn code_in_memory(&self) -> Range<u64> {
-        self.slid(self.code.start)..self.slid(self.code.end)
-    }
-
-    /// Where the table cell is in memory.
-    pub(crate) fn cell(&self) -> u64 {
-        self.slid(self.table)
-    }
-}
+// How many tables of its own a switch writes generations into, reused oldest first: the dev
+// runtime's (`blaze_inproc_rt::live::log::POOL`), whose `Tables` has room for each. A table is
+// written while the cell points at another, and a thread that loaded the cell before it left
+// this one reads each slot whole, of the generation it was in or the one it is brought to,
+// both code that is written and never written again ([`Lasting`]).
+//
+// Right after each switch, the table the cell left longest ago is brought to the new
+// generation ([`Switch::ready`]), or a new one copied while the pool isn't full, so the next
+// patch stores only its own cells before its switch.
+pub(crate) use blaze_inproc_rt::live::log::POOL;
+// What an image's descriptor says, with its slide: the dev runtime's, which finds the
+// execution log's header by it too.
+pub(crate) use blaze_inproc_rt::live::Layout;
+#[cfg(test)]
+pub(crate) use blaze_inproc_rt::live::HOST_ARCH;
 
 /// How the platform's unwinder takes DWARF call frame information.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

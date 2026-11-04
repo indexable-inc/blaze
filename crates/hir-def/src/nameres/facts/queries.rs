@@ -11,7 +11,7 @@ use hir_expand::{mod_path::ModPath, name::Name};
 use triomphe::Arc;
 
 use crate::{
-    MacroId, ModuleId, UseId,
+    ModuleId, UseId,
     item_tree::{ModItemId, TreeId},
     nameres::{DefMapCrateData, ModuleData, ModuleOrigin, mod_resolution::ModDir},
     per_ns::PerNs,
@@ -23,7 +23,7 @@ use super::{
     env::{CollectEnv, CrateEnv, SideTables},
     graph::{ImportShape, Partition},
     macros,
-    ops::{DeclOp, ImportOp, Inherited, MacroOp, OpLog},
+    ops::{DeclOp, ImportOp, Inherited, LegacyExports, MacroOp, OpLog},
     unit::{self, UnitState},
 };
 
@@ -165,8 +165,9 @@ pub(crate) struct ModuleDecls {
     pub(crate) ops: OpLog,
     /// The children it declares, in declaration order; each has its own `module_decls`.
     pub(crate) children: Box<[DeclKey]>,
-    /// Its textual scope after collection, every definition of each name.
-    pub(crate) legacy: Inherited,
+    /// Its textual scope after collection, the latest definition of each name, leaving out what
+    /// it inherited and did not shadow (its parent holds that already).
+    pub(crate) legacy: LegacyExports,
     /// Its tables after collection: where its first macro step starts.
     pub(crate) side: Arc<SideTables>,
     /// The files other than its modules' own that this log reads, whose write changes it with
@@ -413,16 +414,13 @@ pub(crate) fn module_decls(db: &Db, key: DeclKey) -> ModuleDecls {
     frame::task(Tag::Nameres, |frame| collect::module_decls(db, frame, key))
 }
 
-/// The module's `macro_rules!` after collection, the last definition of each name: what a
-/// `#[macro_use] mod` brings into its parent. Backdates unless they change.
+/// The module's `macro_rules!` after collection, the last definition of each name it defines
+/// or brings in (not those it only inherited): what a `#[macro_use] mod` brings into its
+/// parent. Backdates unless they change.
 #[blaze_query::tracked(returns(ref))]
-pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
-    let legacy = &module_decls(db, key).legacy;
-    let exports = || legacy.iter().filter_map(|(name, macs)| Some((*name, *macs.last()?)));
-    // alloc: the query's value, at exact size, once per execution
-    let mut out = Vec::with_capacity(exports().count());
-    out.extend(exports());
-    out.into_boxed_slice()
+pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> LegacyExports {
+    // clone: the query's value, at exact size, once per execution
+    module_decls(db, key).legacy.clone()
 }
 
 /// The ops the module and its round-0 descendants make in the crate root (`#[macro_export]`),

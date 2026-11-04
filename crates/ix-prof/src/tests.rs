@@ -172,6 +172,25 @@ fn a_view_reads_back_from_pprof_as_written(tc: TestCase) {
     assert_eq!(back.to_pprof(), view.to_pprof(), "the same view, the same bytes");
 }
 
+/// A frame twice in a row in one stack (a span inside itself, a recursion) is two frames
+/// read back from pprof, not one: the writer merged equal neighbours until 2026-11-03.
+#[test]
+fn a_stack_that_repeats_a_frame_reads_back_from_pprof_with_both() {
+    let mut view = View {
+        sample_types: vec![crate::view::ValueType::new("samples", "count")],
+        default_type: 0,
+        period: None,
+        frames: vec![Frame::named("fn_0".to_owned(), FrameKind::Span)],
+        samples: vec![crate::view::Sample { stack: vec![0, 0], values: vec![1], labels: Vec::new() }],
+        time_nanos: 5,
+        duration_nanos: 1_000,
+    };
+    view.canonicalize();
+    let back = View::from_pprof(&view.to_pprof()).expect("reads");
+    assert_eq!(back.samples[0].stack, vec![0, 0]);
+    assert_eq!(back, view);
+}
+
 /// A new directory under the system's temporary one, removed when dropped.
 struct TempDir(std::path::PathBuf);
 

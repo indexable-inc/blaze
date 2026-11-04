@@ -59,6 +59,13 @@ uv run --script renderer/fetch.py --scp HOST:DIR [--port 9999]    # DIR = render
 uv run --script renderer/build.py                                 # with the Rust toolchain, clang and wasm-opt
 ```
 
+## Code graph (`/graph`)
+
+`graph/`: a standalone page, not a Flecs page: blaze's symbols and their relations (from `blaze index`; a hand-made
+sample until then) as a live force-directed graph on WebGPU. `gen/build.ts` builds it into `dist/graph.html` and
+`dist/graph/`; the worker sends it a CSP that lets it compile its layout simulation's wasm. `graph/README.md` has the
+rest, `graph/schema.ts` the file format.
+
 ## Commands
 
 ```
@@ -96,7 +103,7 @@ It is reached three ways, all declared in `wrangler.jsonc` `routes`, so `wrangle
 
 `/blaze` itself is a 301 to `/blaze/`. The origin and base are `Served` on `site` in `content/site.flecs`: the
 renderer prefixes every link, asset and form action with the base and writes the canonical and `og:` tags from the
-origin; the build writes `.gen/site.json` (for the worker) and `dist/sitemap.xml`, and copies the repo's `install.sh`
+origin; the build writes `.gen/site.json` (for the worker) and `dist/sitemap.xml`, and copies `site/install.sh`
 to `dist/install.sh` (https://ix.dev/blaze/install.sh, and https://ix.dev/blaze/ itself for a client that doesn't
 ask for HTML, so `curl -fsSL https://ix.dev/blaze | sh` installs). To move the site again, change `Served` and the routes.
 

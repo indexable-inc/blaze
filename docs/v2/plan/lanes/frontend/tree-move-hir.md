@@ -56,7 +56,7 @@ handle path.
 - **Scopes and resolution** (same signatures, views for handles): `scope(Node<'db>) ->
   Option<SemanticsScope<'db>>` (the shared `SemanticsScope`; its
   `speculative_resolve_view(ast::Path<'_>)` is the view twin; `speculative_resolve_mod_path(&ModPath)`,
-  which blaze-lints calls, is frontend-tree-move-tools' request in `v2/requests/db.md`),
+  which blaze-lints calls, is frontend-tree-move-tools' request in `docs/v2/requests/db.md`),
   `resolve_path(_with_subst)`,
   `resolve_path_per_ns`, `resolve_mod_path`, `resolve_method_call`, `resolve_method_call_as_callable`,
   `resolve_expr_as_callable`, `resolve_field`, `resolve_record_field(_with_substitution)`,
@@ -116,7 +116,7 @@ by the tree.md convention. A reader turns one into a view with `ptr.value.to_vie
 
 ## What `hir` needs from below
 
-- hir-expand (`frontend-tree-move-expand`, in `v2/requests/db-expand.md`): `MacroCallLoc::to_node_view`,
+- hir-expand (`frontend-tree-move-expand`, in `docs/v2/requests/db-expand.md`): `MacroCallLoc::to_node_view`,
   `to_node_item_view`, `MacroCallKind::arg_view`, `MacroCallId::call_node_view`,
   `ExpansionInfo::{expanded_view, arg_view, map_range_down_view}`,
   `InFile<Node>::{ancestors_with_macros_view, original_*_view}`, `expand_cfg_attr_view`,
@@ -141,13 +141,13 @@ No build-path crate calls these; they go with `crates/ide*`: `hir/src/term_searc
 ## hir-ty and the checkers
 
 - `hir-ty/src/effects.rs` (`closure_expr_is_const`): `AstPtr::to_view` under
-  `HirFileId::root(db)`, requested in `v2/requests/db.md`.
+  `HirFileId::root(db)`, requested in `docs/v2/requests/db.md`.
 - `method_resolution.rs` (items', DONE; edited): `loaded_crates` walks `Parse::root()`'s
   `Node::flat()`, the same `(tree, at)` the handle `flat()` gave.
 - `opaques.rs` names `ast::TypeAlias` as a kind tag only; `next_solver/format_proof_tree.rs` has
   no syntax.
 - `hir-ty-borrowck/src/names.rs` (`from_external_macro`) and `check/tests.rs`'s `source`:
-  `AstPtr::to_view` / `view::to_node`, requested in `v2/requests/db.md`.
+  `AstPtr::to_view` / `view::to_node`, requested in `docs/v2/requests/db.md`.
 - `lang_items.rs`, `infer/op.rs`, `expr_use_visitor.rs` use the operator enums, which the views
   share (`syntax::view::{BinaryOp, ...}` are `syntax::ast`'s own): nothing to move.
 - `hir-ty-wfcheck`, `hir-ty-matchck`, `hir-ty-unsafeck`: no handle use (unsafeck's tests name

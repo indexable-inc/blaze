@@ -164,7 +164,8 @@ fn harnesses(
     let toolchain = codegen::toolchain(job, unit)?;
     let policy = codegen::policy(job, unit, toolchain)?;
     let paths = std::sync::Arc::clone(lowered.paths());
-    let frontend = codegen::frontend_over(lowered.db(), &paths, &job.mounted, codegen::build_time(job, unit));
+    let spellings = std::sync::Arc::clone(lowered.spellings());
+    let frontend = codegen::frontend_over(lowered.db(), &paths, &spellings, &job.mounted, codegen::build_time(job, unit));
     let mut texts = Vec::with_capacity(asked.len()); // alloc: once per doctest unit with a test example
     for (program, krate) in asked.iter().zip(made) {
         if !program.test {

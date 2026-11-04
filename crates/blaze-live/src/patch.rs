@@ -18,12 +18,12 @@
 //! allocation, the bytes of each write borrowed from the buffer it was read into), and the
 //! linker writes one from borrowed bytes ([`PatchRef`]) into one buffer of the exact size.
 
-/// The name of the descriptor's symbol, which the linker exports.
-pub const DESCRIPTOR: &str = "__blaze_live";
-pub const DESCRIPTOR_MAGIC: [u8; 8] = *b"BLZLIVE2";
-/// The version of [`Descriptor`] this crate reads and writes: 4 since it names no directory
-/// (patches come over blaze-inproc's channel).
-pub const DESCRIPTOR_VERSION: u32 = 4;
+// The descriptor and the jump table's header are the dev runtime's (`blaze_inproc_rt::live`):
+// every dev executable reads them, to find its execution log, whatever it depends on.
+pub use blaze_inproc_rt::live::{
+    ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, STUBS_SECTION_ELF,
+    STUBS_SECTION_MACHO, exec, slot_stub_bytes, stub_slot,
+};
 
 /// The content hash of a function's code, as the commit wrote it into the code memory: its
 /// SHA-256.
@@ -127,150 +127,9 @@ pub mod ask {
     }
 }
 
-/// [`Descriptor::arch`] of x86-64 and of AArch64.
-pub const ARCH_X86_64: u32 = 0;
-pub const ARCH_AARCH64: u32 = 1;
-
 /// The generation of an image's first full link; each commit of the image counts up from it.
 /// A program starts at the generation its descriptor says ([`Descriptor::generation`]).
 pub const FIRST_GENERATION: u64 = 0;
-
-/// The jump table's header, which [`Descriptor::table`] names, and its execution log
-/// (fastcompile-ident-select 9): the layout blaze-link writes and the runtime reads, every
-/// word little-endian, the header 8-aligned in writable data.
-///
-/// Every call through a slot loads [`CELL`](exec::CELL), then the slot's word of the table it
-/// points at.
-/// Without a log the cell points at the current generation's table. With one (blaze-link's
-/// `Output::exec_log`), it points at the log table from the start: word `s` of it holds slot
-/// `s`'s log stub until that is first called, which marks `map + 16 + s`, copies word `s` of
-/// the table at [`CURRENT`](exec::CURRENT) into the log table's word `s` and jumps there, so
-/// each later call goes straight to the code.
-pub mod exec {
-    /// The address of the table calls go through: the current generation's, or the log table.
-    pub const CELL: u64 = 0;
-    /// The address of the current generation's table, which the log stubs copy from.
-    pub const CURRENT: u64 = 8;
-    /// The address of the map the log stubs mark (slot `s` at `map + 16 + s`): the image's
-    /// own private map until the process is armed, then the armed region.
-    pub const MAP: u64 = 16;
-    /// The address of slot 0's log stub; 0 in an image without a log.
-    pub const STUBS: u64 = 24;
-    /// The address of the loader's table, which holds the generation the image was linked at.
-    pub const LOADER: u64 = 32;
-    /// The table's slot count, a `u32`.
-    pub const SLOTS: u64 = 40;
-    /// The bytes from one log stub to the next, a `u32`; 0 without a log.
-    pub const STRIDE: u64 = 44;
-    /// The header's length without a log, and where the log table starts with one.
-    pub const HEADER: u64 = 48;
-
-    /// A region's first bytes: what `__blaze_exec_arm` checks it starts with.
-    pub const MAGIC: [u8; 8] = *b"blzexec1";
-    /// A map's header ([`MAGIC`], the slot count and the slots armed, each a `u32`); slot
-    /// `s`'s byte follows at `REGION_HEADER + s`.
-    pub const REGION_HEADER: u64 = 16;
-
-    /// The offset of the log table's word for `slot`.
-    pub const fn log_word(slot: u64) -> u64 {
-        HEADER + slot * 8
-    }
-
-    /// The offset of the image's private map, after the log table of `slots` words.
-    pub const fn private_map(slots: u64) -> u64 {
-        HEADER + slots * 8
-    }
-
-    /// The header's length for a table of `slots` slots, with the log or without: the log
-    /// table and the private map, padded to a word, follow the fixed words.
-    pub const fn len(slots: u64, logged: bool) -> u64 {
-        if logged {
-            private_map(slots) + (REGION_HEADER + slots).next_multiple_of(8)
-        } else {
-            HEADER
-        }
-    }
-
-    const _: () = assert!(len(3, true) == 48 + 24 + 24 && len(3, false) == HEADER);
-}
-
-/// What the symbol `__blaze_live` of an image blaze-link made is: written by the linker in
-/// read-only data, every address as linked (unslid); the slide is where the descriptor is
-/// in memory minus `this`.
-#[repr(C)]
-// clone: 112 bytes of plain data mirroring the symbol's, read once at start
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Descriptor {
-    pub magic: [u8; 8],
-    pub version: u32,
-    /// 0 x86-64, 1 AArch64.
-    pub arch: u32,
-    pub id: [u8; 16],
-    /// The generation the image was linked at: the program starts there, and accepts a patch
-    /// whose `base` is the generation it is at.
-    pub generation: u64,
-    pub this: u64,
-    /// The jump table's header ([`exec`]), whose first word is the cell holding the address
-    /// of the table calls go through (an array of `slots` code addresses, slid by the
-    /// loader); every call through a slot loads this cell first.
-    pub table: u64,
-    /// The table's capacity: every slot has its stub from the full link on, so a patch only
-    /// sets cells.
-    pub slots: u64,
-    /// `[start, end)` of the region new code is placed in, and of new data's.
-    pub patch_code: [u64; 2],
-    pub patch_data: [u64; 2],
-}
-
-impl Descriptor {
-    /// Its encoded size, which is also its size in memory: every field is aligned as it is.
-    pub const SIZE: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 8 + 16 + 16;
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(Self::SIZE);
-        let mut out = Writer(&mut bytes);
-        out.0.extend_from_slice(&self.magic);
-        out.u32(self.version);
-        out.u32(self.arch);
-        out.0.extend_from_slice(&self.id);
-        for value in [self.generation, self.this, self.table, self.slots]
-            .into_iter()
-            .chain(self.patch_code)
-            .chain(self.patch_data)
-        {
-            out.u64(value);
-        }
-        bytes
-    }
-
-    /// The descriptor at the start of `bytes`: none when they are too short or don't start
-    /// with [`DESCRIPTOR_MAGIC`]. The version is the reader's to check.
-    pub fn decode(bytes: &[u8]) -> Option<Descriptor> {
-        let mut reader = Fields(bytes.get(..Self::SIZE)?);
-        let magic: [u8; 8] = reader.array().ok()?;
-        if magic != DESCRIPTOR_MAGIC {
-            return None;
-        }
-        let version = reader.u32().ok()?;
-        let arch = reader.u32().ok()?;
-        let id = reader.array().ok()?;
-        let mut next = || reader.u64().ok();
-        Some(Descriptor {
-            magic,
-            version,
-            arch,
-            id,
-            generation: next()?,
-            this: next()?,
-            table: next()?,
-            slots: next()?,
-            patch_code: [next()?, next()?],
-            patch_data: [next()?, next()?],
-        })
-    }
-}
-
-const _: () = assert!(Descriptor::SIZE == size_of::<Descriptor>());
 
 /// Code a patch runs, in the patch code region: written by the commit into the code memory,
 /// never carried by the message. The program hashes the `len` bytes it maps at `at` and

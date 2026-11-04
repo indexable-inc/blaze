@@ -1,7 +1,8 @@
 
 // What each test executed, for a binary built with jump-table slots: the harness text of
 // `blaze_usercode::test::fork_server(true)`, after `fork_server.rs`. The runtime's two exports
-// (blaze-live's, over the jump table) are asked once for the slot count. Each test's child
+// (the dev runtime's, `blaze_inproc_rt::live::log`, which blaze links into every dev executable,
+// over the jump table) are asked once for the slot count. Each test's child
 // arms a region the server maps before its fork and reads once it has ended; a region read is
 // cleared and kept for the next test, so the server maps only as many as run at once, and a
 // steady stream of tests makes no `mmap`, `munmap` or fresh page of them.

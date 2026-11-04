@@ -20,10 +20,7 @@
 
 #![allow(rustdoc::private_intra_doc_links)]
 #![deny(unsafe_code)]
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 extern crate rustc_lexer;
 
 pub mod cook;

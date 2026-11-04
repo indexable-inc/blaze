@@ -3,7 +3,7 @@
 //! level, and what it did of late ([`Tiers`]), for the program to show.
 
 /// How many counters [`counters`](crate::blaze_live_counters) has room for.
-pub const COUNTERS: usize = 1 << 16;
+pub use blaze_inproc_rt::live::COUNTERS;
 
 /// The levels a function is compiled at, from the quickest to build to the quickest to run.
 pub const LEVELS: [&str; 3] = ["Cranelift", "LLVM -O3", "LLVM -O3 + PGO"];

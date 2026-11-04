@@ -73,8 +73,7 @@ blaze-mem.workspace = true
 blaze-protocol.workspace = true
 proc-macro-api.workspace = true
 blaze-ui.workspace = true
-# With `query`: the workspace load and unit graph as queries, for v2's daemon.
-blaze-units = { workspace = true, features = ["query"] }
+blaze-units.workspace = true
 blaze-registry.workspace = true
 # The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
 blaze-source.workspace = true
@@ -119,15 +118,13 @@ blaze-lower.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
-# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm with `tui`.
+# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm with `native`.
 ratatui.workspace = true
 # `extended`: the `mi_collect` binding.
 libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-tikv-jemalloc-ctl = { workspace = true, optional = true }
-tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
@@ -145,32 +142,24 @@ uds_windows.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }
 
 [features]
-default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "pprof"]
-# The seed profile (todo/bootstrap/plan.md, "The seed has no C") is this crate with none of
-# these: each is a C, C++ or assembly dependency.
-# blaze-stencil's stencils made by LLVM at build time.
-llvm-stencils = ["hir-ty-codegen/llvm-stencils", "blaze-lazy/llvm-stencils", "blaze-link/llvm-stencils"]
-# Fetching over HTTPS (rustls on ring) and the global cache's client.
-net = ["blaze-registry/net", "blaze-global/net"]
-# `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and wtransport).
-explore = ["dep:blaze-explore"]
-# The process's allocator is mimalloc: `raw::memory::purge_freed_pages` asks it.
-mimalloc = ["dep:libmimalloc-sys"]
-# `blaze test`'s live view drawn on the terminal through crossterm (`cli/live.rs`); without it a
-# run that would draw it is refused, naming this feature. Not C, but crossterm has no wasm32.
-tui = ["ratatui/crossterm"]
-# Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
-heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]
-# `blaze serve`, its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`). Without
-# it (the seed) each command runs the same engine in its own process for its one request and
-# exits (`serve/once.rs`), and `blaze serve`, `stop`, `status` and `units` are refused, naming it.
-daemon = []
-# `blaze pprof` (`cli/pprof.rs`), Unix-only in places; without it the command is refused, naming it.
-pprof = []
-
-# Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm` or a profile's `opt-level`.
-llvm = ["hir-ty-codegen/llvm"]
-
+default = ["native"]
+# Everything the native blaze has and the wasm seed (docs/future/bootstrap.md, "The seed has no C")
+# leaves out, as one switch: LLVM as a code producer and the stencils it makes at build time
+# (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
+# (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
+# wtransport), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
+# test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze serve`
+# with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
+# (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one
+# request and exits (`serve/once.rs`), and what needs any of the above is refused, naming it.
+native = [
+    "hir-ty-codegen/llvm",
+    "blaze-registry/net",
+    "blaze-global/net",
+    "dep:blaze-explore",
+    "dep:libmimalloc-sys",
+    "ratatui/crossterm",
+]
 
 [lints]
 workspace = true

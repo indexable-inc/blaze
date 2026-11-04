@@ -9,7 +9,7 @@
 //! all run between turns. The guard watches the turns from a thread of its own.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 use std::time::Duration;
 
 /// The loop's progress, written by the loop at the end of each turn and read by the stop's
@@ -30,19 +30,19 @@ impl Pulse {
         self.turns.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(all(unix, feature = "daemon"))]
+    #[cfg(all(unix, feature = "native"))]
     pub fn moved(&self) -> u64 {
         self.moved.load(Ordering::Relaxed)
     }
 
-    #[cfg(all(unix, feature = "daemon"))]
+    #[cfg(all(unix, feature = "native"))]
     pub fn turns(&self) -> u64 {
         self.turns.load(Ordering::Relaxed)
     }
 }
 
 /// What one look at the loop's turns found.
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
     /// A turn ended since the last look: the loop turns.
@@ -57,7 +57,7 @@ pub enum Look {
 
 /// Judges the loop's turns, told the time and the count at each look: a turn that lasts past
 /// `report` is reported once, and again only after the loop turned in between.
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 #[derive(Debug)]
 pub struct LoopWatch {
     report_ns: u64,
@@ -66,7 +66,7 @@ pub struct LoopWatch {
     said: bool,
 }
 
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 impl LoopWatch {
     pub fn new(report: Duration) -> LoopWatch {
         LoopWatch { report_ns: u64::try_from(report.as_nanos()).unwrap_or(u64::MAX), seen: None, said: false }
@@ -92,7 +92,7 @@ impl LoopWatch {
     }
 }
 
-#[cfg(all(test, unix, feature = "daemon"))]
+#[cfg(all(test, unix, feature = "native"))]
 mod tests {
     use super::*;
 

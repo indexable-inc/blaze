@@ -60,9 +60,36 @@ pub fn name_with_text(shown: &str, text: &str) -> String {
     name
 }
 
-/// The name rustc shows the file `name` by: without the text a file with no path carries.
+/// What ends the shown name of a file whose text is not the file at its path in the name its
+/// spans give it, the content ID of the text they were made against after it: a crate root
+/// blaze appended a module to (a test harness, a wasm proc macro's glue), whose text is the
+/// file on disk and then the module. Two texts shown by one path are two names, so a span is
+/// placed only in the text it was made against (keys-cover-every-input), never in the file on
+/// disk, which ends before the module. No path and no name rustc shows holds a U+0001.
+const TEXT_ID: char = '\u{1}';
+
+/// The name the spans of a file whose text is not the file at its path give it: `shown`, then
+/// the content ID of the `text` they are of.
+pub fn name_with_id(shown: &str, text: impl fmt::Display) -> String {
+    // alloc: a span's file name, made only as a diagnostic is built
+    let mut name = String::with_capacity(shown.len() + TEXT_ID.len_utf8() + 64);
+    name.push_str(shown);
+    name.push(TEXT_ID);
+    // Writing to a String cannot fail.
+    let _ = fmt::Write::write_fmt(&mut name, format_args!("{text}"));
+    name
+}
+
+/// Whether the file `name` is of a text that is not the file at its path ([`name_with_id`]):
+/// its text is the database's, never read through the path it is shown by.
+pub fn names_text(name: &str) -> bool {
+    name.contains(TEXT_ID) && text_in(name).is_none()
+}
+
+/// The name rustc shows the file `name` by: without the text a file with no path carries, or
+/// the identity of the text one not on disk is ([`name_with_id`]).
 pub fn shown(name: &str) -> &str {
-    name.split_once(TEXT_AFTER).map_or(name, |(shown, _)| shown)
+    name.split_once([TEXT_AFTER, TEXT_ID]).map_or(name, |(shown, _)| shown)
 }
 
 /// The text of the file `name`, when it is one with no path, which carries it.
@@ -1290,6 +1317,31 @@ mod tests {
         assert_eq!(normalize_whitespace(Cow::Borrowed("a\tb\u{200d}c")), "a    bc");
         // `’` starts with 0xE2 too and is kept as it is.
         assert_eq!(normalize_whitespace(Cow::Borrowed("it’s")), "it’s");
+    }
+
+    /// fixspan: a crate root with a module blaze appended (a test harness) and the file on disk
+    /// are shown by one path, and are two names: a span past the end of the file on disk, in
+    /// the module, is placed in the text it was made against, and never in the file on disk,
+    /// which `blaze check --fix --all-targets` once read for it ("a diagnostic's span at byte
+    /// 329 of `src/lib.rs`, which is 137 bytes long").
+    #[test]
+    fn a_text_not_on_disk_and_the_file_at_its_path_are_two_names() {
+        let on_disk = "pub fn f() {}\n";
+        let appended = format!("{on_disk}pub mod __blaze_test_harness {{\n    extern crate test;\n}}\n");
+        let lo = appended.find("extern").unwrap() as u32;
+        let named = name_with_id("src/lib.rs", "0f3a");
+        assert_ne!(named, "src/lib.rs");
+        assert!(names_text(&named) && !names_text("src/lib.rs") && !names_text(&name_with_text("<crate attribute>", "\u{1}")));
+        assert_eq!(shown(&named), "src/lib.rs");
+        let diag = Diag::error(Some("E0463"), "can't find crate for `test`", Span { file: named.clone(), lo, hi: lo + 18, expansion: None });
+        let mut sources = Sources::default();
+        sources.add("src/lib.rs", Some(on_disk.to_owned()));
+        assert_eq!(sources.unread([&diag]), [named.as_str()], "the file on disk is not the text the span names");
+        assert_eq!(sources.check(&diag), Err(Unplaced::Unread { file: "src/lib.rs".to_owned(), byte: lo }));
+        sources.add(&named, Some(appended));
+        assert_eq!(sources.check(&diag), Ok(()));
+        assert_eq!(sources.position(&named, lo), Some((3, 5)));
+        assert_eq!(sources.position("src/lib.rs", lo), None, "the file on disk ends before the module");
     }
 
     /// Two files with no path shown by one name: each span reads its own file's text from its

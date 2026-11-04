@@ -273,7 +273,7 @@ fn an_assemblers_lines_are_read_from_its_error() {
 fn without_llvm_a_global_asm_is_an_error_not_the_machines_compiler() {
     let text = format!("//- /lib.rs crate:nollvm\n{BUILTINS}\nglobal_asm!(\"nop\");\n");
     let error = assembled("x86_64-unknown-linux-gnu", &text).unwrap_err();
-    for said in ["of crate `nollvm`", "built with no assembler", "--features llvm", "--features rsasm"] {
+    for said in ["of crate `nollvm`", "built with no assembler", "blaze-engine's `native`", "hir-ty-codegen's `rsasm`"] {
         assert!(error.contains(said), "says {said:?}: {error}");
     }
 }

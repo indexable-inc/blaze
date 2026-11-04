@@ -22,7 +22,7 @@ blaze-phf.workspace = true
 parking_lot.workspace = true
 
 [features]
-# `intern::fuzz`: the `intern_table` fuzz target's hooks.
+# `intern::fuzz`: the `intern_table` fuzz target's hooks; only fuzz/ turns it on.
 fuzz = []
 
 [dev-dependencies]

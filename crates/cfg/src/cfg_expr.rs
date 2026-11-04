@@ -106,18 +106,15 @@ impl CfgExpr {
 
     // FIXME: Parsing from `tt` is only used in a handful of places, reconsider
     // if we should switch them to AST.
-    #[cfg(feature = "tt")]
     pub fn parse(tt: &tt::TopSubtree) -> CfgExpr {
         next_cfg_expr(&mut tt.iter()).unwrap_or(CfgExpr::Invalid)
     }
 
-    #[cfg(feature = "tt")]
     pub fn parse_from_iter(tt: &mut tt::iter::TtIter<'_>) -> CfgExpr {
         next_cfg_expr(tt).unwrap_or(CfgExpr::Invalid)
     }
 
     /// The `CfgExpr` of a `cfg` predicate, read from a view of it.
-    #[cfg(feature = "syntax")]
     pub fn parse_from_view(ast: syntax::view::CfgPredicate<'_>) -> CfgExpr {
         use intern::sym;
         use syntax::view::{self as ast, AstToken};
@@ -181,7 +178,6 @@ impl CfgExpr {
     }
 }
 
-#[cfg(feature = "tt")]
 fn next_cfg_expr(it: &mut tt::iter::TtIter<'_>) -> Option<CfgExpr> {
     use intern::sym;
     use tt::iter::TtElement;

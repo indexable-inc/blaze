@@ -36,16 +36,18 @@ fn package(name: &str, extra: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\nbench = false\n\n{extra}")
 }
 
-/// A standard library of nine crates, laid out and locked as library/ is (cargo-std's), with
+/// A standard library of ten crates, laid out and locked as library/ is (cargo-std's), with
 /// compiler_builtins' build script. `test` is libtest, which a harnessed test unit adds (cargo's
-/// `std_crates`); as in library/, `sysroot` depends on it.
+/// `std_crates`); as in library/, `sysroot` depends on it. `blaze_inproc_rt` is blaze's dev
+/// runtime ([`crate::stdlib::DEV_RUNTIME`]), a member of the workspace as in library/.
 pub(crate) fn library(tree: &MemTree) -> ContentId {
-    let manifest = "cargo-features = [\"profile-rustflags\"]\n\n[workspace]\nresolver = \"1\"\nmembers = [\"std\", \"sysroot\"]\n\n\
+    let manifest = "cargo-features = [\"profile-rustflags\"]\n\n[workspace]\nresolver = \"1\"\nmembers = [\"std\", \"blaze_inproc_rt\", \"sysroot\"]\n\n\
                     [profile.dev.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n\n\
                     [profile.release.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n";
     let lock = format!(
         "{HEADER}\n\
          [[package]]\nname = \"alloc\"\nversion = \"0.0.0\"\ndependencies = [\n \"compiler_builtins\",\n \"core\",\n]\n\n\
+         [[package]]\nname = \"blaze_inproc_rt\"\nversion = \"0.0.0\"\ndependencies = [\n \"std\",\n]\n\n\
          [[package]]\nname = \"compiler_builtins\"\nversion = \"0.0.0\"\ndependencies = [\n \"core\",\n]\n\n\
          [[package]]\nname = \"core\"\nversion = \"0.0.0\"\n\n\
          [[package]]\nname = \"panic_abort\"\nversion = \"0.0.0\"\ndependencies = [\n \"alloc\",\n \"core\",\n]\n\n\
@@ -82,6 +84,7 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
         "[dependencies]\ncore = { path = \"../core\" }\nstd = { path = \"../std\" }\n\
          panic_unwind = { path = \"../panic_unwind\" }\npanic_abort = { path = \"../panic_abort\" }\n",
     );
+    let runtime = package("blaze_inproc_rt", "[dependencies]\nstd = { path = \"../std\" }\n");
     let lib = b"#![no_std]\n".as_slice();
     tree.root(&[
         ("Cargo.toml", manifest.as_bytes()),
@@ -104,6 +107,8 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
         ("proc_macro/src/lib.rs", lib),
         ("test/Cargo.toml", test.as_bytes()),
         ("test/src/lib.rs", b"".as_slice()),
+        ("blaze_inproc_rt/Cargo.toml", runtime.as_bytes()),
+        ("blaze_inproc_rt/src/lib.rs", b"".as_slice()),
         ("sysroot/Cargo.toml", sysroot.as_bytes()),
         ("sysroot/src/lib.rs", b"".as_slice()),
     ])
@@ -287,10 +292,11 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert!(bin.dependencies.iter().any(|it| it.index == lib_at && it.extern_crate_name == "a"));
 
     // cargo's `attach_std_deps`: every unit but a build script's run gets each of the
-    // library's roots, as `noprelude`, `public` and `nounused`.
+    // library's roots, as `noprelude`, `public` and `nounused`; a dev program of the host's
+    // also blaze's dev runtime, which its library does not get.
     let std_deps: Vec<_> = bin.dependencies.iter().filter(|it| units.graph.units[it.index].is_std).collect();
     let names: Vec<&str> = std_deps.iter().map(|it| it.extern_crate_name.as_str()).collect();
-    assert_eq!(names, ["alloc", "compiler_builtins", "core", "panic_unwind", "proc_macro", "std"]);
+    assert_eq!(names, ["alloc", "blaze_inproc_rt", "compiler_builtins", "core", "panic_unwind", "proc_macro", "std"]);
     assert!(std_deps.iter().all(|it| (it.public, it.noprelude, it.nounused) == (Some(true), Some(true), Some(true))));
     let std_platforms: Vec<_> = units.graph.units.iter().filter(|it| it.is_std).map(|it| (&it.target.name, it.mode, &it.platform)).collect();
     assert!(std_platforms.iter().all(|(_, _, it)| it.is_none()), "{std_platforms:?}");
@@ -422,6 +428,62 @@ fn std_unwinds_under_a_profile_that_aborts_and_its_tests_link_it() {
     assert_eq!(unit.profile.panic, "unwind", "a test unwinds under any profile");
     assert_eq!(linked(&tested, unit, "std"), "unwind");
     assert_eq!(linked(&tested, unit, "test"), "unwind", "and its harness, libtest, is built to unwind too");
+}
+
+// blaze's dev runtime (`DEV_RUNTIME`, library/blaze_inproc_rt) is linked into every program a
+// dev build of the host's runs, as std is, though the package depends on no blaze-inproc: its
+// start hook is what lets blaze run the program on the daemon's code memory. A library gets
+// none, nor does a release build; a program that links the runtime itself (a package named
+// `blaze-inproc-rt`, which blaze-inproc depends on) gets no second one.
+#[test]
+fn a_dev_program_that_depends_on_no_blaze_inproc_gets_the_dev_runtime_as_std() {
+    use crate::stdlib::DEV_RUNTIME;
+    let fixture = Fixture::new();
+    let files = [
+        ("ws/Cargo.toml", A),
+        ("ws/src/lib.rs", "pub fn f() {}\n"),
+        ("ws/src/main.rs", "fn main() {}\n"),
+        ("ws/tests/t.rs", "#[test]\nfn t() {}\n"),
+    ];
+    // The std crate `unit` gets as the dev runtime, if any.
+    let runtime = |units: &Units, unit: &Unit| {
+        unit.dependencies
+            .iter()
+            .find(|it| it.extern_crate_name == DEV_RUNTIME)
+            .map(|it| (units.graph.units[it.index].is_std, it.noprelude, it.public))
+    };
+    let std_runtime = Some((true, Some(true), Some(true)));
+
+    let built = ready(fixture.plan(fixture.open(&ask(&files))));
+    let (_, bin) = units_of(&built, "a").into_iter().find(|(_, it)| it.target.kind == ["bin"]).expect("a bin");
+    assert_eq!(runtime(&built, bin), std_runtime, "the program gets the runtime");
+    let (_, lib, _) = lib_of(&built, "a");
+    assert_eq!(runtime(&built, lib), None, "a library gets none");
+
+    let tested = ready(fixture.plan(fixture.open(&Ask { command: Command::Test, args: &[], ..ask(&files) })));
+    let tests: Vec<&Unit> = units_of(&tested, "a").into_iter().map(|(_, it)| it).filter(|it| it.mode == Mode::Test).collect();
+    assert!(tests.len() >= 2, "the library's test and tests/t.rs: {tests:?}");
+    for test in tests {
+        assert_eq!(runtime(&tested, test), std_runtime, "test `{}` gets the runtime", test.target.name);
+    }
+
+    let release = ready(fixture.plan(fixture.open(&Ask { args: &["--release"], ..ask(&files) })));
+    let (_, bin) = units_of(&release, "a").into_iter().find(|(_, it)| it.target.kind == ["bin"]).expect("a bin");
+    assert_eq!(runtime(&release, bin), None, "a release program runs from its file");
+    assert!(!release.graph.units.iter().any(|it| it.is_std && it.target.name == DEV_RUNTIME), "nor is it built");
+
+    // A program whose dependencies link the runtime: that one, never a second.
+    let manifest = format!("{A}\n[dependencies]\nblaze-inproc-rt = {{ path = \"rt\" }}\n");
+    let own = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/src/main.rs", "fn main() {}\n"),
+        ("ws/rt/Cargo.toml", "[package]\nname = \"blaze-inproc-rt\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\nname = \"blaze_inproc_rt\"\n"),
+        ("ws/rt/src/lib.rs", ""),
+    ];
+    let owned = ready(fixture.plan(fixture.open(&ask(&own))));
+    let (_, bin) = units_of(&owned, "a").into_iter().find(|(_, it)| it.target.kind == ["bin"]).expect("a bin");
+    assert_eq!(runtime(&owned, bin).map(|it| it.0), Some(false), "the program links its dependency's runtime");
+    assert_eq!(bin.dependencies.iter().filter(|it| it.extern_crate_name == DEV_RUNTIME).count(), 1, "and no second");
 }
 
 // A `-Zbuild-std` of `core` (or `core,alloc`) under `panic = "abort"`, on a target that can

@@ -20,7 +20,7 @@
 cosmos.js  744,762 bytes  sha256 baae2a4759db42791001e4f52b9d1730db110a441d762f882c00bad50e3b0444
 ```
 
-The choice of cosmos.gl over Sigma.js is in `bench/results/2026-10-28-web-graph/README.md`.
+The choice of cosmos.gl over Sigma.js is in `tools/bench/results/2026-10-28-web-graph/README.md`.
 
 ## Rebuilding
 

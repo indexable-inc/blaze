@@ -29,13 +29,13 @@ the bound: no instruction sequence rounds a value to a runtime power of two in f
 
 | copy | goes to | request |
 |---|---|---|
-| `blaze-mem/src/os.rs` `round_up` | `checked_align_up` | `v2/requests/mem.md` |
-| `blaze-mem` `frame.rs`, `arena.rs`, `region.rs` inline masks | `align_up`, `align_down` | `v2/requests/mem.md` |
-| `blaze-link/src/reloc.rs` `align_up` (9 calls in `place.rs`) | `align_up_u64` | `v2/requests/link.md` |
-| `blaze-link/src/pe/image.rs` `page_of` | `align_down_u64` | `v2/requests/link.md` |
-| `blaze-cas/src/disk.rs` `aligned`, `blocks` (constant alignments) | std `next_multiple_of` | `v2/requests/mem.md` (mem-backend-cas) |
-| `blaze-inproc/src/alloc.rs:95` mask | `align_down_u64` | `v2/requests/fastcompile.md` |
-| `blaze-stencil/src/buf.rs` `(a - len % a) % a` | `padding_for_u32` | `v2/requests/fastcompile.md` |
+| `blaze-mem/src/os.rs` `round_up` | `checked_align_up` | `docs/v2/requests/mem.md` |
+| `blaze-mem` `frame.rs`, `arena.rs`, `region.rs` inline masks | `align_up`, `align_down` | `docs/v2/requests/mem.md` |
+| `blaze-link/src/reloc.rs` `align_up` (9 calls in `place.rs`) | `align_up_u64` | `docs/v2/requests/link.md` |
+| `blaze-link/src/pe/image.rs` `page_of` | `align_down_u64` | `docs/v2/requests/link.md` |
+| `blaze-cas/src/disk.rs` `aligned`, `blocks` (constant alignments) | std `next_multiple_of` | `docs/v2/requests/mem.md` (mem-backend-cas) |
+| `blaze-inproc/src/alloc.rs:95` mask | `align_down_u64` | `docs/v2/requests/fastcompile.md` |
+| `blaze-stencil/src/buf.rs` `(a - len % a) % a` | `padding_for_u32` | `docs/v2/requests/fastcompile.md` |
 
 **Kept on purpose:**
 - `blaze-live`'s page arithmetic (`pages`, `page` loops in `slots/*.rs`, `linux.rs`, `macos.rs`):
@@ -44,7 +44,7 @@ the bound: no instruction sequence rounds a value to a runtime power of two in f
 - `blaze-format/src/lib.rs` `align_up`: std's `next_multiple_of` plus the format's own check
   (no record aligned past `ALIGN`); not a copy of the arithmetic.
 - `hir-ty-codegen/mod.rs` `align_up`: emits Cranelift instructions, not a number; renamed
-  `emit_align_up` (request in `v2/requests/codegen.md`).
+  `emit_align_up` (request in `docs/v2/requests/codegen.md`).
 - `rustc_abi`'s `Size::align_to`/`is_aligned`: methods of its own types, as the brief says.
 - `hir-ty-mir`'s `Address::aligned`: sets an address's alignment, not rounding.
 
@@ -62,11 +62,11 @@ when never reset), `Revisions`. The copies found:
 
 | copy | what it is | verdict |
 |---|---|---|
-| `blaze-graph/src/arena.rs` `Bump` + `task` + `with` | per-thread task bump arena, spare per depth | copy of `Frame` + `frame::task`; mem-core (owner of the file, migrating it) told, `v2/requests/mem.md`. Its NUMA binding and `Cap` reservation, if kept, belong in `blaze_mem::region` and the tag budgets |
+| `blaze-graph/src/arena.rs` `Bump` + `task` + `with` | per-thread task bump arena, spare per depth | copy of `Frame` + `frame::task`; mem-core (owner of the file, migrating it) told, `docs/v2/requests/mem.md`. Its NUMA binding and `Cap` reservation, if kept, belong in `blaze_mem::region` and the tag budgets |
 | `intern/src/arena.rs` `Bump` | never-freed bump over chunks, one per shard | copy of `Arena`: a `static` `Arena` (`Arena::new` is `const`) never reset, an `ArenaLocal<'static>` per shard; mem-format and dedup-intern told |
-| `blaze-link` `bumpalo::Bump`, reset per stage | request arena | copy of `Arena`; `v2/requests/link.md` (mem-backend-link) |
-| `blaze-inproc/src/alloc.rs` `Arena` | TLSF heap over code offsets: free in any order | differs on purpose; renamed `CodeHeap` with a comment (`v2/requests/fastcompile.md`) |
-| `mbe/src/expander/matcher.rs` `Arena<'t>` | the reused `Vec`s of one match | not an arena; renamed `Buffers` (mem-format, `v2/requests/mem.md`) |
+| `blaze-link` `bumpalo::Bump`, reset per stage | request arena | copy of `Arena`; `docs/v2/requests/link.md` (mem-backend-link) |
+| `blaze-inproc/src/alloc.rs` `Arena` | TLSF heap over code offsets: free in any order | differs on purpose; renamed `CodeHeap` with a comment (`docs/v2/requests/fastcompile.md`) |
+| `mbe/src/expander/matcher.rs` `Arena<'t>` | the reused `Vec`s of one match | not an arena; renamed `Buffers` (mem-format, `docs/v2/requests/mem.md`) |
 | `la_arena` (front end) | typed index arena (`Vec<T>` + `Idx<T>`) | a different kind (an ID-indexed table, not memory): out of scope |
 | `typed_arena` in `blaze-cargo/src/cargo/package.rs`, `hir-ide` | values with destructors on a cold path (a `.dwp` packing; an IDE crate to be removed) | kept: `blaze_mem::Arena` runs no destructors |
 
@@ -75,25 +75,25 @@ slots, never moved" in `base-db`, `blaze-ids`, `blaze-query` (twice), `blaze-vfs
 `blaze-hashcons`, `blaze-graph`, `proc-macro-api`, `blaze-web`, `span`. Those that append are
 `blaze_mem::Column` as it is (the `Column` push is one `fetch_add` and one release `fetch_or`, a
 read one acquire load against two in the `OnceLock` form, and no heap chunk per level). The list
-is in `v2/requests/mem.md` for the children moving each crate's tables.
+is in `docs/v2/requests/mem.md` for the children moving each crate's tables.
 
 ## Pools
 
 - **Thread pools.** `stdx::thread::Pool` (rust-analyzer's, a channel and `Box<dyn FnOnce>` per
   job) has no caller left in the tree; `blaze_graph::pool::Pool` (Chase-Lev deques, LIFO slot,
   topology-aware stealing) is the one pool. Deleting stdx's, with its two crossbeam
-  dependencies, is in `v2/requests/coordinator.md`.
+  dependencies, is in `docs/v2/requests/coordinator.md`.
 - **Process pools.** `blaze_usercode::pool::Pool` (sans-I/O warm processes by `WarmKey`) and
   `proc_macro_api::pool::ProcMacroServerPool` (a client's connections, one claimed per expansion)
   are two layers of one design, not copies: `proc-macro-api/src/warm.rs` asks the first for the
   second's servers. Both stay. The second's hand-built connection list is a `Column` (request in
-  `v2/requests/usercode.md`).
+  `docs/v2/requests/usercode.md`).
 - **Object pools.** `blaze_mem::Pool`/`Slab` are the pools. Free-list copies found:
   `blaze-graph/src/exec.rs` `Table` (a `Slab<Run>`), `blaze-graph/src/pump.rs` `FREE` and
   `blaze-query/src/segment.rs` `LaneIds` (thread slot indices), `blaze-core/src/uring.rs`
   `Registered::free` (a fixed set of 16-bit registered-buffer indices the kernel names: kept, a
   `Slab` would add a generation the kernel cannot carry). The first three are in mem-core's and
-  mem-db's migrations (`v2/requests/mem.md`).
+  mem-db's migrations (`docs/v2/requests/mem.md`).
 
 ## Seen, for other parts
 

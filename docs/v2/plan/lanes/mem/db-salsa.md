@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of `mem-db` ([db.md](db.md), whose **contract** this programs against). The paths
 (`vendor/salsa`, `vendor/salsa-macros`, `vendor/salsa-macro-rules`) belong to lane `db`, so every
-change is a request: M1 to M9 in `v2/requests/mem-db-salsa.md`, each with the code before and
+change is a request: M1 to M9 in `docs/v2/requests/mem-db-salsa.md`, each with the code before and
 after and the test that holds it. Speed-salsa's audit
 ([speed-salsa.md](../db/speed-salsa.md)) is applied and is the base: lock-free hits, the shared
 edge array and node table, the 24-byte memo header, the claim-free verify.

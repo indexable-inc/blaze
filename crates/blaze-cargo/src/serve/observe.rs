@@ -261,8 +261,30 @@ fn query_counts(build: u64) -> Vec<QueryCountRow> {
 }
 
 fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::Counts) -> QueryCountRow {
-    let blaze_query::db::Counts { executed, verified, reran, evicted_asked, evicted, dropped } = counts;
-    QueryCountRow { build_id, query, executed, verified, reran, evicted_asked, evicted, dropped }
+    let blaze_query::db::Counts {
+        executed,
+        verified,
+        reran,
+        evicted_asked,
+        evicted,
+        dropped,
+        reads_recorded,
+        reads_kept,
+        reads_most,
+    } = counts;
+    QueryCountRow {
+        build_id,
+        query,
+        executed,
+        verified,
+        reran,
+        evicted_asked,
+        evicted,
+        dropped,
+        reads_recorded,
+        reads_kept,
+        reads_most,
+    }
 }
 
 /// The `blaze-history` thread: it ends with a last flush once the daemon (its [`Profiling`])
@@ -293,7 +315,7 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             // Held until the last flush is written: a daemon after this one numbers its builds
             // from what this one wrote.
             let _owner = owner;
-            match History::open(&at, history::CAP_BYTES) {
+            match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
                 Ok(history) => {
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
@@ -514,7 +536,7 @@ struct Answered {
 pub struct Observe {
     profiling: Option<Profiling>,
     /// The explorer, once asked for, and whether it accepts the page's development server.
-    #[cfg(feature = "explore")]
+    #[cfg(feature = "native")]
     explorer: Option<(bool, blaze_explore::Explorer)>,
     live: Vec<Subscriber>,
     /// When the subscribers are sent their next frames, on the driver's clock.
@@ -558,7 +580,7 @@ impl Observe {
         let answers = Answers::new(profiling.is_some());
         Observe {
             profiling,
-            #[cfg(feature = "explore")]
+            #[cfg(feature = "native")]
             explorer: None,
             live: Vec::new(),    // alloc: none until a subscriber
             querying: Vec::new(), // alloc: none until a query
@@ -643,7 +665,7 @@ impl Observe {
     /// differs from the one running (so turning it off stops accepting the development
     /// server's Origin), and its link. A start that fails fails the request and keeps none,
     /// so the next one tries again.
-    #[cfg(feature = "explore")]
+    #[cfg(feature = "native")]
     pub fn explore(&mut self, to: RequestRef, dev: bool, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
             return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned())));  // alloc: error path
@@ -672,7 +694,7 @@ impl Observe {
     }
 
     /// `blaze explore` in a blaze built without the explorer: refused, naming the feature.
-    #[cfg(not(feature = "explore"))]
+    #[cfg(not(feature = "native"))]
     pub fn explore(&mut self, to: RequestRef, _dev: bool, out: &mut Vec<Reply>) {
         let what = match self.profiling {
             None => NO_PROFILING,
@@ -828,7 +850,7 @@ impl Observe {
         for querying in &self.querying {
             _ = querying.stop.try_send(());
         }
-        #[cfg(feature = "explore")]
+        #[cfg(feature = "native")]
         {
             self.explorer = None;
         }
@@ -837,11 +859,11 @@ impl Observe {
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
-/// What a blaze built without blaze-cargo's `explore` feature (the seed profile, which has no
+/// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
 /// C: the explorer serves through Flecs and wtransport on ring) says to the explorer and to
 /// `blaze debug sql --live`'s Arrow IPC, whose encoder is the explorer's.
-#[cfg(not(feature = "explore"))]
-const NO_EXPLORER: &str = "this blaze is built without blaze-cargo's `explore` feature (the seed profile), so it has no \
+#[cfg(not(feature = "native"))]
+const NO_EXPLORER: &str = "this blaze is built without blaze-cargo's `native` feature (the seed profile), so it has no \
                            explorer and no Arrow IPC encoder";
 
 /// The error of a `blaze why` past its deadline: the build it still waits for (the oldest
@@ -885,7 +907,7 @@ fn sql_error(error: &sql::SqlError) -> ApiError {
 }
 
 /// A query's batches as one Arrow IPC stream, and their rows; no bytes for no batches.
-#[cfg(feature = "explore")]
+#[cfg(feature = "native")]
 fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
     let rows = batches.iter().map(|it| it.num_rows() as u64).sum();
     // alloc: a query's answer, once a query
@@ -898,7 +920,7 @@ fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError>
 }
 
 /// [`NO_EXPLORER`]: the encoder is blaze-explore's.
-#[cfg(not(feature = "explore"))]
+#[cfg(not(feature = "native"))]
 fn ipc(_batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
     Err(ApiError::new(NO_EXPLORER, Some("sql".to_owned())))  // alloc: error path
 }
@@ -973,7 +995,9 @@ mod tests {
     #[test]
     fn a_builds_query_counts_reach_its_query_counts_table() {
         let dir = tempfile::tempdir().unwrap();
-        let history = History::open(dir.path(), history::CAP_BYTES).unwrap();
+        // A ring of the test's own: the process's is a sampler's wherever one runs.
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
         let counts = blaze_query::db::Counts {
             executed: 6384,
             verified: 1,
@@ -981,11 +1005,24 @@ mod tests {
             evicted_asked: 3,
             evicted: 4,
             dropped: 5,
+            reads_recorded: 6,
+            reads_kept: 7,
+            reads_most: 8,
         };
         let row = query_count_row(71, "mir_body_query", counts);
         assert_eq!(
-            [row.executed, row.verified, row.reran, row.evicted_asked, row.evicted, row.dropped],
-            [6384, 1, 2, 3, 4, 5]
+            [
+                row.executed,
+                row.verified,
+                row.reran,
+                row.evicted_asked,
+                row.evicted,
+                row.dropped,
+                row.reads_recorded,
+                row.reads_kept,
+                row.reads_most
+            ],
+            [6384, 1, 2, 3, 4, 5, 6, 7, 8]
         );
         let ended = Ended {
             row: BuildRow {

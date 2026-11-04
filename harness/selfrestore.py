@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "python", "typed-input", "src"))
+sys.path.insert(0, os.path.join(HERE, "..", "tools", "typed-input", "src"))
 from typed_input import fail, parse
 
 SCRIPT = "selfrestore.py"

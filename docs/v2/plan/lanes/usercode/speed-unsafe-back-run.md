@@ -21,7 +21,7 @@ and `crates/blaze-cargo/src/sandbox/`. Nothing here was compiled; the coordinato
 | sandbox `signal.rs` | allowed on its `mod` line | `sigaction` and the handler's `kill` |
 
 The `mod` lines in `sandbox.rs`, and the removal of the blanket allow on `pub mod sandbox` in
-`lib.rs`, are `cargo`'s (`v2/requests/cargo.md`, "speed-unsafe-back-run").
+`lib.rs`, are `cargo`'s (`docs/v2/requests/cargo.md`, "speed-unsafe-back-run").
 
 std has no safe version of what these modules do: it maps no executable memory, stops no
 thread, installs no signal handler, makes no namespace, AppContainer or seatbelt profile, and

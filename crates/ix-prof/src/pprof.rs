@@ -139,13 +139,21 @@ impl View {
         }
         for s in &self.samples {
             let mut body = Vec::new();
-            // A location stands for all its inline levels: list it once, at its innermost.
+            // A location stands for all its inline levels: list it once, at its innermost. A
+            // frame the run of its location already holds is the location again (a span inside
+            // itself, a recursion), listed again: before 2026-11-03 any two equal neighbours
+            // were merged, and a stack [f, f] read back as [f].
             let mut ids: Vec<u64> = Vec::with_capacity(s.stack.len());
+            let mut run: Vec<u32> = Vec::new();
             for frame in &s.stack {
                 let id = location_of_frame[*frame as usize];
-                if ids.last() != Some(&id) {
-                    ids.push(id);
+                if ids.last() == Some(&id) && !run.contains(frame) {
+                    run.push(*frame);
+                    continue;
                 }
+                ids.push(id);
+                run.clear();
+                run.push(*frame);
             }
             packed(&mut body, 1, ids.into_iter());
             packed(&mut body, 2, s.values.iter().map(|it| *it as u64));

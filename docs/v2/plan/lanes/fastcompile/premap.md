@@ -8,7 +8,7 @@ date: 2026-10-30
 Idea 7 of [compile-time.md](../../design/compile-time.md). Everything below the workspace
 members is prelinked once into one image, keyed by the dependency graph and mapped by every
 dev run, so a dev link places only the workspace's own code. Owned here: `crates/blaze-premap/`
-and this file. Hooks in other lanes are requests in `v2/requests/fastcompile.md`
+and this file. Hooks in other lanes are requests in `docs/v2/requests/fastcompile.md`
 (`fastcompile-premap 1` to `6`) and, for the exec-the-file start, in the queue
 (`fastcompile-premap-start 1` to `3`, below).
 
@@ -323,7 +323,7 @@ failed image fails again for its key: no whole link takes its place. Tested:
 
 ## Requests
 
-In `v2/requests/fastcompile.md`:
+In `docs/v2/requests/fastcompile.md`:
 
 1. link: the prelink hook and the workspace link's layout (in: `prelink::Link`);
 2. link: the outside symbol source (in: `impl Outside for View`);
@@ -332,7 +332,7 @@ In `v2/requests/fastcompile.md`:
 5. cargo: the dev-run path (restated as `fastcompile-premap-start 3`);
 6. coordinator: the workspace dependency.
 
-In the queue (`v2/queue/`), for the exec-the-file start:
+In the lanes' queue (tools/v2/queue.py), for the exec-the-file start:
 
 1. `fastcompile-premap-start 1` (link, 01031): the reservation for fixed maps over the image's
    span; the image's thread-local part, init and fini pieces, libraries and unwind tables

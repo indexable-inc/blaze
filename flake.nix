@@ -89,7 +89,7 @@
           UV_PYTHON_DOWNLOADS = "never";
         };
         # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
-        # pinned toolchain, LLVM 23 for `--features llvm`, and the C side the projects' build
+        # pinned toolchain, the LLVM 23 blaze links, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
         # mold and wild are on PATH for the setups that ask for them with `-fuse-ld`. Every
         # library directory here costs every link a `realpath` in Nix's linker wrapper, which
@@ -236,7 +236,7 @@
         '';
 
         # The demo's own source and the crates it links (blaze-live, the run side of blaze-inproc
-        # it takes patches through, and blaze-api, which its editor sends edits to the daemon
+        # it takes patches through, and its runtime's source in library/, and blaze-api, which its editor sends edits to the daemon
         # with), with the root manifest their `workspace = true` fields come from, copied to a
         # writable directory at run time; its crates.io dependencies are vendored from Cargo.lock
         # so that needs no network.
@@ -254,6 +254,8 @@
             ./crates/blaze-ids
             ./crates/blaze-image
             ./crates/blaze-inproc
+            ./crates/blaze-inproc-rt
+            ./library/blaze_inproc_rt
             ./crates/blaze-live
             ./crates/blaze-mem
             ./crates/blaze-phf
@@ -309,7 +311,7 @@
           program = "${duckdb}/bin/duckdb";
         };
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
-        # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is
+        # toolchain with libstdc++.a, so `cargo build -p blaze-engine` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // z3Env // {
           packages = scripts.packages ++ [ pkgs.rustup llvm z3 ];

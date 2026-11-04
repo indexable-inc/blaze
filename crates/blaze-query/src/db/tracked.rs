@@ -161,9 +161,8 @@ pub fn tracked_fields<'s, T: Tracked>(storage: &'s Storage, id: Id, field: u32) 
     let node = row.first + field;
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
-        super::runaway_reads(storage);
-    }
+    let note = local::with(|local| local.read(storage, node, durability, seen as u32));
+    super::noted(storage, note);
     // SAFETY: the reader reached `id` through its creator, current in this view (the module's
     // read-order rule): its run will not rewrite the fields while `'s` lives.
     unsafe { &*row.fields.get() }

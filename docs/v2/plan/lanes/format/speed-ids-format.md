@@ -38,7 +38,7 @@ NEON and SSE4.1, 8 on AVX2, 16 on AVX-512), which is how BLAKE3 hashes chunks an
   checks it and `compress_lanes` against `blake3::Hasher` at every length 0..=1100 in groups
   of 1 to 33, which leaves lanes empty and fills them. A blake3 bump that changes it fails
   there (or fails to compile), never in an ID. Pinning blake3 to
-  `=1.8.7` is asked for in `v2/requests/format.md`.
+  `=1.8.7` is asked for in `docs/v2/requests/format.md`.
 
 ## The interner (`Sharded`)
 

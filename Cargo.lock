@@ -592,8 +592,6 @@ dependencies = [
  "syntax",
  "tar",
  "tempfile",
- "tikv-jemalloc-ctl",
- "tikv-jemalloc-sys",
  "tokio",
  "toml",
  "tracing",
@@ -1089,10 +1087,21 @@ dependencies = [
 name = "blaze-inproc"
 version = "0.0.0"
 dependencies = [
- "blaze-bytes",
  "blaze-core",
  "blaze-ids",
+ "blaze-inproc-rt",
  "blaze-mem",
+ "blaze-spin",
+ "crossbeam-channel",
+ "libc",
+ "parking_lot",
+]
+
+[[package]]
+name = "blaze-inproc-rt"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
  "blaze-radix",
  "blaze-spin",
  "crossbeam-channel",
@@ -1297,6 +1306,7 @@ dependencies = [
  "blaze-check",
  "blaze-ids",
  "blaze-inproc",
+ "blaze-inproc-rt",
  "blaze-sha256",
 ]
 
@@ -2005,9 +2015,6 @@ name = "camino"
 version = "1.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
-dependencies = [
- "serde_core",
-]
 
 [[package]]
 name = "cargo-platform"
@@ -2062,7 +2069,6 @@ name = "cfg"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
- "cfg",
  "expect-test",
  "hegeltest",
  "intern",
@@ -4272,6 +4278,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "blake3",
+ "blaze-inproc-rt",
  "crossbeam-queue",
  "flate2",
  "gimli",
@@ -4874,12 +4881,6 @@ dependencies = [
  "tracing",
  "winnow",
 ]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pathdiff"
@@ -6216,7 +6217,6 @@ dependencies = [
  "blaze-mem",
  "blaze-spin",
  "parking_lot",
- "serde",
  "text-size",
 ]
 
@@ -6283,9 +6283,6 @@ name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "thin-vec"
@@ -6320,27 +6317,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tikv-jemalloc-ctl"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a184c43b8ab2f41df2733b55556e3f5f632f4aeaa205b1bb018f574b7f5f142"
-dependencies = [
- "libc",
- "paste",
- "tikv-jemalloc-sys",
-]
-
-[[package]]
-name = "tikv-jemalloc-sys"
-version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
-dependencies = [
- "cc",
- "libc",
 ]
 
 [[package]]

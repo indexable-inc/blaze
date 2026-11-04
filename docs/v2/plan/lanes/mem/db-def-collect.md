@@ -10,7 +10,7 @@ Paths: `crates/hir-def/src/nameres.rs` and, in `nameres/`, `collector.rs`, `fact
 `demand.rs`, `mod_resolution.rs`, `proc_macro.rs`, `attr_resolution.rs`, `assoc.rs`,
 `diagnostics.rs`, `frozen.rs`, `uses.rs`, plus the new `tests/budget.rs`. Path resolution
 (`path_resolution.rs`, `item_scope.rs`, `resolver.rs` and the rest) is mem-db-def-resolve's.
-Every change is a request: `v2/requests/mem-db-def-collect.md`, which has the exact changes
+Every change is a request: `docs/v2/requests/mem-db-def-collect.md`, which has the exact changes
 (Parts A to H; H is the building def map on mem-db-def-resolve's R10). This note gives the design
 and the reasons.
 

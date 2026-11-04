@@ -264,7 +264,7 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
 /// Released ranges of linear memory, in 64 KiB pages, by address, neighbours merged: linear
 /// memory never shrinks, so [`release`] decommits a range and files it here for the next
 /// [`reserve`]. Without it a seed that makes and drops reservations (link's 7,028 regions of
-/// about 126 MiB each at native blaze's peak, todo/bootstrap/plan.md) would grow its memory by
+/// about 126 MiB each at native blaze's peak, docs/future/bootstrap.md) would grow its memory by
 /// each one until it hit the runner's maximum.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
 mod freed {

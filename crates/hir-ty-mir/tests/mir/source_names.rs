@@ -42,9 +42,9 @@ fn file_follows_the_names_the_build_gives() {
             .map_err(|error| format!("{error:?}"))
     });
     assert!(unnamed.as_ref().is_err_and(|it| it.contains("name_sources")), "{unnamed:?}");
-    name_sources(&mut db, "first", |_, _| Some("src/first.rs".to_owned()));
+    name_sources(&mut db, "first", |_, _, _| Some("src/first.rs".to_owned()));
     assert_eq!(goal(&db), "src/first.rs");
-    name_sources(&mut db, "second", |_, _| Some("src/second.rs".to_owned()));
+    name_sources(&mut db, "second", |_, _, _| Some("src/second.rs".to_owned()));
     assert_eq!(goal(&db), "src/second.rs");
 }
 
@@ -53,9 +53,9 @@ fn the_same_key_is_the_same_naming() {
     let fx = fixture::db(PROGRAM);
     let _ = fx.only_file();
     let mut db = fx.into_db();
-    name_sources(&mut db, "build", |_, _| Some("src/lib.rs".to_owned()));
+    name_sources(&mut db, "build", |_, _, _| Some("src/lib.rs".to_owned()));
     assert_eq!(goal(&db), "src/lib.rs");
-    name_sources(&mut db, "build", |_, _| Some("src/other.rs".to_owned()));
+    name_sources(&mut db, "build", |_, _, _| Some("src/other.rs".to_owned()));
     assert_eq!(goal(&db), "src/lib.rs");
 }
 
@@ -65,6 +65,21 @@ fn each_file_gets_its_own_name() {
     let file = fx.only_file();
     let mut db = fx.into_db();
     let named = file.file_id(&db);
-    name_sources(&mut db, "build", move |_, file| (file == named).then(|| "src/lib.rs".to_owned()));
+    name_sources(&mut db, "build", move |_, _, file| (file == named).then(|| "src/lib.rs".to_owned()));
     assert_eq!(goal(&db), "src/lib.rs");
+}
+
+/// `file!()` is named as the crate of the code it is written in names its file: rustc names a
+/// crate's files from its root as cargo passed it (`r/../library/rt/src/lib.rs`, `..`s kept),
+/// so one file two crates read has each crate's name.
+#[test]
+fn file_is_named_as_the_crate_of_its_code_names_it() {
+    let fx = fixture::db(PROGRAM);
+    let _ = fx.only_file();
+    let mut db = fx.into_db();
+    let ours = fixture::test_crate(&db);
+    name_sources(&mut db, "build", move |_, krate, _| {
+        Some(if krate == ours { "r/../library/rt/src/lib.rs" } else { "another crate's name" }.to_owned())
+    });
+    assert_eq!(goal(&db), "r/../library/rt/src/lib.rs");
 }

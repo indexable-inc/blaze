@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part `lower` of mem-db-infer (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8, which
 program against mem-db's contract in `docs/v2/plan/lanes/mem/db.md`). The exact changes, with
-code, are `v2/requests/mem-db-infer-lower.md`. They are requests, because the files are lane
+code, are `docs/v2/requests/mem-db-infer-lower.md`. They are requests, because the files are lane
 db's.
 
 ## The context carries the frame

@@ -17,6 +17,7 @@
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
 //! | an `impl Trait`'s hidden type | `HiddenTypes(owner)` |
+//! | an impl method's types for the trait method's `impl Trait`s | `RpititTys(impl method)` |
 //! | the target's data layout | `Target(crate)` |
 //! | a dependency's batches, whether one impl specializes another | `Crate(crate)` |
 //!
@@ -99,6 +100,7 @@ const TARGET: &str = "blaze v2 fact target 1";
 const CRATE: &str = "blaze v2 fact crate 1";
 const CONST_TYPE: &str = "blaze v2 fact const value type 1";
 const HIDDEN_TYPES: &str = "blaze v2 fact hidden types 1";
+const RPITIT_TYS: &str = "blaze v2 fact rpitit types 1";
 
 fn domain(fact: &Fact) -> &'static str {
     match fact {
@@ -121,6 +123,7 @@ fn domain(fact: &Fact) -> &'static str {
         Fact::Target(_) => TARGET,
         Fact::Crate(_) => CRATE,
         Fact::HiddenTypes(_) => HIDDEN_TYPES,
+        Fact::RpititTys(_) => RPITIT_TYS,
     }
 }
 
@@ -268,6 +271,18 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             };
             let sub = crate::form::Cx::leak_free(db).hidden_types(owner);
             h.id(&hash::signature_filled(db, domain, &sub, owner)?);
+        }
+        Fact::RpititTys(subject) => {
+            let func = match item(db, subject, fact) {
+                None => return absent(),
+                Some(ItemId::Function(it)) => it,
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no function"),
+            };
+            // The solver asks it inside a body's inference, and inside another impl method's
+            // `impl_rpitit_tys`: refs by signature hash, and the method's own signature holds
+            // none of it (`Fact::RpititTys`), so this never reads back into what asked it.
+            let sub = crate::form::Cx::leak_free(db).rpitit_tys(func);
+            h.id(&hash::signature_filled(db, domain, &sub, ItemId::Function(func))?);
         }
         Fact::Coherence(key) => {
             let Some(imp) = impl_of(db, key, fact) else { return absent() };
@@ -477,6 +492,11 @@ pub fn discriminant(db: &Db, variant: EnumVariantId) -> Fact {
 /// The hidden types of the `impl Trait`s of a function's return type or of a type alias.
 pub fn hidden_types(db: &Db, owner: ItemId) -> Fact {
     Fact::HiddenTypes(key::item_key(db, owner))
+}
+
+/// An impl method's types for the `impl Trait`s of the trait method it implements.
+pub fn rpitit_tys(db: &Db, func: FunctionId) -> Fact {
+    Fact::RpititTys(key::item_key(db, ItemId::Function(func)))
 }
 
 pub fn name(db: &Db, id: ItemId) -> Fact {

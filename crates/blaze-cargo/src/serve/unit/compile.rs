@@ -1251,19 +1251,21 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
 
 /// The text of each file `diags` point into that no mount of the build holds (a build script's
 /// output under `OUT_DIR`, read by an `include!`, a file outside every source root an
-/// `include!` read), as the database has it: the text their spans were made against, which
-/// [`assemble`], with no database, can't read through `mounted`. Held is a mount's file there,
-/// not a path under a mount's directory: `target/` is under the workspace's, and the view has
-/// none of its outputs. A file the database has no text of is left out, and [`assemble`] names
-/// it as unread.
+/// `include!` read), or that is not the file at its path (a crate root with a test harness or
+/// a wasm macro's glue appended, named with its text's identity,
+/// [`blaze_diagnostics::emit::names_text`]), as the database has it: the text their spans were
+/// made against, which [`assemble`], with no database, can't read through `mounted`. Held is a
+/// mount's file there, not a path under a mount's directory: `target/` is under the
+/// workspace's, and the view has none of its outputs. A file the database has no text of is
+/// left out, and [`assemble`] names it as unread.
 fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
     let db = reader.db();
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
         .into_iter()
         // A mount's bytes that fail their check are left to `add_sources`, which adds them unread.
-        .filter(|name| matches!(mounted.read(&mounted.absolute(name)), Ok(None)))
-        .collect(); // alloc: the few names of a unit's diagnostics no mount holds
+        .filter(|name| blaze_diagnostics::emit::names_text(name) || matches!(mounted.read(&mounted.absolute(name)), Ok(None)))
+        .collect(); // alloc: the few names of a unit's diagnostics no mount holds or that are no file of one
     if names.is_empty() {
         return Vec::new(); // alloc: empty, allocates nothing
     }
@@ -1333,7 +1335,8 @@ fn linted(
     let paths = reader.paths();
     // alloc: a file's name, once per file of the crate and per span that leaves its file
     let name_of = |file: base_db::FileId| match paths.get(&file) {
-        Some(path) => Some(blaze_diagnostics::Files::relative(path, root).to_owned()),
+        // As the check names it: a root with an appended module by its path and its text.
+        Some(path) => Some(blaze_diagnostics::Files::of_text(db, file, blaze_diagnostics::Files::relative(path, root).to_owned())),
         // A file `include!` read from outside every source root, by its path there.
         None => db.files().included_source_path(file).map(|path| blaze_diagnostics::Files::relative(path.as_str(), root).to_owned()),
     };

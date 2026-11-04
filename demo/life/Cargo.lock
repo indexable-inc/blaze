@@ -287,12 +287,17 @@ dependencies = [
 name = "blaze-inproc"
 version = "0.0.0"
 dependencies = [
- "blaze-bytes",
+ "blaze-inproc-rt",
  "blaze-mem",
- "blaze-spin",
  "crossbeam-channel",
- "libc",
  "parking_lot",
+]
+
+[[package]]
+name = "blaze-inproc-rt"
+version = "0.0.0"
+dependencies = [
+ "libc",
  "windows-sys 0.61.2",
 ]
 
@@ -301,6 +306,7 @@ name = "blaze-live"
 version = "0.1.0"
 dependencies = [
  "blaze-inproc",
+ "blaze-inproc-rt",
  "blaze-sha256",
 ]
 

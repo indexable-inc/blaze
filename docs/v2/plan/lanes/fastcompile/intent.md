@@ -9,7 +9,7 @@ Ideas 9 and 10 of [compile-time.md](../../design/compile-time.md). An agent says
 by meaning (`Edit`), and what it is about to do (`WillTest`, `WillSave`), so the daemon
 reparses only what changed and builds ahead what the next request needs. The code is in
 `crates/blaze-intent`. The API's half is in `crates/blaze-api` (`intent.rs`,
-`session/intent.rs`). What other crates must do is requested in `v2/requests/fastcompile.md`
+`session/intent.rs`). What other crates must do is requested in `docs/v2/requests/fastcompile.md`
 under `fastcompile-intent <n>`.
 
 ## Edits by meaning

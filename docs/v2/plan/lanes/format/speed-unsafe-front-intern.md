@@ -70,7 +70,7 @@ with its reason.
       The threaded test covers it;
     - `Bump`, which runs under the shard lock and is covered by the arena models;
     - `Live`, which is single-threaded `&mut`.
-- Fuzz: `intern_table`, filed in `v2/requests/safety.md` ("From speed-unsafe-front-intern").
+- Fuzz: `intern_table`, filed in `docs/v2/requests/safety.md` ("From speed-unsafe-front-intern").
   Its hook is `intern::fuzz` (feature `fuzz`), a third unsafe module. `Table::restore` needs
   a `&'static Image`, so the hook frees each input's image after the table drops. The safe
   version leaks every input's image. The hook also checks that a restored table, written again,

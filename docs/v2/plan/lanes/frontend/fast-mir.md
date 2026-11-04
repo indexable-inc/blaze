@@ -15,7 +15,7 @@ What this builds on, not redone here:
   ([../codegen/speed-of-light.md](../codegen/speed-of-light.md), "3. MIR building"):
   the bound of about 30 cycles an expression, and the two gaps it requested of hir-ty (a
   path's value-namespace resolution and adjustments as columns from inference);
-- lane mem's request [v2/requests/mem-codegen-mir.md](../../../../../v2/requests/mem-codegen-mir.md)
+- lane mem's request [docs/v2/requests/mem-codegen-mir.md](../../../requests/mem-codegen-mir.md)
   §5, which moves every builder container into the task's frame and copies the body out once,
   at its exact size. `codegen-mir-store-lower` is applying it to `lower.rs` and `lower/`. With
   it, lowering's own allocations are a constant per body (§10.3's test), so the "per-node `Vec`
@@ -283,7 +283,7 @@ diagnostics that name locals are unaffected. What could differ, and why it doesn
 
 ## 8. `MirBody::unreachable_after_calls` (`lower/uninhabited.rs`)
 
-db-ty-d-mir's fill (`v2/requests/db-ty.md`, "db-ty-d-mir", 1), from rustc's
+db-ty-d-mir's fill (`docs/v2/requests/db-ty.md`, "db-ty-d-mir", 1), from rustc's
 `compiler/rustc_mir_transform/src/lint_and_remove_uninhabited.rs` as read on rust-lang/rust
 master (2026-10-29). rustc builds what follows a call into the call's target block, then the
 pass cuts the edge of every call of an uninhabited type and, for one whose type is not `!` in a

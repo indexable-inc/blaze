@@ -6,7 +6,6 @@
 //! their code (`mir::providers`). An edit of a pass compiles this crate again, not hir-ty. The passes see hir-ty's modules at this crate's root, and its `mir` as their
 //! parent, as when they were in hir-ty.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 #![allow(rustdoc::private_intra_doc_links)]

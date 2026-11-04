@@ -244,6 +244,227 @@ fn type_name_of_an_item_in_a_body_of_a_trait_impl_in_const_underscore() {
     }
 }
 
+/// Each expected name below is what nightly-2026-10-27 (rustc 16d1ffac1) prints for the same
+/// program; see `type_name_case`.
+fn type_name_case(minicore: &str, edition: Option<&str>, items: &str, goal: &str, name: &str) {
+    let header = match edition {
+        Some(edition) => format!("//- minicore: {minicore}\n//- /main.rs edition:{edition}"),
+        None => format!("//- minicore: {minicore}"),
+    };
+    check_str(
+        &format!(
+            "{header}\n#[rustc_intrinsic]\npub fn type_name<T: ?Sized>() -> &'static str;\n\
+             fn name_of<T: ?Sized>(_: &T) -> &'static str {{ type_name::<T>() }}\n{items}\n\
+             const GOAL: &str = {goal};\n"
+        ),
+        name,
+    );
+}
+
+/// A closure is named after the function it is written in with that function's own generic
+/// arguments, then `{{closure}}`: an early bound lifetime (in a bound or a where clause, or
+/// only in the output) is an argument and written `'_`; a late bound one is none.
+#[test]
+fn type_name_of_a_closure_in_a_function_generic_over_lifetimes() {
+    const ITEMS: &str = r#"
+        pub fn early<'a: 'a, T>(_x: &'a T) -> &'static str { name_of(&|| ()) }
+        pub fn late<'a, T>(_x: &'a T) -> &'static str { name_of(&|| ()) }
+        pub fn out<'a>() -> (&'static str, &'a ()) { (name_of(&|| ()), &()) }
+        pub fn unused<'a>() -> &'static str { name_of(&|| ()) }
+        pub fn bounded<'a, 'b: 'a>(_x: &'a u8, _y: &'b u8) -> &'static str { name_of(&|| ()) }
+        pub fn nested<T>(_t: T) -> &'static str { let outer = || name_of(&|| ()); outer() }
+        pub fn mixed<'a, 'b, T, const N: usize>(_x: &'a T, _y: &'b [u8; N]) -> &'static str where 'b: 'b { name_of(&|| ()) }
+        pub struct S<'a, T>(&'a T);
+        impl<'a, T> S<'a, T> { pub fn m(&self) -> &'static str { name_of(&|| ()) } }
+        pub trait Tr<'a, T> { fn get(&self) -> &'static str; }
+        impl<'a> Tr<'a, u8> for S<'a, u8> { fn get(&self) -> &'static str { name_of(&|| ()) } }
+    "#;
+    let cases = [
+        ("early(&0u8)", "ra_test_fixture::early<'_, u8>::{{closure}}"),
+        ("late(&0u8)", "ra_test_fixture::late<u8>::{{closure}}"),
+        ("out().0", "ra_test_fixture::out<'_>::{{closure}}"),
+        ("unused()", "ra_test_fixture::unused::{{closure}}"),
+        ("bounded(&0u8, &0u8)", "ra_test_fixture::bounded<'_, '_>::{{closure}}"),
+        ("nested(1u16)", "ra_test_fixture::nested<u16>::{{closure}}::{{closure}}"),
+        ("mixed(&0u8, &[0u8; 2])", "ra_test_fixture::mixed<'_, u8, 2>::{{closure}}"),
+        ("S(&0u8).m()", "ra_test_fixture::S<'_, u8>::m::{{closure}}"),
+        ("S(&0u8).get()", "<ra_test_fixture::S<'_, u8> as ra_test_fixture::Tr<'_, u8>>::get::{{closure}}"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn", None, ITEMS, goal, name);
+    }
+}
+
+/// A function item is its path with its own generic arguments, early bound lifetimes `'_`;
+/// a tuple struct's or variant's constructor is the type then `{{constructor}}`.
+#[test]
+fn type_name_of_a_function_item() {
+    const ITEMS: &str = r#"
+        pub fn early<'a: 'a, T>(_x: &'a T) {}
+        pub fn late<'a, T>(_x: &'a T) {}
+        pub fn bounded<'a, 'b: 'a>(_x: &'a u8, _y: &'b u8) {}
+        pub struct S<'a, T>(&'a T);
+        impl<'a, T> S<'a, T> { pub fn m(&self) {} }
+    "#;
+    let cases = [
+        ("name_of(&early::<u8>)", "ra_test_fixture::early<'_, u8>"),
+        ("name_of(&late::<u8>)", "ra_test_fixture::late<u8>"),
+        ("name_of(&bounded)", "ra_test_fixture::bounded<'_, '_>"),
+        ("name_of(&S::<u8>::m)", "ra_test_fixture::S<'_, u8>::m"),
+        ("name_of(&Some::<u8>)", "core::option::Option<u8>::Some::{{constructor}}"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn, option", None, ITEMS, goal, name);
+    }
+}
+
+/// A function pointer's bound lifetimes are `'_` with no `for<..>`; its safety, ABI and
+/// variadic part as written.
+#[test]
+fn type_name_of_a_function_pointer() {
+    const ITEMS: &str = "";
+    let cases = [
+        ("type_name::<fn(&u8) -> &u8>()", "fn(&'_ u8) -> &'_ u8"),
+        ("type_name::<unsafe extern \"C\" fn(u8, ...) -> !>()", "unsafe extern \"C\" fn(u8, ...) -> !"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn", None, ITEMS, goal, name);
+    }
+}
+
+/// A trait object: the trait's path and arguments (a lifetime `'_`, a bound one too, with no
+/// `for<..>`), the auto traits after, an `Fn` trait in its sugar; no object lifetime.
+#[test]
+fn type_name_of_a_trait_object() {
+    const ITEMS: &str = r#"
+        pub trait Tr<'a, T> {}
+        pub trait Tr2<T> {}
+    "#;
+    let cases = [
+        ("type_name::<dyn Tr<'static, u8> + Send>()", "dyn ra_test_fixture::Tr<'_, u8> + core::marker::Send"),
+        ("type_name::<dyn for<'a> Tr2<&'a u8>>()", "dyn ra_test_fixture::Tr2<&'_ u8>"),
+        ("type_name::<dyn Fn(&u8) -> u8>()", "dyn core::ops::function::Fn(&'_ u8) -> u8"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn, send", None, ITEMS, goal, name);
+    }
+}
+
+/// References, arrays, slices, tuples and raw pointers as written, a free lifetime erased.
+#[test]
+fn type_name_of_references_arrays_slices_tuples_and_pointers() {
+    const ITEMS: &str = "";
+    let cases = [
+        ("type_name::<(&'static [u8], [u16; 3], *const str, *mut u8, &mut i32, ())>()", "(&[u8], [u16; 3], *const str, *mut u8, &mut i32, ())"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn", None, ITEMS, goal, name);
+    }
+}
+
+/// An ADT's arguments: a lifetime `'_`, a type, a const by its value.
+#[test]
+fn type_name_of_generic_arguments() {
+    const ITEMS: &str = r#"
+        pub struct S<'a, T>(&'a T);
+        pub struct G<const N: usize>;
+    "#;
+    let cases = [
+        ("type_name::<S<'static, (u8,)>>()", "ra_test_fixture::S<'_, (u8,)>"),
+        ("type_name::<G<3>>()", "ra_test_fixture::G<3>"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("fn", None, ITEMS, goal, name);
+    }
+}
+
+/// The future of an `async` closure is named after the closure, then `{{closure}}`; called
+/// by value when it is `Fn` or `FnMut` it is the by-move body, `{{call_once}}` after
+/// (rustc's `print_coroutine_with_kind`). An `async` block is `{{closure}}`.
+#[test]
+fn type_name_of_an_async_closure_future_and_an_async_block() {
+    const ITEMS: &str = r#"
+        fn once<F: AsyncFnOnce() -> u8>(_f: F) -> &'static str { type_name::<F::CallOnceFuture>() }
+        fn by_ref<F: AsyncFn() -> u8>(_f: &F) -> &'static str { type_name::<F::CallRefFuture<'_>>() }
+        pub struct NoCopy;
+        pub fn coro_ref() -> &'static str { let c = async || 1u8; by_ref(&c) }
+        pub fn coro_once() -> &'static str { let c = async || 1u8; once(c) }
+        pub fn coro_once_generic<T>(_t: T) -> &'static str { let c = async || 1u8; once(c) }
+        pub fn coro_move_once() -> &'static str { let s = NoCopy; let c = async move || { let _t = s; 1u8 }; once(c) }
+        pub fn async_block() -> &'static str { name_of(&async {}) }
+    "#;
+    let cases = [
+        ("coro_ref()", "ra_test_fixture::coro_ref::{{closure}}::{{closure}}"),
+        ("coro_once()", "ra_test_fixture::coro_once::{{closure}}::{{closure}}::{{call_once}}"),
+        ("coro_once_generic(1i8)", "ra_test_fixture::coro_once_generic<i8>::{{closure}}::{{closure}}::{{call_once}}"),
+        ("coro_move_once()", "ra_test_fixture::coro_move_once::{{closure}}::{{closure}}"),
+        ("async_block()", "ra_test_fixture::async_block::{{closure}}"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("async_fn", None, ITEMS, goal, name);
+    }
+}
+
+/// rustc's `has_fully_capturing_opaque` in edition 2021: an `async fn`, a trait's or trait
+/// impl's `impl Trait`, and in edition 2024 any `impl Trait` without `use<..>`, capture every
+/// lifetime, so one no input constrains is early bound, an argument, `'_`.
+#[test]
+fn type_name_of_a_function_whose_return_captures_every_lifetime_2021() {
+    const ITEMS: &str = r#"
+        pub async fn afn<'a>() {}
+        pub async fn afn_in<'a>(_x: &'a u8) {}
+        pub fn rpit<'a>() -> impl Sized {}
+        pub fn rpit_in<'a>(_x: &'a u8) -> impl Sized {}
+        pub fn rpit_use<'a>() -> impl Sized + use<> {}
+        pub struct S;
+        pub trait T { fn m<'a>(&self) -> impl Sized; }
+        impl T for S { fn m<'a>(&self) -> impl Sized {} }
+        impl S { pub fn inh<'a>(&self) -> impl Sized {} }
+    "#;
+    let cases = [
+        ("name_of(&afn)", "ra_test_fixture::afn<'_>"),
+        ("name_of(&afn_in)", "ra_test_fixture::afn_in"),
+        ("name_of(&rpit)", "ra_test_fixture::rpit"),
+        ("name_of(&rpit_in)", "ra_test_fixture::rpit_in"),
+        ("name_of(&rpit_use)", "ra_test_fixture::rpit_use"),
+        ("name_of(&<S as T>::m)", "<ra_test_fixture::S as ra_test_fixture::T>::m<'_>"),
+        ("name_of(&S::inh)", "ra_test_fixture::S::inh"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("async_fn", Some("2021"), ITEMS, goal, name);
+    }
+}
+
+/// rustc's `has_fully_capturing_opaque` in edition 2024: an `async fn`, a trait's or trait
+/// impl's `impl Trait`, and in edition 2024 any `impl Trait` without `use<..>`, capture every
+/// lifetime, so one no input constrains is early bound, an argument, `'_`.
+#[test]
+fn type_name_of_a_function_whose_return_captures_every_lifetime_2024() {
+    const ITEMS: &str = r#"
+        pub async fn afn<'a>() {}
+        pub async fn afn_in<'a>(_x: &'a u8) {}
+        pub fn rpit<'a>() -> impl Sized {}
+        pub fn rpit_in<'a>(_x: &'a u8) -> impl Sized {}
+        pub fn rpit_use<'a>() -> impl Sized + use<> {}
+        pub struct S;
+        pub trait T { fn m<'a>(&self) -> impl Sized; }
+        impl T for S { fn m<'a>(&self) -> impl Sized {} }
+        impl S { pub fn inh<'a>(&self) -> impl Sized {} }
+    "#;
+    let cases = [
+        ("name_of(&afn)", "ra_test_fixture::afn<'_>"),
+        ("name_of(&afn_in)", "ra_test_fixture::afn_in"),
+        ("name_of(&rpit)", "ra_test_fixture::rpit<'_>"),
+        ("name_of(&rpit_in)", "ra_test_fixture::rpit_in"),
+        ("name_of(&rpit_use)", "ra_test_fixture::rpit_use"),
+        ("name_of(&<S as T>::m)", "<ra_test_fixture::S as ra_test_fixture::T>::m<'_>"),
+        ("name_of(&S::inh)", "ra_test_fixture::S::inh<'_>"),
+    ];
+    for (goal, name) in cases {
+        type_name_case("async_fn", Some("2024"), ITEMS, goal, name);
+    }
+}
+
 const TYPE_INFO: &str = r#"
     //- minicore: option, send, slice, matches, phantom_data
     #![feature(lang_items)]

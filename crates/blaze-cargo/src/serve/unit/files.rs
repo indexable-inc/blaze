@@ -104,9 +104,16 @@ impl Mounted {
 
     /// Adds to `sources` the files the snippets of `diags` are read from that it lacks, by the
     /// names [`Mounted::name`] gives, each file read once; a file no mount holds, or whose bytes
-    /// fail their check, is added as unread.
+    /// fail their check, is added as unread. A name of a text that is not the file at its path
+    /// ([`blaze_diagnostics::emit::names_text`]: a root with an appended module) is never read
+    /// from a mount, whose file is not the text its spans are of: the caller gives it from the
+    /// database first, and one it did not is added as unread.
     pub(crate) fn add_sources(&self, sources: &mut blaze_diagnostics::emit::Sources, diags: &[blaze_diagnostics::Diag]) {
         for name in sources.unread(diags) {
+            if blaze_diagnostics::emit::names_text(name) {
+                sources.add(name, None);
+                continue;
+            }
             let text = match self.read(&self.absolute(name)) {
                 Ok(Some((_, _, bytes))) => String::from_utf8(bytes.to_vec()).ok(),
                 Ok(None) | Err(_) => None,

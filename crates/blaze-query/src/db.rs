@@ -38,6 +38,9 @@ pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
 pub use counts::{Counts, take as take_counts};
+/// The most reads one query run held and the most pending rows one task held, process-wide:
+/// what the query stack's runaway bounds are set against (the daemon's memory line says them).
+pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
@@ -319,12 +322,12 @@ pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: 
     let fuel = local::with(|local| local.fuel.take());
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut value = String::new(); // alloc: an error's text, once per bound that trips
-        attach(db, || F::write_key(key, &mut value)).map(|()| value)
+        attach(db, || function::write_key_text(&mut value, id, |out| F::write_key(key, out))).then_some(value)
     }));
     local::with(|local| local.fuel = fuel);
     let value = match written {
-        Ok(Ok(value)) => value,
-        Ok(Err(_)) | Err(_) => format!("{id:?} (its key's `Debug` failed)"), // alloc: an error's text, once per bound that trips
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => format!("{id:?} (its key's `Debug` failed)"), // alloc: an error's text, once per bound that trips
     };
     let out = OutOfFuel { steps, query: ingredient::name(index), key: id, value, depth };
     std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
@@ -333,7 +336,8 @@ pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: 
 /// What a [`Runaway`] held past its bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Over {
-    /// One run's reads on its thread's edge stack (`local::RUN_READS`).
+    /// The reads one run recorded: those it holds on its thread's edge stack and the repeats
+    /// dropped from it as it filled (`local::RUN_READS`).
     Reads,
     /// The rows a verify proved on its assumption and holds pending (`local::PENDING_FLOOR`
     /// past the storage's node count).
@@ -449,9 +453,38 @@ fn most_held(storage: &Storage, nodes: impl Iterator<Item = u32>) -> Vec<(u64, u
     most.into_iter().map(|(node, count)| (storage.key_of(node), count)).collect()
 }
 
-/// Fails the run on top of the task's stack, which holds more reads than it may
+/// Does what a read or a replay left its caller ([`local::Note`]), once the caller has let go
+/// of the stack: fails a run past its bound, names a run that set the high-water mark.
+#[inline(always)]
+pub(crate) fn noted(storage: &Storage, note: local::Note) {
+    match note {
+        local::Note::Fine => {}
+        local::Note::Most(held) => name_most_reads(storage, held),
+        local::Note::Runaway => runaway_reads(storage),
+    }
+}
+
+/// Names the run on top of the task's stack, which set the most reads one run held, `held`
+/// (`Local::full` said so), as `` `query` of key `` in the memory report
+/// ([`local::high_water`]). The key is written as [`unwind_runaway`] writes one, under a
+/// barrier, so what its `Debug` reads is recorded into no run; only as a new mark is set.
+#[cold]
+#[inline(never)]
+fn name_most_reads(storage: &Storage, held: u64) {
+    let top = local::with(|local| local.frames.last().map(|it| (it.ingredient, Id::from_u32(it.id))));
+    let Some((ingredient, id)) = top else { return };
+    local::name_most_reads(held, || {
+        let barrier = local::barrier();
+        let value = key_text(storage, ingredient, id);
+        drop(barrier);
+        format!("`{}` of {value}", ingredient::name(ingredient)) // alloc: a name, once a new mark
+    });
+}
+
+/// Fails the run on top of the task's stack, which recorded more reads than it may
 /// (`Local::read`, `Local::replay`, which said so): unwinds with [`Runaway`] naming it and
-/// what it read most.
+/// what it holds most. Its held reads have had their repeats dropped as the stack filled, so
+/// `held` counts those dropped too.
 #[cold]
 #[inline(never)]
 pub(crate) fn runaway_reads(storage: &Storage) -> ! {
@@ -468,7 +501,7 @@ pub(crate) fn runaway_reads(storage: &Storage) -> ! {
             id: Id::from_u32(frame.id),
             depth,
             frames,
-            held: reads.len() as u64,
+            held: reads.len() as u64 + frame.dropped,
             bound: local.bounds.run_reads,
             most: most_held(storage, window.iter().copied()),
         }

@@ -74,7 +74,7 @@ base-db.workspace = true
 blaze-diagnostics.workspace = true
 blaze-lower.workspace = true
 blaze-query.workspace = true
-blaze-units = { workspace = true, features = ["query"] }
+blaze-units.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true
 hir.workspace = true
@@ -91,30 +91,17 @@ blaze-alloc-count.workspace = true
 blaze-codegen-code.workspace = true
 
 [features]
-default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "pprof"]
-# Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
-llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
-# The default build's C, C++ and assembly dependencies, one feature each; the seed profile
-# has none of them (todo/bootstrap/plan.md, "The seed has no C").
-# blaze-stencil's stencils made by the pinned LLVM at build time (llvm-sys).
-llvm-stencils = ["blaze-cargo/llvm-stencils", "hir-ty-codegen/llvm-stencils"]
-# Fetching over HTTPS: rustls on ring, and the global cache's client.
-net = ["blaze-cargo/net", "blaze-registry/net"]
-# `blaze explore` (Flecs, wtransport on ring).
-explore = ["blaze-cargo/explore"]
-# mimalloc as the general allocator; without it, std's.
-mimalloc = ["dep:libmimalloc-sys", "blaze-cargo/mimalloc"]
-# `blaze test`'s live view on a terminal, through crossterm, which has no wasm32.
-tui = ["blaze-cargo/tui"]
-# `blaze serve` and the CLI's client of it; without it (the seed) each command builds in its own
-# process with the same engine, one-shot.
-daemon = ["blaze-cargo/daemon"]
-# `blaze pprof`.
-pprof = ["blaze-cargo/pprof"]
-# The wasm seed: `--no-default-features --features seed`. Each choice is the fastest with no C:
-# blake3's wasm32 SIMD128 code; the committed stencil libraries (blaze-stencil's `prebuilt/`); std's allocator; no
-# network; rsasm as the assembler, which has no LLVM. Native builds keep the defaults above.
-seed = ["blaze-ids/wasm32-simd", "blaze-codegen-code/wasm32-simd", "hir-ty-codegen/rsasm"]
+default = ["native"]
+# Everything the native blaze has and the wasm seed leaves out, as one switch (blaze-cargo's
+# `native`: LLVM and its stencils, HTTPS, `blaze explore`, the terminal view, the daemon,
+# `blaze pprof`) and mimalloc as the general allocator, a heap per blaze-mem tag. LLVM is why
+# every real build has it: std and every opt-level 2/3 unit are compiled by LLVM alone.
+native = ["blaze-cargo/native", "dep:libmimalloc-sys"]
+# The wasm seed: `--no-default-features --features seed`, which has no C (docs/future/bootstrap.md,
+# "The seed has no C"): the committed stencil libraries (blaze-stencil's `prebuilt/`), std's
+# allocator, no network, and rsasm as the assembler, which has no LLVM. blake3 takes its wasm32
+# SIMD128 code on every wasm32 build (the root manifest).
+seed = ["hir-ty-codegen/rsasm"]
 
 # The global allocator's fast paths, in tasks and out (`benches/global_alloc.rs`).
 [[bench]]

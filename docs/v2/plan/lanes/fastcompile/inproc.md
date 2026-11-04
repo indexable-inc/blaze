@@ -11,7 +11,7 @@ path cargo gives it, written once per content key and never again for a patch, a
 it runs is the daemon's code memory, laid over the file's code before `main`. A patch is a
 write into the daemon's view plus one atomic store, as before. Owned here:
 `crates/blaze-inproc/`, this file and [inproc-windows.md](inproc-windows.md). Hooks in other
-lanes are requests in `v2/requests/fastcompile.md` (`fastcompile-inproc-exec 1` and on; the
+lanes are requests in `docs/v2/requests/fastcompile.md` (`fastcompile-inproc-exec 1` and on; the
 earlier `fastcompile-inproc` and `fastcompile-inproc-macos` requests are superseded there).
 
 ## Why the change
@@ -39,7 +39,8 @@ construction. What blaze adds is one swap of mappings whose bytes are equal.
    for `Effect::Spawn`: the program is the file itself, in the run's sandbox, which gains the
    file to read and the host's socket to connect to. `BLAZE_INPROC` names the socket and a
    128-bit random token.
-3. **The start hook.** The program's runtime (`runtime.rs`, linked into the executable) has
+3. **The start hook.** The program's runtime (`runtime.rs`, linked into the executable; see
+   "The runtime" below) has
    `blaze_inproc_start`, and the link puts a pointer to it first among the executable's
    initializers: ELF `.preinit_array`, Mach-O `__mod_init_func`, a PE TLS callback in
    `.CRT$XLAB`. Only the dynamic linker's own work runs before it (mapping, relocating, the
@@ -347,7 +348,49 @@ What still differs, stated here rather than hidden:
   `MEM_PRIVATE` where the image was `MEM_IMAGE`. Module lists, unwinding and symbolization don't
   read these.
 
-## Wiring (requests in `v2/requests/fastcompile.md`)
+## The runtime
+
+The run process's side (the start hook, the handshake and its checks, the image's headers, the
+fence's words, the asks, the channel's frames, the platform) is one crate,
+`library/blaze_inproc_rt`, that depends only on std and libc. It is built twice from one source:
+
+- **As a crate of the standard library.** `library/Cargo.toml` lists it as a member, and the load
+  asks the library for it (`blaze_units::stdlib::DEV_RUNTIME`). It does this when a build of this
+  machine's own target, on Linux (x86_64, AArch64) or macOS (AArch64), under a profile that
+  allows a live process (`blaze_lazy::allow`: not `release` or `bench`, opt-level 0 or 1), has a
+  binary or a test. Each such program (a test, a binary or example program, never a build
+  script) gets it the way it gets std: a `noprelude` dependency. Being a crate of the standard
+  library, it is linked whether or not the code names it (hir-def `named_dependencies`); a
+  `#![no_std]` crate links it only by naming it, as it does std. So every dev binary and test
+  has `blaze_inproc_start`, whatever it depends on.
+- **As a package of blaze's workspace.** `crates/blaze-inproc-rt` builds the same files.
+  `blaze-inproc` (the daemon's side) is built on it, and `blaze-live` depends on it. A program whose dependencies already link that package gets no second
+  runtime from the library: two would mean two start hooks, and the program would ask a
+  runtime that its hook never attached.
+
+The runtime also carries what every program linked live calls by name, whatever it depends on
+(`blaze_inproc_rt::live`): the descriptor (`__blaze_live`) and the jump table's header as the
+linker writes them, the execution log's exports `__blaze_exec_slots` and `__blaze_exec_arm`
+(which a test binary's recording fork server imports whenever the binary has jump-table slots,
+so every dev test binary), lazy compilation's `publish`, and the tier counters
+(`blaze_live_counters`). They were `blaze-live`'s until starthook2, so a dev test binary that
+did not depend on `blaze-live` failed to link, naming `__blaze_exec_arm`. `blaze-live` now
+re-exports them and builds only the switch, which takes patches, on them, so `blaze-live`
+depends on `blaze-inproc-rt` directly.
+
+blaze-cargo's `inproc::not_in_process` admits a dev executable whose dependencies link either
+one and not `blaze-inproc`'s `host` side. Windows has the run side only in blaze's workspace,
+because the library's windows-sys is a stub; a dev program there has no runtime and is refused,
+naming that. The runtime's own library tests (`blaze-inproc-rt`'s, `blaze-inproc`'s) are refused
+until they are checked to hold when attached (inprocrun's F4).
+
+`blaze test` without `--reached` runs each test executable as a child of the CLI. The daemon's
+launch waits for one known process, and a child's process ID is not known until it is spawned.
+So on Unix the child is the CLI itself (`blaze __launch PROGRAM ARGS...`, blaze-cargo's
+`cli::run::TRAMPOLINE`): it asks the daemon to launch the program as itself, then execs the
+program, as `blaze run` does. A dev test binary never starts from its file.
+
+## Wiring (requests in `docs/v2/requests/fastcompile.md`)
 
 - link: the start hook's pointer first among the initializers; code segments on their own
   pages (PE: 64 KiB granules), never writable; reservations for the arena, cells and fixed

@@ -88,7 +88,7 @@ a view's id is `view::ptr(node)`.
 ## How the edits are handed over
 
 The diagnostics owner granted direct edits (`## frontend-tree-move-diag-lower: grant` in
-`v2/requests/diagnostics.md`): one function at a time, re-read before each edit, the hot-lint
+`docs/v2/requests/diagnostics.md`): one function at a time, re-read before each edit, the hot-lint
 `// alloc:`/`// clone:`/`// dyn:` lines kept where their line still allocates or clones, the
 file's agent told by tmux. `lower/missing_match_arms.rs` and `lower/non_exhaustive_let.rs` go as
 requests to `diagnostics-lints-mir-speed`. Requests (1) to (4) were staged whole first, at

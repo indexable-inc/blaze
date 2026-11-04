@@ -12,7 +12,7 @@ fn main() {
 }
 
 /// The `seed` feature is the seed profile, `--no-default-features --features seed`
-/// (todo/bootstrap/plan.md): no C, C++ or LLVM. With a feature that brings them back (`default`
+/// (docs/future/bootstrap.md): no C, C++ or LLVM. With a feature that brings them back (`default`
 /// among them, which is on unless `--no-default-features` is given) it is refused, naming both,
 /// never built as a seed that isn't one.
 fn seed() {
@@ -23,8 +23,7 @@ fn seed() {
     if !on("seed") {
         return;
     }
-    // `tui` too: crossterm has no wasm32 (Cargo.toml).
-    let not_in_seed = ["default", "llvm-stencils", "net", "explore", "mimalloc", "llvm", "tui"];
+    let not_in_seed = ["default", "native"];
     let also: Vec<&str> = not_in_seed.into_iter().filter(|it| on(it)).collect();
     if !also.is_empty() {
         panic!(

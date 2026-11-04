@@ -191,6 +191,45 @@ pub fn test_crate(db: &Db) -> Crate {
         .expect("the fixture has a crate that is neither a language crate nor a dependency")
 }
 
+/// `out` with each raw interned id renumbered, per id type, in the order `out` first names it:
+/// `Crate(Id(10240))` is `Crate(Id(#0))`, `FunctionId(8c03)` is `FunctionId(#0)`. A raw id is
+/// its place in interning order (its ingredient's page, made when the ingredient first
+/// interns), which anything interned first moves; which lines name the same id is what an
+/// expectation holds. For every test whose expectation prints ids.
+pub fn stable_ids(out: &str) -> String {
+    use std::fmt::Write as _;
+    let mut labels = blaze_hash::HashMap::<(&str, &str), usize, Global>::default();
+    let mut counts = blaze_hash::HashMap::<&str, usize, Global>::default();
+    // alloc: a test's expectation text, once
+    let mut result = String::with_capacity(out.len());
+    let (mut at, mut copied) = (0, 0);
+    while let Some(found) = out[at..].find("Id(") {
+        let open = at + found + 2;
+        let name_start = out[..open]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |it| it + 1);
+        let name = &out[name_start..open];
+        let end = out[open + 1..].find(|c: char| !c.is_ascii_hexdigit()).map(|it| open + 1 + it);
+        match end {
+            Some(end) if end > open + 1 && out[end..].starts_with(')') => {
+                let raw = &out[open + 1..end];
+                let label = *labels.entry((name, raw)).or_insert_with(|| {
+                    let count = counts.entry(name).or_default();
+                    *count += 1;
+                    *count - 1
+                });
+                result.push_str(&out[copied..=open]);
+                write!(result, "#{label}").unwrap();
+                copied = end;
+                at = end;
+            }
+            _ => at = open + 1,
+        }
+    }
+    result.push_str(&out[copied..]);
+    result
+}
+
 impl Fixture {
     pub fn db(&self) -> &Db {
         &self.db

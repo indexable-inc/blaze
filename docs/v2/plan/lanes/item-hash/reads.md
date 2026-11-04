@@ -71,6 +71,7 @@ walks every module's inherent impls inline in inference). It is refused.
 | `TraitSignature::kept`, `supertraits_info`, `dyn_compatibility_of_trait_query` | I | `Signature(trait)` | the trait's header, supertraits and items' signatures are its interface |
 | `FunctionSignature::kept`, `fn_sig_for_fn` | I M B | `Signature(fn)` | the signature is its interface |
 | `rpit_hidden_types`, `tait_hidden_types` | I M B | `HiddenTypes(fn or alias)` (lane items' `fact_of_read`) | a hidden type, which the signature hash marks (section 4) |
+| `impl_rpitit_tys` | I M B | `RpititTys(impl fn)` (lane items' `fact_of_read`) | an impl method's types for the trait method's `impl Trait`s, kept out of its signature: finding them reads the bounds of its own `impl Trait`s, its `Signature` |
 | `const_eval_static_query`, `const_eval_discriminant_variant` | I M | `ConstValue` of the static or the variant | a value, which the signature hash marks (section 4) |
 | `fact_value` (lane items) | I M B | the fact its key names | the value of that fact |
 | `generic_predicates_of`, `variances_of_query`, `const_conditions_query` | I B | `Signature(generic def)` | predicates by interface: a supertrait's change is the trait's interface's |

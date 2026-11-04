@@ -260,7 +260,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             MirSpan::from(clause),
         )
         .and_then(|(file, line, column)| {
-            Some(format!(" ({}:{line}:{column})", location::source_path(self.db, file)?))
+            let krate = hir_def::HasModule::krate(&func, self.db);
+            Some(format!(" ({}:{line}:{column})", location::source_path(self.db, krate, file)?))
         })
         .unwrap_or_default();
         match kind {

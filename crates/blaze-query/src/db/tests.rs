@@ -628,12 +628,14 @@ fn runaway_of(f: impl FnOnce()) -> super::Runaway {
     }
 }
 
-/// A run that keeps reading (rule 15) fails once it holds more reads than a run may, with a
+/// A run that keeps reading (rule 15) fails once it recorded more reads than a run may, with a
 /// [`super::Runaway`] naming the query, its key, where it is on its task's stack and what it
-/// read most; the stack is left empty, the database answers the next ask, the same ask fails
-/// the same way again (its row was emptied, not poisoned), and with room it ends. Without the
-/// bound its stack grows a `u32` per read until the run ends: in run m2 of lane checkheap such a
-/// stack doubled to 97 GiB and the daemon was killed at 229 GiB, naming nothing.
+/// holds; the stack is left empty, the database answers the next ask, the same ask fails the
+/// same way again (its row was emptied, not poisoned), and with room it ends. Its stack holds
+/// each of its two reads once (repeats are dropped as the stack fills), so the bound counts the
+/// reads recorded, not held: without it the loop would spin on a small stack until it ended,
+/// and before repeats were dropped such a stack grew a `u32` per read (in run m2 of lane
+/// checkheap it doubled to 97 GiB and the daemon was killed at 229 GiB, naming nothing).
 #[test]
 fn a_run_that_keeps_reading_fails_naming_itself_and_what_it_reads_and_the_next_ask_is_served() {
     let mut db = TestDb::new();
@@ -649,7 +651,7 @@ fn a_run_that_keeps_reading_fails_naming_itself_and_what_it_reads_and_the_next_a
     names.sort_unstable();
     let (a, b) = (format!("`Cell.a`({:?})", looping.0), format!("`Cell.b`({:?})", looping.0));
     assert_eq!(names, [a.as_str(), b.as_str()], "the loop's body, its two reads: {out}");
-    assert!(out.most.iter().all(|it| it.1 >= bound / 4), "each read about half the time: {out}");
+    assert!(out.most.iter().all(|it| it.1 == 1), "each read held once, its repeats dropped: {out}");
     let text = out.to_string();
     let parts = ["`Endless` of", "query 2 of the 2", a.as_str(), b.as_str()];
     assert!(parts.iter().all(|it| text.contains(it)), "{text}");
@@ -663,6 +665,74 @@ fn a_run_that_keeps_reading_fails_naming_itself_and_what_it_reads_and_the_next_a
     assert_eq!(*get::<EndlessReader>(&db, looping), ENDLESS * 3 + 1, "with room the run ends");
     other.set_a(&mut db, 4);
     assert_eq!(*get::<Double>(&db, other), 8, "and the next view is served");
+}
+
+/// Rows [`Rereader`] reads, each [`PASSES`] times: more than any other test's run holds, so
+/// the high-water mark is its.
+const WIDE: usize = 1 << 17;
+const PASSES: u64 = 8;
+
+query!(Rereader, u64, |db, _key| {
+    let cells = db.cells.lock().clone();
+    for _ in 0..PASSES {
+        for cell in &cells {
+            let _ = Cell(*cell).a(db);
+        }
+    }
+    // What the run holds on its thread's edge stack as it ends.
+    super::local::with(|local| {
+        let frame = local.frames.last().expect("its run");
+        (local.edges.len() - frame.edges_start as usize) as u64
+    })
+});
+
+/// How many times [`FewRows`] reads its key's two fields.
+const FEW_PASSES: u64 = 1 << 16;
+
+query!(FewRows, u64, |db, key| {
+    let mut sum = 0;
+    for _ in 0..FEW_PASSES {
+        sum += key.a(db) + key.b(db);
+    }
+    sum
+});
+
+/// A run that reads the same rows again and again holds each about once on its thread's edge
+/// stack (its repeats are dropped as its own count doubles), not once a read, on a cold thread
+/// and on a warm one whose stack an earlier run grew: one run of coord-120's check held 2^27
+/// reads, 512 MiB of stack. Its query's counts say what it recorded, what its
+/// row kept and the most one run held, so the profile names a query that re-reads; and the
+/// memory report names the run that held the most.
+#[test]
+fn a_run_re_reading_its_rows_holds_each_about_once_and_its_counts_and_the_high_water_name_it() {
+    let db = TestDb::new();
+    let cells: Vec<Cell> = (0..WIDE as u64).map(|at| Cell::new(&db, at, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let wide = WIDE as u64;
+    counts_of("Rereader");
+    counts_of("FewRows");
+    let held = *get::<Rereader>(&db, cells[0]);
+    assert!(held <= 2 * wide, "{wide} rows read {PASSES} times held as {held} reads, not about {wide}");
+    let counts = counts_of("Rereader");
+    assert_eq!(counts.executed, 1, "{counts:?}");
+    assert_eq!((counts.reads_recorded, counts.reads_kept), (PASSES * wide, wide), "{counts:?}");
+    assert_eq!(counts.reads_most, 2 * wide, "at most twice its distinct reads at once, and it gets there: {counts:?}");
+    let most = super::stack_high_water();
+    assert!(most.run_reads >= wide, "{most:?}");
+    let named = format!("`Rereader` of {:?}", cells[0]);
+    assert!(most.run.starts_with("`Rereader` of"), "the high-water mark names its run, {named}: {most:?}");
+
+    // Two rows read 2^16 times each, on this thread whose stack `Rereader` grew past all
+    // 2^17 of those reads: recorded far past kept, and still held on a small stack. A dedup
+    // fired by the stack's capacity never runs here (batch23-1 held all 131072).
+    let warm = super::local::with(|local| local.edges.capacity()) as u64;
+    assert!(warm >= 2 * FEW_PASSES, "the thread's stack is warm, {warm} entries");
+    assert_eq!(*get::<FewRows>(&db, cells[1]), FEW_PASSES, "cell 1 is (1, 0)");
+    let few = counts_of("FewRows");
+    assert_eq!((few.executed, few.reads_recorded, few.reads_kept), (1, 2 * FEW_PASSES, 2), "{few:?}");
+    // A run holds at most `max(4096, 2 x kept)` at once (`local::next_dedup`): 4096 here, and
+    // it does reach it.
+    assert_eq!(few.reads_most, 1 << 12, "two rows held at most 4096 at once on a warm thread: {few:?}");
 }
 
 /// Rows of [`Nest`] past its two heads and `y`: the chain `x`.
@@ -1566,20 +1636,36 @@ query!(
     const EVICT: bool = true;
 );
 
-/// What the three counted queries did since the last take; other tests count other queries,
-/// and only this one takes.
-fn counted() -> [Counts; 3] {
-    let mut found = [Counts::default(); 3];
-    crate::db::take_counts(|name, counts| {
-        let at = match name {
-            "CountedTens" => 0,
-            "CountedReader" => 1,
-            "CountedCapped" => 2,
-            _ => return,
-        };
-        found[at] = counts;
+/// Every query's counts taken since a test last asked for its own ([`counts_of`]): a take is
+/// process-wide, so tests that read counts take into here, and each reads only its queries'.
+static TAKEN: Mutex<Vec<(&'static str, Counts)>> = Mutex::new(Vec::new());
+
+/// What query `query` did since the last time a test asked for it: counts added, marks the
+/// most.
+fn counts_of(query: &str) -> Counts {
+    let mut taken = TAKEN.lock();
+    crate::db::take_counts(|name, counts| match taken.iter_mut().find(|it| it.0 == name) {
+        Some((_, was)) => {
+            *was = Counts {
+                executed: was.executed + counts.executed,
+                verified: was.verified + counts.verified,
+                reran: was.reran + counts.reran,
+                evicted_asked: was.evicted_asked + counts.evicted_asked,
+                evicted: was.evicted + counts.evicted,
+                dropped: was.dropped + counts.dropped,
+                reads_recorded: was.reads_recorded + counts.reads_recorded,
+                reads_kept: was.reads_kept + counts.reads_kept,
+                reads_most: was.reads_most.max(counts.reads_most),
+            };
+        }
+        None => taken.push((name, counts)),
     });
-    found
+    taken.iter().position(|it| it.0 == query).map_or_else(Counts::default, |at| taken.swap_remove(at).1)
+}
+
+/// What the three counted queries did since the last take.
+fn counted() -> [Counts; 3] {
+    ["CountedTens", "CountedReader", "CountedCapped"].map(counts_of)
 }
 
 /// `(executed, verified, reran, evicted_asked)` of `counts`.

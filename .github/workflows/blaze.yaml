@@ -19,7 +19,7 @@
 # the vendored crates, astlog (tools/astlog), the workspace's manifest, lock file, cargo
 # config, .rustfmt.toml and .clippy.toml, the pinned nightly (harness/toolchain),
 # harness/unittests.py, the flake, the release of blaze that builds blaze
-# (.github/blaze-version, install.sh), and these workflows and the actions they use; on a push
+# (.github/blaze-version, site/install.sh), and these workflows and the actions they use; on a push
 # to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
 # .github/scripts/gate_changes.py has the list and why each path is on it. It names what is
 # code, so a new directory is not: any other change (documentation, the site, benches, the
@@ -91,7 +91,7 @@ jobs:
       - run: uv run --frozen ruff check
       - run: uv run --frozen pyright
       # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
-      # the workspace's Python, which has its helpers (python/*) for the scripts that use them.
+      # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
       - run: uv run --frozen python harness/imports.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
@@ -172,7 +172,7 @@ jobs:
       # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
       - run: blaze build -p astlog
       - run: >-
-          PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py
+          PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py
           '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 
   # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
@@ -200,7 +200,7 @@ jobs:
         with:
           job: build
           llvm: true
-      - name: blaze build --release --features blaze-engine/llvm (the build job's)
+      - name: blaze build --release (the build job's)
         run: python3 harness/unittests.py '{"build": true}'
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
       - run: blaze stop

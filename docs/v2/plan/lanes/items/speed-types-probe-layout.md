@@ -66,7 +66,7 @@ For each call of `layout_of_adt`:
   `IndexVec` per variant, so that is the one allocation left per variant (exact-sized, and none
   for a variant without fields).
 - The struct-tail `Sized` check is now the tracked query `struct_tail_may_be_unsized(StructId,
-  Crate)`, kind `0x2457` (requested in `v2/requests/db-ty.md`). It runs once per struct and
+  Crate)`, kind `0x2457` (requested in `docs/v2/requests/db-ty.md`). It runs once per struct and
   crate rather than once per instantiation. It also takes `trait_environment` and the last
   field's type out of `layout_of_adt`'s dependencies.
 - `target.rs`: `target_data_layout` is one tracked query per crate. It is parsed once and

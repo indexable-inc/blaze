@@ -1,5 +1,5 @@
 // Update: build scripts' downloads pinned by sha256 (`blaze lock --fetches`, #637), on stable since v0.20261027.0
-// (CHANGELOG.md). Extends lesson 4: a sealed build script has no network, so what it would download is handed in.
+// (docs/CHANGELOG.md). Extends lesson 4: a sealed build script has no network, so what it would download is handed in.
 site {
   updates {
     "pinned-downloads" : Page {

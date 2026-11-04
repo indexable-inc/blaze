@@ -33,7 +33,7 @@ allocator from empty: tens of allocations per function before any IR is written.
 them empty). `build`, `compile_as` and `built_in_body` take from it and give back; the function
 itself moves out (`mem::replace` with an empty `ir::Function`) so the context can be kept while
 the IR goes on to v2. `with_context(func, |context| ..)` is the same for v2's compile, which
-`v2/backend.rs::compiled` moves to (request in `v2/requests/codegen-adapter.md`). It is a stack
+`v2/backend.rs::compiled` moves to (request in `docs/v2/requests/codegen-adapter.md`). It is a stack
 and not one slot because builds nest: a callee built in is built while its caller is. A
 context whose function had more than `SINGLE_PASS` instructions is let go, so one huge function
 doesn't pin its capacity on the thread for good. Steady state: no allocation for a context of a

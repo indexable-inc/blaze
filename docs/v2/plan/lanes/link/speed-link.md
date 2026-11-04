@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of [link](../link.md). The core of `blaze-link` (model, placement, relocation, commit) is
 lead `link`'s and not covered here; what the formats still need from it is in
-`v2/requests/link.md` items 5 to 11.
+`docs/v2/requests/link.md` items 5 to 11.
 
 | part | code | notes |
 |---|---|---|
@@ -23,7 +23,7 @@ lead `link`'s and not covered here; what the formats still need from it is in
 - **Parse**: inputs are read in place at any alignment (`object`'s `unaligned` feature). Mach-O
   atoms are `Data::Input` ranges with names in one arena per object, sized once. `.tbd` files go
   through a byte lexer onto a flat tape, the way simdjson does. The ELF readers still copy section
-  bytes and names until the model's zero-copy types reach ELF (`v2/requests/link.md` item 5).
+  bytes and names until the model's zero-copy types reach ELF (`docs/v2/requests/link.md` item 5).
 - **Resolve** (what the readers feed): archive members are found by binary search over their
   offsets, and ELF members without an index are read in parallel. A name index on `Shared`
   (item 7) would make the work proportional to imports rather than exports. It is open.
@@ -38,5 +38,5 @@ lead `link`'s and not covered here; what the formats still need from it is in
   patch is one `mprotect` pair per run of pages, or none for code dual-mapped on Linux.
 
 What still falls short of the benchmarks, and why, is in each part's notes under "Not done"
-or "What would beat it". Chained fixups (`v2/requests/link.md` item 6) and incremental ELF
+or "What would beat it". Chained fixups (`docs/v2/requests/link.md` item 6) and incremental ELF
 synthesis are the biggest of those.

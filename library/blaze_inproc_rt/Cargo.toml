@@ -1,0 +1,26 @@
+[package]
+name = "blaze_inproc_rt"
+version = "0.0.0"
+license = "MIT OR Apache-2.0"
+description = "blaze's dev runtime: the run process's side of a dev run on the daemon's code memory, linked into every dev executable (docs/v2/plan/lanes/fastcompile/inproc.md, \"The runtime\")"
+edition = "2024"
+
+# One source, two builds: this manifest is the standard library's (blaze attaches the crate as
+# one of std's roots, `blaze_units::stdlib::DEV_RUNTIME`); crates/blaze-inproc-rt builds the same
+# files in blaze's workspace, for the daemon's side and the tests. Only std and libc here, and
+# no Windows (the library's windows-sys is a stub): blaze attaches it on Linux and macOS.
+
+[lib]
+test = false
+bench = false
+doc = false
+
+[features]
+# The image tests' helpers, for blaze-inproc's tests: built only by crates/blaze-inproc-rt.
+testing = []
+
+[dependencies]
+std = { path = "../std" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.191", default-features = false, features = ['rustc-dep-of-std'] }

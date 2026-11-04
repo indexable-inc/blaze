@@ -84,7 +84,7 @@ pub struct Described<I, S> {
     /// its crate and none of its type arguments names a workspace crate's type, closure or
     /// item; [`Owner::Workspace`] otherwise. An `asm!` function is its asker's.
     pub owner: Owner,
-    /// What it is across versions, before its settings ([`crate::exec::fn_id`]): its item's
+    /// What it is across versions, before whose code it is ([`crate::driver::subject`]): its item's
     /// key, which instance of the item it is (a closure by its place in its owner's body, a
     /// shim by its kind) and its type arguments. An edit of its body keeps it.
     pub identity: ContentId,

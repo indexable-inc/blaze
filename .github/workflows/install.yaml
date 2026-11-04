@@ -1,6 +1,6 @@
 name: install
 
-# install.sh, run as a user runs it, on each platform it installs on: from the newest release
+# site/install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
 # `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
 # `--version stable|canary|V`) against the release GitHub says it is. And this commit's build, installed in a Debian
@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml"]
   pull_request:
-    paths: ["install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml"]
   release:
     types: [published]
   schedule:
@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck -s sh install.sh
+      - run: shellcheck -s sh site/install.sh
 
   install:
     name: ${{ matrix.os }}
@@ -60,7 +60,7 @@ jobs:
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
       # Piped, as the README has it: no terminal, nothing asked. dash is Ubuntu's /bin/sh.
       - name: install
-        run: sh < install.sh
+        run: sh < site/install.sh
       - name: what it installed runs
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
@@ -71,7 +71,7 @@ jobs:
           blaze --help | head -n 3
           blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $(cat harness/toolchain))"
       - name: again, which upgrades in place
-        run: sh install.sh --verbose
+        run: sh site/install.sh --verbose
       - name: blaze in a new project
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
@@ -83,7 +83,7 @@ jobs:
           blaze stop
       - name: a release that is not there says so
         run: |
-          if sh install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
+          if sh site/install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
           cat out.txt
           grep -F "there is no blaze release 0.0.0-none" out.txt
       # The channels (docs/release.md), each against the release GitHub's API says it is:
@@ -106,15 +106,15 @@ jobs:
             grep -Fx "$said is installed." out.txt
             blaze --version | tee /dev/stderr | grep -F "blaze $version " > /dev/null
           }
-          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain
-          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --channel stable
-          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --version stable
-          installs "$canary" "blaze $canary (canary)" sh install.sh --no-toolchain --channel canary
-          installs "$canary" "blaze $canary (canary)" env BLAZE_CHANNEL=canary sh install.sh --no-toolchain
-          installs "$canary" "blaze $canary (canary)" sh install.sh --no-toolchain --version canary
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel stable
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --version stable
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --channel canary
+          installs "$canary" "blaze $canary (canary)" env BLAZE_CHANNEL=canary sh site/install.sh --no-toolchain
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --version canary
           # A version is that release, whatever the channel.
-          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --channel canary --version "$stable"
-          if sh install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel canary --version "$stable"
+          if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
           grep -F "blaze has no channel nightly." out.txt
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
@@ -185,7 +185,7 @@ jobs:
         run: |
           set -eu
           began=$(date +%s.%N)
-          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < install.sh
+          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < site/install.sh
           export PATH="$HOME/.cargo/bin:$PATH"
           mkdir -p "$RUNNER_TEMP/hello/src"
           cd "$RUNNER_TEMP/hello"

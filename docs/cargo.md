@@ -18,7 +18,7 @@ where v1 had a setting or command v2 lacks, the section says so. v2's design is
 
 ## Install
 
-`blaze` is one program, also installed as `blaze-engine`. The [installer](../install.sh) and
+`blaze` is one program, also installed as `blaze-engine`. The [installer](../site/install.sh) and
 `cargo install` both install it:
 
     curl -fsSL https://ix.dev/blaze | sh
@@ -34,9 +34,8 @@ profile and fails with it. From a checkout, the release's own recipe builds all 
 
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do: the script fetches the LLVM 23 blaze pins and links it in statically
-([which LLVM](contributing.md#llvm-for---features-llvm)). `cargo install` from crates.io has
-the Cranelift backend only; `--features llvm` there needs `LLVM_SYS_231_PREFIX` set to that
-same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harnesses and CI use while
+([which LLVM](contributing.md#llvm)). `cargo install` from crates.io builds the same: it
+needs `LLVM_SYS_231_PREFIX` set to that same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harnesses and CI use while
 working on blaze; it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in
@@ -978,7 +977,7 @@ is the one place Cranelift's code generator runs. `codegen-backend = "cranelift"
 asks for the fast unoptimized code stencils are, and is taken; at 2 and up it is an error.
 `codegen-backend = "stencil"` compiles every function of the build as stencils whatever its
 level, the standard library's and what build scripts and proc macros run included. It is the
-seed's setting (todo/bootstrap/plan.md, "std and assembly in the seed"), works with or without
+seed's setting (docs/future/bootstrap.md, "std and assembly in the seed"), works with or without
 LLVM, and is taken for a whole build from the profile, never per package. Otherwise the
 standard library's own functions are compiled as rustc's shipped std is, at `-O3`, and a blaze
 built without LLVM refuses a profile that asks for LLVM, saying so and naming

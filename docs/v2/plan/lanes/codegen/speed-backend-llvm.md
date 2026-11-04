@@ -105,20 +105,20 @@ benchmark is rustc's release output, which the post-link pipelines follow.
   module, and in a function-per-module design that is once per importer. Beating it means
   keeping parsed modules in the thread's context and cloning from them (`CloneModule` is
   cheaper than a bitcode parse). That needs `emit` to run on the thread that ran
-  `summarize`, which is `v2/requests/codegen-release.md` 3 (the driver's).
+  `summarize`, which is `docs/v2/requests/codegen-release.md` 3 (the driver's).
 - v1's tiering and release (`llvm.rs` `compiled`, `imports.rs`, `tier.rs`) get the kept
   passes too, since they go through the same `Machine`. Nothing else in them was changed.
 
 ## Sanitizers (`llvm/sanitize.rs`; speed-backend-sanitize, 2026-10-29)
 
-S2 of `v2/requests/codegen.md` and F2 of `v2/requests/safety.md`: rustc's `-Zsanitizer=address,
+S2 of `docs/v2/requests/codegen.md` and F2 of `docs/v2/requests/safety.md`: rustc's `-Zsanitizer=address,
 thread,memory` (with `-Zsanitizer-recover` and `-Zsanitizer-memory-track-origins`) and
 SanitizerCoverage on the release path. The set is data, `Spec::sanitize`
 (`blaze_codegen::settings::Sanitize`), the same for every function and hashed into the
 settings, so the unit and template keys follow it (requested of the lead, codegen.md Z1).
 rustc has no SanitizerCoverage flag of its own: it gets it from `-Cpasses=sancov-module` with
 `-Cllvm-args=-sanitizer-coverage-*`, which is what cargo-fuzz passes, and cargo reads those
-into `Sanitize::coverage` (`v2/requests/cargo.md`, same date).
+into `Sanitize::coverage` (`docs/v2/requests/cargo.md`, same date).
 
 - **Attributes.** `prelink` gives the function `sanitize_address`, `sanitize_memory`,
   `sanitize_thread`, in rustc's order (`sanitize_attrs`), for each sanitizer on that its
@@ -127,7 +127,7 @@ into `Sanitize::coverage` (`v2/requests/cargo.md`, same date).
   builds in only what has the same ones. A function named `__sanitizer_*`, which
   SanitizerCoverage skips by name in rustc's build, gets `nosanitize_coverage`, because here every
   function is named `blaze.own`. The set comes from the front end through the adapter
-  (`Function::unsanitized`, codegen.md Z3; the query is in `v2/requests/db.md`).
+  (`Function::unsanitized`, codegen.md Z3; the query is in `docs/v2/requests/db.md`).
 - **Passes.** `compile` instruments the module after the post-link pipeline, `rebase` and
   `elim-avail-extern`, through `LLVMBlazeRunSanitizers` (`vendor/llvm-sys/wrappers/passes.cpp`)
   on the kept analysis managers. The order is clang's (`addSanitizers`): SanitizerCoverage,
@@ -151,7 +151,7 @@ into `Sanitize::coverage` (`v2/requests/cargo.md`, same date).
   offsets in the function, with the flags as LLVM wrote them (the entry block 1). Then
   `v2/release.rs` sets `CompiledFunction::coverage` (codegen.md Z2), and the link lays every
   function's arrays out together, builds one PC table and calls the init functions
-  (`v2/requests/link.md`, same date). `__sancov_cfs` and COFF objects with coverage stop with
+  (`docs/v2/requests/link.md`, same date). `__sancov_cfs` and COFF objects with coverage stop with
   an error.
 - **What is dropped and remade.** Only `blaze.own`'s section is read. So the module
   constructors (`asan.module_ctor` and the rest), ASan's global descriptors and MSan's
@@ -165,7 +165,7 @@ into `Sanitize::coverage` (`v2/requests/cargo.md`, same date).
   does not instrument.
 - **`return_address`.** `Opcode::GetReturnAddress` lowers to `llvm.returnaddress(i32 0)`, as
   rustc's intrinsic does (F2 item 2). `mod.rs` still has to emit the opcode for the intrinsic
-  (`v2/requests/speed-backend.md`, same date).
+  (`docs/v2/requests/speed-backend.md`, same date).
 - **Not yet as rustc does.** Lowering emits no `llvm.lifetime` markers, which rustc emits
   under ASan and MSan even at `-O0`. So ASan's use-after-scope finds nothing here until lowering
   says where each slot's life ends. Cranelift's IR does not carry that; it has to come from

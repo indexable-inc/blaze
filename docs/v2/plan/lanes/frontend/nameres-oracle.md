@@ -93,7 +93,7 @@ the rest. A test can force a result to rerun or to be kept.
 - Every case is a slot of `fixture.py` and in its `nameres` regression. The kinds are distinct
   and in `blaze_query::kinds::{FACTS, FRONT}`.
 
-## 5. Requests (`v2/requests/frontend-nameres.md`, `## oracle`)
+## 5. Requests (`docs/v2/requests/frontend-nameres.md`, `## oracle`)
 
 1. Core, done: `crates/hir-def/src/nameres/facts/kinds.rs`, the resolver's kind table at
    `0x2200..0x2240`. `nameres::kinds` names the kinds the cases read and watches the whole

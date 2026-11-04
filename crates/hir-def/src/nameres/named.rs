@@ -20,7 +20,7 @@
 //! named yet: most crates name each in a `use`, and lowering a body is the costly part.
 //!
 //! The standard library's crates a crate is given are named whatever its code says (rustc injects
-//! `std`), but for a `#![no_std]` crate's std, alloc, test and proc_macro, named only as any
+//! `std`), but for a `#![no_std]` crate's std, alloc, test, proc_macro and blaze's dev runtime, named only as any
 //! other dependency is (rustc injects `core` there), and for a panic runtime (`#![panic_runtime]`, the toolchain's `panic_unwind` and
 //! `panic_abort`): cargo's `-Zbuild-std` gives every crate `panic_unwind` as a `noprelude` extern,
 //! which rustc loads only for an `extern crate panic_unwind;`, and the program's runtime is the
@@ -57,6 +57,10 @@ use crate::{
     src::HasSource as _,
 };
 
+/// The `--extern` name of blaze's dev runtime among the standard library's crates
+/// (`blaze_units::stdlib::DEV_RUNTIME`; hir-def depends on no loader).
+const DEV_RUNTIME: &str = "blaze_inproc_rt";
+
 /// The dependencies of `krate` that its code names, as rustc loads them, with those of the
 /// standard library's that it is given (rustc injects `std` or `core`, and blaze builds the
 /// standard library as a whole) but a panic runtime its code does not name with an `extern
@@ -76,9 +80,12 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
     // injects `core` in place of std, and a `#![no_std]` program links no std.
     let no_std = crate_def_map(db, krate).is_no_std()
         && !krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test));
-    let by_name = |krate: Crate| {
+    // blaze's dev runtime, which blaze gives a dev executable's crates as a crate of the
+    // standard library (`blaze_units::stdlib::DEV_RUNTIME`), is built on std: a `#![no_std]`
+    // crate links it only by naming it, as it does std.
+    let by_name = |krate: Crate, name: &str| {
         no_std
-            && matches!(
+            && (matches!(
                 krate.data(db).origin,
                 CrateOrigin::Lang(
                     LangCrateOrigin::Std
@@ -86,12 +93,12 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
                         | LangCrateOrigin::Test
                         | LangCrateOrigin::ProcMacro
                 )
-            )
+            ) || (lang(krate) && name == DEV_RUNTIME))
     };
     // Names are unique among a crate's dependencies: each is its `--extern` name.
     let unnamed: HashSet<&str, Global> = dependencies
         .iter()
-        .filter(|it| !lang(it.crate_id) || by_name(it.crate_id))
+        .filter(|it| !lang(it.crate_id) || by_name(it.crate_id, it.name.as_str()))
         .map(|it| it.name.as_str())
         // alloc: one set per crate's walk
         .collect();
@@ -114,7 +121,7 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
         .iter()
         .filter(|it| {
             walk.named.contains(it.name.as_str())
-                || (lang(it.crate_id) && !by_name(it.crate_id) && !is_panic_runtime(db, it.crate_id))
+                || (lang(it.crate_id) && !by_name(it.crate_id, it.name.as_str()) && !is_panic_runtime(db, it.crate_id))
         })
         .map(|it| it.crate_id)
         // alloc: the memo's value, once per crate

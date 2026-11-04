@@ -21,6 +21,31 @@ you send them, including fixes you find here and want to upstream.
 
 ## Layout of the tree
 
+The root holds only what a reader needs first or a tool requires there; everything else is
+one level down:
+
+    crates/                   blaze's crates, and the front end's (below)
+    library/                  the standard library blaze builds, upstream's sources with blaze's changes
+    vendor/                   third-party crates blaze patches or builds as dependencies
+    harness/                  the test harnesses and their fixtures
+    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
+                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
+                              (the pinned PGO profiles), bench/results/ (recorded results),
+                              remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              workspace's shared helper), v2/ (the lanes' scripts and queue)
+    docs/                     these documents; docs/future/ the plans for work not started,
+                              docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
+                              requests
+    demo/                     small projects the harnesses build, and the live-reload demo
+    fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
+    site/                     the website, and install.sh, the installer `curl | sh` and CI run
+    licenses/                 NOTICE and the license texts of code blaze includes
+    hegel.toml                Hegel's settings for the property tests (read from the root)
+    Cargo.toml, pyproject.toml, flake.nix
+                              the Rust, Python (uv) and Nix workspaces, each with its lock
+
+The crates to know first:
+
     crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
     crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
@@ -30,15 +55,6 @@ you send them, including fixes you find here and want to upstream.
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
     crates/blaze-wasm/        experiment: the compiler running in a web page (not in the workspace)
-    harness/                  the test harnesses and their fixtures
-    demo/                     small projects the harnesses build
-    docs/                     these documents
-    docs/reports/             working reports, one per piece of work, as written at the time
-    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
-                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/ (recorded results), remote-cache/
-                              (the cache gateway Worker)
-    licenses/                 NOTICE and the license texts of code blaze includes
     .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)
@@ -135,7 +151,7 @@ one file; everything else reads it or is written from it:
   questions (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
-- `install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
+- `site/install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
   bench nightly alike) and `Cargo.toml`'s `rust-version`.
 
 ### Moving to a newer nightly
@@ -151,7 +167,7 @@ picks the nightly (the newest of the last two weeks whose manifest has every com
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
 `pins.txt`, re-vendors `crates/rustc_abi` from rust-lang/rust at the new commit, merges that
 nightly's standard library into `library/` (`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
-are kept; a conflict stops it and names the files), moves the pin where else it is written (`install.sh`, the
+are kept; a conflict stops it and names the files), moves the pin where else it is written (`site/install.sh`, the
 server's version string, `Cargo.toml`, the flake's rust-overlay input) and
 installs the nightly with rustup. Each step names itself when it fails.
 
@@ -167,8 +183,8 @@ What it leaves to a person, and prints at the end:
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
 3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM (in `nix develop`,
-   with a blaze built with `--features llvm`: the profile picks the backend, and the harnesses
-   that cover LLVM build the release profile). It builds blaze and runs, in parallel,
+   with a blaze built there, which has LLVM as every native blaze does: the profile picks the
+   backend, and the harnesses that cover LLVM build the release profile). It builds blaze and runs, in parallel,
    `toolchain_pins.py` and the gate's quick parts.
 4. The full tier re-measured at the new commit: the train and the crates' own test suites.
 5. One commit for the bump, landed like any other change.
@@ -212,9 +228,8 @@ did about it in one line.
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
-- The LLVM backend builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo build -p blaze-engine --release --features llvm`
-  ([LLVM for `--features llvm`](#llvm-for---features-llvm)).
+- blaze builds in the flake's dev shell, against the LLVM it pins:
+  `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
 - `cargo fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
@@ -337,15 +352,17 @@ how many have: 24 after a one-line edit, about 1,600 for code 23 commits and 6,7
 (of the 187,000 functions a profile has). Run the workflow by hand when that count passes a
 few thousand and before a release after large changes to the daemon.
 
-## LLVM for `--features llvm`
+## LLVM
 
 blaze builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
 and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codegen/llvm.json`.
-Every build of blaze needs it, not only the LLVM backend: `blaze-stencil`'s build script has it
-make the stencils. The flake's dev shell fetches it (the flake's `blaze-llvm`) and sets
+Every native build of blaze links it (blaze-engine's default `native` feature, through
+hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
+build script has it make the stencils. Only the seed (`--no-default-features --features seed`)
+has none. The flake's dev shell fetches it (the flake's `blaze-llvm`) and sets
 `LLVM_SYS_231_PREFIX` to it:
 
-    nix develop -c cargo build -p blaze-engine --release --features llvm
+    nix develop -c cargo build -p blaze-engine --release
 
 Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
 (`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
@@ -355,7 +372,7 @@ build` refuses a prefix in your home directory.
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
     python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
-    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release
 
 Every crate that uses LLVM (`hir-ty-codegen` through inkwell, `blaze-stencil`'s build script)
 links it through llvm-sys, whose build script checks the prefix before anything else
@@ -364,7 +381,7 @@ its `llvm-config --version` must say that version. `LLVM_SYS_231_PREFIX` unset, 
 (no `blaze-llvm.json`) or another build stops the build with one error naming what it found,
 the pin and the fix. Nothing else is searched: not `PATH`, Homebrew's LLVM, a distribution's or
 another `LLVM_SYS_*_PREFIX`. LLVM is linked in statically, and on Linux so
-is libstdc++, so a binary built with the feature needs no LLVM where it runs. inkwell's llvm-sys
+is libstdc++, so a blaze binary needs no LLVM where it runs. inkwell's llvm-sys
 does the linking (vendored in `vendor/llvm-sys` for the static libstdc++; its SOURCE.md says why
 the libraries must come from a crate below inkwell for GNU ld). CI and Windows
 fetch the archive the same way (`.github/actions/toolchain`).
@@ -386,7 +403,8 @@ each library's file and its id, the BLAKE3 hash of its bytes with the id field z
 `blaze-stencil`'s build script checks every library it includes against the pin. It checks that
 the library hashes to the id in its header, and that this id is the pinned one:
 
-- A build with LLVM (the default `llvm-stencils` feature) makes the libraries and writes their
+- A build with LLVM (every native one: hir-ty-codegen's `llvm` turns on blaze-stencil's
+  `llvm-stencils`) makes the libraries and writes their
   pin beside them, as `stencils.json` in blaze-stencil's `OUT_DIR`. When that differs from the
   tree's pin, the build stops and names each id. When a change to the generator (`gen/`,
   `src/shape.rs`, `src/enc.rs`, `src/table/format.rs`, LLVM) changes what it makes, pin the

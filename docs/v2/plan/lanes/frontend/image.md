@@ -54,7 +54,7 @@ and named; interned values are freed by the image's GC.
 
 ## Hooks asked of other lanes
 
-- **db** (`v2/requests/db.md`, "frontend-image: the daemon image on `blaze-image`"):
+- **db** (`docs/v2/requests/db.md`, "frontend-image: the daemon image on `blaze-image`"):
   - move `blaze-query`'s hand-laid image onto sections;
   - turn the "image is corrupt" panics into `Corrupt`, with the key recomputed and the error
     reported;
@@ -62,7 +62,7 @@ and named; interned values are freed by the image's GC.
   - mark symbols at `write_image`;
   - store `Sym` instead of text in persisted HIR and solver values;
   - make salsa interned values and item IDs mapped tables with the same GC.
-- **cargo** (`v2/requests/cargo.md`, "frontend-image: one daemon image"): restore symbols
+- **cargo** (`docs/v2/requests/cargo.md`, "frontend-image: one daemon image"): restore symbols
   first, keep the plane history in the image, and write one image.
 
 ## The state of the art, and where this stands

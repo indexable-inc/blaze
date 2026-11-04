@@ -7,7 +7,7 @@ date: 2026-10-29
 
 The speed pass of `crates/parser` and `crates/syntax` (all but format-edit's editing files).
 `crates/syntax-tree` was not free (format-tree is running again as format-edit), so its
-findings are requests (`v2/requests/format.md`, section speed-syntax). Where the time goes, from
+findings are requests (`docs/v2/requests/format.md`, section speed-syntax). Where the time goes, from
 `docs/research/lean-frontend.md`: lexing and parsing to events is 11.5% of a cold start's
 innermost frames. Within the parser's samples, `LexedStr::new` is 10%, `event::process` 8%, the
 flat tree builder 6.5% and `intersperse_trivia` 3.6%, and the grammar is the rest.

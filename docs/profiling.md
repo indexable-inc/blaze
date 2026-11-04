@@ -168,6 +168,9 @@ are the `query_counts` table.
 | evicted | u64 | its values a sweep let go past its cap |
 | refused | u64 | of those, the ones recency alone would have kept |
 | dropped | u64 | its values an explicit `evict_values` or `evict_values_of` let go |
+| reads_recorded | u64 | the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows |
+| reads_kept | u64 | the reads its runs' rows kept: each run's distinct reads, summed |
+| reads_most | u64 | the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum) |
 
 When a build ends, the daemon takes the counts (`blaze_query::db::take_counts`, in
 `crates/blaze-cargo/src/serve/observe.rs`) and the next flush writes them. The counts belong to
@@ -657,6 +660,7 @@ same rows give the same bytes. Findings that save less than 1% of the wall time 
 | `queued` | the path's `queued` and `spawned` links: runnable but not run | their time |
 | `redone` | one query key (`name`, `crate`, `function`) run more than once in the build | its extra running / mean parallelism |
 | `reran`, `evicted` | `query_counts.reran` and `evicted_asked`, costed at the query's CPU per run from its spans | runs x CPU per run / mean parallelism |
+| `reread` | a query one of whose runs held 2^20 reads or more on its query stack (`query_counts.reads_most`), or whose runs recorded 8 reads or more for each read their rows kept (`reads_recorded` over `reads_kept`, with 2^20 recorded or more): runs re-reading the same rows, as a loop over items re-reading inputs does | unknown |
 | `missed` | the `misses` rows by step and cause, except `first` | unknown |
 | `shed` | the daemon's `live bytes` coming into the build (the build before's last value, or this build's first) against the least during it: a fall of more than 1 GiB, or of more than half of 256 MiB or more. What it let go is computed again | unknown |
 

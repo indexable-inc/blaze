@@ -393,7 +393,7 @@ once per macro version: the image is stored by code hash and shared through the 
 
 ## Requests
 
-In `v2/requests/fastcompile.md`:
+In `docs/v2/requests/fastcompile.md`:
 
 1. `fastcompile-macros-tier 1` (codegen): the IR of an instance for a sandboxed unit.
 2. `fastcompile-macros-tier 2` (fastcompile-stencil): the fused confined access, and the

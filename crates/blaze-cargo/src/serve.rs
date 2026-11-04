@@ -25,13 +25,13 @@ mod job;
 mod mounts;
 pub mod observe;
 /// The seed's one-shot build: this engine in the CLI's process, for its command alone.
-#[cfg(not(feature = "daemon"))]
+#[cfg(not(feature = "native"))]
 pub(crate) mod once;
 mod plane;
 mod pulse;
 pub(crate) mod signals;
 mod still;
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 mod stop;
 #[cfg(test)]
 mod tests;
@@ -39,7 +39,7 @@ mod unit;
 pub mod why;
 mod work;
 
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 use std::{ffi::OsString, process::ExitCode};
 use std::{
     net::SocketAddr,
@@ -56,7 +56,7 @@ pub use daemon::{Daemon, Options};
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
 /// last start by it, and harness/storelib.py's `LISTENING` that it listens.
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 pub const LISTENING: &str = "blaze serve: listening on ";
 
 /// What the daemon's line that says how it started begins with, after `blaze serve: `: written
@@ -244,7 +244,7 @@ pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     FileName::new(rest.trim_end_matches('/')).with_context(|| format!("{text} has an empty, `.` or `..` part"))
 }
 
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 struct Args {
     socket: Option<PathBuf>,
     http: Option<SocketAddr>,
@@ -259,7 +259,7 @@ struct Args {
     memory: Option<(u64, String)>,
 }
 
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
     let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None, memory: None };
     let mut args = args.into_iter();
@@ -365,7 +365,7 @@ pub(crate) fn limit_said(budget: &blaze_graph::Budget) -> String {
 
 /// The socket systemd or launchd passed `blaze serve --activated` (the units of
 /// `blaze daemon install`, [`blaze_api::units`]).
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 fn activated() -> anyhow::Result<blaze_api::activation::Passed> {
     use blaze_api::activation::{Manager, take};
     let manager = Manager::here().context(
@@ -574,7 +574,7 @@ fn say(ready: Option<&mut std::fs::File>, phase: Phase) {
 }
 
 /// The pipe of `blaze serve --ready-fd N`, made this process's: close-on-exec from here on.
-#[cfg(all(unix, feature = "daemon"))]
+#[cfg(all(unix, feature = "native"))]
 fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
     use std::os::fd::FromRawFd as _;
     if fd < 3 {
@@ -590,7 +590,7 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
 }
 
 /// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -601,7 +601,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let args = parse(args)?;
     // First, before any thread starts: taking the passed socket reads and clears the
@@ -826,9 +826,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     Ok(Engine { options, steps, runner, driver, keeper, held })
 }
 
-#[cfg(all(feature = "daemon", not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(all(feature = "native", not(any(target_os = "linux", target_os = "macos", windows))))]
 compile_error!(
-    "blaze serve (blaze-cargo's `daemon` feature) runs on a native driver: io_uring (Linux), kqueue (macOS) or \
+    "blaze serve (blaze-cargo's `native` feature) runs on a native driver: io_uring (Linux), kqueue (macOS) or \
      IOCP (Windows); the wasm seed is built without it (`--no-default-features --features seed`) and builds one-shot"
 );
 
@@ -929,7 +929,7 @@ fn begin(
 }
 
 /// `blaze serve`'s loop: the daemon listens, answers until it stops, and says how it stopped.
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option<std::fs::File>) -> anyhow::Result<()> {
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.

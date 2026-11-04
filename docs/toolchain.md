@@ -82,11 +82,11 @@ archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flak
 `blaze-llvm`); outside the shell, `python3 .github/scripts/llvm.py fetch` unpacks the same
 archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
 one. llvm-sys's build script refuses any other prefix with one error before anything links it
-([contributing.md](contributing.md#llvm-for---features-llvm)). The LLVM inside a blaze binary
+([contributing.md](contributing.md#llvm)). The LLVM inside a blaze binary
 is not a toolchain for projects: it builds them with the toolchain above. Its MC assembler is
 what assembles `asm!`, `naked_asm!` and `global_asm!` in process, never the machine's clang or
-`cc`. A blaze built without LLVM assembles them with rsasm in process when built with
-`--features rsasm`, as the seed is (`vendor/rsasm/SOURCE.md`), and refuses them otherwise. What else
+`cc`. The seed, built without LLVM, assembles them with rsasm in process (hir-ty-codegen's
+`rsasm`, which blaze-engine's `seed` turns on; `vendor/rsasm/SOURCE.md`). What else
 blaze still takes from the machine's C toolchain (the C driver the linker asks for crt files,
 the macOS SDK, MSVC's libraries, build scripts' `CC`) and the plan to replace it with one C
 toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/toolchain-c.md).
@@ -102,7 +102,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
    `crates/rustc_abi` from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `install.sh`, `Cargo.toml`
+   library](#the-standard-library-library)), and moves the pin in `site/install.sh`, `Cargo.toml`
    and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into

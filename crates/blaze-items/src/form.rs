@@ -1296,7 +1296,35 @@ impl<'db> Cx<'db> {
         // (`impl_rpitit_tys`, rustc's `collect_return_position_impl_trait_in_trait_tys`): what
         // a caller normalizing the trait's item for this impl gets. It is found by matching
         // this signature against the trait method's, so it changes with the trait method too.
-        let rpitits = hir_ty::rpitit::impl_rpitit_tys(db, func);
+        // The interface writes it; the signature form leaves it to its own fact
+        // (`Fact::RpititTys`, [`Cx::rpitit_tys`]): finding it proves the trait's bounds of this
+        // method's own `impl Trait`s, which reads their bounds, written above, so the
+        // signature fact is what that proof reads. A signature holding the values would be
+        // read while they are found, a cycle through the goal store (wasmtime's
+        // `AccessorTask::run`, `WasmTyList::valtypes`). rustc keeps them apart likewise:
+        // `explicit_item_bounds` and `fn_sig` are not
+        // `collect_return_position_impl_trait_in_trait_tys`.
+        if !self.leak_free {
+            self.rpitit_values(f, func);
+        }
+    }
+
+    /// An impl method's types for the `impl Trait`s of the trait method it implements, alone:
+    /// what [`crate::Fact::RpititTys`] stands for. Asked of a [`Cx::leak_free`], as the solver
+    /// asks the fact inside a body's inference.
+    pub(crate) fn rpitit_tys(&self, func: FunctionId) -> Sub {
+        debug_assert!(
+            self.leak_free,
+            "an impl method's RPITIT types are written by a leak-free `Cx`"
+        );
+        let mut f = Form::new("rpitit types");
+        self.rpitit_values(&mut f, func);
+        f.sub()
+    }
+
+    /// What `impl_rpitit_tys` gives `func`, each value or why it has none.
+    fn rpitit_values(&self, f: &mut Form, func: FunctionId) {
+        let rpitits = hir_ty::rpitit::impl_rpitit_tys(self.db, func);
         f.len(rpitits.len());
         for value in rpitits {
             match value {

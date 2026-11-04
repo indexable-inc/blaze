@@ -104,7 +104,7 @@ salsa's macro, linted as external.
 ## salsa
 
 The comment scan finds no block without `// SAFETY:` in `vendor/salsa*`. Missing: root gates in
-all three crates. They are requested in `v2/requests/speed-salsa.md` under "speed-unsafe-front":
+all three crates. They are requested in `docs/v2/requests/speed-salsa.md` under "speed-unsafe-front":
 - `forbid` for salsa-macros, whose unsafe is all inside `quote!`, and for salsa-macro-rules;
 - `deny` for salsa, with an allow on each of its 27 modules holding unsafe;
 - `forbid` on the test and bench roots, after making `benches/field_access.rs`'s three

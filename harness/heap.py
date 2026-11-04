@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """heap.py FOLDED [ROWS] [--syntax]: attributes a heap profile to salsa queries and to blaze's own structures.
 
-FOLDED is what `jeprof --collapsed` makes of a profile the daemon wrote (on macOS, what
-`heapfold.py` makes of it): build it with `--features heap-profile`, run it with
-`BLAZE_MEMORY=DIR _RJEM_MALLOC_CONF=prof:true`.
+FOLDED is what `jeprof --collapsed` makes of a jemalloc heap profile (on macOS, what
+`heapfold.py` makes of it). blaze no longer writes one: its `heap-profile` feature went on
+2026-11-03, as nothing had made jemalloc its allocator since v2 (mimalloc is, `heaps.rs`), so the
+profile it dumped held none of blaze's allocations. Profiles written before then still read.
 
 Each allocation goes to the innermost salsa ingredient on its stack: a query's `value` (what the
 memo keeps, which an `lru` can let go of), its `record` (the dependencies and revisions salsa keeps

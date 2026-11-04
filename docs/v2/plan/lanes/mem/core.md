@@ -96,7 +96,7 @@ daemon's own kinds (`admission::kinds`, which `blaze-cargo`'s `serve/plane.rs` i
 The kinds in use fit the front and back sub-ranges: `hir-def`'s names at `0x2200..0x2240`,
 `hir-ty`'s at `0x2400..0x2600`, `blaze-codegen`'s at `0x4000..`, `blaze-units`' loads at
 `0x6010..0x6800`. Lane db is asked to write the sub-ranges into `blaze_query::kinds`
-(`v2/requests/mem-core.md`) so that a new kind is placed by its subsystem; the test
+(`docs/v2/requests/mem-core.md`) so that a new kind is placed by its subsystem; the test
 `each_kind_belongs_to_its_subsystem` pins the map.
 
 **Each tag's budget** is its share of the machine budget in 64ths (`admission::share`,
@@ -145,7 +145,7 @@ codec identity test, which now generates both variants.
 `Effect::Times { file, modified_ns, tag }`, completing with `Done::Timed`, sets a file's (or a
 directory's) access and modification times both to `modified_ns`, nanoseconds since the Unix
 epoch: cargo dates a build script's `output` with the time its run began
-(`v2/requests/cargo.md`, "cargo-inbox-user: to lane core, the time a written file is given").
+(`docs/v2/requests/cargo.md`, "cargo-inbox-user: to lane core, the time a written file is given").
 
 **A new effect, not a field on `Effect::Write`.** Read across `crates/` on 2026-10-29:
 
@@ -212,7 +212,7 @@ failed set changes nothing, a crash keeps the time, a later write moves it on).
 
 ## Exec of a just-written file
 
-From `fastcompile-inproc-exec 4` (`v2/requests/fastcompile.md`): the dev executable is written
+From `fastcompile-inproc-exec 4` (`docs/v2/requests/fastcompile.md`): the dev executable is written
 by the daemon to cargo's path and started by the kernel from there, in the run's sandbox, and a
 sandboxed run on macOS looks up the daemon's rendezvous service.
 
@@ -252,7 +252,7 @@ only one.
 written), and the launcher's own child execs `Command.program`: `blaze-cargo/src/sandbox/linux.rs`
 `exec` (`raw::execve`) and `macos.rs`'s forked child. That exec can meet the same `ETXTBSY`, so
 the launcher needs the same loop on the same schedule (`blaze_core::busy::next`). That code is
-usercode's, so the change is requested in `v2/requests/usercode.md`. There the retry may run in
+usercode's, so the change is requested in `docs/v2/requests/usercode.md`. There the retry may run in
 the child: each launcher process is one thread, it forked its child after its own exec closed
 every descriptor it was started with, and so that child holds no copy of the writer's descriptor.
 
@@ -274,7 +274,7 @@ None of this is built in blaze-core; the sandboxes are blaze-cargo's (usercode's
 may look up beyond the profile's fixed list (`dev.blaze.inproc.<daemon pid>` for an in-process
 run). They are ignored on Linux and Windows. blaze-core's constructors give `Vec::new()`. The rest
 is requested of other lanes:
-- usercode (`v2/requests/usercode.md`): `confine::Spec` and `SpecOf` carry the names; the warm
+- usercode (`docs/v2/requests/usercode.md`): `confine::Spec` and `SpecOf` carry the names; the warm
   pool's key hashes them, since a process allowed other lookups is another process; and
   `macos.rs`'s profile adds `(allow mach-lookup (global-name (param "SERVICE<n>")))` per name.
   As a parameter the name needs no quoting. A name that is empty or has a NUL fails the run,
@@ -301,7 +301,7 @@ Tests (`crates/blaze-core/src/process/spawn/tests.rs`):
 
 ## The warm launcher on Windows
 
-By `mem-core-warm`, for section 2 of `v2/requests/usercode-win-launcher.md`; paths
+By `mem-core-warm`, for section 2 of `docs/v2/requests/usercode-win-launcher.md`; paths
 `crates/blaze-core/src/iocp.rs`, `iocp/{warm,rundirs,process,sys}.rs`. Costs in
 [core/warm.md](core/warm.md).
 
@@ -376,6 +376,6 @@ before `main` through `.CRT$XCU` when `TINY` is set, with a 52-byte frame of its
   task's frame, bind a frame to a NUMA node, and cap a frame's growth with `Cap`'s spill and
   cancel-the-newest backstop (request C6). Without the last, the move would drop the daemon's
   hard backstop for task memory.
-- `v2/requests/mem-core.md`: the daemon's `cx!` sets `Daemon::memory`, and its kinds come from
+- `docs/v2/requests/mem-core.md`: the daemon's `cx!` sets `Daemon::memory`, and its kinds come from
   `admission::kinds`; `blaze-ui` renders `Response::Memory`; lane db writes the front and back
   sub-ranges into `blaze_query::kinds`.

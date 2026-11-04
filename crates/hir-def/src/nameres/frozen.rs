@@ -417,6 +417,19 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     encode_maps(db, krate, pair.def_map(db), pair.local(db))
 }
 
+/// [`encode`] with the content ID of each file the bytes name left out of their header: the
+/// bytes of a `DefMap` equal to another, whose files' text differs. The header's IDs move with
+/// every edit of a file the map names (the image's check that a served map is read against the
+/// text it was made from), so an edit that leaves the map equal still changes [`encode`]'s
+/// bytes; these do not (`nameres::tests::backdate`).
+#[cfg(test)]
+pub(crate) fn encode_without_contents(db: &Db, krate: Crate) -> R<Vec<u8>> {
+    let pair = super::crate_local_def_map(db, krate);
+    let mut enc = Enc::new(db, krate);
+    enc.maps(krate, pair.def_map(db), pair.local(db))?;
+    enc.finish_naming(false)
+}
+
 /// `krate` and the crates it depends on, transitively, breadth first in the order the crate
 /// graph lists dependencies: the crates frozen bytes name by index.
 fn closure(db: &Db, krate: Crate) -> Vec<Crate> {
@@ -590,16 +603,22 @@ fn encode_maps(
     local: &LocalDefMap,
 ) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
-    for (index, &module) in def_map.table(db).keys().enumerate() {
-        enc.modules.insert(module, (0, index as u32));
-    }
-    enc.indexed.insert(krate);
-    enc.def_map(def_map)?;
-    enc.local(local)?;
+    enc.maps(krate, def_map, local)?;
     enc.finish()
 }
 
 impl<'a> Enc<'a> {
+    /// Writes `def_map` and `local`, the maps of `krate`, which this writes values of.
+    fn maps(&mut self, krate: Crate, def_map: &DefMap, local: &LocalDefMap) -> R {
+        let db = self.db;
+        for (index, &module) in def_map.table(db).keys().enumerate() {
+            self.modules.insert(module, (0, index as u32));
+        }
+        self.indexed.insert(krate);
+        self.def_map(def_map)?;
+        self.local(local)
+    }
+
     /// Writes values of `krate`, which names its dependencies by their index in its closure.
     pub fn new(db: &'a Db, krate: Crate) -> Self {
         let closure = closure(db, krate);
@@ -631,7 +650,13 @@ impl<'a> Enc<'a> {
     }
 
     /// The bytes written, after the files they name, which [`Dec::new_checked`] reads first.
-    pub fn finish(mut self) -> R<Vec<u8>> {
+    pub fn finish(self) -> R<Vec<u8>> {
+        self.finish_naming(true)
+    }
+
+    /// [`Enc::finish`], each file in the header with its content ID when `contents`; without,
+    /// the bytes are no image's, only what a test compares ([`encode_without_contents`]).
+    fn finish_naming(mut self, contents: bool) -> R<Vec<u8>> {
         // The target directories the closure's build scripts wrote below, which nothing the
         // bytes say may name: they are of one checkout.
         let mut places: Vec<String> = (self.out_dirs.iter())
@@ -651,8 +676,10 @@ impl<'a> Enc<'a> {
             // The content ID it has: the owner's image key covers every file of its source root
             // and the text of its root, and the crate's key covers that key, so [`Dec::files`]
             // finding another one is a key that left an input out, refused there.
-            let content = self.db.file_content(file);
-            self.out.extend_from_slice(&content.0);
+            if contents {
+                let content = self.db.file_content(file);
+                self.out.extend_from_slice(&content.0);
+            }
             if !path.starts_with(OUT) && path != ROOT {
                 let full = joined(&self.dirs[&owner], &path);
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {

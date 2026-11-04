@@ -76,132 +76,31 @@
 //! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64. Elsewhere every
 //! constructor stops with an [`Error`] naming the platform.
 
-pub mod ask;
-pub mod channel;
+// The run process's side and what both sides share (the channel's frames, the handshake, the
+// image's headers, the asks, the fence's words, the platform) are `blaze-inproc-rt`, whose source
+// is library/blaze_inproc_rt: the dev runtime blaze links into every dev executable whose
+// dependencies don't link it themselves (docs/v2/plan/lanes/fastcompile/inproc.md, "The
+// runtime"). This crate is the daemon's side built on it, and names its modules as its own.
+pub use blaze_inproc_rt::{Access, Error, Format, ImageLookup, ImageWrite, ask, channel, fence, frame, image, runtime};
+pub(crate) use blaze_inproc_rt::sys;
+#[cfg(test)]
+pub(crate) use blaze_inproc_rt::bind;
+#[cfg(any(test, feature = "host"))]
+pub(crate) use blaze_inproc_rt::handshake;
+
 pub mod exec;
-pub mod fence;
-pub mod frame;
 #[cfg(feature = "host")]
 pub mod host;
-pub mod image;
-pub mod runtime;
 
 mod alloc;
-mod bind;
-mod handshake;
-mod sys;
 
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
 use std::sync::Arc;
 
 use fence::{Fences, Grace};
 pub use image::{Layout, Segment};
-
-/// Why something of this crate could not be done, and on which platform.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Error {
-    pub what: String,
-}
-
-impl Error {
-    pub(crate) fn new(what: impl Into<String>) -> Error {
-        Error { what: what.into() }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "blaze-inproc on {}-{}: {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            self.what
-        )
-    }
-}
-
-impl std::error::Error for Error {}
-
-/// The object format of a program's executable.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Format {
-    Elf,
-    MachO,
-    Pe,
-}
-
-impl Format {
-    pub(crate) fn tag(self) -> u8 {
-        match self {
-            Format::Elf => 1,
-            Format::MachO => 2,
-            Format::Pe => 3,
-        }
-    }
-
-    pub(crate) fn from_tag(tag: u8) -> Option<Format> {
-        match tag {
-            1 => Some(Format::Elf),
-            2 => Some(Format::MachO),
-            3 => Some(Format::Pe),
-            _ => None,
-        }
-    }
-
-    /// The format of programs on this platform.
-    pub fn host() -> Option<Format> {
-        if cfg!(target_os = "linux") {
-            Some(Format::Elf)
-        } else if cfg!(target_os = "macos") {
-            Some(Format::MachO)
-        } else if cfg!(windows) {
-            Some(Format::Pe)
-        } else {
-            None
-        }
-    }
-}
-
-/// How a range of a memory object is mapped in a run process.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Access {
-    /// Readable and executable, shared with the daemon's writable view: code.
-    Execute,
-    /// Readable, shared: read-only data the daemon may still change.
-    Read,
-    /// Readable and writable, a private copy: data. Nothing relies on whether the daemon's
-    /// later writes show through: on Linux and Windows they do in pages the process has not
-    /// written (copy on write), on macOS never (a snapshot taken when it is mapped, since a
-    /// mapping of a Mach memory entry can't gain more rights than the entry has).
-    Copy,
-    /// Readable and writable, shared both ways: the fence's control words, and cells.
-    Shared,
-}
-
-impl Access {
-    pub(crate) fn tag(self) -> u8 {
-        match self {
-            Access::Execute => 1,
-            Access::Read => 2,
-            Access::Copy => 3,
-            Access::Shared => 4,
-        }
-    }
-
-    pub(crate) fn from_tag(tag: u8) -> Option<Access> {
-        match tag {
-            1 => Some(Access::Execute),
-            2 => Some(Access::Read),
-            3 => Some(Access::Copy),
-            4 => Some(Access::Shared),
-            _ => None,
-        }
-    }
-}
 
 /// A range of a [`CodeMemory`], by offset in its object.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -232,34 +131,6 @@ pub struct FixedMap<'a> {
     /// it, never another address.
     pub at: u64,
     pub access: Access,
-}
-
-/// An 8-byte word of a fixed map's run-private copy that the start hook stores before any code
-/// of the map runs: `blaze-premap`'s binding of a dependency image's open cells to a definition
-/// the image's link could not see (`blaze_premap::start::Write`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ImageWrite {
-    /// Linked, inside a [`FixedMap`] of [`Access::Copy`]; the run's slide is added.
-    pub place: u64,
-    pub value: u64,
-    /// `value` is a linked address, which moves with the run's slide as `place` does; a
-    /// thread-local's offset from the thread pointer does not.
-    pub address: bool,
-}
-
-/// An 8-byte word of a fixed map's run-private copy bound to `name` in the run process's
-/// global scope, which the system loader filled from the executable's libraries
-/// (`blaze_premap::start::Lookup`): the start hook stores its address plus `addend`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ImageLookup<'a> {
-    /// Linked, inside a [`FixedMap`] of [`Access::Copy`]; the run's slide is added.
-    pub place: u64,
-    /// As the image's symbol table has it: on Mach-O with its leading `_`, which the hook takes
-    /// off for `dlsym`.
-    pub name: &'a str,
-    pub addend: i64,
-    /// 0 when nothing defines it; a strong one nothing defines fails the start, naming it.
-    pub weak: bool,
 }
 
 /// The run processes a code memory is mapped in.

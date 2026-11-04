@@ -3445,7 +3445,7 @@ fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the
 }
 
 #[test]
-#[cfg(feature = "daemon")]
+#[cfg(feature = "native")]
 fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     let parse = |args: &[&str]| super::parse(args.iter().map(std::ffi::OsString::from));
     let args = parse(&["--activated", "--socket", "/run/b.sock"]).unwrap();

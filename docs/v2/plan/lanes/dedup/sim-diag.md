@@ -8,7 +8,7 @@ date: 2026-10-29
 Part of the dedup lane. The 87 groups `tools/similar` found touching blaze-diagnostics,
 blaze-lints, blaze-doc or blaze-fmt; the full list, group by group, is in the lane report
 (`/tmp/blaze-lanes/v2-dedup-sim-diag.md`). The model, `Level` and the emitter were moved by
-dedup-scan-diag. The edits are requests to the owners (`v2/requests/*.md`, headings
+dedup-scan-diag. The edits are requests to the owners (`docs/v2/requests/*.md`, headings
 `## dedup: …` from dedup-sim-diag), except `blaze_phf::bytes_eq`, which is in.
 
 ## Stability and deprecation: hir-def's parse, read through `hir`

@@ -28,6 +28,11 @@ pub trait Programs {
     /// Readies `exec` to start `artifact`'s program, asking the daemon whether it runs on its
     /// code memory ([`super::run::launch`]); the tests' fake asks no daemon.
     fn launch(&mut self, artifact: &Artifact, exec: &mut Exec) -> Result<(), String>;
+
+    /// What starts test executable `artifact`, whose command is `exec`, as a child: on the
+    /// daemon's code memory when the daemon holds it as a dev executable, never from its file
+    /// ([`super::run::TRAMPOLINE`]); the tests' fake starts `exec`.
+    fn started(&mut self, artifact: &Artifact, exec: &Exec) -> Result<Exec, String>;
 }
 
 /// Runs each program on the terminal, its output inherited.
@@ -40,6 +45,18 @@ impl Programs for Spawned {
 
     fn launch(&mut self, artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
         super::run::launch(artifact, exec)
+    }
+
+    /// On Unix through [`super::run::TRAMPOLINE`], which the daemon launches the program as.
+    /// Elsewhere the launch is asked here, which a program the daemon runs on its code memory
+    /// refuses: a child's process ID is known only once it is spawned.
+    fn started(&mut self, artifact: &Artifact, exec: &Exec) -> Result<Exec, String> {
+        // clone: once per test executable run, its command
+        let mut exec = exec.clone();
+        match cfg!(unix) {
+            true => super::run::through_trampoline(artifact, exec),
+            false => super::run::launch(artifact, &mut exec).map(|()| exec),
+        }
     }
 }
 
@@ -304,11 +321,24 @@ fn ran(
 ) -> io::Result<Option<Failed>> {
     let rerun = rerun(artifact, kind, spec_flag);
     let what = format!("{}, to rerun pass `{rerun}`", kind.failed());
-    let ended = match programs.run(exec) {
+    let never = |error: String| caused(&what, &[format!("could not execute process {shown} (never executed)"), error], speaking.color);
+    // A doctest's programs run under its runner, each a process of its own, never on the
+    // daemon's code memory; a test executable starts as the daemon launches it.
+    let started = match kind {
+        Kind::Doctest => Ok(exec.clone()), // clone: once per doctest run, its command
+        Kind::Test | Kind::Bench => programs.started(artifact, exec),
+    };
+    let started = match started {
+        Ok(it) => it,
+        Err(error) => {
+            err.write_all(never(error).as_bytes())?;
+            return Ok(Some(Failed { rerun, code: None }));
+        }
+    };
+    let ended = match programs.run(&started) {
         Ok(ended) => ended,
         Err(error) => {
-            let never = format!("could not execute process {shown} (never executed)");
-            err.write_all(caused(&what, &[never, error.to_string()], speaking.color).as_bytes())?;
+            err.write_all(never(error.to_string()).as_bytes())?;
             return Ok(Some(Failed { rerun, code: None }));
         }
     };

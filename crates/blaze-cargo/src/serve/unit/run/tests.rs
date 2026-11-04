@@ -46,11 +46,19 @@ fn policy(level: OptLevel) -> Policy {
     }
 }
 
+/// Why a test binary of a platform the dev runtime has no std build for is no dev executable
+/// ([`super::inproc::not_in_process`]).
+const NO_RUNTIME: &str = "it links no dev runtime (`blaze_inproc_rt`, the start hook): its standard library, for \
+    `x86_64-pc-windows-msvc` under profile `dev`, was built without it";
+
 #[test]
-fn a_dev_process_runs_in_process_and_says_what_blaze_lacks() {
+fn a_dev_process_that_is_no_dev_executable_says_why_and_what_blaze_lacks() {
     for (profile, level) in [("dev", OptLevel::O0), ("test", OptLevel::O0), ("dev", OptLevel::O1), ("mine", OptLevel::O0)] {
-        let why = launch_of(profile, "app", &policy(level)).unwrap_err();
-        assert_eq!(why, format!("`app` runs under profile `{profile}`: {NOT_IN_PROCESS}"));
+        let why = launch_of(profile, "app", &policy(level), Some(NO_RUNTIME)).unwrap_err();
+        assert_eq!(
+            why,
+            format!("`app` runs under profile `{profile}`, so on the daemon's code memory, and can't: {NO_RUNTIME}. {NOT_IN_PROCESS}")
+        );
     }
 }
 
@@ -63,14 +71,24 @@ fn a_release_process_starts_from_its_file() {
         ("dev", OptLevel::O2),
         ("small", OptLevel::Z),
     ] {
-        assert_eq!(launch_of(profile, "app", &policy(level)), Ok(Launch::File), "{profile}");
+        assert_eq!(launch_of(profile, "app", &policy(level), Some(NO_RUNTIME)), Ok(Launch::File), "{profile}");
     }
 }
 
 #[test]
-fn the_build_written_whole_does_not_decide_the_start() {
-    // A run's build links a file today; the start is the profile's, as a live build's would be.
-    let mut live = policy(OptLevel::O0);
-    live.mode = Mode::Live;
-    assert_eq!(launch_of("dev", "app", &live), launch_of("dev", "app", &policy(OptLevel::O0)));
+fn a_dev_executable_runs_on_the_daemons_code_memory() {
+    // `codegen::policy` makes a build live exactly when its unit is a dev executable
+    // (`inproc::runs_in_process`): a dev binary or test binary of either profile starts in
+    // process, never from its file.
+    for (profile, level) in [("dev", OptLevel::O0), ("test", OptLevel::O0), ("test", OptLevel::O1)] {
+        let mut live = policy(level);
+        live.mode = Mode::Live;
+        assert_eq!(launch_of(profile, "app", &live, None), Ok(Launch::InProcess), "{profile}");
+    }
+}
+
+#[test]
+fn a_dev_executable_whose_build_is_not_live_is_an_error_not_a_file() {
+    let why = launch_of("test", "app", &policy(OptLevel::O0), None).unwrap_err();
+    assert!(why.contains("`app`") && why.contains("not live"), "{why}");
 }

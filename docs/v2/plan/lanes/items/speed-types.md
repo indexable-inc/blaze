@@ -91,7 +91,7 @@ All in `tests/hashes.rs`:
 
 ## Left
 
-- `ContentId::of_many` is not in `blaze-ids` yet (requested in `v2/requests/format.md`).
+- `ContentId::of_many` is not in `blaze-ids` yet (requested in `docs/v2/requests/format.md`).
   blaze-items does not build until it is.
 - `of_many` should take a per-domain context key, `blake3::hazmat` style, so each input saves one
   compression.

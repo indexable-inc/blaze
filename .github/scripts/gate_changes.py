@@ -52,7 +52,7 @@ CODE = (
     ".github/scripts/llvm.py",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
     ".github/blaze-version",
-    "install.sh",
+    "site/install.sh",
     # The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
     ".github/workflows/blaze-platform.yaml",
