@@ -651,7 +651,8 @@ impl App {
             View::of(self.world.entity_from_id(part)).text(&cut);
         }
         let w = self.world.world_ref();
-        // The main card's header.
+        // The window title from the selected object; the main card's header parts are written only when the scene has
+        // them (hn.Main has no head row now).
         let main = View::of(w.entity_from_id(self.ids.main));
         let head = main.part("head");
         let part = |n: &str| head.and_then(|h| h.part(n));
