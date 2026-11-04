@@ -17,6 +17,25 @@ use blaze_codegen::InstanceKey;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
+#[test]
+fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
+    let target = blaze_lower::target_data(HOST).unwrap();
+    let mut workspace = base_db::CrateWorkspaceData {
+        target: Ok(target), toolchain: None, const_eval: Default::default(),
+    };
+    assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
+    let original = workspace.target.clone(); // clone: restore the layout after each control
+    workspace.target.as_mut().unwrap().data_layout = "e-p:32:32".into();
+    let error = super::verify_target_data(HOST, &workspace).unwrap_err();
+    assert!(error.contains(HOST) && error.contains("e-p:32:32") && error.contains("toolchain key"), "{error}");
+    workspace.target = original;
+    assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
+    workspace.target.as_mut().unwrap().has_thumb_interworking = true;
+    assert!(super::verify_target_data(HOST, &workspace).is_err(), "the target's other layout facts count too");
+    workspace.target = Err("the crate's target could not be loaded".into());
+    assert_eq!(super::verify_target_data(HOST, &workspace).unwrap_err(), "the crate's target could not be loaded");
+}
+
 fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
     Profile {
         name: name.to_owned(),

@@ -126,6 +126,20 @@ pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
         .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))
 }
 
+/// A per-crate layout override must not leave the toolchain identity keyed by the target's
+/// default layout. Refuse it before selecting a backend or reading stored code (#1621 M2).
+fn verify_target_data(target: &str, workspace: &base_db::CrateWorkspaceData) -> Result<(), String> {
+    let actual = workspace.target.as_ref().map_err(|error| error.to_string())?;
+    let keyed = blaze_lower::target_data(target).map_err(|error| error.to_string())?;
+    if actual != &keyed {
+        return Err(format!(
+            "target `{target}` has front-end data {actual:?}, but its codegen toolchain is keyed \
+             by {keyed:?}: the toolchain key must cover the crate's target data"
+        )); // alloc: an error naming both layouts
+    }
+    Ok(())
+}
+
 /// Where `unit`'s code runs: [`blaze_units::schema::runs_here`], the one rule, which the
 /// standard library's key reads too, so a std compiled for this machine's CPU and one for the
 /// target's baseline are two stds. Elsewhere is the target's baseline, as rustc's code.
@@ -902,6 +916,9 @@ pub(crate) fn generate<'db>(
 ) -> Result<Result<Parts, Refused>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let toolchain = toolchain(job, unit)?;
+    verify_target_data(triple(job, u), krate.workspace_data(reader.db())).map_err(|error| {
+        format!("unit {unit} (`{}` of {}), crate `{}`: {error}", u.target.name, u.pkg_id, krate.named(reader.db()))
+    })?; // alloc: an error's place
     // The process's code generator compiles for one toolchain: the first unit sets it up, and
     // a unit of another is refused here, naming both.
     hir_ty_codegen::v2::select(&toolchain)?;
