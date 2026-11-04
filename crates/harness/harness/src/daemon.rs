@@ -1,7 +1,7 @@
 //! harnessd: owns every agent PTY, mirrors each into a vt100 emulator (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{paths, profiles, proto, queries, web};
+use crate::{paths, profiles, proto, queries, runs, web};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -136,6 +136,9 @@ pub enum Req {
     Kill { id: u64 },
     Forget { id: u64 },
     Shutdown,
+    /// Shell runs with every pipeline stage's output stored: run, run_status, runs, run_read, run_kill, run_wait.
+    #[serde(untagged)]
+    Runs(runs::RunReq),
 }
 
 fn now_ms() -> u64 {
@@ -157,8 +160,8 @@ impl Daemon {
     ) -> Result<u64> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let sock = paths::sock();
-        let launch = profiles::launch(kind, &profiles::Ctx { session: id, sock: &sock, user_args: args, prompt })?;
         let cwd = cwd.unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        let launch = profiles::launch(kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: args, prompt })?;
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
         cmd.cwd(&cwd);
@@ -284,6 +287,7 @@ impl Daemon {
                 let _ = std::fs::remove_file(paths::sock());
                 std::process::exit(0);
             }
+            Req::Runs(r) => runs::handle(r)?,
             Req::Attach { .. } => unreachable!("attach is handled by the connection loop"),
         })
     }

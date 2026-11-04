@@ -5,9 +5,9 @@ import { table, Table } from "../table.ts";
 import { nuon } from "../nuon.ts";
 import { tasks, task, taskValue, wait } from "../tasks.ts";
 import { agents } from "../agents.ts";
-import { sh, procs, out, err, lines, kill, ptree } from "../proc.ts";
+import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo } from "../proc.ts";
 
-export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, agents };
+export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
 
 /** Shown in the MCP tool description so the model knows what it can call. */
 export const docs: Record<keyof typeof functions, string> = {
@@ -23,13 +23,16 @@ export const docs: Record<keyof typeof functions, string> = {
   task: "task(id: 't3' | 3): { id; status; code; started; elapsed_ms; logs: string[]; result: string } — snapshot of one cell; logs and result stay after it finishes.",
   taskValue: "taskValue(id): unknown — raw value of a finished cell's last expression (or its thrown error).",
   wait: "wait(id, timeoutMs?): Promise<task snapshot> — wait for a backgrounded cell; on timeout returns it still running.",
-  sh: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, maxBytes? = 8MB per stream (oldest lines dropped, line numbers kept), timeoutMs? }): Proc — spawn now (string runs via /bin/sh -c), return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id, pid, exit_code, signal, stdout, stderr }. Handle: id 'p1', pid, status running|exited|killed, kill(sig?).",
-  procs: "procs(): Table<{ id; pid; cmd; status; exit_code; started; elapsed_ms; stdout_bytes; stderr_bytes; truncated }> — all sh() processes, finished included.",
-  out: "out(p: 'p1' | pid | Proc, { from?, to?, tail?, new?: true, cursor? = 'default' }): string — stdout lines; from/to are 1-based inclusive line numbers, tail last N; new: only output since the previous read with that cursor (every read moves it to the end).",
-  err: "err(p, opts?): string — stderr, same options as out().",
+  sh: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, maxBytes? = 8MB per stream kept in memory (oldest lines dropped, line numbers kept), timeoutMs?, local?: true to bypass harnessd }): Proc — start now, return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id: 'p1', run: 'r12' | null, pid, exit_code, signal, stdout, stderr }. Runs through harnessd (bash) when it's up: the command is split at top-level ; && || and |, and the FULL stdout and stderr of EVERY pipeline stage is stored as run r12 stage 0, 1, ... readable later by any agent (`cargo clippy 2>&1 | head -n5` shows you 5 lines, clippy still runs to the end and stage(r, 0) has all of it — so pipe through head/tail/grep freely, nothing is lost). stdout here = last stage of each pipeline; stderr = every stage's. Falls back to a local Bun.spawn (run: null) when the daemon is down. Handle: id, run, pid, status running|exited|killed, kill().",
+  procs: "procs(): Table<{ id; run; pid; cmd; status; exit_code; started; elapsed_ms; stdout_bytes; stderr_bytes; truncated }> — this REPL's sh() processes, finished included.",
+  out: "out(p: 'p1' | 'r12' | pid | Proc, { from?, to?, tail?, new?: true, cursor? = 'default', stage? }): string — stdout lines; from/to are 1-based inclusive line numbers, tail last N; new: only output since the previous read with that cursor (every read moves it to the end). With stage: n | 'final' it returns Promise<string> of that stored stage (same as stage()).",
+  err: "err(p, opts?): string — stderr, same options as out() (stage too).",
   lines: "lines(p, 'stdout' | 'stderr' = 'stdout', opts?): Table<{ n; text }> — same options as out(), as numbered rows.",
-  kill: "kill(p, signal? = 'SIGTERM'): proc record.",
-  ptree: "ptree(): Promise<Table<{ pid; ppid; depth; proc: 'p1' | null; stat; etime; command (indented by depth) }>> — live process tree of everything this REPL spawned, grandchildren included (from ps).",
+  kill: "kill(p, signal? = 'SIGTERM'): proc record. harnessd runs: SIGTERM to the run's process group, SIGKILL after 3s.",
+  ptree: "ptree(): Promise<Table<{ pid; ppid; depth; proc: 'p1' | null; stat; etime; command (indented by depth) }>> — live process tree of everything this REPL spawned, grandchildren included, plus each live harnessd run's tree (from ps).",
+  runs: "runs({ all?: boolean, session?: number, limit? = 50 }): Promise<Table<{ id: 'r12'; session; status: running|exited|killed|lost; exit_code; stages: '0:0 1:running' (index:exit|status); cmd; cwd; started; elapsed_ms; out_bytes; err_bytes }>> — harnessd runs newest first: this agent's by default, every agent's with all: true (or one session's).",
+  stage: "stage(run: 'r12' | Proc, i: number | 'final' = 'final', { stream?: 'out' | 'err' = 'out', from?, to?, tail?, new?, cursor? }): Promise<string> — stored output of one pipeline stage of any agent's run (works while it runs: new: true tails it); 'final' = what the caller saw (stdout of each pipeline's last stage; stream 'err' = all stderr).",
+  runInfo: "runInfo(run: 'r12' | Proc): Promise<{ id; cmd; cwd; session; parent; status; exit_code; signal; start_ms; end_ms; pipelines: { op: ';'|'&&'|'||'|null; stages: number[] }[]; stages: Table<{ i; text; pipeline; pid; exit_code; signal; status: pending|running|done|skipped|unknown; start_ms; end_ms; stdout_bytes; stderr_bytes }>; procs?: live process tree while running }> — the run graph for one command.",
   agents:
     "agents — the harness agent tree (sessions shown in the harness web UI). agents.self() / agents.parent(): session ids; await agents.list() / agents.tree(): Table; await agents.spawn({ kind?: 'claude'|'codex'|'shell' = 'claude', prompt?, args?, cwd? }): id of a new child agent under this one; await agents.send(id, text, { submit? = true }): type a message into it (Enter pressed); await agents.notifyParent(text); await agents.screen(id): its screen as text; await agents.waitFor(id, textOrRegex, timeoutMs?); await agents.kill(id); await agents.url(id?): web UI link.",
 };

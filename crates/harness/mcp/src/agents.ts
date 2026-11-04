@@ -1,45 +1,13 @@
 // Talk to harnessd from the REPL: list the agent tree, spawn child agents (they appear in the
 // harness web UI and TUI under this agent), type into sessions, and read their screens.
 import { table, type Table } from "./table.ts";
-
-const T_JSON = 1;
-const SOCK = () => process.env.HARNESS_SOCK ?? `${process.env.HOME}/.harness/harnessd.sock`;
+import { req } from "./daemon.ts";
 
 export type Kind = "claude" | "codex" | "shell";
 export type AgentInfo = {
   id: number; kind: Kind; parent: number | null; title: string; cwd: string;
   exit: number | null; attached: number; cols: number; rows: number; created_ms: number;
 };
-
-/** One request/response over the daemon socket ([type u8][len u32 BE][payload] frames). */
-async function req<T = Record<string, unknown>>(body: object): Promise<T> {
-  const payload = new TextEncoder().encode(JSON.stringify(body));
-  const frame = new Uint8Array(5 + payload.length);
-  frame[0] = T_JSON;
-  new DataView(frame.buffer).setUint32(1, payload.length);
-  frame.set(payload, 5);
-  return new Promise<T>((resolve, reject) => {
-    let buf = new Uint8Array(0);
-    Bun.connect({
-      unix: SOCK(),
-      socket: {
-        open(s) { s.write(frame); },
-        data(s, chunk) {
-          const next = new Uint8Array(buf.length + chunk.length);
-          next.set(buf); next.set(chunk, buf.length); buf = next;
-          if (buf.length < 5) return;
-          const len = new DataView(buf.buffer, buf.byteOffset).getUint32(1);
-          if (buf.length < 5 + len) return;
-          s.end();
-          const v = JSON.parse(new TextDecoder().decode(buf.subarray(5, 5 + len)));
-          v.error ? reject(new Error(`harnessd: ${v.error}`)) : resolve(v as T);
-        },
-        error(_s, e) { reject(e); },
-        connectError(_s, e) { reject(new Error(`harnessd not reachable at ${SOCK()} (start it with ./harness): ${e.message}`)); },
-      },
-    });
-  });
-}
 
 const selfId = (): number | null => (process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null);
 
