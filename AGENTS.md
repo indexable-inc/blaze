@@ -70,8 +70,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     proving it right. Skill: `changing-code`.
 28. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-29. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
-    codegen, the store, the daemon and the runtime stay outside. Skill: `compiler-correctness`.
+29. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
+    (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
+    runtime stay outside. Skill: `compiler-correctness`.
 30. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
     `compiler-correctness`.

@@ -1,6 +1,6 @@
 ---
 name: compiler-correctness
-description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's salsa crates, keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
+description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
 ---
 
 # Compiler correctness
@@ -99,9 +99,12 @@ a test builds twice and compares bytes.
 ## semantics-in-front-end (rule 29)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
-hashes) go in the front end's salsa crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived
-from rust-analyzer but no longer synced with it), in a crate of their own where possible. Codegen,
-the store, the daemon, cargo integration and the runtime stay outside the front end.
+hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
+rust-analyzer but no longer synced with it), whose queries run on blaze's own engine
+(`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one
+view at a time; persisted, shared results go through blaze-kernel), in a crate of their own where
+possible. Codegen, the store, the daemon, cargo integration and the runtime stay outside the front
+end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
