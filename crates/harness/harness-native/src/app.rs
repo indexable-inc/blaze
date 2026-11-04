@@ -1734,7 +1734,8 @@ impl RowLooks {
                 "lost" => self.lost,
                 _ => self.clear,
             });
-            crate::look::breathe(d.entity(), status == "running");
+            // Breathing while its program writes, not merely while it lives: an idle shell draws nothing.
+            crate::look::breathe(d.entity(), status == "running" && o.has(model::Busy::id()));
         }
         let _ = self.failed;
     }

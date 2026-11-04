@@ -3,7 +3,8 @@
 //!
 //! - [`ensure_daemon`] connects, or starts `harness daemon` the way the CLI's `ensure_daemon` does (setsid, output appended
 //!   to `~/.harness/daemon.log`) and waits for the socket.
-//! - A poll thread asks `list` every [`POLL`] (the daemon pushes no list changes) and sends the world [`Msg::List`].
+//! - A list thread asks `list` and `runs` and sends the world [`Msg::List`] and [`Msg::Runs`]: again each time the
+//!   daemon's change feed (`watch`) says something changed, or every [`POLL`] against an older daemon without one.
 //! - Each attached object has a thread reading its stream (`attach`: a JSON ok, the snapshot, then live bytes and the
 //!   exit) into [`Msg::Data`] and [`Msg::Exit`]; its write half takes the keyboard (`T_DATA`) and resizes (`T_RESIZE`).
 use harness_native_model::{LinkState, Msg};
@@ -120,6 +121,22 @@ pub fn ensure_daemon() -> Result<(), String> {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Open the daemon's change feed: `watch` answers ok, then sends a JSON event each time its sessions or runs change.
+/// None when the daemon has no such op (an older one) or is not there.
+fn watch_feed() -> Option<UnixStream> {
+    let mut s = UnixStream::connect(sock()).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    write_frame(&mut s, T_JSON, json!({"op": "watch"}).to_string().as_bytes()).ok()?;
+    let (t, body) = read_frame(&mut s).ok()??;
+    let v: Value = serde_json::from_slice(&body).ok()?;
+    if t != T_JSON || v.get("ok").is_none() {
+        return None;
+    }
+    // Events come only on a change: wait for them as long as it takes.
+    s.set_read_timeout(None).ok()?;
+    Some(s)
+}
+
 /// Long-poll `run_read` on one `stream` of run `r{run}` from the start, handing each answer to `got`, while `live()`;
 /// until the run is done and read to the end. False when the daemon refused the stream (no chunk index for
 /// "ordered"), so the caller reads it another way.
@@ -191,6 +208,9 @@ impl Link {
             .name("harness-list".into())
             .spawn(move || {
                 let mut up = None;
+                // The daemon's change feed (`watch`), while it is open; None against a daemon without one (it is polled).
+                let mut feed: Option<UnixStream> = None;
+                let mut polled = false;
                 loop {
                     let asked = std::time::Instant::now();
                     let state = match request(&json!({"op": "list"})) {
@@ -231,8 +251,32 @@ impl Link {
                         up = Some(state);
                     }
                     wake();
-                    // Woken early by a spawn or a kill, so the tree follows at once.
-                    let _ = poked.recv_timeout(POLL);
+                    if state != LinkState::Up {
+                        // A daemon that comes back may be a newer one: try its feed again.
+                        (feed, polled) = (None, false);
+                        let _ = poked.recv_timeout(POLL);
+                        continue;
+                    }
+                    // The daemon pushes a change event (a session or run came, went, or changed its status, title or
+                    // busyness): ask for the list again only then. Its events coalesce, so a burst asks once.
+                    if feed.is_none() && !polled {
+                        feed = watch_feed();
+                        polled = feed.is_none();
+                        if feed.is_some() {
+                            // Ask once more: a change made before the feed opened is in this answer.
+                            continue;
+                        }
+                    }
+                    match feed.as_mut() {
+                        Some(s) => match read_frame(s) {
+                            Ok(Some((T_JSON, _))) => {}
+                            _ => feed = None,
+                        },
+                        None => {
+                            // An older daemon: poll, woken early by a spawn or a kill so the tree follows at once.
+                            let _ = poked.recv_timeout(POLL);
+                        }
+                    }
                     while poked.try_recv().is_ok() {}
                 }
             })
@@ -459,7 +503,7 @@ impl Link {
             if let Err(e) = request(&json!({"op": "kill", "id": id})) {
                 eprintln!("harness-native: kill {id}: {e}");
             }
-            std::thread::sleep(Duration::from_millis(150));
+            // The daemon pushes the exit when it comes; an older one is polled again now.
             let _ = poke.send(());
         });
     }

@@ -15,6 +15,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
+/// The tree's generation: bumped whenever a session or run comes, goes, or changes what `list`/`runs` say of it that a
+/// client draws (status, title, busy). `watch` clients get an event per change (coalesced), instead of polling.
+static CHANGES: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> = std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Something `list` or `runs` reports changed: tell the `watch` clients.
+pub fn changed() {
+    CHANGES.send_modify(|g| *g = g.wrapping_add(1));
+}
+
+/// A session is busy while its program wrote output in the last this many milliseconds.
+const BUSY_MS: u64 = 1500;
+
 #[derive(Clone, Debug)]
 pub enum Ev {
     Data(Bytes),
@@ -43,6 +55,9 @@ pub struct Session {
     /// `kill` was asked for (a shell that catches SIGHUP exits with a plain code, not by the signal).
     killed: AtomicBool,
     pub attached: AtomicUsize,
+    /// When its program last wrote output (ms since the epoch), and whether `list` last said it was busy.
+    last_out: AtomicU64,
+    busy: AtomicBool,
 }
 
 impl Session {
@@ -87,7 +102,23 @@ impl Session {
             "argv": self.argv, "created_ms": self.created_ms, "exit": *self.exit.lock().unwrap(),
             "status": ended.map_or("running", |(s, _)| s), "ended_ms": ended.map(|(_, ms)| ms),
             "attached": self.attached.load(Ordering::Relaxed), "cols": cols, "rows": rows,
+            "busy": self.busy.load(Ordering::Relaxed),
         })
+    }
+
+    /// Output came: busy now (a change when it was not).
+    fn wrote(&self) {
+        self.last_out.store(now_ms(), Ordering::Relaxed);
+        if !self.busy.swap(true, Ordering::Relaxed) {
+            changed();
+        }
+    }
+
+    /// No output for [`BUSY_MS`]: not busy any more (a change when it was).
+    fn settle(&self, now: u64) {
+        if self.busy.load(Ordering::Relaxed) && now.saturating_sub(self.last_out.load(Ordering::Relaxed)) >= BUSY_MS && self.busy.swap(false, Ordering::Relaxed) {
+            changed();
+        }
     }
 
     pub fn kill(&self) {
@@ -124,6 +155,10 @@ pub enum Req {
         rows: Option<u16>,
     },
     Attach { id: u64, cols: Option<u16>, rows: Option<u16> },
+    /// The change feed: an ok, then `{"ev":"changed","gen":N}` each time `list` or `runs` would answer differently
+    /// (sessions or runs come, go, or change status, title or busy), coalesced to at most 20 a second. Like `attach`
+    /// it holds the connection; any frame from the client ends it.
+    Watch,
     /// Type into a session. `submit` (default true) presses Enter afterwards; text goes in as a
     /// bracketed paste so multi-line messages arrive as one input. `raw` writes bytes verbatim.
     Send {
@@ -242,8 +277,10 @@ impl Daemon {
             term: Mutex::new(harness_vt::Term::new(if cols == 0 { 80 } else { cols }, if rows == 0 { 24 } else { rows }, 10_000)),
             writer: Mutex::new(writer), master: Mutex::new(pair.master), killer: Mutex::new(killer),
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
+            last_out: AtomicU64::new(0), busy: AtomicBool::new(false),
         });
         self.sessions.lock().unwrap().insert(id, session.clone());
+        changed();
 
         let s = session.clone();
         std::thread::Builder::new().name(format!("pty-read-{id}")).spawn(move || {
@@ -257,14 +294,22 @@ impl Daemon {
                 if let Err(e) = raw.write_all(&buf[..n]) {
                     eprintln!("session {id} pty stream: {e}");
                 }
-                let f = {
+                // An OSC in the chunk may set the title `list` reports: compare it around the feed (only then).
+                let osc = buf[..n].windows(2).any(|w| w == b"\x1b]");
+                let (f, retitled) = {
                     let mut term = s.term.lock().unwrap();
+                    let before = osc.then(|| term.title());
                     let f = queries::filter(&buf[..n], &mut term);
                     if !f.out.is_empty() {
                         let _ = s.tx.send(Ev::Data(Bytes::from(f.out.clone())));
                     }
-                    f
+                    let retitled = before.is_some_and(|b| b != term.title());
+                    (f, retitled)
                 };
+                s.wrote();
+                if retitled {
+                    changed();
+                }
                 if !f.replies.is_empty() {
                     let _ = s.write(&f.replies);
                 }
@@ -279,6 +324,7 @@ impl Daemon {
             let ended = now_ms();
             *s.ended.lock().unwrap() = Some((status, ended));
             *s.exit.lock().unwrap() = Some(code);
+            changed();
             let _ = s.tx.send(Ev::Exit(code));
             db::session_end(s.id, code, status, ended);
             archive::compact_bg(format!("s{}", s.id));
@@ -300,6 +346,7 @@ impl Daemon {
             }
             Req::ReplTask { task } => {
                 db::repl_task(&task)?;
+                changed();
                 json!({ "ok": true })
             }
             Req::Info => json!({ "pid": std::process::id(), "sock": paths::sock() }),
@@ -342,6 +389,7 @@ impl Daemon {
                     s.kill();
                 }
                 self.sessions.lock().unwrap().remove(&id);
+                changed();
                 json!({ "ok": true })
             }
             Req::Shutdown => {
@@ -352,7 +400,7 @@ impl Daemon {
                 std::process::exit(0);
             }
             Req::Runs(r) => runs::handle(r)?,
-            Req::Attach { .. } => unreachable!("attach is handled by the connection loop"),
+            Req::Attach { .. } | Req::Watch => unreachable!("attach and watch are handled by the connection loop"),
         })
     }
 }
@@ -375,6 +423,28 @@ pub async fn run() -> Result<()> {
     });
     std::thread::spawn(messages::poll);
     let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(next), last: Mutex::new(None) });
+    // What no event marks: a session going quiet (busy after BUSY_MS without output), and a live run's pipeline stages
+    // starting and ending (their tee helpers write the stage files, not this process): looked at in memory here, and
+    // `watch` clients told only when something did change (stages: while a run is live).
+    {
+        let d = d.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut n = 0u64;
+            loop {
+                tick.tick().await;
+                n += 1;
+                let now = now_ms();
+                let sessions: Vec<Arc<Session>> = d.sessions.lock().unwrap().values().cloned().collect();
+                for s in sessions {
+                    s.settle(now);
+                }
+                if n % 2 == 0 && runs::any_live() {
+                    changed();
+                }
+            }
+        });
+    }
     std::fs::write(paths::info(), json!({ "pid": std::process::id(), "sock": sock }).to_string())?;
     eprintln!("harnessd pid {} socket {}", std::process::id(), sock.display());
     loop {
@@ -416,12 +486,36 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             proto::write_json(&mut w, &json!({ "ok": true, "info": s.info() })).await?;
             return attach(s, r, w).await;
         }
+        if let Req::Watch = req {
+            proto::write_json(&mut w, &json!({ "ok": true })).await?;
+            return watch(r, w).await;
+        }
         let d2 = d.clone();
         let resp = tokio::task::spawn_blocking(move || d2.handle(req)).await?;
         let v = resp.unwrap_or_else(|e| json!({ "error": format!("{e:#}") }));
         proto::write_json(&mut w, &v).await?;
     }
     Ok(())
+}
+
+/// A `watch` connection: an event per change of the tree's generation, at most one each 50 ms (a burst of changes is
+/// one event, sent after the burst's first), until the client sends anything or goes.
+async fn watch(mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let mut rx = CHANGES.subscribe();
+    rx.mark_unchanged();
+    loop {
+        tokio::select! {
+            c = rx.changed() => {
+                if c.is_err() {
+                    return Ok(());
+                }
+                let generation = *rx.borrow_and_update();
+                proto::write_json(&mut w, &json!({ "ev": "changed", "gen": generation })).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            _ = proto::read_frame(&mut r) => return Ok(()),
+        }
+    }
 }
 
 async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {

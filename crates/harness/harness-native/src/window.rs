@@ -24,7 +24,7 @@ use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::{CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CAMetalLayer, kCAGravityTopLeft};
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const INITIAL: (f64, f64) = (1180.0, 760.0);
 /// Frame rates: while anything moves, and while only a running dot breathes.
@@ -84,21 +84,28 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 fn wake() {
+    ASLEEP.store(false, Ordering::SeqCst);
     with(|st| st.link.setPaused(false));
 }
 
-/// A wake the daemon's threads may call: it reaches the main thread once per burst.
+/// The display link is paused (the app went idle): the next daemon message must wake it. While it runs, each frame
+/// drains the daemon's messages itself, so the daemon's threads leave the main thread alone.
+static ASLEEP: AtomicBool = AtomicBool::new(false);
+/// Daemon messages posted so far (a frame that would pause checks none came since it began draining).
+static POSTED: AtomicU64 = AtomicU64::new(0);
+
+/// A wake the daemon's threads call after each message: it reaches the main thread only when the display link sleeps,
+/// once per sleep. Messages that come while frames run are drained by the next frame (at most one apply a vsync).
 fn wake_from_any_thread() -> Arc<dyn Fn() + Send + Sync> {
-    let pending = Arc::new(AtomicBool::new(false));
     Arc::new(move || {
-        if pending.swap(true, Ordering::AcqRel) {
+        POSTED.fetch_add(1, Ordering::SeqCst);
+        if !ASLEEP.swap(false, Ordering::SeqCst) {
             return;
         }
-        let p = pending.clone();
+        // Only unpause: the frame drains the message and draws on if it changed anything (`daemon`), else sleeps again.
         DispatchQueue::main().exec_async(move || {
-            p.store(false, Ordering::Release);
             with(|st| {
-                st.app.poke_why("wake");
+                framelog::wake(st.link.isPaused(), st.window.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible));
                 st.link.setPaused(false);
             });
         });
@@ -564,10 +571,16 @@ impl HarnessView {
     }
 
     fn frame(&self, update: &CAMetalDisplayLinkUpdate) {
+        let entered = objc2_quartz_core::CACurrentMediaTime();
+        self.frame_into(Dest::Drawable(update.drawable()), entered, update.targetTimestamp(), update.targetPresentationTimestamp());
+    }
+
+    /// One frame drawn into `dest`, for the display time `t` (presented at `present`); `entered` when the clock called.
+    fn frame_into(&self, dest: Dest, entered: f64, t: f64, present: f64) {
+        // Before this frame drains the daemon's messages: any posted after it may not have been drained.
+        let seen = POSTED.load(Ordering::SeqCst);
         let points = self.bounds().size;
         let backing = self.convertSizeToBacking(points).width / points.width.max(1.0);
-        let drawable = update.drawable();
-        let t = update.targetTimestamp();
         // The keys were loaded again (the user's keys.flecs changed): the menu bar follows.
         let menu = with(|st| (st.app.keys_gen() != st.menu_gen).then(|| {
             st.menu_gen = st.app.keys_gen();
@@ -582,7 +595,9 @@ impl HarnessView {
             st.last = Some(t);
             let renderer = &st.renderer;
             let draw = st.app.frame((points.width as f32, points.height as f32), backing as f32, dt, &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b));
-            st.renderer.render(&draw, Dest::Drawable(drawable));
+            let built = objc2_quartz_core::CACurrentMediaTime();
+            st.renderer.render(&draw, dest);
+            framelog::note(entered, t, present, built, objc2_quartz_core::CACurrentMediaTime(), f32::from_bits(st.renderer.gpu_clock().load(Ordering::Relaxed)));
             if st.app.title != st.title {
                 st.title.clone_from(&st.app.title);
                 st.window.setTitle(&NSString::from_str(&st.title));
@@ -600,6 +615,13 @@ impl HarnessView {
                 }
                 (true, true) => {}
                 (true, false) => {
+                    // Asleep first, then a last look: a message posted since this frame began either shows here (draw
+                    // once more) or finds ASLEEP set and wakes the link itself.
+                    ASLEEP.store(true, Ordering::SeqCst);
+                    if POSTED.load(Ordering::SeqCst) != seen {
+                        ASLEEP.store(false, Ordering::SeqCst);
+                        return;
+                    }
                     st.link.setPaused(true);
                     st.last = None;
                     if st.app.stats_arm() {
@@ -613,6 +635,72 @@ impl HarnessView {
                 (false, _) => {}
             }
         });
+    }
+}
+
+/// `HARNESS_NATIVE_BENCH_HZ=<hz>`: frames from a main-run-loop timer at `hz` into an offscreen texture instead of the
+/// display link, while the link is unpaused (as the link would call). For measuring frame pacing where no display link
+/// calls (a locked screen, an occluded window): the timer is a run-loop source like the link, so whatever keeps the main
+/// thread busy delays it the same way.
+fn bench_clock(view: &Retained<HarnessView>, hz: f64) {
+    let view = view.clone();
+    let tex: RefCell<Option<gpu::Tex>> = RefCell::new(None);
+    let last = std::cell::Cell::new(0.0f64);
+    let block = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+        let Some((paused, texture)) = with(|st| {
+            let size = st.layer.drawableSize();
+            let (w, h) = (size.width.max(1.0) as usize, size.height.max(1.0) as usize);
+            let mut tex = tex.borrow_mut();
+            if tex.as_ref().is_none_or(|t| objc2_metal::MTLTexture::width(&**t) != w || objc2_metal::MTLTexture::height(&**t) != h) {
+                *tex = Some(st.renderer.offscreen(w, h));
+            }
+            // At the rate the link is asked for (the calm rate while only a dot breathes), as the link would call.
+            let want = f64::from(st.link.preferredFrameRateRange().preferred).clamp(1.0, hz);
+            (st.link.isPaused() || objc2_quartz_core::CACurrentMediaTime() - last.get() < 1.0 / want - 0.5 / hz, tex.clone().unwrap())
+        }) else {
+            return;
+        };
+        if paused {
+            return;
+        }
+        let now = objc2_quartz_core::CACurrentMediaTime();
+        last.set(now);
+        view.frame_into(Dest::Texture(texture), now, now + 1.0 / hz, now + 2.0 / hz);
+    });
+    // SAFETY: the block runs on the main thread (a main-run-loop timer) and touches only main-thread state.
+    let timer = unsafe { objc2_foundation::NSTimer::timerWithTimeInterval_repeats_block(1.0 / hz, true, &block) };
+    // SAFETY: the main run loop, common modes.
+    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+}
+
+/// `HARNESS_NATIVE_FRAMELOG=<path>`: one line a display-link callback (media-time seconds: entered, target, target
+/// presentation, app frame built, render returned; then the last GPU time in ms), for measuring the frame clock against real timestamps.
+mod framelog {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static LOG: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    static WAKES: Mutex<(f64, u32)> = Mutex::new((0.0, 0));
+    /// A daemon wake reached the main thread: once a second, how many came, whether the link was paused, and whether the
+    /// window is visible (an occluded window's display link stops calling).
+    pub fn wake(paused: bool, visible: bool) {
+        if std::env::var_os("HARNESS_NATIVE_FRAMELOG").is_none() {
+            return;
+        }
+        let now = objc2_quartz_core::CACurrentMediaTime();
+        let mut w = WAKES.lock().unwrap();
+        w.1 += 1;
+        if now - w.0 >= 1.0 {
+            eprintln!("framelog: {now:.3} wakes={} paused={paused} visible={visible}", w.1);
+            *w = (now, 0);
+        }
+    }
+    pub fn note(entered: f64, target: f64, present: f64, built: f64, rendered: f64, gpu_ms: f32) {
+        let log = LOG.get_or_init(|| std::env::var_os("HARNESS_NATIVE_FRAMELOG").and_then(|p| std::fs::File::create(p).ok()).map(|f| Mutex::new(std::io::BufWriter::new(f))));
+        if let Some(l) = log {
+            let mut w = l.lock().unwrap();
+            let _ = writeln!(w, "{entered:.6} {target:.6} {present:.6} {built:.6} {rendered:.6} {gpu_ms:.3}");
+            let _ = w.flush();
+        }
     }
 }
 
@@ -739,8 +827,13 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     link.setDelegate(Some(ProtocolObject::from_ref(&*view)));
     link.setPreferredFrameRateRange(LIVE);
     link.setPreferredFrameLatency(1.0);
-    // SAFETY: the main run loop and the common modes (frames keep coming during live resize and tracking).
-    unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
+    let bench = std::env::var("HARNESS_NATIVE_BENCH_HZ").ok().and_then(|s| s.parse::<f64>().ok()).filter(|hz| *hz > 0.0);
+    if let Some(hz) = bench {
+        bench_clock(&view, hz);
+    } else {
+        // SAFETY: the main run loop and the common modes (frames keep coming during live resize and tracking).
+        unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
+    }
 
     let mut app = App::new(wake_from_any_thread())?;
     app.set_gpu_clock(renderer.gpu_clock());
@@ -782,6 +875,12 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
         }
     }
     window.center();
+    // `HARNESS_NATIVE_FRAME=x,y,w,h` (points, from the main screen's top left): where the window goes, for measuring the
+    // frame clock in a corner no other window covers (an occluded window's display link stops calling).
+    if let Some([x, y, w, h]) = std::env::var("HARNESS_NATIVE_FRAME").ok().and_then(|v| v.split(',').map(|p| p.trim().parse::<f64>().ok()).collect::<Option<Vec<_>>>()).and_then(|v| <[f64; 4]>::try_from(v).ok()) {
+        let top = objc2_app_kit::NSScreen::mainScreen(mtm).map_or(0.0, |s| s.frame().size.height);
+        window.setFrame_display(NSRect::new(NSPoint::new(x, top - y - h), NSSize::new(w, h)), false);
+    }
     window.makeFirstResponder(Some(&view));
     if no_activate() {
         window.orderBack(None);
