@@ -46,6 +46,8 @@ exclude = [
     # is its wasm implementation, built only there (vendor/libzstd-rs-sys/SOURCE.md).
     "vendor/zstd-sys",
     "vendor/libzstd-rs-sys",
+    # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
+    "vendor/corosensei",
 ]
 resolver = "2"
 
@@ -258,6 +260,9 @@ wasmtime = { path = "vendor/wasmtime" }
 # rsasm's master after 0.1.3, which has aarch64's exclusive and LSE atomics that compiler_builtins'
 # outline atomics are written in (vendor/rsasm/SOURCE.md).
 rsasm = { path = "vendor/rsasm" }
+# For one release: its trampolines assembled from .S by cc, not `global_asm!`, which stage 0 drops
+# (#1659); removed when stage 0 is a release built after 8498b0dfc1 (vendor/corosensei/SOURCE.md).
+corosensei = { path = "vendor/corosensei" }
 
 [workspace.dependencies]
 # local crates
