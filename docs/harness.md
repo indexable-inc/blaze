@@ -19,6 +19,60 @@ may still time cargo as their baseline.
 There are also Rust unit tests in `crates/blaze-engine` and in the code generator; the harnesses
 are what carries the weight.
 
+## Real projects: the verdict
+
+blaze is judged by building big real Rust workspaces with blaze and running their own test
+suites ([AGENTS.md](../AGENTS.md), verify-on-real-projects): a project whose tests pass under
+blaze is correct for what they cover, and every failure is a blaze bug. No rustc and no cargo
+run: the projects are fetched by git and built and tested by blaze alone, and nothing is
+compared with another compiler's output. `harness/v2/realprojects.py` does it:
+
+    uv run --frozen python harness/v2/realprojects.py run '{"out": "/tmp/rp"}'
+    uv run --frozen python harness/v2/realprojects.py run '{"out": "/tmp/rp", "projects": ["ripgrep", "tokio"], "baseline": "/tmp/rp-last/result.json"}'
+    uv run --frozen python harness/v2/realprojects.py run '{"out": "/tmp/rp", "where": "ix", "projects": ["bevy"]}'
+    uv run --frozen python harness/v2/realprojects.py merge '{"results": ["a/result.json", "b/result.json"], "out": "/tmp/rp"}'
+    uv run --frozen python harness/v2/realprojects.py selftest
+
+The corpus is the `workspaces` of `harness/v2/corpus.json` (its shape in `harness/v2/pins.py`,
+shared with `corpus.py`'s crates.io crates): blaze itself first, at the run's `commit`, then
+ripgrep, nushell, helix, wasmtime, rust-analyzer, cargo, bevy, tokio, serde, rayon, regex,
+hyper and polars, each at a commit and that commit's git tree id. A fetch whose commit or tree
+is another is refused; wasmtime's submodules come at the commits its tree pins. Where blaze_cli.py
+pins the same project it pins the same commit (the selftest holds them together). A project
+that commits its `Cargo.lock` builds with it; for one that does not (bevy, tokio, serde, rayon,
+regex, hyper) the lock is the harness's, `harness/v2/locks/<name>.Cargo.lock`, so two runs
+build the same dependencies. Until it is committed that project stops at its `lock` step; a run
+with `"write_locks": true` has blaze resolve it and writes it there.
+
+For each project, `jobs` at a time, the longest first, each with a daemon home of its own
+(its `toolchains` linked to the machine's, as `BLAZE_HOME` moves them too):
+
+| Step | What it does and records |
+|---|---|
+| `fetch` | `git fetch --depth 1` of the commit into a sources directory kept between runs, checked against the pin, then a block-cloned copy |
+| `lock` | the project's `Cargo.lock` or the harness's; either is built `--locked` |
+| `tree` | the exact tree (rule measure-the-exact-tree): the BLAKE3 of every file of the copy, the lock's sha256 and the blaze binary's BLAKE3 |
+| `build` | `blaze build --workspace --all-targets --message-format=json`: units built, and each unit that failed with blaze's error |
+| `test` | `blaze test --workspace --no-fail-fast --message-format=json`, after a failed build too: each test passed, failed or ignored, the panic of each failure, and each test executable that crashed or never built (`blaze-unchecked`) |
+
+Each step is bounded (the workspace's `minutes` for the build and the tests), and one the
+harness could not finish names the step, the command, its exit status and the end of what it
+printed. Failures are grouped into clusters by blaze's error with numbers, paths and hashes
+taken out, so one bug that fails 300 tests is one row. The run writes `result.json` (every
+test's outcome, every failure, the trees, the wall times), `report.md` (a table of all
+projects, then per project its steps and its top build and test clusters) and
+`logs/<project>/<step>.log`. Against a `baseline` (an earlier `result.json`) each project at the
+same commit and lock lists the tests and units that newly broke and those that got fixed. The
+exit status is 1 when the harness could not finish a project or something newly broke (with
+`strict`, when anything failed).
+
+It runs on the Mac or, with `"where": "ix"`, in one ix VM per project: this repository's commit
+goes over as a bundle, the release of blaze `vm.blaze` names (else `.github/blaze-version`) is
+installed by `site/install.sh`, and the project's out directory comes back under `vm/<name>/`.
+`realprojects.yaml` runs every workspace daily (and by hand with a list), one job each on the
+stage 0 blaze (`.github/actions/blaze`), then merges them and diffs against the last scheduled
+run's result.
+
 ## What runs against v2 today
 
 Since 2026-10-30 the blaze under test is v2's `blaze` (`crates/blaze-engine/src/program.rs` in
@@ -359,7 +413,7 @@ harness/v2/<script>.py '<json>'`. They are not in CI yet.
 |---|---|
 | `proof.py '{"engine": ..., "out": DIR}'` | Runs every check below with one engine (or those `checks` names, each with its own `given` input), and writes `DIR/report.json` and `DIR/report.md`: a line per check, the budgets as a table, every outcome that did not pass |
 | `oracle.py run '{"engine": ...}'` | The invalidation oracle. Random edit sequences over `fixture.py`'s three-crate workspace, one slot per kind of edit of [v2/items.md](v2/plan/lanes/items.md) section 6, plus fixed sequences for [#906](https://github.com/indexable-inc/blaze/issues/906), [#1325](https://github.com/indexable-inc/blaze/issues/1325), [#1326](https://github.com/indexable-inc/blaze/issues/1326) and [#805](https://github.com/indexable-inc/blaze/issues/805). The slots cover bodies, signatures, impls, renames, moves, formatting, comments, cfgs, features, closure captures, `include_str!` inputs deleted, literal whitespace, names `type_name` and `module_path!` read, positions `line!` and `#[track_caller]` read, and the environment. After every edit, a daemon kept for the sequence must build what a daemon with an empty home and a std-only store builds of the same source: the same errors, program output and tests, and on v2 the same output bytes, codegen inputs and query trace (compared by `crates/blaze-v2-proof`). A state `fixture.py` marks as one Rust refuses has to be refused by both builds (`refuses/...`). An edit [v2/plan/targets.md](v2/plan/goals/targets.md) says compiles nothing (formatting, comments, renames and moves nothing reads, `PATH`) fails if it compiles anything. Findings land in `found/`, reduced, and `oracle.py replay` builds them again |
-| `corpus.py` | blaze, nushell, ripgrep, helix and the 52 pinned crates.io crates of `corpus.json` (each `.crate` checked against the sparse index's checksum), built, run and tested by blaze: each build exits 0, each run exits 0, and each test passes by its own verdict (`blaze_cli.test_verdict`) unless the project's `OPEN` list names it; the backends are held to each other |
+| `corpus.py` | blaze, nushell, ripgrep, helix and the 52 pinned crates.io crates of `corpus.json` (each `.crate` checked against the sparse index's checksum), built, run and tested by blaze: each build exits 0, each run exits 0, and each test passes by its own verdict (`blaze_cli.test_verdict`) unless the project's `OPEN` list names it; the backends are held to each other. It still resolves each project with `cargo fetch`, a no-rustc bug; whole workspaces are [realprojects.py's](#real-projects-the-verdict) |
 | `frontend/cases.py` | The front end's cases under `frontend/cases/<area>/`, each held to its own header: `//@ expect: reject KEYS` has blaze give exactly those errors, `accept` none, and an accepted program exits 0 (or panics, with `//@ run: panic`) and prints its `.stdout` when one is beside it. `rejects/` holds the cases of [#1522](https://github.com/indexable-inc/blaze/issues/1522) and [#1440](https://github.com/indexable-inc/blaze/issues/1440); `bodies-cache/` is built twice on one store, the second serving each dependency from it |
 | `determinism.py` | Two cold builds at the same path, pinned to different core counts (Linux), dev and release, of pinned projects and the oracle's fixture, must be byte for byte the same |
 | `worktree_keys.py` | `a_second_checkout_at_another_path_reuses_every_key` (after kache's benchmark): one commit of ripgrep copied to checkouts at three paths and built in order by one daemon with one store, A from an empty store. B and C must compile nothing A compiled: every unit `fresh`, every build-script run found and naming only its own checkout's places, no `macro expand` span and no `compiled` macro module in their builds' history, the same `codegen-inputs`. C tells the portable keys' first-use verification apart from a key that differs. Naming each function B compiled with its key's parts needs `blaze-keys` lines blaze does not print yet, an error until it does |
@@ -621,7 +675,7 @@ A failure joins the list only with an owner and a cause, in the change that expl
 commits the tables and the README's numbers to main. It runs a platform only once the
 repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)).
 `bench.yaml` (the store's microbenchmarks, two minutes) runs on pull requests and pushes too.
-`bench-bun.yaml` and `live-latency.yaml` keep
+`bench-bun.yaml`, `live-latency.yaml` and `realprojects.yaml` ([Real projects](#real-projects-the-verdict)) keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on
 them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which
