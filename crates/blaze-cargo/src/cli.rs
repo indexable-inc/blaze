@@ -99,7 +99,7 @@ Commands:
     explore [--dev] [--print]      The explorer: the daemon's builds and spans at https://ix.dev/explore
     debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
     debug live                     The daemon's threads as they run
-    debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
+    debug sql QUERY                SQL over the profile history, flushed first (every row recorded so far)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now

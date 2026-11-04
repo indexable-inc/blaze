@@ -761,16 +761,16 @@ impl Session {
             }
             Request::Explore { .. }
             | Request::Live
-            | Request::Sql { .. }
+            | Request::Flush
             | Request::Gc { .. }
             | Request::Rebuilt { .. }
             | Request::Launch { .. }
             | Request::FetchUrl { .. } => {
                 return Err(ApiError::new(
-                    "the explorer, the live feed, live SQL, the collector, the last build's \
-                     reasons, the dev runs' launches and fetches by digest are answered by the \
-                     daemon's loop, which holds their servers, feeds, collector, reasons, programs \
-                     and store; this one handed the request on instead",
+                    "the explorer, the live feed, the profile history's flush, the collector, the \
+                     last build's reasons, the dev runs' launches and fetches by digest are \
+                     answered by the daemon's loop, which holds their servers, feeds, history, \
+                     collector, reasons, programs and store; this one handed the request on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -1107,7 +1107,7 @@ fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Explore { .. } => "blaze explore",
         Request::Live => "blaze debug live",
-        Request::Sql { .. } => "blaze debug sql --live",
+        Request::Flush => "a read of the profile history",
         Request::Gc { .. } => "blaze cache gc",
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",

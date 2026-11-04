@@ -7,7 +7,7 @@ use arrow_array::RecordBatch;
 use super::{BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, QueryCount, Recorder, Report, SpanKind, ThreadName, analyse};
 use crate::time::{
     Model, TimeError,
-    load::{Source, get, ints, query, query_many, texts, uints},
+    load::{Source, get, ints, query, query_many_in, texts, uints},
     path,
 };
 
@@ -92,7 +92,15 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, proces
     }
     // alloc: the queries' text, once a report
     let asked: Vec<&str> = sqls.iter().map(String::as_str).collect();
-    let answers = query_many(source, &asked, "reading the build's row, threads, spans by name, misses, query counts, memory and recorder")?;
+    // Every file, not the build's alone ([`crate::sql::Scope::Build`]): the memory and the
+    // recorder's counts take the last counter before the build's window, which a file of no
+    // build before the window holds.
+    let answers = query_many_in(
+        source,
+        crate::sql::Scope::All,
+        &asked,
+        "reading the build's row, threads, spans by name, misses, query counts, memory and recorder",
+    )?;
     let answer = |i: usize| answers.get(i).map(Vec::as_slice).unwrap_or_default();
     Ok(Facts {
         build: build_row(answer(0), build)?,

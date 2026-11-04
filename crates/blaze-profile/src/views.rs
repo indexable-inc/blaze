@@ -7,11 +7,14 @@ use std::{fmt, fmt::Write as _, path::Path};
 
 use serde_json::{Map, Value};
 
-use crate::schema;
+use crate::{
+    history::manifest::{Manifest, Scope},
+    schema,
+};
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
 /// `fiber_stacks`, `job_waits`, `job_spans` and `span_sums`. Each
-/// `@<table>` in it is a list of globs, filled in by [`prelude`].
+/// `@<table>` in it is the list of that table's files, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
 const EXAMPLES: &str = include_str!("../sql/examples.sql");
@@ -203,8 +206,11 @@ pub enum ViewError {
     /// `$<name>` in the view's SQL, or `@<name>` in the prelude, that names no argument or
     /// table: a bug in the SQL files.
     Undeclared { view: &'static str, name: String },
-    /// A directory a glob can't be made of.
+    /// A directory a file's path can't be said in of.
     BadPath { path: String, why: &'static str },
+    /// A file the manifest lists whose schema's version this blaze can't read as its own
+    /// ([`schema::readable`]).
+    Version { file: String, version: u32, why: &'static str },
 }
 
 impl ViewError {
@@ -213,7 +219,7 @@ impl ViewError {
         match self {
             ViewError::NoSuchView { .. } => "no_such_view",
             ViewError::UnknownArg { .. } | ViewError::MissingArg { .. } | ViewError::BadArg { .. } => "bad_args",
-            ViewError::Undeclared { .. } | ViewError::BadPath { .. } => "sql",
+            ViewError::Undeclared { .. } | ViewError::BadPath { .. } | ViewError::Version { .. } => "sql",
         }
     }
 }
@@ -248,6 +254,9 @@ impl fmt::Display for ViewError {
                 write!(f, "the SQL of {view} names `{name}`, which is no argument or table of it")
             }
             ViewError::BadPath { path, why } => write!(f, "the directory {path} {why}"),
+            ViewError::Version { file, version, why } => {
+                write!(f, "the history's file {file} is of schema version {version}, and this blaze's is {}: {why}", schema::VERSION)
+            }
         }
     }
 }
@@ -362,27 +371,31 @@ pub(crate) fn quote(text: &str, out: &mut String) {
     out.push('\'');
 }
 
-/// [`PRELUDE`] reading each table from `<dir>/*.<table>.parquet` of every directory of `dirs`,
-/// then each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name
-/// (the latest build, the default limit), so a query can say `FROM uncovered_time`. Other
-/// arguments take `blaze explain <view> <args>`.
-pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
-    // alloc: the prelude, once a query
-    let mut globs: Vec<&str> = Vec::with_capacity(dirs.len());
-    for dir in dirs {
-        let path = dir.to_str().ok_or_else(|| ViewError::BadPath {
-            // alloc: an error, once a request
-            path: dir.display().to_string(),
-            why: "is not UTF-8, and DuckDB's globs are",
-        })?;
-        if path.contains(['*', '?', '[', ']', '{', '}']) {
-            // alloc: an error, once a request
-            return Err(ViewError::BadPath { path: path.to_owned(), why: "has a character DuckDB's globs expand" });
-        }
-        globs.push(path.trim_end_matches('/'));
+/// [`PRELUDE`] reading each table from the files of the history `dir` its `manifest` lists for
+/// `scope` (every file, or the files that can hold a build's rows: [`Manifest::scoped`]), each
+/// list led by the table's `schema.<table>.parquet`, which has every column and no row, so each
+/// view resolves with no file of its own. Then each view of [`VIEWS`] whose arguments all have
+/// defaults as a DuckDB view of that name (the latest build, the default limit), so a query can
+/// say `FROM uncovered_time`. Other arguments take `blaze explain <view> <args>`. A file of a
+/// schema version this blaze can't read as its own is [`ViewError::Version`], naming it.
+///
+/// No glob: a glob read whatever files were in the directory as DuckDB listed it, a merge's
+/// output beside the inputs it holds the rows of among them (each row twice), until
+/// 2026-11-04. The manifest is the one list.
+pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, ViewError> {
+    let path = dir.to_str().ok_or_else(|| ViewError::BadPath {
+        // alloc: an error, once a request
+        path: dir.display().to_string(),
+        why: "is not UTF-8, and DuckDB's paths are",
+    })?;
+    if path.contains(['*', '?', '[', ']', '{', '}']) {
+        // DuckDB expands these in a path to `read_parquet` even with no glob meant.
+        // alloc: an error, once a request
+        return Err(ViewError::BadPath { path: path.to_owned(), why: "has a character DuckDB's globs expand" });
     }
+    let dir = path.trim_end_matches('/');
     // alloc: the prelude, once a query
-    let mut out = String::with_capacity(PRELUDE.len() + 256 * dirs.len());
+    let mut out = String::with_capacity(PRELUDE.len() + 4096);
     let mut copied = 0;
     scan(PRELUDE, |it| {
         if it.sigil != b'@' {
@@ -394,12 +407,18 @@ pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
         };
         out.push_str(&PRELUDE[copied..it.at]);
         out.push('[');
-        for (i, dir) in globs.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
+        // alloc: the prelude, once a query
+        quote(&format!("{dir}/schema.{}.parquet", table.name), &mut out);
+        for (file, entry) in manifest.scoped(table.name, scope) {
+            schema::readable(entry.version).map_err(|why| ViewError::Version {
+                // alloc: an error, once a request
+                file: format!("{dir}/{file}"),
+                version: entry.version,
+                why,
+            })?;
+            out.push_str(", ");
             // alloc: the prelude, once a query
-            quote(&format!("{dir}/*.{}.parquet", table.name), &mut out);
+            quote(&format!("{dir}/{file}"), &mut out);
         }
         out.push(']');
         copied = it.end;
@@ -539,15 +558,40 @@ mod tests {
     }
 
     #[test]
-    fn the_prelude_lists_each_tables_files_in_every_directory() {
-        let sql = prelude(&[Path::new("/state/profile/"), Path::new("/tmp/it's live")]).unwrap();
+    fn the_prelude_lists_each_tables_files_from_the_manifest() {
+        use crate::history::manifest::Entry;
+        let entry = |builds: Option<[u64; 2]>, t_ns: Option<[i64; 2]>| Entry {
+            version: schema::VERSION,
+            rows: 1,
+            builds,
+            t_ns,
+            boot: Some("b".to_owned()),
+            pid: Some(1),
+        };
+        let mut manifest = Manifest::new();
+        manifest.insert("1-00000001.spans.parquet", entry(Some([1, 1]), Some([100, 200]))).unwrap();
+        // 20 s on: past build 1's window, its end and a flush.
+        manifest.insert("2-00000002.spans.parquet", entry(Some([2, 2]), Some([20_000_000_000, 21_000_000_000]))).unwrap();
+        // No build's rows, in build 1's window: a build-1 reader reads it.
+        manifest.insert("0-00000003.samples.parquet", entry(None, Some([150, 160]))).unwrap();
+        let sql = prelude(Path::new("/state/it's profile/"), &manifest, Scope::All).unwrap();
         assert!(sql.contains(
-            "read_parquet(['/state/profile/*.spans.parquet', '/tmp/it''s live/*.spans.parquet'], union_by_name = true)"
+            "read_parquet(['/state/it''s profile/schema.spans.parquet', '/state/it''s profile/1-00000001.spans.parquet', '/state/it''s profile/2-00000002.spans.parquet'], union_by_name = true)"
         ));
-        assert!(!sql.contains("@spans") && !sql.contains("@heap_by_owner"));
+        assert!(sql.contains("read_parquet(['/state/it''s profile/schema.heap_by_owner.parquet'], union_by_name = true)"), "a table of no file reads its schema file");
+        assert!(!sql.contains("@spans") && !sql.contains("@heap_by_owner") && !sql.contains("*."));
         assert!(sql.contains("`@<table>`"), "a comment's text is left alone");
-        let error = prelude(&[Path::new("/tmp/a*b")]).unwrap_err();
+        let one = prelude(Path::new("/p"), &manifest, Scope::Build(1)).unwrap();
+        assert!(one.contains("read_parquet(['/p/schema.spans.parquet', '/p/1-00000001.spans.parquet'], union_by_name = true)"), "{one}");
+        assert!(one.contains("read_parquet(['/p/schema.samples.parquet', '/p/0-00000003.samples.parquet'], union_by_name = true)"));
+        let two = prelude(Path::new("/p"), &manifest, Scope::Build(2)).unwrap();
+        assert!(two.contains("read_parquet(['/p/schema.samples.parquet'], union_by_name = true)"), "outside build 2's window");
+        let error = prelude(Path::new("/tmp/a*b"), &manifest, Scope::All).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
+        let mut old = Manifest::new();
+        old.insert("1-00000001.spans.parquet", Entry { version: 1, ..entry(None, None) }).unwrap();
+        let error = prelude(Path::new("/p"), &old, Scope::All).unwrap_err();
+        assert!(matches!(&error, ViewError::Version { file, version: 1, .. } if file == "/p/1-00000001.spans.parquet"), "{error:?}");
     }
 
     #[test]

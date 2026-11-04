@@ -79,11 +79,7 @@ pub enum ResponseRef<'a> {
         trace: &'a [u8],
     },
     Live(#[serde(borrow)] LiveFrameRef<'a>),
-    Queried {
-        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
-        ipc: &'a [u8],
-        rows: u64,
-    },
+    Flushed { seq: u64 },
     Hot(Hot),
     Collected { report: &'a str },
     UnitBegan(#[serde(borrow)] UnitOfRef<'a>),
@@ -333,7 +329,7 @@ impl ResponseRef<'_> {
             ResponseRef::Explored { link } => Response::Explored { link: owned(link) },
             ResponseRef::Profiled { trace } => Response::Profiled { trace: bytes(trace) },
             ResponseRef::Live(it) => Response::Live(it.into_owned()),
-            ResponseRef::Queried { ipc, rows } => Response::Queried { ipc: bytes(ipc), rows },
+            ResponseRef::Flushed { seq } => Response::Flushed { seq },
             ResponseRef::Hot(it) => Response::Hot(it),
             ResponseRef::Collected { report } => Response::Collected { report: owned(report) },
             ResponseRef::UnitBegan(it) => Response::UnitBegan(it.into_owned()),

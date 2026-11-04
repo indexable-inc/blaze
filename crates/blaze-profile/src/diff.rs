@@ -180,7 +180,7 @@ pub fn of_builds(duckdb: &Path, history: &Path, builds: &[u64]) -> Result<Vec<(u
          SELECT 'error', CAST(build_id AS BIGINT), CAST(kind AS VARCHAR), CAST(count(*) AS BIGINT), \
          CAST(NULL AS BIGINT) FROM errors WHERE build_id IN ({list}) GROUP BY build_id, kind"
     );
-    let batches = sql::run(&Query { duckdb, history, sql: &sql }).map_err(DiffError::Sql)?;
+    let batches = sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql: &sql }).map_err(DiffError::Sql)?;
     // alloc: two summaries, once a diff
     let mut out: Vec<(u64, Summary, bool)> = builds.iter().map(|it| (*it, Summary::default(), false)).collect();
     for batch in &batches {

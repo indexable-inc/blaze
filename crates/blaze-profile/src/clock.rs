@@ -201,3 +201,42 @@ mod tests {
         assert!(scale.mono(ticks()) >= scale.mono(first));
     }
 }
+
+/// The id of the machine's boot, once a process: every `*_ns` instant counts from a boot, so
+/// two instants compare only under one boot id, and a process is `(boot, pid)`, as a pid is
+/// used again after a reboot. Linux's `/proc/sys/kernel/random/boot_id`; macOS's
+/// `kern.bootsessionuuid`. `None` where the OS says none, or elsewhere: a reader takes a file
+/// of no boot as of any boot, so it reads more files, never fewer.
+pub fn boot() -> Option<&'static str> {
+    static BOOT: OnceLock<Option<String>> = OnceLock::new();
+    BOOT.get_or_init(read_boot).as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    // alloc: once a process
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_boot() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: the name is NUL-terminated, `buf` is `len` bytes to write, and no new value is set.
+    let read = unsafe {
+        libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if read != 0 || len == 0 || len > buf.len() {
+        return None;
+    }
+    let id = std::str::from_utf8(&buf[..len]).ok()?.trim_end_matches('\0').trim();
+    // alloc: once a process
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn read_boot() -> Option<String> {
+    None
+}

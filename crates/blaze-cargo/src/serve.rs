@@ -13,8 +13,8 @@
 //!   daemon ([`daemon::Failed`]).
 //! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
 //! - It keeps the profile history in `<state>/profile` on the thread `blaze-history`, samples
-//!   its CPUs, and answers `blaze explore`, `blaze debug live` and `blaze debug sql --live`
-//!   itself ([`observe`]).
+//!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
+//!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
 mod daemon;
 mod fetch;
