@@ -58,6 +58,11 @@ pub(crate) struct Finish {
     limit: Limit,
     /// Its place in [`CHILDREN`] until it is reaped.
     listed: Listed,
+    /// When [`start`] began, what its sandbox took, and when the spawn call returned: what a
+    /// [`crate::reaped::Reaped`] says of it.
+    spawned: Instant,
+    sandbox: Option<Duration>,
+    executed: Instant,
 }
 
 /// The children [`start`] made that [`reap`] has not reaped, in the order they started: a few
@@ -214,6 +219,7 @@ pub(crate) fn start(
     confine: Option<&Arc<dyn Confine>>,
 ) -> io::Result<Started> {
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
+    let began = Instant::now();
     let (confined, scratch, confine): (Option<Confined>, _, _) = match &command.sandbox {
         Sandbox::Off => (None, None, None),
         Sandbox::On { .. } => {
@@ -246,6 +252,7 @@ pub(crate) fn start(
             }
         }
     };
+    let sandbox = confined.as_ref().map(|_| began.elapsed());
     // What the sandbox starts, else the command itself, borrowed either way.
     let program = match &confined {
         Some(it) => spawn::Program { program: &it.program, args: &it.args, env: &it.env, dir: &it.dir },
@@ -298,6 +305,7 @@ pub(crate) fn start(
             format!("starting {}: {error}", program.program.display()),
         ))
     })?;
+    let executed = Instant::now();
     let pid = spawned.pid;
     #[cfg(target_os = "linux")]
     let limit = cgroup.map_or(Limit::None, Limit::Cgroup);
@@ -316,7 +324,7 @@ pub(crate) fn start(
         stdin: spawned.stdin,
         stdout: spawned.stdout,
         stderr: spawned.stderr,
-        finish: Finish { command, confine, scratch, limit, listed },
+        finish: Finish { command, confine, scratch, limit, listed, spawned: began, sandbox, executed },
     })
 }
 
@@ -347,6 +355,16 @@ impl Finish {
             #[cfg(target_os = "macos")]
             Limit::Footprint(watch) => Ok(watch.stop()),
         };
+        // Before the reap, which unlists it: the spawn effect that waits for it, whose label
+        // says what it was.
+        let label = match crate::reaped::observed() {
+            true => CHILDREN.lock().iter().find(|it| it.run == self.listed.run).and_then(|it| match it.waiter {
+                Waiter::Effect(tag) => Some(tag),
+                Waiter::Starter(_) | Waiter::Abandoned => None,
+            }),
+            false => None,
+        }
+        .and_then(crate::reaped::take);
         let reaped = reap(pid);
         let ((status, rusage), limited) = match (reaped, limited) {
             (Ok(reaped), Ok(limited)) => (reaped, limited),
@@ -365,8 +383,29 @@ impl Finish {
         };
         let max_rss = u64::try_from(rusage.ru_maxrss).unwrap_or(0);
         // Kibibytes on Linux, bytes on Apple's systems.
-        let peak_memory =
-            if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 }.max(limited);
+        let peak_rss = if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 };
+        let peak_memory = peak_rss.max(limited);
+        if crate::reaped::observed() {
+            let count = |it: libc::c_long| u64::try_from(it).unwrap_or(0);
+            crate::reaped::report(&crate::reaped::Reaped {
+                pid: u32::try_from(pid).unwrap_or(0),
+                program: &self.command.program,
+                label,
+                spawned: self.spawned,
+                executed: self.executed,
+                exited: Instant::now(),
+                sandbox: self.sandbox,
+                user: cpu(rusage.ru_utime),
+                system: cpu(rusage.ru_stime),
+                peak_rss,
+                minor_faults: count(rusage.ru_minflt),
+                major_faults: count(rusage.ru_majflt),
+                voluntary_switches: count(rusage.ru_nvcsw),
+                involuntary_switches: count(rusage.ru_nivcsw),
+                code,
+                signal,
+            });
+        }
         let traced = match (&self.command.sandbox, &self.confine, &self.scratch) {
             (Sandbox::On { trace: true, .. }, Some(confine), Some(scratch)) => {
                 Some(confine.traced(&self.command, scratch).map_err(|why| {
@@ -385,6 +424,13 @@ impl Finish {
         let traced = traced.transpose()?;
         Ok(Exit { code, signal, stdout, stderr, traced, peak_memory })
     }
+}
+
+/// A `timeval` of CPU time, as a duration: none for the negative values no kernel gives.
+fn cpu(it: libc::timeval) -> Duration {
+    let secs = u64::try_from(it.tv_sec).unwrap_or(0);
+    let micros = u32::try_from(it.tv_usec).unwrap_or(0);
+    Duration::from_secs(secs) + Duration::from_micros(u64::from(micros))
 }
 
 /// Reaps `pid`, waiting until it has exited: its status and what it used. The one reap of a

@@ -765,12 +765,14 @@ impl Session {
             | Request::Gc { .. }
             | Request::Rebuilt { .. }
             | Request::Launch { .. }
-            | Request::FetchUrl { .. } => {
+            | Request::FetchUrl { .. }
+            | Request::ClientRows { .. } => {
                 return Err(ApiError::new(
                     "the explorer, the live feed, live SQL, the collector, the last build's \
-                     reasons, the dev runs' launches and fetches by digest are answered by the \
-                     daemon's loop, which holds their servers, feeds, collector, reasons, programs \
-                     and store; this one handed the request on instead",
+                     reasons, the dev runs' launches, fetches by digest and clients' profile rows \
+                     are answered by the daemon's loop, which holds their servers, feeds, \
+                     collector, reasons, programs, store and history; this one handed the request \
+                     on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -1112,6 +1114,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",
         Request::FetchUrl { .. } => "blaze fetch-url",
+        Request::ClientRows { .. } => "a client's profile rows",
         _ => "a request",
     }
 }

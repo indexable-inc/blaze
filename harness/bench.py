@@ -55,7 +55,7 @@ Both backends run one blaze, `BLAZE_BIN`, which has LLVM as every native blaze d
 is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the release profile
 (`--release`), on both sides.
 """
-import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, memory, storelib
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed, wait_warm
@@ -617,20 +617,10 @@ def cold_steps(text):
     return steps
 
 
-# The steps of compiling one function, as the profile's spans name them.
-COMPILE_STEPS = ("infer", "mir", "monomorphize", "translate", "describe", "store read", "store write")
-
-
-def thread_steps(text, profile=None):
-    """What the daemon's threads spent on each producer in `text`, and with the directory of a
-    build's profile (BLAZE_PROFILE) on each step of compiling a function: seconds summed
-    over the threads."""
+def thread_steps(text):
+    """What the daemon's threads spent on each producer in `text`: seconds summed over the
+    threads."""
     steps = {}
-    phases = os.path.join(profile, "phases.tsv") if profile else None
-    if phases and os.path.exists(phases):
-        for row in csv.DictReader(open(phases), delimiter="\t"):
-            if row["phase"] in COMPILE_STEPS:
-                steps[row["phase"]] = round(float(row["wall_ms"]) / 1000, 3)
     for producer, took in re.findall(r"^backend: (\w+) compiled \d+ functions, \d+ bytes, (\S+) ", text, re.M):
         steps[producer] = round(steps.get(producer, 0) + seconds(took), 3)
     return steps

@@ -33,7 +33,8 @@ use std::alloc::Global;
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
-    Counter, Event, Part, clock,
+    clock,
+    dump::{Counter, Event, Part},
     span::{self, Said, TYPED},
 };
 
@@ -1798,8 +1799,7 @@ pub(crate) fn exited(id: u64) {
 }
 
 /// A handle of the span `id` was dropped, on this thread. With the last, the span closed now:
-/// its row is written to this thread's ring, and `Some` the ticks it lasted, which is what
-/// `BLAZE_PROFILE` keeps of it.
+/// its row is written to this thread's ring, and `Some` the ticks it lasted.
 #[inline]
 pub(crate) fn closed(id: u64) -> Option<u64> {
     if id == UNRECORDED {
@@ -2756,14 +2756,14 @@ pub(crate) fn part(window: Duration) -> Part {
 }
 
 /// The last `window` of every thread's ring and of the CPU samples, as the Chrome trace
-/// (ui.perfetto.dev) `BLAZE_PROFILE` writes: what a stall writes beside its error.
+/// (ui.perfetto.dev, [`crate::dump`]): what a stall writes beside its error.
 pub fn dump(window: Duration) -> Vec<u8> {
     let part = part(window);
     let end = Epoch::now().now_us;
     let start = end.saturating_sub(window.as_micros() as u64);
     // alloc: a dump, on demand
     let mut out = Vec::new();
-    match crate::chrome(&mut out, &[], std::slice::from_ref(&part), start, end) {
+    match crate::dump::chrome(&mut out, std::slice::from_ref(&part), start, end) {
         Ok(()) => out,
         Err(why) => unreachable!("a trace written to memory fails only when out of memory: {why}"),
     }

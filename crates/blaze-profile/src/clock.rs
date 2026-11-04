@@ -65,6 +65,16 @@ pub fn mono_ns() -> i64 {
     }
 }
 
+/// `at` on the schema's clock ([`mono_ns`]): now, less how long ago it was. Both read the
+/// same monotonic clock on Linux and Apple's systems, so the pairing's error is the time
+/// between the two reads.
+pub fn mono_of(at: Instant) -> i64 {
+    let (now, read) = (mono_ns(), Instant::now());
+    let ago = read.saturating_duration_since(at).as_nanos() as i64;
+    let ahead = at.saturating_duration_since(read).as_nanos() as i64;
+    now - ago + ahead
+}
+
 /// A tick and the instant it was read at, once a process: [`crate::began`] takes it first.
 pub fn origin() -> (u64, Instant) {
     static ORIGIN: OnceLock<(u64, Instant)> = OnceLock::new();

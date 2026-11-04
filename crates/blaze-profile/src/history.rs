@@ -73,7 +73,7 @@ use crate::{
     batches::{self, Process},
     clock,
     errors::{self, ErrorRow},
-    facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
+    facts::{self, CrateDepRow, LinkRow, MissRow, ProcessRow, QueryCountRow, TestRunRow},
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity,
     sampler::{self, Sample},
@@ -195,7 +195,7 @@ impl Outcome {
 }
 
 /// A row of the schema's `builds` table: one build request the daemon ran.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: an ended row kept for its client's times, once a build
 pub struct BuildRow {
     pub build_id: u64,
     pub commit: Option<String>,
@@ -215,7 +215,35 @@ pub struct BuildRow {
     pub tree: Option<String>,
     /// [`identity::binary`]: given by [`History::build_ended`] when `None`.
     pub blaze: Option<String>,
+    /// When the client that asked for it started and when it had the answer, on the schema's
+    /// clock (`builds.client_started_ns`, `client_ended_ns`): given by
+    /// [`History::client_rows`], `None` until then.
+    pub client_ns: Option<(i64, i64)>,
+    /// The daemon process's user and system CPU over the build, from getrusage
+    /// (`builds.daemon_user_ns`, `daemon_system_ns`); `None` while it runs.
+    pub daemon_cpu_ns: Option<(i64, i64)>,
 }
+
+/// What a client sent of a build it asked for, as it ended (`blaze_api::Request::ClientRows`):
+/// its own `spans`, `events` and `folded` rows, each an Arrow IPC stream of that table's
+/// schema with every row's `build_id` the build's, and when it started and ended.
+#[derive(Debug, Default)]
+pub struct ClientRows {
+    pub build: u64,
+    pub started_ns: i64,
+    pub ended_ns: i64,
+    pub spans: Vec<u8>,
+    pub events: Vec<u8>,
+    pub folded: Vec<u8>,
+}
+
+/// What a client's rows name their process (`process_name`): told from its daemon's by it
+/// where one build's rows must be one process's (`time::load`).
+pub const CLIENT_PROCESS: &str = "blaze client";
+
+/// The ended builds' rows kept for their clients' times: past this many, a client that sends
+/// its rows later than this many builds ended after its own has its times dropped, named.
+const RECENT_BUILDS: usize = 64;
 
 /// What a flush wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -236,6 +264,10 @@ pub struct Flushed {
     pub crate_deps: usize,
     pub query_counts: usize,
     pub misses: usize,
+    pub processes: usize,
+    pub test_runs: usize,
+    /// Rows clients sent ([`History::client_rows`]), of every table.
+    pub client: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -264,6 +296,9 @@ pub enum HistoryError {
     /// Merging files into `output` failed at the step `doing`, on `file`: an input, or the
     /// hidden file the output is written to. Every input stays in place.
     Compact { output: PathBuf, file: PathBuf, doing: &'static str, error: CompactError },
+    /// What the client of build `build` sent of `table` can't be written: bytes that are not
+    /// Arrow IPC, a batch not of the table's schema, or a row of another build.
+    Client { build: u64, table: &'static str, why: String },
 }
 
 /// Why a merge of history files failed.
@@ -314,6 +349,9 @@ impl fmt::Display for HistoryError {
                 output.display(),
                 file.display()
             ),
+            HistoryError::Client { build, table, why } => {
+                write!(f, "the profile history: the {table} rows build {build}'s client sent: {why}")
+            }
         }
     }
 }
@@ -329,6 +367,7 @@ impl std::error::Error for HistoryError {
             HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::Parquet(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::SchemaDiffers, .. } => None,
+            HistoryError::Client { .. } => None,
         }
     }
 }
@@ -504,6 +543,10 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
         column(StringArray::from_iter(rows.iter().map(|it| it.tree.as_deref()))),
         column(StringArray::from_iter(rows.iter().map(|it| it.blaze.as_deref()))),
         column(UInt32Array::from_value(pid, rows.len())),
+        column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.0)))),
+        column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.1)))),
+        column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.0)))),
+        column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.1)))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
@@ -664,6 +707,21 @@ pub struct History {
     query_counts: Vec<QueryCountRow>,
     /// What builds computed again, and why, since the last flush.
     misses: Vec<MissRow>,
+    /// Children reaped ([`facts::take_processes`]) and tests run since the last flush.
+    processes: Vec<ProcessRow>,
+    test_runs: Vec<TestRunRow>,
+    /// What clients sent since the last flush, by table: written by the next.
+    client_spans: Vec<RecordBatch>,
+    client_events: Vec<RecordBatch>,
+    client_folded: Vec<RecordBatch>,
+    /// The highest build a client sent rows of since the last flush, 0 for none.
+    client_build: u64,
+    /// The last [`RECENT_BUILDS`] builds that ended, newest last: a client's times are given
+    /// to its build's row, written again with them.
+    recent: VecDeque<BuildRow>,
+    /// Clients' times of builds that had not ended as they came, by build: given to its row
+    /// as it ends. At most [`RECENT_BUILDS`], oldest dropped.
+    pending_clients: VecDeque<(u64, (i64, i64))>,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
@@ -775,6 +833,21 @@ impl History {
             query_counts: Vec::new(),
             // alloc: once a history
             misses: Vec::new(),
+            // alloc: once a history
+            processes: Vec::new(),
+            // alloc: once a history
+            test_runs: Vec::new(),
+            // alloc: once a history
+            client_spans: Vec::new(),
+            // alloc: once a history
+            client_events: Vec::new(),
+            // alloc: once a history
+            client_folded: Vec::new(),
+            client_build: 0,
+            // alloc: once a history
+            recent: VecDeque::with_capacity(RECENT_BUILDS),
+            // alloc: once a history
+            pending_clients: VecDeque::new(),
             kept: kept.into(),
             total,
             last_build,
@@ -837,7 +910,58 @@ impl History {
                 }
             }
         }
+        if let Some(at) = self.pending_clients.iter().position(|it| it.0 == row.build_id) {
+            row.client_ns = self.pending_clients.remove(at).map(|it| it.1);
+        }
+        if self.recent.len() == RECENT_BUILDS {
+            self.recent.pop_front();
+        }
+        // clone: the row kept for its client's times, once a build
+        self.recent.push_back(row.clone());
         self.ended.push(row);
+    }
+
+    /// Notes what the client of a build sent as it ended, for the next flush to write: its
+    /// rows, each table's batches checked against the table's schema and every row's build
+    /// against the build, and its times, given to the build's row, which is written again
+    /// with them (the `builds` view keeps that one). A build not ended yet gets them as it
+    /// ends. A batch that does not fit is the error, naming the build and table; nothing of
+    /// that client is noted then.
+    pub fn client_rows(&mut self, client: ClientRows) -> Result<(), HistoryError> {
+        let build = client.build;
+        let spans = client_batches(build, &schema::SPANS, &client.spans)?;
+        let events = client_batches(build, &schema::EVENTS, &client.events)?;
+        let folded = client_batches(build, &schema::FOLDED, &client.folded)?;
+        self.client_spans.extend(spans);
+        self.client_events.extend(events);
+        self.client_folded.extend(folded);
+        self.client_build = self.client_build.max(build);
+        let times = (client.started_ns, client.ended_ns);
+        match self.recent.iter_mut().rev().find(|it| it.build_id == build) {
+            Some(row) => {
+                row.client_ns = Some(times);
+                // clone: the build's row written again with its client's times, once a build
+                self.ended.push(row.clone());
+            }
+            None => {
+                if self.pending_clients.len() == RECENT_BUILDS {
+                    self.pending_clients.pop_front();
+                }
+                self.pending_clients.push_back((build, times));
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes children reaped, for the next flush to write beside those the drivers queued
+    /// ([`facts::reaped`]).
+    pub fn processes_reaped(&mut self, rows: impl IntoIterator<Item = ProcessRow>) {
+        self.processes.extend(rows);
+    }
+
+    /// Notes the tests a build ran, one row a test, for the next flush to write.
+    pub fn tests_ran(&mut self, rows: impl IntoIterator<Item = TestRunRow>) {
+        self.test_runs.extend(rows);
     }
 
     /// Notes errors a build said ([`errors::rows`]), for the next flush to write.
@@ -893,6 +1017,7 @@ impl History {
             );
         }
         self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
+        facts::take_processes(&mut self.processes);
         let written = self.write(build);
         // Written or not, the rows drained are this flush's: none goes to the next.
         self.read.clear();
@@ -984,10 +1109,13 @@ impl History {
             });
         }
         let of_build = Process { commit, ..self.process };
-        let spans = [
+        let client_rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let client = client_rows(&self.client_spans) + client_rows(&self.client_events) + client_rows(&self.client_folded);
+        let mut spans = vec![
             batches::spans(&self.read.spans, of_build).map_err(arrow_error(&schema::SPANS))?,
             batches::spans(&self.others, self.process).map_err(arrow_error(&schema::SPANS))?,
-        ];
+        ]; // alloc: a flush's parts, once a flush
+        spans.append(&mut self.client_spans);
         let counters =
             [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
         let builds = [builds(&self.ended, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
@@ -999,8 +1127,12 @@ impl History {
         let misses = [facts::misses(&self.misses).map_err(arrow_error(&schema::MISSES))?];
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
-        let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
-        let folded = [batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?];
+        let mut events = vec![batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?]; // alloc: as `spans`
+        events.append(&mut self.client_events);
+        let mut folded = vec![batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?]; // alloc: as `spans`
+        folded.append(&mut self.client_folded);
+        let processes = [facts::processes(&self.processes, self.process.pid).map_err(arrow_error(&schema::PROCESSES))?];
+        let test_runs = [facts::test_runs(&self.test_runs).map_err(arrow_error(&schema::TEST_RUNS))?];
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
@@ -1033,13 +1165,16 @@ impl History {
             misses: rows(&misses),
             open: rows(&open),
             folded: rows(&folded),
+            processes: rows(&processes),
+            test_runs: rows(&test_runs),
+            client,
             skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 13] = [
+        let tables: [(&'static Table, &[RecordBatch]); 15] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1053,6 +1188,8 @@ impl History {
             (&schema::MISSES, &misses),
             (&schema::OPEN, &open),
             (&schema::FOLDED, &folded),
+            (&schema::PROCESSES, &processes),
+            (&schema::TEST_RUNS, &test_runs),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -1072,6 +1209,9 @@ impl History {
         self.crate_deps.clear();
         self.query_counts.clear();
         self.misses.clear();
+        self.processes.clear();
+        self.test_runs.clear();
+        self.client_build = 0;
         let compacted = self.compact(ended, &mut flushed);
         flushed.deleted = self.trim()?;
         compacted?;
@@ -1158,6 +1298,9 @@ impl History {
             self.crate_deps.iter().map(|it| it.build_id).max(),
             self.query_counts.iter().map(|it| it.build_id).max(),
             self.misses.iter().map(|it| it.build_id).max(),
+            self.processes.iter().map(|it| it.build_id).max(),
+            self.test_runs.iter().map(|it| it.build_id).max(),
+            Some(self.client_build),
         ];
         facts.into_iter().flatten().fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
     }
@@ -1290,6 +1433,30 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
     }
 }
 
+/// The batches of `table` in `bytes`, an Arrow IPC stream build `build`'s client sent (none for
+/// no bytes), each made again under the table's own schema so it writes beside the daemon's,
+/// and refused, naming why, when a column does not fit or a row is of another build.
+fn client_batches(build: u64, table: &'static Table, bytes: &[u8]) -> Result<Vec<RecordBatch>, HistoryError> {
+    let refused = |why: String| HistoryError::Client { build, table: table.name, why };
+    if bytes.is_empty() {
+        return Ok(Vec::new()); // alloc: empty, allocates nothing
+    }
+    let schema = batches::schema_of(table);
+    let at = table.column("build_id").unwrap_or_else(|| unreachable!("{} has a build_id column", table.name));
+    let mut out = crate::live::decode(bytes).map_err(|error| refused(format!("not an Arrow IPC stream: {error}")))?;
+    for batch in &mut out {
+        // clone: the columns' `Arc`s, once a batch
+        *batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+            .map_err(|error| refused(format!("not of the table's schema: {error}")))?;
+        let builds = batch.column(at).as_any().downcast_ref::<UInt64Array>();
+        let Some(builds) = builds else { return Err(refused("its build_id column is not u64".to_owned())) };
+        if let Some(other) = builds.iter().find(|it| *it != Some(build)) {
+            return Err(refused(format!("a row of build {other:?}, not of the build it was sent for")));
+        }
+    }
+    Ok(out)
+}
+
 /// The last `window` of the rings as `<dir>/live.<table>.parquet`, a file of every table (empty
 /// where the rings hold none of it) beside `schema.<table>.parquet`, for `blaze debug sql
 /// --live` to query beside the history.
@@ -1371,7 +1538,125 @@ mod tests {
             joined: None,
             tree: Some("7".repeat(64)),
             blaze: Some("b".repeat(64)),
+            client_ns: None,
+            daemon_cpu_ns: None,
         }
+    }
+
+    #[test]
+    fn a_child_process_row_and_a_test_run_row_read_back_column_for_column() {
+        use crate::facts::{ProcessRow, TestOutcome, TestRunRow};
+        let dir = scratch("processes-test-runs");
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let child = ProcessRow {
+            build_id: 71,
+            pid: 4242,
+            kind: "build_script",
+            unit: Some("cc v1.2.0 (build script run)".into()),
+            program: "/target/debug/build/cc-1/build-script-build".into(),
+            parent_span: 0x1_0000_0007,
+            spawned_ns: 1_000,
+            exec_ns: Some(1_400),
+            exited_ns: 90_000,
+            sandbox_ns: Some(300),
+            user_ns: 50_000,
+            system_ns: 9_000,
+            peak_rss: Some(12 << 20),
+            minor_faults: Some(800),
+            major_faults: Some(2),
+            voluntary_switches: Some(31),
+            involuntary_switches: Some(4),
+            code: Some(0),
+            signal: None,
+        };
+        // A child no spawner labelled, killed by a signal: no build, no span, no code.
+        let unlabelled = ProcessRow {
+            build_id: 0,
+            kind: "unlabelled",
+            unit: None,
+            parent_span: 0,
+            sandbox_ns: None,
+            code: None,
+            signal: Some(9),
+            ..child.clone()
+        };
+        let test = TestRunRow {
+            build_id: 71,
+            test: "parse::tests::a_number".into(),
+            krate: Some("app".into()),
+            binary: "app-0123abcd".into(),
+            outcome: TestOutcome::Passed,
+            dur_ns: 3_000_000,
+            retries: 1,
+            ended_ns: 95_000,
+        };
+        history.processes_reaped([child.clone(), unlabelled.clone()]);
+        history.tests_ran([test.clone()]);
+        let flushed = history.flush(Some(71)).unwrap();
+        assert_eq!((flushed.processes, flushed.test_runs), (2, 1));
+        let file = |table: &str| dir.join(format!("{}-{:08}.{table}.parquet", flushed.build, flushed.seq));
+        let pid = Process::this().pid;
+        same(&facts::processes(&[child, unlabelled], pid).unwrap(), &read_back(&file("processes")));
+        same(&facts::test_runs(&[test]).unwrap(), &read_back(&file("test_runs")));
+        let read = read_back(&file("processes"));
+        let builds = read[0].column(schema::PROCESSES.column("build_id").unwrap());
+        assert!(!builds.is_null(0) && builds.is_null(1), "a child of no build has a null build_id");
+
+        let again = history.flush(Some(72)).unwrap();
+        assert_eq!((again.processes, again.test_runs), (0, 0), "a flush writes each row once");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A client's span of `build`, its columns otherwise none.
+    fn client_span(build: u32) -> SpanRow {
+        SpanRow {
+            build,
+            thread: 1,
+            thread_name: 0,
+            span_id: 5,
+            parent: 0,
+            depth: 0,
+            site: 0,
+            start_ns: 600,
+            dur_ns: 80_000,
+            alloc: None,
+            copied: None,
+            krate: 0,
+            function: 0,
+            unit: 0,
+            self_cpu_ns: None,
+            typed: crate::span::Said::EMPTY.typed,
+            folded_spans: 0,
+            folded_ns: 0,
+        }
+    }
+
+    #[test]
+    fn a_clients_rows_are_written_with_its_builds_row_given_its_times() {
+        let dir = scratch("client-rows");
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        history.build_ended(BuildRow { daemon_cpu_ns: Some((7, 3)), ..row(81, Outcome::Ok) });
+        history.flush(Some(81)).unwrap();
+        let span = client_span(81);
+        let spans = batches::spans(&[span], Process { pid: 9, name: "client", commit: None }).unwrap();
+        let mut bytes = Vec::new();
+        crate::live::ipc(&spans, &mut bytes).unwrap();
+        history
+            .client_rows(ClientRows { build: 81, started_ns: 500, ended_ns: 90_000, spans: bytes, ..ClientRows::default() })
+            .unwrap();
+        let flushed = history.flush(None).unwrap();
+        assert_eq!((flushed.builds, flushed.client, flushed.build), (1, 1, 81));
+        let read = read_back(&dir.join(format!("81-{:08}.builds.parquet", flushed.seq)));
+        let int = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap()).as_primitive::<arrow_array::types::Int64Type>().value(0);
+        assert_eq!((int("client_started_ns"), int("client_ended_ns")), (500, 90_000));
+        assert_eq!((int("daemon_user_ns"), int("daemon_system_ns")), (7, 3));
+
+        let mut other = Vec::new();
+        let span = client_span(82);
+        crate::live::ipc(&batches::spans(&[span], Process { pid: 9, name: "client", commit: None }).unwrap(), &mut other).unwrap();
+        let refused = history.client_rows(ClientRows { build: 81, spans: other, ..ClientRows::default() });
+        assert!(matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })), "{refused:?}");
+        _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

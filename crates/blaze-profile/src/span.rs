@@ -525,9 +525,7 @@ fn open_id<K: Span>(kind: K) -> u64 {
     let Some(site) = K::site() else { return flight::UNRECORDED };
     let mut said = Said::EMPTY;
     kind.write(&mut said);
-    let id = flight::open_said(site, &said);
-    crate::profile_began(id);
-    id
+    flight::open_said(site, &said)
 }
 
 #[inline]

@@ -10828,7 +10828,7 @@
   },
   "blaze-profile@0.0.0": {
    "authors": "blaze contributors",
-   "description": "Where the time of a blaze build goes: the steps of a build, with BLAZE_PROFILE every process's per-thread timeline, the CPU time of each function compiled and of each pass; always on, the flight recorder, the stall watchdog and the CPU sampler",
+   "description": "Where the time of a blaze build goes: the flight recorder, the profile history the daemon writes (spans, child processes, test runs, the client's rows), BLAZE_PROFILE's trace export, the stall watchdog and the CPU sampler",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",

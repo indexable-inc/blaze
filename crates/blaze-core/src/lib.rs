@@ -72,6 +72,7 @@ pub mod children {
 }
 #[allow(unsafe_code, reason = "single system calls and the aligned-copy view, each behind a safe function")]
 mod raw;
+pub mod reaped;
 pub mod signal;
 pub mod sim;
 mod sync;

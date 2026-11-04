@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, samples, provenance, inputs, alloc_samples, heap_by_owner; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` / `BLAZE_STATS`.
+summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, processes, test_runs, samples, provenance, inputs, alloc_samples, heap_by_owner; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the client's rows in it, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` as an export from the history.
 date: 2026-10-31
 ---
 # Profiling blaze
@@ -27,7 +27,8 @@ several readers.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
-  - `BLAZE_PROFILE=<dir>`: a whole build's Chrome trace.
+  - `BLAZE_PROFILE=<dir>`: the build's Chrome trace, exported from the history by the client
+    as its request ends (see `BLAZE_PROFILE` below).
   - The hot sketches (crates/blaze-profile/src/hot.rs): each thread's ring also keeps a
     count-min sketch of the time under each (span, `function`) and its 32 heaviest keys, and
     a DDSketch of each kind of wait's durations (1% relative error). `blaze debug hot [--top N]
@@ -240,12 +241,73 @@ rests on these numbers.
 | tree | utf8? | the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree <dir>` prints it with `target` and `.git` skipped; null for a build of no directory. Compare it with the same digest of a checkout to tell which tree a build tested: `commit` is null for a snapshot that is not a git checkout |
 | blaze | utf8? | the BLAKE3 hash of the blaze executable that ran the build |
 | process | u32? | the daemon's process id; null in rows of a blaze before it |
+| client_started_ns | i64? | when the client process that asked for the build began; null when no client sent its rows (an agent's request, the seed, a blaze before 2026-11-04) |
+| client_ended_ns | i64? | when that client sent its rows, at its request's end |
+| daemon_user_ns | i64? | the daemon process's user CPU over the build (getrusage `RUSAGE_SELF`, the end less the start); null in the `running` row |
+| daemon_system_ns | i64? | the same, system CPU |
 
 A build has two rows: one of outcome `running` and null `dur_ns`, written as it starts (the
 history flushes at once), and one as it ends, with the same `started_ns`. The `builds` view keeps
 the end row where there is one. A build whose only row is its start, and whose `process` no
 longer writes the history (`owner.lock` does not name it, or its lock is not held), ended by
 its daemon's death: `blaze slow` reports it to that process's last row.
+
+**The client's rows.** Only the daemon writes the history. A client that ran a build sends
+its own flight recorder's rows (its start-up, connect, printing, a toolchain download) at its
+request's end as `Request::ClientRows` (blaze-api schema 36), every row tagged with the build
+id the daemon gave it in `Worked::build_id`, with its start and end on the history's clock.
+The daemon writes them into `spans`, `events` and `folded` as the client's process
+(`process_name` = `blaze client`, `pid` the client's) and refuses rows of another build. The
+times go on a third row of the build in `builds` with `client_started_ns` and
+`client_ended_ns`; the view keeps the row with `dur_ns` and those times. A client's rows that
+arrive before the build's end row are held and go on it. The client waits for the write (at
+most the loop's 50 ms idle tick), so an export right after reads them. `blaze debug time`
+reads one process's rows a build, the daemon's, so it leaves the client's out.
+
+### `processes`: one row a child process blaze spawned, reaped
+
+Written as the driver reaps the child (blaze-core `process.rs`, through `blaze_core::reaped`
+into `facts::reaped`), from its rusage. A spawner names the child before its spawn effect goes
+to the driver (`blaze_core::reaped::label`); a spawn no one named has kind `unlabelled`.
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build it worked for, as the daemon's recorder said when it was labelled; null for none |
+| process | u32 | the daemon's process id |
+| pid | u32 | the child's process id |
+| kind | dict | `build_script`, `test`, `run`, `warm_server`, or `unlabelled` |
+| unit | utf8? | what it ran for: `anyhow v1.0.98 (build script run)`, a test binary, a program |
+| program | utf8 | the executable |
+| parent_span | u64? | the span it was asked for inside; null for none |
+| spawned_ns | i64 | when the driver began to start it, before its sandbox |
+| exec_ns | i64? | when the spawn returned, the child having exec'd |
+| exited_ns | i64 | when it was reaped |
+| sandbox_ns | i64? | how long making its sandbox took; null for a child run without one |
+| user_ns | i64 | its user CPU |
+| system_ns | i64 | its system CPU |
+| peak_rss | u64? | its peak resident set, in bytes (Linux reports KiB, macOS bytes; both written as bytes) |
+| minor_faults | u64? | page faults served without IO |
+| major_faults | u64? | page faults that read from disk |
+| voluntary_switches | u64? | times it gave up the CPU to wait |
+| involuntary_switches | u64? | times the kernel took the CPU from it |
+| code | u32? | its exit code; null when a signal ended it |
+| signal | u32? | the signal that ended it |
+
+Not covered yet: children the threads driver's `run_process` starts (unlabelled spawns are
+written, but with no unit), children a test's fork server forks, and Windows.
+
+### `test_runs`: one row a test that finished, from the test queue's `Finished` events
+
+| column | type | |
+|---|---|---|
+| build_id | u64 | the build that ran it |
+| test | utf8 | the test's path |
+| crate | dict? | the package its binary is of |
+| binary | utf8 | the test binary |
+| outcome | dict | `passed`, `failed`, `ignored`, `timed_out` or `crashed` (a signal, or a lost process) |
+| dur_ns | i64 | how long its last attempt ran |
+| retries | u32 | attempts after the first |
+| ended_ns | i64 | when it finished |
 
 ### `samples`: one row a CPU sample of a running thread
 
@@ -641,8 +703,8 @@ The build's top-level phases each have a span:
   work for that run alone, and a run whose wall is far above it was its program's time.
 - blaze's own toolchain downloaded into a home that lacks it: `toolchain download`, with the
   release in `toolchain` and the bytes in `bytes`. The client downloads it before the daemon
-  starts and records no spans, so there it is a step of the client's part of a `BLAZE_PROFILE`
-  profile and of the table it prints, `toolchain download nightly-2026-10-27 (116917942 bytes)`.
+  starts; its span is in the client's flight recorder and reaches the history with the client's
+  rows of the build it then asks for.
 - the dependencies' image keys: `dependency image keys`, with the crates asked in `crates` and
   the database's view in `function` (`View(1234)`). A serve at the view the same crates were last keyed at, none
   moved, walks nothing and opens no span.
@@ -701,8 +763,9 @@ wait and the owner's serial work under it can both count the same stretch of the
 What the profile could not see is listed after the findings, as blind spots, never skipped:
 - critical-path time the record lost (`unrecorded` links, by reason and lane);
 - job running time inside no span, against the 1% gate;
-- worker running time with no span CPU counted for it. No OS CPU is recorded, so the spans'
-  total can't be checked against the process's;
+- worker running time with no span CPU counted for it, beside the daemon's own OS CPU over the
+  build (`builds.daemon_user_ns` and `daemon_system_ns`, from getrusage), so the spans' total
+  can be checked against the process's; a build row from before those columns says it has none;
 - waits with no wait span (rule 13), classed by their kind alone (`key wait with no wait span`)
   and sized by the wall they cover, with the recorder's `profile spans lost` over the build
   beside them; and named waits that never name an owner. A class's evidence says its waits'
@@ -855,9 +918,34 @@ daemon sooner still finds it), and again once one unit's step has run 300 s whil
 ended. A livelock that keeps moving the counts is not the watchdog's to catch: each loop that
 waits for progress carries its own bound (fuel, depth or a deadline).
 
-## `BLAZE_PROFILE` and `BLAZE_STATS`
+## `BLAZE_PROFILE`
 
-`BLAZE_PROFILE=<dir> blaze build` writes, for every process of the build, its spans with each
-`blaze` span's own CPU time. At the end they are merged into `<dir>/trace.json` (a Chrome
-trace), `phases.tsv`, `functions.tsv` and `passes.tsv`. `BLAZE_STATS=1` prints the build's wall
-time by step.
+`BLAZE_PROFILE=<dir> blaze build` exports the build's Chrome trace (ui.perfetto.dev) from the
+history to `<dir>/trace.json`, the trace `blaze debug time --build N --trace FILE` writes: every
+lane of the daemon's rows, the fibers' tracks and the critical path on a track of its own
+(`time::load::trace_of`). The client makes it once its rows are written, and says its path on
+stderr; a failure is a warning naming the step and the build, and the command's outcome stands.
+The daemon needs no variable: the history is always written.
+
+Removed on 2026-11-04, with every caller: the cross-process profiler `BLAZE_PROFILE` used to
+turn on. Each process kept per-thread phase, function and pass costs while it was set, wrote
+`<dir>/parts/<pid>-<n>.json` at exit (an `atexit` hook) or, in the daemon, at each build's end,
+and the client put the parts together into `trace.json`, `phases.tsv`, `functions.tsv` and
+`passes.tsv`. Gone with it: `BLAZE_STATS`'s step table (`blaze time: ...` and `blaze where the
+time went`), `BLAZE_PROFILE_CONST` (one constant's requests and runs), and `blaze_profile`'s
+`note`, `step`, `pass`, `write_part`, `discard`, `finish`, `table`, `breakdown`, `start`,
+`from_env`, `child_env`, `on`, `dir`, `with_spans`/`split`, `link_output` and `Span`. Each was
+a second record beside the history, written only when asked for, and the client's part was
+the only record of the client. The history now has the client's rows, every span's own CPU,
+each child's rusage and each test run, so a phase table is a query:
+
+```sql
+SELECT name, count(*) AS n, sum(dur_ns) / 1e6 AS wall_ms, sum(self_cpu_ns) / 1e6 AS cpu_ms
+FROM spans WHERE build_id = 42 GROUP BY name ORDER BY cpu_ms DESC;
+```
+
+`harness/realbench.py` reads the exported trace's critical path in place of the old
+`blaze.breakdown`; `crates/blaze-profile/src/diff.rs` still reads the `phases.tsv` of old
+profile directories a log names. The flight recorder's dump beside a stall (`flight::dump`)
+keeps its own one-process Chrome writer (`crates/blaze-profile/src/dump.rs`).
+
