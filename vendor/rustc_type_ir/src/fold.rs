@@ -936,7 +936,10 @@ mod tests {
     use super::fold_arc;
 
     /// The safe fold `fold_arc` must give the same value as.
-    fn safe_fold<T: Clone, E>(arc: Arc<T>, fold: impl FnOnce(T) -> Result<T, E>) -> Result<Arc<T>, E> {
+    fn safe_fold<T: Clone, E>(
+        arc: Arc<T>,
+        fold: impl FnOnce(T) -> Result<T, E>,
+    ) -> Result<Arc<T>, E> {
         Ok(Arc::new(fold(Arc::unwrap_or_clone(arc))?))
     }
 

@@ -1,8 +1,8 @@
 //! The labels, notes and suggestions of the errors, in rustc's words: its `cannot_*` builders
 //! in `borrowck_errors.rs` and the reports of `conflict_errors.rs` that use them.
 
-use hir_ty::db::HirDatabase;
 use hir_def::hir::{BindingAnnotation, ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId};
+use hir_ty::db::HirDatabase;
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind};
 
 use hir_ty::{
@@ -16,9 +16,7 @@ use hir_ty::{
 };
 
 use super::{Checker, Draft, InitAction, PlaceRef, explain::Explanation, mutability};
-use crate::{
-    Applicability, PartSpan, Sublevel, cfg::Location, mem::FVec, moves::Mpi,
-};
+use crate::{Applicability, PartSpan, Sublevel, cfg::Location, mem::FVec, moves::Mpi};
 
 impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
     /// Where rustc's `retrieve_borrow_spans(..).args_or_use()` points for loan `id`: the head
@@ -116,7 +114,9 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                     text!(self, "{} borrow occurs here", mutability(issued_loan.kind)),
                 );
                 match issued_loan.kind {
-                    BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow } => "mutable ",
+                    BorrowKind::Mut {
+                        kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow,
+                    } => "mutable ",
                     _ => "immutable ",
                 }
             }
@@ -280,7 +280,11 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
         }
         diagnostic.child(
             Sublevel::Note,
-            text!(self, "if `{}` implemented `Clone`, you could clone the value", self.ctx.shown_adt(adt)),
+            text!(
+                self,
+                "if `{}` implemented `Clone`, you could clone the value",
+                self.ctx.shown_adt(adt)
+            ),
             &[PartSpan::Def(adt)],
             &[
                 (PartSpan::Def(adt), "consider implementing `Clone` for this type"),
@@ -342,8 +346,7 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
 
     /// rustc's `clone_on_reference`: `expr` is `x.clone()` of the type of `x`.
     fn clones_a_reference(&self, expr: ExprId) -> bool {
-        let Expr::MethodCall { receiver, method_name, args, .. } = self.ctx.store.expr(expr)
-        else {
+        let Expr::MethodCall { receiver, method_name, args, .. } = self.ctx.store.expr(expr) else {
             return false;
         };
         let types = &self.ctx.infer.type_of_expr;
@@ -478,7 +481,8 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
             PartSpan::At(diagnostic.span),
             "creates a temporary value which is freed while still in use",
         );
-        diagnostic.label(PartSpan::At(drop), "temporary value is freed at the end of this statement");
+        diagnostic
+            .label(PartSpan::At(drop), "temporary value is freed at the end of this statement");
         let explanation = self.explain(location, id, None);
         if explanation.is_used_later() {
             diagnostic.note("consider using a `let` binding to create a longer lived value");
@@ -535,8 +539,10 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
         returned: Option<MirSpan>,
     ) {
         let kind = self.closure_kind_name(closure);
-        diagnostic
-            .label(PartSpan::ClosureHead(closure), text!(self, "may outlive borrowed value {what}"));
+        diagnostic.label(
+            PartSpan::ClosureHead(closure),
+            text!(self, "may outlive borrowed value {what}"),
+        );
         if let Some(capture) = capture {
             diagnostic.label(PartSpan::At(capture), text!(self, "{what} is borrowed here"));
         }
@@ -629,7 +635,8 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 text!(self, "value {verb} here after {partial}move"),
             );
         }
-        let place = PlaceRef { local: self.moves.local(path), projection: self.moves.projection(path) };
+        let place =
+            PlaceRef { local: self.moves.local(path), projection: self.moves.projection(path) };
         let ty = self.ctx.place_ty(self.body, place.local, place.projection).ty;
         // A closure's note is rustc's `closure_kind_origin`'s, which is not ported.
         if !matches!(ty.kind(), TyKind::Closure(..)) {
@@ -645,7 +652,8 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
     /// The closure or coroutine the statement at `location` makes with `local` as a capture,
     /// and where its body uses the capture.
     fn closure_use_at(&self, location: Location, local: LocalId) -> Option<(ExprId, MirSpan)> {
-        let statement = self.body.basic_blocks[location.block].statements.get(location.statement)?;
+        let statement =
+            self.body.basic_blocks[location.block].statements.get(location.statement)?;
         let StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), operands)) =
             &statement.kind
         else {

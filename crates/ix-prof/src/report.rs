@@ -41,7 +41,11 @@ pub fn format_value(value: i64, unit: &str) -> String {
 }
 
 fn pct(part: i64, total: i64) -> String {
-    if total == 0 { "0.00%".to_owned() } else { format!("{:.2}%", part as f64 * 100.0 / total as f64) }
+    if total == 0 {
+        "0.00%".to_owned()
+    } else {
+        format!("{:.2}%", part as f64 * 100.0 / total as f64)
+    }
 }
 
 fn value(s: &Sample, ty: usize) -> i64 {
@@ -81,15 +85,25 @@ fn flat_cum(view: &View, ty: usize) -> BTreeMap<&str, (i64, i64)> {
 pub fn top(view: &View, ty: usize, cum: bool, n: usize) -> String {
     let u = unit(view, ty);
     let total = total(view, ty);
-    let mut rows: Vec<(&str, i64, i64)> = flat_cum(view, ty).into_iter().map(|(k, (f, c))| (k, f, c)).collect();
+    let mut rows: Vec<(&str, i64, i64)> =
+        flat_cum(view, ty).into_iter().map(|(k, (f, c))| (k, f, c)).collect();
     rows.sort_by(|a, b| {
         let key = |r: &(&str, i64, i64)| if cum { r.2.abs() } else { r.1.abs() };
         key(b).cmp(&key(a)).then(a.0.cmp(b.0))
     });
     let mut out = String::new();
     let ty_name = view.sample_types.get(ty).map_or("?", |it| it.name.as_str());
-    let _ = writeln!(out, "{ty_name}: total {} in {} samples", format_value(total, u), view.samples.len());
-    let _ = writeln!(out, "{:>12} {:>7} {:>7} {:>12} {:>7}  function", "flat", "flat%", "sum%", "cum", "cum%");
+    let _ = writeln!(
+        out,
+        "{ty_name}: total {} in {} samples",
+        format_value(total, u),
+        view.samples.len()
+    );
+    let _ = writeln!(
+        out,
+        "{:>12} {:>7} {:>7} {:>12} {:>7}  function",
+        "flat", "flat%", "sum%", "cum", "cum%"
+    );
     let mut sum = 0;
     for (name, flat, cumv) in rows.into_iter().take(n) {
         sum += flat;
@@ -124,7 +138,11 @@ pub fn peek(view: &View, ty: usize, pattern: &Regex) -> String {
             }
             counted.push(n);
             *cum.entry(n).or_default() += v;
-            *callers.entry(n).or_default().entry(if i == 0 { "(root)" } else { names[i - 1] }).or_default() += v;
+            *callers
+                .entry(n)
+                .or_default()
+                .entry(if i == 0 { "(root)" } else { names[i - 1] })
+                .or_default() += v;
             match names.get(i + 1) {
                 Some(next) => *callees.entry(n).or_default().entry(next).or_default() += v,
                 None => *flat.entry(n).or_default() += v,
@@ -138,7 +156,13 @@ pub fn peek(view: &View, ty: usize, pattern: &Regex) -> String {
         v
     };
     for (name, c) in &cum {
-        let _ = writeln!(out, "{name}: cum {} ({}), flat {}", format_value(*c, u), pct(*c, total), format_value(flat.get(name).copied().unwrap_or(0), u));
+        let _ = writeln!(
+            out,
+            "{name}: cum {} ({}), flat {}",
+            format_value(*c, u),
+            pct(*c, total),
+            format_value(flat.get(name).copied().unwrap_or(0), u)
+        );
         for (caller, v) in sorted(callers.get(name).unwrap_or(&BTreeMap::new())) {
             let _ = writeln!(out, "  {:>12} {:>7}  <- {caller}", format_value(v, u), pct(v, *c));
         }
@@ -193,11 +217,24 @@ pub fn tree(view: &View, ty: usize, min_fraction: f64, reverse: bool) -> String 
                 hidden += kid.total;
                 continue;
             }
-            let _ = writeln!(out, "{:>12} {:>7}  {}{name}", format_value(kid.total, u), pct(kid.total, total), "  ".repeat(depth));
+            let _ = writeln!(
+                out,
+                "{:>12} {:>7}  {}{name}",
+                format_value(kid.total, u),
+                pct(kid.total, total),
+                "  ".repeat(depth)
+            );
             walk(out, kid, depth + 1, cut, total, u);
         }
         if hidden != 0 {
-            let _ = writeln!(out, "{:>12} {:>7}  {}(below {})", format_value(hidden, u), pct(hidden, total), "  ".repeat(depth), format_value(cut, u));
+            let _ = writeln!(
+                out,
+                "{:>12} {:>7}  {}(below {})",
+                format_value(hidden, u),
+                pct(hidden, total),
+                "  ".repeat(depth),
+                format_value(cut, u)
+            );
         }
     }
     walk(&mut out, &root, 0, cut, total, u);
@@ -223,7 +260,15 @@ pub fn flame(view: &View, ty: usize, width: usize, max_depth: usize) -> String {
     let root = build(view, ty, false);
     let width = width.max(20);
     let mut rows: Vec<Vec<char>> = Vec::new();
-    fn place(rows: &mut Vec<Vec<char>>, node: &Node<'_>, depth: usize, start: f64, scale: f64, width: usize, max_depth: usize) {
+    fn place(
+        rows: &mut Vec<Vec<char>>,
+        node: &Node<'_>,
+        depth: usize,
+        start: f64,
+        scale: f64,
+        width: usize,
+        max_depth: usize,
+    ) {
         if depth >= max_depth {
             return;
         }
@@ -239,7 +284,11 @@ pub fn flame(view: &View, ty: usize, width: usize, max_depth: usize) -> String {
                 }
                 let row = &mut rows[depth];
                 let cells = b.min(width) - a.min(width);
-                let label: Vec<char> = if cells >= 3 { short(name).chars().take(cells - 2).collect() } else { Vec::new() };
+                let label: Vec<char> = if cells >= 3 {
+                    short(name).chars().take(cells - 2).collect()
+                } else {
+                    Vec::new()
+                };
                 for (i, c) in row[a.min(width)..b.min(width)].iter_mut().enumerate() {
                     *c = if i == 0 {
                         '['
@@ -314,7 +363,12 @@ pub fn list(view: &View, ty: usize, pattern: &Regex, source_root: Option<&Path>)
     }
     for ((function, file), lines) in by {
         let (flat, cum) = lines.values().fold((0, 0), |a, b| (a.0 + b.0, a.1.max(b.1)));
-        let _ = writeln!(out, "ROUTINE {function}\n  {file}: flat {}, cum {}", format_value(flat, u), format_value(cum, u));
+        let _ = writeln!(
+            out,
+            "ROUTINE {function}\n  {file}: flat {}, cum {}",
+            format_value(flat, u),
+            format_value(cum, u)
+        );
         let path = match source_root {
             Some(root) if Path::new(file).is_relative() => root.join(file),
             _ => Path::new(file).to_path_buf(),
@@ -324,16 +378,30 @@ pub fn list(view: &View, ty: usize, pattern: &Regex, source_root: Option<&Path>)
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let from = first.saturating_sub(3).max(1);
-                for (n, src) in text.lines().enumerate().map(|(i, l)| (i as u32 + 1, l)).filter(|(n, _)| *n >= from && *n <= last + 2) {
+                for (n, src) in text
+                    .lines()
+                    .enumerate()
+                    .map(|(i, l)| (i as u32 + 1, l))
+                    .filter(|(n, _)| *n >= from && *n <= last + 2)
+                {
                     let (f, c) = lines.get(&n).copied().unwrap_or((0, 0));
                     let show = |x: i64| if x == 0 { ".".to_owned() } else { format_value(x, u) };
                     let _ = writeln!(out, "{:>12} {:>12} {n:>6}: {src}", show(f), show(c));
                 }
             }
             Err(why) => {
-                let _ = writeln!(out, "  (source {} not read: {why}; pass --source <dir>)", path.display());
+                let _ = writeln!(
+                    out,
+                    "  (source {} not read: {why}; pass --source <dir>)",
+                    path.display()
+                );
                 for (n, (f, c)) in &lines {
-                    let _ = writeln!(out, "{:>12} {:>12} {n:>6}", format_value(*f, u), format_value(*c, u));
+                    let _ = writeln!(
+                        out,
+                        "{:>12} {:>12} {n:>6}",
+                        format_value(*f, u),
+                        format_value(*c, u)
+                    );
                 }
             }
         }
@@ -345,7 +413,9 @@ pub fn list(view: &View, ty: usize, pattern: &Regex, source_root: Option<&Path>)
 /// `go tool pprof -diff_base` does), frames matched by function name. Both must have the same
 /// sample types.
 pub fn diff(view: &View, base: &View) -> Result<View, String> {
-    let names = |v: &View| v.sample_types.iter().map(|t| format!("{}/{}", t.name, t.unit)).collect::<Vec<_>>();
+    let names = |v: &View| {
+        v.sample_types.iter().map(|t| format!("{}/{}", t.name, t.unit)).collect::<Vec<_>>()
+    };
     if names(view) != names(base) {
         return Err(format!(
             "the profiles have different sample types: {:?} and base {:?}",

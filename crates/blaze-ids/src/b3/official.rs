@@ -67,7 +67,13 @@ const CHUNK_START: u8 = 1;
 const DERIVE_KEY_MATERIAL: u8 = 64;
 
 impl many::Leading for Many {
-    fn leading_blocks(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+    fn leading_blocks(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
         let platform = Platform::detect();
         macro_rules! by_blocks {
             ($($blocks:literal)*) => {

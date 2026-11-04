@@ -90,10 +90,23 @@ pub(super) enum Kind {
 /// is the writer's check, [`fits_memory`].
 pub(super) fn kind(r_type: u32) -> Result<Kind, String> {
     match r_type {
-        FUNCTION_INDEX_LEB | FUNCTION_INDEX_I32 | TABLE_INDEX_SLEB | TABLE_INDEX_I32
-        | MEMORY_ADDR_LEB | MEMORY_ADDR_SLEB | MEMORY_ADDR_REL_SLEB | MEMORY_ADDR_I32 | GLOBAL_INDEX_LEB
-        | GLOBAL_INDEX_I32 | TABLE_NUMBER_LEB | MEMORY_ADDR_LEB64 | MEMORY_ADDR_SLEB64 | MEMORY_ADDR_I64
-        | MEMORY_ADDR_REL_SLEB64 | TABLE_INDEX_SLEB64 | TABLE_INDEX_I64 => Ok(Kind::Applied),
+        FUNCTION_INDEX_LEB
+        | FUNCTION_INDEX_I32
+        | TABLE_INDEX_SLEB
+        | TABLE_INDEX_I32
+        | MEMORY_ADDR_LEB
+        | MEMORY_ADDR_SLEB
+        | MEMORY_ADDR_REL_SLEB
+        | MEMORY_ADDR_I32
+        | GLOBAL_INDEX_LEB
+        | GLOBAL_INDEX_I32
+        | TABLE_NUMBER_LEB
+        | MEMORY_ADDR_LEB64
+        | MEMORY_ADDR_SLEB64
+        | MEMORY_ADDR_I64
+        | MEMORY_ADDR_REL_SLEB64
+        | TABLE_INDEX_SLEB64
+        | TABLE_INDEX_I64 => Ok(Kind::Applied),
         TYPE_INDEX_LEB => Ok(Kind::Type),
         FUNCTION_OFFSET_I32 | SECTION_OFFSET_I32 => Ok(Kind::Debug),
         _ => Err(match name(r_type) {
@@ -116,9 +129,17 @@ pub(super) fn kind(r_type: u32) -> Result<Kind, String> {
 pub(super) fn fits_memory(r_type: u32, memory64: bool) -> Result<(), String> {
     let wide = matches!(
         r_type,
-        MEMORY_ADDR_LEB64 | MEMORY_ADDR_SLEB64 | MEMORY_ADDR_I64 | MEMORY_ADDR_REL_SLEB64 | TABLE_INDEX_SLEB64 | TABLE_INDEX_I64
+        MEMORY_ADDR_LEB64
+            | MEMORY_ADDR_SLEB64
+            | MEMORY_ADDR_I64
+            | MEMORY_ADDR_REL_SLEB64
+            | TABLE_INDEX_SLEB64
+            | TABLE_INDEX_I64
     );
-    let narrow = matches!(r_type, MEMORY_ADDR_LEB | MEMORY_ADDR_SLEB | MEMORY_ADDR_REL_SLEB | TABLE_INDEX_SLEB);
+    let narrow = matches!(
+        r_type,
+        MEMORY_ADDR_LEB | MEMORY_ADDR_SLEB | MEMORY_ADDR_REL_SLEB | TABLE_INDEX_SLEB
+    );
     match (memory64, wide, narrow) {
         // alloc: error path
         (false, true, _) => Err(format!(
@@ -199,7 +220,9 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
         MEMORY_ADDR_LEB64 => put(bytes, &padded_uleb64(address64()?), what()),
         // `i64.const` takes the address as a signed number, as `i32.const` does on wasm32;
         // from `__memory_base`, which is 0, the address itself.
-        MEMORY_ADDR_SLEB64 | MEMORY_ADDR_REL_SLEB64 => put(bytes, &padded_sleb64(address64()? as i64), what()),
+        MEMORY_ADDR_SLEB64 | MEMORY_ADDR_REL_SLEB64 => {
+            put(bytes, &padded_sleb64(address64()? as i64), what())
+        }
         MEMORY_ADDR_I64 => put(bytes, &address64()?.to_le_bytes(), what()),
         GLOBAL_INDEX_LEB | TABLE_NUMBER_LEB => {
             no_addend()?;
@@ -311,7 +334,14 @@ mod tests {
 
     #[test]
     fn a_module_holds_only_its_memory_width() {
-        for wide in [MEMORY_ADDR_LEB64, MEMORY_ADDR_SLEB64, MEMORY_ADDR_I64, MEMORY_ADDR_REL_SLEB64, TABLE_INDEX_SLEB64, TABLE_INDEX_I64] {
+        for wide in [
+            MEMORY_ADDR_LEB64,
+            MEMORY_ADDR_SLEB64,
+            MEMORY_ADDR_I64,
+            MEMORY_ADDR_REL_SLEB64,
+            TABLE_INDEX_SLEB64,
+            TABLE_INDEX_I64,
+        ] {
             assert_eq!(fits_memory(wide, true), Ok(()));
             assert!(fits_memory(wide, false).unwrap_err().contains("wasm32"));
         }
@@ -319,7 +349,14 @@ mod tests {
             assert_eq!(fits_memory(narrow, false), Ok(()));
             assert!(fits_memory(narrow, true).unwrap_err().contains("memory64"));
         }
-        for either in [FUNCTION_INDEX_LEB, FUNCTION_INDEX_I32, MEMORY_ADDR_I32, TABLE_INDEX_I32, GLOBAL_INDEX_LEB, TABLE_NUMBER_LEB] {
+        for either in [
+            FUNCTION_INDEX_LEB,
+            FUNCTION_INDEX_I32,
+            MEMORY_ADDR_I32,
+            TABLE_INDEX_I32,
+            GLOBAL_INDEX_LEB,
+            TABLE_NUMBER_LEB,
+        ] {
             assert_eq!((fits_memory(either, false), fits_memory(either, true)), (Ok(()), Ok(())));
         }
     }

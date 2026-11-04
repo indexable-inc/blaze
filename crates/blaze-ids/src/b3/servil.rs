@@ -85,7 +85,13 @@ impl Default for Hasher {
 pub struct Many;
 
 impl many::Leading for Many {
-    fn leading_blocks(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+    fn leading_blocks(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
         many::leading_lanes(key, inputs, members, blocks, cvs);
     }
 

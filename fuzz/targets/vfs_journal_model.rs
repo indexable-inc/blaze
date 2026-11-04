@@ -25,7 +25,7 @@ use std::time::Duration;
 use blaze_core::{Completion, Done, Effect, FileName, IoError};
 use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
-use blaze_vfs::{CommitError, Mode, Op, Ticket, View, Vfs};
+use blaze_vfs::{CommitError, Mode, Op, Ticket, Vfs, View};
 
 const TARGET: Target = Target {
     name: "vfs_journal_model",
@@ -85,8 +85,7 @@ fn journal() -> FileName {
 }
 
 fn recover(bytes: &[u8]) -> Vfs {
-    let (largest, (vfs, _)) =
-        blaze_fuzz::largest_allocation(|| Vfs::recover(journal(), 0, bytes));
+    let (largest, (vfs, _)) = blaze_fuzz::largest_allocation(|| Vfs::recover(journal(), 0, bytes));
     let allowed = blaze_fuzz::allowed(bytes.len());
     assert!(
         largest <= allowed,
@@ -386,7 +385,9 @@ impl Run {
                 Done::Written
             }
             Effect::Truncate { .. } | Effect::Write { .. } => failed(),
-            other => panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}"),
+            other => {
+                panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}")
+            }
         };
         let durable = self.vfs.complete(Completion { tag, done }, &mut self.scratch);
         self.take();
@@ -463,7 +464,9 @@ impl Run {
             None => {
                 for (head, root) in &now {
                     assert!(
-                        self.states.iter().any(|state| state.iter().any(|it| it.0 == *head && it.1 == *root)),
+                        self.states
+                            .iter()
+                            .any(|state| state.iter().any(|it| it.0 == *head && it.1 == *root)),
                         "a damaged journal recovers {head:?} at {root:x}, where no transaction left it"
                     );
                 }

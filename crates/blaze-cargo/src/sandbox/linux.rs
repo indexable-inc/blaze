@@ -85,7 +85,8 @@ mod raw;
 /// `build.rs`: it tells the supervisor what its filter can't see, the variables read by name
 /// and the realtime clock read through the vDSO, and says it loaded, so that a program it is
 /// not in (a static or setuid one) is known.
-const INTERPOSER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libblaze_sandbox_interpose.so"));
+const INTERPOSER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/libblaze_sandbox_interpose.so"));
 
 /// The variable the interposer is told its own path by, which it takes out of what the program
 /// sees as it loads, with itself out of `LD_PRELOAD`, and puts back in what the program runs.
@@ -98,7 +99,9 @@ fn interposer() -> Result<PathBuf, String> {
     let caches = caches
         .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
         .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's interposer in")?;
-    let dir = caches.join("blaze/sandbox").join(crate::content::hex(&blaze_ids::b3::hash(INTERPOSER)[..12]));
+    let dir = caches
+        .join("blaze/sandbox")
+        .join(crate::content::hex(&blaze_ids::b3::hash(INTERPOSER)[..12]));
     let file = dir.join("libblaze_sandbox_interpose.so");
     // The name is that of the contents it should have; what is there is still compared, so a
     // file left half written, or changed since, is written again.
@@ -873,9 +876,11 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     // or a device the rights of a file it writes.
     for dir in &spec.writable {
         match std::fs::metadata(dir) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)
-                // alloc: the error, once, and no sandbox is made.
-                .map_err(|error| format!("{}: {error}", dir.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)
+                    // alloc: the error, once, and no sandbox is made.
+                    .map_err(|error| format!("{}: {error}", dir.display()))?
+            }
             _ => drop(Passed::open(dir, Given::Write)?),
         }
     }
@@ -1051,7 +1056,8 @@ mod landlock {
             };
             let stat = super::raw::stat_of(fd.as_raw_fd());
             let is_dir = stat.is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFDIR);
-            let is_file = stat.is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_nlink == 1);
+            let is_file = stat
+                .is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_nlink == 1);
             // A writable entry checked by its path before ([`super::Passed::open`]) is still
             // checked by what was opened here: no device, pipe, socket or linked file.
             if required && !(is_dir || is_file) {
@@ -1071,7 +1077,9 @@ mod landlock {
             drop(fd);
             match error {
                 // alloc: the error, once, and no sandbox is made.
-                Some(error) => Err(format!("{} written (landlock_add_rule): {error}", path.display())),
+                Some(error) => {
+                    Err(format!("{} written (landlock_add_rule): {error}", path.display()))
+                }
                 None => Ok(()),
             }
         };
@@ -1158,7 +1166,9 @@ impl Passed {
             .ok()
             .filter(|it| it.is_absolute())
             // alloc: the error, once, and no sandbox is made.
-            .ok_or_else(|| format!("the {what} entry {}: where its descriptor is can't be read", at.display()))?;
+            .ok_or_else(|| {
+                format!("the {what} entry {}: where its descriptor is can't be read", at.display())
+            })?;
         let kind = match (stat.st_mode & libc::S_IFMT, given) {
             (libc::S_IFDIR, _) => return Ok(Passed { fd, dir: true, real }),
             (libc::S_IFREG, Given::Write) if stat.st_nlink > 1 => {
@@ -1170,7 +1180,9 @@ impl Passed {
                     stat.st_nlink
                 ));
             }
-            (libc::S_IFREG, _) | (libc::S_IFSOCK, Given::Read) => return Ok(Passed { fd, dir: false, real }),
+            (libc::S_IFREG, _) | (libc::S_IFSOCK, Given::Read) => {
+                return Ok(Passed { fd, dir: false, real });
+            }
             (libc::S_IFSOCK, Given::Write) => "a socket",
             (libc::S_IFIFO, _) => "a pipe",
             (libc::S_IFCHR, _) => "a character device",
@@ -1182,7 +1194,10 @@ impl Passed {
             Given::Write => "a directory or a regular file",
         };
         // alloc: the error, once, and no sandbox is made.
-        Err(format!("the {what} entry {} is {kind}: a sandbox is given as {what} only {may}", at.display()))
+        Err(format!(
+            "the {what} entry {} is {kind}: a sandbox is given as {what} only {may}",
+            at.display()
+        ))
     }
 
     /// Makes the point `at` this is mounted on, as the sandbox sees the machine now (read-only,
@@ -1204,15 +1219,25 @@ impl Passed {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let made = match (self.dir, at.parent()) {
                     (true, _) => std::fs::create_dir_all(at),
-                    (false, parent) => parent.map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
-                        std::fs::OpenOptions::new().write(true).create_new(true).open(at).map(drop)
-                    }),
+                    (false, parent) => {
+                        parent.map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(at)
+                                .map(drop)
+                        })
+                    }
                 };
                 // alloc: the error, once, and no sandbox is made.
-                made.map_err(|error| format!("{} mounted on, for the {what} entry: {error}", at.display()))
+                made.map_err(|error| {
+                    format!("{} mounted on, for the {what} entry: {error}", at.display())
+                })
             }
             // alloc: the error, once, and no sandbox is made.
-            Err(error) => Err(format!("{} mounted on, for the {what} entry: {error}", at.display())),
+            Err(error) => {
+                Err(format!("{} mounted on, for the {what} entry: {error}", at.display()))
+            }
         }
     }
 }
@@ -1232,11 +1257,17 @@ fn machine(spec: &Spec) -> Result<(), String> {
     // read-only or hidden, and bound back in place after: they stay the directories and files
     // outside, written for real.
     // alloc: once per sandbox, a descriptor of each.
-    let writable =
-        spec.writable.iter().map(|it| Passed::open(it, Given::Write)).collect::<Result<Vec<_>, _>>()?;
+    let writable = spec
+        .writable
+        .iter()
+        .map(|it| Passed::open(it, Given::Write))
+        .collect::<Result<Vec<_>, _>>()?;
     // alloc: as `writable`'s.
-    let readable =
-        spec.readable.iter().map(|it| Passed::open(it, Given::Read)).collect::<Result<Vec<_>, _>>()?;
+    let readable = spec
+        .readable
+        .iter()
+        .map(|it| Passed::open(it, Given::Read))
+        .collect::<Result<Vec<_>, _>>()?;
     let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
     if raw::mount_setattr(&root, AT_RECURSIVE, &attr) < 0 {
         return Err(os("making every mount read-only (mount_setattr)"));
@@ -1349,9 +1380,11 @@ fn machine(spec: &Spec) -> Result<(), String> {
         let from = by_fd(&passed.fd, "");
         match given {
             // Read-only as its source's mount now is, said again rather than left to the bind.
-            Given::Read => bind(&from, path, MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
-                // alloc: the error, once, and no sandbox is made.
-                .map_err(|error| format!("{} seen read-only: {error}", path.display()))?,
+            Given::Read => {
+                bind(&from, path, MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
+                    // alloc: the error, once, and no sandbox is made.
+                    .map_err(|error| format!("{} seen read-only: {error}", path.display()))?
+            }
             Given::Write => {
                 let (from, to) = (c(&from), c(path));
                 let flags = libc::MS_BIND | libc::MS_REC;
@@ -1369,7 +1402,10 @@ fn machine(spec: &Spec) -> Result<(), String> {
                 };
                 if raw::mount_setattr(&to, AT_RECURSIVE, &attr) < 0 {
                     // alloc: the error, once, and no sandbox is made.
-                    return Err(os(&format!("{} written for real (mount_setattr)", path.display())));
+                    return Err(os(&format!(
+                        "{} written for real (mount_setattr)",
+                        path.display()
+                    )));
                 }
             }
         }
@@ -1382,7 +1418,10 @@ fn machine(spec: &Spec) -> Result<(), String> {
         let what = given.name();
         let Some(fs) = raw::statvfs(&c(path)) else {
             // alloc: the error, once, and no sandbox is made.
-            return Err(os(&format!("the {what} entry {} as the sandbox sees it (statvfs)", path.display())));
+            return Err(os(&format!(
+                "the {what} entry {} as the sandbox sees it (statvfs)",
+                path.display()
+            )));
         };
         let read_only = fs.f_flag & libc::ST_RDONLY != 0;
         if read_only == (given == Given::Read) {
@@ -2047,7 +2086,12 @@ fn send(socket: libc::c_int, fd: libc::c_int) -> Result<(), String> {
 /// Answers the kernel's notifications through `listener`, noting what each call reached,
 /// until the process `first` has ended, or no process is left that the filter is on, the
 /// program seeing what `around` says.
-fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, watch: &mut Watch) {
+fn supervise(
+    listener: libc::c_int,
+    first: libc::pid_t,
+    recorder: &mut Recorder,
+    watch: &mut Watch,
+) {
     // The kernel wakes the supervisor on the CPU of the thread it holds and switches to it
     // there, as gVisor has it, rather than waking it as any other waiter. A kernel before 6.6
     // has no such flag and refuses it: the calls are answered the same, each a wake-up later.
@@ -2352,7 +2396,8 @@ fn noted(
     match call.does {
         Does::Signal(target) => {
             let Around::Confined(first) = watch.around else { return None };
-            let outside = signal_outside(pid, target, notif.args[0], first, &mut scratch.procs.file);
+            let outside =
+                signal_outside(pid, target, notif.args[0], first, &mut scratch.procs.file);
             return outside.then_some(libc::EPERM);
         }
         Does::List(fd) => {
@@ -2423,8 +2468,8 @@ fn noted(
         Some(Address::Unix(path)) if to_unix => {
             scratch.raw.clear();
             scratch.raw.extend_from_slice(&scratch.memory[path]);
-            let found = whole(pid, None, scratch)
-                && resolved(pid, &scratch.path, &mut scratch.resolving);
+            let found =
+                whole(pid, None, scratch) && resolved(pid, &scratch.path, &mut scratch.resolving);
             if !(found && recorder.may_connect(&scratch.resolving.out)) {
                 scratch.text.clear();
                 scratch.text.push_str("unix:");
@@ -2451,7 +2496,10 @@ fn noted(
                 continue;
             }
             if !dir.is_some_and(|it| proc_link(pid, Some(it), &mut scratch.raw)) {
-                recorder.incomplete(thread, "a program run from a descriptor the sandbox could not follow");
+                recorder.incomplete(
+                    thread,
+                    "a program run from a descriptor the sandbox could not follow",
+                );
                 continue;
             }
         }
@@ -3003,7 +3051,8 @@ mod tests {
     #[test]
     fn every_run_refuses_terminal_input_and_io_uring() {
         for (recorded, reads) in [(false, false), (true, false), (true, true)] {
-            for (confined, network) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (confined, network) in [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let program = super::filter_program(recorded, reads, confined, network, 3);
                 let has = |k: u32| program.iter().any(|it| it.k == k);
                 assert!(has(super::TIOCSTI) && has(super::TIOCLINUX));
@@ -3074,7 +3123,10 @@ mod tests {
     /// Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
     fn a_traced_run_loads_the_interposer_and_sees_none_of_it() {
-        use blaze_usercode::{confine, trace::{self, Seen}};
+        use blaze_usercode::{
+            confine,
+            trace::{self, Seen},
+        };
         if let Err(why) = alone::probe(crate::sandbox::Probe::V2) {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
@@ -3101,6 +3153,7 @@ for it in "$OUT"/*; do :; done
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec!["/bin/sh".into()],
+            given: None,
         };
         assert_eq!(alone::launch(&spec), 0);
         let read = |it: &Path| std::fs::read_to_string(it).unwrap();
@@ -3137,7 +3190,10 @@ for it in "$OUT"/*; do :; done
             ]
         );
         let plain = super::environment(&given[..1], None, Some(lib)).unwrap();
-        assert_eq!(plain[1].as_bytes(), b"LD_PRELOAD=/c/blaze/sandbox/h/libblaze_sandbox_interpose.so");
+        assert_eq!(
+            plain[1].as_bytes(),
+            b"LD_PRELOAD=/c/blaze/sandbox/h/libblaze_sandbox_interpose.so"
+        );
         let nul = vec![("A".into(), OsString::from_vec(b"x\0y".to_vec()))];
         assert!(super::environment(&nul, None, None).unwrap_err().contains("nul"));
     }
@@ -3317,7 +3373,10 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         let most = std::time::Duration::from_nanos(blaze_core::busy::MOST_NS);
         let (sh, (code, said)) = run("sh-held", most + most / 2);
         assert_eq!(code, Ok(blaze_core::exit::Exit::ExecFailed.code()), "{said}");
-        assert!(said.contains(&sh.display().to_string()) && said.contains("still open for writing"), "{said}");
+        assert!(
+            said.contains(&sh.display().to_string()) && said.contains("still open for writing"),
+            "{said}"
+        );
         _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3579,7 +3638,10 @@ true
         for (entry, says) in [("pipe", "is a pipe"), ("linked", "2 links")] {
             let (code, said) = run(vec![at(entry)], "exit 0");
             assert_ne!(code, Ok(0), "{entry} was written: {said}");
-            assert!(said.contains(&at(entry).display().to_string()) && said.contains(says), "{said}");
+            assert!(
+                said.contains(&at(entry).display().to_string()) && said.contains(says),
+                "{said}"
+            );
         }
         _ = std::fs::remove_dir_all(&dir);
     }
@@ -3588,7 +3650,8 @@ true
     /// directories, so that what the sandbox binds lands on the machine's own mounts.
     fn beside_binary(name: &str) -> PathBuf {
         let exe = std::env::current_exe().unwrap();
-        let dir = exe.parent().unwrap().join(format!("blaze-sandbox-{name}-{}", std::process::id()));
+        let dir =
+            exe.parent().unwrap().join(format!("blaze-sandbox-{name}-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3687,7 +3750,9 @@ echo y > "$D/w/y" || fail "the written directory named through a link is read-on
     fn a_readable_socket_is_reached_and_one_not_given_is_not() {
         let Some(bash) = namespaced_bash() else { return };
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let Some(python) = std::env::split_paths(&path).map(|it| it.join("python3")).find(|it| it.exists()) else {
+        let Some(python) =
+            std::env::split_paths(&path).map(|it| it.join("python3")).find(|it| it.exists())
+        else {
             eprintln!("skipped: no python3 on PATH");
             return;
         };
@@ -3695,7 +3760,8 @@ echo y > "$D/w/y" || fail "the written directory named through a link is read-on
         // The directory's path may be longer than a socket's address holds: the sockets are
         // made through its descriptor, and reached from the sandbox's working directory.
         let held = std::fs::File::open(&d).unwrap();
-        let short = |name: &str| format!("/proc/self/fd/{}/{name}", std::os::fd::AsRawFd::as_raw_fd(&held));
+        let short =
+            |name: &str| format!("/proc/self/fd/{}/{name}", std::os::fd::AsRawFd::as_raw_fd(&held));
         let _given = std::os::unix::net::UnixListener::bind(short("given")).unwrap();
         let _other = std::os::unix::net::UnixListener::bind(short("other")).unwrap();
         let script = format!(

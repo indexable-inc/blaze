@@ -603,10 +603,12 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
                 _ => false,
             })?;
         let at = clauses().position(|it| it == clause);
-        Some(at.map(|at| match at < predicates.own_predicates_start as usize {
-            true => parent_generic_def(self.db(), self.candidate.into())
-                .expect("a function with its parent's clauses is in a trait or impl"),
-            false => self.candidate.into(),
+        Some(at.map(|at| {
+            match at < predicates.own_predicates_start as usize {
+                true => parent_generic_def(self.db(), self.candidate.into())
+                    .expect("a function with its parent's clauses is in a trait or impl"),
+                false => self.candidate.into(),
+            }
         }))
     }
 

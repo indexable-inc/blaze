@@ -8,7 +8,6 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::db::HirDatabase;
 use hir_def::{
     AdtId, AttrDefId, HasModule as _, ModuleId, VariantId,
@@ -27,6 +26,7 @@ use hir_ty::{
 };
 use rustc_type_ir::{AliasTyKind, inherent::IntoKind as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::lints::bodies::types::util::Solver;
 
@@ -76,9 +76,9 @@ impl<'s, 'db> Preds<'s, 'db> {
             TyKind::Never => Pred::False,
             TyKind::Param(_) => Pred::GenericType(ty),
             TyKind::Alias(_, AliasTy { kind, .. }) => match kind {
-                AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } | AliasTyKind::Free { .. } => {
-                    Pred::GenericType(ty)
-                }
+                AliasTyKind::Projection { .. }
+                | AliasTyKind::Inherent { .. }
+                | AliasTyKind::Free { .. } => Pred::GenericType(ty),
                 AliasTyKind::Opaque { def_id } => {
                     let krate = match def_id.0.loc(self.db) {
                         ImplTraitId::ReturnTypeImplTrait(it, _) => it.krate(self.db),
@@ -129,7 +129,11 @@ impl<'s, 'db> Preds<'s, 'db> {
             AdtId::UnionId(it) => [VariantId::UnionId(it)].into_iter().collect(),
             AdtId::EnumId(it) => {
                 // alloc: inline but for an enum of more than four variants, once per ADT (kept in `adts`)
-                it.enum_variants(self.db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)).collect()
+                it.enum_variants(self.db)
+                    .variants
+                    .values()
+                    .map(|&(it, _)| VariantId::EnumVariantId(it))
+                    .collect()
             }
         };
         let is_enum = matches!(adt, AdtId::EnumId(_));
@@ -152,7 +156,8 @@ impl<'s, 'db> Preds<'s, 'db> {
         let db = self.db;
         let fields = variant.fields(db).fields();
         let types = db.field_types(variant);
-        let visibilities = if is_enum { None } else { Some(VariantFields::field_visibilities(db, variant)) };
+        let visibilities =
+            if is_enum { None } else { Some(VariantFields::field_visibilities(db, variant)) };
         let mut result = Pred::True;
         for (field, _) in fields.iter() {
             let pred = self.ty(types[field].ty().skip_binder());

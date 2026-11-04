@@ -5,13 +5,16 @@
 //! check shares, each made the first time a pass asks: the walk of the crate's syntax, the
 //! HIR lint levels, and the set of lints that may fire.
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
+use std::alloc::Global;
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: memos of one check, dropped with it, not global state"
+)]
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
     ops::ControlFlow,
 };
-use std::alloc::Global;
 
 use base_db::Db;
 use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
@@ -95,7 +98,10 @@ impl<'a> Files<'a> {
 }
 
 /// A diagnostic of a crate being lowered.
-#[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: memos of one check, dropped with it, not global state"
+)]
 pub struct Cx<'a, 'db> {
     /// The `Semantics` of views. Every view handed to it is of a tree it gave out: roots are
     /// taken through [`Cx::root`], never `HirFileId::root`.
@@ -128,13 +134,11 @@ pub struct Cx<'a, 'db> {
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
-    #[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
-    pub fn new(
-        db: &'db Db,
-        krate: hir::Crate,
-        files: Files<'a>,
-        frame: &'a Frame,
-    ) -> Cx<'a, 'db> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: memos of one check, dropped with it, not global state"
+    )]
+    pub fn new(db: &'db Db, krate: hir::Crate, files: Files<'a>, frame: &'a Frame) -> Cx<'a, 'db> {
         // A file of two crates (a crate built for the host and the target) is a module of each:
         // its syntax must map to this crate's items, not the first crate's.
         let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([krate.base()], Global)); // alloc: once a check, one crate
@@ -176,7 +180,9 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// The context checking with the lint flags `lints`, before anything was asked of it.
     pub fn with_lints(self, lints: &'a crate::lints::CommandLine) -> Cx<'a, 'db> {
         assert!(
-            self.walk.get().is_none() && self.levels.borrow().is_none() && self.may_fire.get().is_none(),
+            self.walk.get().is_none()
+                && self.levels.borrow().is_none()
+                && self.may_fire.get().is_none(),
             "the lint flags are given before a level is asked"
         );
         Cx { lints: Some(lints), ..self }
@@ -279,7 +285,9 @@ impl<'a, 'db> Cx<'a, 'db> {
             false => match outside() {
                 Some(path) => Files::relative(path.as_str(), self.files.root).to_owned(),
                 None if base_db::crate_attr_owner(self.db, file).is_none() => self.files.name(file),
-                None => crate::emit::name_with_text(base_db::CRATE_ATTR_FILE_NAME, self.file_text(file)),
+                None => {
+                    crate::emit::name_with_text(base_db::CRATE_ATTR_FILE_NAME, self.file_text(file))
+                }
             },
         };
         let mut named = self.named.borrow_mut();
@@ -343,7 +351,9 @@ impl<'a, 'db> Cx<'a, 'db> {
         let loc = call.loc(self.db);
         let local = hir::Crate::from(loc.def.krate) == self.krate;
         let at = match mapped {
-            Some((at, _)) if local => Span::new(&self.file_name(at.file_id.file_id(self.db)), at.range),
+            Some((at, _)) if local => {
+                Span::new(&self.file_name(at.file_id.file_id(self.db)), at.range)
+            }
             _ => match &expansion {
                 // clone: the call site's span, on the path of a diagnostic
                 Some(it) => Span { expansion: None, ..it.call_site.clone() },
@@ -418,10 +428,13 @@ impl<'a, 'db> Cx<'a, 'db> {
         use syntax::view::{HasModuleItem as _, HasName as _};
         let db = self.db;
         let Some(real) = file.file_id() else { return false };
-        let Some(name) = db.file_text(real.file_id(db)).appended_root_module(db) else { return false };
+        let Some(name) = db.file_text(real.file_id(db)).appended_root_module(db) else {
+            return false;
+        };
         let Some(root) = view::SourceFile::cast(self.root(file)) else { return false };
         let Some(view::Item::Module(module)) = root.items().last() else { return false };
-        module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(range)
+        module.name().is_some_and(|it| it.text() == name)
+            && module.syntax().text_range().contains_range(range)
     }
 
     /// The root of `file`, parsed or expanded, as a view of a tree [`Cx::vsema`] gave out.
@@ -430,7 +443,10 @@ impl<'a, 'db> Cx<'a, 'db> {
     }
 
     /// The node `ptr` points to, as a view: [`Cx::node`] with no handle.
-    pub fn node_view<N: AstNode + view::Typed>(&self, ptr: InFile<AstPtr<N>>) -> InFile<N::Of<'db>> {
+    pub fn node_view<N: AstNode + view::Typed>(
+        &self,
+        ptr: InFile<AstPtr<N>>,
+    ) -> InFile<N::Of<'db>> {
         InFile::new(ptr.file_id, self.vsema.to_view(ptr))
     }
 
@@ -450,7 +466,9 @@ impl<'a, 'db> Cx<'a, 'db> {
             // Its declaration where it is written: in a file, or in what a macro of its crate
             // wrote (synstructure's `decl_derive!`, which rustc_type_ir_macros and vir_macros
             // declare their derives with).
-            MacroDefKind::ProcMacro(id, ..) => Some(self.span(id.with_value(signature_range_view(id.to_view(db))))),
+            MacroDefKind::ProcMacro(id, ..) => {
+                Some(self.span(id.with_value(signature_range_view(id.to_view(db)))))
+            }
             MacroDefKind::Declarative(id, _)
             | MacroDefKind::BuiltIn(id, _)
             | MacroDefKind::BuiltInAttr(id, _)
@@ -460,13 +478,18 @@ impl<'a, 'db> Cx<'a, 'db> {
                 Some(self.span(id.with_value(item_range_view(id.to_view(db).syntax()))))
             }
         };
-        let opaque = !matches!(loc.def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..));
+        let opaque =
+            !matches!(loc.def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..));
         Some(Expansion { call_site, kind, name, def_site, opaque })
     }
 
     /// What the macro call `call` is, its name (empty unless `named`) and the range its call
     /// site is shown at; none exactly where [`Cx::expansion_of`] tells nothing of it.
-    fn call_of(&self, call: MacroCallId, named: bool) -> Option<(MacroKind, String, InFile<TextRange>)> {
+    fn call_of(
+        &self,
+        call: MacroCallId,
+        named: bool,
+    ) -> Option<(MacroKind, String, InFile<TextRange>)> {
         let db = self.db;
         let loc = call.loc(db);
         let node = loc.to_node_view(db);
@@ -488,7 +511,8 @@ impl<'a, 'db> Cx<'a, 'db> {
                 // A derive's node is its `derive(..)` meta (`MacroCallLoc::to_node_view`).
                 let meta = view::Meta::cast(node.value)?;
                 if named {
-                    let (range, path) = derive_paths_view(meta).into_iter().nth(*derive_index as usize)?;
+                    let (range, path) =
+                        derive_paths_view(meta).into_iter().nth(*derive_index as usize)?;
                     (MacroKind::Derive, owned(path.rsplit("::").next()?), range)
                 } else {
                     let mut at = None;
@@ -506,13 +530,15 @@ impl<'a, 'db> Cx<'a, 'db> {
             MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
                 // The attribute that invoked the macro, not the item's first: a `#[cfg(test)]`
                 // before `#[global_allocator]` is a `cfg` meta, with no path to name a macro by.
-                let (attr, meta) = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
+                let (attr, meta) =
+                    censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
                 let path = meta.path()?;
                 let name = if named { fast_print_path(path)? } else { String::new() };
                 // rustc's span of the attribute: all of it as written, or what a `cfg_attr`
                 // holds of it.
                 let written = attr.meta().is_some_and(|it| it.syntax() == meta.syntax());
-                let range = if written { attr.syntax().text_range() } else { meta.syntax().text_range() };
+                let range =
+                    if written { attr.syntax().text_range() } else { meta.syntax().text_range() };
                 (MacroKind::Attr, name, range)
             }
         };
@@ -602,7 +628,10 @@ pub fn derive_paths_view(meta: view::Meta<'_>) -> Vec<(TextRange, String)> {
 
 /// Each path of a `derive(...)` meta, the attribute's own or one in a `cfg_attr`, in order:
 /// where it is and its tokens (names, `::`). No allocation for a path of up to eight tokens.
-pub fn derive_path_tokens_view<'t>(meta: view::Meta<'t>, mut each: impl FnMut(TextRange, &[view::Token<'t>])) {
+pub fn derive_path_tokens_view<'t>(
+    meta: view::Meta<'t>,
+    mut each: impl FnMut(TextRange, &[view::Token<'t>]),
+) {
     let Some((_, tt)) = meta.as_simple_call() else { return };
     let mut current: SmallVec<[view::Token<'t>; 8]> = SmallVec::new();
     let mut flush = |current: &mut SmallVec<[view::Token<'t>; 8]>| {
@@ -631,7 +660,9 @@ pub fn closure_decl_range_view(node: view::Node<'_>) -> TextRange {
     let range = item_range_view(node);
     let end = view::ClosureExpr::cast(node)
         .and_then(|it| {
-            it.ret_type().map(|it| it.syntax().text_range().end()).or_else(|| it.param_list().map(|it| it.syntax().text_range().end()))
+            it.ret_type()
+                .map(|it| it.syntax().text_range().end())
+                .or_else(|| it.param_list().map(|it| it.syntax().text_range().end()))
         })
         .unwrap_or(range.end());
     TextRange::new(range.start(), end.max(range.start()))
@@ -698,7 +729,10 @@ mod tests {
         assert_eq!(&text[def_range_view(node.syntax())], "pub struct S<T> where T: Copy");
         let text = "struct U;";
         let parsed = parse(text);
-        assert_eq!(&text[def_range_view(first_view::<view::Struct<'_>>(&parsed).syntax())], "struct U");
+        assert_eq!(
+            &text[def_range_view(first_view::<view::Struct<'_>>(&parsed).syntax())],
+            "struct U"
+        );
     }
 
     /// A closure is spanned from after its attributes to its return type, else its parameters;
@@ -762,7 +796,10 @@ mod tests {
             [
                 vec![],
                 vec![("Debug", "Debug".to_owned())],
-                vec![("Debug", "Debug".to_owned()), ("serde :: Serialize", "serde::Serialize".to_owned())],
+                vec![
+                    ("Debug", "Debug".to_owned()),
+                    ("serde :: Serialize", "serde::Serialize".to_owned())
+                ],
             ]
         );
         let f: view::Fn<'_> = first_view(&parse);
@@ -774,8 +811,12 @@ mod tests {
         let text = "#[derive(Debug, serde::Serialize)]\nstruct S;";
         let parse = parse(text);
         let meta = first_view::<view::Attr<'_>>(&parse).meta().unwrap();
-        let paths: Vec<_> = derive_paths_view(meta).into_iter().map(|(range, it)| (&text[range], it)).collect();
-        assert_eq!(paths, [("Debug", "Debug".to_owned()), ("serde::Serialize", "serde::Serialize".to_owned())]);
+        let paths: Vec<_> =
+            derive_paths_view(meta).into_iter().map(|(range, it)| (&text[range], it)).collect();
+        assert_eq!(
+            paths,
+            [("Debug", "Debug".to_owned()), ("serde::Serialize", "serde::Serialize".to_owned())]
+        );
     }
 
     #[test]

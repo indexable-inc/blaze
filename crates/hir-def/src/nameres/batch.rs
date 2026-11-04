@@ -47,7 +47,8 @@ pub(crate) fn expand_round(db: &Db, krate: Crate, calls: &[MacroCallId]) {
     // A crate whose session already ran a call in this revision (an earlier round's) can run
     // all of this round's ahead; the others' first call runs alone, and the rest after it.
     // alloc: once per round, a flag per crate
-    let warm: Vec<bool> = ordered.iter().map(|(_, them)| them[0].proc_macro_speculates(db)).collect();
+    let warm: Vec<bool> =
+        ordered.iter().map(|(_, them)| them[0].proc_macro_speculates(db)).collect();
     let span = tracing::info_span!(
         target: "blaze",
         "expand round",
@@ -61,7 +62,9 @@ pub(crate) fn expand_round(db: &Db, krate: Crate, calls: &[MacroCallId]) {
     // The calls not ordered and the first of each cold crate's: each its own task.
     // alloc: once per round, the first batch's calls
     let mut first: Vec<MacroCallId> = free;
-    first.extend(ordered.iter().zip(&warm).filter(|(_, warm)| !**warm).map(|((_, them), _)| them[0]));
+    first.extend(
+        ordered.iter().zip(&warm).filter(|(_, warm)| !**warm).map(|((_, them), _)| them[0]),
+    );
     // Each crate's calls left after the first batch, in order.
     // alloc: once per round, a list per crate
     let rest: Vec<&[MacroCallId]> = ordered

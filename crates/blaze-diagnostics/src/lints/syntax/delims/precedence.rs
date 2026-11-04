@@ -16,7 +16,12 @@ use crate::cx::Cx;
 /// Whether the delimiters around `inner` (expanded) are needed where it is: before the `else`
 /// of a `let`-`else`, a range as a `let` scrutinee, `&raw`, a leftmost operand that would end
 /// a statement, and before a block, what would run into it.
-pub(super) fn delims_necessary<'db>(cx: &Cx<'_, 'db>, inner: ast::Expr<'db>, ctx: Ctx, followed_by_block: bool) -> bool {
+pub(super) fn delims_necessary<'db>(
+    cx: &Cx<'_, 'db>,
+    inner: ast::Expr<'db>,
+    ctx: Ctx,
+    followed_by_block: bool,
+) -> bool {
     if ctx == Ctx::AssignedValueLetElse && (is_lazy(inner) || trailing_brace(cx, inner)) {
         return true;
     }
@@ -62,7 +67,9 @@ pub(super) fn delims_necessary<'db>(cx: &Cx<'_, 'db>, inner: ast::Expr<'db>, ctx
         let next = match innermost {
             ast::Expr::PrefixExpr(it) => it.expr(),
             ast::Expr::BinExpr(it) => it.rhs(),
-            ast::Expr::ReturnExpr(_) | ast::Expr::YieldExpr(_) | ast::Expr::YeetExpr(_) => return true,
+            ast::Expr::ReturnExpr(_) | ast::Expr::YieldExpr(_) | ast::Expr::YeetExpr(_) => {
+                return true;
+            }
             // `if (break 'a i) {}`: `i {}` would be a struct literal.
             ast::Expr::BreakExpr(it) => {
                 return it.expr().is_some_and(|it| {
@@ -164,7 +171,9 @@ fn trailing_brace<'db>(cx: &Cx<'_, 'db>, e: ast::Expr<'db>) -> bool {
             | ast::Expr::MatchExpr(_)
             | ast::Expr::RecordExpr(_)
             | ast::Expr::WhileExpr(_) => return true,
-            ast::Expr::CastExpr(it) => return it.ty().is_some_and(|it| type_trailing_braced_mac_call(cx, it)),
+            ast::Expr::CastExpr(it) => {
+                return it.ty().is_some_and(|it| type_trailing_braced_mac_call(cx, it));
+            }
             ast::Expr::MacroExpr(it) => return it.macro_call().is_some_and(braced),
             _ => return false,
         };
@@ -212,7 +221,9 @@ fn path_return_type(path: ast::Path<'_>) -> Option<ast::Type<'_>> {
 /// `contains_exterior_struct_lit`: a struct literal not inside delimiters of its own, which
 /// before a block would take the block as its fields.
 fn contains_exterior_struct_lit<'db>(cx: &Cx<'_, 'db>, e: ast::Expr<'db>) -> bool {
-    let sub = |it: Option<ast::Expr<'db>>| it.is_some_and(|it| contains_exterior_struct_lit(cx, expanded(cx, it)));
+    let sub = |it: Option<ast::Expr<'db>>| {
+        it.is_some_and(|it| contains_exterior_struct_lit(cx, expanded(cx, it)))
+    };
     match e {
         ast::Expr::RecordExpr(_) => true,
         ast::Expr::BinExpr(it) => sub(it.lhs()) || sub(it.rhs()),
@@ -235,7 +246,8 @@ mod tests {
     /// `f` of the initializer of `let _ = text;`, viewed in its parse.
     fn expr<R>(text: &str, f: impl FnOnce(ast::Expr<'_>) -> R) -> R {
         let parse = SourceFile::parse(&format!("fn f() {{ let _ = {text}; }}"), Edition::CURRENT);
-        let init = parse.root().descendants().find_map(ast::LetStmt::cast).and_then(|it| it.initializer());
+        let init =
+            parse.root().descendants().find_map(ast::LetStmt::cast).and_then(|it| it.initializer());
         f(init.unwrap())
     }
 

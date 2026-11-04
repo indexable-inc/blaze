@@ -85,11 +85,11 @@ impl<'db> inherent::Features<DbInterner<'db>> for Features<'db> {
 mod tests {
     use base_db::{Crate, Db};
     use hir_def::{FunctionId, ModuleDefId, TraitId, nameres::crate_def_map};
+    use hir_expand::fixture;
     use rustc_type_ir::{
         Interner as _,
         inherent::{Clause as _, Features as _},
     };
-    use hir_expand::fixture;
 
     use crate::{
         lower::{GenericPredicates, trait_environment},

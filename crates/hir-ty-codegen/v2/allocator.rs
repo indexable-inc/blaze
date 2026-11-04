@@ -5,19 +5,23 @@
 //! to alloc's `__rdl_alloc_error_handler`.
 //! Each entry is an instance of its own ([`Kind::Allocator`]), defined under its symbol.
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_codegen::backend::FrontRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use cranelift_codegen::ir::{AbiParam, InstBuilder as _, Signature};
 use hir_def::HasModule as _;
-use hir_ty::{ParamEnvAndCrate, db::HirDatabase as _, next_solver::{DbInterner, ParamEnv}};
+use hir_ty::{
+    ParamEnvAndCrate,
+    db::HirDatabase as _,
+    next_solver::{DbInterner, ParamEnv},
+};
 use smallvec::SmallVec;
 
 use super::{HirInstance, Kind, places::Ref};
 use crate::{
-    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, linked_crates,
-    fragment::FuncTarget, global_allocator_export,
+    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, fragment::FuncTarget,
+    global_allocator_export, linked_crates,
 };
 
 /// One function of the shim: `symbol`, of `params` pointer-sized arguments and a pointer
@@ -61,7 +65,9 @@ pub(super) fn shim(
                 let Some(func) = global_allocator_export(db, allocator, ours) else {
                     let name = allocator.named(db);
                     // alloc: the error's message
-                    return Err(format!("`#[global_allocator]` of crate `{name}` exports no `{ours}`"));
+                    return Err(format!(
+                        "`#[global_allocator]` of crate `{name}` exports no `{ours}`"
+                    ));
                 };
                 shim.push(root(func));
                 ours
@@ -74,14 +80,17 @@ pub(super) fn shim(
     // `__rust_alloc_error_handler` goes to the program's `#[alloc_error_handler]` (std has one)
     // or else to alloc's default, as rustc's shim goes to `__rg_oom` or `__rdl_alloc_error_handler`.
     let handler = "__rust_alloc_error_handler";
-    let mut handlers = program.iter().filter_map(|&it| Some((it, alloc_error_handler_export(db, it)?)));
+    let mut handlers =
+        program.iter().filter_map(|&it| Some((it, alloc_error_handler_export(db, it)?)));
     let to = match (handlers.next(), handlers.next()) {
         (Some((_, func)), None) => {
             shim.push(root(func));
             hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT
         }
         (None, _) => "__rdl_alloc_error_handler",
-        (Some((first, _)), Some((other, _))) => return Err(two_alloc_error_handlers(db, first, other)),
+        (Some((first, _)), Some((other, _))) => {
+            return Err(two_alloc_error_handlers(db, first, other));
+        }
     };
     shim.push(forward(Forward { symbol: handler, to: Some(to), params: 2, returns: false, krate }));
     let marker = "__rust_no_alloc_shim_is_unstable_v2";
@@ -163,7 +172,9 @@ fn allocations_unobserved_attached(db: &Db, krate: Crate) -> Result<bool, String
     let body = match db.mir_body(hir_ty::InferBodyId::DefWithBodyId(alloc.into())) {
         Ok(body) => body,
         // alloc: the log's message
-        Err(e) => return kept(&format!("has a `__blaze_global_alloc` whose MIR does not build: {e:?}")),
+        Err(e) => {
+            return kept(&format!("has a `__blaze_global_alloc` whose MIR does not build: {e:?}"));
+        }
     };
     let mut statics = SmallVec::<[hir_def::StaticId; 1]>::new();
     let mut named = |operand: &hir_ty_mir::mir::Operand| {
@@ -185,7 +196,10 @@ fn allocations_unobserved_attached(db: &Db, krate: Crate) -> Result<bool, String
     }
     let [id] = statics[..] else {
         // alloc: the log's message
-        return kept(&format!("has a `__blaze_global_alloc` that names {} statics, not one", statics.len()));
+        return kept(&format!(
+            "has a `__blaze_global_alloc` that names {} statics, not one",
+            statics.len()
+        ));
     };
     let ty = hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(id))
         .expr_ty(hir_def::expr_store::Body::of(db, id.into()).root_expr());
@@ -197,8 +211,10 @@ fn is_std_system(db: &Db, ty: hir_ty::next_solver::Ty<'_>) -> bool {
     use rustc_type_ir::inherent::IntoKind as _;
     let hir_ty::next_solver::TyKind::Adt(adt, _) = ty.kind() else { return false };
     let hir_def::AdtId::StructId(id) = adt.def_id() else { return false };
-    matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Std))
-        && hir_def::signatures::StructSignature::of(db, id).name.as_str() == "System"
+    matches!(
+        id.krate(db).data(db).origin,
+        base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Std)
+    ) && hir_def::signatures::StructSignature::of(db, id).name.as_str() == "System"
 }
 
 /// std's default of an entry: `__rdl_alloc` for `__rust_alloc`.

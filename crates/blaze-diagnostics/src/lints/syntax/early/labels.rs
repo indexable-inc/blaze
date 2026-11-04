@@ -42,7 +42,9 @@ pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
         used.reset(0);
         for (_, expr) in body.exprs() {
             match expr {
-                Expr::Loop { label: Some(label), .. } | Expr::Block { label: Some(label), .. } => declared.push(label),
+                Expr::Loop { label: Some(label), .. } | Expr::Block { label: Some(label), .. } => {
+                    declared.push(label)
+                }
                 Expr::Break { label: Some(label), .. } | Expr::Continue { label: Some(label) } => {
                     used.insert_growing(u32::from(label.into_raw()));
                 }
@@ -59,7 +61,9 @@ pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
                 continue;
             }
             let node = cx.syntax_view(InFile::new(source.file_id, ptr));
-            let Some(lifetime) = node.value.children().find_map(ast::Lifetime::cast) else { continue };
+            let Some(lifetime) = node.value.children().find_map(ast::Lifetime::cast) else {
+                continue;
+            };
             if lifetime.text().as_bytes().get(1) == Some(&b'_') {
                 continue;
             }
@@ -77,13 +81,20 @@ pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
 /// The warning resolution gives when the label `node` (of `tree`) resolves, as a `break` to it
 /// would, to a label of an enclosing loop or block. Called in walk order, so in the order rustc's
 /// visitor declares them.
-pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree<'_>, node: ast::Node<'_>, out: &mut Vec<Emitted>) {
+pub(super) fn shadowing(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    node: ast::Node<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let Some(lifetime) = node.children().find_map(ast::Lifetime::cast) else { return };
     let Some(labeled) = node.parent() else { return };
     let range = lifetime.syntax().text_range();
     let at = InFile::new(tree.file, ast::ptr(labeled));
     let hygiene = ctxt(cx, tree.file, range);
-    let Some(orig) = resolve(cx, InFile::new(tree.file, labeled), lifetime.text(), hygiene) else { return };
+    let Some(orig) = resolve(cx, InFile::new(tree.file, labeled), lifetime.text(), hygiene) else {
+        return;
+    };
     let name = lifetime.text();
     let shadower = cx.span(InFile::new(tree.file, range));
     let mut diag =
@@ -119,7 +130,9 @@ fn resolve(
         if barrier(parent, child) {
             return None;
         }
-        if parent.kind() == SyntaxKind::STMT_LIST && macro_definitions(cx, file, parent, child, &mut hygiene) {
+        if parent.kind() == SyntaxKind::STMT_LIST
+            && macro_definitions(cx, file, parent, child, &mut hygiene)
+        {
             key = None;
         }
         if let Some(label) = label_over(parent, child)
@@ -150,7 +163,10 @@ fn label_over<'t>(parent: ast::Node<'t>, child: ast::Node<'t>) -> Option<ast::La
             // `ForExpr::loop_body`: its second block, else its first.
             let (first, second) = (blocks.next(), blocks.next());
             let in_scope = second.or(first).is_some_and(|body| body == child)
-                || parent.children().find(|it| ast::Pat::can_cast(it.kind())).is_some_and(|pat| pat == child);
+                || parent
+                    .children()
+                    .find(|it| ast::Pat::can_cast(it.kind()))
+                    .is_some_and(|pat| pat == child);
             in_scope.then(label).flatten()
         }
         SyntaxKind::BLOCK_EXPR if child.kind() == SyntaxKind::STMT_LIST => label(),
@@ -163,9 +179,10 @@ fn label_over<'t>(parent: ast::Node<'t>, child: ast::Node<'t>) -> Option<ast::La
 /// const argument or parameter default, a discriminant) or an item's own scope.
 fn barrier(parent: ast::Node<'_>, child: ast::Node<'_>) -> bool {
     match parent.kind() {
-        SyntaxKind::CLOSURE_EXPR | SyntaxKind::CONST_ARG | SyntaxKind::CONST_PARAM | SyntaxKind::VARIANT => {
-            true
-        }
+        SyntaxKind::CLOSURE_EXPR
+        | SyntaxKind::CONST_ARG
+        | SyntaxKind::CONST_PARAM
+        | SyntaxKind::VARIANT => true,
         SyntaxKind::BLOCK_EXPR => parent
             .children_with_tokens()
             .any(|it| matches!(it.kind(), T![async] | T![gen] | T![const])),
@@ -173,7 +190,9 @@ fn barrier(parent: ast::Node<'_>, child: ast::Node<'_>) -> bool {
             .children_with_tokens()
             .find(|it| it.kind() == T![;])
             .is_some_and(|semi| child.text_range().start() > semi.text_range().start()),
-        SyntaxKind::ARRAY_TYPE => ast::Expr::can_cast(child.kind()) || child.kind() == SyntaxKind::CONST_ARG,
+        SyntaxKind::ARRAY_TYPE => {
+            ast::Expr::can_cast(child.kind()) || child.kind() == SyntaxKind::CONST_ARG
+        }
         SyntaxKind::MACRO_CALL => false,
         kind => ast::Item::can_cast(kind) || kind == SyntaxKind::SOURCE_FILE,
     }
@@ -194,7 +213,10 @@ fn macro_definitions(
     let mut bound = child.text_range().start();
     let mut removed = false;
     while let Some(call) = hygiene.outer_expn(cx.db) {
-        let Some(ast_id) = hir_expand::MacroCallId::from(call).loc(cx.db).def.ast_id().left() else { break };
+        let Some(ast_id) = hir_expand::MacroCallId::from(call).loc(cx.db).def.ast_id().left()
+        else {
+            break;
+        };
         if ast_id.file_id != file {
             break;
         }
@@ -202,7 +224,8 @@ fn macro_definitions(
         let start = ptr.text_range().start();
         let defined_here = start < bound
             && list.children().any(|stmt| {
-                matches!(stmt.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) && ast::ptr(stmt) == ptr
+                matches!(stmt.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)
+                    && ast::ptr(stmt) == ptr
             });
         if !defined_here {
             break;

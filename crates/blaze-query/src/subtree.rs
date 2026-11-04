@@ -30,7 +30,11 @@ pub struct TreeHash {
 impl TreeHash {
     /// The hash of the directory asked for when `top`, or of one below it.
     pub fn new(package: bool, top: bool) -> TreeHash {
-        TreeHash { hasher: Hasher::new(if package { PACKAGE_DOMAIN } else { TREE_DOMAIN }), package, top }
+        TreeHash {
+            hasher: Hasher::new(if package { PACKAGE_DOMAIN } else { TREE_DOMAIN }),
+            package,
+            top,
+        }
     }
 
     /// Whether the entry `name` is hashed: callers skip one that isn't, and all below it.
@@ -49,7 +53,9 @@ impl TreeHash {
     pub fn file(&mut self, name: &str, file: Option<(ContentId, Mode)>) {
         self.hasher.part(name.as_bytes());
         match file {
-            Some((id, mode)) => _ = self.hasher.update(b"f").id(&id).update(&mode.git().to_le_bytes()),
+            Some((id, mode)) => {
+                _ = self.hasher.update(b"f").id(&id).update(&mode.git().to_le_bytes())
+            }
             None => _ = self.hasher.update(b"-"),
         }
     }

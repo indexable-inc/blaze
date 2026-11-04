@@ -13,13 +13,15 @@
 //! Apache-2.0).
 
 use either::Either;
-use hir::{Adt, AsAssocItem as _, GenericArgsProhibitedReason, GenericDef, InFile, ModuleDef, PathResolution, StructKind};
+use hir::{
+    Adt, AsAssocItem as _, GenericArgsProhibitedReason, GenericDef, InFile, ModuleDef,
+    PathResolution, StructKind,
+};
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _},
 };
 
-use stdx::list::Join;
 use crate::{
     cx::{Cx, def_range_view as def_range},
     lower::{
@@ -28,6 +30,7 @@ use crate::{
     },
     model::{Applicability, Diag, MultiSpan},
 };
+use stdx::list::Join;
 
 /// rustc's `ProhibitGenericsArg`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,13 +148,21 @@ fn checked(cx: &Cx<'_, '_>, segs: &[Seg<'_>], value: bool) -> (Vec<usize>, Exten
             Some(PathResolution::Def(ModuleDef::EnumVariant(_))) => {
                 (but(variant_allowed(segs)), Extend::DefVariant)
             }
-            Some(PathResolution::Def(ModuleDef::Function(it))) if it.as_assoc_item(db).is_some() => {
+            Some(PathResolution::Def(ModuleDef::Function(it)))
+                if it.as_assoc_item(db).is_some() =>
+            {
                 // alloc: on the error path
-                (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
+                (
+                    but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()),
+                    Extend::None,
+                )
             }
             Some(PathResolution::Def(ModuleDef::Const(it))) if it.as_assoc_item(db).is_some() => {
                 // alloc: on the error path
-                (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
+                (
+                    but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()),
+                    Extend::None,
+                )
             }
             _ => (but(vec![last]), Extend::None), // alloc: on the error path
         };
@@ -185,7 +196,8 @@ fn checked(cx: &Cx<'_, '_>, segs: &[Seg<'_>], value: bool) -> (Vec<usize>, Exten
 fn what(cx: &Cx<'_, '_>, seg: &Seg<'_>, value_last: bool) -> String {
     let db = cx.db;
     // alloc: a label of the error
-    let named = |descr: &str, name: hir::Name| format!("{descr} `{}`", name.display(db, cx.edition));
+    let named =
+        |descr: &str, name: hir::Name| format!("{descr} `{}`", name.display(db, cx.edition));
     match &seg.res {
         None => "this type".to_owned(), // alloc: a label of the error
         Some(PathResolution::Local(_)) => "local variable".to_owned(), // alloc: a label of the error
@@ -219,7 +231,8 @@ fn what(cx: &Cx<'_, '_>, seg: &Seg<'_>, value_last: bool) -> String {
                 None => named("function", it.name(db)),
             },
             ModuleDef::Const(it) => {
-                let descr = if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
+                let descr =
+                    if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
                 match it.name(db) {
                     Some(name) => named(descr, name),
                     None => descr.to_owned(), // alloc: a label of the error
@@ -254,10 +267,16 @@ fn args_after_name(segment: ast::PathSegment<'_>) -> Option<TextRange> {
 
 /// A segment's generic arguments blaze can't report as rustc does: an error naming why, never
 /// nothing.
-fn refused<'db>(cx: &Cx<'_, 'db>, file: hir::HirFileId, segment: ast::PathSegment<'db>, why: &str) -> Vec<Found> {
+fn refused<'db>(
+    cx: &Cx<'_, 'db>,
+    file: hir::HirFileId,
+    segment: ast::PathSegment<'db>,
+    why: &str,
+) -> Vec<Found> {
     // alloc: the error's text, for an error hir found
     let message = format!("blaze can't report these generic arguments as rustc does: {why}");
-    let mut diag = Diag::error(None, message, cx.span(InFile::new(file, segment.syntax().text_range())));
+    let mut diag =
+        Diag::error(None, message, cx.span(InFile::new(file, segment.syntax().text_range())));
     site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
     vec![Found::new(diag, phase_at(segment.syntax()))] // alloc: the error found
 }
@@ -317,7 +336,12 @@ fn type_relative_variant<'db>(
     let type_name = adt.name(db).display(db, cx.edition).to_string(); // alloc: for the suggestion
     let msg = format!("you might have meant to specify type parameters on enum `{type_name}`"); // alloc
     let Some(args_span) = args_after_name(seg.segment) else {
-        return refused(cx, file, segment, "the variant's segment has no name before its arguments");
+        return refused(
+            cx,
+            file,
+            segment,
+            "the variant's segment has no name before its arguments",
+        );
     };
     if GenericDef::Adt(Adt::Enum(adt)).params(db).is_empty() {
         diag.suggestion_verbose(
@@ -350,13 +374,15 @@ fn type_relative_variant<'db>(
                 // rustc's `span_to_snippet` of `args_span`, which lies in the segment.
                 let seg_start = seg.segment.syntax().text_range().start();
                 let seg_text = seg.segment.syntax().text();
-                let snippet = &seg_text
-                    [usize::from(args_span.start() - seg_start)..usize::from(args_span.end() - seg_start)];
-                let Some(name) = target.segment.name_ref().map(|it| it.syntax().text_range()) else {
+                let snippet = &seg_text[usize::from(args_span.start() - seg_start)
+                    ..usize::from(args_span.end() - seg_start)];
+                let Some(name) = target.segment.name_ref().map(|it| it.syntax().text_range())
+                else {
                     diag.note(msg);
                     return finish(cx, diag, file, segment);
                 };
-                let target_args = args_after_name(target.segment).unwrap_or_else(|| TextRange::empty(name.end()));
+                let target_args =
+                    args_after_name(target.segment).unwrap_or_else(|| TextRange::empty(name.end()));
                 let first = if is_self {
                     let qself_range = target.segment.syntax().text_range();
                     (span(qself_range), format!("{type_name}{snippet}")) // alloc: a part
@@ -377,7 +403,12 @@ fn type_relative_variant<'db>(
     finish(cx, diag, file, segment)
 }
 
-fn finish<'db>(cx: &Cx<'_, 'db>, mut diag: Diag, file: hir::HirFileId, segment: ast::PathSegment<'db>) -> Vec<Found> {
+fn finish<'db>(
+    cx: &Cx<'_, 'db>,
+    mut diag: Diag,
+    file: hir::HirFileId,
+    segment: ast::PathSegment<'db>,
+) -> Vec<Found> {
     site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
     vec![Found::new(diag, phase_at(segment.syntax()))] // alloc: the error found
 }
@@ -390,7 +421,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
     let owner = node.value.syntax().parent().and_then(ast::PathSegment::cast);
     let Some(segment) = owner else {
         let range = node.value.syntax().text_range();
-        let mut diag = Diag::error(Some("E0109"), "type arguments are not allowed on this type", span(range));
+        let mut diag =
+            Diag::error(Some("E0109"), "type arguments are not allowed on this type", span(range));
         diag.span_label(span(range), "type argument not allowed");
         site_fact(cx, &mut diag, InFile::new(file, node.value.syntax()));
         return vec![Found::new(diag, phase_at(node.value.syntax()))]; // alloc: the error found
@@ -413,10 +445,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
                 Segment::of_node(file, segment.syntax(), None)
                     .map(|seg| takes_none(cx, &seg, GenericDef::Static(*it), None))
             }
-            Some(PathResolution::ConstParam(it)) => {
-                Segment::of_node(file, segment.syntax(), None)
-                    .map(|seg| takes_none(cx, &seg, it.parent(db), Some(*it)))
-            }
+            Some(PathResolution::ConstParam(it)) => Segment::of_node(file, segment.syntax(), None)
+                .map(|seg| takes_none(cx, &seg, it.parent(db), Some(*it))),
             _ => None,
         };
         if let Some(found) = found {
@@ -430,7 +460,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
         false => (vec![h], Extend::None), // alloc: on the error path
     };
     // alloc: on the error path
-    let with_args: Vec<usize> = checked.iter().copied().filter(|&i| has_args(segs[i].segment)).collect();
+    let with_args: Vec<usize> =
+        checked.iter().copied().filter(|&i| has_args(segs[i].segment)).collect();
     // The segments checked together are one error, given with the first.
     if with_args.first() != Some(&h) {
         return Vec::new(); // alloc: empty, allocates nothing
@@ -469,7 +500,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
             .collect(); // alloc: for the error's message
         let kind = stdx::list::list(kind_names.iter(), Join::AndNoSerialComma, false);
         // alloc: for the error's message
-        let this_type = stdx::list::list(types_and_spans.iter().map(|(it, _)| it.as_str()), Join::AndNoSerialComma, false);
+        let this_type = stdx::list::list(
+            types_and_spans.iter().map(|(it, _)| it.as_str()),
+            Join::AndNoSerialComma,
+            false,
+        );
         let mut diag = Diag::error(
             Some("E0109"),
             format!("{kind} arguments are not allowed on {this_type}"), // alloc: the error's message
@@ -505,8 +540,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
         })
     });
     if let Some(range) = constraint {
-        let mut diag =
-            Diag::error(Some("E0229"), "associated item constraints are not allowed here", span(range));
+        let mut diag = Diag::error(
+            Some("E0229"),
+            "associated item constraints are not allowed here",
+            span(range),
+        );
         diag.span_label(span(range), "associated item constraint not allowed here");
         site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
         found.push(Found::new(diag, phase_at(segment.syntax())));
@@ -589,8 +627,10 @@ fn extend_err(
         Extend::SelfTyAlias(of) => {
             let (ty, impl_span) = match of {
                 Either::Left(impl_) => {
-                    let impl_span =
-                        cx.vsema.source(impl_).map(|src| cx.span(src.map(|it| def_range(it.syntax()))));
+                    let impl_span = cx
+                        .vsema
+                        .source(impl_)
+                        .map(|src| cx.span(src.map(|it| def_range(it.syntax()))));
                     (impl_.self_ty(db), impl_span)
                 }
                 Either::Right(adt) => (adt.ty(db), None),

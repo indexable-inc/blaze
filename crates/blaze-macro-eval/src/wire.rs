@@ -19,7 +19,9 @@ pub(crate) struct Reader<'a> {
 
 fn short(what: &str) -> Stop {
     // alloc: error path
-    Stop(format!("sent the server a request cut short in {what}, which the pinned bridge never does"))
+    Stop(format!(
+        "sent the server a request cut short in {what}, which the pinned bridge never does"
+    ))
 }
 
 fn bad(what: &str, value: u8) -> Stop {

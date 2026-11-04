@@ -43,9 +43,9 @@ use std::{borrow::Cow, fmt};
 
 use blaze_core::{Completion, Effect, FileName, Tag};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Idx};
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 use crate::{
     journal::{Journal, Loaded},
@@ -170,7 +170,10 @@ pub enum OpError {
     UnknownRoot(ContentId),
     /// A file of the image the tree was restored from failed its page group's CRC32C: its
     /// bytes are not read until the same bytes are written again ([`Vfs::corrupt`]).
-    Corrupt { section: u32, group: u32 },
+    Corrupt {
+        section: u32,
+        group: u32,
+    },
 }
 
 impl fmt::Display for OpError {

@@ -92,7 +92,8 @@ fn promote_in(
     if !any {
         return;
     }
-    let slot = |func: &ir::Function, value: Value| slot_of[func.dfg.resolve_aliases(value)].expand();
+    let slot =
+        |func: &ir::Function, value: Value| slot_of[func.dfg.resolve_aliases(value)].expand();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             match func.dfg.insts[inst] {
@@ -250,13 +251,13 @@ fn only_fully_promoted_slots_release_their_storage() {
 #[cfg(test)]
 mod tests {
     use blaze_hash::{HashMap, HashSet};
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         AbiParam, InstBuilder, StackSlotData, StackSlotKind,
         types::{F64, I32, I64},
     };
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use std::alloc::Global;
 
     use super::*;
 
@@ -270,7 +271,8 @@ mod tests {
         }
         let mut escaped: HashSet<StackSlot, Global> = kept.collect();
         let mut slot_of: HashMap<Value, StackSlot, Global> = HashMap::new_in(Global);
-        let mut parts: HashMap<StackSlot, HashMap<(i32, ir::Type), Part, Global>, Global> = HashMap::new_in(Global);
+        let mut parts: HashMap<StackSlot, HashMap<(i32, ir::Type), Part, Global>, Global> =
+            HashMap::new_in(Global);
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 if let InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[inst]
@@ -340,8 +342,7 @@ mod tests {
                     unused = false;
                     continue;
                 };
-                let InstructionData::Store { args: [stored, _], .. } = func.dfg.insts[store]
-                else {
+                let InstructionData::Store { args: [stored, _], .. } = func.dfg.insts[store] else {
                     continue;
                 };
                 let dominators = dominators.get_or_insert_with(|| dominator_tree(func));
@@ -434,7 +435,9 @@ mod tests {
         ops(&mut builder, &mut random);
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
-        builder.finalize(super::super::isa_for(super::super::Target::for_host()).unwrap().frontend_config());
+        builder.finalize(
+            super::super::isa_for(super::super::Target::for_host()).unwrap().frontend_config(),
+        );
         let kept = slots.into_iter().filter(|_| random.below(6) == 0).collect();
         (func, kept)
     }

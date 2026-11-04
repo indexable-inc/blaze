@@ -11,13 +11,13 @@ use std::alloc::Allocator;
 
 use crate::mem::{self, FMap, FVec};
 use blaze_mem::frame::Frame;
-use smallvec::SmallVec;
 use rustc_type_ir::{
     ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFlags,
     TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt as _, TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
+use smallvec::SmallVec;
 
 use hir_ty::{
     GenericPredicates,
@@ -334,15 +334,14 @@ fn wf_into<'db, A: Allocator>(
     if depth > 32 || !ty.has_type_flags(MAY_NEED) {
         return;
     }
-    let args = |inferred: &mut Inferred<'db>,
-                args: GenericArgs<'db>,
-                out: &mut Vec<Needs<'db>, A>| {
-        for arg in args.iter() {
-            if let GenericArgKind::Type(ty) = arg.kind() {
-                wf_into(db, inferred, ty, out, depth + 1);
+    let args =
+        |inferred: &mut Inferred<'db>, args: GenericArgs<'db>, out: &mut Vec<Needs<'db>, A>| {
+            for arg in args.iter() {
+                if let GenericArgKind::Type(ty) = arg.kind() {
+                    wf_into(db, inferred, ty, out, depth + 1);
+                }
             }
-        }
-    };
+        };
     match ty.kind() {
         TyKind::Ref(region, inner, _) => {
             out.push(Needs::Type(inner, region));
@@ -556,7 +555,11 @@ impl<'f, 'db> Wfcx<'f, 'db> {
         );
         let constraints: FVec<'_, Constraint<'db>> = mem::collect(
             self.frame,
-            inner.unwrap_region_constraints().region_constraint_data().constraints.iter_from(mark.1),
+            inner
+                .unwrap_region_constraints()
+                .region_constraint_data()
+                .constraints
+                .iter_from(mark.1),
         );
         drop(inner);
         // The impl's lifetimes are inference variables the solver equates with the item's.
@@ -760,8 +763,7 @@ impl<'db> Inferred<'db> {
         &self,
         db: &'db Db,
         adt: AdtId,
-    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db>
-    {
+    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db> {
         inferred_outlives(db, adt).0.iter().map(|it| {
             let arg: GenericArg<'db> = match &it.arg {
                 InferredArg::Type(ty) => ty.as_ref().into(),
@@ -1034,13 +1036,7 @@ impl<'f, 'db> Known<'f, 'db> {
         failing
     }
 
-    fn alias_outlives(
-        &self,
-        db: &'db Db,
-        ty: Ty<'db>,
-        region: Region<'db>,
-        depth: usize,
-    ) -> bool {
+    fn alias_outlives(&self, db: &'db Db, ty: Ty<'db>, region: Region<'db>, depth: usize) -> bool {
         let TyKind::Alias(_, alias) = ty.kind() else { return true };
         let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind else { return true };
         if depth > 8 || ty.has_non_region_infer() || ty.references_error() {

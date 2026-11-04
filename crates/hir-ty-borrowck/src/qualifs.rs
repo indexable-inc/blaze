@@ -155,14 +155,8 @@ impl<'db> ValueCx<'_, '_, 'db> {
     /// rustc's `Rvalue::Aggregate`: a struct or variant is made of its fields unless it is
     /// a union, or its type has a `Drop` impl (for `NeedsDrop`) or is `UnsafeCell` (for
     /// `HasMutInterior`), which have what any value of the type has.
-    fn aggregate(
-        &self,
-        ty: Ty<'db>,
-        parts: impl Iterator<Item = ExprId>,
-        depth: usize,
-    ) -> Qualifs {
-        let parts =
-            || parts.fold(Qualifs::default(), |acc, it| acc.or(self.value(it, depth + 1)));
+    fn aggregate(&self, ty: Ty<'db>, parts: impl Iterator<Item = ExprId>, depth: usize) -> Qualifs {
+        let parts = || parts.fold(Qualifs::default(), |acc, it| acc.or(self.value(it, depth + 1)));
         let TyKind::Adt(def, _) = ty.kind() else { return parts() };
         let id = def.def_id();
         if matches!(id, AdtId::UnionId(_)) {

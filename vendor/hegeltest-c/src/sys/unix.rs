@@ -34,11 +34,7 @@ pub(super) fn retry_intr<T>(
 /// Entries whose names are not valid UTF-8 are skipped.
 pub(super) fn read_dir(path: &str) -> Result<Vec<String>, Error> {
     let fd = retry_intr(|| {
-        rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
+        rustix::fs::open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
     })?;
     let dir = rustix::fs::Dir::read_from(&fd)?;
     let mut names = Vec::new();
@@ -168,20 +164,14 @@ pub(super) fn exists(path: &str) -> bool {
 /// Nanoseconds on the monotonic clock (`CLOCK_MONOTONIC`).
 pub(super) fn monotonic_nanos() -> Option<u64> {
     let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    Some(
-        (ts.tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec as u64),
-    )
+    Some((ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64))
 }
 
 /// Fill `buf` from the OS entropy source: the `getrandom` syscall on Linux,
 /// a `/dev/urandom` read elsewhere.
 #[cfg(target_os = "linux")]
 pub(super) fn entropy(buf: &mut [u8]) -> Result<(), Error> {
-    fill_all(buf, |chunk| {
-        rustix::rand::getrandom(chunk, rustix::rand::GetRandomFlags::empty())
-    })
+    fill_all(buf, |chunk| rustix::rand::getrandom(chunk, rustix::rand::GetRandomFlags::empty()))
 }
 
 /// Fill `buf` from the OS entropy source: the `getrandom` syscall on Linux,
@@ -368,11 +358,7 @@ pub(super) fn alloc(layout: core::alloc::Layout) -> *mut u8 {
         // and `align` is a power of two at least `sizeof(void *)` as
         // `posix_memalign` requires.
         let rc = unsafe { posix_memalign(&mut out, align, layout.size()) };
-        if rc == 0 {
-            out.cast()
-        } else {
-            core::ptr::null_mut()
-        }
+        if rc == 0 { out.cast() } else { core::ptr::null_mut() }
     }
 }
 

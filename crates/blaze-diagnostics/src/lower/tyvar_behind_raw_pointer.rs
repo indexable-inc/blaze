@@ -19,7 +19,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TyvarBehindRawPointer) -> Vec<Foun
         return Vec::new();
     }
     let site = d.site.map(|it| it.syntax_node_ptr());
-    let mut diag = Diag::lint("tyvar_behind_raw_pointer", "type annotations needed", method_name_span(cx, d.site));
+    let mut diag = Diag::lint(
+        "tyvar_behind_raw_pointer",
+        "type annotations needed",
+        method_name_span(cx, d.site),
+    );
     code_fact(cx, &mut diag, site);
     // alloc: the lint, for a call hir found
     vec![Found::lint(diag, Phase::Bodies, site)]

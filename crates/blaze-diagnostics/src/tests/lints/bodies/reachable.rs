@@ -27,7 +27,8 @@ macro_rules! println {
 /// [`ui`] beside a core that declares the library feature `type_ascription`, as
 /// `library/core/src/macros/mod.rs` does, for the tests that enable it.
 fn ui_ascription(name: &str, source: &str) -> String {
-    let fixture = format!("{ASCRIPTION_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
+    let fixture =
+        format!("{ASCRIPTION_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -106,7 +107,10 @@ fn b() {
 
 fn main() { }
 "##;
-    assert_reports(&ui("expr_call.rs", "2015", source), &[error(12, &["unreachable expression", "22"]), error(17, &["unreachable call", "bar"])]);
+    assert_reports(
+        &ui("expr_call.rs", "2015", source),
+        &[error(12, &["unreachable expression", "22"]), error(17, &["unreachable call", "bar"])],
+    );
 }
 
 #[test]
@@ -136,7 +140,10 @@ fn b() {
 
 fn main() { }
 "##;
-    assert_reports(&ui("expr_method.rs", "2015", source), &[error(15, &["unreachable expression", "22"]), error(20, &["unreachable call", "bar"])]);
+    assert_reports(
+        &ui("expr_method.rs", "2015", source),
+        &[error(15, &["unreachable expression", "22"]), error(20, &["unreachable call", "bar"])],
+    );
 }
 
 #[test]
@@ -237,7 +244,10 @@ fn main() {
     };
 }
 "##;
-    assert_reports(&ui_std("expr_again.rs", "2015", "sized, fmt", PRINTLN, source), &[error(8, &[])]);
+    assert_reports(
+        &ui_std("expr_again.rs", "2015", "sized, fmt", PRINTLN, source),
+        &[error(8, &[])],
+    );
 }
 
 #[test]
@@ -289,11 +299,6 @@ fn main() { }
 "##;
     assert_reports(
         &ui_std("expr_match.rs", "2015", "sized, fmt, option", PRINTLN, source),
-        &[
-            error(8, &[]),
-            error(19, &[]),
-            error(25, &[]),
-            error(29, &[]),
-        ],
+        &[error(8, &[]), error(19, &[]), error(25, &[]), error(29, &[])],
     );
 }

@@ -12,12 +12,12 @@ use blaze_codegen::{
     settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
 use hir_expand::fixture;
 use hir_ty::db::HirDatabase;
+use std::alloc::Global;
 
 use super::{Walking, walk};
 use crate::{
@@ -56,7 +56,8 @@ fn spec() -> Spec {
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
         crate::Arch::Wasm64 => blaze_codegen::Arch::Wasm64,
     };
-    let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
+    let pic =
+        crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
         toolchain: Toolchain {
             id: ContentId::default(),
@@ -106,11 +107,7 @@ type Reached = Vec<(HirInstance, Vec<Ref>)>;
 
 /// The walk of `instance`, checked: the same twice over and in another of the build's
 /// databases, and each reference once.
-fn walked(
-    frontend: &HirFrontend,
-    db: &Db,
-    instance: &HirInstance,
-) -> Vec<Ref> {
+fn walked(frontend: &HirFrontend, db: &Db, instance: &HirInstance) -> Vec<Ref> {
     let first = walk(db, instance, Walking::plain(false)).unwrap_or_else(|e| panic!("{e}"));
     let again = walk(db, instance, Walking::plain(false)).unwrap_or_else(|e| panic!("again: {e}"));
     assert_eq!(first, again, "{instance:?} walks two ways");
@@ -125,12 +122,7 @@ fn walked(
 
 /// The IR of `instance` built with `spec` and overflow checks `checked` asks for nothing its
 /// walk has not listed.
-fn placed(
-    db: &Db,
-    spec: &Spec,
-    instance: &HirInstance,
-    walked: &[Ref],
-) {
+fn placed(db: &Db, spec: &Spec, instance: &HirInstance, walked: &[Ref]) {
     let checked = spec.overflow_checks;
     let setting = format!(
         "overflow checks {checked}, debug assertions {}, panic {:?}",
@@ -143,9 +135,10 @@ fn placed(
         Built::Assembled(_, requests) => requests,
     };
     let mut placer = Placer::listed(walked.to_vec());
-    place_requests(db, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
-        panic!("{instance:?} with {setting} asks for what its walk has not: {e}")
-    });
+    place_requests(db, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests)
+        .unwrap_or_else(|e| {
+            panic!("{instance:?} with {setting} asks for what its walk has not: {e}")
+        });
 }
 
 /// Walks from `root` through every instance of code it reaches, checking each walk
@@ -171,7 +164,9 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(..) => assert_eq!(walk(db, next, Walking::plain(false)), Ok(Vec::new())),
+                    Kind::Asm(..) => {
+                        assert_eq!(walk(db, next, Walking::plain(false)), Ok(Vec::new()))
+                    }
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -395,8 +390,13 @@ fn a_derived_method_is_reached_where_derives_are_expanded() {
 
     let (db, frontend) = frontend(DERIVED);
     let root = frontend.root(function(db, "roots"));
-    let refused = frontend.with(|db| walk(db, &root, Walking::plain(false))).expect_err("the call of `clone`");
-    assert!(refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"), "{refused}");
+    let refused = frontend
+        .with(|db| walk(db, &root, Walking::plain(false)))
+        .expect_err("the call of `clone`");
+    assert!(
+        refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"),
+        "{refused}"
+    );
 }
 
 const DERIVED_DEBUG: &str = r#"
@@ -420,7 +420,8 @@ fn a_derived_debug_of_a_unit_struct_and_a_unit_variant_lowers() {
     let mut expanded = fixture::db(DERIVED_DEBUG).into_db();
     hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
     let db: &'static TestDB = Box::leak(Box::new(expanded));
-    let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
+    let frontend =
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     let reached = reach(&frontend, frontend.root(function(db, "roots")));
     let fmts = names(db, &reached).iter().filter(|it| *it == "fmt").count();
     assert_eq!(fmts, 2, "`Unit`'s and `E`'s derived `fmt`: {:?}", names(db, &reached));
@@ -438,9 +439,14 @@ pub fn roots() -> u32 { g() }
 fn a_body_whose_mir_does_not_lower_is_refused_naming_it_and_the_call() {
     let (db, frontend) = frontend(NO_FUNCTION);
     let root = frontend.root(function(db, "roots"));
-    let refused = frontend.with(|db| walk(db, &root, Walking::plain(false))).expect_err("`g` resolves to nothing");
+    let refused = frontend
+        .with(|db| walk(db, &root, Walking::plain(false)))
+        .expect_err("`g` resolves to nothing");
     assert!(refused.contains("the MIR of `"), "the body is named: {refused}");
-    assert!(refused.contains("roots` did not lower: the call of `g` at "), "the body and the callee: {refused}");
+    assert!(
+        refused.contains("roots` did not lower: the call of `g` at "),
+        "the body and the callee: {refused}"
+    );
     assert!(refused.contains(" has no function: "), "{refused}");
     assert!(!refused.contains("MissingFunctionDefinition"), "{refused}");
 }
@@ -660,8 +666,14 @@ fn extern_and_variadic_calls_list_their_symbols() {
         {
             let mut code = code.expect("the assembly");
             let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
-            place_requests(db, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
-                .expect("assembly that names nothing");
+            place_requests(
+                db,
+                &HashSource::ById(ById),
+                None,
+                &mut Placer::listed(Vec::new()),
+                requests,
+            )
+            .expect("assembly that names nothing");
         }
         // A blaze with no assembler refuses it, naming the block's target and the missing
         // assembler, never assembling it some other way.
@@ -669,7 +681,9 @@ fn extern_and_variadic_calls_list_their_symbols() {
         {
             let Err(e) = code else { panic!("a blaze with no assembler assembled `asm!`") };
             assert!(
-                e.contains("inline assembly for x86_64-") && e.contains("built with no assembler") && e.contains("blaze-engine's `native`"),
+                e.contains("inline assembly for x86_64-")
+                    && e.contains("built with no assembler")
+                    && e.contains("blaze-engine's `native`"),
                 "{e}"
             );
         }
@@ -825,10 +839,14 @@ fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");
-            let tys: Vec<String> = facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
+            let tys: Vec<String> =
+                facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
             for (ty, _) in &facts.vtables {
                 let ty = ty.as_ref();
-                assert!(!ty.has_type_flags(rustc_type_ir::TypeFlags::HAS_FREE_REGIONS), "`{ty:?}` keeps a region: {tys:?}");
+                assert!(
+                    !ty.has_type_flags(rustc_type_ir::TypeFlags::HAS_FREE_REGIONS),
+                    "`{ty:?}` keeps a region: {tys:?}"
+                );
                 assert!(matches!(ty.kind(), rustc_type_ir::TyKind::Ref(..)), "{tys:?}");
             }
             assert_eq!(facts.vtables.len(), 1, "one vtable of `&u32` for `Tr`: {tys:?}");
@@ -865,8 +883,13 @@ fn vtables_whose_types_differ_in_binder_names_only_are_one() {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");
-            let tys: Vec<String> = facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
-            assert_eq!(facts.vtables.len(), 1, "one vtable of `fn(&u32) -> bool` for `Tr`: {tys:?}");
+            let tys: Vec<String> =
+                facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
+            assert_eq!(
+                facts.vtables.len(),
+                1,
+                "one vtable of `fn(&u32) -> bool` for `Tr`: {tys:?}"
+            );
         })
     });
 }

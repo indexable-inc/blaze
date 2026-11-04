@@ -22,7 +22,6 @@
 
 use base_db::{CrateOrigin, LangCrateOrigin};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::Frame;
 use cfg::CfgAtom;
 use hir::InFile;
@@ -31,6 +30,7 @@ use hir_expand::name::Name;
 use intern::sym;
 use memchr::memmem;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, TextRange,
     view::{self as ast, AstNode as _, HasName, Node},
@@ -89,7 +89,10 @@ impl Unused {
                 {
                     if tree.kind == TreeKind::Simple
                         && tree.underscore
-                        && !matches!(entry(&tree.imported, Ns::Types), Some(Entry { def: ModuleDefId::TraitId(_), .. }))
+                        && !matches!(
+                            entry(&tree.imported, Ns::Types),
+                            Some(Entry { def: ModuleDefId::TraitId(_), .. })
+                        )
                     {
                         unused.insert_growing(j);
                     }
@@ -98,7 +101,11 @@ impl Unused {
                 }
                 match tree.kind {
                     TreeKind::List => {
-                        if tree.node.use_tree_list().is_none_or(|it| it.use_trees().next().is_none()) {
+                        if tree
+                            .node
+                            .use_tree_list()
+                            .is_none_or(|it| it.use_trees().next().is_none())
+                        {
                             unused.insert_growing(j);
                         }
                     }
@@ -135,11 +142,12 @@ impl Unused {
         // What is redundant is read by `unused_qualifications` too.
         let check_redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
             || cx.lint_may_fire(LintId::named("unused_qualifications"));
-        let mut seen: hashbrown::HashSet<ModuleId, FixedState, _> = hashbrown::HashSet::with_capacity_and_hasher_in(
-            if check_redundant { uses.by_module.len() } else { 0 },
-            FixedState,
-            cx.frame(),
-        );
+        let mut seen: hashbrown::HashSet<ModuleId, FixedState, _> =
+            hashbrown::HashSet::with_capacity_and_hasher_in(
+                if check_redundant { uses.by_module.len() } else { 0 },
+                FixedState,
+                cx.frame(),
+            );
         for module in uses.items.iter().map(|it| it.module).filter(|_| check_redundant) {
             if !seen.insert(module) {
                 continue;
@@ -174,11 +182,18 @@ impl Unused {
             let mut diag = Diag::lint("unused_imports", message, span);
             if let Some(name) = &tree.name {
                 // alloc: the fact of a lint that fires
-                diag.fact(cx.resolves_fact(item.module.into(), name.as_str()), format!("what uses `{}`", name.as_str()));
+                diag.fact(
+                    cx.resolves_fact(item.module.into(), name.as_str()),
+                    format!("what uses `{}`", name.as_str()),
+                );
             }
             let root = item.trees.first().is_some_and(|it| it.node == tree.node);
             let at = if root { item.node.value.syntax() } else { tree.node.syntax() };
-            out.bodies.push(Found::lint(diag, Phase::Bodies, InFile::new(item.node.file_id, ast::ptr(at))));
+            out.bodies.push(Found::lint(
+                diag,
+                Phase::Bodies,
+                InFile::new(item.node.file_id, ast::ptr(at)),
+            ));
         }
         out
     }
@@ -223,7 +238,13 @@ impl Unused {
     }
 
     /// `unused_extern_crates` of `krate`: unused, or one a `use` could replace.
-    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, krate: &ExternCrate<'_>, maybe_unused: &HashSet<hir_def::ExternCrateId, Global>) {
+    fn extern_crate(
+        &mut self,
+        cx: &Cx<'_, '_>,
+        uses: &Uses<'_, '_>,
+        krate: &ExternCrate<'_>,
+        maybe_unused: &HashSet<hir_def::ExternCrateId, Global>,
+    ) {
         let node = krate.node;
         let at = node.map(|it| ast::ptr(it.syntax()));
         let name = krate.name.as_str();
@@ -234,7 +255,12 @@ impl Unused {
             let mut diag = Diag::lint("unused_extern_crates", "unused extern crate", span.clone());
             diag.span_label(span, "unused");
             let removal = cx.span(node.map(|it| with_attrs(it.syntax())));
-            diag.suggestion_verbose(removal, "remove the unused `extern crate`", "", Applicability::MachineApplicable);
+            diag.suggestion_verbose(
+                removal,
+                "remove the unused `extern crate`",
+                "",
+                Applicability::MachineApplicable,
+            );
             // alloc: the fact of a lint that fires
             diag.fact(cx.resolves_fact(module, name), format!("what uses `{name}`"));
             self.resolve.push(Found::lint(diag, Phase::Resolve, at));
@@ -257,7 +283,11 @@ impl Unused {
         };
         let between = TextRange::new(vis.end(), ident.syntax().text_range().start());
         let code = if vis.is_empty() { "use " } else { " use " };
-        let mut diag = Diag::lint("unused_extern_crates", "`extern crate` is not idiomatic in the new edition", span);
+        let mut diag = Diag::lint(
+            "unused_extern_crates",
+            "`extern crate` is not idiomatic in the new edition",
+            span,
+        );
         diag.suggestion_verbose(
             cx.span(InFile::new(node.file_id, between)),
             "convert it to a `use`",
@@ -265,7 +295,10 @@ impl Unused {
             Applicability::MachineApplicable,
         );
         // alloc: the fact of a lint that fires
-        diag.fact(cx.resolves_fact(module, name), format!("what `{name}` is in the extern prelude"));
+        diag.fact(
+            cx.resolves_fact(module, name),
+            format!("what `{name}` is in the extern prelude"),
+        );
         self.resolve.push(Found::lint(diag, Phase::Resolve, at));
     }
 
@@ -284,7 +317,8 @@ impl Unused {
         // alloc: the spans of a lint that fires
         let spans: Vec<Span> = spans.into_iter().map(|it| cx.span(InFile::new(file, it))).collect();
         // alloc: the snippets of the message of a lint that fires
-        let mut snippets: Vec<String> = spans.iter().filter_map(|it| cx.snippet(it)).map(|it| format!("`{it}`")).collect();
+        let mut snippets: Vec<String> =
+            spans.iter().filter_map(|it| cx.snippet(it)).map(|it| format!("`{it}`")).collect();
         snippets.sort();
         let list = stdx::list::list(snippets.iter(), Join::And, false);
         let message =
@@ -299,7 +333,8 @@ impl Unused {
         }
         let remove_whole_use = remove.len() == 1 && remove[0] == item_span;
         // alloc: the removals of a lint that fires
-        let remove: Vec<Span> = remove.into_iter().map(|it| cx.span(InFile::new(file, it))).collect();
+        let remove: Vec<Span> =
+            remove.into_iter().map(|it| cx.span(InFile::new(file, it))).collect();
         if remove.iter().all(|it| it.expansion.is_none()) {
             if remove_whole_use {
                 diag.suggestion_with_style(
@@ -310,7 +345,11 @@ impl Unused {
                     SuggestionStyle::CompletelyHidden,
                 );
             } else {
-                let message = if spans.len() == 1 { "remove the unused import" } else { "remove the unused imports" };
+                let message = if spans.len() == 1 {
+                    "remove the unused import"
+                } else {
+                    "remove the unused imports"
+                };
                 diag.suggestion_with_style(
                     // alloc: the suggestion of a lint that fires
                     remove.into_iter().map(|it| (it, String::new())).collect(),
@@ -329,7 +368,10 @@ impl Unused {
         for j in unused.iter() {
             if let Some(name) = &item.trees[j].name {
                 // alloc: the fact of a lint that fires
-                diag.fact(cx.resolves_fact(module, name.as_str()), format!("what uses `{}`", name.as_str()));
+                diag.fact(
+                    cx.resolves_fact(module, name.as_str()),
+                    format!("what uses `{}`", name.as_str()),
+                );
             }
         }
         let at = InFile::new(file, ast::ptr(item.node.value.syntax()));
@@ -348,7 +390,8 @@ impl<'f> Candidates<'f> {
     fn of(frame: &'f Frame, candidates: &[Binding]) -> Candidates<'f> {
         let mut order = Vec::with_capacity_in(candidates.len(), frame);
         order.extend_from_slice(candidates);
-        let mut at = hashbrown::HashMap::with_capacity_and_hasher_in(candidates.len(), FixedState, frame);
+        let mut at =
+            hashbrown::HashMap::with_capacity_and_hasher_in(candidates.len(), FixedState, frame);
         at.extend(candidates.iter().enumerate().map(|(i, it)| (*it, i as u32)));
         Candidates { order, at }
     }
@@ -415,7 +458,11 @@ fn calc_unused_spans(
     match tree.kind {
         TreeKind::Simple | TreeKind::Glob => {
             // alloc: the spans of a lint that fires
-            if unused.contains(j) { Calc::Unused { spans: vec![span], remove: full_span } } else { Calc::Used }
+            if unused.contains(j) {
+                Calc::Unused { spans: vec![span], remove: full_span }
+            } else {
+                Calc::Used
+            }
         }
         TreeKind::List => {
             let nested = children.get(&j).map(Vec::as_slice).unwrap_or(&[]);
@@ -459,7 +506,9 @@ fn calc_unused_spans(
                         TextRange::new(child_span.start(), next.start())
                     };
                     match to_remove.pop() {
-                        Some(previous) if previous_unused => to_remove.push(previous.cover(remove_span)),
+                        Some(previous) if previous_unused => {
+                            to_remove.push(previous.cover(remove_span))
+                        }
                         Some(previous) => {
                             to_remove.push(previous);
                             to_remove.push(remove_span);
@@ -496,7 +545,13 @@ fn calc_unused_spans(
 
 /// rustc's `redundant_imports` of the single import `tree`: each namespace it imports in
 /// resolves to the same without it.
-fn redundant(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tree<'_>, binding: Binding) -> Option<Found> {
+fn redundant(
+    cx: &Cx<'_, '_>,
+    uses: &Uses<'_, '_>,
+    item: &UseItem<'_>,
+    tree: &Tree<'_>,
+    binding: Binding,
+) -> Option<Found> {
     if tree.self_import
         || tree.underscore
         || item.node.file_id.is_macro()
@@ -528,7 +583,9 @@ fn redundant(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tr
                 let (range, import) = binding_range(cx, uses, found)?;
                 (Some(range), import)
             }
-            Bound::ExternCrate(krate) => (Some(krate.node.map(|it| item_range_view(it.syntax()))), true),
+            Bound::ExternCrate(krate) => {
+                (Some(krate.node.map(|it| item_range_view(it.syntax()))), true)
+            }
             Bound::Prelude => (None, false),
         };
         ranges.push((range, import));
@@ -545,7 +602,11 @@ fn redundant(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tr
     let text = source.text().to_string();
     let span = cx.span(InFile::new(item.node.file_id, tree.node.syntax().text_range()));
     // clone: alloc: the message of a lint that fires, whose span its labels may share
-    let mut diag = Diag::lint("redundant_imports", format!("the item `{text}` is imported redundantly"), span.clone());
+    let mut diag = Diag::lint(
+        "redundant_imports",
+        format!("the item `{text}` is imported redundantly"),
+        span.clone(),
+    );
     for (other, import) in found {
         let label = match (other.is_some(), import) {
             // alloc: a label of a lint that fires
@@ -592,7 +653,9 @@ fn without<'u, 'db>(
 ) -> Option<(ModuleDefId, Bound<'u, 'db>)> {
     let db = cx.db;
     let in_glob = |from: ModuleDefId| match from {
-        ModuleDefId::ModuleId(from) => entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns),
+        ModuleDefId::ModuleId(from) => {
+            entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns)
+        }
         _ => None,
     };
     let mut at = item.module;
@@ -609,9 +672,17 @@ fn without<'u, 'db>(
                 if globs.any(|(_, _, it)| it.def != found.def) {
                     return None;
                 }
-                return Some((found.def, Bound::Glob(InFile::new(glob_item.node.file_id, glob.node.syntax().text_range()))));
+                return Some((
+                    found.def,
+                    Bound::Glob(InFile::new(
+                        glob_item.node.file_id,
+                        glob.node.syntax().text_range(),
+                    )),
+                ));
             }
-        } else if let Some(found) = entry(&at.def_map(db).module(db, at).name_in_scope(db, name), ns) {
+        } else if let Some(found) =
+            entry(&at.def_map(db).module(db, at).name_in_scope(db, name), ns)
+        {
             if let Some(Binding::Glob(_)) = found.import
                 && uses
                     .globs_of(at)
@@ -633,7 +704,10 @@ fn without<'u, 'db>(
     let root: ModuleId = cx.krate.root_module(db).into();
     if let Some(krate) = uses.crates.iter().find(|it| it.module == root && it.name == *name) {
         let loaded = krate.krate?;
-        return Some((ModuleDefId::ModuleId(loaded.root_module(db).into()), Bound::ExternCrate(krate)));
+        return Some((
+            ModuleDefId::ModuleId(loaded.root_module(db).into()),
+            Bound::ExternCrate(krate),
+        ));
     }
     if uses.extern_prelude.contains(name) {
         let dep = cx.krate.dependencies_iter(db).find(|it| it.name == *name)?;
@@ -644,7 +718,11 @@ fn without<'u, 'db>(
 }
 
 /// Where the binding `found` is, and whether it is an import's.
-fn binding_range(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, found: Entry) -> Option<(InFile<TextRange>, bool)> {
+fn binding_range(
+    cx: &Cx<'_, '_>,
+    uses: &Uses<'_, '_>,
+    found: Entry,
+) -> Option<(InFile<TextRange>, bool)> {
     match found.import {
         Some(binding @ (Binding::Import(_) | Binding::Glob(_))) => {
             let (item, tree) = uses.tree(binding)?;
@@ -757,14 +835,18 @@ fn no_implicit_prelude(cx: &Cx<'_, '_>, module: ModuleId) -> bool {
         let module = hir::Module::from(id);
         let source = module.definition_source_view(db).value;
         let inner = match source {
-            hir::view::ModuleSourceView::SourceFile(it) => ast::attrs_including_inner(&it).any(is_no_implicit_prelude),
-            hir::view::ModuleSourceView::Module(it) => ast::attrs_including_inner(&it).any(is_no_implicit_prelude),
+            hir::view::ModuleSourceView::SourceFile(it) => {
+                ast::attrs_including_inner(&it).any(is_no_implicit_prelude)
+            }
+            hir::view::ModuleSourceView::Module(it) => {
+                ast::attrs_including_inner(&it).any(is_no_implicit_prelude)
+            }
             hir::view::ModuleSourceView::BlockExpr(_) => false,
         };
         if inner
-            || module
-                .declaration_source_view(db)
-                .is_some_and(|declared| ast::HasAttrs::attrs(&declared.value).any(is_no_implicit_prelude))
+            || module.declaration_source_view(db).is_some_and(|declared| {
+                ast::HasAttrs::attrs(&declared.value).any(is_no_implicit_prelude)
+            })
         {
             return true;
         }
@@ -774,7 +856,9 @@ fn no_implicit_prelude(cx: &Cx<'_, '_>, module: ModuleId) -> bool {
 }
 
 fn is_no_implicit_prelude(attr: ast::Attr<'_>) -> bool {
-    attr.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "no_implicit_prelude")
+    attr.path()
+        .and_then(|it| it.as_single_name_ref())
+        .is_some_and(|it| it.text() == "no_implicit_prelude")
 }
 
 /// Whether the crate `krate` exports a macro named `name` at its root.
@@ -790,7 +874,12 @@ fn exports_macro(cx: &Cx<'_, '_>, krate: hir::Crate, name: &Name) -> bool {
 fn may_be_unused(cx: &Cx<'_, '_>, krate: hir::Crate) -> bool {
     let db = cx.db;
     match &krate.base().data(db).origin {
-        CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc | LangCrateOrigin::ProcMacro | LangCrateOrigin::Test) => {
+        CrateOrigin::Lang(
+            LangCrateOrigin::Core
+            | LangCrateOrigin::Alloc
+            | LangCrateOrigin::ProcMacro
+            | LangCrateOrigin::Test,
+        ) => {
             return true;
         }
         CrateOrigin::Lang(_) => return false,
@@ -806,7 +895,8 @@ fn may_be_unused(cx: &Cx<'_, '_>, krate: hir::Crate) -> bool {
     true
 }
 
-const KEPT: [&str; 5] = ["compiler_builtins", "panic_runtime", "global_allocator", "panic_handler", "eii"];
+const KEPT: [&str; 5] =
+    ["compiler_builtins", "panic_runtime", "global_allocator", "panic_handler", "eii"];
 
 /// Whether `text` has one of [`KEPT`] as a word, or a word starting `eii_`. One SIMD substring
 /// search per name (memchr's `memmem`, chosen for the machine at run time) over the source as

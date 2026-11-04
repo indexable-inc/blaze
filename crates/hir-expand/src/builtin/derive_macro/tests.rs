@@ -2,8 +2,10 @@
 //! they replace: over the same items, the same trees (encoding, spans, symbols), the same
 //! `Debug` and `Display`, the same errors.
 
-use span::{Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext};
 use blaze_mem::{Frame, Tag};
+use span::{
+    Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext,
+};
 use syntax::{
     AstNode, Parse, SourceFile, TextRange, TextSize,
     ast::{self, HasName as _},
@@ -146,7 +148,8 @@ type Derive = for<'f> fn(
     &ItemSource<'_>,
     view::Adt<'_>,
     Span,
-) -> (ExpandResult<tt::TopSubtree>, ExpandResult<tt::TopSubtree<&'f Frame>>);
+)
+    -> (ExpandResult<tt::TopSubtree>, ExpandResult<tt::TopSubtree<&'f Frame>>);
 
 fn derives() -> [(&'static str, Derive); 12] {
     macro_rules! pair {
@@ -236,10 +239,9 @@ fn from_matches_nested_quotes() {
 #[test]
 fn partial_eq_writes_structural_partial_eq_first() {
     let span = call_site();
-    for (text, union) in [
-        ("#[repr(packed)] struct P<T: Clone>(T);", false),
-        ("union U<T: Clone> { a: T }", true),
-    ] {
+    for (text, union) in
+        [("#[repr(packed)] struct P<T: Clone>(T);", false), ("union U<T: Clone> { a: T }", true)]
+    {
         let (_, map) = item(text);
         let parse = parsed(text);
         let info = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
@@ -261,7 +263,10 @@ fn partial_eq_writes_structural_partial_eq_first() {
         assert_eq!(err.is_some(), union, "{text}");
         assert_eq!(partial_eq.is_empty(), union, "{text}: {partial_eq}");
         if !union {
-            assert!(partial_eq.contains("$crate::marker::Copy"), "a packed struct's fields are copied");
+            assert!(
+                partial_eq.contains("$crate::marker::Copy"),
+                "a packed struct's fields are copied"
+            );
         }
     }
 }
@@ -273,7 +278,8 @@ fn partial_eq_writes_structural_partial_eq_first() {
 #[test]
 fn a_packed_structs_copies_name_self_and_other_in_the_derives_hygiene() {
     let span = call_site();
-    for text in ["#[repr(packed)] struct P { a: u8, b: u32 }", "#[repr(packed)] struct T(u8, u32);"] {
+    for text in ["#[repr(packed)] struct P { a: u8, b: u32 }", "#[repr(packed)] struct T(u8, u32);"]
+    {
         let (_, map) = item(text);
         let parse = parsed(text);
         let info = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
@@ -285,11 +291,21 @@ fn a_packed_structs_copies_name_self_and_other_in_the_derives_hygiene() {
             let tt::Leaf::Ident(it) = leaf else { return };
             match it.sym.as_str() {
                 "self" | "other" => {
-                    assert_eq!(it.span.ctx, span.ctx, "{text}: `{}` in the derive's hygiene", it.sym.as_str());
+                    assert_eq!(
+                        it.span.ctx,
+                        span.ctx,
+                        "{text}: `{}` in the derive's hygiene",
+                        it.sym.as_str()
+                    );
                     bases += 1;
                 }
                 "a" | "b" => {
-                    assert_ne!(it.span.ctx, span.ctx, "{text}: the field `{}` keeps its own", it.sym.as_str());
+                    assert_ne!(
+                        it.span.ctx,
+                        span.ctx,
+                        "{text}: the field `{}` keeps its own",
+                        it.sym.as_str()
+                    );
                     fields += 1;
                 }
                 _ => {}
@@ -381,12 +397,19 @@ fn reference_from(
     let krate = dollar_crate(span);
     let value = || tt::Ident::new("value", span);
     let record_field = match strukt.field_list() {
-        Some(ast::FieldList::RecordFieldList(_)) => {
-            Some(reference::name_to_token(span, map, strukt.field_list().and_then(|it| match it {
-                ast::FieldList::RecordFieldList(it) => it.fields().next().and_then(|it| it.name()),
-                ast::FieldList::TupleFieldList(_) => None,
-            })).expect("a name"))
-        }
+        Some(ast::FieldList::RecordFieldList(_)) => Some(
+            reference::name_to_token(
+                span,
+                map,
+                strukt.field_list().and_then(|it| match it {
+                    ast::FieldList::RecordFieldList(it) => {
+                        it.fields().next().and_then(|it| it.name())
+                    }
+                    ast::FieldList::TupleFieldList(_) => None,
+                }),
+            )
+            .expect("a name"),
+        ),
         _ => None,
     };
     let body = match record_field {
@@ -476,7 +499,11 @@ fn shape_is_one_field_list() {
         }
         assert_eq!(at, new.shape.fields.len(), "{text}");
         for (field, bound) in new.shape.fields.iter().zip(new.bindings("_other")) {
-            assert_eq!(bound, tt::Ident::new(&format!("{}_other", field.sym), field.span), "{text}");
+            assert_eq!(
+                bound,
+                tt::Ident::new(&format!("{}_other", field.sym), field.span),
+                "{text}"
+            );
         }
     }
 }
@@ -497,8 +524,12 @@ fn derives_copy_reads_words_as_the_text_did() {
         assert_eq!(super::derives_copy(adt), copy, "{text}");
         let (adt, _) = item(text);
         assert_eq!(
-            ast::HasAttrs::attrs(&adt)
-                .any(|attr| super::editor::attr_words_have(&attr, "derive", &[], "Copy")),
+            ast::HasAttrs::attrs(&adt).any(|attr| super::editor::attr_words_have(
+                &attr,
+                "derive",
+                &[],
+                "Copy"
+            )),
             copy,
             "{text}: the handle form, as the derive's own item reads it"
         );
@@ -509,9 +540,15 @@ fn derives_copy_reads_words_as_the_text_did() {
 fn joined_names() {
     assert_eq!(super::tuple_field_symbol(0), intern::Symbol::intern("f0"));
     assert_eq!(super::tuple_field_symbol(12345), intern::Symbol::intern("f12345"));
-    assert_eq!(super::tuple_field_symbol(usize::MAX), intern::Symbol::intern(&format!("f{}", usize::MAX)));
+    assert_eq!(
+        super::tuple_field_symbol(usize::MAX),
+        intern::Symbol::intern(&format!("f{}", usize::MAX))
+    );
     let long = "x".repeat(100);
-    assert_eq!(intern::Symbol::intern_concat(&[&long, "_self"]), intern::Symbol::intern(&format!("{long}_self")));
+    assert_eq!(
+        intern::Symbol::intern_concat(&[&long, "_self"]),
+        intern::Symbol::intern(&format!("{long}_self"))
+    );
 }
 
 #[test]
@@ -540,7 +577,10 @@ fn builtin_derives_found_as_by_compare() {
     }
     for (at, symbol) in BuiltinDeriveExpander::NAMES.iter().enumerate() {
         let name = Name::new_symbol_root(symbol.clone());
-        assert_eq!(BuiltinDeriveExpander::find_by_name(&name), Some(BuiltinDeriveExpander::ALL[at]));
+        assert_eq!(
+            BuiltinDeriveExpander::find_by_name(&name),
+            Some(BuiltinDeriveExpander::ALL[at])
+        );
     }
 }
 
@@ -664,7 +704,11 @@ impl Copied<'_> {
         assert_eq!(with.err, None, "{what}");
         let (plain, with) = (plain.value, with.value);
         assert_eq!(written(&plain).matches("impl").count(), impls, "{what}: {plain}");
-        assert_eq!(written(&with), written(&plain).replace("impl", &format!("{copied}impl")), "{what}");
+        assert_eq!(
+            written(&with),
+            written(&plain).replace("impl", &format!("{copied}impl")),
+            "{what}"
+        );
         let mut first_leaf = None;
         each_leaf(with.iter(), &mut |leaf| {
             first_leaf.get_or_insert(*leaf.span());
@@ -694,7 +738,8 @@ impl Copied<'_> {
 #[test]
 fn derived_impls_of_an_item_without_them_are_unchanged() {
     let span = call_site();
-    let extra = "#[repr(C)] #[doc = \"x\"] #[must_use] #[tool::deny(x)] #[allowed] struct Other(u8);";
+    let extra =
+        "#[repr(C)] #[doc = \"x\"] #[must_use] #[tool::deny(x)] #[allowed] struct Other(u8);";
     for text in ITEMS.iter().copied().chain([extra]) {
         let (adt, map) = item(text);
         let parse = parsed(text);
@@ -916,7 +961,12 @@ fn coerce_pointee_keeps_a_2015_items_names() {
             return;
         }
         assert!(matches!(it.is_raw, tt::IdentIsRaw::No), "{text}: `{}` is raw", it.sym.as_str());
-        assert_eq!(&text[it.span.range], it.sym.as_str(), "{text}: `{}` in the item", it.sym.as_str());
+        assert_eq!(
+            &text[it.span.range],
+            it.sym.as_str(),
+            "{text}: `{}` in the item",
+            it.sym.as_str()
+        );
         assert_eq!(it.span.ctx, SyntaxContext::root(Edition::Edition2015), "{text}");
         names += 1;
     });
@@ -961,8 +1011,14 @@ fn coerce_pointee_substitutes_as_rustc() {
                 ("Vec<U>:Send,", 2),
             ],
         ),
-        ("#[repr(transparent)] struct Ptr<T: ?Sized>(Box<T>) where ::T: Tr<T>;", &[("::T:Tr<__S>,", 2)]),
-        ("#[repr(transparent)] struct Ptr<r#T: ?Sized>(Box<T>) where T: Tr<r#T>;", &[("__S:Tr<__S>,", 2)]),
+        (
+            "#[repr(transparent)] struct Ptr<T: ?Sized>(Box<T>) where ::T: Tr<T>;",
+            &[("::T:Tr<__S>,", 2)],
+        ),
+        (
+            "#[repr(transparent)] struct Ptr<r#T: ?Sized>(Box<T>) where T: Tr<r#T>;",
+            &[("__S:Tr<__S>,", 2)],
+        ),
         (
             "#[repr(transparent)] struct Ptr<#[pointee] T: ?Sized, U: Tr<unsafe<'x> &'x T>>(Box<T>, U);",
             &[("U:Tr<unsafe<'x>&'x__S>,", 2)],
@@ -1000,7 +1056,8 @@ fn derived_impls_start_with_automatically_derived() {
     let span = call_site();
     let text = "#[allow(dead_code)] #[repr(transparent)] struct S<T: ?Sized>(Box<T>);";
     let marker = "#[automatically_derived]";
-    let written = |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
+    let written =
+        |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
     let (adt, map) = item(text);
     let parse = parsed(text);
     let input = item_input(&adt, &map);
@@ -1008,7 +1065,11 @@ fn derived_impls_start_with_automatically_derived() {
     let check = |what: &str, plain: &tt::TopSubtree<&Frame>, marked: &tt::TopSubtree<&Frame>| {
         let impls = written(plain).matches("impl").count();
         assert!(impls >= 1, "{what}: {plain}");
-        assert_eq!(written(marked), written(plain).replace("impl", &format!("{marker}impl")), "{what}");
+        assert_eq!(
+            written(marked),
+            written(plain).replace("impl", &format!("{marker}impl")),
+            "{what}"
+        );
         let mut at_span = 0;
         each_leaf(marked.iter(), &mut |leaf| {
             if let tt::Leaf::Ident(it) = leaf

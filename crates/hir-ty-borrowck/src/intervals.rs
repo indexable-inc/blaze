@@ -281,8 +281,7 @@ mod tests {
                     assert_eq!(changed, want.len() != a.len());
                     let mut d = set(frame, a);
                     d.subtract(&set(frame, b));
-                    let want: Vec<usize> =
-                        a.iter().copied().filter(|it| !b.contains(it)).collect();
+                    let want: Vec<usize> = a.iter().copied().filter(|it| !b.contains(it)).collect();
                     assert_eq!(d.iter().collect::<Vec<_>>(), want, "{a:?} - {b:?}");
                     assert_eq!(d, set(frame, &want));
                     for start in 0..13 {

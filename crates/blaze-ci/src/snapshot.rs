@@ -97,7 +97,9 @@ pub fn run(argv: &[String]) -> Result<Vec<u8>, SnapshotError> {
         // alloc: error path
         let said = last_line(&output.stderr).unwrap_or_else(|| "nothing on stderr".to_owned());
         // alloc: error path
-        return Err(SnapshotError { what: format!("`{shown}` failed ({}): {said}", output.status) });
+        return Err(SnapshotError {
+            what: format!("`{shown}` failed ({}): {said}", output.status),
+        });
     }
     Ok(output.stdout)
 }
@@ -162,8 +164,9 @@ mod tests {
 
     #[test]
     fn needs_sh_a_failing_command_names_itself_and_its_stderr() {
-        let argv: Vec<String> =
-            ["sh", "-c", "echo first >&2; echo the last line >&2; exit 3"].map(str::to_owned).into();
+        let argv: Vec<String> = ["sh", "-c", "echo first >&2; echo the last line >&2; exit 3"]
+            .map(str::to_owned)
+            .into();
         let error = run(&argv).unwrap_err();
         assert!(error.what.contains("sh -c"), "{error}");
         assert!(error.what.contains("the last line"), "{error}");

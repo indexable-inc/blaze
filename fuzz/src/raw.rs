@@ -46,9 +46,11 @@ const WORD_U64S: usize = WORD / 8;
 /// A slot of [`TORC_WORDS`]: its length, then each operand's words.
 const WORD_SLOT: usize = 1 + 2 * WORD_U64S;
 
-static COUNTERS: [AtomicPtr<u8>; 2 * MODULES] = [const { AtomicPtr::new(ptr::null_mut()) }; 2 * MODULES];
+static COUNTERS: [AtomicPtr<u8>; 2 * MODULES] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; 2 * MODULES];
 static COUNTER_MODULES: AtomicUsize = AtomicUsize::new(0);
-static PCS: [AtomicPtr<usize>; 2 * MODULES] = [const { AtomicPtr::new(ptr::null_mut()) }; 2 * MODULES];
+static PCS: [AtomicPtr<usize>; 2 * MODULES] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; 2 * MODULES];
 static PC_MODULES: AtomicUsize = AtomicUsize::new(0);
 static TOO_MANY: AtomicBool = AtomicBool::new(false);
 static ASAN: AtomicBool = AtomicBool::new(false);
@@ -84,7 +86,12 @@ pub(crate) extern "C" fn __sanitizer_cov_pcs_init(start: *const usize, stop: *co
     register(&PCS, &PC_MODULES, start.cast_mut(), stop.cast_mut());
 }
 
-fn register<T>(table: &[AtomicPtr<T>; 2 * MODULES], count: &AtomicUsize, start: *mut T, stop: *mut T) {
+fn register<T>(
+    table: &[AtomicPtr<T>; 2 * MODULES],
+    count: &AtomicUsize,
+    start: *mut T,
+    stop: *mut T,
+) {
     let n = count.load(Ordering::Acquire);
     // Every object of a module calls with the module's whole section: the first call counts.
     if (0..n).any(|module| table[2 * module].load(Ordering::Relaxed) == start) {
@@ -114,7 +121,12 @@ fn value(at: u64) {
     // are `AtomicU64`s, loaded and stored atomically.
     let old = unsafe { intrinsics::atomic_load::<u64, { Relaxed }, false>(word) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(word, old | 1u64.wrapping_shl(bit as u32)) };
+    unsafe {
+        intrinsics::atomic_store::<u64, { Relaxed }, false>(
+            word,
+            old | 1u64.wrapping_shl(bit as u32),
+        )
+    };
 }
 
 /// libFuzzer's `HandleCmp`: the Hamming distance and the distance's leading zeros of the
@@ -132,8 +144,14 @@ fn recent(a: u64, b: u64, width: u64) {
     // take the same slot at once overwrite one comparison, as in libFuzzer's table.
     let n = unsafe { intrinsics::atomic_load::<u64, { Relaxed }, false>(RECENT_NEXT.as_ptr()) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(RECENT_NEXT.as_ptr(), n.wrapping_add(1)) };
-    let slot = RECENT.as_ptr().wrapping_add((n & TORC_MASK).wrapping_mul(3) as usize).cast::<u64>().cast_mut();
+    unsafe {
+        intrinsics::atomic_store::<u64, { Relaxed }, false>(RECENT_NEXT.as_ptr(), n.wrapping_add(1))
+    };
+    let slot = RECENT
+        .as_ptr()
+        .wrapping_add((n & TORC_MASK).wrapping_mul(3) as usize)
+        .cast::<u64>()
+        .cast_mut();
     // SAFETY: the slot index is masked below `TORC`, so `slot` and the two words after it are
     // `RECENT`'s `AtomicU64`s, stored to atomically.
     unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(slot, a) };
@@ -262,7 +280,8 @@ pub(crate) extern "C" fn __sanitizer_weak_hook_memcmp(
     let slot = next % TORC_WORDS * WORD_SLOT;
     RECENT_WORDS[slot].store(len as u64, Ordering::Relaxed);
     for (i, (x, y)) in a.chunks_exact(8).zip(b.chunks_exact(8)).enumerate() {
-        RECENT_WORDS[slot + 1 + i].store(u64::from_le_bytes(x.try_into().unwrap()), Ordering::Relaxed);
+        RECENT_WORDS[slot + 1 + i]
+            .store(u64::from_le_bytes(x.try_into().unwrap()), Ordering::Relaxed);
         RECENT_WORDS[slot + 1 + WORD_U64S + i]
             .store(u64::from_le_bytes(y.try_into().unwrap()), Ordering::Relaxed);
     }
@@ -277,7 +296,8 @@ pub(crate) extern "C" fn __asan_default_options() -> *const c_char {
     // A report ends the process with SIGABRT, which `minimize` tells from a clean exit; an
     // allocation past 2 GiB is a finding, not a null; a leak at exit is not looked for (the
     // fuzzer runs for hours in one process and ends by `exit`).
-    c"abort_on_error=1:allocator_may_return_null=0:max_allocation_size_mb=2048:detect_leaks=0".as_ptr()
+    c"abort_on_error=1:allocator_may_return_null=0:max_allocation_size_mb=2048:detect_leaks=0"
+        .as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -337,15 +357,19 @@ impl Coverage<'static> {
     /// the functions at `engine` dropped, or why this build can't be fuzzed.
     pub(crate) fn new(engine: &[usize]) -> Result<Self, String> {
         if TOO_MANY.load(Ordering::Relaxed) {
-            return Err(format!("more than {MODULES} instrumented modules registered counters"));  // alloc: error message
+            return Err(format!("more than {MODULES} instrumented modules registered counters")); // alloc: error message
         }
         let counted = COUNTER_MODULES.load(Ordering::Acquire);
         if counted == 0 {
-            return Err(format!("this binary was built without SanitizerCoverage's counters: {}", crate::FLAGS));  // alloc: error message
+            return Err(format!(
+                "this binary was built without SanitizerCoverage's counters: {}",
+                crate::FLAGS
+            )); // alloc: error message
         }
         let tabled = PC_MODULES.load(Ordering::Acquire);
         if tabled != counted {
-            return Err(format!(  // alloc: error message
+            return Err(format!(
+                // alloc: error message
                 "{counted} modules registered counters and {tabled} a PC table: build with `pc-table` ({})",
                 crate::FLAGS
             ));
@@ -359,20 +383,23 @@ impl Coverage<'static> {
             let pcs = PCS[2 * module].load(Ordering::Relaxed).cast_const();
             let pcs_stop = PCS[2 * module + 1].load(Ordering::Relaxed).cast_const();
             let len = (stop as usize).saturating_sub(start as usize);
-            let entries = (pcs_stop as usize).saturating_sub(pcs as usize) / (2 * size_of::<usize>());
+            let entries =
+                (pcs_stop as usize).saturating_sub(pcs as usize) / (2 * size_of::<usize>());
             if entries != len {
-                return Err(format!(  // alloc: error message
+                return Err(format!(
+                    // alloc: error message
                     "module {module} has {len} counters and {entries} PC table entries; they must be one per block"
                 ));
             }
             // SAFETY: SanitizerCoverage registered `[pcs, pcs_stop)`, a constant array of
             // (pc, flags) pairs, one per counter (checked just above), for the program's life.
             let table = unsafe { std::slice::from_raw_parts(pcs, 2 * len) };
-            let mut ignored = vec![0u64; len.div_ceil(8)];  // alloc: the engine's mask, once per module at start
+            let mut ignored = vec![0u64; len.div_ceil(8)]; // alloc: the engine's mask, once per module at start
             for &function in ours.iter().chain(engine) {
                 // Its entry block (flag 1) at its address, then its other blocks up to the next
                 // entry. An engine function that is not instrumented has none.
-                let Some(entry) = (0..len).find(|&k| table[2 * k] == function && table[2 * k + 1] & 1 == 1)
+                let Some(entry) =
+                    (0..len).find(|&k| table[2 * k] == function && table[2 * k + 1] & 1 == 1)
                 else {
                     continue;
                 };
@@ -385,7 +412,7 @@ impl Coverage<'static> {
             total += len;
         }
         if total > (u32::MAX as usize >> 3) - VALUE_BITS {
-            return Err(format!("{total} counters are more than features can number"));  // alloc: error message
+            return Err(format!("{total} counters are more than features can number")); // alloc: error message
         }
         Ok(Coverage { modules, total, _counters: PhantomData })
     }
@@ -432,7 +459,11 @@ impl<'a> Coverage<'a> {
 /// dictionary words.
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub(crate) fn __sanitizer_blaze_fuzzer_find(data: &[u8], from: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn __sanitizer_blaze_fuzzer_find(
+    data: &[u8],
+    from: &[u8],
+    start: usize,
+) -> Option<usize> {
     let ends = data.len() - from.len() + 1;
     for (low, end) in [(start, ends), (0, start)] {
         'at: for at in low..end {
@@ -572,7 +603,12 @@ fn clear(module: &Module) {
 #[unsafe(no_mangle)]
 #[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 #[inline(never)]
-fn __sanitizer_blaze_fuzzer_run(coverage: &Coverage<'_>, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
+fn __sanitizer_blaze_fuzzer_run(
+    coverage: &Coverage<'_>,
+    check: fn(&[u8]),
+    data: &[u8],
+    now: u64,
+) -> bool {
     for module in &coverage.modules {
         clear(module);
     }
@@ -609,7 +645,7 @@ pub(crate) fn current() -> Option<Vec<u8>> {
     // the target returned; a caller is either inside that call (the slice is borrowed and
     // unchanged for its whole length) or the watchdog holding `DUMPING`, which keeps `run`
     // from returning.
-    Some(unsafe { std::slice::from_raw_parts(at, len) }.to_vec())  // alloc: a crash report's copy of the input, once per process
+    Some(unsafe { std::slice::from_raw_parts(at, len) }.to_vec()) // alloc: a crash report's copy of the input, once per process
 }
 
 /// For the watchdog: when the running input started more than `limit` milliseconds before
@@ -638,9 +674,11 @@ pub(crate) fn recent_bytes(slot: usize) -> ([u8; WORD], [u8; WORD], usize) {
     let len = (RECENT_WORDS[at].load(Ordering::Relaxed) as usize).min(WORD);
     let (mut a, mut b) = ([0u8; WORD], [0u8; WORD]);
     for i in 0..WORD_U64S {
-        a[8 * i..8 * i + 8].copy_from_slice(&RECENT_WORDS[at + 1 + i].load(Ordering::Relaxed).to_le_bytes());
-        b[8 * i..8 * i + 8]
-            .copy_from_slice(&RECENT_WORDS[at + 1 + WORD_U64S + i].load(Ordering::Relaxed).to_le_bytes());
+        a[8 * i..8 * i + 8]
+            .copy_from_slice(&RECENT_WORDS[at + 1 + i].load(Ordering::Relaxed).to_le_bytes());
+        b[8 * i..8 * i + 8].copy_from_slice(
+            &RECENT_WORDS[at + 1 + WORD_U64S + i].load(Ordering::Relaxed).to_le_bytes(),
+        );
     }
     (a, b, len)
 }

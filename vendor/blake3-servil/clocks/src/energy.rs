@@ -69,7 +69,9 @@ mod imp {
     const SYS_PERF_EVENT_OPEN: i64 = -1;
 
     fn sysfs(name: &str) -> Option<String> {
-        std::fs::read_to_string(format!("/sys/bus/event_source/devices/power/{name}")).ok().map(|s| s.trim().to_owned())
+        std::fs::read_to_string(format!("/sys/bus/event_source/devices/power/{name}"))
+            .ok()
+            .map(|s| s.trim().to_owned())
     }
 
     impl Counter {
@@ -78,7 +80,9 @@ mod imp {
                 return None;
             }
             let pmu: u64 = sysfs("type")?.parse().ok()?;
-            let config = u64::from_str_radix(sysfs("events/energy-pkg")?.strip_prefix("event=0x")?, 16).ok()?;
+            let config =
+                u64::from_str_radix(sysfs("events/energy-pkg")?.strip_prefix("event=0x")?, 16)
+                    .ok()?;
             let (mantissa, exponent) = parse_scale(&sysfs("events/energy-pkg.scale")?)?;
             let cpu: i64 = sysfs("cpumask")?.split([',', '-']).next()?.parse().ok()?;
             // struct perf_event_attr, as 64-bit words: type and size, then
@@ -88,18 +92,28 @@ mod imp {
             attr[1] = config;
             // Sound: `attr` is a perf_event_attr of the size it states; pid
             // -1 with a CPU counts that CPU's package, every process.
-            let fd = unsafe { syscall(SYS_PERF_EVENT_OPEN, attr.as_ptr(), -1i64, cpu, -1i64, 0u64) };
+            let fd =
+                unsafe { syscall(SYS_PERF_EVENT_OPEN, attr.as_ptr(), -1i64, cpu, -1i64, 0u64) };
             // Sound: a descriptor perf_event_open just returned, ours alone.
-            (fd >= 0).then(|| Counter { file: unsafe { std::os::fd::FromRawFd::from_raw_fd(fd as i32) }, mantissa, exponent })
+            (fd >= 0).then(|| Counter {
+                file: unsafe { std::os::fd::FromRawFd::from_raw_fd(fd as i32) },
+                mantissa,
+                exponent,
+            })
         }
 
         pub fn read_nj(&self) -> u64 {
             let mut count = [0u8; 8];
-            std::io::Read::read_exact(&mut &self.file, &mut count).expect("reading the package energy counter");
+            std::io::Read::read_exact(&mut &self.file, &mut count)
+                .expect("reading the package energy counter");
             // count x mantissa x 10^(exponent + 9) nanojoules, rounded down.
             let scaled = u128::from(u64::from_ne_bytes(count)) * self.mantissa;
             let exponent = self.exponent + 9;
-            let nj = if exponent >= 0 { scaled * 10u128.pow(exponent as u32) } else { scaled / 10u128.pow(exponent.unsigned_abs()) };
+            let nj = if exponent >= 0 {
+                scaled * 10u128.pow(exponent as u32)
+            } else {
+                scaled / 10u128.pow(exponent.unsigned_abs())
+            };
             u64::try_from(nj).expect("energy fits in u64")
         }
     }
@@ -128,7 +142,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn scales_parse_exactly() {
-        assert_eq!(imp::parse_scale("2.3283064365386962890625e-10\n"), Some((23283064365386962890625, -32)));
+        assert_eq!(
+            imp::parse_scale("2.3283064365386962890625e-10\n"),
+            Some((23283064365386962890625, -32))
+        );
         assert_eq!(imp::parse_scale("1.52587890625e-5"), Some((152587890625, -16)));
         assert_eq!(imp::parse_scale("1"), Some((1, 0)));
         assert_eq!(imp::parse_scale("joules"), None);

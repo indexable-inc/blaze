@@ -31,17 +31,19 @@ pub fn deeply_normalize<'db>(
         return Ok(ty);
     }
     if ty.has_escaping_bound_vars() {
-        return Err(Unshared::NoContent(format!( // alloc: error path
+        return Err(Unshared::NoContent(format!(
+            // alloc: error path
             "`{ty:?}` has bound variables of a binder outside it, so it is not normalized alone"
         )));
     }
     let reset = rustc_type_ir::set_aliases_to_non_rigid(infcx.interner, ty).skip_normalization();
-    let normalized = infcx
-        .at(&ObligationCause::dummy(), param_env)
-        .deeply_normalize(reset)
-        .map_err(|errors| Unshared::NoContent(format!("`{ty:?}` does not normalize: {errors:?}")))?; // alloc: error path
+    let normalized =
+        infcx.at(&ObligationCause::dummy(), param_env).deeply_normalize(reset).map_err(
+            |errors| Unshared::NoContent(format!("`{ty:?}` does not normalize: {errors:?}")),
+        )?; // alloc: error path
     if references_non_lt_error(&normalized) {
-        return Err(Unshared::NoContent(format!( // alloc: error path
+        return Err(Unshared::NoContent(format!(
+            // alloc: error path
             "`{ty:?}` normalizes to `{normalized:?}`, which holds an error (a constant in it that \
              does not evaluate)"
         )));

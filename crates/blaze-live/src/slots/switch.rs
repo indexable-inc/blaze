@@ -67,9 +67,9 @@ pub(crate) const KEPT: usize = 64;
 pub(crate) use blaze_inproc_rt::live::log::POOL;
 // What an image's descriptor says, with its slide: the dev runtime's, which finds the
 // execution log's header by it too.
-pub(crate) use blaze_inproc_rt::live::Layout;
 #[cfg(test)]
 pub(crate) use blaze_inproc_rt::live::HOST_ARCH;
+pub(crate) use blaze_inproc_rt::live::Layout;
 
 /// How the platform's unwinder takes DWARF call frame information.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

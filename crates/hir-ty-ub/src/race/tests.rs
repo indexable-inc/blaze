@@ -107,28 +107,48 @@ fn assert_order(l: &[u32], r: &[u32], o: Option<Ordering>) {
     let compare = l.partial_cmp(&r);
     assert_eq!(compare, o, "Invalid comparison\n l: {l:?}\n r: {r:?}");
     let alt_compare = r.partial_cmp(&l);
-    assert_eq!(alt_compare, o.map(Ordering::reverse), "Invalid alt comparison\n l: {l:?}\n r: {r:?}");
+    assert_eq!(
+        alt_compare,
+        o.map(Ordering::reverse),
+        "Invalid alt comparison\n l: {l:?}\n r: {r:?}"
+    );
 
     // Test operators with faster implementations
-    assert_eq!(matches!(compare, Some(Ordering::Less)), l < r, "Invalid (<):\n l: {l:?}\n r: {r:?}");
+    assert_eq!(
+        matches!(compare, Some(Ordering::Less)),
+        l < r,
+        "Invalid (<):\n l: {l:?}\n r: {r:?}"
+    );
     assert_eq!(
         matches!(compare, Some(Ordering::Less) | Some(Ordering::Equal)),
         l <= r,
         "Invalid (<=):\n l: {l:?}\n r: {r:?}"
     );
-    assert_eq!(matches!(compare, Some(Ordering::Greater)), l > r, "Invalid (>):\n l: {l:?}\n r: {r:?}");
+    assert_eq!(
+        matches!(compare, Some(Ordering::Greater)),
+        l > r,
+        "Invalid (>):\n l: {l:?}\n r: {r:?}"
+    );
     assert_eq!(
         matches!(compare, Some(Ordering::Greater) | Some(Ordering::Equal)),
         l >= r,
         "Invalid (>=):\n l: {l:?}\n r: {r:?}"
     );
-    assert_eq!(matches!(alt_compare, Some(Ordering::Less)), r < l, "Invalid alt (<):\n l: {l:?}\n r: {r:?}");
+    assert_eq!(
+        matches!(alt_compare, Some(Ordering::Less)),
+        r < l,
+        "Invalid alt (<):\n l: {l:?}\n r: {r:?}"
+    );
     assert_eq!(
         matches!(alt_compare, Some(Ordering::Less) | Some(Ordering::Equal)),
         r <= l,
         "Invalid alt (<=):\n l: {l:?}\n r: {r:?}"
     );
-    assert_eq!(matches!(alt_compare, Some(Ordering::Greater)), r > l, "Invalid alt (>):\n l: {l:?}\n r: {r:?}");
+    assert_eq!(
+        matches!(alt_compare, Some(Ordering::Greater)),
+        r > l,
+        "Invalid alt (>):\n l: {l:?}\n r: {r:?}"
+    );
     assert_eq!(
         matches!(alt_compare, Some(Ordering::Greater) | Some(Ordering::Equal)),
         r >= l,
@@ -153,7 +173,10 @@ fn find_gt_index() {
     assert_eq!(l.find_gt_index(&VClock::from_times(&[1, 2, 3])), None);
     assert_eq!(l.find_gt_index(&VClock::from_times(&[1, 1, 3])), Some(VectorIdx(1)));
     assert_eq!(l.find_gt_index(&VClock::from_times(&[1, 2])), Some(VectorIdx(2)));
-    assert_eq!(VClock::from_times(&[0, 0, 0, 4]).find_gt_index(&VClock::from_times(&[1])), Some(VectorIdx(3)));
+    assert_eq!(
+        VClock::from_times(&[0, 0, 0, 4]).find_gt_index(&VClock::from_times(&[1])),
+        Some(VectorIdx(3))
+    );
 }
 
 // --- dedup_range_map.rs ---
@@ -403,7 +426,10 @@ fn preemption_is_seeded() {
     assert!(decisions(1, 0.0, 256).iter().all(|&t| t == MAIN));
     assert!(decisions(1, 1.0, 256).windows(2).all(|w| w[0] != w[1]));
     // Miri's default rate switches about once in a hundred terminators.
-    let switches = decisions(5, Config::default().preemption_rate, 20_000).windows(2).filter(|w| w[0] != w[1]).count();
+    let switches = decisions(5, Config::default().preemption_rate, 20_000)
+        .windows(2)
+        .filter(|w| w[0] != w[1])
+        .count();
     assert!((100..300).contains(&switches), "{switches}");
 }
 
@@ -427,11 +453,17 @@ fn join_and_detach_errors() {
     assert_eq!(r.schedule(t1, &[MAIN]), Ok(MAIN));
     r.join(t1).unwrap();
     assert_eq!(r.join(t1).unwrap_err().to_string(), "trying to join an already joined thread");
-    assert_eq!(r.detach(t1).unwrap_err().to_string(), "trying to detach thread that was already detached or joined");
+    assert_eq!(
+        r.detach(t1).unwrap_err().to_string(),
+        "trying to detach thread that was already detached or joined"
+    );
 
     let t2 = r.spawn();
     r.detach(t2).unwrap();
-    assert_eq!(r.detach(t2).unwrap_err().to_string(), "trying to detach thread that was already detached or joined");
+    assert_eq!(
+        r.detach(t2).unwrap_err().to_string(),
+        "trying to detach thread that was already detached or joined"
+    );
     assert_eq!(r.join(t2).unwrap_err().to_string(), "trying to join a detached thread");
 }
 
@@ -571,7 +603,10 @@ fn named_threads_and_retags() {
         err.to_string(),
         "Data race detected between (1) non-atomic write on thread `worker` and (2) retag read on thread `main` at alloc1"
     );
-    assert_eq!(err.help()[0], "retags occur on all (re)borrows and as well as when references are copied or moved");
+    assert_eq!(
+        err.help()[0],
+        "retags occur on all (re)borrows and as well as when references are copied or moved"
+    );
 }
 
 #[test]
@@ -850,7 +885,13 @@ impl<'p> Sim<'p> {
         }
     }
 
-    fn rmw(&mut self, l: Loc, ord: AtomicOrd, site: SiteId, f: impl FnOnce(u64) -> u64) -> Result<u64, Stop> {
+    fn rmw(
+        &mut self,
+        l: Loc,
+        ord: AtomicOrd,
+        site: SiteId,
+        f: impl FnOnce(u64) -> u64,
+    ) -> Result<u64, Stop> {
         self.live(l.alloc)?;
         self.races.rmw(l.id(), l.span(), ord, site).map_err(Stop::Race)?;
         let old_bytes = self.bytes(l).ok_or(Stop::Uninit(l.alloc))?;
@@ -957,7 +998,8 @@ fn sim_reports_sites() {
 
 /// The two threads every `atomic_*_race*.rs` test spawns, on an 8-byte `AtomicUsize`.
 fn atomic_vs_na(t1: &[Op], t2: &[Op]) -> String {
-    let main: &[Op] = &[Alloc(1, 8), Write(at_sized(1, 0, 8), 0), Spawn(1), Spawn(2), Join(1), Join(2)];
+    let main: &[Op] =
+        &[Alloc(1, 8), Write(at_sized(1, 0, 8), 0), Spawn(1), Spawn(2), Join(1), Join(2)];
     race(&[main, t1, t2]).to_string()
 }
 
@@ -1139,8 +1181,16 @@ fn write_write_race_stack() {
 fn dangling_thread_race() {
     // Thread 1 is detached and runs to its end while `main` sleeps; spawning and joining
     // another thread must not turn race detection off.
-    let main: &[Op] =
-        &[Alloc(1, 4), Write(at(1), 0), Spawn(1), Detach(1), Yield, Spawn(2), Join(2), Write(at(1), 64)];
+    let main: &[Op] = &[
+        Alloc(1, 4),
+        Write(at(1), 0),
+        Spawn(1),
+        Detach(1),
+        Yield,
+        Spawn(2),
+        Join(2),
+        Write(at(1), 64),
+    ];
     assert_eq!(
         race(&[main, &[Write(at(1), 32)], &[]]).to_string(),
         "Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `main` at alloc1"
@@ -1149,8 +1199,17 @@ fn dangling_thread_race() {
 
 #[test]
 fn dangling_thread_async_race() {
-    let main: &[Op] =
-        &[Alloc(1, 4), Write(at(1), 0), Spawn(1), Detach(1), Yield, Spawn(2), Join(2), Spawn(3), Join(3)];
+    let main: &[Op] = &[
+        Alloc(1, 4),
+        Write(at(1), 0),
+        Spawn(1),
+        Detach(1),
+        Yield,
+        Spawn(2),
+        Join(2),
+        Spawn(3),
+        Join(3),
+    ];
     assert_eq!(
         race(&[main, &[Write(at(1), 32)], &[], &[Write(at(1), 64)]]).to_string(),
         "Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-3` at alloc1"
@@ -1189,8 +1248,16 @@ fn fence_after_load() {
     // value an SC store wrote don't synchronize.
     let v = at(1);
     let a = at_sized(2, 0, 8);
-    let main: &[Op] =
-        &[Static(1, 4, 0), Alloc(2, 8), Write(a, 0), Spawn(1), Yield, Fence(SeqCst), Load(a, Relaxed, 0), Write(v, 2)];
+    let main: &[Op] = &[
+        Static(1, 4, 0),
+        Alloc(2, 8),
+        Write(a, 0),
+        Spawn(1),
+        Yield,
+        Fence(SeqCst),
+        Load(a, Relaxed, 0),
+        Write(v, 2),
+    ];
     let t1: &[Op] = &[Write(v, 1), Store(a, 1, SeqCst)];
     assert_eq!(
         race(&[main, t1]).to_string(),
@@ -1200,8 +1267,11 @@ fn fence_after_load() {
 
 /// The thread of the `local_variable_*_race.rs` tests: spins until `P` (a static) is set, then
 /// writes through it.
-const LOCAL_SPINNER: &[Op] =
-    &[SpinUntil(at_sized(1, 0, 8), Relaxed, 2), Load(at_sized(1, 0, 8), Relaxed, 0), Write(at_sized(2, 0, 1), 127)];
+const LOCAL_SPINNER: &[Op] = &[
+    SpinUntil(at_sized(1, 0, 8), Relaxed, 2),
+    Load(at_sized(1, 0, 8), Relaxed, 0),
+    Write(at_sized(2, 0, 1), 127),
+];
 
 #[test]
 fn local_variable_alloc_race() {
@@ -1217,8 +1287,15 @@ fn local_variable_alloc_race() {
 fn local_variable_read_race() {
     let p = at_sized(1, 0, 8);
     let val = at_sized(2, 0, 1);
-    let main: &[Op] =
-        &[Static(1, 8, 0), Alloc(2, 1), Write(val, 0), Spawn(1), Read(val, 0), Store(p, 2, Relaxed), Join(1)];
+    let main: &[Op] = &[
+        Static(1, 8, 0),
+        Alloc(2, 1),
+        Write(val, 0),
+        Spawn(1),
+        Read(val, 0),
+        Store(p, 2, Relaxed),
+        Join(1),
+    ];
     assert_eq!(
         race(&[main, LOCAL_SPINNER]).to_string(),
         "Data race detected between (1) non-atomic read on thread `main` and (2) non-atomic write on thread `unnamed-1` at alloc2"
@@ -1228,8 +1305,14 @@ fn local_variable_read_race() {
 #[test]
 fn local_variable_write_race() {
     let p = at_sized(1, 0, 8);
-    let main: &[Op] =
-        &[Static(1, 8, 0), Spawn(1), Alloc(2, 1), Write(at_sized(2, 0, 1), 0), Store(p, 2, Relaxed), Join(1)];
+    let main: &[Op] = &[
+        Static(1, 8, 0),
+        Spawn(1),
+        Alloc(2, 1),
+        Write(at_sized(2, 0, 1), 0),
+        Store(p, 2, Relaxed),
+        Join(1),
+    ];
     assert_eq!(
         race(&[main, LOCAL_SPINNER]).to_string(),
         "Data race detected between (1) non-atomic write on thread `main` and (2) non-atomic write on thread `unnamed-1` at alloc2"
@@ -1249,8 +1332,17 @@ fn stack_pop_race() {
 /// The `SYNC` static and the variable `a` of the release-sequence tests.
 const SYNC: Loc = at_sized(1, 0, 8);
 const VAR: Loc = at(2);
-const SYNC_MAIN: &[Op] =
-    &[Static(1, 8, 0), Alloc(2, 4), Write(VAR, 0), Spawn(1), Spawn(2), Spawn(3), Join(1), Join(2), Join(3)];
+const SYNC_MAIN: &[Op] = &[
+    Static(1, 8, 0),
+    Alloc(2, 4),
+    Write(VAR, 0),
+    Spawn(1),
+    Spawn(2),
+    Spawn(3),
+    Join(1),
+    Join(2),
+    Join(3),
+];
 
 #[test]
 fn relax_acquire_race() {
@@ -1276,7 +1368,8 @@ fn release_seq_race() {
 
 #[test]
 fn release_seq_race_same_thread() {
-    let main: &[Op] = &[Static(1, 8, 0), Alloc(2, 4), Write(VAR, 0), Spawn(1), Spawn(2), Join(1), Join(2)];
+    let main: &[Op] =
+        &[Static(1, 8, 0), Alloc(2, 4), Write(VAR, 0), Spawn(1), Spawn(2), Join(1), Join(2)];
     // Since C++20 the relaxed store ends the release sequence, though on the same thread.
     let t1: &[Op] = &[Write(VAR, 1), Store(SYNC, 1, Release), Store(SYNC, 2, Relaxed)];
     let t2: &[Op] = &[Load(SYNC, Acquire, 0), If(0, 2, 1), Read(VAR, 1)];
@@ -1312,7 +1405,10 @@ fn mixed_size(threads: &[&[Op]]) -> RaceError {
     let mut progs = vec![main.as_slice()];
     progs.extend_from_slice(threads);
     let err = race(&progs);
-    assert_eq!(err.help()[0], "overlapping unsynchronized atomic accesses must use the same access size");
+    assert_eq!(
+        err.help()[0],
+        "overlapping unsynchronized atomic accesses must use the same access size"
+    );
     err
 }
 
@@ -1350,13 +1446,21 @@ fn mixed_size_read_write() {
 fn mixed_size_read_read_write() {
     let a8 = at_sized(1, 0, 1);
     // match_first_load
-    let err = mixed_size(&[&[Load(A16, SeqCst, 0)], &[Load(a8, SeqCst, 0)], &[Yield, Store(A16, 0, SeqCst)]]);
+    let err = mixed_size(&[
+        &[Load(A16, SeqCst, 0)],
+        &[Load(a8, SeqCst, 0)],
+        &[Yield, Store(A16, 0, SeqCst)],
+    ]);
     assert_eq!(
         err.to_string(),
         "Race condition detected between (1) multiple differently-sized atomic loads, including one load on thread `unnamed-1` and (2) 2-byte atomic store on thread `unnamed-3` at alloc1"
     );
     // match_second_load
-    let err = mixed_size(&[&[Load(A16, SeqCst, 0)], &[Load(a8, SeqCst, 0)], &[Yield, Store(a8, 0, SeqCst)]]);
+    let err = mixed_size(&[
+        &[Load(A16, SeqCst, 0)],
+        &[Load(a8, SeqCst, 0)],
+        &[Yield, Store(a8, 0, SeqCst)],
+    ]);
     assert_eq!(
         err.to_string(),
         "Race condition detected between (1) multiple differently-sized atomic loads, including one load on thread `unnamed-1` and (2) 1-byte atomic store on thread `unnamed-3` at alloc1"
@@ -1391,7 +1495,10 @@ fn weak_uninit() {
             Ok(regs) => assert_eq!(regs[2][0], 1),
             Err(Stop::Race(err)) => {
                 assert_eq!(err.kind, RaceErrorKind::UninitLoad { alloc: id(1), offset: 0 });
-                assert_eq!(err.to_string(), "using uninitialized data, but this operation requires initialized memory");
+                assert_eq!(
+                    err.to_string(),
+                    "using uninitialized data, but this operation requires initialized memory"
+                );
                 ub += 1;
             }
             Err(other) => panic!("{other:?}"),
@@ -1501,7 +1608,9 @@ fn weak_weaker_release_sequences() {
     let t1: &[Op] = &[Store(X, 2, Relaxed)];
     let t2: &[Op] = &[Store(Y, 1, Relaxed), Store(X, 1, Release), Store(X, 3, Relaxed)];
     let t3: &[Op] = &[Load(X, Acquire, 0), If(0, 3, 1), Load(Y, Relaxed, 1)];
-    check_all_outcomes(&[None, Some(0), Some(1)], |seed| if_then(&regs(&fixed(seed), &[&main, t1, t2, t3]), 3, 3));
+    check_all_outcomes(&[None, Some(0), Some(1)], |seed| {
+        if_then(&regs(&fixed(seed), &[&main, t1, t2, t3]), 3, 3)
+    });
 }
 
 #[test]
@@ -1510,7 +1619,9 @@ fn weak_release_sequence() {
     let main = spawn_join(&[0, 0], 2);
     let t1: &[Op] = &[Store(Y, 1, Relaxed), Store(X, 1, Release), Swap(X, 3, Relaxed, 2)];
     let t2: &[Op] = &[Load(X, Acquire, 0), If(0, 3, 1), Load(Y, Relaxed, 1)];
-    check_all_outcomes(&[None, Some(1)], |seed| if_then(&regs(&fixed(seed), &[&main, t1, t2]), 2, 3));
+    check_all_outcomes(&[None, Some(1)], |seed| {
+        if_then(&regs(&fixed(seed), &[&main, t1, t2]), 2, 3)
+    });
 }
 
 #[test]
@@ -1519,7 +1630,9 @@ fn weak_old_release_store() {
     let main = spawn_join(&[0, 0], 2);
     let t1: &[Op] = &[Store(Y, 1, Relaxed), Store(X, 1, Release), Store(X, 3, Relaxed)];
     let t2: &[Op] = &[Load(X, Acquire, 0), If(0, 1, 1), Load(Y, Relaxed, 1)];
-    check_all_outcomes(&[None, Some(1)], |seed| if_then(&regs(&fixed(seed), &[&main, t1, t2]), 2, 1));
+    check_all_outcomes(&[None, Some(1)], |seed| {
+        if_then(&regs(&fixed(seed), &[&main, t1, t2]), 2, 1)
+    });
 }
 
 // --- tests/pass/0weak_memory/consistency.rs (Miri's default schedule) ---
@@ -1560,7 +1673,16 @@ fn consistency_wrc() {
 fn consistency_message_passing() {
     fifty(|config| {
         // `var` is a plain `u32` on main's stack, `y` an atomic.
-        let main: &[Op] = &[Alloc(1, 4), Write(X, 0), Alloc(2, 4), Write(Y, 0), Spawn(1), Spawn(2), Join(1), Join(2)];
+        let main: &[Op] = &[
+            Alloc(1, 4),
+            Write(X, 0),
+            Alloc(2, 4),
+            Write(Y, 0),
+            Spawn(1),
+            Spawn(2),
+            Join(1),
+            Join(2),
+        ];
         let t1: &[Op] = &[Write(X, 1), Store(Y, 1, Release)];
         let t2: &[Op] = &[SpinUntil(Y, Acquire, 1), Read(X, 0)];
         assert_eq!(regs(config, &[main, t1, t2])[2][0], 1);
@@ -1592,8 +1714,13 @@ fn consistency_mixed_access() {
 #[test]
 fn consistency_single_thread() {
     fifty(|config| {
-        let main: &[Op] =
-            &[Alloc(1, 4), Write(X, 42), Load(X, Relaxed, 0), Store(X, 43, Relaxed), Load(X, Relaxed, 1)];
+        let main: &[Op] = &[
+            Alloc(1, 4),
+            Write(X, 42),
+            Load(X, Relaxed, 0),
+            Store(X, 43, Relaxed),
+            Load(X, Relaxed, 1),
+        ];
         assert_eq!(regs(config, &[main])[0][..2], [42, 43]);
     });
 }
@@ -1717,8 +1844,13 @@ fn sc_multi_fence() {
 fn sc_relaxed() {
     fifty(|config| {
         let main = spawn_join(&[0, 0, 0], 2);
-        let t1: &[Op] =
-            &[Store(Y, 1, Relaxed), Fence(SeqCst), Load(X, Relaxed, 1), Fence(Acquire), Load(Z, Relaxed, 0)];
+        let t1: &[Op] = &[
+            Store(Y, 1, Relaxed),
+            Fence(SeqCst),
+            Load(X, Relaxed, 1),
+            Fence(Acquire),
+            Load(Z, Relaxed, 0),
+        ];
         let t2: &[Op] = &[Store(Z, 1, Relaxed), Store(X, 1, SeqCst), Load(Y, SeqCst, 0)];
         let regs = regs(config, &[&main, t1, t2]);
         assert_ne!((regs[1][0], regs[2][0]), (0, 0));
@@ -1729,7 +1861,16 @@ fn sc_relaxed() {
 fn sc_cob_due_to_mo() {
     fifty(|config| {
         let mut main = static_atomics(&[0, 0]);
-        main.extend([Store(X, 0, Relaxed), Store(Y, 0, Relaxed), Spawn(1), Spawn(2), Spawn(3), Join(2), Join(3), Join(1)]);
+        main.extend([
+            Store(X, 0, Relaxed),
+            Store(Y, 0, Relaxed),
+            Spawn(1),
+            Spawn(2),
+            Spawn(3),
+            Join(2),
+            Join(3),
+            Join(1),
+        ]);
         let t1: &[Op] = &[Store(X, 1, Release)];
         let t2: &[Op] = &[Load(X, Relaxed, 0), Store(X, 2, SeqCst), Load(Y, SeqCst, 1)];
         let t3: &[Op] = &[Store(Y, 1, SeqCst), Load(X, SeqCst, 0)];
@@ -1765,7 +1906,8 @@ fn extra_cpp_from_mut_split() {
 
 #[test]
 fn extra_cpp_assign_to_mut() {
-    let main: &[Op] = &[Alloc(1, 4), Write(X, 0), Store(X, 1, Relaxed), Write(X, 2), Load(X, Relaxed, 0)];
+    let main: &[Op] =
+        &[Alloc(1, 4), Write(X, 0), Store(X, 1, Relaxed), Write(X, 2), Load(X, Relaxed, 0)];
     assert_eq!(regs(&seeded(0), &[main])[0][0], 2);
 }
 

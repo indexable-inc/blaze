@@ -95,8 +95,14 @@ pub(crate) const CASES: &[(Case, &str)] = &[
     (Hash { offset: 0, len: 8 * KIB - 1 }, "seven chunks and a partial one: q7"),
     (Hash { offset: 5, len: 8 * KIB + 200 }, "eight chunks and a partial one, unaligned: q8"),
     (Hash { offset: 0, len: 10 * KIB }, "ten chunks: k10"),
-    (Hash { offset: 1, len: 16 * KIB - 1 }, "fifteen chunks and a partial one, unaligned: k6 and q9"),
-    (Hash { offset: 2, len: 3 * KIB }, "three chunks, unaligned: k3 (on SME2 also the remainder below)"),
+    (
+        Hash { offset: 1, len: 16 * KIB - 1 },
+        "fifteen chunks and a partial one, unaligned: k6 and q9",
+    ),
+    (
+        Hash { offset: 2, len: 3 * KIB },
+        "three chunks, unaligned: k3 (on SME2 also the remainder below)",
+    ),
     (Hash { offset: 0, len: 4 * KIB }, "four chunks: k4"),
     (Hash { offset: 3, len: 5 * KIB }, "five chunks, unaligned: k5"),
     (Hash { offset: 0, len: 7 * KIB }, "seven chunks: k7"),
@@ -107,7 +113,10 @@ pub(crate) const CASES: &[(Case, &str)] = &[
     (Hash { offset: 7, len: 19 * KIB + 5 }, "an SME2 group, a remainder on NEON, unaligned: k3"),
     (Hash { offset: 0, len: 32 * KIB }, "two SME2 groups: the SME2 parent kernel"),
     (ChunkValues { chunks: 18 }, "keyed chaining values: the SME2 kernel with integer lanes"),
-    (ChunkValues { chunks: 16 }, "keyed chaining values from a group's counter: the SME2 chunk kernel at a counter per group"),
+    (
+        ChunkValues { chunks: 16 },
+        "keyed chaining values from a group's counter: the SME2 chunk kernel at a counter per group",
+    ),
     (Many { offset: 1, len: 64, count: 2 }, "a pair of 64-byte messages: the parent plans"),
     (Many { offset: 0, len: 64, count: 11 }, "eleven 64-byte messages: a padded SME2 group"),
     (Many { offset: 3, len: 64, count: 21 }, "an SME2 group and five more in a padded group"),
@@ -121,8 +130,14 @@ pub(crate) const CASES: &[(Case, &str)] = &[
     (Keyed { len: 2 * KIB + 1 }, "keyed hashing"),
     (Incremental { len: 5 * KIB + 7, piece: 700 }, "a Hasher fed in uneven pieces"),
     (Incremental { len: 2 * KIB, piece: 63 }, "a Hasher fed less than a block at a time"),
-    (Xof { len: 100, skip: 37, out: 300 }, "extended output of several blocks, from an unaligned position"),
-    (Xof { len: 1500, skip: 64, out: 1600 }, "extended output of twenty-five blocks: SME2's sixteen, then x8 and x1"),
+    (
+        Xof { len: 100, skip: 37, out: 300 },
+        "extended output of several blocks, from an unaligned position",
+    ),
+    (
+        Xof { len: 1500, skip: 64, out: 1600 },
+        "extended output of twenty-five blocks: SME2's sixteen, then x8 and x1",
+    ),
 ];
 
 /// The cases elsewhere (x86-64 and portable builds), each kernel
@@ -142,13 +157,22 @@ pub(crate) const CASES: &[(Case, &str)] = &[
         Keyed { len: KIB + 65 },
         "keyed, a chunk and a block and a byte (the shortest the one-chunk pass takes): the four-lane pass with a partial chunk (AVX2, AVX-512)",
     ),
-    (Hash { offset: 3, len: 4 * KIB + 65 }, "four chunks and a block, unaligned: the chunk kernel over chunks, their parents, the tree"),
-    (Hash { offset: 0, len: 3 * KIB + 100 }, "three chunks and a partial one: the four-lane pass with a partial chunk"),
+    (
+        Hash { offset: 3, len: 4 * KIB + 65 },
+        "four chunks and a block, unaligned: the chunk kernel over chunks, their parents, the tree",
+    ),
+    (
+        Hash { offset: 0, len: 3 * KIB + 100 },
+        "three chunks and a partial one: the four-lane pass with a partial chunk",
+    ),
     (
         Hash { offset: 5, len: 5 * KIB + 321 },
         "five chunks and a partial one of six blocks, unaligned (the fewest the eight-lane pass takes): the eight-lane pass with a partial chunk",
     ),
-    (Many { offset: 1, len: 64, count: 17 }, "seventeen 64-byte messages: the batch kernel, full groups and a tail"),
+    (
+        Many { offset: 1, len: 64, count: 17 },
+        "seventeen 64-byte messages: the batch kernel, full groups and a tail",
+    ),
     (Derive { len: 64 }, "key derivation over a block holding all of the previous output"),
     (
         Xof { len: 100, skip: 37, out: 1100 },
@@ -192,7 +216,9 @@ pub(crate) const CONTEXT: &str = "blake3-servil self-test";
 /// A case's outputs as one 64-bit word: FNV-1a over their bytes. It needs
 /// no hash of its own; a wrong output changes it but for a 2^-64 chance.
 pub(crate) fn fold(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
 /// Run the cases in order, chained: before each, the first 32 bytes of the
@@ -202,7 +228,10 @@ pub(crate) fn fold(bytes: &[u8]) -> u64 {
 /// one. `outputs` hashes one case into its buffer and returns how many
 /// bytes it wrote; `check` sees each case's fold as it comes. Returns the
 /// final chaining seed for the platform-specific checks that follow.
-pub(crate) fn chain(mut outputs: impl FnMut(Case, &[u8], &[u8; 32], &mut [u8]) -> usize, mut check: impl FnMut(usize, u64)) -> [u8; 32] {
+pub(crate) fn chain(
+    mut outputs: impl FnMut(Case, &[u8], &[u8; 32], &mut [u8]) -> usize,
+    mut check: impl FnMut(usize, u64),
+) -> [u8; 32] {
     let mut input = [0u8; INPUT_LEN];
     fill(&mut input);
     let mut out = [0u8; OUTPUT_LEN];
@@ -212,7 +241,9 @@ pub(crate) fn chain(mut outputs: impl FnMut(Case, &[u8], &[u8; 32], &mut [u8]) -
             Hash { offset, len } => (offset, len, 1),
             Many { len, count, .. } => (0, len, count),
             ChunkValues { chunks } => (0, chunks * crate::CHUNK_LEN, 1),
-            Keyed { len } | Derive { len } | Incremental { len, .. } | Xof { len, .. } => (0, len, 1),
+            Keyed { len } | Derive { len } | Incremental { len, .. } | Xof { len, .. } => {
+                (0, len, 1)
+            }
         };
         let n = len.min(32);
         for message in 0..count {
@@ -289,20 +320,47 @@ const EXPECTED: [u64; 8] = [
 
 /// A case's outputs from this build, into `out`, through the entry points'
 /// bodies from `platform`; returns their length.
-pub(crate) fn outputs(platform: Platform, case: Case, input: &[u8], previous: &[u8; 32], out: &mut [u8]) -> usize {
+pub(crate) fn outputs(
+    platform: Platform,
+    case: Case,
+    input: &[u8],
+    previous: &[u8; 32],
+    out: &mut [u8],
+) -> usize {
     let words = |key: &[u8; 32]| crate::platform::words_from_le_bytes_32(key);
     let mut digest = |hash: crate::Hash| {
         out[..32].copy_from_slice(hash.as_bytes());
         32
     };
     match case {
-        Hash { offset, len } => digest(crate::hash_serial_from(platform, &input[offset..][..len], crate::IV, 0)),
-        Many { offset, len, count } => many(platform, &input[..len * count], offset, len, &mut out[..count * crate::OUT_LEN]),
-        ChunkValues { chunks } => chunk_values(platform, &input[..chunks * crate::CHUNK_LEN], previous, out),
-        Keyed { len } => digest(crate::hash_serial_from(platform, &input[..len], &words(previous), crate::KEYED_HASH)),
+        Hash { offset, len } => {
+            digest(crate::hash_serial_from(platform, &input[offset..][..len], crate::IV, 0))
+        }
+        Many { offset, len, count } => {
+            many(platform, &input[..len * count], offset, len, &mut out[..count * crate::OUT_LEN])
+        }
+        ChunkValues { chunks } => {
+            chunk_values(platform, &input[..chunks * crate::CHUNK_LEN], previous, out)
+        }
+        Keyed { len } => digest(crate::hash_serial_from(
+            platform,
+            &input[..len],
+            &words(previous),
+            crate::KEYED_HASH,
+        )),
         Derive { len } => {
-            let context = crate::hash_serial_from(platform, CONTEXT.as_bytes(), crate::IV, crate::DERIVE_KEY_CONTEXT);
-            digest(crate::hash_serial_from(platform, &input[..len], &words(context.as_bytes()), crate::DERIVE_KEY_MATERIAL))
+            let context = crate::hash_serial_from(
+                platform,
+                CONTEXT.as_bytes(),
+                crate::IV,
+                crate::DERIVE_KEY_CONTEXT,
+            );
+            digest(crate::hash_serial_from(
+                platform,
+                &input[..len],
+                &words(context.as_bytes()),
+                crate::DERIVE_KEY_MATERIAL,
+            ))
         }
         Incremental { len, piece } => digest(incremental(platform, &input[..len], piece)),
         Xof { len, skip, out: n } => xof(platform, &input[..len], skip, &mut out[..n]),
@@ -354,13 +412,16 @@ fn many(platform: Platform, messages: &[u8], offset: usize, len: usize, out: &mu
 fn chunk_values(platform: Platform, input: &[u8], key: &[u8; 32], out: &mut [u8]) -> usize {
     let key = crate::platform::words_from_le_bytes_32(key);
     let mut chunks = arrayvec::ArrayVec::<&[u8; crate::CHUNK_LEN], 18>::new();
-    chunks.extend(input.chunks_exact(crate::CHUNK_LEN).map(|c| c.try_into().expect("whole chunks")));
+    chunks
+        .extend(input.chunks_exact(crate::CHUNK_LEN).map(|c| c.try_into().expect("whole chunks")));
     let out = &mut out[..chunks.len() * crate::OUT_LEN];
     #[cfg(blake3_sme2)]
     if chunks.len() % crate::sme2::HYBRID_GROUP == 0 {
         let turn = crate::platform::Sme2Turn::take(platform, true);
         if matches!(turn.platform(), Platform::SME2) {
-            let flags = crate::KEYED_HASH as u32 | (crate::CHUNK_START as u32) << 8 | (crate::CHUNK_END as u32) << 16;
+            let flags = crate::KEYED_HASH as u32
+                | (crate::CHUNK_START as u32) << 8
+                | (crate::CHUNK_END as u32) << 16;
             crate::ran_kernel(crate::sme2::ffi::blake3_servil_sme2x2_hash_chunks_512 as *const ());
             // Sound: SME2 was detected, and the table holds 18 chunk pointers per group.
             let lanes = unsafe {
@@ -384,11 +445,30 @@ fn chunk_values(platform: Platform, input: &[u8], key: &[u8; 32], out: &mut [u8]
         let turn = crate::platform::Sme2Turn::take(platform, true);
         if matches!(turn.platform(), Platform::SME2) {
             // Sound: SME2 was detected.
-            unsafe { crate::sme2::hash_groups_at(&chunks, &[1], &key, crate::KEYED_HASH, crate::CHUNK_START, crate::CHUNK_END, out) };
+            unsafe {
+                crate::sme2::hash_groups_at(
+                    &chunks,
+                    &[1],
+                    &key,
+                    crate::KEYED_HASH,
+                    crate::CHUNK_START,
+                    crate::CHUNK_END,
+                    out,
+                )
+            };
             return out.len();
         }
     }
-    platform.hash_many(&chunks, &key, 1, crate::IncrementCounter::Yes, crate::KEYED_HASH, crate::CHUNK_START, crate::CHUNK_END, out);
+    platform.hash_many(
+        &chunks,
+        &key,
+        1,
+        crate::IncrementCounter::Yes,
+        crate::KEYED_HASH,
+        crate::CHUNK_START,
+        crate::CHUNK_END,
+        out,
+    );
     out.len()
 }
 
@@ -540,7 +620,9 @@ fn ensure_slow() {
         struct Failed;
         impl Drop for Failed {
             fn drop(&mut self) {
-                stop(format_args!("blake3-servil startup self-test failed: a kernel panicked on this build or this CPU"));
+                stop(format_args!(
+                    "blake3-servil startup self-test failed: a kernel panicked on this build or this CPU"
+                ));
             }
         }
         let failed = Failed;
@@ -577,7 +659,10 @@ mod test {
         #[cfg(all(blake3_avx512_ffi, target_os = "linux"))]
         let expected = if crate::platform::wide_avx512() {
             for (name, entry) in crate::avx512_32::entries() {
-                assert!(crate::RAN_ENTRIES.with(|r| r.borrow().contains(&(entry as usize))), "startup left out {name}");
+                assert!(
+                    crate::RAN_ENTRIES.with(|r| r.borrow().contains(&(entry as usize))),
+                    "startup left out {name}"
+                );
             }
             expected + crate::avx512_32::entries().len()
         } else {
@@ -633,12 +718,18 @@ mod test {
                 break RAN_ENTRIES.with(|r| r.borrow().clone());
             }
         };
-        let missing: std::vec::Vec<&str> = want.iter().filter(|(_, e)| !ran.contains(&(*e as usize))).map(|(n, _)| n.as_str()).collect();
+        let missing: std::vec::Vec<&str> = want
+            .iter()
+            .filter(|(_, e)| !ran.contains(&(*e as usize)))
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert!(missing.is_empty(), "the self-test leaves out {missing:?}");
     }
 
     /// `outputs` as `chain` takes it: the bytes written into its buffer.
-    fn into(mut outputs: impl FnMut(Case, &[u8], &[u8; 32]) -> std::vec::Vec<u8>) -> impl FnMut(Case, &[u8], &[u8; 32], &mut [u8]) -> usize {
+    fn into(
+        mut outputs: impl FnMut(Case, &[u8], &[u8; 32]) -> std::vec::Vec<u8>,
+    ) -> impl FnMut(Case, &[u8], &[u8; 32], &mut [u8]) -> usize {
         move |case, input, previous, out| {
             let output = outputs(case, input, previous);
             out[..output.len()].copy_from_slice(&output);
@@ -653,13 +744,27 @@ mod test {
         use crate::test::official;
         match case {
             Hash { offset, len } => official::hash(Mode::Plain, &input[offset..][..len]).to_vec(),
-            Many { len, count, .. } => (0..count).flat_map(|i| official::hash(Mode::Plain, &input[i * len..][..len])).collect(),
+            Many { len, count, .. } => (0..count)
+                .flat_map(|i| official::hash(Mode::Plain, &input[i * len..][..len]))
+                .collect(),
             ChunkValues { chunks } => {
                 let key = crate::platform::words_from_le_bytes_32(previous);
-                let table: std::vec::Vec<&[u8; crate::CHUNK_LEN]> =
-                    input[..chunks * crate::CHUNK_LEN].chunks_exact(crate::CHUNK_LEN).map(|c| c.try_into().unwrap()).collect();
+                let table: std::vec::Vec<&[u8; crate::CHUNK_LEN]> = input
+                    [..chunks * crate::CHUNK_LEN]
+                    .chunks_exact(crate::CHUNK_LEN)
+                    .map(|c| c.try_into().unwrap())
+                    .collect();
                 let mut out = std::vec![0u8; chunks * crate::OUT_LEN];
-                official::hash_many(&table, &key, 1, true, crate::KEYED_HASH, crate::CHUNK_START, crate::CHUNK_END, &mut out);
+                official::hash_many(
+                    &table,
+                    &key,
+                    1,
+                    true,
+                    crate::KEYED_HASH,
+                    crate::CHUNK_START,
+                    crate::CHUNK_END,
+                    &mut out,
+                );
                 out
             }
             Keyed { len } => official::hash(Mode::Keyed(previous), &input[..len]).to_vec(),
@@ -678,7 +783,13 @@ mod test {
     }
 
     #[cfg(all(blake3_avx512_ffi, target_os = "linux"))]
-    fn wide_reference(inputs: &[&[u8; 192]], key: &crate::CVWords, counter: u64, increment: crate::IncrementCounter, out: &mut [u8]) {
+    fn wide_reference(
+        inputs: &[&[u8; 192]],
+        key: &crate::CVWords,
+        counter: u64,
+        increment: crate::IncrementCounter,
+        out: &mut [u8],
+    ) {
         for (i, &input) in inputs.iter().enumerate() {
             // hash_many's increment is not wrapping; exercise the
             // explicitly wrapping raw ABI with individual calls.
@@ -704,11 +815,18 @@ mod test {
     #[test]
     #[cfg(all(blake3_avx512_ffi, target_os = "linux"))]
     fn wide_self_test_matches_reference() {
-        let previous = chain(ours, |i, folded| assert_eq!(folded, EXPECTED[i], "shared chain changed"));
+        let previous =
+            chain(ours, |i, folded| assert_eq!(folded, EXPECTED[i], "shared chain changed"));
         let mut folds = std::vec::Vec::new();
-        crate::avx512_32::self_test_chain(&previous, wide_reference, |_, folded| folds.push(folded));
-        let table: std::string::String = folds.iter().map(|f| std::format!("    0x{f:016x},\n")).collect();
-        assert!(folds == crate::avx512_32::SELF_TEST_EXPECTED, "wide EXPECTED differs from SSE4.1's; its table:\n{table}");
+        crate::avx512_32::self_test_chain(&previous, wide_reference, |_, folded| {
+            folds.push(folded)
+        });
+        let table: std::string::String =
+            folds.iter().map(|f| std::format!("    0x{f:016x},\n")).collect();
+        assert!(
+            folds == crate::avx512_32::SELF_TEST_EXPECTED,
+            "wide EXPECTED differs from SSE4.1's; its table:\n{table}"
+        );
     }
 
     /// Each new case detects corruption in its last output byte, not
@@ -740,7 +858,10 @@ mod test {
                 .map(std::string::String::as_str)
                 .or_else(|| failure.downcast_ref::<&str>().copied())
                 .unwrap_or("");
-            assert!(message.contains("blake3-servil startup self-test failed"), "wrong failure for case {bad}: {message}");
+            assert!(
+                message.contains("blake3-servil startup self-test failed"),
+                "wrong failure for case {bad}: {message}"
+            );
             assert_eq!(calls, bad + 1, "a case ran after the failed one");
         }
     }
@@ -752,7 +873,8 @@ mod test {
     fn self_test_matches_official_blake3() {
         let mut folds = std::vec::Vec::new();
         chain(into(reference), |_, folded| folds.push(folded));
-        let table: std::string::String = folds.iter().map(|f| std::format!("    0x{f:016x},\n")).collect();
+        let table: std::string::String =
+            folds.iter().map(|f| std::format!("    0x{f:016x},\n")).collect();
         assert!(folds == EXPECTED, "EXPECTED differs from official BLAKE3's; its table:\n{table}");
     }
 }
@@ -782,17 +904,33 @@ mod stops {
             std::process::exit(0);
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "self_test::stops::test_a_failing_self_test_stops_the_process", "--nocapture", "--test-threads", "1"])
+            .args([
+                "--exact",
+                "self_test::stops::test_a_failing_self_test_stops_the_process",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
             .env(CHILD, "1")
             .output()
             .expect("the test binary runs again");
         use std::os::unix::process::ExitStatusExt as _;
         let stderr = std::string::String::from_utf8_lossy(&out.stderr);
         if cfg!(feature = "std") {
-            assert_eq!(out.status.signal(), Some(6), "the child aborts (SIGABRT): {:?}\n{stderr}", out.status);
+            assert_eq!(
+                out.status.signal(),
+                Some(6),
+                "the child aborts (SIGABRT): {:?}\n{stderr}",
+                out.status
+            );
             assert!(stderr.contains("startup self-test failed"), "it says why: {stderr}");
         } else {
-            assert_eq!(out.status.signal(), Some(4), "the child traps (SIGILL): {:?}\n{stderr}", out.status);
+            assert_eq!(
+                out.status.signal(),
+                Some(4),
+                "the child traps (SIGILL): {:?}\n{stderr}",
+                out.status
+            );
         }
     }
 }

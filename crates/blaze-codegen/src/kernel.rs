@@ -58,5 +58,8 @@ pub fn code(toolchain: &ContentId) -> CodeId {
 /// The store key of the dev template of the instance kept as `stored`, at `settings`, compiled
 /// by the codegen of `toolchain` (`Spec::toolchain.id`).
 pub fn template(stored: &InstanceKey, settings: &Settings, toolchain: &ContentId) -> Key {
-    whole::key(&identity::<DevTemplate>(code(toolchain), &TemplateOf { stored: *stored, settings: *settings }))
+    whole::key(&identity::<DevTemplate>(
+        code(toolchain),
+        &TemplateOf { stored: *stored, settings: *settings },
+    ))
 }

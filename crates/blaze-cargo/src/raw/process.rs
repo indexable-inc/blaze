@@ -89,7 +89,10 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     change.fflags = libc::NOTE_EXIT;
     // SAFETY: registers the one live `change`, read only, and asks for no event back: a null
     // list of none and no timeout are allowed.
-    if unsafe { libc::kevent(queue.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+    if unsafe {
+        libc::kevent(queue.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+    } < 0
+    {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ESRCH) { Ok(true) } else { Err(error) };
     }
@@ -109,7 +112,10 @@ pub fn wait_exited(pid: u32) -> std::io::Result<()> {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live local the call writes and does not keep; `waitid` takes no
         // other pointer, and `WNOWAIT` changes nothing of the child it waits for.
-        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+        if unsafe {
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+        } == 0
+        {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -145,7 +151,10 @@ pub fn wait_exited(pid: u32) -> std::io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 pub fn wait_exited(pid: u32) -> std::io::Result<()> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("waiting for process {pid} to exit is not built for this platform")))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("waiting for process {pid} to exit is not built for this platform"),
+    ))
 }
 
 /// How a child of this process ended.
@@ -385,7 +394,10 @@ mod tests {
         });
         assert!(started.elapsed() < Duration::from_secs(10), "ended after {:?}", started.elapsed());
         child.wait().unwrap();
-        assert!(ended_within(child.id(), Duration::from_secs(60)).unwrap(), "one reaped and gone has ended");
+        assert!(
+            ended_within(child.id(), Duration::from_secs(60)).unwrap(),
+            "one reaped and gone has ended"
+        );
     }
 
     #[cfg(unix)]

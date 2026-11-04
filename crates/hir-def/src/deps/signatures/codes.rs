@@ -268,14 +268,12 @@ impl Code for WherePredicate {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         Ok(match r.tag(2, "a where predicate kind out of range")? {
-            0 => {
-                WherePredicate::TypeBound {
-                    lifetimes: r.get()?,
-                    binder: r.get()?,
-                    target: r.get()?,
-                    bound: r.get()?,
-                }
-            }
+            0 => WherePredicate::TypeBound {
+                lifetimes: r.get()?,
+                binder: r.get()?,
+                target: r.get()?,
+                bound: r.get()?,
+            },
             _ => WherePredicate::Lifetime { target: r.get()?, bound: r.get()? },
         })
     }
@@ -822,10 +820,9 @@ mod tests {
 
     #[test]
     fn a_where_predicate_or_bound_past_its_store_is_refused() {
-        let db = fixture::db(
-            "trait Tr<'a> {}\nfn f<'x, T>() where for<'a> T: Tr<'a>, T: 'x, 'x: 'x {}",
-        )
-        .into_db();
+        let db =
+            fixture::db("trait Tr<'a> {}\nfn f<'x, T>() where for<'a> T: Tr<'a>, T: 'x, 'x: 'x {}")
+                .into_db();
         let krate = db.fetch_test_crate();
         let def_map = crate_def_map(&db, krate);
         let mut function = None;

@@ -16,27 +16,27 @@
 
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
-use hir::{HasAttrs as _, HasVisibility as _, InFile, LangItem};
 use either::Either;
+use hir::{HasAttrs as _, HasVisibility as _, InFile, LangItem};
 use syntax::{
     SyntaxKind, T, TextRange, TextSize,
     view::{self as ast, AstNode as _, RangeItem as _},
 };
 
-use stdx::list::Join;
 use crate::{
     cx::Cx,
     lints::code_fact,
     lower::{
         Found, Phase,
         no_such_field::{
-            Record, RecordField, has_unmentioned_error, is_number, pat_fields, suggestable, tuple_variant_as_struct,
-            variant_path,
+            Record, RecordField, has_unmentioned_error, is_number, pat_fields, suggestable,
+            tuple_variant_as_struct, variant_path,
         },
         unresolved_method_call::inject_use_span,
     },
     model::{Applicability, Diag, MultiSpan, SuggestionStyle},
 };
+use stdx::list::Join;
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingFields) -> Vec<Found> {
     let variant = d.variant;
@@ -65,16 +65,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingFields) -> Vec<Found> {
 /// not read may be the one missing. A destructuring assignment is lowered to a pattern
 /// without it (`destructure_assign_mut`), so it still reports them.
 fn recovered(record: &Record<'_>) -> bool {
-    let list = record
-        .node
-        .children()
-        .find(|it| matches!(it.kind(), SyntaxKind::RECORD_EXPR_FIELD_LIST | SyntaxKind::RECORD_PAT_FIELD_LIST));
+    let list = record.node.children().find(|it| {
+        matches!(it.kind(), SyntaxKind::RECORD_EXPR_FIELD_LIST | SyntaxKind::RECORD_PAT_FIELD_LIST)
+    });
     let Some(list) = list else { return true };
     let closed = list.children_with_tokens().any(|it| it.kind() == T!['}']);
     let error = list.descendants_with_tokens().any(|it| it.kind() == SyntaxKind::ERROR);
     let fields = list
         .children()
-        .filter(|it| matches!(it.kind(), SyntaxKind::RECORD_EXPR_FIELD | SyntaxKind::RECORD_PAT_FIELD))
+        .filter(|it| {
+            matches!(it.kind(), SyntaxKind::RECORD_EXPR_FIELD | SyntaxKind::RECORD_PAT_FIELD)
+        })
         .count();
     !closed || error || fields != record.fields.len()
 }
@@ -115,7 +116,11 @@ fn foreign_non_exhaustive(cx: &Cx<'_, '_>, variant: hir::Variant) -> bool {
 }
 
 /// The fields of `variant` the expression leaves out, in the order of the variant.
-fn remaining(cx: &Cx<'_, '_>, record: &Record<'_>, variant: hir::Variant) -> Vec<(String, hir::Field)> {
+fn remaining(
+    cx: &Cx<'_, '_>,
+    record: &Record<'_>,
+    variant: hir::Variant,
+) -> Vec<(String, hir::Field)> {
     variant
         .fields_iter(cx.db)
         // alloc: the error's parts, for an error hir found
@@ -128,7 +133,8 @@ fn remaining(cx: &Cx<'_, '_>, record: &Record<'_>, variant: hir::Variant) -> Vec
 /// The struct expression forms (`check_expr_struct_fields`).
 fn expression<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant) -> Option<Diag> {
     // alloc: the error's parts, for an error hir found
-    let names: Vec<String> = variant.fields_iter(cx.db).map(|it| it.name(cx.db).as_str().to_owned()).collect();
+    let names: Vec<String> =
+        variant.fields_iter(cx.db).map(|it| it.name(cx.db).as_str().to_owned()).collect();
     let unknown = record.fields.iter().any(|it| !names.contains(&it.name));
     let repeated = record.repeats().into_iter().any(|it| it);
     if unknown || repeated {
@@ -169,8 +175,14 @@ fn private<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant) -
 /// range note itself (`suggest_fru_from_range_and_emit` of the E0308); with some it is
 /// stashed, and the E0063 that gives the range note takes its place
 /// (`try_steal_replace_and_emit_err`). False when it is not to be given.
-pub(crate) fn last_field_mismatch<'db>(cx: &Cx<'_, 'db>, value: InFile<ast::Node<'db>>, diag: &mut Diag) -> bool {
-    let Some(field) = value.value.parent().and_then(ast::RecordExprField::cast) else { return true };
+pub(crate) fn last_field_mismatch<'db>(
+    cx: &Cx<'_, 'db>,
+    value: InFile<ast::Node<'db>>,
+    diag: &mut Diag,
+) -> bool {
+    let Some(field) = value.value.parent().and_then(ast::RecordExprField::cast) else {
+        return true;
+    };
     let Some(record) = Record::of_field(value.file_id, Either::Left(field)) else { return true };
     let Some(last) = record.fields.last() else { return true };
     if record.is_pat || last.value != Some(value.value) {
@@ -183,7 +195,8 @@ pub(crate) fn last_field_mismatch<'db>(cx: &Cx<'_, 'db>, value: InFile<ast::Node
         return true;
     }
     // alloc: the error's parts, for an error hir found
-    let names: Vec<String> = variant.fields_iter(cx.db).map(|it| it.name(cx.db).as_str().to_owned()).collect();
+    let names: Vec<String> =
+        variant.fields_iter(cx.db).map(|it| it.name(cx.db).as_str().to_owned()).collect();
     let gives_e0063 = record.rest.is_none()
         && !record.fields.iter().any(|it| !names.contains(&it.name))
         && !record.repeats().into_iter().any(|it| it)
@@ -205,18 +218,22 @@ fn default_fields<'db>(
     let mandatory: Vec<&str> =
         // alloc: the error's parts, for an error hir found
         remaining.iter().filter(|(_, it)| !has_default(cx, *it)).map(|(name, _)| name.as_str()).collect();
-    let feature = cx.krate.is_unstable_feature_enabled(cx.db, &intern::Symbol::intern("default_field_values"));
+    let feature = cx
+        .krate
+        .is_unstable_feature_enabled(cx.db, &intern::Symbol::intern("default_field_values"));
     let dots = record.span(cx, dots);
     if !feature {
         let at = dots.shrink_to_hi();
         // clone: the error's parts, for an error hir found
-        let mut diag = Diag::error(Some("E0797"), "base expression required after `..`", at.clone());
+        let mut diag =
+            Diag::error(Some("E0797"), "base expression required after `..`", at.clone());
         // `sess.is_nightly_build()`, as `checks::features` reads it: `RUSTC_BOOTSTRAP=-1` makes
         // it a stable compiler.
         let nightly = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP").as_deref() != Some("-1");
         if nightly && mandatory.is_empty() && !remaining.is_empty() {
             let root = cx.krate.root_module(cx.db);
-            let inject = inject_use_span(cx, root).expect("the crate root is a file, whose items have a start");
+            let inject = inject_use_span(cx, root)
+                .expect("the crate root is a file, whose items have a start");
             diag.suggestion_verbose(
                 inject,
                 "add `#![feature(default_field_values)]` to the crate attributes to enable default values on `struct` fields",
@@ -225,9 +242,12 @@ fn default_fields<'db>(
             );
         }
         match remaining.is_empty() {
-            false => {
-                diag.suggestion_verbose(at, "add a base expression here", "/* expr */", Applicability::HasPlaceholders)
-            }
+            false => diag.suggestion_verbose(
+                at,
+                "add a base expression here",
+                "/* expr */",
+                Applicability::HasPlaceholders,
+            ),
             true => diag.suggestion_verbose(
                 dots,
                 "remove the `..` as all the fields are already present",
@@ -251,13 +271,25 @@ fn default_fields<'db>(
     let s = if mandatory.len() == 1 { "" } else { "s" };
     let at = dots.shrink_to_lo();
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(None, format!("missing field{s} {} in initializer", stdx::list::list(mandatory.iter(), Join::AndNoSerialComma, true)), at.clone());
+    let mut diag = Diag::error(
+        None,
+        format!(
+            "missing field{s} {} in initializer",
+            stdx::list::list(mandatory.iter(), Join::AndNoSerialComma, true)
+        ),
+        at.clone(),
+    );
     diag.span_label(at, "fields that do not have a defaulted value must be provided explicitly");
     Some(diag)
 }
 
 /// E0063 (`report_missing_fields`).
-fn missing<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant, remaining: &[(String, hir::Field)]) -> Diag {
+fn missing<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    variant: hir::Variant,
+    remaining: &[(String, hir::Field)],
+) -> Diag {
     // alloc: the error's parts, for an error hir found
     let mut sorted: Vec<&str> = remaining.iter().map(|(name, _)| name.as_str()).collect();
     sorted.sort_unstable();
@@ -274,32 +306,45 @@ fn missing<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant, r
             let shown: Vec<String> = sorted.iter().take(3).map(|it| format!("`{it}`")).collect();
             let others = len - 3;
             // alloc: the error's text, for an error hir found
-            (shown.join(", "), format!(" and {others} other field{}", if others == 1 { "" } else { "s" }))
+            (
+                shown.join(", "),
+                format!(" and {others} other field{}", if others == 1 { "" } else { "s" }),
+            )
         }
     };
     let s = if len == 1 { "" } else { "s" };
     let path = record.span(cx, record.path_range());
     // alloc: the error's text, for an error hir found
-    let message = format!("missing field{s} {names}{truncated} in initializer of `{}`", adt_ty(cx, record, variant));
+    let message = format!(
+        "missing field{s} {names}{truncated} in initializer of `{}`",
+        adt_ty(cx, record, variant)
+    );
     // clone: the error's parts, for an error hir found
     let mut diag = Diag::error(Some("E0063"), message, path.clone());
     // alloc: clone: the error's parts, for an error hir found
     diag.span_label(path.clone(), format!("missing {names}{truncated}"));
     if remaining.iter().all(|(_, it)| has_default(cx, *it)) {
-        let feature = cx.krate.is_unstable_feature_enabled(cx.db, &intern::Symbol::intern("default_field_values"));
+        let feature = cx
+            .krate
+            .is_unstable_feature_enabled(cx.db, &intern::Symbol::intern("default_field_values"));
         let you_can = match feature {
             true => "you can",
             false => "if you added `#![feature(default_field_values)]` to your crate you could",
         };
         // alloc: the error's text, for an error hir found
-        let message = format!("all remaining fields have default values, {you_can} use those values with `..`");
+        let message = format!(
+            "all remaining fields have default values, {you_can} use those values with `..`"
+        );
         match record.fields.last() {
             Some(last) => {
                 let at = record.span(cx, last.range).shrink_to_hi();
                 diag.suggestion_verbose(at, message, ", ..", Applicability::MachineApplicable);
             }
             None => {
-                let at = record.span(cx, TextRange::new(record.path_range().end(), record.node.text_range().end()));
+                let at = record.span(
+                    cx,
+                    TextRange::new(record.path_range().end(), record.node.text_range().end()),
+                );
                 diag.suggestion_verbose(at, message, " { .. }", Applicability::MachineApplicable);
             }
         }
@@ -322,7 +367,8 @@ fn fru_range<'db>(
     if range.op_kind() != Some(ast::RangeOp::Exclusive) {
         return None;
     }
-    let range_adt = cx.vsema.type_of_expr(ast::Expr::RangeExpr(range)).and_then(|it| it.original.as_adt());
+    let range_adt =
+        cx.vsema.type_of_expr(ast::Expr::RangeExpr(range)).and_then(|it| it.original.as_adt());
     let field_adt = variant
         .fields_iter(cx.db)
         .find(|it| it.name(cx.db).as_str() == last.name)
@@ -346,8 +392,11 @@ fn fru_typo<'db>(
     let start_range = start.syntax().text_range();
     let end_range = end.syntax().text_range();
     let text = range.syntax().text();
-    let between = text.get(usize::from(start_range.end() - range.syntax().text_range().start())..).unwrap_or_default();
-    let spaces: usize = between.chars().take_while(|it| it.is_whitespace()).map(char::len_utf8).sum();
+    let between = text
+        .get(usize::from(start_range.end() - range.syntax().text_range().start())..)
+        .unwrap_or_default();
+    let spaces: usize =
+        between.chars().take_while(|it| it.is_whitespace()).map(char::len_utf8).sum();
     let fru_lo = start_range.end() + TextSize::try_from(spaces).unwrap_or_default();
     let expr_span = record.span(cx, start_range);
     let fru_span = record.span(cx, TextRange::new(fru_lo.min(end_range.end()), end_range.end()));
@@ -386,13 +435,20 @@ fn fru_typo<'db>(
 }
 
 /// `report_private_fields`: a struct with a field not visible where it is built.
-fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant, private: &[hir::Field]) -> Diag {
+fn private_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    variant: hir::Variant,
+    private: &[hir::Field],
+) -> Diag {
     let adt_ty_text = adt_ty(cx, record, variant);
     let path = record.span(cx, record.path_range());
     let mut diag = Diag::error(
         None,
         // alloc: the error's text, for an error hir found
-        format!("cannot construct `{adt_ty_text}` with struct literal syntax due to private fields"),
+        format!(
+            "cannot construct `{adt_ty_text}` with struct literal syntax due to private fields"
+        ),
         // clone: the error's parts, for an error hir found
         path.clone(),
     );
@@ -426,7 +482,8 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Var
         // alloc: the error's text, for an error hir found
         diag.note(format!("{and_other}private field{s} {names}that {were} not provided"));
     }
-    let tail = record.span(cx, TextRange::new(record.path_range().end(), record.node.text_range().end()));
+    let tail =
+        record.span(cx, TextRange::new(record.path_range().end(), record.node.text_range().end()));
     let ty = record.ty(cx);
     let self_adt = ty.as_ref().and_then(|it| it.as_adt()).unwrap_or(adt);
     // alloc: the error's parts, for an error hir found
@@ -487,7 +544,10 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Var
             Applicability::MaybeIncorrect,
         );
         // alloc: the error's text, for an error hir found
-        diag.fact_opt(cx.implements_fact(default, ty), format!("whether `{adt_ty_text}` implements `Default`"));
+        diag.fact_opt(
+            cx.implements_fact(default, ty),
+            format!("whether `{adt_ty_text}` implements `Default`"),
+        );
     }
     diag
 }
@@ -523,7 +583,8 @@ fn no_accessible_fields(cx: &Cx<'_, '_>, record: &Record<'_>) -> Diag {
             let trimmed = text.trim_start();
             let (at, code) = match trimmed.starts_with(',') {
                 true => {
-                    let comma_hi = TextSize::try_from(text.len() - trimmed.len() + 1).unwrap_or_default();
+                    let comma_hi =
+                        TextSize::try_from(text.len() - trimmed.len() + 1).unwrap_or_default();
                     (record.span(cx, TextRange::empty(tail.start() + comma_hi)), " ..")
                 }
                 false => (record.span(cx, last.range).shrink_to_hi(), ", .."),
@@ -531,7 +592,10 @@ fn no_accessible_fields(cx: &Cx<'_, '_>, record: &Record<'_>) -> Diag {
             diag.suggestion_verbose(at, message, code, Applicability::MachineApplicable);
         }
         None => {
-            let at = record.span(cx, TextRange::new(record.path_range().end(), record.node.text_range().end()));
+            let at = record.span(
+                cx,
+                TextRange::new(record.path_range().end(), record.node.text_range().end()),
+            );
             diag.suggestion_verbose(at, message, " { .. }", Applicability::MachineApplicable);
         }
     }
@@ -539,7 +603,12 @@ fn no_accessible_fields(cx: &Cx<'_, '_>, record: &Record<'_>) -> Diag {
 }
 
 /// E0027 (`error_unmentioned_fields`).
-fn unmentioned(cx: &Cx<'_, '_>, record: &Record<'_>, fields: &[hir::Field], inaccessible: bool) -> Diag {
+fn unmentioned(
+    cx: &Cx<'_, '_>,
+    record: &Record<'_>,
+    fields: &[hir::Field],
+    inaccessible: bool,
+) -> Diag {
     // alloc: the error's parts, for an error hir found
     let names: Vec<String> = fields.iter().map(|it| it.name(cx.db).as_str().to_owned()).collect();
     let and_inaccessible = if inaccessible { " and inaccessible fields" } else { "" };
@@ -555,7 +624,11 @@ fn unmentioned(cx: &Cx<'_, '_>, record: &Record<'_>, fields: &[hir::Field], inac
     };
     let whole = record.span(cx, record.node.text_range());
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(Some("E0027"), format!("pattern does not mention {field_names}"), whole.clone());
+    let mut diag = Diag::error(
+        Some("E0027"),
+        format!("pattern does not mention {field_names}"),
+        whole.clone(),
+    );
     // alloc: the error's text, for an error hir found
     diag.span_label(whole, format!("missing {field_names}"));
     let end = record.node.text_range().end();
@@ -587,12 +660,19 @@ fn unmentioned(cx: &Cx<'_, '_>, record: &Record<'_>, fields: &[hir::Field], inac
         // clone: the error's parts, for an error hir found
         at.clone(),
         // alloc: the error's text, for an error hir found
-        format!("if you don't care about {these} missing field{s}, you can explicitly ignore {them}"),
+        format!(
+            "if you don't care about {these} missing field{s}, you can explicitly ignore {them}"
+        ),
         // alloc: the error's text, for an error hir found
         format!("{prefix}{}{rest}{postfix}", ignored.join(", ")),
         Applicability::MachineApplicable,
     );
     // alloc: the error's text, for an error hir found
-    diag.suggestion(at, "or always ignore missing fields here", format!("{prefix}..{postfix}"), Applicability::MachineApplicable);
+    diag.suggestion(
+        at,
+        "or always ignore missing fields here",
+        format!("{prefix}..{postfix}"),
+        Applicability::MachineApplicable,
+    );
     diag
 }

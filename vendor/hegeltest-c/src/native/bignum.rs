@@ -83,19 +83,13 @@ impl BigInt {
     /// Build from a sign and big-endian magnitude bytes (mirrors
     /// `num_bigint::BigInt::from_bytes_be`).
     pub fn from_bytes_be(sign: Sign, bytes: &[u8]) -> BigInt {
-        BigInt(IBig::from_parts(
-            to_dashu_sign(sign),
-            UBig::from_be_bytes(bytes),
-        ))
+        BigInt(IBig::from_parts(to_dashu_sign(sign), UBig::from_be_bytes(bytes)))
     }
 
     /// Big-endian magnitude bytes, paired with the value's [`Sign`].
     pub fn to_bytes_be(&self) -> (Sign, Vec<u8>) {
         let (sign, mag) = self.0.clone().into_parts();
-        (
-            from_dashu_sign(sign, mag.is_zero()),
-            mag.to_be_bytes().into_vec(),
-        )
+        (from_dashu_sign(sign, mag.is_zero()), mag.to_be_bytes().into_vec())
     }
 
     /// The value's [`Sign`] (three-valued: zero is [`Sign::NoSign`]).
@@ -141,10 +135,7 @@ impl BigInt {
             Some(_) => {
                 let mut buf = bytes.to_vec();
                 twos_complement_le(&mut buf);
-                BigInt(IBig::from_parts(
-                    DashuSign::Negative,
-                    UBig::from_le_bytes(&buf),
-                ))
+                BigInt(IBig::from_parts(DashuSign::Negative, UBig::from_le_bytes(&buf)))
             }
         }
     }
@@ -263,9 +254,7 @@ macro_rules! impl_from_int {
         )*
     };
 }
-impl_from_int!(
-    BigInt, IBig, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
-);
+impl_from_int!(BigInt, IBig, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 impl_from_int!(BigUint, UBig, u8, u16, u32, u64, u128);
 
 impl From<BigUint> for BigInt {
@@ -286,9 +275,7 @@ macro_rules! impl_try_into_native {
         )*
     };
 }
-impl_try_into_native!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
-);
+impl_try_into_native!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 macro_rules! impl_try_from_owned_bigint {
     ($($t:ty),*) => {
@@ -302,9 +289,7 @@ macro_rules! impl_try_from_owned_bigint {
         )*
     };
 }
-impl_try_from_owned_bigint!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
-);
+impl_try_from_owned_bigint!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 macro_rules! impl_try_into_native_uint {
     ($($t:ty),*) => {
@@ -401,10 +386,7 @@ macro_rules! impl_binop_i32 {
         impl ::core::ops::$trait<i32> for &BigInt {
             type Output = BigInt;
             fn $method(self, rhs: i32) -> BigInt {
-                BigInt(::core::ops::$trait::$method(
-                    self.0.clone(),
-                    IBig::from(rhs),
-                ))
+                BigInt(::core::ops::$trait::$method(self.0.clone(), IBig::from(rhs)))
             }
         }
     };

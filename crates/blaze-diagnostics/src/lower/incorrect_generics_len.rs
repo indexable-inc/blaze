@@ -13,7 +13,8 @@
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir::{
-    Adt, AsAssocItem as _, AssocItemContainer, GenericDef, HirFileId, InFile, IncorrectGenericsLenKind,
+    Adt, AsAssocItem as _, AssocItemContainer, GenericDef, HirFileId, InFile,
+    IncorrectGenericsLenKind,
 };
 use hir_def::{
     ImplId, TraitId,
@@ -245,7 +246,10 @@ pub(crate) fn item_id(def: GenericDef) -> Option<ItemId> {
 pub(crate) fn generics_fact(cx: &Cx<'_, '_>, diag: &mut Diag, def: GenericDef) {
     if let Some(item) = item_id(def) {
         // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(item)), format!("the generics of `{}`", def_name(cx, def)));
+        diag.fact(
+            Fact::Signature(cx.key(item)),
+            format!("the generics of `{}`", def_name(cx, def)),
+        );
     }
 }
 
@@ -430,16 +434,10 @@ fn item_of<'db>(cx: &Cx<'_, 'db>, item: ast::Item<'db>) -> Option<(ItemId, Strin
         ast::Item::Struct(it) => {
             (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
         }
-        ast::Item::Enum(it) => {
-            (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
-        }
-        ast::Item::Union(it) => {
-            (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
-        }
+        ast::Item::Enum(it) => (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name())),
+        ast::Item::Union(it) => (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name())),
         ast::Item::Trait(it) => (ItemId::Trait(sema.to_def(it)?.into()), named(it.name())),
-        ast::Item::TypeAlias(it) => {
-            (ItemId::Alias(sema.to_def(it)?.into()), named(it.name()))
-        }
+        ast::Item::TypeAlias(it) => (ItemId::Alias(sema.to_def(it)?.into()), named(it.name())),
         ast::Item::Const(it) => (ItemId::Const(sema.to_def(it)?.into()), named(it.name())),
         ast::Item::Static(it) => (ItemId::Static(sema.to_def(it)?.into()), named(it.name())),
         ast::Item::Impl(it) => {
@@ -557,7 +555,9 @@ impl<'db> Wrong<'_, '_, 'db> {
         let provided = self.num_provided_type_or_const_args();
         match self.info {
             Info::MissingTypesOrConsts { missing, defaults } => provided + missing - defaults,
-            Info::ExcessTypesOrConsts { redundant, defaults, .. } => provided - redundant - defaults,
+            Info::ExcessTypesOrConsts { redundant, defaults, .. } => {
+                provided - redundant - defaults
+            }
             _ => 0,
         }
     }
@@ -590,9 +590,8 @@ impl<'db> Wrong<'_, '_, 'db> {
 
     fn num_default_params(&self) -> usize {
         match self.info {
-            Info::MissingTypesOrConsts { defaults, .. } | Info::ExcessTypesOrConsts { defaults, .. } => {
-                defaults
-            }
+            Info::MissingTypesOrConsts { defaults, .. }
+            | Info::ExcessTypesOrConsts { defaults, .. } => defaults,
             _ => 0,
         }
     }
@@ -610,7 +609,9 @@ impl<'db> Wrong<'_, '_, 'db> {
                 ("at least ", self.num_expected_type_or_const_args_including_defaults())
             }
             Info::ExcessLifetimes { .. } => ("at most ", self.num_expected_lifetime_args()),
-            Info::ExcessTypesOrConsts { .. } => ("at most ", self.num_expected_type_or_const_args()),
+            Info::ExcessTypesOrConsts { .. } => {
+                ("at most ", self.num_expected_type_or_const_args())
+            }
         }
     }
 
@@ -733,7 +734,12 @@ impl<'db> Wrong<'_, '_, 'db> {
             None => {
                 let at = self.seg.name_span(self.cx).shrink_to_hi();
                 // alloc: the suggestion's text, for an error hir found
-                diag.suggestion_verbose(at, msg, format!("<{suggested}>"), Applicability::HasPlaceholders);
+                diag.suggestion_verbose(
+                    at,
+                    msg,
+                    format!("<{suggested}>"),
+                    Applicability::HasPlaceholders,
+                );
             }
             Some(_) => {
                 let Some(inner) = self.seg.inner_range() else { return };
@@ -818,7 +824,9 @@ impl<'db> Wrong<'_, '_, 'db> {
     fn suggest_moving_args_from_assoc_fn_to_trait(&self, diag: &mut Diag) {
         let db = self.cx.db;
         let (GenericDef::Function(f), None) = (self.def, self.param) else { return };
-        let Some(AssocItemContainer::Trait(trait_)) = f.as_assoc_item(db).map(|it| it.container(db)) else {
+        let Some(AssocItemContainer::Trait(trait_)) =
+            f.as_assoc_item(db).map(|it| it.container(db))
+        else {
             return;
         };
         if self.num_expected_type_or_const_args() + self.num_expected_lifetime_args() > 0 {
@@ -842,14 +850,14 @@ impl<'db> Wrong<'_, '_, 'db> {
             && path.syntax().parent().is_some_and(|it| ast::PathExpr::can_cast(it.kind()))
         {
             let Some(first) = path.first_segment() else { return };
-            let supplied = Segment::of_node(self.seg.file, first.syntax(), None)
-                .map_or(0, |it| {
-                    it.args().iter().filter(|it| !matches!(it, ast::GenericArg::LifetimeArg(_))).count()
-                });
+            let supplied = Segment::of_node(self.seg.file, first.syntax(), None).map_or(0, |it| {
+                it.args().iter().filter(|it| !matches!(it, ast::GenericArg::LifetimeArg(_))).count()
+            });
             if supplied + excess != trait_generics {
                 return;
             }
-            let removed = self.span(TextRange::new(self.seg.name.syntax().text_range().end(), span_ext.end()));
+            let removed = self
+                .span(TextRange::new(self.seg.name.syntax().text_range().end(), span_ext.end()));
             diag.multipart_suggestion(
                 msg,
                 // alloc: the suggestion's parts, for an error hir found
@@ -925,7 +933,9 @@ impl<'db> Wrong<'_, '_, 'db> {
                 let article = if parts.len() == 1 { "an " } else { "" };
                 diag.multipart_suggestion(
                     // alloc: the suggestion's text, for an error hir found
-                    format!("turn the generic argument{s} into {article}associated item binding{s}"),
+                    format!(
+                        "turn the generic argument{s} into {article}associated item binding{s}"
+                    ),
                     parts,
                     Applicability::MaybeIncorrect,
                 );
@@ -966,7 +976,9 @@ impl<'db> Wrong<'_, '_, 'db> {
                 break;
             }
         }
-        let (Some(&lo), Some(&hi)) = (spans.get(expected.saturating_sub(1)), spans.last()) else { return };
+        let (Some(&lo), Some(&hi)) = (spans.get(expected.saturating_sub(1)), spans.last()) else {
+            return;
+        };
         let range = TextRange::empty(lo.end()).cover(hi);
         let n = spans.len() - expected;
         diag.suggestion(
@@ -995,7 +1007,9 @@ impl<'db> Wrong<'_, '_, 'db> {
                 _ => {}
             }
         }
-        let (Some(&lo), Some(&hi)) = (spans.get(expected.saturating_sub(1)), spans.last()) else { return };
+        let (Some(&lo), Some(&hi)) = (spans.get(expected.saturating_sub(1)), spans.last()) else {
+            return;
+        };
         let range = TextRange::empty(lo.end()).cover(hi);
         let n = spans.len() - expected;
         diag.suggestion(

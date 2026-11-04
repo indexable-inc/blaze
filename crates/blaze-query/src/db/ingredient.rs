@@ -40,6 +40,21 @@ pub(crate) struct Weighed {
     pub(crate) evict: fn(storage: &Storage, ingredient: u32, gone: &[Held]) -> (usize, u64),
 }
 
+/// What the storage asks of a function whose values are let go only when asked (`lru = 0`),
+/// by the tag they count to ([`Storage::evict_tag`]): a caller lets go of a whole tag's values
+/// at once (every MIR, as a build ends), never of a list of functions it would have to keep in
+/// step with the queries that exist.
+#[derive(Clone, Copy)]
+pub(crate) struct Explicit {
+    /// The tag its values count to: the function's `mem_tag`.
+    pub(crate) tag: Tag,
+    /// How many of its rows hold a value.
+    pub(crate) values: fn(storage: &Storage, ingredient: u32) -> usize,
+    /// Lets go of every value it holds, keeping each row's stamp, edges and hash; returns how
+    /// many held one.
+    pub(crate) evict: fn(storage: &mut Storage, ingredient: u32) -> usize,
+}
+
 /// What the storage does with an ingredient's table without knowing its types: the cold
 /// paths (verifying a dependency by its node, emptying a cycle's row, a view's sweep,
 /// compaction, drop). Made by [`Vtable::function`], [`Vtable::input`], [`Vtable::interned`]
@@ -75,6 +90,9 @@ pub struct Vtable {
     /// A function whose values are kept by their bytes (`lru`): what the storage's view
     /// boundary asks of it ([`super::budget`]).
     pub(crate) weighed: Option<Weighed>,
+    /// A function whose values are let go only when asked (`lru = 0`): what a caller letting go
+    /// of a tag's values asks of it ([`Storage::evict_tag`]).
+    pub(crate) explicit: Option<Explicit>,
     /// Moves each of its rows' edge spans into the compacted array.
     pub(crate) relocate: Option<fn(storage: &mut Storage, ingredient: u32, moved: &mut Relocate)>,
     /// Passes each view stamp its rows hold through `restamp`, storing what it gives: the

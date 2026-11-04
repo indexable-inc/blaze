@@ -32,12 +32,27 @@ fn pool() -> Arc<Pool> {
 /// Every scenario that holds on the seed, by name.
 pub const ON_THE_SEED: &[(&str, fn())] = &[
     ("jobs_run_on_the_thread_that_waits_for_them", jobs_run_on_the_thread_that_waits_for_them),
-    ("a_job_waiting_on_an_event_frees_the_one_worker", a_job_waiting_on_an_event_frees_the_one_worker),
+    (
+        "a_job_waiting_on_an_event_frees_the_one_worker",
+        a_job_waiting_on_an_event_frees_the_one_worker,
+    ),
     ("a_wait_that_would_close_a_cycle_is_refused", a_wait_that_would_close_a_cycle_is_refused),
-    ("a_job_waits_for_a_nested_scope_without_holding_the_worker", a_job_waits_for_a_nested_scope_without_holding_the_worker),
-    ("a_job_of_one_pool_waits_for_another_pools_job", a_job_of_one_pool_waits_for_another_pools_job),
-    ("dropping_the_pool_runs_every_job_it_was_given", dropping_the_pool_runs_every_job_it_was_given),
-    ("a_job_that_gave_way_and_asks_again_at_once_ends", a_job_that_gave_way_and_asks_again_at_once_ends),
+    (
+        "a_job_waits_for_a_nested_scope_without_holding_the_worker",
+        a_job_waits_for_a_nested_scope_without_holding_the_worker,
+    ),
+    (
+        "a_job_of_one_pool_waits_for_another_pools_job",
+        a_job_of_one_pool_waits_for_another_pools_job,
+    ),
+    (
+        "dropping_the_pool_runs_every_job_it_was_given",
+        dropping_the_pool_runs_every_job_it_was_given,
+    ),
+    (
+        "a_job_that_gave_way_and_asks_again_at_once_ends",
+        a_job_that_gave_way_and_asks_again_at_once_ends,
+    ),
 ];
 
 /// A scope's jobs run on the thread that waits for the scope, as the pool's one worker; a job
@@ -52,7 +67,11 @@ pub fn jobs_run_on_the_thread_that_waits_for_them() {
             scope.submit(
                 None,
                 move || {
-                    assert_eq!(std::thread::current().id(), here, "job {n} runs on the waiting thread");
+                    assert_eq!(
+                        std::thread::current().id(),
+                        here,
+                        "job {n} runs on the waiting thread"
+                    );
                     assert_eq!(pool.worker(), Some(0), "job {n} runs as the one worker");
                     sum.fetch_add(n, Ordering::Relaxed);
                 },
@@ -79,7 +98,8 @@ pub fn a_job_waiting_on_an_event_frees_the_one_worker() {
                 let event = Event::new();
                 let waiter = event.waiter();
                 {
-                    let (pool_, seen, order) = (Arc::clone(&pool), Arc::clone(&seen), Arc::clone(&order));
+                    let (pool_, seen, order) =
+                        (Arc::clone(&pool), Arc::clone(&seen), Arc::clone(&order));
                     pool.submit(
                         None,
                         move || {
@@ -98,7 +118,10 @@ pub fn a_job_waiting_on_an_event_frees_the_one_worker() {
         );
     });
     assert_eq!(seen.load(Ordering::SeqCst), 1, "the waiting job was parked while the other ran");
-    assert_eq!(*order.lock(), ["the waiting job waits", "the firing job runs", "the waiting job resumed"]);
+    assert_eq!(
+        *order.lock(),
+        ["the waiting job waits", "the firing job runs", "the waiting job resumed"]
+    );
 }
 
 /// Two jobs each make a key and then wait for the other's: the wait that would close the cycle
@@ -140,7 +163,11 @@ pub fn a_wait_that_would_close_a_cycle_is_refused() {
     });
     // b's job is the pool's, not the scope's: the pool's drop runs it to its end.
     drop(Arc::into_inner(pool).expect("the jobs let go of the pool"));
-    assert_eq!(*outcomes.lock(), [("a waits for b", false), ("b waits for a", true)], "a's wait closed the cycle");
+    assert_eq!(
+        *outcomes.lock(),
+        [("a waits for b", false), ("b waits for a", true)],
+        "a's wait closed the cycle"
+    );
 }
 
 /// A job that opens a scope of its own on the same pool waits for it switched out: the one
@@ -154,9 +181,13 @@ pub fn a_job_waits_for_a_nested_scope_without_holding_the_worker() {
         pool.scope(|scope| {
             for _ in 0..3 {
                 let sum = &sum;
-                scope.submit(None, move || sum.fetch_add(nest(pool, depth - 1), Ordering::Relaxed), |ran| {
-                    ran.expect("a nested job does not panic");
-                });
+                scope.submit(
+                    None,
+                    move || sum.fetch_add(nest(pool, depth - 1), Ordering::Relaxed),
+                    |ran| {
+                        ran.expect("a nested job does not panic");
+                    },
+                );
             }
         });
         sum.load(Ordering::Relaxed)
@@ -192,10 +223,18 @@ pub fn dropping_the_pool_runs_every_job_it_was_given() {
         );
         for _ in 0..10 {
             let ran = Arc::clone(&ran);
-            pool.submit(None, move || ran.fetch_add(1, Ordering::SeqCst), |it| _ = it.expect("no job panics"));
+            pool.submit(
+                None,
+                move || ran.fetch_add(1, Ordering::SeqCst),
+                |it| _ = it.expect("no job panics"),
+            );
         }
         pool.submit(None, move || event.fire(), |it| it.expect("the firing job does not panic"));
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "a driven pool runs nothing until its thread waits");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a driven pool runs nothing until its thread waits"
+        );
     }
     assert_eq!(ran.load(Ordering::SeqCst), 110, "every job ran before the drop returned");
 }
@@ -229,7 +268,12 @@ impl Meeting {
 /// Asks for `mine`, whose run asks for `theirs` (made, when this job runs it, as 0), until it
 /// gets a value, asking again at once each time it gives way, as a caller that loops on
 /// [`Cancelled`] does: the value and how many times it gave way, or `Err` after [`ASKS`] asks.
-fn ask_until_done(flights: &Flights<u64>, meeting: &Meeting, mine: Key, theirs: Key) -> Result<(u64, u32), u32> {
+fn ask_until_done(
+    flights: &Flights<u64>,
+    meeting: &Meeting,
+    mine: Key,
+    theirs: Key,
+) -> Result<(u64, u32), u32> {
     for gave_way in 0..ASKS {
         let got = flights.get_or_run(mine, || {
             meeting.meet();
@@ -256,8 +300,16 @@ pub fn asked_again_at_once(pool: &Pool) -> [Result<(u64, u32), u32>; 2] {
     let (mut x, mut y) = (None, None);
     pool.scope(|scope| {
         let (flights, meeting, x, y) = (&flights, &meeting, &mut x, &mut y);
-        scope.submit(None, move || ask_until_done(flights, meeting, a, b), |it| *x = Some(it.expect("x does not panic")));
-        scope.submit(None, move || ask_until_done(flights, meeting, b, a), |it| *y = Some(it.expect("y does not panic")));
+        scope.submit(
+            None,
+            move || ask_until_done(flights, meeting, a, b),
+            |it| *x = Some(it.expect("x does not panic")),
+        );
+        scope.submit(
+            None,
+            move || ask_until_done(flights, meeting, b, a),
+            |it| *y = Some(it.expect("y does not panic")),
+        );
     });
     [x.expect("x ran"), y.expect("y ran")]
 }
@@ -271,7 +323,9 @@ pub fn a_job_that_gave_way_and_asks_again_at_once_ends() {
 /// Both jobs got 1, and of the two exactly one gave way, once.
 pub fn assert_gave_way_once(x: Result<(u64, u32), u32>, y: Result<(u64, u32), u32>) {
     let (Ok((in_x, x_gave)), Ok((in_y, y_gave))) = (x, y) else {
-        panic!("a job never ended: it gave way {ASKS} times, asking again at once (x {x:?}, y {y:?})");
+        panic!(
+            "a job never ended: it gave way {ASKS} times, asking again at once (x {x:?}, y {y:?})"
+        );
     };
     assert_eq!((in_x, in_y), (1, 1), "each job's value");
     assert_eq!(x_gave + y_gave, 1, "exactly one gave way, once: x {x_gave}, y {y_gave}");

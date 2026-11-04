@@ -14,7 +14,6 @@ use span::Edition;
 use syntax::{TextRange, TextSize};
 
 use super::args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue};
-use stdx::list::Join;
 use crate::{
     checks::features::Features,
     cx::{Cx, item_range_view as item_range},
@@ -25,6 +24,7 @@ use crate::{
     },
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
+use stdx::list::Join;
 
 /// What the crate says that the parsers read: rustc's `Session` and `Features`, of what they
 /// look at.
@@ -61,7 +61,8 @@ impl TargetInfo {
     fn of(cx: &Cx<'_, '_>) -> TargetInfo {
         let cfg = cx.krate.cfg(cx.db);
         // alloc: setup, once per check: the target's cfg values the parsers read
-        let one = |key: &str| cfg.get_cfg_values(key).next().map(|it| it.to_string()).unwrap_or_default();
+        let one =
+            |key: &str| cfg.get_cfg_values(key).next().map(|it| it.to_string()).unwrap_or_default();
         TargetInfo {
             arch: one("target_arch"),
             os: one("target_os"),
@@ -110,11 +111,14 @@ impl Session {
     pub(crate) fn of<'db>(cx: &Cx<'_, 'db>, owners: &[Owner<'db>], features: Features) -> Session {
         // alloc: setup, once per check: the tools the crate registers
         let mut tools = Vec::new();
-        let crate_attrs = owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
+        let crate_attrs =
+            owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
         for attr in crate_attrs.filter(|it| super::is(it, "register_tool")) {
             // alloc: setup, once per `#![register_tool]`: its parse errors, dropped here
             let mut quiet = Vec::new();
-            let Some(ArgParser::List(list)) = super::args::parse(cx, attr, &["register_tool"], &mut quiet) else {
+            let Some(ArgParser::List(list)) =
+                super::args::parse(cx, attr, &["register_tool"], &mut quiet)
+            else {
                 continue;
             };
             for item in list.mixed() {
@@ -137,7 +141,12 @@ impl Session {
     }
 
     /// rustc's `feature_err` of the language feature `feature` at `span`.
-    pub(crate) fn feature_err(&self, feature: &str, span: Span, explain: impl Into<String>) -> Diag {
+    pub(crate) fn feature_err(
+        &self,
+        feature: &str,
+        span: Span,
+        explain: impl Into<String>,
+    ) -> Diag {
         crate::checks::features::feature_err(&self.features, feature, span, explain)
     }
 }
@@ -253,7 +262,12 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     /// An error with code `code` at `range` of the attribute's file.
-    pub(crate) fn err(&self, code: Option<&str>, message: impl Into<String>, range: TextRange) -> Diag {
+    pub(crate) fn err(
+        &self,
+        code: Option<&str>,
+        message: impl Into<String>,
+        range: TextRange,
+    ) -> Diag {
         Diag::error(code, message, self.span(range))
     }
 
@@ -287,7 +301,11 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     /// rustc's `expect_list`.
-    pub(crate) fn expect_list<'p>(&mut self, args: &'p ArgParser, range: TextRange) -> Option<&'p MetaList> {
+    pub(crate) fn expect_list<'p>(
+        &mut self,
+        args: &'p ArgParser,
+        range: TextRange,
+    ) -> Option<&'p MetaList> {
         let list = args.as_list();
         if list.is_none() {
             self.expected_list(range, args);
@@ -386,7 +404,12 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     /// rustc's `push_suggestion`: given with the next error, in place of the valid forms.
-    pub(crate) fn push_suggestion(&mut self, message: impl Into<String>, range: TextRange, code: impl Into<String>) -> &mut Self {
+    pub(crate) fn push_suggestion(
+        &mut self,
+        message: impl Into<String>,
+        range: TextRange,
+        code: impl Into<String>,
+    ) -> &mut Self {
         self.custom.push(Custom { message: message.into(), range, code: code.into() });
         self
     }
@@ -396,9 +419,17 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
         self.builtin.template.suggestions(&self.name(), self.attr.is_unsafe())
     }
 
-    pub(crate) fn expected_integer_literal_in_range(&mut self, range: TextRange, lower: i64, upper: i64) {
+    pub(crate) fn expected_integer_literal_in_range(
+        &mut self,
+        range: TextRange,
+        lower: i64,
+        upper: i64,
+    ) {
         // alloc: the error's label
-        self.parse_error(range, Reason::Label(format!("expected an integer literal in the range of {lower}..={upper}")));
+        self.parse_error(
+            range,
+            Reason::Label(format!("expected an integer literal in the range of {lower}..={upper}")),
+        );
     }
 
     /// rustc's `expected_list`; `range` is used when `args` has none.
@@ -430,19 +461,27 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
 
     pub(crate) fn expected_no_args(&mut self, range: TextRange) {
         // alloc: the error's label
-        self.parse_error(range, Reason::Coded("didn't expect any arguments here".to_owned(), "E0565"));
+        self.parse_error(
+            range,
+            Reason::Coded("didn't expect any arguments here".to_owned(), "E0565"),
+        );
     }
 
     pub(crate) fn expected_identifier(&mut self, range: TextRange) {
         // alloc: the error's label
-        self.parse_error(range, Reason::Coded("expected a valid identifier here".to_owned(), "E0565"));
+        self.parse_error(
+            range,
+            Reason::Coded("expected a valid identifier here".to_owned(), "E0565"),
+        );
     }
 
     /// rustc's `expected_name_value`: `name = "..."` was expected at `range`.
     pub(crate) fn expected_name_value(&mut self, range: TextRange, name: Option<&str>) {
         let reason = match name {
             // alloc: the error's label
-            Some(name) => Reason::Label(format!("expected this to be of the form `{name} = \"...\"`")),
+            Some(name) => {
+                Reason::Label(format!("expected this to be of the form `{name} = \"...\"`"))
+            }
             None => Reason::NameValue,
         };
         self.parse_error(range, reason);
@@ -455,7 +494,10 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
 
     pub(crate) fn duplicate_key(&mut self, range: TextRange, key: &str) {
         // alloc: the error's label
-        self.parse_error(range, Reason::Coded(format!("found `{key}` used as a key more than once"), "E0538"));
+        self.parse_error(
+            range,
+            Reason::Coded(format!("found `{key}` used as a key more than once"), "E0538"),
+        );
     }
 
     pub(crate) fn expected_not_literal(&mut self, range: TextRange) {
@@ -490,7 +532,11 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     /// "this attribute is only valid with `a` as an argument".
-    pub(crate) fn expected_specific_argument_and_list(&mut self, range: TextRange, possibilities: &[&str]) {
+    pub(crate) fn expected_specific_argument_and_list(
+        &mut self,
+        range: TextRange,
+        possibilities: &[&str],
+    ) {
         let label = specific(possibilities, '`').map(|it| match possibilities.len() {
             // alloc: the error's label
             1 => format!("this attribute is only valid with {it} as an argument"),
@@ -503,7 +549,11 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     /// "valid arguments are \"a\" or \"b\"".
-    pub(crate) fn expected_specific_argument_strings(&mut self, range: TextRange, possibilities: &[&str]) {
+    pub(crate) fn expected_specific_argument_strings(
+        &mut self,
+        range: TextRange,
+        possibilities: &[&str],
+    ) {
         let label = specific(possibilities, '"').map(|it| match possibilities.len() {
             // alloc: the error's label
             1 => format!("the only valid argument here is {it}"),
@@ -516,7 +566,9 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// rustc's `expected_string_literal`, with the literal found, if one was.
     pub(crate) fn expected_string_literal(&mut self, range: TextRange, found: Option<&Lit>) {
         let reason = match found {
-            Some(lit) if lit.is_bytestr() => Reason::ByteString(TextRange::at(lit.range.start(), TextSize::from(1))),
+            Some(lit) if lit.is_bytestr() => {
+                Reason::ByteString(TextRange::at(lit.range.start(), TextSize::from(1)))
+            }
             // alloc: the error's label
             _ => Reason::Label("expected a string literal here".to_owned()),
         };
@@ -525,7 +577,10 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
 
     pub(crate) fn expected_filename_literal(&mut self, range: TextRange) {
         // alloc: the error's label
-        self.parse_error(range, Reason::Label("expected a filename string literal here".to_owned()));
+        self.parse_error(
+            range,
+            Reason::Label("expected a filename string literal here".to_owned()),
+        );
     }
 
     pub(crate) fn expected_integer_literal(&mut self, range: TextRange) {
@@ -541,11 +596,20 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
         let span = self.span(range);
         let inner_span = self.span(inner);
         // alloc: the error's message; clone: its span, used again for the suggestions
-        let mut diag = Diag::error(Some("E0539"), format!("malformed `{}` attribute input", self.name()), inner_span.clone());
+        let mut diag = Diag::error(
+            Some("E0539"),
+            format!("malformed `{}` attribute input", self.name()),
+            inner_span.clone(),
+        );
         let mut code = None;
         match reason {
             Reason::ByteString(prefix) => {
-                diag.suggestion(self.span(prefix), "consider removing the prefix", "", Applicability::MaybeIncorrect);
+                diag.suggestion(
+                    self.span(prefix),
+                    "consider removing the prefix",
+                    "",
+                    Applicability::MaybeIncorrect,
+                );
                 diag.note("expected a normal string literal, not a byte string literal");
                 self.errors.push(diag);
                 return;
@@ -583,13 +647,25 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
                     // alloc: the error's suggestion message
                     1 => "must be of the form".to_owned(),
                     // alloc: the error's suggestion message
-                    _ => "try changing it to one of the following valid forms of the attribute".to_owned(),
+                    _ => "try changing it to one of the following valid forms of the attribute"
+                        .to_owned(),
                 };
-                diag.suggestions(&inner_span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
+                diag.suggestions(
+                    &inner_span,
+                    message,
+                    suggestions,
+                    Applicability::HasPlaceholders,
+                    SuggestionStyle::ShowAlways,
+                );
             }
         } else if custom.len() < 4 {
             for it in custom {
-                diag.suggestion_verbose(self.span(it.range), it.message, it.code, Applicability::MaybeIncorrect);
+                diag.suggestion_verbose(
+                    self.span(it.range),
+                    it.message,
+                    it.code,
+                    Applicability::MaybeIncorrect,
+                );
             }
         }
         self.errors.push(diag);
@@ -599,7 +675,9 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// (`AllowedTargets::ManuallyChecked`), with its arguments as the message names them
     /// (`"(C)"`): the errors; the lints are `lints::syntax::attrs`'.
     pub(crate) fn check_target(&mut self, args: &str, targets: Targets) {
-        if let Some(diag) = target_error(self.cx, &self.session.krate, self.owner, self.attr, targets, args) {
+        if let Some(diag) =
+            target_error(self.cx, &self.session.krate, self.owner, self.attr, targets, args)
+        {
             self.errors.push(diag);
         }
     }
@@ -680,7 +758,8 @@ pub(crate) fn target_error(
     let name = attr.name();
     let range = if args.is_empty() { attr.path_range() } else { attr.inner_range() };
     // alloc: the error's message
-    let message = format!("the `{name}{args}` attribute cannot be used on {}", owner.target.plural_name());
+    let message =
+        format!("the `{name}{args}` attribute cannot be used on {}", owner.target.plural_name());
     let mut diag = Diag::error(None, message, cx.span(attr.in_file(range)));
     diag.suggestion_with_style(
         // alloc: the error's suggestion
@@ -693,7 +772,10 @@ pub(crate) fn target_error(
     let (applied, only) = applied(krate, targets.allowed().collect(), owner.target);
     let only = if only { "only " } else { "" };
     // alloc: the error's help
-    diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
+    diag.help(format!(
+        "the `{name}{args}` attribute can {only}be applied to {}",
+        stdx::list::list(applied.iter(), Join::And, false)
+    ));
     match (path.as_slice(), owner.target) {
         ([it], Target::Static) if it.as_str() == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));
@@ -709,12 +791,20 @@ pub(crate) fn target_error(
                 // alloc: the error's suggestion
                 parts.push((inner.shrink_to_hi(), ")".to_owned()));
             }
-            diag.multipart_suggestion("did you mean to use `#[export_name]`?", parts, Applicability::MaybeIncorrect);
+            diag.multipart_suggestion(
+                "did you mean to use `#[export_name]`?",
+                parts,
+                Applicability::MaybeIncorrect,
+            );
         }
-        ([it], Target::Fn | Target::Method(_)) if it.as_str() == "repr" && args == "(align(...))" && krate.fn_align => {
+        ([it], Target::Fn | Target::Method(_))
+            if it.as_str() == "repr" && args == "(align(...))" && krate.fn_align =>
+        {
             diag.help("use `#[rustc_align(...)]` instead");
         }
-        ([it], Target::Static) if it.as_str() == "repr" && args == "(align(...))" && krate.static_align => {
+        ([it], Target::Static)
+            if it.as_str() == "repr" && args == "(align(...))" && krate.static_align =>
+        {
             diag.help("use `#[rustc_align_static(...)]` instead");
         }
         _ => {}

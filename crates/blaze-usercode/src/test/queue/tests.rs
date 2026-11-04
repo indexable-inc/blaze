@@ -5,8 +5,8 @@ use std::{
 };
 
 use blaze_core::{
-    Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Sandbox, Tag,
-    Traced,
+    Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Sandbox,
+    Tag, Traced,
     sim::{self, Faults, Rng, Sim},
 };
 use blaze_ids::{ContentId, rng::SplitMix64};
@@ -186,7 +186,8 @@ impl Fake {
                         self.sends += 1;
                         bytes.clear();
                         let error = IoError("Broken pipe (os error 32)".into());
-                        answers.push(Completion { tag, done: Done::Broken { buffer: bytes, error } });
+                        answers
+                            .push(Completion { tag, done: Done::Broken { buffer: bytes, error } });
                     }
                     Effect::Send { conn, mut bytes, tag } => {
                         let mut frames = Frames::new();
@@ -206,7 +207,9 @@ impl Fake {
                         self.hangups.push(conn);
                         answers.push(Completion { tag, done: Done::HungUp });
                     }
-                    Effect::Timer { after, tag } => self.timers.push((tag, self.now + after, self.sends)),
+                    Effect::Timer { after, tag } => {
+                        self.timers.push((tag, self.now + after, self.sends))
+                    }
                     Effect::Listen { at, tag } => self.listens.push((tag, at)),
                     Effect::Recv { conn, tag, .. } => self.recvs.push((tag, conn)),
                     Effect::Spawn { command, tag } => self.spawns.push((tag, *command)),
@@ -226,7 +229,10 @@ impl Fake {
     fn advance(&mut self, by: Duration) {
         let to = self.now + by;
         loop {
-            let Some(at) = (0..self.timers.len()).filter(|&at| self.timers[at].1 <= to).min_by_key(|&at| self.timers[at].1) else {
+            let Some(at) = (0..self.timers.len())
+                .filter(|&at| self.timers[at].1 <= to)
+                .min_by_key(|&at| self.timers[at].1)
+            else {
                 break;
             };
             let (tag, when, _) = self.timers.remove(at);
@@ -246,7 +252,8 @@ impl Fake {
     }
 
     fn say_bytes(&mut self, conn: Conn, bytes: Vec<u8>) {
-        let at = self.recvs.iter().position(|it| it.1 == conn).expect("a receive on the connection");
+        let at =
+            self.recvs.iter().position(|it| it.1 == conn).expect("a receive on the connection");
         let (tag, _) = self.recvs.remove(at);
         self.complete(tag, Done::Read(bytes));
     }
@@ -276,7 +283,10 @@ impl Fake {
     /// How many replicas `conn` was asked for since the last call; the rest of what it was
     /// sent is kept.
     fn replicate(&mut self, conn: Conn) -> Option<u32> {
-        let at = self.sent.iter().position(|it| it.0 == conn && matches!(it.1, Frame::Replicate { .. }))?;
+        let at = self
+            .sent
+            .iter()
+            .position(|it| it.0 == conn && matches!(it.1, Frame::Replicate { .. }))?;
         match self.sent.remove(at).1 {
             Frame::Replicate { count } => Some(count),
             _ => None,
@@ -293,7 +303,8 @@ impl Fake {
 
     /// The frames sent to `conn` since the last call.
     fn frames(&mut self, conn: Conn) -> Vec<Frame> {
-        let (to, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.sent).into_iter().partition(|it| it.0 == conn);
+        let (to, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.sent).into_iter().partition(|it| it.0 == conn);
         self.sent = rest;
         to.into_iter().map(|it| it.1).collect()
     }
@@ -317,7 +328,10 @@ impl Fake {
 
     fn append(&mut self, b: usize, lines: &[Line]) {
         let text: String = lines.iter().map(Line::text).collect();
-        self.records.get_mut(&name(&format!("req/1/r{b}"))).expect("the record").extend_from_slice(text.as_bytes());
+        self.records
+            .get_mut(&name(&format!("req/1/r{b}")))
+            .expect("the record")
+            .extend_from_slice(text.as_bytes());
     }
 
     fn spawn_of(&self, program: &str) -> Tag {
@@ -331,22 +345,30 @@ impl Fake {
     }
 
     fn result(&self, test: &str) -> &Finished {
-        self.results.iter().find(|it| it.test.as_deref() == Some(test)).unwrap_or_else(|| panic!("no result of {test}: {:?}", self.results))
+        self.results
+            .iter()
+            .find(|it| it.test.as_deref() == Some(test))
+            .unwrap_or_else(|| panic!("no result of {test}: {:?}", self.results))
     }
 }
 
 #[test]
 fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
-    let mut fake = Fake::new(config(2), vec![binary("lib", vec![job("a", 10), job("b", 50), job("c", 30)])]);
+    let mut fake =
+        Fake::new(config(2), vec![binary("lib", vec![job("a", 10), job("b", 50), job("c", 30)])]);
     assert_eq!(fake.records.get(&name("req/1/r0")), Some(&Vec::new()));
     let command = &fake.spawns[0].1;
     assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
     assert!(command.env.contains(&(confine::LIVE.into(), "/root/req/1/r0".into())));
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     assert!(command.args.is_empty());
-    let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else { panic!("{command:?}") };
+    let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else {
+        panic!("{command:?}")
+    };
     assert!(*trace && !*network);
-    assert!(read.contains(&PathBuf::from("/root/req/1/t0")) && read.contains(&PathBuf::from("/ws")));
+    assert!(
+        read.contains(&PathBuf::from("/root/req/1/t0")) && read.contains(&PathBuf::from("/ws"))
+    );
     assert_eq!(write, &vec![PathBuf::from("/tmp/t")]);
     let conn = fake.hello(0, &["a", "b", "c"]);
     // Two cores: b and c, the longest.
@@ -355,17 +377,23 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     let (b, c) = (runs[0].0, runs[1].0);
     // One driver timer, for the earlier deadline.
     assert_eq!(fake.timers.len(), 1);
-    fake.append(0, &[
-        Line::new(Seen::Read, "", "/lib/libc.so"),
-        Line::new(Seen::Env, "", SOCKET),
-        Line::new(Seen::Looked, "", "/root/req/1/t0"),
-        Line::new(Seen::Read, "b", "/ws/b.txt"),
-        Line::new(Seen::Read, "c", "/ws/c.txt"),
-    ]);
+    fake.append(
+        0,
+        &[
+            Line::new(Seen::Read, "", "/lib/libc.so"),
+            Line::new(Seen::Env, "", SOCKET),
+            Line::new(Seen::Looked, "", "/root/req/1/t0"),
+            Line::new(Seen::Read, "b", "/ws/b.txt"),
+            Line::new(Seen::Read, "c", "/ws/c.txt"),
+        ],
+    );
     fake.advance(Duration::from_millis(40));
     fake.end(conn, b, End::Exited(0), b"b ok");
     let result = fake.result("b");
-    assert_eq!((&result.outcome, result.output.as_slice(), result.attempts), (&Outcome::Passed, &b"b ok"[..], 1));
+    assert_eq!(
+        (&result.outcome, result.output.as_slice(), result.attempts),
+        (&Outcome::Passed, &b"b ok"[..], 1)
+    );
     assert_eq!(result.took, Duration::from_millis(40));
     assert_eq!(result.trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/b.txt")]));
     assert_eq!(result.executed, unrecorded());
@@ -379,18 +407,32 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     assert_eq!(result.outcome, Outcome::Failed(Failure::Code(101)));
     let Trace::Lines(read) = &result.trace else { panic!("{result:?}") };
     let read: Vec<(Seen, &str)> = read.iter().collect();
-    assert!(read.contains(&(Seen::Env, "HOME")) && read.contains(&(Seen::Read, "/ws/c.txt")), "{read:?}");
+    assert!(
+        read.contains(&(Seen::Env, "HOME")) && read.contains(&(Seen::Read, "/ws/c.txt")),
+        "{read:?}"
+    );
     // No line of every scope came between b's result and c's: they share one buffer of them.
-    let (Trace::Lines(b_read), Trace::Lines(c_read)) = (&fake.result("b").trace, &fake.result("c").trace) else { panic!() };
+    let (Trace::Lines(b_read), Trace::Lines(c_read)) =
+        (&fake.result("b").trace, &fake.result("c").trace)
+    else {
+        panic!()
+    };
     assert!(c_read.common_is(b_read) && c_read.common() == 1);
     assert!(fake.frames(conn).is_empty());
     // One comes before a's result: a's has a new buffer of both.
     fake.append(0, &[Line::new(Seen::Read, "", "/lib/libm.so")]);
     fake.end(conn, a, End::Exited(0), b"");
     assert_eq!(fake.result("a").outcome, Outcome::Passed);
-    let (Trace::Lines(a_read), Trace::Lines(c_read)) = (&fake.result("a").trace, &fake.result("c").trace) else { panic!() };
+    let (Trace::Lines(a_read), Trace::Lines(c_read)) =
+        (&fake.result("a").trace, &fake.result("c").trace)
+    else {
+        panic!()
+    };
     assert!(!a_read.common_is(c_read) && a_read.common() == 2);
-    assert_eq!(a_read.iter().take(2).collect::<Vec<_>>(), [(Seen::Read, "/lib/libc.so"), (Seen::Read, "/lib/libm.so")]);
+    assert_eq!(
+        a_read.iter().take(2).collect::<Vec<_>>(),
+        [(Seen::Read, "/lib/libc.so"), (Seen::Read, "/lib/libm.so")]
+    );
     assert_eq!(c_read.iter().take(1).collect::<Vec<_>>(), [(Seen::Read, "/lib/libc.so")]);
     // Nothing is left: the server is told to quit, and the queue is done once it has ended.
     assert_eq!(fake.frames(conn), vec![Frame::Quit]);
@@ -420,7 +462,10 @@ fn a_test_past_its_timeout_is_killed_and_a_server_that_does_not_kill_it_is_kille
     fake.advance(Duration::from_millis(1));
     assert_eq!(fake.frames(conn), vec![Frame::Kill { id: slow }]);
     fake.end(conn, slow, End::Signaled(9), b"partial");
-    assert_eq!(fake.result("slow").outcome, Outcome::Failed(Failure::TimedOut(Duration::from_secs(1))));
+    assert_eq!(
+        fake.result("slow").outcome,
+        Outcome::Failed(Failure::TimedOut(Duration::from_secs(1)))
+    );
     let later = fake.run(conn, 2);
     fake.end(conn, later, End::Exited(0), b"");
     fake.advance(Duration::from_secs(1));
@@ -431,7 +476,9 @@ fn a_test_past_its_timeout_is_killed_and_a_server_that_does_not_kill_it_is_kille
     let server = fake.spawn_of("/bin/lib");
     assert_eq!(fake.kills, vec![server]);
     fake.exit("/bin/lib", exited(None, Some(9), None));
-    let Outcome::Failed(Failure::Lost(why)) = &fake.result("stuck").outcome else { panic!("{:?}", fake.results) };
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("stuck").outcome else {
+        panic!("{:?}", fake.results)
+    };
     assert!(why.contains("did not end") && why.contains("lib"), "{why}");
     assert!(fake.result("stuck").output.ends_with(b"server out"));
     assert_eq!(fake.result("stuck").executed, Executed::Not(why.clone()));
@@ -481,7 +528,8 @@ fn a_flaky_test_that_fails_every_time_fails_after_its_retries() {
 fn fail_fast_stops_at_the_first_failure_and_no_fail_fast_runs_all() {
     for fail_fast in [true, false] {
         let config = Config { fail_fast, ..config(1) };
-        let mut fake = Fake::new(config, vec![binary("lib", vec![job("a", 30), job("b", 20), job("c", 10)])]);
+        let mut fake =
+            Fake::new(config, vec![binary("lib", vec![job("a", 30), job("b", 20), job("c", 10)])]);
         let conn = fake.hello(0, &["a", "b", "c"]);
         let a = fake.run(conn, 0);
         fake.end(conn, a, End::Exited(1), b"");
@@ -489,7 +537,9 @@ fn fail_fast_stops_at_the_first_failure_and_no_fail_fast_runs_all() {
         if fail_fast {
             assert_eq!(fake.result("b").outcome, Outcome::NotRun);
             assert_eq!(fake.result("c").outcome, Outcome::NotRun);
-            assert!(matches!(&fake.result("c").executed, Executed::Not(why) if why.contains("stopped")));
+            assert!(
+                matches!(&fake.result("c").executed, Executed::Not(why) if why.contains("stopped"))
+            );
             assert_eq!(fake.frames(conn), vec![Frame::Quit]);
         } else {
             let b = fake.run(conn, 1);
@@ -508,7 +558,10 @@ fn fail_fast_stops_at_the_first_failure_and_no_fail_fast_runs_all() {
 fn one_queue_over_every_binary_runs_the_longest_ready_test_first() {
     let mut fake = Fake::new(
         config(1),
-        vec![binary("a", vec![job("big", 100), job("tiny", 1)]), binary("b", vec![job("mid", 50), job("small", 20)])],
+        vec![
+            binary("a", vec![job("big", 100), job("tiny", 1)]),
+            binary("b", vec![job("mid", 50), job("small", 20)]),
+        ],
     );
     let a = fake.hello(0, &["big", "tiny"]);
     let big = fake.run(a, 0);
@@ -536,10 +589,17 @@ fn one_queue_over_every_binary_runs_the_longest_ready_test_first() {
 fn ties_in_the_order_go_by_binary_then_job() {
     let mut fake = Fake::new(
         config(1),
-        vec![binary("a", vec![job("x", 5), job("y", 9), job("z", 5)]), binary("b", vec![job("w", 5), job("v", 9)])],
+        vec![
+            binary("a", vec![job("x", 5), job("y", 9), job("z", 5)]),
+            binary("b", vec![job("w", 5), job("v", 9)]),
+        ],
     );
-    let order: Vec<(u32, u32)> =
-        fake.queue.order.iter().map(|&unit| (fake.queue.unit_bin[unit as usize], fake.queue.unit_job[unit as usize])).collect();
+    let order: Vec<(u32, u32)> = fake
+        .queue
+        .order
+        .iter()
+        .map(|&unit| (fake.queue.unit_bin[unit as usize], fake.queue.unit_job[unit as usize]))
+        .collect();
     assert_eq!(order, [(0, 1), (1, 1), (0, 0), (0, 2), (1, 0)]);
     for (at, &unit) in fake.queue.order.iter().enumerate() {
         assert_eq!(fake.queue.rank[unit as usize], at as u32);
@@ -561,7 +621,9 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
     fake.spawns.clear();
     fake.complete(spawn, Done::Failed(IoError("no user namespaces".into())));
     for test in ["a", "b"] {
-        let Outcome::Failed(Failure::Lost(why)) = &fake.result(test).outcome else { panic!("{:?}", fake.results) };
+        let Outcome::Failed(Failure::Lost(why)) = &fake.result(test).outcome else {
+            panic!("{:?}", fake.results)
+        };
         assert!(why.contains("could not be started in its sandbox: no user namespaces"), "{why}");
         assert_eq!(fake.result(test).trace, Trace::Unknown(why.clone()));
         assert_eq!(fake.result(test).executed, Executed::Not(why.clone()));
@@ -576,7 +638,8 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
 /// not known, so selection keeps nothing of it.
 #[test]
 fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
-    let mut fake = Fake::new(config(3), vec![outside("lib", vec![job("a", 30), job("b", 20), job("c", 10)])]);
+    let mut fake =
+        Fake::new(config(3), vec![outside("lib", vec![job("a", 30), job("b", 20), job("c", 10)])]);
     assert!(fake.records.is_empty(), "no record is made: {:?}", fake.records);
     let command = &fake.spawns[0].1;
     assert_eq!(command.sandbox, Sandbox::Off);
@@ -590,7 +653,10 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     fake.end_with(conn, runs[0].0, End::Exited(0), b"a ok", hits());
     fake.end(conn, runs[1].0, End::Exited(101), b"b failed");
     fake.end(conn, runs[2].0, End::Signaled(6), b"");
-    assert_eq!((&fake.result("a").outcome, fake.result("a").output.as_slice()), (&Outcome::Passed, &b"a ok"[..]));
+    assert_eq!(
+        (&fake.result("a").outcome, fake.result("a").output.as_slice()),
+        (&Outcome::Passed, &b"a ok"[..])
+    );
     assert_eq!(fake.result("a").executed, hits());
     assert_eq!(fake.result("b").outcome, Outcome::Failed(Failure::Code(101)));
     assert_eq!(fake.result("c").outcome, Outcome::Failed(Failure::Signal(6)));
@@ -624,7 +690,9 @@ fn a_test_outside_is_retried_and_lost_as_inside() {
     let spawn = fake.spawn_of("/bin/lib");
     fake.spawns.clear();
     fake.complete(spawn, Done::Failed(IoError("no such file".into())));
-    let Outcome::Failed(Failure::Lost(why)) = &fake.result("a").outcome else { panic!("{:?}", fake.results) };
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("a").outcome else {
+        panic!("{:?}", fake.results)
+    };
     assert!(why.contains("/bin/lib could not be started: no such file"), "{why}");
     assert!(fake.queue.finished());
 }
@@ -655,7 +723,10 @@ fn an_outside_and_a_sandboxed_run_of_one_program_each_run_their_own_tests() {
     // Every sandboxed test has its result: the outside run starts, on its own socket.
     assert_eq!(fake.spawns.len(), 2);
     let command = &fake.spawns[1].1;
-    assert_eq!((command.sandbox.clone(), command.program.clone()), (Sandbox::Off, PathBuf::from("/bin/lib")));
+    assert_eq!(
+        (command.sandbox.clone(), command.program.clone()),
+        (Sandbox::Off, PathBuf::from("/bin/lib"))
+    );
     assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t1".into())));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE));
     assert!(!fake.records.contains_key(&name("req/1/r1")));
@@ -663,7 +734,10 @@ fn an_outside_and_a_sandboxed_run_of_one_program_each_run_their_own_tests() {
     let home = fake.run(out, 2);
     fake.end(out, home, End::Exited(0), b"");
     let result = fake.result("writes_home");
-    assert_eq!((result.binary, &result.outcome, &result.trace), (1, &Outcome::Passed, &not_known()));
+    assert_eq!(
+        (result.binary, &result.outcome, &result.trace),
+        (1, &Outcome::Passed, &not_known())
+    );
     assert!(fake.reads.iter().all(|it| *it == name("req/1/r0")), "{:?}", fake.reads);
     assert_eq!(fake.frames(out), vec![Frame::Quit]);
     let (first, second) = (fake.spawns[0].0, fake.spawns[1].0);
@@ -714,7 +788,9 @@ fn a_binary_run_whole_outside_has_no_sandbox() {
 fn a_test_the_binary_does_not_have_is_lost() {
     let mut fake = Fake::new(config(4), vec![binary("lib", vec![job("a", 0), job("gone", 0)])]);
     let conn = fake.hello(0, &["a"]);
-    let Outcome::Failed(Failure::Lost(why)) = &fake.result("gone").outcome else { panic!("{:?}", fake.results) };
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("gone").outcome else {
+        panic!("{:?}", fake.results)
+    };
     assert!(why.contains("no test named gone"), "{why}");
     fake.run(conn, 0);
 }
@@ -743,7 +819,9 @@ fn a_server_that_breaks_the_protocol_or_hangs_up_is_killed() {
         assert_eq!(fake.kills, vec![server]);
         fake.exit("/bin/lib", exited(None, Some(9), None));
         for test in ["a", "b"] {
-            let Outcome::Failed(Failure::Lost(why)) = &fake.result(test).outcome else { panic!("{:?}", fake.results) };
+            let Outcome::Failed(Failure::Lost(why)) = &fake.result(test).outcome else {
+                panic!("{:?}", fake.results)
+            };
             assert!(why.contains(expected), "{why}");
         }
         assert!(fake.queue.finished());
@@ -811,20 +889,25 @@ fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
         let mut ignored = job("y", 5);
         ignored.ignore = true;
         let mut old = binary("old", vec![job("x", 5), ignored]);
-        old.mode = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(10) };
+        old.mode =
+            Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(10) };
         old
     };
     let mut fake = Fake::new(config(4), vec![old()]);
     assert!(fake.records.is_empty() && fake.listens.is_empty());
     let command = &fake.spawns[0].1;
-    let args: Vec<String> = command.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
+    let args: Vec<String> =
+        command.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
     assert_eq!(args, ["x", "y", "--exact", "--test-threads=2", "--include-ignored", "--nocapture"]);
     assert!(!command.env.iter().any(|it| it.0 == SOCKET));
     assert!(matches!(command.sandbox, Sandbox::On { trace: true, .. }));
     let traced = Traced { env: vec![("HOME".into(), Some("/h".into()))], ..Traced::default() };
     fake.exit("/bin/old", exited(Some(0), None, Some(traced.clone())));
     let whole = &fake.results[0];
-    assert_eq!((whole.test.as_ref(), &whole.outcome, &whole.trace), (None, &Outcome::Passed, &Trace::Whole(traced)));
+    assert_eq!(
+        (whole.test.as_ref(), &whole.outcome, &whole.trace),
+        (None, &Outcome::Passed, &Trace::Whole(traced))
+    );
     assert_eq!(whole.executed, Executed::Not(WHOLE_UNRECORDED.to_owned()));
     assert!(fake.queue.finished());
 
@@ -834,7 +917,10 @@ fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
     fake.advance(Duration::from_millis(1));
     assert_eq!(fake.kills, vec![fake.spawn_of("/bin/old")]);
     fake.exit("/bin/old", exited(None, Some(sim::KILLED), None));
-    assert_eq!(fake.results[0].outcome, Outcome::Failed(Failure::TimedOut(Duration::from_secs(10))));
+    assert_eq!(
+        fake.results[0].outcome,
+        Outcome::Failed(Failure::TimedOut(Duration::from_secs(10)))
+    );
     assert!(matches!(&fake.results[0].trace, Trace::Unknown(_)));
 }
 
@@ -860,7 +946,13 @@ fn what_a_test_executed_comes_with_its_result() {
     let runs = fake.runs(conn);
     let hits = || Executed::Hits { slots: 64, hits: vec![3, 9, 63] };
     fake.end_with(conn, runs[0].0, End::Exited(0), b"", hits());
-    fake.end_with(conn, runs[1].0, End::Exited(1), b"", Executed::Not("its region was not armed".to_owned()));
+    fake.end_with(
+        conn,
+        runs[1].0,
+        End::Exited(1),
+        b"",
+        Executed::Not("its region was not armed".to_owned()),
+    );
     assert_eq!(fake.result("a").executed, hits());
     assert_eq!(fake.result("b").executed, Executed::Not("its region was not armed".to_owned()));
 }
@@ -890,18 +982,31 @@ fn simulated(two_outside: bool) {
         let mut sim = Sim::new(seed, Faults::default());
         for program in ["/bin/one", "/bin/two"] {
             sim.program(program, |_: &Command, _: &mut Rng| sim::Ran {
-                exit: Exit { code: Some(0), signal: None, stdout: Vec::new(), stderr: Vec::new(), traced: Some(Traced::default()), peak_memory: 0 },
+                exit: Exit {
+                    code: Some(0),
+                    signal: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    traced: Some(Traced::default()),
+                    peak_memory: 0,
+                },
                 takes: Duration::from_secs(3600),
             });
         }
         let mut one = binary("one", vec![job("a", 30), job("fails", 20), job("c", 10)]);
         one.jobs[1].retries = 0;
-        let two = Binary { sandboxed: !two_outside, ..binary("two", vec![job("d", 50), job("e", 5)]) };
+        let two =
+            Binary { sandboxed: !two_outside, ..binary("two", vec![job("d", 50), job("e", 5)]) };
         let mut effects = Vec::new();
         let mut queue = Queue::new(config(2), vec![one, two], sim.now(), &mut effects);
         let mut played: Vec<Played> = [vec!["a", "fails", "c"], vec!["d", "e"]]
             .into_iter()
-            .map(|tests| Played { tests: tests.into_iter().map(str::to_owned).collect(), conn: None, frames: Frames::new(), quit: false })
+            .map(|tests| Played {
+                tests: tests.into_iter().map(str::to_owned).collect(),
+                conn: None,
+                frames: Frames::new(),
+                quit: false,
+            })
             .collect();
         let mut results = Vec::new();
         let mut out = Vec::new();
@@ -917,7 +1022,12 @@ fn simulated(two_outside: bool) {
                 let Some(conn) = server.conn.or_else(|| sim.dial(&socket).ok()) else { continue };
                 if server.conn.is_none() {
                     server.conn = Some(conn);
-                    let hello = Frame::Hello { version: wire::VERSION, pid: 7, fork: 0, tests: server.tests.clone() };
+                    let hello = Frame::Hello {
+                        version: wire::VERSION,
+                        pid: 7,
+                        fork: 0,
+                        tests: server.tests.clone(),
+                    };
                     sim.peer_send(conn, &hello.to_bytes());
                 }
                 server.frames.push(&sim.peer_received(conn));
@@ -926,11 +1036,18 @@ fn simulated(two_outside: bool) {
                         Frame::Run { id, index } => {
                             let test = &server.tests[index as usize];
                             if two_outside && b == 1 {
-                                assert!(results.len() >= 3, "seed {seed}: two ran before one's tests had results");
+                                assert!(
+                                    results.len() >= 3,
+                                    "seed {seed}: two ran before one's tests had results"
+                                );
                             } else {
                                 let record = name(&format!("req/1/r{b}"));
                                 let mut bytes = sim.contents(&record);
-                                bytes.extend_from_slice(Line::new(Seen::Read, test, &format!("/ws/{test}")).text().as_bytes());
+                                bytes.extend_from_slice(
+                                    Line::new(Seen::Read, test, &format!("/ws/{test}"))
+                                        .text()
+                                        .as_bytes(),
+                                );
                                 sim.change(&record, &bytes);
                             }
                             let end = match test.as_str() {
@@ -938,7 +1055,12 @@ fn simulated(two_outside: bool) {
                                 _ => End::Exited(0),
                             };
                             let executed = Executed::Hits { slots: 16, hits: vec![index] };
-                            let ended = Frame::Ended { id, end, output: test.as_bytes().to_vec(), executed };
+                            let ended = Frame::Ended {
+                                id,
+                                end,
+                                output: test.as_bytes().to_vec(),
+                                executed,
+                            };
                             sim.peer_send(conn, &ended.to_bytes());
                         }
                         Frame::Quit => {
@@ -974,15 +1096,23 @@ fn simulated(two_outside: bool) {
                 false => lines(&[(Seen::Read, &format!("/ws/{test}"))]),
             };
             assert_eq!(result.trace, trace, "seed {seed}");
-            let index = played[result.binary].tests.iter().position(|it| it == test).unwrap() as u32;
-            assert_eq!(result.executed, Executed::Hits { slots: 16, hits: vec![index] }, "seed {seed}");
+            let index =
+                played[result.binary].tests.iter().position(|it| it == test).unwrap() as u32;
+            assert_eq!(
+                result.executed,
+                Executed::Hits { slots: 16, hits: vec![index] },
+                "seed {seed}"
+            );
         }
     }
 }
 
 #[test]
 fn what_one_call_says_to_a_server_goes_as_one_send_with_the_timer_after_it() {
-    let mut fake = Fake::new(config(4), vec![binary("lib", vec![job("a", 4), job("b", 3), job("c", 2), job("d", 1)])]);
+    let mut fake = Fake::new(
+        config(4),
+        vec![binary("lib", vec![job("a", 4), job("b", 3), job("c", 2), job("d", 1)])],
+    );
     let before = fake.sends;
     let conn = fake.hello(0, &["a", "b", "c", "d"]);
     assert_eq!(fake.sends, before + 1);
@@ -1017,7 +1147,16 @@ fn a_line_of_every_scope_is_given_once_however_often_it_comes() {
     let a = fake.run(conn, 0);
     let libc = Line::new(Seen::Read, "", "/lib/libc.so");
     let looked = Line::new(Seen::Looked, "", "/lib/libc.so");
-    fake.append(0, &[libc.clone(), libc.clone(), looked.clone(), Line::new(Seen::Read, "a", "/ws/a"), libc.clone()]);
+    fake.append(
+        0,
+        &[
+            libc.clone(),
+            libc.clone(),
+            looked.clone(),
+            Line::new(Seen::Read, "a", "/ws/a"),
+            libc.clone(),
+        ],
+    );
     fake.end(conn, a, End::Exited(0), b"");
     let common = [(Seen::Read, "/lib/libc.so"), (Seen::Looked, "/lib/libc.so")];
     assert_eq!(fake.result("a").trace, lines(&[common[0], common[1], (Seen::Read, "/ws/a")]));
@@ -1059,7 +1198,11 @@ fn a_line_is_read_in_place_as_line_parse_reads_it() {
     for _ in 0..20_000 {
         let len = rng.index(12);
         let text: String = (0..len).map(|_| alphabet[rng.index(alphabet.len())]).collect();
-        let read = record_line(&text).map(|(seen, scope, what)| Line { seen, scope: scope.to_owned(), what: what.to_owned() });
+        let read = record_line(&text).map(|(seen, scope, what)| Line {
+            seen,
+            scope: scope.to_owned(),
+            what: what.to_owned(),
+        });
         assert_eq!(read, Line::parse(&text), "{text:?}");
     }
 }
@@ -1071,7 +1214,10 @@ fn a_packed_line_reads_back_its_kind() {
         assert_eq!(seen as usize, at);
         assert_eq!(unpack(pack(names::MOST - 1, seen)), (names::MOST - 1, seen));
         assert_eq!(Seen::of(&Line::new(seen, "", "").text()[..1]), Some(seen));
-        assert_eq!(record_line(&format!("{}\t\tx", &Line::new(seen, "", "").text()[..1])), Some((seen, "", "x")));
+        assert_eq!(
+            record_line(&format!("{}\t\tx", &Line::new(seen, "", "").text()[..1])),
+            Some((seen, "", "x"))
+        );
     }
 }
 
@@ -1149,12 +1295,21 @@ fn steady_state(fork: u64, sandboxed: bool) {
     let mut ended = 0;
     let mut high = None;
     while ended < 600 {
-        let runs: Vec<(Conn, u64, u32)> =
-            conns.clone().into_iter().flat_map(|conn| fake.runs(conn).into_iter().map(move |(id, index)| (conn, id, index))).collect();
+        let runs: Vec<(Conn, u64, u32)> = conns
+            .clone()
+            .into_iter()
+            .flat_map(|conn| fake.runs(conn).into_iter().map(move |(id, index)| (conn, id, index)))
+            .collect();
         assert!(!runs.is_empty(), "nothing runs after {ended}");
         for (conn, id, index) in runs {
             if sandboxed {
-                fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, names[index as usize], "/ws/x")]);
+                fake.append(
+                    0,
+                    &[
+                        Line::new(Seen::Read, "", "/lib/libc.so"),
+                        Line::new(Seen::Read, names[index as usize], "/ws/x"),
+                    ],
+                );
             }
             let before = fake.allocations;
             fake.advance(Duration::from_millis(3));
@@ -1167,11 +1322,19 @@ fn steady_state(fork: u64, sandboxed: bool) {
             // Outside, no line and no read, and the reason its trace is not known.
             const PER_TEST: u64 = 8;
             let used = fake.allocations - before;
-            assert!(ended < 100 || used <= PER_TEST, "test {ended}: {used} allocations, budget {PER_TEST}");
+            assert!(
+                ended < 100 || used <= PER_TEST,
+                "test {ended}: {used} allocations, budget {PER_TEST}"
+            );
         }
         let queue = &fake.queue;
         let server = queue.bins[0].server.as_ref().unwrap();
-        let now = (queue.attempts.len(), queue.tags.len(), server.waiting.capacity(), server.next.capacity());
+        let now = (
+            queue.attempts.len(),
+            queue.tags.len(),
+            server.waiting.capacity(),
+            server.next.capacity(),
+        );
         if ended == 100 {
             high = Some(now);
         }
@@ -1182,7 +1345,10 @@ fn steady_state(fork: u64, sandboxed: bool) {
             assert_eq!(now, high, "after {ended} tests");
         }
         // A sandboxed test holds its slot until its record is read, after the next one is sent.
-        assert!(queue.attempts.len() <= 4 + usize::from(sandboxed) && queue.wheel.len() <= 8, "{now:?}");
+        assert!(
+            queue.attempts.len() <= 4 + usize::from(sandboxed) && queue.wheel.len() <= 8,
+            "{now:?}"
+        );
     }
     assert_eq!(fake.results.len(), 600);
     assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));
@@ -1227,7 +1393,8 @@ fn names_of(count: usize) -> Vec<String> {
 fn tests_are_spread_across_replicas() {
     let names = names_of(12);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut fake = Fake::new(config(4), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let mut fake =
+        Fake::new(config(4), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
     let first = fake.hello_with(0, &names, 1_000_000, 1);
     let sent = fake.frames(first);
     assert_eq!(sent[0], Frame::Replicate { count: 3 }, "asked first: {sent:?}");
@@ -1284,12 +1451,14 @@ fn tests_are_spread_across_replicas() {
 fn a_replica_that_dies_mid_test_fails_only_its_own_test() {
     let names = names_of(6);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut fake = Fake::new(config(3), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let mut fake =
+        Fake::new(config(3), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
     let first = fake.hello_with(0, &names, 1_000_000, 1);
     assert_eq!(fake.replicate(first), Some(2));
     let runs = fake.runs(first);
     assert_eq!(indices(&runs), [0, 1, 2]);
-    let (second, third) = (fake.hello_with(0, &names, 1_000_000, 2), fake.hello_with(0, &names, 1_000_000, 3));
+    let (second, third) =
+        (fake.hello_with(0, &names, 1_000_000, 2), fake.hello_with(0, &names, 1_000_000, 3));
     // Each end frees a core for the next replica with room: the server runs two still.
     fake.end(first, runs[0].0, End::Exited(0), b"");
     let on_second = fake.run(second, 3);
@@ -1302,7 +1471,10 @@ fn a_replica_that_dies_mid_test_fails_only_its_own_test() {
     let lost = fake.result("t3");
     let Outcome::Failed(Failure::Lost(why)) = &lost.outcome else { panic!("{lost:?}") };
     assert!(why.contains("lib: replica 1 of its fork server (pid 2) closed its socket"), "{why}");
-    assert_eq!((&lost.trace, &lost.executed, lost.attempts), (&Trace::Unknown(why.clone()), &Executed::Not(why.clone()), 1));
+    assert_eq!(
+        (&lost.trace, &lost.executed, lost.attempts),
+        (&Trace::Unknown(why.clone()), &Executed::Not(why.clone()), 1)
+    );
     assert!(fake.kills.is_empty(), "the server and its other replicas carry on");
     let server = fake.queue.bins[0].server.as_ref().unwrap();
     assert_eq!((server.live, server.room), (2, 2));
@@ -1327,14 +1499,17 @@ fn a_replica_that_dies_mid_test_fails_only_its_own_test() {
 fn a_replica_a_send_to_breaks_is_lost() {
     let names = names_of(4);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let mut fake =
+        Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
     let first = fake.hello_with(0, &names, 1_000_000, 1);
     assert_eq!(fake.replicate(first), Some(1));
     let runs = fake.runs(first);
     let second = fake.hello_with(0, &names, 1_000_000, 2);
     fake.breaks.push(second);
     fake.end(first, runs[0].0, End::Exited(0), b"");
-    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else { panic!("{:?}", fake.results) };
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else {
+        panic!("{:?}", fake.results)
+    };
     assert!(why.contains("replica 1") && why.contains("could not be sent to"), "{why}");
     assert!(fake.kills.is_empty(), "the server carries on");
     assert!(fake.frames(second).is_empty(), "nothing reached it");
@@ -1351,7 +1526,8 @@ fn a_replica_a_send_to_breaks_is_lost() {
 fn an_end_on_another_replica_s_connection_loses_only_that_replica() {
     let names = names_of(4);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let mut fake =
+        Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
     let first = fake.hello_with(0, &names, 1_000_000, 1);
     assert_eq!(fake.replicate(first), Some(1));
     let runs = fake.runs(first);
@@ -1359,7 +1535,9 @@ fn an_end_on_another_replica_s_connection_loses_only_that_replica() {
     fake.end(first, runs[0].0, End::Exited(0), b"");
     let on_second = fake.run(second, 2);
     fake.end(second, runs[1].0, End::Exited(0), b"");
-    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else { panic!("{:?}", fake.results) };
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else {
+        panic!("{:?}", fake.results)
+    };
     assert!(why.contains("replica 1") && why.contains("broke the protocol"), "{why}");
     assert!(fake.hangups.contains(&second) && fake.kills.is_empty());
     let _ = on_second;
@@ -1377,7 +1555,8 @@ fn an_end_on_another_replica_s_connection_loses_only_that_replica() {
 fn a_replica_s_hello_may_come_late() {
     let names = names_of(4);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let mut fake =
+        Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
     let first = fake.hello_with(0, &names, 1_000_000, 1);
     assert_eq!(fake.replicate(first), Some(1));
     let runs = fake.runs(first);
@@ -1415,7 +1594,8 @@ fn a_replica_s_hello_may_come_late() {
 /// A replica's hello must name the first's tests, and a replica can't ask again.
 #[test]
 fn a_replica_with_other_tests_or_a_second_hello_is_lost() {
-    let mut fake = Fake::new(config(3), vec![binary("lib", vec![job("a", 0), job("b", 0), job("c", 0)])]);
+    let mut fake =
+        Fake::new(config(3), vec![binary("lib", vec![job("a", 0), job("b", 0), job("c", 0)])]);
     let first = fake.hello_with(0, &["a", "b", "c"], 1_000_000, 1);
     assert_eq!(fake.replicate(first), Some(2));
     let other = fake.hello_with(0, &["a", "b"], 1_000_000, 2);
@@ -1423,7 +1603,11 @@ fn a_replica_with_other_tests_or_a_second_hello_is_lost() {
     let again = fake.hello_with(0, &["a", "b", "c"], 1_000_000, 3);
     fake.say_hello(again, &["a", "b", "c"], 1_000_000, 3);
     assert!(fake.hangups.contains(&again));
-    assert!(fake.kills.is_empty() && fake.results.is_empty(), "the server runs a, b and c: {:?}", fake.results);
+    assert!(
+        fake.kills.is_empty() && fake.results.is_empty(),
+        "the server runs a, b and c: {:?}",
+        fake.results
+    );
     assert_eq!(fake.runs(first).len(), 3);
 }
 
@@ -1438,7 +1622,10 @@ fn replicas_give_the_results_of_one_server() {
     assert_eq!(one.0, four.0);
     let flaky = one.0.iter().find(|it| it.test.as_deref() == Some("flaky")).unwrap();
     assert_eq!((&flaky.outcome, flaky.attempts), (&Outcome::Passed, 2));
-    assert!(one.0.iter().any(|it| it.test.as_deref() == Some("bad") && it.outcome == Outcome::Failed(Failure::Code(1))));
+    assert!(
+        one.0.iter().any(|it| it.test.as_deref() == Some("bad")
+            && it.outcome == Outcome::Failed(Failure::Code(1)))
+    );
 }
 
 /// Ten tests through four cores, each ended in the order it was sent, with a fork of `fork`
@@ -1455,7 +1642,8 @@ fn drive(fork: u64) -> (Vec<Finished>, usize) {
     let first = fake.hello_with(0, &names, fork, 1);
     let mut conns = vec![first];
     let count = fake.replicate(first).unwrap_or(0);
-    let mut flight: VecDeque<(Conn, u64, u32)> = fake.runs(first).into_iter().map(|(id, index)| (first, id, index)).collect();
+    let mut flight: VecDeque<(Conn, u64, u32)> =
+        fake.runs(first).into_iter().map(|(id, index)| (first, id, index)).collect();
     for pid in 0..count {
         conns.push(fake.hello_with(0, &names, fork, 2 + pid));
     }
@@ -1464,7 +1652,13 @@ fn drive(fork: u64) -> (Vec<Finished>, usize) {
     while let Some((conn, id, index)) = flight.pop_front() {
         used.insert(conn.0);
         let name = names[index as usize];
-        fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, name, &format!("/ws/{name}"))]);
+        fake.append(
+            0,
+            &[
+                Line::new(Seen::Read, "", "/lib/libc.so"),
+                Line::new(Seen::Read, name, &format!("/ws/{name}")),
+            ],
+        );
         fake.advance(Duration::from_millis(1));
         let tried = tries.entry(index).or_default();
         *tried += 1;

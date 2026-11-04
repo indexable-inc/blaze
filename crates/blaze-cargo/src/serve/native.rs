@@ -128,7 +128,8 @@ pub(crate) fn ensure(
         return Ok(dir);
     }
     let failed_io = |what: &str, error: io::Error| refused(input, &format!("{what}: {error}"));
-    fs::create_dir_all(native).map_err(|e| failed_io(&format!("creating {}", native.display()), e))?;
+    fs::create_dir_all(native)
+        .map_err(|e| failed_io(&format!("creating {}", native.display()), e))?;
     let lock_path = native.join(format!(".sha256-{}.lock", input.sha256));
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -151,14 +152,18 @@ pub(crate) fn ensure(
     .entered();
     // What a layout of this digest that stopped left, by this process or any other: the lock
     // is held, so none is being written.
-    remove_stale(native, &input.sha256).map_err(|e| failed_io(&format!("removing what a layout that stopped left in {}", native.display()), e))?;
+    remove_stale(native, &input.sha256).map_err(|e| {
+        failed_io(&format!("removing what a layout that stopped left in {}", native.display()), e)
+    })?;
     let digest = blaze_fetch::Digest::parse(&format!("sha256:{}", input.sha256))
         .map_err(|e| refused(input, &format!("the pinned sha256 is not a digest: {e}")))?;
     // clone: once an input
     let source = blaze_fetch::Source::Url { url: input.url.clone(), digest };
     let object = fetcher.get(&source).map_err(|e| refused(input, &format!("fetching it: {e}")))?;
     let downloads = native.join(".downloads");
-    let archive = fetcher.materialize(&object, &downloads).map_err(|e| refused(input, &format!("writing it out: {e}")))?;
+    let archive = fetcher
+        .materialize(&object, &downloads)
+        .map_err(|e| refused(input, &format!("writing it out: {e}")))?;
     let part = native.join(format!(".sha256-{}.part-{}", input.sha256, std::process::id()));
     let made = lay_out(input, &digest, &archive, &part, &dir, native);
     // The archive stays in the store, by its digest; this copy was only to read it from.
@@ -174,14 +179,31 @@ pub(crate) fn ensure(
 
 /// The archive at `archive` unpacked into `part`, held to `digest` as it is read, marked,
 /// synced, sealed and renamed to `dir`, under `native`.
-fn lay_out(input: &NativeInput, digest: &blaze_fetch::Digest, archive: &Path, part: &Path, dir: &Path, native: &Path) -> Result<(), String> {
+fn lay_out(
+    input: &NativeInput,
+    digest: &blaze_fetch::Digest,
+    archive: &Path,
+    part: &Path,
+    dir: &Path,
+    native: &Path,
+) -> Result<(), String> {
     fs::create_dir(part).map_err(|e| format!("creating {}: {e}", part.display()))?;
     let file = File::open(archive).map_err(|e| format!("opening {}: {e}", archive.display()))?;
     let mut raw = HashingRead { inner: file, hashing: blaze_fetch::Hashing::new(digest.algo()) };
     let mut unpacked = {
-        let mut xz = lzma_rust2::XzReader::new_mem_limit(BufReader::with_capacity(1 << 20, &mut raw), false, XZ_MEMORY_KIB);
+        let mut xz = lzma_rust2::XzReader::new_mem_limit(
+            BufReader::with_capacity(1 << 20, &mut raw),
+            false,
+            XZ_MEMORY_KIB,
+        );
         let rules = Rules {
-            names: NameRules { top: None, fold: true, twice: Twice::Refuse, reserved: &[MARK], most_path: MOST_PATH },
+            names: NameRules {
+                top: None,
+                fold: true,
+                twice: Twice::Refuse,
+                reserved: &[MARK],
+                most_path: MOST_PATH,
+            },
             links: true,
             modes: Modes::ReadOnly,
             skip: &[],
@@ -199,11 +221,16 @@ fn lay_out(input: &NativeInput, digest: &blaze_fetch::Digest, archive: &Path, pa
     io::copy(&mut raw, &mut io::sink()).map_err(|e| format!("reading the archive: {e}"))?;
     let got = raw.hashing.finish().digest;
     if got != *digest {
-        return Err(format!("the bytes unpacked are {got}, not the pinned {digest}: the copy changed as it was read"));
+        return Err(format!(
+            "the bytes unpacked are {got}, not the pinned {digest}: the copy changed as it was read"
+        ));
     }
     let mut mark = mark_line(&input.sha256).into_bytes();
     mark.push(b'\n');
-    mark.extend(tree::listing(&mut unpacked.entries).map_err(|e| format!("listing what it unpacked to: {e}"))?);
+    mark.extend(
+        tree::listing(&mut unpacked.entries)
+            .map_err(|e| format!("listing what it unpacked to: {e}"))?,
+    );
     if mark.len() as u64 > MOST_MARK {
         return Err(format!("its listing is {} bytes, more than {MOST_MARK}", mark.len()));
     }
@@ -221,7 +248,8 @@ fn lay_out(input: &NativeInput, digest: &blaze_fetch::Digest, archive: &Path, pa
     unpack::sync_dir(part).map_err(|e| format!("syncing {}: {e}", part.display()))?;
     // Sealed before it moves: a rename within one directory asks nothing of the one renamed.
     unpack::seal_dir(part).map_err(|e| format!("making {} read-only: {e}", part.display()))?;
-    fs::rename(part, dir).map_err(|e| format!("moving {} to {}: {e}", part.display(), dir.display()))?;
+    fs::rename(part, dir)
+        .map_err(|e| format!("moving {} to {}: {e}", part.display(), dir.display()))?;
     unpack::sync_dir(native).map_err(|e| format!("syncing {}: {e}", native.display()))
 }
 
@@ -270,7 +298,10 @@ fn laid_out(input: &NativeInput, dir: &Path, verified: &Verified) -> Result<bool
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(refused(input, &format!("reading {}: {error}", dir.display()))),
         Ok(meta) if !meta.is_dir() => {
-            return Err(refused(input, &format!("{} is there and is no directory; {}", dir.display(), remove_hint(dir))));
+            return Err(refused(
+                input,
+                &format!("{} is there and is no directory; {}", dir.display(), remove_hint(dir)),
+            ));
         }
         Ok(_) => {}
     }
@@ -289,10 +320,20 @@ fn laid_out(input: &NativeInput, dir: &Path, verified: &Verified) -> Result<bool
             ));
         }
     };
-    let changed = |what: String| refused(input, &format!("{what}: the layout was changed since it was laid out; {}", remove_hint(dir)));
-    let (line, listing) = mark.split_at(mark.iter().position(|it| *it == b'\n').map_or(mark.len(), |at| at + 1));
+    let changed = |what: String| {
+        refused(
+            input,
+            &format!("{what}: the layout was changed since it was laid out; {}", remove_hint(dir)),
+        )
+    };
+    let (line, listing) =
+        mark.split_at(mark.iter().position(|it| *it == b'\n').map_or(mark.len(), |at| at + 1));
     if line.strip_suffix(b"\n") != Some(mark_line(&input.sha256).as_bytes()) {
-        return Err(changed(format!("{} says `{}`, not this digest", mark_path.display(), String::from_utf8_lossy(line).trim())));
+        return Err(changed(format!(
+            "{} says `{}`, not this digest",
+            mark_path.display(),
+            String::from_utf8_lossy(line).trim()
+        )));
     }
     if verified.0.lock().contains(&input.sha256) {
         return Ok(true);
@@ -309,8 +350,10 @@ fn laid_out(input: &NativeInput, dir: &Path, verified: &Verified) -> Result<bool
         bytes = tracing::field::Empty,
     );
     let _entered = span.enter();
-    let want = tree::parse(listing).map_err(|e| changed(format!("{} lists nothing blaze reads: {e}", mark_path.display())))?;
-    let got = unpack::walk(dir, &[MARK], true).map_err(|e| changed(format!("in {}, {e}", dir.display())))?;
+    let want = tree::parse(listing)
+        .map_err(|e| changed(format!("{} lists nothing blaze reads: {e}", mark_path.display())))?;
+    let got = unpack::walk(dir, &[MARK], true)
+        .map_err(|e| changed(format!("in {}, {e}", dir.display())))?;
     span.record("files", got.len() as u64);
     span.record("bytes", got.iter().map(|it| it.len).sum::<u64>());
     if let Some((path, how)) = unpack::first_difference(&got, &want) {
@@ -332,7 +375,12 @@ fn read_mark(path: &Path) -> io::Result<Vec<u8>> {
 
 /// `lock` taken, waiting at most [`LOCK_WAIT`] for another process laying out the same input,
 /// and no longer once `cancelled` is set.
-fn lock_within(input: &NativeInput, lock: File, path: &Path, cancelled: &AtomicBool) -> Result<stdx::file_lock::Locked, ApiError> {
+fn lock_within(
+    input: &NativeInput,
+    lock: File,
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<stdx::file_lock::Locked, ApiError> {
     let mut lock = lock;
     let start = Instant::now();
     let mut span = None;
@@ -340,10 +388,15 @@ fn lock_within(input: &NativeInput, lock: File, path: &Path, cancelled: &AtomicB
         match stdx::file_lock::Locked::try_lock(lock) {
             Ok(Ok(locked)) => return Ok(locked),
             Ok(Err(file)) => lock = file,
-            Err(error) => return Err(refused(input, &format!("locking {}: {error}", path.display()))),
+            Err(error) => {
+                return Err(refused(input, &format!("locking {}: {error}", path.display())));
+            }
         }
         if cancelled.load(Ordering::Acquire) {
-            return Err(refused(input, &format!("cancelled while another process held {} laying it out", path.display())));
+            return Err(refused(
+                input,
+                &format!("cancelled while another process held {} laying it out", path.display()),
+            ));
         }
         let waited = start.elapsed();
         if waited >= LOCK_WAIT {
@@ -370,7 +423,10 @@ fn lock_within(input: &NativeInput, lock: File, path: &Path, cancelled: &AtomicB
 }
 
 /// Holds this IO thread for one look at a lock another process holds: the driver's timer.
-#[allow(clippy::disallowed_methods, reason = "an IO thread's poll of a file lock another process holds, bounded by LOCK_WAIT and the job's cancellation")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "an IO thread's poll of a file lock another process holds, bounded by LOCK_WAIT and the job's cancellation"
+)]
 fn wait_out(wait: Duration) {
     std::thread::sleep(wait);
 }

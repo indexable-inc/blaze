@@ -33,10 +33,7 @@ pub struct ExplicitTestCase {
 impl ExplicitTestCase {
     #[doc(hidden)]
     pub fn new() -> Self {
-        ExplicitTestCase {
-            values: RefCell::new(HashMap::new()),
-            notes: RefCell::new(Vec::new()),
-        }
+        ExplicitTestCase { values: RefCell::new(HashMap::new()), notes: RefCell::new(Vec::new()) }
     }
 
     #[doc(hidden)]

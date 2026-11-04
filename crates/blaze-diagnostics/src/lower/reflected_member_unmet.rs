@@ -44,12 +44,18 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: hir::ReflectedMemberUnmet<'db>) ->
     // alloc: each arm, the error's text, for an error hir found
     let message = match (&member_ty, &missing_trait) {
         (Some(ty), Some(trait_)) => {
-            format!("{member} of `{container}` has type `{ty}`, which does not implement `{trait_}`")
+            format!(
+                "{member} of `{container}` has type `{ty}`, which does not implement `{trait_}`"
+            )
         }
         (Some(ty), None) => {
-            format!("{member} of `{container}`, of type `{ty}`, does not meet the bound over every {domain} of `{container}`")
+            format!(
+                "{member} of `{container}`, of type `{ty}`, does not meet the bound over every {domain} of `{container}`"
+            )
         }
-        (None, _) => format!("{member} of `{container}` does not meet the bound over every {domain} of `{container}`"),
+        (None, _) => format!(
+            "{member} of `{container}` does not meet the bound over every {domain} of `{container}`"
+        ),
     };
     // clone: on the error path, for an error hir found
     let mut diag = Diag::error(None, message, span.clone());

@@ -36,24 +36,31 @@ static REQUESTS: AtomicU64 = AtomicU64::new(1);
 /// Where the daemon published lazy function `lazy`'s code, or why it can't.
 pub fn fetch(lazy: u32) -> Result<u64, String> {
     // alloc: every `format!` and `to_owned` here is an error, after which the run aborts.
-    let attached = runtime::attach().map_err(|it| format!("asking the daemon for its code: {it}"))?;
+    let attached =
+        runtime::attach().map_err(|it| format!("asking the daemon for its code: {it}"))?;
     let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
     let mut answer = [0u8; ask::MOST_BODY];
     let (kind, len) = attached
         .request_into(ASK_KIND, &wire::ask(request, lazy), &mut answer) // alloc: below, an error
         .map_err(|it| format!("asking the daemon for its code: {it}"))?;
     // alloc: an error.
-    let answer = answer.get(..len).ok_or_else(|| format!("the daemon's answer of {len} bytes, past the {} asked for", ask::MOST_BODY))?;
+    let answer = answer.get(..len).ok_or_else(|| {
+        format!("the daemon's answer of {len} bytes, past the {} asked for", ask::MOST_BODY)
+    })?;
     let frame = Frame::decode(answer).map_err(|it| format!("the daemon's answer: {it}"))?; // alloc: an error
     if wire::channel_kind(&frame) != kind {
         return Err(format!("the daemon's answer of kind {:#06x} carries {frame:?}", kind.0)); // alloc: an error
     }
     match frame {
-        Frame::Ready { request: asked, lazy: of, target } if asked == request && of == lazy && target != 0 => {
+        Frame::Ready { request: asked, lazy: of, target }
+            if asked == request && of == lazy && target != 0 =>
+        {
             Ok(target)
         }
         // alloc: the daemon's reason, after which the run aborts.
-        Frame::Failed { request: asked, lazy: of, why } if asked == request && of == lazy => Err(why.to_owned()),
+        Frame::Failed { request: asked, lazy: of, why } if asked == request && of == lazy => {
+            Err(why.to_owned())
+        }
         other => Err(format!("the daemon answered {other:?} to ask {request}")), // alloc: an error
     }
 }

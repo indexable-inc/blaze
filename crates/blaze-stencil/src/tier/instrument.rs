@@ -87,11 +87,17 @@ pub fn instrument(func: &mut ir::Function) -> Result<(), Error> {
 /// Moves successor `index` of `inst` to a new block right after `inst`'s that counts a back
 /// edge and jumps to the successor with its arguments: plain values, which dominate the new
 /// block as they do the branch.
-fn split(func: &mut ir::Function, cells: ir::GlobalValue, inst: ir::Inst, index: usize) -> Result<(), Error> {
+fn split(
+    func: &mut ir::Function,
+    cells: ir::GlobalValue,
+    inst: ir::Inst,
+    index: usize,
+) -> Result<(), Error> {
     let Some(block) = func.layout.inst_block(inst) else {
         return Err(Error::at(inst, "a branch outside the layout"));
     };
-    let call = func.dfg.insts[inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[index];
+    let call = func.dfg.insts[inst]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[index];
     let target = call.block(&func.dfg.value_lists);
     // alloc: inline up to 8 arguments; the pool is borrowed while the jump is built.
     let args: SmallVec<[ir::BlockArg; 8]> = call.args(&func.dfg.value_lists).collect();
@@ -103,7 +109,8 @@ fn split(func: &mut ir::Function, cells: ir::GlobalValue, inst: ir::Inst, index:
     cursor.ins().jump(target, &args);
     let dfg = &mut func.dfg;
     let moved = ir::BlockCall::new(edge, std::iter::empty::<ir::BlockArg>(), &mut dfg.value_lists);
-    dfg.insts[inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[index] = moved;
+    dfg.insts[inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        [index] = moved;
     Ok(())
 }
 

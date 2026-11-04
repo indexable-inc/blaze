@@ -23,8 +23,8 @@ use crate::{
     lower::{
         Found, Phase,
         unresolved_method_call::{
-            NoMatch, adt_fact, likely_intended, not_found_for_this, not_found_label, similar_candidate,
-            traits_to_import,
+            NoMatch, adt_fact, likely_intended, not_found_for_this, not_found_label,
+            similar_candidate, traits_to_import,
         },
     },
     model::{Diag, Span},
@@ -126,9 +126,17 @@ fn qualifier_ty<'db>(cx: &Cx<'_, 'db>, qualifier: ast::Path<'db>) -> Option<hir:
 
 /// E0599 where the type the item was looked for on is not known here: rustc's message with the
 /// qualifier as written, so the program is still refused at the name.
-fn unknown(cx: &Cx<'_, '_>, d: &hir::UnresolvedAssocItem<'_>, span: Span, qualifier: &str, name: &str) -> Found {
+fn unknown(
+    cx: &Cx<'_, '_>,
+    d: &hir::UnresolvedAssocItem<'_>,
+    span: Span,
+    qualifier: &str,
+    name: &str,
+) -> Found {
     // alloc: the error's text, for an error hir found
-    let message = format!("no associated function or constant named `{name}` found for `{qualifier}` in the current scope");
+    let message = format!(
+        "no associated function or constant named `{name}` found for `{qualifier}` in the current scope"
+    );
     // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0599"), message, span.clone());
     // alloc: the error's text, for an error hir found

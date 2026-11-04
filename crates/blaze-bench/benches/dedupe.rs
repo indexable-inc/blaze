@@ -37,7 +37,12 @@ fn function(body: usize, instance: usize) -> CompiledFunction {
     code[4] = class;
     let relocs = match body % RUN {
         0 => Vec::new(),
-        _ => vec![Relocation { at: 8, kind: RelocKind::PcRel32, target: Target::Direct(key(body - 1, instance)), addend: -4 }],
+        _ => vec![Relocation {
+            at: 8,
+            kind: RelocKind::PcRel32,
+            target: Target::Direct(key(body - 1, instance)),
+            addend: -4,
+        }],
     };
     CompiledFunction {
         key: key(body, instance),
@@ -56,7 +61,9 @@ fn function(body: usize, instance: usize) -> CompiledFunction {
 }
 
 fn build() -> Vec<CompiledFunction> {
-    (0..BODIES).flat_map(|body| (0..INSTANCES).map(move |instance| function(body, instance))).collect()
+    (0..BODIES)
+        .flat_map(|body| (0..INSTANCES).map(move |instance| function(body, instance)))
+        .collect()
 }
 
 fn exported(key: &InstanceKey) -> bool {
@@ -65,7 +72,11 @@ fn exported(key: &InstanceKey) -> bool {
 
 /// Folds `functions`: the number merged away.
 fn fold(functions: &mut Vec<CompiledFunction>) -> usize {
-    blaze_codegen::dedupe::dedupe(functions, &mut [], |it| !exported(it)).expect("a fixpoint").0.merged.len()
+    blaze_codegen::dedupe::dedupe(functions, &mut [], |it| !exported(it))
+        .expect("a fixpoint")
+        .0
+        .merged
+        .len()
 }
 
 fn benchmarks() -> impl IntoBenchmarks {

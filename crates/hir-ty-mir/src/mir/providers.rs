@@ -30,6 +30,5 @@ fn interpret_mir<'db>(
     body: &'db MirBody<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, MirEvalError<'db>> {
-    eval::interpret_mir(db, body, trait_env)
-        .and_then(|(value, _)| value)
+    eval::interpret_mir(db, body, trait_env).and_then(|(value, _)| value)
 }

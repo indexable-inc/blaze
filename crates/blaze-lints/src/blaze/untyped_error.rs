@@ -81,7 +81,9 @@ struct Kinds {
 impl Kinds {
     fn of(cx: &Cx<'_, '_>) -> Option<Kinds> {
         let db = cx.db();
-        let Some(hir::ModuleDef::Adt(result)) = cx.std_def(&["core", "result", "Result"]) else { return None };
+        let Some(hir::ModuleDef::Adt(result)) = cx.std_def(&["core", "result", "Result"]) else {
+            return None;
+        };
         let lang = lang_items(db, cx.krate().base());
         Some(Kinds {
             result,

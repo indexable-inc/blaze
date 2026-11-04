@@ -65,7 +65,7 @@ use std::{
     sync::Arc,
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use cfg::CfgExpr;
 use hir_expand::{
     ExpandTo, HirFileId,
@@ -223,11 +223,7 @@ pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
 /// a macro file's is lowered whole, as each expansion is made anew. The tree is behind an
 /// `Arc` so the last one is kept beside the query database without a copy.
 #[blaze_query::tracked(returns(deref))]
-fn file_item_tree_query(
-    db: &Db,
-    file_id: HirFileId,
-    krate: Crate,
-) -> Arc<ItemTree> {
+fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTree> {
     let _p = crate::span_names::of_file(
         db,
         file_id,
@@ -277,11 +273,7 @@ pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree
 }
 
 #[blaze_query::tracked(returns(ref))]
-pub(crate) fn block_item_tree_query(
-    db: &Db,
-    block: BlockId,
-    krate: Crate,
-) -> ItemTree {
+pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
     // A block of a body written in a file is lowered from that body's syntax alone, which an
@@ -304,7 +296,8 @@ pub(crate) fn block_item_tree_query(
     });
     let node = view::to_node(ptr, view::Node::root(&tree));
     let view = view::BlockExpr::cast(node).expect("a block's ast id names a block");
-    let ctx = lower::Ctx::with_maps(db, ast_id.file_id, krate, &syntax.ast_id_map, &syntax.span_map);
+    let ctx =
+        lower::Ctx::with_maps(db, ast_id.file_id, krate, &syntax.ast_id_map, &syntax.span_map);
     let lowered = ctx.lower_block(view);
     if crate::expr_store::body::check_relative(db) {
         let whole = lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
@@ -618,11 +611,7 @@ impl TreeId {
         Self { file, block }
     }
 
-    pub(crate) fn item_tree<'db>(
-        &self,
-        db: &'db Db,
-        krate: Crate,
-    ) -> &'db ItemTree {
+    pub(crate) fn item_tree<'db>(&self, db: &'db Db, krate: Crate) -> &'db ItemTree {
         match self.block {
             Some(block) => block_item_tree_query(db, block, krate),
             None => file_item_tree(db, self.file, krate),

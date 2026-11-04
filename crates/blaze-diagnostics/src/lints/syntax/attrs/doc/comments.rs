@@ -10,8 +10,8 @@
 //! (`MacroCallUnusedDocComment`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{HirFileId, InFile};
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode, CommentShape, HasLoopBody as _, HasName as _},
@@ -40,7 +40,8 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitt
         Target::Arm => {
             let Some(arm) = ast::MatchArm::cast(node) else { return };
             let (Some(pat), Some(body)) = (arm.pat(), arm.expr()) else { return };
-            let range = TextRange::new(pat.syntax().text_range().start(), body.syntax().text_range().end());
+            let range =
+                TextRange::new(pat.syntax().text_range().start(), body.syntax().text_range().end());
             ("match arms", range, owner.at())
         }
         Target::PatField => {
@@ -53,17 +54,23 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitt
         }
         Target::GenericParam { .. } => {
             let name = match node.kind() {
-                SyntaxKind::LIFETIME_PARAM => {
-                    ast::LifetimeParam::cast(node).and_then(|it| it.lifetime()).map(|it| it.syntax().text_range())
-                }
-                SyntaxKind::TYPE_PARAM => ast::TypeParam::cast(node).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
-                _ => ast::ConstParam::cast(node).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
+                SyntaxKind::LIFETIME_PARAM => ast::LifetimeParam::cast(node)
+                    .and_then(|it| it.lifetime())
+                    .map(|it| it.syntax().text_range()),
+                SyntaxKind::TYPE_PARAM => ast::TypeParam::cast(node)
+                    .and_then(|it| it.name())
+                    .map(|it| it.syntax().text_range()),
+                _ => ast::ConstParam::cast(node)
+                    .and_then(|it| it.name())
+                    .map(|it| it.syntax().text_range()),
             };
             let Some(name) = name else { return };
             ("generic parameters", name, owner.at())
         }
         Target::ForeignMod => ("extern blocks", item_range_view(node), owner.at()),
-        _ if ast::Expr::can_cast(node.kind()) && !is_block(node) => ("expressions", item_range_view(node), owner.at()),
+        _ if ast::Expr::can_cast(node.kind()) && !is_block(node) => {
+            ("expressions", item_range_view(node), owner.at())
+        }
         _ => return,
     };
     let label = cx.span(InFile::new(owner.node.file_id, label));
@@ -75,7 +82,9 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitt
         let range = attr.in_file(attr.range());
         if is_doc {
             sugared = Some(match sugared {
-                Some(it) if it.file_id == range.file_id => it.map(|it| TextRange::new(it.start(), range.value.end())),
+                Some(it) if it.file_id == range.file_id => {
+                    it.map(|it| TextRange::new(it.start(), range.value.end()))
+                }
                 _ => range,
             });
         }
@@ -87,12 +96,17 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitt
             continue;
         }
         let help = match &attr.kind {
-            AttrKind::Doc(doc) if matches!(doc.token().shape(), CommentShape::Block) => "use `/* */` for a plain comment",
+            AttrKind::Doc(doc) if matches!(doc.token().shape(), CommentShape::Block) => {
+                "use `/* */` for a plain comment"
+            }
             _ => "use `//` for a plain comment",
         };
         let mut diag = Diag::lint(LINT, "unused doc comment", cx.span(span));
         // alloc: the diagnostic's text and span
-        diag.span_label(label.clone(), format!("rustdoc does not generate documentation for {kind}"));
+        diag.span_label(
+            label.clone(),
+            format!("rustdoc does not generate documentation for {kind}"),
+        );
         diag.help(help);
         // clone: a pointer, copied for a lint emitted
         source_fact(cx, &mut diag, at.clone());
@@ -103,7 +117,11 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitt
 
 /// rustc's `MacroCallUnusedDocComment`: the doc comment `attr` of a macro call, `span` from the
 /// call's first attribute to it.
-pub(super) fn macro_call(cx: &Cx<'_, '_>, span: InFile<TextRange>, attr: InFile<TextRange>) -> Diag {
+pub(super) fn macro_call(
+    cx: &Cx<'_, '_>,
+    span: InFile<TextRange>,
+    attr: InFile<TextRange>,
+) -> Diag {
     let mut diag = Diag::lint(LINT, "unused doc comment", cx.span(span));
     diag.span_label(cx.span(attr), "rustdoc does not generate documentation for macro invocations");
     diag.help("to document an item produced by a macro, the macro must produce the documentation as part of its expansion");
@@ -137,7 +155,9 @@ fn is_block(node: ast::Node<'_>) -> bool {
 
 /// The `mod` items module files are declared by, found once when a lint needs one.
 #[derive(Default)]
-pub(in crate::lints::syntax::attrs) struct Modules(Option<HashMap<HirFileId, InFile<SyntaxNodePtr>, Global>>);
+pub(in crate::lints::syntax::attrs) struct Modules(
+    Option<HashMap<HirFileId, InFile<SyntaxNodePtr>, Global>>,
+);
 
 impl Modules {
     fn declaration(&mut self, cx: &Cx<'_, '_>, file: HirFileId) -> Option<InFile<SyntaxNodePtr>> {
@@ -147,7 +167,8 @@ impl Modules {
                 if let Some(file) = module.as_source_file_id(cx.db)
                     && let Some(declaration) = module.declaration_source_view(cx.db)
                 {
-                    declared.insert(HirFileId::from(file), declaration.map(|it| ast::ptr(it.syntax())));
+                    declared
+                        .insert(HirFileId::from(file), declaration.map(|it| ast::ptr(it.syntax())));
                 }
             }
             declared
@@ -160,7 +181,11 @@ impl Modules {
 /// (`current_expansion.lint_node_id`): the innermost node around the call that the invocation
 /// collector gives an id of its own, through the expansions the call is in. A module file's
 /// root is its `mod` item.
-pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: InFile<ast::Node<'_>>, modules: &mut Modules) -> InFile<SyntaxNodePtr> {
+pub(in crate::lints::syntax::attrs) fn lint_node(
+    cx: &Cx<'_, '_>,
+    call: InFile<ast::Node<'_>>,
+    modules: &mut Modules,
+) -> InFile<SyntaxNodePtr> {
     let mut at = call;
     loop {
         // `at` itself is a macro call (or what an attribute macro or derive is on): no node
@@ -190,7 +215,10 @@ pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: InFile<a
 /// and the crate.
 fn has_id(node: ast::Node<'_>) -> bool {
     match node.kind() {
-        SyntaxKind::MACRO_CALL | SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE => false,
+        SyntaxKind::MACRO_CALL
+        | SyntaxKind::MACRO_EXPR
+        | SyntaxKind::MACRO_PAT
+        | SyntaxKind::MACRO_TYPE => false,
         SyntaxKind::SOURCE_FILE
         | SyntaxKind::LET_STMT
         | SyntaxKind::VARIANT
@@ -209,6 +237,11 @@ fn has_id(node: ast::Node<'_>) -> bool {
             it.semicolon_token().is_some() && !matches!(it.expr(), Some(ast::Expr::MacroExpr(_)))
         }),
         SyntaxKind::BLOCK_EXPR => !is_block(node),
-        kind => ast::Item::can_cast(kind) || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind) || ast::Type::can_cast(kind),
+        kind => {
+            ast::Item::can_cast(kind)
+                || ast::Expr::can_cast(kind)
+                || ast::Pat::can_cast(kind)
+                || ast::Type::can_cast(kind)
+        }
     }
 }

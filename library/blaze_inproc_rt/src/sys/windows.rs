@@ -23,30 +23,31 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError, HANDLE, HMODULE,
-    INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError,
+    HANDLE, HMODULE, INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::ProcessPrng;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, FlushInstructionCache, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind,
-    UNW_FLAG_NHANDLER, WriteProcessMemory,
+    CONTEXT, FlushInstructionCache, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry,
+    RtlVirtualUnwind, UNW_FLAG_NHANDLER, WriteProcessMemory,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFreeEx,
-    VirtualProtectEx, VirtualQueryEx,
+    CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, UnmapViewOfFile,
+    UnmapViewOfFile2, VirtualAlloc2, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, GetCurrentThreadId, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
-    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, SetEvent,
-    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
+    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE, SetEvent, TerminateProcess, WaitForMultipleObjects,
+    WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
 };
 
 pub use pipe::{Listener, Stream, connect};
@@ -118,7 +119,11 @@ fn allowed(rights: Rights, access: Access) -> bool {
 /// Views start, end and are placed on whole granules.
 fn granular(offset: u64, len: u64, at: u64) -> Result<(), Error> {
     let page = page();
-    if len == 0 || !offset.is_multiple_of(page) || !len.is_multiple_of(page) || !at.is_multiple_of(page) {
+    if len == 0
+        || !offset.is_multiple_of(page)
+        || !len.is_multiple_of(page)
+        || !at.is_multiple_of(page)
+    {
         return Err(Error::new(format!(
             "a view of {len:#x} bytes from offset {offset:#x} at {at:#x}: Windows maps views of whole \
              {page:#x}-byte granules"
@@ -156,7 +161,9 @@ fn map_view(
         )
     };
     if view.Value.is_null() {
-        return Err(os(format_args!("MapViewOfFile3 of {len:#x} bytes from offset {offset:#x} at {at:#x} as {access:?}")));
+        return Err(os(format_args!(
+            "MapViewOfFile3 of {len:#x} bytes from offset {offset:#x} at {at:#x} as {access:?}"
+        )));
     }
     Ok(view.Value as u64)
 }
@@ -195,15 +202,26 @@ impl Object {
     }
 
     pub fn duplicate(&self) -> Result<Object, Error> {
-        let section =
-            self.section.try_clone().map_err(|it| Error::new(format!("Windows: DuplicateHandle of a section: {it}")))?;
+        let section = self
+            .section
+            .try_clone()
+            .map_err(|it| Error::new(format!("Windows: DuplicateHandle of a section: {it}")))?;
         Ok(Object { section, len: self.len })
     }
 
     pub fn map_here(&self, access: Access) -> Result<View, Error> {
-        let len = usize::try_from(self.len).map_err(|_| Error::new(format!("a view of {:#x} bytes", self.len)))?;
+        let len = usize::try_from(self.len)
+            .map_err(|_| Error::new(format!("a view of {:#x} bytes", self.len)))?;
         // SAFETY: GetCurrentProcess returns a pseudo-handle, valid always.
-        let at = map_view(self.section.as_raw_handle(), unsafe { GetCurrentProcess() }, 0, self.len, 0, 0, access)?;
+        let at = map_view(
+            self.section.as_raw_handle(),
+            unsafe { GetCurrentProcess() },
+            0,
+            self.len,
+            0,
+            0,
+            access,
+        )?;
         Ok(View { at, len, writable: matches!(access, Access::Shared | Access::Copy) })
     }
 }
@@ -226,7 +244,10 @@ impl View {
 
     fn check(&self, range: &Range<usize>) -> Result<(), Error> {
         if range.start > range.end || range.end > self.len {
-            return Err(Error::new(format!("bytes {:#x}..{:#x} of a view of {:#x}", range.start, range.end, self.len)));
+            return Err(Error::new(format!(
+                "bytes {:#x}..{:#x} of a view of {:#x}",
+                range.start, range.end, self.len
+            )));
         }
         Ok(())
     }
@@ -237,7 +258,9 @@ impl View {
         // `self` lives. Nothing writes the bytes a caller reads while it reads them: the daemon
         // writes a range of code before any process can reach it (`CodeMemory::write`), and a
         // run process maps code objects only to read, execute or copy (`allowed`).
-        Ok(unsafe { std::slice::from_raw_parts((self.at as usize + range.start) as *const u8, range.len()) })
+        Ok(unsafe {
+            std::slice::from_raw_parts((self.at as usize + range.start) as *const u8, range.len())
+        })
     }
 
     pub fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
@@ -247,7 +270,9 @@ impl View {
         self.check(&range)?;
         // SAFETY: as in `bytes`, and the view is writable (checked); `&mut self` keeps every
         // other slice of this view from living meanwhile.
-        Ok(unsafe { std::slice::from_raw_parts_mut((self.at as usize + range.start) as *mut u8, range.len()) })
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut((self.at as usize + range.start) as *mut u8, range.len())
+        })
     }
 
     pub fn word(&self, at: usize) -> &AtomicU64 {
@@ -277,7 +302,13 @@ impl View {
             return;
         }
         // SAFETY: a range of this view; FlushInstructionCache reads nothing of it.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), (self.at as usize + range.start) as *const c_void, range.len()) };
+        unsafe {
+            FlushInstructionCache(
+                GetCurrentProcess(),
+                (self.at as usize + range.start) as *const c_void,
+                range.len(),
+            )
+        };
     }
 }
 
@@ -311,7 +342,11 @@ impl Drop for Exec {
 }
 
 impl Exec {
-    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(
+        code: usize,
+        data: usize,
+        write: impl FnOnce(&mut [u8], &mut [u8]),
+    ) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let len = code_pages + data.next_multiple_of(page);
@@ -336,14 +371,27 @@ impl Exec {
         // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
         // disjoint and in it. `write` can't keep them past its return.
         let (code_bytes, data_bytes) = unsafe {
-            (std::slice::from_raw_parts_mut(exec.at, code), std::slice::from_raw_parts_mut(exec.at.add(code_pages), data))
+            (
+                std::slice::from_raw_parts_mut(exec.at, code),
+                std::slice::from_raw_parts_mut(exec.at.add(code_pages), data),
+            )
         };
         write(code_bytes, data_bytes);
         let mut old = 0;
         // SAFETY: the code's pages of the allocation above, which nothing writes from here on.
-        if unsafe { VirtualProtectEx(GetCurrentProcess(), exec.at as *const c_void, code_pages, PAGE_EXECUTE_READ, &mut old) } == 0
+        if unsafe {
+            VirtualProtectEx(
+                GetCurrentProcess(),
+                exec.at as *const c_void,
+                code_pages,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            )
+        } == 0
         {
-            return Err(os(format_args!("VirtualProtectEx of {code_pages:#x} bytes of code to execute and read")));
+            return Err(os(format_args!(
+                "VirtualProtectEx of {code_pages:#x} bytes of code to execute and read"
+            )));
         }
         // SAFETY: a range of the allocation; FlushInstructionCache reads nothing of it.
         unsafe { FlushInstructionCache(GetCurrentProcess(), exec.at as *const c_void, code) };
@@ -494,7 +542,10 @@ pub struct Bells {
 
 impl Bells {
     pub fn new(remote: &Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
-        let process = remote.process.try_clone().map_err(|it| Error::new(format!("Windows: DuplicateHandle of a process: {it}")))?;
+        let process = remote
+            .process
+            .try_clone()
+            .map_err(|it| Error::new(format!("Windows: DuplicateHandle of a process: {it}")))?;
         let mut names = Vec::with_capacity(slots + 1);
         let doorbell = bell(&remote.process, &mut names)?;
         let mut kept = Vec::with_capacity(slots);
@@ -536,7 +587,15 @@ fn bell(process: &OwnedHandle, names: &mut Vec<u64>) -> Result<OwnedHandle, Erro
     // SAFETY: duplicates an event this daemon holds into the run process, opened with
     // PROCESS_DUP_HANDLE; writes only `theirs`, a handle value in that process.
     let ok = unsafe {
-        DuplicateHandle(GetCurrentProcess(), event.as_raw_handle(), process.as_raw_handle(), &mut theirs, 0, 0, DUPLICATE_SAME_ACCESS)
+        DuplicateHandle(
+            GetCurrentProcess(),
+            event.as_raw_handle(),
+            process.as_raw_handle(),
+            &mut theirs,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
     };
     if ok == 0 {
         return Err(os("DuplicateHandle of an asks bell into the run process"));
@@ -572,7 +631,9 @@ pub fn wait_answer(_: &AtomicU64, _: u32, bell: u64, timeout: std::time::Duratio
 pub fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration) -> bool {
     // SAFETY: `word` is live and 8-aligned; WaitOnAddress compares its first four bytes, the
     // low half, with `expected`, which is live for the call.
-    let ok = unsafe { WaitOnAddress(word.as_ptr().cast(), (&raw const expected).cast(), 4, millis(timeout)) };
+    let ok = unsafe {
+        WaitOnAddress(word.as_ptr().cast(), (&raw const expected).cast(), 4, millis(timeout))
+    };
     // SAFETY: GetLastError reads this thread's last error.
     ok != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT
 }
@@ -620,9 +681,19 @@ impl Remote {
             return Err(Error::new(format!("a map of object {object} of {}", self.objects.len())));
         };
         if !allowed(*rights, access) || access == Access::Execute {
-            return Err(Error::new(format!("object {object} ({rights:?}) may not be mapped anywhere as {access:?}")));
+            return Err(Error::new(format!(
+                "object {object} ({rights:?}) may not be mapped anywhere as {access:?}"
+            )));
         }
-        map_view(granted.section.as_raw_handle(), self.process.as_raw_handle(), 0, granted.len, 0, 0, access)
+        map_view(
+            granted.section.as_raw_handle(),
+            self.process.as_raw_handle(),
+            0,
+            granted.len,
+            0,
+            0,
+            access,
+        )
     }
 
     pub fn overlay(&self, slide: u64, grant: &Grant) -> Result<(), Error> {
@@ -634,16 +705,32 @@ impl Remote {
             .wrapping_add(slide)
             .checked_next_multiple_of(page)
             .filter(|it| *it > base && base.is_multiple_of(page))
-            .ok_or_else(|| Error::new(format!("an image span {:#x}..{:#x} slid by {slide:#x}", grant.span.start, grant.span.end)))?;
-        let overlays: Vec<Range<u64>> = grant.overlays.iter().map(|it| it.range()).map(|it| it.start + slide..it.end + slide).collect();
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "an image span {:#x}..{:#x} slid by {slide:#x}",
+                    grant.span.start, grant.span.end
+                ))
+            })?;
+        let overlays: Vec<Range<u64>> = grant
+            .overlays
+            .iter()
+            .map(|it| it.range())
+            .map(|it| it.start + slide..it.end + slide)
+            .collect();
         for (overlay, range) in grant.overlays.iter().zip(&overlays) {
             granular(overlay.offset, overlay.len, range.start)?;
-            let (_, rights) = self
-                .objects
-                .get(overlay.object as usize)
-                .ok_or_else(|| Error::new(format!("an overlay of object {} of {}", overlay.object, self.objects.len())))?;
+            let (_, rights) = self.objects.get(overlay.object as usize).ok_or_else(|| {
+                Error::new(format!(
+                    "an overlay of object {} of {}",
+                    overlay.object,
+                    self.objects.len()
+                ))
+            })?;
             if !allowed(*rights, overlay.access) {
-                return Err(Error::new(format!("object {} ({rights:?}) may not be mapped {:?}", overlay.object, overlay.access)));
+                return Err(Error::new(format!(
+                    "object {} ({rights:?}) may not be mapped {:?}",
+                    overlay.object, overlay.access
+                )));
             }
         }
         let pieces = pieces(base..end, &overlays)?;
@@ -662,7 +749,12 @@ impl Remote {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: writes at most `size_of::<MEMORY_BASIC_INFORMATION>()` bytes into `info`.
         let got = unsafe {
-            VirtualQueryEx(self.process.as_raw_handle(), at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+            VirtualQueryEx(
+                self.process.as_raw_handle(),
+                at as *const c_void,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
         };
         if got == 0 {
             return Err(os(format_args!("VirtualQueryEx at {at:#x} in the run process")));
@@ -677,7 +769,8 @@ impl Remote {
         let mut at = base;
         while at < end {
             let info = self.query(at)?;
-            let region = at..(info.BaseAddress as u64).saturating_add(info.RegionSize as u64).min(end);
+            let region =
+                at..(info.BaseAddress as u64).saturating_add(info.RegionSize as u64).min(end);
             if info.State != MEM_COMMIT {
                 at = region.end;
                 continue;
@@ -707,7 +800,10 @@ impl Remote {
                     )
                 };
                 if got == 0 || read != bytes.len() {
-                    return Err(os(format_args!("ReadProcessMemory of {:#x}..{:#x}", part.start, part.end)));
+                    return Err(os(format_args!(
+                        "ReadProcessMemory of {:#x}..{:#x}",
+                        part.start, part.end
+                    )));
                 }
                 kept.push(Kept { at: part.start, protect, bytes });
             }
@@ -716,12 +812,22 @@ impl Remote {
         Ok(kept)
     }
 
-    fn rebuild(&self, base: u64, end: u64, pieces: &[Piece], overlays: &[Overlay], kept: &[Kept]) -> Result<(), Error> {
+    fn rebuild(
+        &self,
+        base: u64,
+        end: u64,
+        pieces: &[Piece],
+        overlays: &[Overlay],
+        kept: &[Kept],
+    ) -> Result<(), Error> {
         let process = self.process.as_raw_handle();
         // SAFETY: unmaps the run process's image view, whose every page outside the overlays was
         // read above; its only thread that runs, the start hook's, waits on the pipe for the
         // OVERLAID this answers with, and reaches no byte of the image until then.
-        if unsafe { UnmapViewOfFile2(process, MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, 0) } == 0 {
+        if unsafe {
+            UnmapViewOfFile2(process, MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, 0)
+        } == 0
+        {
             return Err(os(format_args!("UnmapViewOfFile2 of the image at {base:#x}")));
         }
         // SAFETY: reserves the span just unmapped, free now, as one placeholder of no access.
@@ -737,7 +843,9 @@ impl Remote {
             )
         };
         if placeholder as u64 != base {
-            return Err(os(format_args!("VirtualAlloc2 of a placeholder over the image at {base:#x}..{end:#x}")));
+            return Err(os(format_args!(
+                "VirtualAlloc2 of a placeholder over the image at {base:#x}..{end:#x}"
+            )));
         }
         for piece in pieces {
             let (at, len) = match *piece {
@@ -746,8 +854,18 @@ impl Remote {
             if at + len < end {
                 // SAFETY: splits `at..at + len` off the front of the placeholder this loop
                 // still holds from `at`: no memory changes.
-                if unsafe { VirtualFreeEx(process, at as *mut c_void, len as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
-                    return Err(os(format_args!("VirtualFreeEx splitting {len:#x} bytes at {at:#x} off the placeholder")));
+                if unsafe {
+                    VirtualFreeEx(
+                        process,
+                        at as *mut c_void,
+                        len as usize,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    )
+                } == 0
+                {
+                    return Err(os(format_args!(
+                        "VirtualFreeEx splitting {len:#x} bytes at {at:#x} off the placeholder"
+                    )));
                 }
             }
             match *piece {
@@ -755,7 +873,15 @@ impl Remote {
                     let overlay = &overlays[index];
                     let (object, _) = &self.objects[overlay.object as usize];
                     let kind = MEM_REPLACE_PLACEHOLDER;
-                    map_view(object.section.as_raw_handle(), process, overlay.offset, len, at, kind, overlay.access)?;
+                    map_view(
+                        object.section.as_raw_handle(),
+                        process,
+                        overlay.offset,
+                        len,
+                        at,
+                        kind,
+                        overlay.access,
+                    )?;
                 }
                 Piece::Private { .. } => {
                     // SAFETY: replaces the placeholder at `at..at + len`, just split off, with
@@ -772,7 +898,9 @@ impl Remote {
                         )
                     };
                     if got as u64 != at {
-                        return Err(os(format_args!("VirtualAlloc2 of {len:#x} private bytes at {at:#x}")));
+                        return Err(os(format_args!(
+                            "VirtualAlloc2 of {len:#x} private bytes at {at:#x}"
+                        )));
                     }
                 }
             }
@@ -781,24 +909,50 @@ impl Remote {
             let len = part.bytes.len();
             // SAFETY: commits pages of private address space reserved just above.
             let got = unsafe {
-                VirtualAlloc2(process, part.at as *const c_void, len, MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0)
+                VirtualAlloc2(
+                    process,
+                    part.at as *const c_void,
+                    len,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
             };
             if got as u64 != part.at {
-                return Err(os(format_args!("VirtualAlloc2 committing {len:#x} bytes at {:#x}", part.at)));
+                return Err(os(format_args!(
+                    "VirtualAlloc2 committing {len:#x} bytes at {:#x}",
+                    part.at
+                )));
             }
             let mut written = 0usize;
             // SAFETY: writes the bytes read from these addresses back into the pages just
             // committed writable, of the same length.
             let got = unsafe {
-                WriteProcessMemory(process, part.at as *const c_void, part.bytes.as_ptr().cast(), len, &mut written)
+                WriteProcessMemory(
+                    process,
+                    part.at as *const c_void,
+                    part.bytes.as_ptr().cast(),
+                    len,
+                    &mut written,
+                )
             };
             if got == 0 || written != len {
-                return Err(os(format_args!("WriteProcessMemory of {len:#x} bytes at {:#x}", part.at)));
+                return Err(os(format_args!(
+                    "WriteProcessMemory of {len:#x} bytes at {:#x}",
+                    part.at
+                )));
             }
             let mut old = 0;
             // SAFETY: the protection of the pages just written, as the image had them.
-            if unsafe { VirtualProtectEx(process, part.at as *const c_void, len, part.protect, &mut old) } == 0 {
-                return Err(os(format_args!("VirtualProtectEx of {len:#x} bytes at {:#x}", part.at)));
+            if unsafe {
+                VirtualProtectEx(process, part.at as *const c_void, len, part.protect, &mut old)
+            } == 0
+            {
+                return Err(os(format_args!(
+                    "VirtualProtectEx of {len:#x} bytes at {:#x}",
+                    part.at
+                )));
             }
         }
         Ok(())
@@ -816,12 +970,17 @@ pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>,
     let bad = |it: FrameError| Error::new(format!("the daemon's list of objects: {it}"));
     let frame = channel.recv()?;
     if frame.seq != OBJECTS_SEQ {
-        return Err(Error::new(format!("the daemon's list of objects came as frame {}", frame.seq)));
+        return Err(Error::new(format!(
+            "the daemon's list of objects came as frame {}",
+            frame.seq
+        )));
     }
     let mut read = frame.reader(kinds::GRANT).map_err(bad)?;
     let listed = read.count(9).map_err(bad)?;
     if listed != count {
-        return Err(Error::new(format!("the daemon listed {listed} objects, where the grant names {count}")));
+        return Err(Error::new(format!(
+            "the daemon listed {listed} objects, where the grant names {count}"
+        )));
     }
     let mut out = Vec::with_capacity(listed);
     for index in 0..listed {
@@ -838,14 +997,21 @@ pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>,
 }
 
 /// The daemon's answer to a request of the start hook: the body of `want`, or why not.
-fn answer<'a>(frame: crate::frame::Frame<'a>, want: crate::frame::Kind, what: &str) -> Result<&'a [u8], Error> {
+fn answer<'a>(
+    frame: crate::frame::Frame<'a>,
+    want: crate::frame::Kind,
+    what: &str,
+) -> Result<&'a [u8], Error> {
     match frame.kind {
         kind if kind == want => Ok(frame.body),
         kinds::REFUSED => Err(Error::new(format!(
             "the daemon would not {what}: {}",
             Reader::new(frame.body).str().unwrap_or("(not UTF-8)")
         ))),
-        other => Err(Error::new(format!("the daemon answered a request to {what} with a frame of kind {:#06x}", other.0))),
+        other => Err(Error::new(format!(
+            "the daemon answered a request to {what} with a frame of kind {:#06x}",
+            other.0
+        ))),
     }
 }
 
@@ -856,7 +1022,10 @@ impl Granted {
 
     pub fn map_anywhere(&self, channel: &mut Channel, access: Access) -> Result<u64, Error> {
         if !allowed(self.rights, access) || access == Access::Execute {
-            return Err(Error::new(format!("object {} ({:?}) mapped anywhere as {access:?}", self.index, self.rights)));
+            return Err(Error::new(format!(
+                "object {} ({:?}) mapped anywhere as {access:?}",
+                self.index, self.rights
+            )));
         }
         let bad = |it: FrameError| Error::new(format!("the daemon's answer to a map: {it}"));
         let mut body = Vec::with_capacity(5);
@@ -883,7 +1052,12 @@ pub fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> R
 unsafe extern "system" {
     /// psapi's `EnumProcessModules`, which kernel32 exports under this name: the process's
     /// modules in load order, read from its loader's list without taking the loader lock.
-    fn K32EnumProcessModules(process: HANDLE, modules: *mut HMODULE, bytes: u32, needed: *mut u32) -> windows_sys::core::BOOL;
+    fn K32EnumProcessModules(
+        process: HANDLE,
+        modules: *mut HMODULE,
+        bytes: u32,
+        needed: *mut u32,
+    ) -> windows_sys::core::BOOL;
 }
 
 /// What the process's global scope is on Windows: every module the system loader loaded, the
@@ -915,7 +1089,10 @@ impl Scope {
             let mut needed = 0u32;
             // SAFETY: the process's own pseudo-handle; `modules` is `bytes` writable bytes and
             // `needed` a live `u32`, the only memory the call writes.
-            if unsafe { K32EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), bytes, &mut needed) } == 0 {
+            if unsafe {
+                K32EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), bytes, &mut needed)
+            } == 0
+            {
                 return Err(os("EnumProcessModules of this process"));
             }
             let count = needed as usize / size_of::<HMODULE>();

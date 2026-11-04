@@ -275,8 +275,11 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<Refused> {
         let Some((key, value)) = data.split_once('=') else { continue };
         let value = value.trim_end();
         let (rule, why) = match key {
-            "rustc-link-search" => ("sandbox:link-dir", (!ran.may_search(search_dir(value)))
-                .then(|| format!("a library directory that is none of {}", ran.places()))),
+            "rustc-link-search" => (
+                "sandbox:link-dir",
+                (!ran.may_search(search_dir(value)))
+                    .then(|| format!("a library directory that is none of {}", ran.places())),
+            ),
             "rustc-flags" => {
                 let mut flags = value.split_whitespace();
                 let mut why = None;
@@ -292,9 +295,10 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<Refused> {
                 }
                 ("sandbox:link-dir", why)
             }
-            "rustc-link-arg-bin" => {
-                ("sandbox:link-arg", value.split_once('=').and_then(|(_, arg)| ran.link_arg_refused(arg)))
-            }
+            "rustc-link-arg-bin" => (
+                "sandbox:link-arg",
+                value.split_once('=').and_then(|(_, arg)| ran.link_arg_refused(arg)),
+            ),
             "rustc-link-arg"
             | "rustc-link-arg-bins"
             | "rustc-link-arg-tests"
@@ -302,12 +306,12 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<Refused> {
             | "rustc-link-arg-examples"
             | "rustc-link-arg-cdylib"
             | "rustc-cdylib-link-arg" => ("sandbox:link-arg", ran.link_arg_refused(value)),
-            "rustc-env" => ("sandbox:rustc-env", value
-                .split_once('=')
-                .filter(|(name, _)| given_by_cargo(name))
-                .map(|(name, _)| {
+            "rustc-env" => (
+                "sandbox:rustc-env",
+                value.split_once('=').filter(|(name, _)| given_by_cargo(name)).map(|(name, _)| {
                     format!("`{name}`, which cargo gives the crate or the toolchain acts on itself")
-                })),
+                }),
+            ),
             _ => continue,
         };
         if let Some(why) = why {
@@ -319,13 +323,18 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<Refused> {
 
 /// The report of a build a script of `package` broke the rules of, `at` naming the script:
 /// each line refused and why, under the first's rule, and the ways out.
-pub fn refused_report(package: &str, at: blaze_report::Text, refused: &[Refused]) -> blaze_report::Report {
+pub fn refused_report(
+    package: &str,
+    at: blaze_report::Text,
+    refused: &[Refused],
+) -> blaze_report::Report {
     use blaze_report::{Fix, Report, Text};
     let what = match refused.len() {
         1 => "a directive",
         _ => "directives",
     };
-    let headline = Text::new().words("a build script printed ").words(what).words(" its sandbox refuses");
+    let headline =
+        Text::new().words("a build script printed ").words(what).words(" its sandbox refuses");
     let mut report = Report::error(headline).at(at);
     if let Some(first) = refused.first() {
         report = report.rule(first.rule);
@@ -358,7 +367,10 @@ pub fn refused_report(package: &str, at: blaze_report::Text, refused: &[Refused]
 /// what the script links, which the manifest can't spell: `${LLVM_SYS_231_PREFIX}/lib`), any
 /// other entry as it is. An error names a variable the script was not given, or one that is
 /// no absolute path.
-pub fn link_dirs(dirs: &[String], env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Result<Vec<PathBuf>, String> {
+pub fn link_dirs(
+    dirs: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<PathBuf>, String> {
     dirs.iter()
         .map(|dir| {
             let Some((name, rest)) = dir.strip_prefix("${").and_then(|it| it.split_once('}')) else {
@@ -502,16 +514,31 @@ mod tests {
 
     #[test]
     fn the_report_names_the_script_each_line_and_the_rule() {
-        let refused = refused(b"cargo:rustc-link-search=/root/x\ncargo:rustc-env=RUSTFLAGS=-Cx\n", &ran());
-        assert_eq!(refused.iter().map(|it| it.rule).collect::<Vec<_>>(), ["sandbox:link-dir", "sandbox:rustc-env"]);
-        let at = blaze_report::Text::new().words("build script of ").package("evil-sys", Some("0.1.0"));
+        let refused =
+            refused(b"cargo:rustc-link-search=/root/x\ncargo:rustc-env=RUSTFLAGS=-Cx\n", &ran());
+        assert_eq!(
+            refused.iter().map(|it| it.rule).collect::<Vec<_>>(),
+            ["sandbox:link-dir", "sandbox:rustc-env"]
+        );
+        let at =
+            blaze_report::Text::new().words("build script of ").package("evil-sys", Some("0.1.0"));
         let report = refused_report("evil-sys", at, &refused);
         assert_eq!(report.rule.as_deref(), Some("sandbox:link-dir"));
         assert_eq!(report.subject(), Some("evil-sys"));
         let flat = report.flat();
-        assert!(flat.contains("`cargo:rustc-link-search=/root/x`") && flat.contains("`RUSTFLAGS`"), "{flat}");
-        assert!(flat.contains("build-script-link-dirs") && flat.contains("unsandboxed-build-scripts = [\"evil-sys\"]"), "{flat}");
-        assert!(blaze_report::rules::find("sandbox:link-dir").is_some() && blaze_report::rules::find("sandbox:rustc-env").is_some());
+        assert!(
+            flat.contains("`cargo:rustc-link-search=/root/x`") && flat.contains("`RUSTFLAGS`"),
+            "{flat}"
+        );
+        assert!(
+            flat.contains("build-script-link-dirs")
+                && flat.contains("unsandboxed-build-scripts = [\"evil-sys\"]"),
+            "{flat}"
+        );
+        assert!(
+            blaze_report::rules::find("sandbox:link-dir").is_some()
+                && blaze_report::rules::find("sandbox:rustc-env").is_some()
+        );
     }
 
     /// A link dir under a variable is where the script's environment puts it, and the search it
@@ -520,7 +547,9 @@ mod tests {
     #[test]
     fn a_link_dir_under_a_variable_is_where_the_scripts_environment_puts_it() {
         use std::ffi::OsString;
-        let env = |value: &str| -> Vec<(OsString, OsString)> { vec![("LLVM_SYS_231_PREFIX".into(), value.into())] };
+        let env = |value: &str| -> Vec<(OsString, OsString)> {
+            vec![("LLVM_SYS_231_PREFIX".into(), value.into())]
+        };
         let dirs = ["${LLVM_SYS_231_PREFIX}/lib".to_owned(), "/opt/vendor/lib".to_owned()];
         let found = link_dirs(&dirs, &env("/m/llvm-23.1.4")).unwrap();
         assert_eq!(found, [PathBuf::from("/m/llvm-23.1.4/lib"), PathBuf::from("/opt/vendor/lib")]);
@@ -529,7 +558,10 @@ mod tests {
         assert!(!refused(b"cargo:rustc-link-search=native=/m/other/lib\n", &ran).is_empty());
 
         let unset = link_dirs(&dirs, &[]).unwrap_err();
-        assert!(unset.contains("`LLVM_SYS_231_PREFIX`") && unset.contains("does not set"), "{unset}");
+        assert!(
+            unset.contains("`LLVM_SYS_231_PREFIX`") && unset.contains("does not set"),
+            "{unset}"
+        );
         let relative = link_dirs(&dirs, &env("llvm")).unwrap_err();
         assert!(relative.contains("no absolute path"), "{relative}");
     }

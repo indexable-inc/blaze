@@ -37,7 +37,8 @@ impl Corpus {
         })?;
         let text = match value.trim_start().starts_with('{') {
             true => value,
-            false => std::fs::read_to_string(&value).map_err(|error| format!("{VAR}={value}: {error}"))?,
+            false => std::fs::read_to_string(&value)
+                .map_err(|error| format!("{VAR}={value}: {error}"))?,
         };
         serde_json::from_str(&text).map_err(|error| format!("{VAR}: {error}"))
     }
@@ -48,7 +49,9 @@ impl Corpus {
     }
 
     pub(crate) fn scratch(&self) -> Result<&str, String> {
-        self.scratch.as_deref().ok_or_else(|| format!("{VAR} names no `scratch`: a built copy of the workspace to change"))
+        self.scratch.as_deref().ok_or_else(|| {
+            format!("{VAR} names no `scratch`: a built copy of the workspace to change")
+        })
     }
 }
 

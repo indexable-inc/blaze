@@ -17,9 +17,9 @@ pub mod target;
 mod tests;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
+use std::alloc::Global;
 
 use crate::load::{Foreign, ForeignAsk, ForeignProfile, key_id};
 use crate::query::{
@@ -107,7 +107,8 @@ pub const DEV_RUNTIME: &str = "blaze_inproc_rt";
 /// (crates/blaze-inproc-rt): the library's windows-sys is a stub.
 pub fn has_dev_runtime(triple: &str) -> bool {
     let arch = triple.split('-').next().unwrap_or_default();
-    (matches!(arch, "x86_64" | "aarch64") && triple.split('-').any(|it| it == "linux")) || triple == "aarch64-apple-darwin"
+    (matches!(arch, "x86_64" | "aarch64") && triple.split('-').any(|it| it == "linux"))
+        || triple == "aarch64-apple-darwin"
 }
 
 /// The crates built, from those asked: `std` brings `core`, `alloc`, `proc_macro`,
@@ -117,7 +118,9 @@ pub fn std_crates(asked: &[String]) -> Vec<String> {
     let mut crates: Vec<String> = asked.to_vec();
     let has = |name: &str| asked.iter().any(|it| it == name);
     if has("std") {
-        crates.extend(["core", "alloc", "proc_macro", "panic_unwind", "compiler_builtins"].map(str::to_owned));
+        crates.extend(
+            ["core", "alloc", "proc_macro", "panic_unwind", "compiler_builtins"].map(str::to_owned),
+        );
     } else if has("core") {
         crates.push("compiler_builtins".to_owned());
     }
@@ -213,32 +216,56 @@ pub fn foreign_ask(key: &StdKey) -> Result<ForeignAsk, LoadError> {
 /// `panic_abort` built to abort.
 fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
     if graph.plans.len() != graph.units.len() {
-        return Err(format!("the load planned {} of the standard library's {} units", graph.plans.len(), graph.units.len()));
+        return Err(format!(
+            "the load planned {} of the standard library's {} units",
+            graph.plans.len(),
+            graph.units.len()
+        ));
     }
-    let mut names: HashMap<&str, &str, Global> = HashMap::with_capacity_in(graph.packages.len(), Global);
+    let mut names: HashMap<&str, &str, Global> =
+        HashMap::with_capacity_in(graph.packages.len(), Global);
     names.extend(graph.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())));
     let name_of = |pkg_id: &str| names.get(pkg_id).copied();
     for unit in &graph.units {
-        let name = name_of(&unit.pkg_id).ok_or_else(|| format!("the load gave no package `{}`", unit.pkg_id))?;
+        let name = name_of(&unit.pkg_id)
+            .ok_or_else(|| format!("the load gave no package `{}`", unit.pkg_id))?;
         if !unit.is_std {
-            return Err(format!("the load gave a unit of `{name}` in the standard library that is not `is_std`"));
+            return Err(format!(
+                "the load gave a unit of `{name}` in the standard library that is not `is_std`"
+            ));
         }
         let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
         if ALWAYS_ABORT.contains(&name) && !script && unit.profile.panic != "abort" {
-            return Err(format!("`{name}` is built with `panic = \"{}\"`, not `\"abort\"`", unit.profile.panic));
+            return Err(format!(
+                "`{name}` is built with `panic = \"{}\"`, not `\"abort\"`",
+                unit.profile.panic
+            ));
         }
-        let asked = crate::schema::BuiltFor { platform: Some(&ask.triple), macro_wasm: ask.macro_wasm };
+        let asked =
+            crate::schema::BuiltFor { platform: Some(&ask.triple), macro_wasm: ask.macro_wasm };
         if unit.platform.is_some() && unit.built_for() != asked {
-            return Err(format!("the load gave a unit of `{name}` built for {}, in a standard library for {asked}", unit.built_for()));
+            return Err(format!(
+                "the load gave a unit of `{name}` built for {}, in a standard library for {asked}",
+                unit.built_for()
+            ));
         }
     }
     if !graph.roots.iter().map(|(name, _)| name).eq(&ask.roots) {
         let named: Vec<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
-        return Err(format!("the load's roots are {named:?}, not the crates asked, {:?}", ask.roots));
+        return Err(format!(
+            "the load's roots are {named:?}, not the crates asked, {:?}",
+            ask.roots
+        ));
     }
     for (name, index) in &graph.roots {
-        let unit = graph.units.get(*index).ok_or_else(|| format!("root `{name}` is unit {index}, past the graph"))?;
-        if name_of(&unit.pkg_id) != Some(name.as_str()) || !unit.target.is_lib() || unit.mode != Mode::Build {
+        let unit = graph
+            .units
+            .get(*index)
+            .ok_or_else(|| format!("root `{name}` is unit {index}, past the graph"))?;
+        if name_of(&unit.pkg_id) != Some(name.as_str())
+            || !unit.target.is_lib()
+            || unit.mode != Mode::Build
+        {
             return Err(format!("root `{name}` is not the library unit of package `{name}`"));
         }
     }
@@ -275,7 +302,10 @@ impl Query for StdUnits {
         Ok(match found.get() {
             StdPlanned::Ready(graph) => match checked(&ask, &graph) {
                 Ok(()) => CborBytes::of(found),
-                Err(what) => failed(format!("the standard library's units: {what}"), Some(ask.manifest.clone())),
+                Err(what) => failed(
+                    format!("the standard library's units: {what}"),
+                    Some(ask.manifest.clone()),
+                ),
             },
             StdPlanned::Failed(_) => CborBytes::of(found),
         })

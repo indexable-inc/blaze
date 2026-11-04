@@ -10,12 +10,12 @@ use std::{
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::Database as _;
 use hegel::generators as gs;
 use hegel::{Hegel, Settings};
 use hir_expand::fixture;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::write_body_path;
 use crate::{
@@ -64,7 +64,10 @@ fn crate_text(types: u8, blocks: usize, nested: bool, unnamed: usize, called: us
     );
     for (_, ty) in TYPES.iter().enumerate().filter(|&(at, _)| types >> at & 1 == 1) {
         _ = writeln!(text, "impl NonZero<{ty}> {{ pub fn swap_bytes(self) -> Self {{ self }} }}");
-        _ = writeln!(text, "impl Swap for NonZero<{ty}> {{ fn swap_bytes(self) -> Self {{ self }} }}");
+        _ = writeln!(
+            text,
+            "impl Swap for NonZero<{ty}> {{ fn swap_bytes(self) -> Self {{ self }} }}"
+        );
     }
     text.push_str("pub fn outer() {\n");
     for _ in 0..blocks {
@@ -98,7 +101,11 @@ fn no_two_bodies_of_a_crate_share_a_span_name() {
         let db = fixture.db();
         let named = names(db, fixture::test_crate(db), &text);
         let inner = named.keys().filter(|it| it.ends_with("}::inner")).count();
-        assert_eq!(inner, blocks * (1 + usize::from(nested)), "a block's `inner` lost to another of\n{text}");
+        assert_eq!(
+            inner,
+            blocks * (1 + usize::from(nested)),
+            "a block's `inner` lost to another of\n{text}"
+        );
     })
     .settings(Settings::new().test_cases(cases).database(None))
     .run();
@@ -159,8 +166,14 @@ fn a_span_name_says_which_impl_const_block_and_build_script() {
         all.iter().any(|it| it.starts_with("shapes::outer::{block#") && it.ends_with("}::inner")),
         "a block's item is not under its body; the names are {all:?}"
     );
-    let by_macro = all.iter().filter(|it| it.starts_with("shapes::<impl#0 in macro call ") && it.ends_with(">::get"));
-    assert_eq!(by_macro.count(), 2, "each `nonzero!` impl is named by its call; the names are {all:?}");
+    let by_macro = all
+        .iter()
+        .filter(|it| it.starts_with("shapes::<impl#0 in macro call ") && it.ends_with(">::get"));
+    assert_eq!(
+        by_macro.count(),
+        2,
+        "each `nonzero!` impl is named by its call; the names are {all:?}"
+    );
 }
 
 /// A macro that calls itself writes each inner call at ordinal 0 of its own output, so its
@@ -248,8 +261,9 @@ fn naming_a_span_reads_nothing_into_its_query() {
     let named: &'static Named = Box::leak(Box::default());
     for def in local_bodies(db) {
         let plain = reads_beside_a_named_span(db, def, false).clone();
-        let traced =
-            tracing::subscriber::with_default(named, || reads_beside_a_named_span(db, def, true).clone());
+        let traced = tracing::subscriber::with_default(named, || {
+            reads_beside_a_named_span(db, def, true).clone()
+        });
         assert_eq!(plain, traced, "naming {def:?}'s span changed what its query read");
     }
     let functions = named.functions.lock();
@@ -273,6 +287,10 @@ fn a_crate_label_tells_a_library_from_its_test_copy() {
         (K::Lib { is_proc_macro: true }, K::Lib { is_proc_macro: true }),
         (K::BuildScript, K::BuildScript),
     ];
-    let labels: Vec<&str> = kinds.iter().map(|&(kind, manifest)| super::kind_label(kind, manifest)).collect();
-    assert_eq!(labels, ["lib", "lib-test", "bin-test", "test", "bin", "proc-macro", "build-script"]);
+    let labels: Vec<&str> =
+        kinds.iter().map(|&(kind, manifest)| super::kind_label(kind, manifest)).collect();
+    assert_eq!(
+        labels,
+        ["lib", "lib-test", "bin-test", "test", "bin", "proc-macro", "build-script"]
+    );
 }

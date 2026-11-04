@@ -10,8 +10,8 @@
 use base_db::Db;
 use blaze_items::ItemId;
 use hir::{
-    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasAttrs as _, HasVisibility as _, InFile, ModuleDef,
-    StructKind, Variant,
+    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasAttrs as _, HasVisibility as _,
+    InFile, ModuleDef, StructKind, Variant,
 };
 use hir_def::attrs::stability::{DeprecationEntry, Stability};
 use syntax::{
@@ -232,13 +232,17 @@ impl ItemLike {
             SyntaxKind::SOURCE_FILE => ItemLike::Def(ModuleDef::Module(def!(SourceFile))),
             SyntaxKind::MODULE => ItemLike::Def(ModuleDef::Module(def!(Module))),
             SyntaxKind::FN => ItemLike::Def(ModuleDef::Function(def!(Fn))),
-            SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION => ItemLike::Def(ModuleDef::Adt(def!(Adt))),
+            SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION => {
+                ItemLike::Def(ModuleDef::Adt(def!(Adt)))
+            }
             SyntaxKind::VARIANT => ItemLike::Def(ModuleDef::EnumVariant(def!(Variant))),
             SyntaxKind::CONST => ItemLike::Def(ModuleDef::Const(def!(Const))),
             SyntaxKind::STATIC => ItemLike::Def(ModuleDef::Static(def!(Static))),
             SyntaxKind::TRAIT => ItemLike::Def(ModuleDef::Trait(def!(Trait))),
             SyntaxKind::TYPE_ALIAS => ItemLike::Def(ModuleDef::TypeAlias(def!(TypeAlias))),
-            SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => ItemLike::Def(ModuleDef::Macro(def!(Macro))),
+            SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
+                ItemLike::Def(ModuleDef::Macro(def!(Macro)))
+            }
             SyntaxKind::RECORD_FIELD => ItemLike::Field(def!(RecordField)),
             SyntaxKind::TUPLE_FIELD => ItemLike::Field(def!(TupleField)),
             SyntaxKind::IMPL => ItemLike::Impl(def!(Impl)),
@@ -367,7 +371,12 @@ pub(super) fn path(cx: &Cx<'_, '_>, def: Def) -> Option<String> {
 /// the item's own path in its crate.
 fn visible_path(cx: &Cx<'_, '_>, item: ModuleDef) -> String {
     let db = cx.db;
-    let cfg = hir::FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
+    let cfg = hir::FindPathConfig {
+        prefer_no_std: false,
+        prefer_prelude: false,
+        prefer_absolute: false,
+        allow_unstable: true,
+    };
     let root = cx.krate.root_module(db);
     let deps = cx.krate.dependencies(db);
     if let ModuleDef::Module(it) = item
@@ -377,7 +386,8 @@ fn visible_path(cx: &Cx<'_, '_>, item: ModuleDef) -> String {
         // alloc: the path a firing diagnostic prints
         return dep.name.display(db, cx.edition).to_string();
     }
-    if let Some(found) = root.find_use_path(db, hir::ItemInNs::from(item), hir::PrefixKind::Plain, cfg)
+    if let Some(found) =
+        root.find_use_path(db, hir::ItemInNs::from(item), hir::PrefixKind::Plain, cfg)
         && found.kind == hir::PathKind::Plain
         && found.segments().first().is_some_and(|first| deps.iter().any(|dep| &dep.name == first))
     {
@@ -386,7 +396,10 @@ fn visible_path(cx: &Cx<'_, '_>, item: ModuleDef) -> String {
     }
     let krate = item.module(db).map(|it| it.krate(db));
     // alloc: the crate segment of the path a firing diagnostic prints
-    let crate_name = krate.and_then(|it| it.display_name(db)).map(|it| it.crate_name().to_string()).unwrap_or_default();
+    let crate_name = krate
+        .and_then(|it| it.display_name(db))
+        .map(|it| it.crate_name().to_string())
+        .unwrap_or_default();
     match item {
         ModuleDef::Module(it) if it.is_crate_root(db) => crate_name,
         _ => match item.canonical_path(db, cx.edition) {
@@ -483,7 +496,11 @@ fn segment<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<String> {
 
 /// Which of the closures of `parent` (the crate root when `None`) `closure` is, in the order
 /// rustc numbers them: as they are written.
-fn closure_index<'db>(cx: &Cx<'_, 'db>, parent: Option<InFile<Node<'db>>>, closure: InFile<Node<'db>>) -> usize {
+fn closure_index<'db>(
+    cx: &Cx<'_, 'db>,
+    parent: Option<InFile<Node<'db>>>,
+    closure: InFile<Node<'db>>,
+) -> usize {
     let Some(parent) = parent.filter(|it| it.file_id == closure.file_id) else { return 0 };
     let mut index = 0;
     for node in parent.value.descendants() {
@@ -504,14 +521,28 @@ pub(super) fn is_def_parent(node: Node<'_>) -> bool {
     use syntax::SyntaxKind::*;
     matches!(
         node.kind(),
-        MODULE | FN | CONST | STATIC | STRUCT | ENUM | UNION | VARIANT | TRAIT | IMPL | TYPE_ALIAS | CLOSURE_EXPR
+        MODULE
+            | FN
+            | CONST
+            | STATIC
+            | STRUCT
+            | ENUM
+            | UNION
+            | VARIANT
+            | TRAIT
+            | IMPL
+            | TYPE_ALIAS
+            | CLOSURE_EXPR
     )
 }
 
 /// The definition `node`'s is in (`opt_local_parent`): the nearest enclosing one, through a
 /// macro's expansion to where it was called and from a module's file to its `mod`; `None`
 /// at the crate root.
-pub(super) fn def_parent<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<InFile<Node<'db>>> {
+pub(super) fn def_parent<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<Node<'db>>,
+) -> Option<InFile<Node<'db>>> {
     parent(cx, node, is_def_parent)
 }
 

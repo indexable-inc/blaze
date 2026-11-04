@@ -62,7 +62,10 @@ impl<T> RangeMap<T> {
         let slice: &[Elem<T>] = if len == 0 { &[] } else { &self.v[self.find_offset(offset)..] };
         let end = offset + len;
         assert!(end <= self.size(), "iterating beyond the bounds of this RangeMap");
-        slice.iter().take_while(move |elem| elem.range.start < end).map(|elem| (elem.range.clone(), &elem.data))
+        slice
+            .iter()
+            .take_while(move |elem| elem.range.start < end)
+            .map(|elem| (elem.range.clone(), &elem.data))
     }
 
     pub(super) fn iter_mut_all(&mut self) -> impl Iterator<Item = (Range<u64>, &mut T)> {

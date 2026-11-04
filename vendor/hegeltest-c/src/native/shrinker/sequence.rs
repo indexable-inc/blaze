@@ -22,13 +22,11 @@ impl<'a> Shrinker<'a> {
     }
 
     pub(super) async fn sort_values_integers(&mut self) -> ShrinkResult<()> {
-        self.try_sort_group(|d| matches!(d, ChoiceData::Integer(..)))
-            .await
+        self.try_sort_group(|d| matches!(d, ChoiceData::Integer(..))).await
     }
 
     pub(super) async fn sort_values_booleans(&mut self) -> ShrinkResult<()> {
-        self.try_sort_group(|d| matches!(d, ChoiceData::Boolean(..)))
-            .await
+        self.try_sort_group(|d| matches!(d, ChoiceData::Boolean(..))).await
     }
 
     async fn try_sort_group<F>(&mut self, matches_kind: F) -> ShrinkResult<()>
@@ -46,28 +44,18 @@ impl<'a> Shrinker<'a> {
             return Ok(());
         }
 
-        let values: Vec<ChoiceValue> = indices
-            .iter()
-            .map(|&i| self.current_nodes[i].value())
-            .collect();
+        let values: Vec<ChoiceValue> =
+            indices.iter().map(|&i| self.current_nodes[i].value()).collect();
         let mut keyed: Vec<_> = indices
             .iter()
-            .map(|&i| {
-                (
-                    self.current_nodes[i].sort_key_ref(),
-                    self.current_nodes[i].value(),
-                )
-            })
+            .map(|&i| (self.current_nodes[i].sort_key_ref(), self.current_nodes[i].value()))
             .collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
         let sorted_values: Vec<ChoiceValue> = keyed.into_iter().map(|(_, v)| v).collect();
 
         if sorted_values != values {
-            let replacements: HashMap<usize, ChoiceValue> = indices
-                .iter()
-                .zip(sorted_values.iter())
-                .map(|(&i, v)| (i, v.clone()))
-                .collect();
+            let replacements: HashMap<usize, ChoiceValue> =
+                indices.iter().zip(sorted_values.iter()).map(|(&i, v)| (i, v.clone())).collect();
             if self.replace(&replacements).await? {
                 return Ok(());
             }
@@ -131,12 +119,10 @@ impl<'a> Shrinker<'a> {
                     continue;
                 }
 
-                let block_a: Vec<ChoiceValue> = (0..block_size)
-                    .map(|k| self.current_nodes[i + k].value())
-                    .collect();
-                let block_b: Vec<ChoiceValue> = (0..block_size)
-                    .map(|k| self.current_nodes[j + k].value())
-                    .collect();
+                let block_a: Vec<ChoiceValue> =
+                    (0..block_size).map(|k| self.current_nodes[i + k].value()).collect();
+                let block_b: Vec<ChoiceValue> =
+                    (0..block_size).map(|k| self.current_nodes[j + k].value()).collect();
 
                 if block_a == block_b {
                     i += 1;

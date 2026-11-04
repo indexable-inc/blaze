@@ -9,8 +9,8 @@ use std::fmt;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use intern::{Symbol, sym};
+use std::alloc::Global;
 
 impl fmt::Debug for UnstableFeatures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

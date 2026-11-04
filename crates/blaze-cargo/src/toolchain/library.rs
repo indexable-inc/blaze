@@ -143,7 +143,8 @@ fn candidates() -> Result<Vec<PathBuf>, String> {
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|error| {
         format!("finding blaze's own program, beside which its standard library can be: {error}")
     })?;
-    let mut dirs: Vec<PathBuf> = exe.ancestors().skip(1).take(3).map(|it| it.join("share/blaze/library")).collect();
+    let mut dirs: Vec<PathBuf> =
+        exe.ancestors().skip(1).take(3).map(|it| it.join("share/blaze/library")).collect();
     dirs.extend(own());
     Ok(dirs)
 }
@@ -297,7 +298,9 @@ fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
             match got {
                 Ok(bytes) => return Ok(bytes),
                 // alloc: error path, the last failure.
-                Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
+                Err(e) if tries + 1 == TRIES => {
+                    return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
+                }
                 Err(_) => tries += 1,
             }
             tokio::time::sleep(Duration::from_secs(tries.into())).await;

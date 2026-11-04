@@ -171,8 +171,7 @@ pub(super) fn transcribe<'a, A: Allocator>(
         tt::Delimiter::invisible_spanned(ctx.call_site),
         template.0.len() + bindings.token_trees(),
     );
-    expand_subtree(&mut ctx, template, &mut builder, marker)
-        .map(|()| (build(builder), ctx.made))
+    expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| (build(builder), ctx.made))
 }
 
 #[derive(Debug)]
@@ -735,12 +734,7 @@ fn fix_up_and_push_path_tt(
 
 /// Handles `${count(t, depth)}`. `our_depth` is the recursion depth and `count_depth` is the depth
 /// defined by the metavar expression.
-fn count(
-    bindings: &Bindings<'_>,
-    binding: Binding,
-    depth_curr: usize,
-    depth_max: usize,
-) -> usize {
+fn count(bindings: &Bindings<'_>, binding: Binding, depth_curr: usize, depth_max: usize) -> usize {
     match binding {
         Binding::Nested { start, len } => {
             if depth_curr == depth_max {

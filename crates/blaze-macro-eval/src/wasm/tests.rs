@@ -60,7 +60,11 @@ fn echo() -> Vec<u8> {
 
 /// [`ECHO`] with an import of `env::open`: a way to the system around the host's shims.
 fn reaching_around() -> String {
-    ECHO.replacen("(memory", "(import \"env\" \"open\" (func (param i32 i32) (result i32)))\n  (memory", 1)
+    ECHO.replacen(
+        "(memory",
+        "(import \"env\" \"open\" (func (param i32 i32) (result i32)))\n  (memory",
+        1,
+    )
 }
 
 /// [`ECHO`] that first reads the variable `A` through the bridge's `env_var`, as the glue's
@@ -126,7 +130,8 @@ struct Workspace(std::path::PathBuf);
 
 impl Workspace {
     fn new(name: &str) -> Workspace {
-        let top = std::env::temp_dir().join(format!("blaze-macro-eval-wasm-{name}-{}", std::process::id()));
+        let top = std::env::temp_dir()
+            .join(format!("blaze-macro-eval-wasm-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&top);
         std::fs::create_dir_all(top.join("pkg/data")).unwrap();
         std::fs::write(top.join("pkg/data/a.txt"), "hello, macro").unwrap();
@@ -157,7 +162,11 @@ impl Drop for Workspace {
 /// Runs macro 0 of `library` on `input` in a fresh instance whose working directory is `cwd`
 /// (the call's directory, [`crate::os::Os::wasm_in`]): what it gave, or why it stopped, and
 /// what it read.
-fn expand_in(library: &Library, env: Env, cwd: String) -> (Result<(), String>, Vec<(Seen, String)>) {
+fn expand_in(
+    library: &Library,
+    env: Env,
+    cwd: String,
+) -> (Result<(), String>, Vec<(Seen, String)>) {
     use std::sync::Arc;
     let input = [a_plus()];
     let g = given(&input);
@@ -167,19 +176,28 @@ fn expand_in(library: &Library, env: Env, cwd: String) -> (Result<(), String>, V
     let pre = library.pre.clone();
     let statics = Arc::clone(&library.statics);
     let db = Db::new();
-    super::thread::run(&db, move |link: &super::thread::Link<(Result<(), String>, Vec<(Seen, String)>)>| {
-        let mut watch =
-            super::host::Watch { statics, writes: Vec::new(), before: Vec::new(), after: Vec::new(), memory_len: 0, started: false };
-        let mut cx = super::host::Cx::new(link, server, crate::os::Os::wasm_in(&env, &cwd));
-        let (output, _) = super::host::expand(&pre, &mut cx, 0, &wire, &mut watch);
-        let seen = cx.os.seen().map(|(seen, what)| (seen, what.to_owned())).collect();
-        let output = match output {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(panic)) => Err(format!("panicked: {panic}")),
-            Err(stop) => Err(stop.0),
-        };
-        (output, seen)
-    })
+    super::thread::run(
+        &db,
+        move |link: &super::thread::Link<(Result<(), String>, Vec<(Seen, String)>)>| {
+            let mut watch = super::host::Watch {
+                statics,
+                writes: Vec::new(),
+                before: Vec::new(),
+                after: Vec::new(),
+                memory_len: 0,
+                started: false,
+            };
+            let mut cx = super::host::Cx::new(link, server, crate::os::Os::wasm_in(&env, &cwd));
+            let (output, _) = super::host::expand(&pre, &mut cx, 0, &wire, &mut watch);
+            let seen = cx.os.seen().map(|(seen, what)| (seen, what.to_owned())).collect();
+            let output = match output {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(panic)) => Err(format!("panicked: {panic}")),
+                Err(stop) => Err(stop.0),
+            };
+            (output, seen)
+        },
+    )
     .unwrap()
 }
 
@@ -189,10 +207,14 @@ fn expand_in(library: &Library, env: Env, cwd: String) -> (Result<(), String>, V
 #[test]
 fn a_relative_path_a_module_reads_starts_in_the_calling_packages_directory() {
     let ws = Workspace::new("manifest");
-    let (library, _) = Library::load_with(&modules(), &binary(&reading_relative("data/a.txt")), None, WHAT).unwrap();
+    let (library, _) =
+        Library::load_with(&modules(), &binary(&reading_relative("data/a.txt")), None, WHAT)
+            .unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let ran = library.expand(&Db::new(), &ws.env(), 0, &given(&input), &[], &ws.path("pkg"), &mut spent).unwrap();
+    let ran = library
+        .expand(&Db::new(), &ws.env(), 0, &given(&input), &[], &ws.path("pkg"), &mut spent)
+        .unwrap();
     assert!(ran.output.is_ok(), "{:?}", ran.output.err());
     assert!(ran.seen.contains(&(Seen::Read, ws.path("pkg/data/a.txt"))), "{:?}", ran.seen);
 }
@@ -203,13 +225,17 @@ fn a_relative_path_a_module_reads_starts_in_the_calling_packages_directory() {
 #[test]
 fn a_member_modules_relative_path_starts_at_the_workspaces_root_and_only_the_roots_are_read() {
     let ws = Workspace::new("member");
-    let (library, _) = Library::load_with(&modules(), &binary(&reading_relative("pkg/data/a.txt")), None, WHAT).unwrap();
+    let (library, _) =
+        Library::load_with(&modules(), &binary(&reading_relative("pkg/data/a.txt")), None, WHAT)
+            .unwrap();
     let (output, seen) = expand_in(&library, ws.env(), ws.path(""));
     assert_eq!(output, Ok(()));
     assert!(seen.contains(&(Seen::Read, ws.path("pkg/data/a.txt"))), "{seen:?}");
     assert!(!seen.iter().any(|it| it.1 == ws.path("")), "entering the root was noted: {seen:?}");
 
-    let (library, _) = Library::load_with(&modules(), &binary(&reading_relative("secret.txt")), None, WHAT).unwrap();
+    let (library, _) =
+        Library::load_with(&modules(), &binary(&reading_relative("secret.txt")), None, WHAT)
+            .unwrap();
     let (output, _) = expand_in(&library, ws.env(), ws.path(""));
     let stop = output.unwrap_err();
     assert!(stop.contains(&format!("(which is `{}`)", ws.path("secret.txt"))), "{stop}");
@@ -289,18 +315,38 @@ fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
 }
 
 /// How `store` took `bytes` under `key`, sent by a remote as a value of `kind`.
-fn fetched(store: &mut Store, key: blaze_cas::Key, kind: blaze_cas::Kind, bytes: &[u8]) -> blaze_cas::Fetched {
+fn fetched(
+    store: &mut Store,
+    key: blaze_cas::Key,
+    kind: blaze_cas::Kind,
+    bytes: &[u8],
+) -> blaze_cas::Fetched {
     struct Far;
     impl blaze_cas::Remote for Far {
-        fn fetch(&mut self, _: &blaze_cas::Key, _: blaze_core::Tag, _: &mut Vec<blaze_core::Effect>) -> blaze_cas::Asked {
+        fn fetch(
+            &mut self,
+            _: &blaze_cas::Key,
+            _: blaze_core::Tag,
+            _: &mut Vec<blaze_core::Effect>,
+        ) -> blaze_cas::Asked {
             blaze_cas::Asked::Sent
         }
     }
     let mut effects = Vec::new();
     // What this checks is the store's own refusal of a kind (machine code): every value is let in.
-    let tag = store.fetch(&key, &mut Far, |_, _| Ok(()), &mut effects).expect("a store without the key asks for it");
-    let answer = blaze_cas::remote::Answer::Value { key, kind, content: blaze_cas::content_of(bytes), bytes: bytes.to_vec() };
-    store.complete(blaze_core::Completion { tag, done: blaze_core::Done::Read(answer.encode_framed()) }, &mut effects);
+    let tag = store
+        .fetch(&key, &mut Far, |_, _| Ok(()), &mut effects)
+        .expect("a store without the key asks for it");
+    let answer = blaze_cas::remote::Answer::Value {
+        key,
+        kind,
+        content: blaze_cas::content_of(bytes),
+        bytes: bytes.to_vec(),
+    };
+    store.complete(
+        blaze_core::Completion { tag, done: blaze_core::Done::Read(answer.encode_framed()) },
+        &mut effects,
+    );
     let mut all = store.fetched();
     assert_eq!(all.len(), 1, "{all:?}");
     all.pop().unwrap().1
@@ -322,15 +368,24 @@ fn echo_code() -> (blaze_cas::Key, Vec<u8>) {
 fn a_plus() -> Stream {
     let mut stream = Stream::default();
     let trees = stream.trees_mut();
-    trees.push(Tree::Ident { sym: Symbol::intern("a"), kind: IdentKind::Normal, span: at(0, 1), spacing: Spacing::Alone });
+    trees.push(Tree::Ident {
+        sym: Symbol::intern("a"),
+        kind: IdentKind::Normal,
+        span: at(0, 1),
+        spacing: Spacing::Alone,
+    });
     trees.push(Tree::Punct { ch: b'+', spacing: Spacing::Alone, span: at(1, 2) });
     stream
 }
 
 #[test]
 fn a_module_that_imports_around_the_shims_is_refused_naming_its_macro_and_the_import() {
-    let error = Library::load_with(&modules(), reaching_around().as_bytes(), None, WHAT).unwrap_err();
-    assert_eq!(error, LoadError::Mismatch(Mismatch::Import { module: "env".to_owned(), name: "open".to_owned() }));
+    let error =
+        Library::load_with(&modules(), reaching_around().as_bytes(), None, WHAT).unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Mismatch(Mismatch::Import { module: "env".to_owned(), name: "open".to_owned() })
+    );
     let said = format!("{WHAT} {error}");
     assert!(said.contains("`demo_derive`"), "{said}");
     assert!(said.contains("`env::open`"), "{said}");
@@ -343,16 +398,47 @@ fn a_module_that_imports_around_the_shims_is_refused_naming_its_macro_and_the_im
 #[test]
 fn a_macro_is_served_only_the_sandboxs_wasi_and_never_a_call_that_writes() {
     let sandbox = [
-        "args_get", "args_sizes_get", "clock_res_get", "clock_time_get", "environ_get", "environ_sizes_get", "fd_close",
-        "fd_fdstat_get", "fd_fdstat_set_flags", "fd_filestat_get", "fd_prestat_dir_name", "fd_prestat_get", "fd_read",
-        "fd_readdir", "fd_seek", "fd_tell", "fd_write", "path_filestat_get", "path_open", "path_readlink", "poll_oneoff",
-        "proc_exit", "random_get", "sched_yield",
+        "args_get",
+        "args_sizes_get",
+        "clock_res_get",
+        "clock_time_get",
+        "environ_get",
+        "environ_sizes_get",
+        "fd_close",
+        "fd_fdstat_get",
+        "fd_fdstat_set_flags",
+        "fd_filestat_get",
+        "fd_prestat_dir_name",
+        "fd_prestat_get",
+        "fd_read",
+        "fd_readdir",
+        "fd_seek",
+        "fd_tell",
+        "fd_write",
+        "path_filestat_get",
+        "path_open",
+        "path_readlink",
+        "poll_oneoff",
+        "proc_exit",
+        "random_get",
+        "sched_yield",
     ];
     assert_eq!(super::abi::WASI_SHIMS, &sandbox[..]);
     let writes = [
-        "fd_allocate", "fd_datasync", "fd_filestat_set_size", "fd_filestat_set_times", "fd_pwrite", "fd_renumber", "fd_sync",
-        "path_create_directory", "path_filestat_set_times", "path_link", "path_remove_directory", "path_rename",
-        "path_symlink", "path_unlink_file",
+        "fd_allocate",
+        "fd_datasync",
+        "fd_filestat_set_size",
+        "fd_filestat_set_times",
+        "fd_pwrite",
+        "fd_renumber",
+        "fd_sync",
+        "path_create_directory",
+        "path_filestat_set_times",
+        "path_link",
+        "path_remove_directory",
+        "path_rename",
+        "path_symlink",
+        "path_unlink_file",
     ];
     let refused = writes
         .iter()
@@ -361,8 +447,20 @@ fn a_macro_is_served_only_the_sandboxs_wasi_and_never_a_call_that_writes() {
         .chain(blaze_wasi::seed::FUNCTIONS.iter().map(|name| (blaze_wasi::seed::MODULE, *name)));
     for (module, name) in refused {
         let import = format!("(import \"{module}\" \"{name}\" (func))\n  (memory");
-        let error = Library::load_with(&modules(), ECHO.replacen("(memory", &import, 1).as_bytes(), None, WHAT).unwrap_err();
-        assert_eq!(error, LoadError::Mismatch(Mismatch::Import { module: module.to_owned(), name: name.to_owned() }));
+        let error = Library::load_with(
+            &modules(),
+            ECHO.replacen("(memory", &import, 1).as_bytes(),
+            None,
+            WHAT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            LoadError::Mismatch(Mismatch::Import {
+                module: module.to_owned(),
+                name: name.to_owned()
+            })
+        );
     }
 }
 
@@ -399,12 +497,20 @@ fn another_module_of_the_same_crate_runs_other_code() {
     let code = blaze_ids::ContentId([9; 32]);
     let (one, _) = Library::load_with(&modules, &echo(), None, WHAT).unwrap();
     let (again, _) = Library::load_with(&modules, &echo(), None, WHAT).unwrap();
-    let rebuilt = binary(&ECHO.replacen("(func (export \"_initialize\"))", "(func (export \"_initialize\") nop)", 1));
+    let rebuilt = binary(&ECHO.replacen(
+        "(func (export \"_initialize\"))",
+        "(func (export \"_initialize\") nop)",
+        1,
+    ));
     let (other, _) = Library::load_with(&modules, &rebuilt, None, WHAT).unwrap();
     assert_ne!(one.id(), other.id(), "the rebuilt module is other bytes");
     let (one, again, other) = (Engine::Wasm(one), Engine::Wasm(again), Engine::Wasm(other));
     assert_eq!(one.runs(code), again.runs(code), "one module of one crate runs one code");
-    assert_ne!(one.runs(code), other.runs(code), "another module of the same crate runs other code");
+    assert_ne!(
+        one.runs(code),
+        other.runs(code),
+        "another module of the same crate runs other code"
+    );
     assert_ne!(one.runs(code), code, "a module's code is not the crate's alone");
     assert_ne!(one.runs(code), one.runs(blaze_ids::ContentId([10; 32])), "nor the module's alone");
 }
@@ -417,7 +523,8 @@ fn a_kept_modules_machine_code_loads_in_another_process_without_compiling() {
     let reader = store.reader();
     let (_, put) = Library::load_with(&first, &echo(), Some(&reader), WHAT).unwrap();
     assert_eq!(first.loads(), Loads { memo: 0, store: 0, compiled: 1 });
-    let put = put.expect("a module compiled with a store installed leaves its machine code to keep");
+    let put =
+        put.expect("a module compiled with a store installed leaves its machine code to keep");
     assert!(put.what.contains("`demo_derive`"), "{}", put.what);
     let published = publish(&mut store, vec![put]);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
@@ -426,20 +533,30 @@ fn a_kept_modules_machine_code_loads_in_another_process_without_compiling() {
     let second = modules();
     let reader = store.reader();
     let (library, put) = Library::load_with(&second, &echo(), Some(&reader), WHAT).unwrap();
-    assert_eq!(second.loads(), Loads { memo: 0, store: 1, compiled: 0 }, "the kept machine code was compiled again");
+    assert_eq!(
+        second.loads(),
+        Loads { memo: 0, store: 1, compiled: 0 },
+        "the kept machine code was compiled again"
+    );
     assert!(put.is_none(), "a module found in the store is kept again");
 
     // And what it loaded runs.
     let db = Db::new();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let ran = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let ran =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
     let output = ran.output.unwrap();
     assert!(matches!(output.trees(), [Tree::Ident { .. }, Tree::Punct { ch: b'+', .. }]));
 }
 
 fn given(inputs: &[Stream]) -> Given<'_> {
-    Given { inputs, sites: [at(0, 0), at(1, 1), at(2, 2)], edition: Edition::CURRENT, forced_keywords: false }
+    Given {
+        inputs,
+        sites: [at(0, 0), at(1, 1), at(2, 2)],
+        edition: Edition::CURRENT,
+        forced_keywords: false,
+    }
 }
 
 #[test]
@@ -448,21 +565,30 @@ fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
     let (library, _) = Library::load_with(&modules(), &echo(), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let first = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let first =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
     assert!(!spent.evaluated && spent.steps > 0 && spent.over.is_none(), "{spent:?}");
-    assert!(first.seen.is_empty() && first.unkeyable.is_none() && !first.asked, "an echo read nothing");
+    assert!(
+        first.seen.is_empty() && first.unkeyable.is_none() && !first.asked,
+        "an echo read nothing"
+    );
     // A fresh instance each time: the second run is the first again.
-    let second = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let second =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
     assert_eq!(first.output.unwrap().trees().len(), second.output.unwrap().trees().len());
 
-    let missing = library.expand(&db, &Env::default(), 7, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let missing =
+        library.expand(&db, &Env::default(), 7, &given(&input), &[], "/", &mut spent).unwrap_err();
     assert!(missing.0.contains("no macro at index 7"), "{missing}");
 }
 
 /// A per-run variable such as `BLAZE_PROFILE`, which the macro never reads, differs between
 /// two builds; the variable it reads does not.
 fn env(a: &str, profile: &str) -> Env {
-    [("A", a), ("BLAZE_PROFILE", profile)].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+    [("A", a), ("BLAZE_PROFILE", profile)]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
 }
 
 #[test]
@@ -473,21 +599,41 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
     let mut spent = Spent::default();
     let first = env("1", "/tmp/blaze-lanes/profile-1855");
     let ran = library.expand(&db, &first, 0, &given(&input), &[], "/", &mut spent).unwrap();
-    assert_eq!(ran.seen, [(Seen::Env, "A".to_owned())], "it read `A` by name, not the whole environment");
+    assert_eq!(
+        ran.seen,
+        [(Seen::Env, "A".to_owned())],
+        "it read `A` by name, not the whole environment"
+    );
 
     let mut sim = Sim::new(5, Faults::default());
     let mut store = opened(&mut sim);
-    let key = RunKey { code: library.id(), given: blaze_ids::Hasher::new("a test's call of the macro").finish() };
-    let traced = assemble_seen(ran.seen.iter().map(|(seen, what)| (*seen, what.as_str())), &mut Calling::new(&first)).unwrap();
-    let put = Put { keep: Keep::Run { run: key, traced }, value: b"a +".to_vec(), what: WHAT.to_owned() };
+    let key = RunKey {
+        code: library.id(),
+        given: blaze_ids::Hasher::new("a test's call of the macro").finish(),
+    };
+    let traced = assemble_seen(
+        ran.seen.iter().map(|(seen, what)| (*seen, what.as_str())),
+        &mut Calling::new(&first),
+    )
+    .unwrap();
+    let put =
+        Put { keep: Keep::Run { run: key, traced }, value: b"a +".to_vec(), what: WHAT.to_owned() };
     let published = publish(&mut store, vec![put]);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
 
     let reader = store.reader();
     let guard = blaze_cas::enter();
-    let found = |env: &Env| matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }));
-    assert!(found(&env("1", "/tmp/blaze-lanes/profile-1910")), "a variable it never read made it miss");
-    assert!(!found(&env("2", "/tmp/blaze-lanes/profile-1855")), "the variable it read changed and it was found");
+    let found = |env: &Env| {
+        matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }))
+    };
+    assert!(
+        found(&env("1", "/tmp/blaze-lanes/profile-1910")),
+        "a variable it never read made it miss"
+    );
+    assert!(
+        !found(&env("2", "/tmp/blaze-lanes/profile-1855")),
+        "the variable it read changed and it was found"
+    );
 }
 
 #[test]
@@ -539,7 +685,10 @@ fn each_way_a_module_loads_is_counted_plotted_and_spanned_with_where_from_and_it
     );
     // Only this test loads from the memo; the counts themselves are `Modules::loads`'s above.
     for plot in [Plot::MacroModuleMemo, Plot::MacroModuleStore, Plot::MacroModuleCompiled] {
-        assert!(read.counters.iter().any(|it| it.plot == plot && it.value >= 1), "{plot:?} was not plotted");
+        assert!(
+            read.counters.iter().any(|it| it.plot == plot && it.value >= 1),
+            "{plot:?} was not plotted"
+        );
     }
 }
 
@@ -554,7 +703,10 @@ fn machine_code_a_remote_sent_is_refused_by_where_it_came_from_and_never_deseria
     let mut sim = Sim::new(5, Faults::default());
     let mut store = opened(&mut sim);
     let refused = fetched(&mut store, key, Kind::Machine, &code);
-    assert!(matches!(&refused, Fetched::Refused(why) if why.contains("machine code")), "{refused:?}");
+    assert!(
+        matches!(&refused, Fetched::Refused(why) if why.contains("machine code")),
+        "{refused:?}"
+    );
     let daemon = modules();
     Library::load_with(&daemon, &echo(), Some(&store.reader()), WHAT).unwrap();
     assert_eq!(daemon.loads(), Loads { memo: 0, store: 0, compiled: 1 });
@@ -566,8 +718,15 @@ fn machine_code_a_remote_sent_is_refused_by_where_it_came_from_and_never_deseria
     assert!(matches!(kept, Fetched::Kept(_)), "{kept:?}");
     let daemon = modules();
     let error = Library::load_with(&daemon, &echo(), Some(&store.reader()), WHAT).unwrap_err();
-    assert!(matches!(error, LoadError::NotLocal { origin: Origin::Own, kind: Kind::Run }), "{error:?}");
-    assert_eq!(daemon.loads(), Loads::default(), "a refused value was deserialized or compiled around");
+    assert!(
+        matches!(error, LoadError::NotLocal { origin: Origin::Own, kind: Kind::Run }),
+        "{error:?}"
+    );
+    assert_eq!(
+        daemon.loads(),
+        Loads::default(),
+        "a refused value was deserialized or compiled around"
+    );
 }
 
 #[test]
@@ -586,8 +745,14 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     let daemon = modules();
     let error = Library::load_with(&daemon, &echo(), Some(&mine.reader()), WHAT).unwrap_err();
     let base = FileName::new("base").unwrap();
-    assert!(matches!(&error, LoadError::NotLocal { origin: Origin::Behind(dir), kind: Kind::Machine } if *dir == base), "{error:?}");
-    assert!(format!("{WHAT} {error}").contains("base"), "the refusal does not name the store it came from: {error}");
+    assert!(
+        matches!(&error, LoadError::NotLocal { origin: Origin::Behind(dir), kind: Kind::Machine } if *dir == base),
+        "{error:?}"
+    );
+    assert!(
+        format!("{WHAT} {error}").contains("base"),
+        "the refusal does not name the store it came from: {error}"
+    );
     assert_eq!(daemon.loads(), Loads::default());
 }
 
@@ -606,7 +771,9 @@ fn two_daemons_in_one_process_each_load_machine_code_from_their_own_store() {
     // Its own crate name: the puts a load leaves are this thread's, and those of threads that
     // ended before theirs were taken.
     let what = "the wasm module of the proc-macro crate `two_daemons_derive`";
-    let mine = |puts: Vec<Put>| puts.into_iter().filter(|it| it.what.contains("`two_daemons_derive`")).collect::<Vec<_>>();
+    let mine = |puts: Vec<Put>| {
+        puts.into_iter().filter(|it| it.what.contains("`two_daemons_derive`")).collect::<Vec<_>>()
+    };
     let mut sim = Sim::new(5, Faults::default());
     let mut one = opened_in(&mut sim, "one", &[]);
     let other = opened_in(&mut sim, "other", &[]);
@@ -625,16 +792,29 @@ fn two_daemons_in_one_process_each_load_machine_code_from_their_own_store() {
     let again = modules();
     Library::load(&again, &one_keeps, &echo(), what).unwrap();
     assert_eq!(again.loads(), Loads { memo: 0, store: 1, compiled: 0 });
-    assert!(mine(proc_macro_api::kept::take_puts()).is_empty(), "a module found in the store is kept again");
+    assert!(
+        mine(proc_macro_api::kept::take_puts()).is_empty(),
+        "a module found in the store is kept again"
+    );
     let others = modules();
     Library::load(&others, &other_keeps, &echo(), what).unwrap();
-    assert_eq!(others.loads(), Loads { memo: 0, store: 0, compiled: 1 }, "the second daemon loaded the first's machine code");
+    assert_eq!(
+        others.loads(),
+        Loads { memo: 0, store: 0, compiled: 1 },
+        "the second daemon loaded the first's machine code"
+    );
     assert_eq!(mine(proc_macro_api::kept::take_puts()).len(), 1);
     drop(other);
 
     // Keeping nothing, a load compiles and leaves nothing to keep.
     let alone = modules();
-    Library::load(&alone, &proc_macro_api::kept::Keeps::Nothing("a test that keeps nothing"), &echo(), what).unwrap();
+    Library::load(
+        &alone,
+        &proc_macro_api::kept::Keeps::Nothing("a test that keeps nothing"),
+        &echo(),
+        what,
+    )
+    .unwrap();
     assert_eq!(alone.loads(), Loads { memo: 0, store: 0, compiled: 1 });
     assert!(mine(proc_macro_api::kept::take_puts()).is_empty());
 }
@@ -646,7 +826,10 @@ fn a_module_without_its_statics_list_is_refused() {
     let bare = ECHO.replacen("  (@custom \"blaze.statics\" \"\")\n", "", 1);
     assert_ne!(bare, ECHO);
     let error = Library::load_with(&modules(), &binary(&bare), None, WHAT).unwrap_err();
-    assert!(matches!(&error, LoadError::Statics(why) if why.contains("has no `blaze.statics` section")), "{error}");
+    assert!(
+        matches!(&error, LoadError::Statics(why) if why.contains("has no `blaze.statics` section")),
+        "{error}"
+    );
 }
 
 /// [`ECHO`] whose macro first adds one to the `u32` at 64, which its `blaze.statics` list says
@@ -663,7 +846,11 @@ fn counting(item: &[u8; 32], heap: bool) -> String {
         &format!("(@custom \"blaze.statics\" \"{}\")", super::statics::encode::wat_string(&entry)),
         1,
     )
-    .replacen("(i32.store8 (i32.const 0) (i32.const 0))", &format!("{bump}\n    (i32.store8 (i32.const 0) (i32.const 0))"), 1)
+    .replacen(
+        "(i32.store8 (i32.const 0) (i32.const 0))",
+        &format!("{bump}\n    (i32.store8 (i32.const 0) (i32.const 0))"),
+        1,
+    )
 }
 
 /// A crate with `pub static mut COUNT: u32`, its static, and the static's item key.
@@ -689,22 +876,32 @@ fn counter_crate() -> (Db, base_db::Crate, hir_def::StaticId, [u8; 32]) {
 #[test]
 fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
     let (db, krate, id, item) = counter_crate();
-    let (mut library, _) = Library::load_with(&modules(), &binary(&counting(&item, false)), None, WHAT).unwrap();
+    let (mut library, _) =
+        Library::load_with(&modules(), &binary(&counting(&item, false)), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
     // Unresolved, it runs nothing.
-    let error = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let error =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
     assert!(error.0.contains("not resolved"), "{error}");
 
     library.watch(&db, krate).unwrap();
-    let first = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let first =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
     assert_eq!(first.statics, [(id, vec![1, 0, 0, 0], false)]);
     let preset = [(id, first.statics[0].1.clone())];
-    let second = library.expand(&db, &Env::default(), 0, &given(&input), &preset, "/", &mut spent).unwrap();
-    assert_eq!(second.statics, [(id, vec![2, 0, 0, 0], false)], "the second instance started from the first's 1");
+    let second =
+        library.expand(&db, &Env::default(), 0, &given(&input), &preset, "/", &mut spent).unwrap();
+    assert_eq!(
+        second.statics,
+        [(id, vec![2, 0, 0, 0], false)],
+        "the second instance started from the first's 1"
+    );
 
     // A preset of another size is refused, naming nothing it can't.
-    let error = library.expand(&db, &Env::default(), 0, &given(&input), &[(id, vec![0; 3])], "/", &mut spent).unwrap_err();
+    let error = library
+        .expand(&db, &Env::default(), 0, &given(&input), &[(id, vec![0; 3])], "/", &mut spent)
+        .unwrap_err();
     assert!(error.0.contains("3 bytes of state"), "{error}");
 }
 
@@ -713,19 +910,25 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
 #[test]
 fn a_static_left_holding_a_heap_address_stops_naming_it() {
     let (db, krate, _, item) = counter_crate();
-    let (mut library, _) = Library::load_with(&modules(), &binary(&counting(&item, true)), None, WHAT).unwrap();
+    let (mut library, _) =
+        Library::load_with(&modules(), &binary(&counting(&item, true)), None, WHAT).unwrap();
     library.watch(&db, krate).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let error = library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
-    assert!(error.0.contains("address of its heap in the static `") && error.0.contains("COUNT`"), "{error}");
+    let error =
+        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
+    assert!(
+        error.0.contains("address of its heap in the static `") && error.0.contains("COUNT`"),
+        "{error}"
+    );
 }
 
 /// A list naming a key no crate of the macro's has is refused at load.
 #[test]
 fn a_listed_static_of_no_crate_is_refused() {
     let (db, krate, _, _) = counter_crate();
-    let (mut library, _) = Library::load_with(&modules(), &binary(&counting(&[7; 32], false)), None, WHAT).unwrap();
+    let (mut library, _) =
+        Library::load_with(&modules(), &binary(&counting(&[7; 32], false)), None, WHAT).unwrap();
     let error = library.watch(&db, krate).unwrap_err();
     assert!(matches!(&error, LoadError::Statics(why) if why.contains("of no crate")), "{error}");
 }

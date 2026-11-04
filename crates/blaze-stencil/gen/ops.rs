@@ -44,7 +44,9 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         Op::Isub => one(b.val(&format!("sub {t} {}, {}", x(), y()))),
         Op::Imul => one(b.val(&format!("mul {t} {}, {}", x(), y()))),
         Op::Ineg => one(b.val(&format!("sub {t} {}, {}", zero(ty), x()))),
-        Op::Iabs => one(b.call(t, &format!("llvm.abs.{}", mangle(ty)), &[(t, x()), ("i1", "false")])),
+        Op::Iabs => {
+            one(b.call(t, &format!("llvm.abs.{}", mangle(ty)), &[(t, x()), ("i1", "false")]))
+        }
         Op::Umulhi => one(mulhi(b, ty, x(), y(), false)),
         Op::Smulhi => one(mulhi(b, ty, x(), y(), true)),
         Op::Udiv | Op::Urem => {
@@ -126,12 +128,20 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             one(b.val(&format!("{op} {t} {}, {amount}", x())))
         }
         Op::Bitrev => one(b.call(t, &format!("llvm.bitreverse.{}", mangle(ty)), &[(t, x())])),
-        Op::Clz => one(b.call(t, &format!("llvm.ctlz.{}", mangle(ty)), &[(t, x()), ("i1", "false")])),
-        Op::Ctz => one(b.call(t, &format!("llvm.cttz.{}", mangle(ty)), &[(t, x()), ("i1", "false")])),
+        Op::Clz => {
+            one(b.call(t, &format!("llvm.ctlz.{}", mangle(ty)), &[(t, x()), ("i1", "false")]))
+        }
+        Op::Ctz => {
+            one(b.call(t, &format!("llvm.cttz.{}", mangle(ty)), &[(t, x()), ("i1", "false")]))
+        }
         Op::Cls => {
             let sign = b.val(&format!("ashr {t} {}, {}", x(), lane_bits(ty) - 1));
             let flipped = b.val(&format!("xor {t} {}, {sign}", x()));
-            let lz = b.call(t, &format!("llvm.ctlz.{}", mangle(ty)), &[(t, flipped.as_str()), ("i1", "false")]);
+            let lz = b.call(
+                t,
+                &format!("llvm.ctlz.{}", mangle(ty)),
+                &[(t, flipped.as_str()), ("i1", "false")],
+            );
             one(b.val(&format!("sub {t} {lz}, 1")))
         }
         Op::Bswap => one(b.call(t, &format!("llvm.bswap.{}", mangle(ty)), &[(t, x())])),
@@ -205,7 +215,11 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             )))
         }
         Op::FvpromoteLow => {
-            let low = b.val(&format!("shufflevector <4 x float> {}, <4 x float> poison, {}", x(), lanes_mask(0..2)));
+            let low = b.val(&format!(
+                "shufflevector <4 x float> {}, <4 x float> poison, {}",
+                x(),
+                lanes_mask(0..2)
+            ));
             one(b.val(&format!("fpext <2 x float> {low} to <2 x double>")))
         }
         Op::FcvtToUint | Op::FcvtToSint => one(fcvt_to_int(b, shape, x())),
@@ -233,36 +247,68 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         Op::SwidenLow | Op::SwidenHigh | Op::UwidenLow | Op::UwidenHigh => {
             let src = shape.arg(0);
             let half = ty.lanes();
-            let range = if matches!(shape.op, Op::SwidenLow | Op::UwidenLow) { 0..half } else { half..2 * half };
-            let part = b.val(&format!("shufflevector {} {}, {} poison, {}", ir(src), x(), ir(src), lanes_mask(range)));
-            let ext = if matches!(shape.op, Op::SwidenLow | Op::SwidenHigh) { "sext" } else { "zext" };
+            let range = if matches!(shape.op, Op::SwidenLow | Op::UwidenLow) {
+                0..half
+            } else {
+                half..2 * half
+            };
+            let part = b.val(&format!(
+                "shufflevector {} {}, {} poison, {}",
+                ir(src),
+                x(),
+                ir(src),
+                lanes_mask(range)
+            ));
+            let ext =
+                if matches!(shape.op, Op::SwidenLow | Op::SwidenHigh) { "sext" } else { "zext" };
             one(b.val(&format!("{ext} {} {part} to {t}", vec_of(half, lane_bits(src)))))
         }
         Op::IaddPairwise => {
             let n = ty.lanes();
             let evens = (0..n).map(|i| 2 * i);
-            let even = b.val(&format!("shufflevector {t} {}, {t} {}, {}", x(), y(), lanes_mask(evens)));
-            let odd = b.val(&format!("shufflevector {t} {}, {t} {}, {}", x(), y(), lanes_mask((0..n).map(|i| 2 * i + 1))));
+            let even =
+                b.val(&format!("shufflevector {t} {}, {t} {}, {}", x(), y(), lanes_mask(evens)));
+            let odd = b.val(&format!(
+                "shufflevector {t} {}, {t} {}, {}",
+                x(),
+                y(),
+                lanes_mask((0..n).map(|i| 2 * i + 1))
+            ));
             one(b.val(&format!("add {t} {even}, {odd}")))
         }
-        Op::ScalarToVector => {
-            one(b.val(&format!("insertelement {t} zeroinitializer, {} {}, i64 0", ir(ty.lane()), x())))
-        }
+        Op::ScalarToVector => one(b.val(&format!(
+            "insertelement {t} zeroinitializer, {} {}, i64 0",
+            ir(ty.lane()),
+            x()
+        ))),
         Op::Splat => one(splat_value(b, ty, x())),
         Op::Swizzle => {
             let name = "llvm.aarch64.neon.tbl1.v16i8";
             one(b.call("<16 x i8>", name, &[("<16 x i8>", x()), ("<16 x i8>", y())]))
         }
         Op::Shuffle => {
-            let mask = b.val(&format!("load <16 x i8>, ptr @{}, align 16", HoleKind::Const.symbol()));
+            let mask =
+                b.val(&format!("load <16 x i8>, ptr @{}, align 16", HoleKind::Const.symbol()));
             let name = "llvm.aarch64.neon.tbl2.v16i8";
-            one(b.call("<16 x i8>", name, &[("<16 x i8>", x()), ("<16 x i8>", y()), ("<16 x i8>", mask.as_str())]))
+            one(b.call(
+                "<16 x i8>",
+                name,
+                &[("<16 x i8>", x()), ("<16 x i8>", y()), ("<16 x i8>", mask.as_str())],
+            ))
         }
-        Op::Insertlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => one(insert_byte(b, x(), y(), shape.aux)),
-        Op::Insertlane => {
-            one(b.val(&format!("insertelement {t} {}, {} {}, i64 {}", x(), ir(ty.lane()), y(), shape.aux)))
+        Op::Insertlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => {
+            one(insert_byte(b, x(), y(), shape.aux))
         }
-        Op::Extractlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => one(extract_byte(b, x(), shape.aux)),
+        Op::Insertlane => one(b.val(&format!(
+            "insertelement {t} {}, {} {}, i64 {}",
+            x(),
+            ir(ty.lane()),
+            y(),
+            shape.aux
+        ))),
+        Op::Extractlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => {
+            one(extract_byte(b, x(), shape.aux))
+        }
         Op::Extractlane => one(b.val(&format!("extractelement {t} {}, i64 {}", x(), shape.aux))),
         Op::VanyTrue => {
             let lane = ir(ty.lane());
@@ -274,7 +320,11 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             let n = ty.lanes();
             let each = b.val(&format!("icmp ne {t} {}, zeroinitializer", x()));
             let lanes = format!("<{n} x i1>");
-            let all = b.call("i1", &format!("llvm.vector.reduce.and.v{n}i1"), &[(lanes.as_str(), each.as_str())]);
+            let all = b.call(
+                "i1",
+                &format!("llvm.vector.reduce.and.v{n}i1"),
+                &[(lanes.as_str(), each.as_str())],
+            );
             one(b.val(&format!("zext i1 {all} to i8")))
         }
         Op::VhighBits => {
@@ -305,8 +355,17 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         Op::Sload16 => one(load(b, Ty::I16, ty, Some("sext"), x())),
         Op::Uload32 => one(load(b, Ty::I32, ty, Some("zext"), x())),
         Op::Sload32 => one(load(b, Ty::I32, ty, Some("sext"), x())),
-        Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
-            let ext = if matches!(shape.op, Op::Sload8x8 | Op::Sload16x4 | Op::Sload32x2) { "sext" } else { "zext" };
+        Op::Uload8x8
+        | Op::Sload8x8
+        | Op::Uload16x4
+        | Op::Sload16x4
+        | Op::Uload32x2
+        | Op::Sload32x2 => {
+            let ext = if matches!(shape.op, Op::Sload8x8 | Op::Sload16x4 | Op::Sload32x2) {
+                "sext"
+            } else {
+                "zext"
+            };
             let narrow = vec_of(ty.lanes(), lane_bits(ty) / 2);
             let at = address(b, x());
             let v = b.val(&format!("load {narrow}, ptr {at}, align 1"));
@@ -355,11 +414,20 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
                 RmwOp::Smax => "max",
             };
             let p = pointer(b, x());
-            one(b.val(&format!("atomicrmw {op} ptr {p}, {t} {} seq_cst, align {}", y(), ty.bytes())))
+            one(b.val(&format!(
+                "atomicrmw {op} ptr {p}, {t} {} seq_cst, align {}",
+                y(),
+                ty.bytes()
+            )))
         }
         Op::AtomicCas => {
             let p = pointer(b, x());
-            let pair = b.val(&format!("cmpxchg ptr {p}, {t} {}, {t} {} seq_cst seq_cst, align {}", y(), z(), ty.bytes()));
+            let pair = b.val(&format!(
+                "cmpxchg ptr {p}, {t} {}, {t} {} seq_cst seq_cst, align {}",
+                y(),
+                z(),
+                ty.bytes()
+            ));
             one(b.val(&format!("extractvalue {{ {t}, i1 }} {pair}, 0")))
         }
         Op::Fence => {
@@ -477,8 +545,16 @@ fn sqmul_round_sat(b: &mut B<'_>, ty: Ty, x: &str, y: &str) -> String {
     let wide_name = format!("v{}i{}", ty.lanes(), 2 * w);
     let lo = wide_splat(ty, -(1i128 << (w - 1)));
     let hi = wide_splat(ty, (1i128 << (w - 1)) - 1);
-    let s = b.call(&wide, &format!("llvm.smax.{wide_name}"), &[(wide.as_str(), s.as_str()), (wide.as_str(), lo.as_str())]);
-    let s = b.call(&wide, &format!("llvm.smin.{wide_name}"), &[(wide.as_str(), s.as_str()), (wide.as_str(), hi.as_str())]);
+    let s = b.call(
+        &wide,
+        &format!("llvm.smax.{wide_name}"),
+        &[(wide.as_str(), s.as_str()), (wide.as_str(), lo.as_str())],
+    );
+    let s = b.call(
+        &wide,
+        &format!("llvm.smin.{wide_name}"),
+        &[(wide.as_str(), s.as_str()), (wide.as_str(), hi.as_str())],
+    );
     b.val(&format!("trunc {wide} {s} to {t}"))
 }
 
@@ -490,7 +566,11 @@ fn wide_of(ty: Ty) -> String {
 
 /// `value` in every lane of [`wide_of`]`(ty)`.
 fn wide_splat(ty: Ty, value: i128) -> String {
-    if ty.is_vector() { format!("splat (i{} {value})", 2 * lane_bits(ty)) } else { value.to_string() }
+    if ty.is_vector() {
+        format!("splat (i{} {value})", 2 * lane_bits(ty))
+    } else {
+        value.to_string()
+    }
 }
 
 /// A comparison's `i1` (or `<n x i1>`) as Cranelift's result: an `i8` 0 or 1, or lanes of
@@ -577,10 +657,15 @@ fn narrow(b: &mut B<'_>, shape: Shape, x: &str, y: &str) -> String {
     let both = vec_of(n, w);
     let name = format!("v{n}i{w}");
     let lanes = |value: i128| format!("splat (i{w} {value})");
-    let joined = b.val(&format!("shufflevector {} {x}, {} {y}, {}", ir(wide), ir(wide), lanes_mask(0..n)));
+    let joined =
+        b.val(&format!("shufflevector {} {x}, {} {y}, {}", ir(wide), ir(wide), lanes_mask(0..n)));
     let clamp = |b: &mut B<'_>, op: &str, v: &str, value: i128| {
         let bound = lanes(value);
-        b.call(&both, &format!("{op}.{name}"), &[(both.as_str(), v), (both.as_str(), bound.as_str())])
+        b.call(
+            &both,
+            &format!("{op}.{name}"),
+            &[(both.as_str(), v), (both.as_str(), bound.as_str())],
+        )
     };
     let clamped = match shape.op {
         Op::Snarrow => {
@@ -674,12 +759,23 @@ fn confined(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             };
             load(b, ir(mem), Some(ext))
         }
-        Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
-            let ext = if matches!(access, Op::Sload8x8 | Op::Sload16x4 | Op::Sload32x2) { "sext" } else { "zext" };
+        Op::Uload8x8
+        | Op::Sload8x8
+        | Op::Uload16x4
+        | Op::Sload16x4
+        | Op::Uload32x2
+        | Op::Sload32x2 => {
+            let ext = if matches!(access, Op::Sload8x8 | Op::Sload16x4 | Op::Sload32x2) {
+                "sext"
+            } else {
+                "zext"
+            };
             let narrow = vec_of(ty.lanes(), lane_bits(ty) / 2);
             load(b, &narrow, Some(ext))
         }
-        Op::AtomicLoad => vec![b.val(&format!("load atomic {t}, ptr {at} seq_cst, align {}", ty.bytes()))],
+        Op::AtomicLoad => {
+            vec![b.val(&format!("load atomic {t}, ptr {at} seq_cst, align {}", ty.bytes()))]
+        }
         Op::Store => store(b, ty),
         Op::Istore8 => store(b, Ty::I8),
         Op::Istore16 => store(b, Ty::I16),
@@ -709,13 +805,19 @@ fn fma(b: &mut B<'_>, ty: Ty, negated: bool, x: &str, y: &str, z: &str) -> Strin
         (Ty::F64, true) => "fmsub ${0:d}, ${1:d}, ${2:d}, ${3:d}\", \"=w,w,w,w",
         (Ty::F32x4, true) => "fmls $0.4s, $2.4s, $3.4s\", \"=w,0,w,w",
         (Ty::F64x2, true) => "fmls $0.2d, $2.2d, $3.2d\", \"=w,0,w,w",
-        (_, true) => unreachable!("an `fma` of {} with an operand negated, which no shape is", ty.name()),
+        (_, true) => {
+            unreachable!("an `fma` of {} with an operand negated, which no shape is", ty.name())
+        }
         (_, false) => {
             let name = format!("llvm.fma.{}", mangle(ty));
             return b.call(t, &name, &[(t, x), (t, y), (t, z)]);
         }
     };
-    let args = if ty.is_vector() { format!("{t} {z}, {t} {x}, {t} {y}") } else { format!("{t} {x}, {t} {y}, {t} {z}") };
+    let args = if ty.is_vector() {
+        format!("{t} {z}, {t} {x}, {t} {y}")
+    } else {
+        format!("{t} {x}, {t} {y}, {t} {z}")
+    };
     b.val(&format!("call {t} asm \"{asm}\"({args})"))
 }
 

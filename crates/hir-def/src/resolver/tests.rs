@@ -6,13 +6,13 @@ use std::hint::black_box;
 
 use blaze_alloc_count::assert_at_most;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
+use std::alloc::Global;
 
 use crate::{
     AssocItemId, DefWithBodyId, TraitId,
@@ -122,9 +122,17 @@ fn type_and_value_lookups_at_a_warm_scope_allocate_nothing() {
     let mut resolver = def.resolver(&db);
     let _guard = resolver.update_to_inner_scope(&db, def, at);
 
-    let type_paths =
-        [&["T"][..], &["m", "S"], &["B"], &["Pre"], &["u32"], &["m", "E", "A"], &["Tr"], &["Local"]]
-            .map(path);
+    let type_paths = [
+        &["T"][..],
+        &["m", "S"],
+        &["B"],
+        &["Pre"],
+        &["u32"],
+        &["m", "E", "A"],
+        &["Tr"],
+        &["Local"],
+    ]
+    .map(path);
     let types = type_paths.each_ref().map(Path::BarePath);
     let found: Vec<_> = types.iter().map(|it| resolver.resolve_path_in_type_ns(&db, *it)).collect();
     let kinds: Vec<&str> = found
@@ -143,8 +151,8 @@ fn type_and_value_lookups_at_a_warm_scope_allocate_nothing() {
         ["generic param", "adt", "adt", "adt", "builtin", "variant", "trait", "trait"]
     );
 
-    let value_paths = [&["y"][..], &["x"], &["f"], &["m", "S", "new"], &["m", "E", "A"], &["B"]]
-        .map(path);
+    let value_paths =
+        [&["y"][..], &["x"], &["f"], &["m", "S", "new"], &["m", "E", "A"], &["B"]].map(path);
     let values = value_paths.each_ref().map(Path::BarePath);
     let found: Vec<_> = values
         .iter()

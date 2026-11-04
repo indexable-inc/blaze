@@ -16,7 +16,6 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     AdtId, HasModule as _, Lookup, VariantId, nameres::crate_def_map, src::HasSource as _,
@@ -32,6 +31,7 @@ use rustc_type_ir::{
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _},
 };
 use smallvec::{SmallVec, smallvec};
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use crate::{
@@ -62,11 +62,20 @@ pub(super) struct SignificantDrops<'s, 'db> {
 }
 
 impl<'s, 'db> SignificantDrops<'s, 'db> {
-    pub(super) fn new(b: &BodyCx<'_, '_, 'db>, solver: &'s Solver<'db>) -> SignificantDrops<'s, 'db> {
+    pub(super) fn new(
+        b: &BodyCx<'_, '_, 'db>,
+        solver: &'s Solver<'db>,
+    ) -> SignificantDrops<'s, 'db> {
         let db = b.db();
         let limit = crate_def_map(db, b.cx.krate.into()).recursion_limit() as usize;
         // alloc: empty, pushed to only on the overflow error
-        SignificantDrops { db, solver, limit, dtors: HashMap::new_in(Global), overflowed: Vec::new() }
+        SignificantDrops {
+            db,
+            solver,
+            limit,
+            dtors: HashMap::new_in(Global),
+            overflowed: Vec::new(),
+        }
     }
 
     /// rustc's `extract_component_with_significant_dtor`: the parts of a value of `ty` with a
@@ -80,7 +89,11 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
     }
 
     /// rustc's `extract_component_raw`.
-    fn components_raw(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>) -> SmallVec<[Ty<'db>; 4]> {
+    fn components_raw(
+        &mut self,
+        ty: Ty<'db>,
+        seen: &mut HashSet<Ty<'db>, Global>,
+    ) -> SmallVec<[Ty<'db>; 4]> {
         let ty = self.normalize(ty);
         let mut out = SmallVec::new();
         for ty in self.list(ty) {
@@ -135,7 +148,10 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
                         }
                         queue(args.as_coroutine().resume_ty());
                         let interner = self.solver.interner();
-                        let witness = interner.coroutine_hidden_types(def).instantiate(interner, args).skip_norm_wip();
+                        let witness = interner
+                            .coroutine_hidden_types(def)
+                            .instantiate(interner, args)
+                            .skip_norm_wip();
                         for field in witness.skip_binder().types.iter() {
                             queue(field);
                         }
@@ -162,7 +178,10 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
                             queue(self.normalize(required));
                         }
                     }
-                    TyKind::Alias(..) | TyKind::Array(..) | TyKind::Placeholder(_) | TyKind::Param(_) => {
+                    TyKind::Alias(..)
+                    | TyKind::Array(..)
+                    | TyKind::Placeholder(_)
+                    | TyKind::Param(_) => {
                         if ty == component {
                             out.push(component);
                             continue 'next;
@@ -233,7 +252,11 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
 
     /// `drop_tys_helper`'s `adt_components` when only significant destructors count: what a
     /// value of the ADT needs drop through, none when its own destructor is significant.
-    fn adt_components(&mut self, def: AdtDef, args: GenericArgs<'db>) -> Option<SmallVec<[Ty<'db>; 8]>> {
+    fn adt_components(
+        &mut self,
+        def: AdtDef,
+        args: GenericArgs<'db>,
+    ) -> Option<SmallVec<[Ty<'db>; 8]>> {
         if def.is_manually_drop() {
             return Some(SmallVec::new());
         }
@@ -311,7 +334,8 @@ fn def_path(db: &Db, adt: AdtId) -> Option<SmallVec<[&'static str; 6]>> {
     let adt = hir::Adt::from(adt);
     let module = adt.module(db);
     let krate = module.krate(db).display_name(db)?.crate_name().as_str();
-    if !matches!(krate, "syn" | "proc_macro2" | "core" | "std" | "tracing" | "bytes" | "hashbrown") {
+    if !matches!(krate, "syn" | "proc_macro2" | "core" | "std" | "tracing" | "bytes" | "hashbrown")
+    {
         return None;
     }
     let mut path: SmallVec<[&'static str; 6]> = SmallVec::new();
@@ -338,10 +362,16 @@ fn insignificant_dtor(db: &Db, adt: AdtId) -> bool {
         AdtId::UnionId(it) => it.lookup(db).source_view(db).value.attrs(),
     };
     let cfg = adt.krate(db).cfg_options(db);
-    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
-        ast::Meta::PathMeta(meta) if meta.path().is1("rustc_insignificant_dtor") => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    })
+    expand_cfg_attr_view(
+        attrs,
+        || cfg,
+        |meta, _| match meta {
+            ast::Meta::PathMeta(meta) if meta.path().is1("rustc_insignificant_dtor") => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        },
+    )
     .is_some()
 }
 

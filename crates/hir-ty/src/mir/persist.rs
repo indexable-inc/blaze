@@ -34,7 +34,6 @@ use blaze_format::{
     FormatError, Part, Placed, Record, Rel, SchemaHash, Slice, Writer, open_as, schema_of,
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, FieldId, LocalFieldId, VariantId,
     expr_store::ExpressionStore,
@@ -46,13 +45,14 @@ use hir_def::{
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_type_ir::{IntTy, UintTy, UniverseIndex, inherent::IntoKind as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     AggregateKind, AsmOperand, AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
-    ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, Local, LocalId, MirBody, MirPhase, MirSpan,
-    MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem, Rvalue,
-    Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind, UnOp,
-    UnreachableAfterCall,
+    ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, Local, LocalId, MirBody,
+    MirPhase, MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection,
+    ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator,
+    TerminatorKind, UnOp, UnreachableAfterCall,
 };
 use crate::{
     InferBodyId, MemoryMap,
@@ -97,16 +97,19 @@ impl Locations<'_> {
         }
         let in_pattern = self.store.pats().any(|(_, pat)| match pat {
             Pat::Lit(expr) => self.has(expr),
-            Pat::Range { start, end, .. } => start.is_some_and(|it| self.has(it)) || end.is_some_and(|it| self.has(it)),
+            Pat::Range { start, end, .. } => {
+                start.is_some_and(|it| self.has(it)) || end.is_some_and(|it| self.has(it))
+            }
             _ => false,
         });
         if in_pattern {
             return Some("a location macro in a pattern");
         }
         let in_asm = self.store.exprs().any(|(_, expr)| match expr {
-            Expr::InlineAsm(asm) => {
-                asm.operands.iter().any(|(_, operand)| matches!(operand, HirAsmOperand::Const(it) if self.has(*it)))
-            }
+            Expr::InlineAsm(asm) => asm
+                .operands
+                .iter()
+                .any(|(_, operand)| matches!(operand, HirAsmOperand::Const(it) if self.has(*it))),
             _ => false,
         });
         in_asm.then_some("a location macro as an `asm!` constant")
@@ -128,8 +131,12 @@ impl Locations<'_> {
                 fat.extend_from_slice(&text.len().to_le_bytes()[..word]);
                 (fat.into_boxed_slice(), MemoryMap::simple(Box::from(text.as_bytes())))
             }
-            Literal::Uint(value, _) => (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty),
-            Literal::Int(value, _) => (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty),
+            Literal::Uint(value, _) => {
+                (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty)
+            }
+            Literal::Int(value, _) => {
+                (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty)
+            }
             _ => return None,
         };
         Some(Allocation::new(AllocationData { ty, memory, memory_map }).store())
@@ -203,7 +210,9 @@ impl std::fmt::Display for ReadBack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReadBack::Refused(why) => write!(f, "a body written that does not read back: {why}"),
-            ReadBack::Differs(what) => write!(f, "a body written that reads back as another: its {what} differ"),
+            ReadBack::Differs(what) => {
+                write!(f, "a body written that reads back as another: its {what} differ")
+            }
         }
     }
 }
@@ -316,7 +325,8 @@ fn write_unchecked<'db>(
         locations,
     };
     encode.body(body)?;
-    let Encode { out: _, tys, words, text, allocs, alloc_places: _, refused, locations: _ } = encode;
+    let Encode { out: _, tys, words, text, allocs, alloc_places: _, refused, locations: _ } =
+        encode;
     if let Some(why) = refused {
         return Err(why);
     }
@@ -702,8 +712,16 @@ impl<'db> Encode<'_, 'db> {
     /// Nothing: only built MIR is kept, and a built body has no inlined code, specialized
     /// calls or allocations moved into its frame. A body with any is optimized MIR, refused.
     fn inlined(&mut self, inlined: &Inlined<'db>) {
-        let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame } =
-            inlined;
+        let Inlined {
+            callees,
+            scopes,
+            spans,
+            bindings,
+            promoted,
+            devirtualized,
+            specialized,
+            moved_to_frame,
+        } = inlined;
         let why = if !callees.is_empty() {
             "a body with inlined callees, which only optimized MIR has"
         } else if !scopes.is_empty() {
@@ -864,7 +882,9 @@ impl<'db> Encode<'_, 'db> {
                 (Some(MirSpan::ExprId(expr)), Some(locations)) if locations.has(expr) => {
                     let ty = allocation.as_ref().ty;
                     if locations.constant(expr, ty) != Some(*allocation) {
-                        self.refused.get_or_insert("a location literal's constant that is not what its literal makes");
+                        self.refused.get_or_insert(
+                            "a location literal's constant that is not what its literal makes",
+                        );
                     }
                     self.word(5);
                     self.ty(&ty.store());
@@ -1250,7 +1270,12 @@ impl<'db> Encode<'_, 'db> {
                 self.block(*real_target);
                 self.opt_block(*unwind);
             }
-            TerminatorKind::ComptimeFor { binder: ComptimeBinder(universe), domain, body, after } => {
+            TerminatorKind::ComptimeFor {
+                binder: ComptimeBinder(universe),
+                domain,
+                body,
+                after,
+            } => {
                 self.word(15);
                 self.word(*universe);
                 self.ty(domain);
@@ -1348,7 +1373,12 @@ impl<'a, 'db> Decode<'a, 'db> {
 
     /// An error at the word just read, by its byte in the buffer: `what`, `found`, is past
     /// its bound `bound`.
-    fn past(&self, what: &'static str, found: impl Into<u64>, bound: impl Into<u64>) -> FormatError {
+    fn past(
+        &self,
+        what: &'static str,
+        found: impl Into<u64>,
+        bound: impl Into<u64>,
+    ) -> FormatError {
         self.past_at(self.at.saturating_sub(1), what, found, bound)
     }
 
@@ -1451,9 +1481,14 @@ impl<'a, 'db> Decode<'a, 'db> {
         }
         let (allocs, buffer): (&'a [Rel<AllocationRec>], &'a [u8]) = (self.allocs, self.buffer);
         let rel = allocs.get(index).ok_or_else(|| {
-            self.past("an allocation operand's index, below the body's allocation count", index as u64, allocs.len() as u64)
+            self.past(
+                "an allocation operand's index, below the body's allocation count",
+                index as u64,
+                allocs.len() as u64,
+            )
         })?;
-        let record = rel.follow(buffer)?.ok_or_else(|| self.invalid("an allocation of no record"))?;
+        let record =
+            rel.follow(buffer)?.ok_or_else(|| self.invalid("an allocation of no record"))?;
         let made = read_allocation(record, buffer, &self.tys)?.store();
         self.made[index] = Some(made);
         Ok(made)
@@ -1491,7 +1526,11 @@ impl<'a, 'db> Decode<'a, 'db> {
         match self.word()? {
             0 => Ok(None),
             raw if raw - 1 < self.blocks => Ok(Some(idx(raw - 1))),
-            raw => Err(self.past("an optional block, below the body's block count", raw - 1, self.blocks)),
+            raw => Err(self.past(
+                "an optional block, below the body's block count",
+                raw - 1,
+                self.blocks,
+            )),
         }
     }
 
@@ -1573,7 +1612,10 @@ impl<'a, 'db> Decode<'a, 'db> {
         let upvar_locals = self.upvar_locals()?;
         let param_locals = self.locals("the body's parameter locals")?;
         let promoted_locals = self.list_of("the body's promoted locals", 2, |it| {
-            Ok((it.local()?, it.expr("a promoted local's expression, below the store's expression count")?))
+            Ok((
+                it.local()?,
+                it.expr("a promoted local's expression, below the store's expression count")?,
+            ))
         })?;
         let closures = self.list_of("the body's closures", 2, |it| it.id())?;
         let coroutine = match self.word()? {
@@ -1588,7 +1630,8 @@ impl<'a, 'db> Decode<'a, 'db> {
         let panic_unwinds = self.list_of("the body's panic unwinds", 3, |it| {
             let block = it.block()?;
             let statements = basic_blocks[block].statements.len();
-            let statement = it.own("a panic unwind's statement, below its block's statement count", statements)?;
+            let statement = it
+                .own("a panic unwind's statement, below its block's statement count", statements)?;
             Ok((block, statement as usize, it.block()?))
         })?;
         let promoted_constants = self.locals("the body's promoted constants")?;
@@ -1604,7 +1647,10 @@ impl<'a, 'db> Decode<'a, 'db> {
             Ok(UnreachableAfterCall { call, next, descr, ty: it.ty()? })
         })?;
         let guard_refs = self.list_of("the body's guard references", 2, |it| {
-            Ok((it.local()?, it.binding("a guard reference's binding, below the store's binding count")?))
+            Ok((
+                it.local()?,
+                it.binding("a guard reference's binding, below the store's binding count")?,
+            ))
         })?;
         let capture_copies = self.list_of("the body's capture copies", 2, |it| {
             Ok((it.local()?, FieldIndex(it.word()?)))
@@ -1677,10 +1723,14 @@ impl<'a, 'db> Decode<'a, 'db> {
         let base = match self.word()? {
             0 => PlaceBase::Rvalue,
             1 => PlaceBase::StaticItem,
-            2 => PlaceBase::Local(self.binding("a captured place's binding, below the store's binding count")?),
+            2 => PlaceBase::Local(
+                self.binding("a captured place's binding, below the store's binding count")?,
+            ),
             3 => PlaceBase::Upvar {
-                closure: self.expr("a captured upvar's closure, below the store's expression count")?,
-                var_id: self.binding("a captured upvar's binding, below the store's binding count")?,
+                closure: self
+                    .expr("a captured upvar's closure, below the store's expression count")?,
+                var_id: self
+                    .binding("a captured upvar's binding, below the store's binding count")?,
             },
             _ => return Err(self.invalid("a captured place's base of no kind")),
         };
@@ -1720,14 +1770,22 @@ impl<'a, 'db> Decode<'a, 'db> {
     /// A span of the body, of its store: never an inlined span, which only optimized MIR has.
     fn span(&mut self) -> R<MirSpan> {
         Ok(match self.word()? {
-            0 => MirSpan::ExprId(self.expr("a span's expression, below the store's expression count")?),
-            1 => MirSpan::ExprEnd(self.expr("a span's expression end, below the store's expression count")?),
+            0 => MirSpan::ExprId(
+                self.expr("a span's expression, below the store's expression count")?,
+            ),
+            1 => MirSpan::ExprEnd(
+                self.expr("a span's expression end, below the store's expression count")?,
+            ),
             2 => MirSpan::PatId(self.pat("a span's pattern, below the store's pattern count")?),
-            3 => MirSpan::BindingId(self.binding("a span's binding, below the store's binding count")?),
+            3 => MirSpan::BindingId(
+                self.binding("a span's binding, below the store's binding count")?,
+            ),
             4 => MirSpan::SelfParam,
             5 => MirSpan::Unknown,
             6 => {
-                return Err(self.invalid("an inlined span, which only optimized MIR has and is never kept"));
+                return Err(
+                    self.invalid("an inlined span, which only optimized MIR has and is never kept")
+                );
             }
             _ => return Err(self.invalid("a span of no kind")),
         })
@@ -1803,9 +1861,13 @@ impl<'a, 'db> Decode<'a, 'db> {
         };
         let locations = self.locations;
         if !locations.has(expr) {
-            return Err(self.invalid("a location slot of an expression that is no location literal now"));
+            return Err(
+                self.invalid("a location slot of an expression that is no location literal now")
+            );
         }
-        locations.constant(expr, ty.as_ref()).ok_or_else(|| self.invalid("a location slot whose literal makes no constant now"))
+        locations
+            .constant(expr, ty.as_ref())
+            .ok_or_else(|| self.invalid("a location slot whose literal makes no constant now"))
     }
 
     fn opt_operand(&mut self) -> R<Option<Operand>> {
@@ -1913,23 +1975,29 @@ impl<'a, 'db> Decode<'a, 'db> {
                         match parent {
                             VariantId::UnionId(it) if it == union => {}
                             VariantId::UnionId(_) => {
-                                return Err(self.invalid("a union aggregate's field of another union"));
+                                return Err(
+                                    self.invalid("a union aggregate's field of another union")
+                                );
                             }
                             VariantId::StructId(_) => {
                                 let what = "a union aggregate's field of a struct, not its union";
                                 return Err(self.invalid(what));
                             }
                             VariantId::EnumVariantId(_) => {
-                                let what = "a union aggregate's field of an enum variant, not its union";
+                                let what =
+                                    "a union aggregate's field of an enum variant, not its union";
                                 return Err(self.invalid(what));
                             }
                         }
                         // A query, outside the relocating scope (`ids::relocating`'s contract):
                         // the union's fields are hir-def's and name no id of the record.
-                        let fields = crate::check_cache::outside(|| parent.fields(self.db).fields().len());
+                        let fields =
+                            crate::check_cache::outside(|| parent.fields(self.db).fields().len());
                         let fields = table_len(fields);
-                        let local_id: LocalFieldId =
-                            self.below("a union aggregate's field, below its union's field count", fields)?;
+                        let local_id: LocalFieldId = self.below(
+                            "a union aggregate's field, below its union's field count",
+                            fields,
+                        )?;
                         AggregateKind::Union(union, FieldId { parent, local_id })
                     }
                     4 => AggregateKind::Closure(self.ty()?),

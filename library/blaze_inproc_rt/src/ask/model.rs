@@ -143,7 +143,8 @@ struct State {
 
 impl State {
     fn new() -> State {
-        let slot = Slot { phase: Phase::Free, generation: 0, used: false, owner: 0, ask: 0, answer: 0 };
+        let slot =
+            Slot { phase: Phase::Free, generation: 0, used: false, owner: 0, ask: 0, answer: 0 };
         State {
             slots: [slot; MOST_SLOTS],
             frees: 0,
@@ -198,7 +199,10 @@ fn ask_step(config: &Config, state: &State, me: usize) -> Result<Option<State>, 
         Pc::Set(slot) => {
             let at = &mut next.slots[slot as usize];
             if at.owner != 0 {
-                return Err(format!("asker {me} claimed slot {slot}, which asker {} holds", at.owner - 1));
+                return Err(format!(
+                    "asker {me} claimed slot {slot}, which asker {} holds",
+                    at.owner - 1
+                ));
             }
             at.used = true;
             at.owner = ghost;
@@ -211,7 +215,9 @@ fn ask_step(config: &Config, state: &State, me: usize) -> Result<Option<State>, 
         Pc::Counted => Pc::Frees(state.frees),
         Pc::Frees(frees) if (0..config.slots).all(|it| state.slots[it].used) => Pc::Sleep(frees),
         Pc::Frees(_) => Pc::Leave,
-        Pc::Sleep(frees) if state.frees == frees || config.mutation == Mutation::NoCompare => Pc::SleepingForASlot,
+        Pc::Sleep(frees) if state.frees == frees || config.mutation == Mutation::NoCompare => {
+            Pc::SleepingForASlot
+        }
         Pc::Sleep(_) => Pc::Leave,
         Pc::SleepingForASlot | Pc::Asleep(..) | Pc::Done => return Ok(None),
         Pc::Leave => {
@@ -239,12 +245,19 @@ fn ask_step(config: &Config, state: &State, me: usize) -> Result<Option<State>, 
         Pc::Wait(slot, generation, phase, seen) => {
             let at = state.slots[slot as usize];
             let same = at.phase == phase && at.generation == seen;
-            if same || config.mutation == Mutation::NoCompare { Pc::Asleep(slot, generation) } else { Pc::Check(slot, generation) }
+            if same || config.mutation == Mutation::NoCompare {
+                Pc::Asleep(slot, generation)
+            } else {
+                Pc::Check(slot, generation)
+            }
         }
         Pc::Read(slot, generation) => {
             let at = state.slots[slot as usize];
             if at.answer != ghost || at.generation != generation {
-                return Err(format!("asker {me} read slot {slot}'s answer to {} of generation {}", at.answer, at.generation));
+                return Err(format!(
+                    "asker {me} read slot {slot}'s answer to {} of generation {}",
+                    at.answer, at.generation
+                ));
             }
             Pc::Free(slot, generation)
         }
@@ -341,7 +354,9 @@ fn successors(config: &Config, state: &State, out: &mut Vec<State>) -> Result<()
         SenderPc::Answer(slot, generation) => {
             let at = state.slots[slot as usize];
             if at.phase != Phase::Taken || at.generation != generation {
-                return Err(format!("the daemon answered slot {slot} of generation {generation}, which is {at:?}"));
+                return Err(format!(
+                    "the daemon answered slot {slot} of generation {generation}, which is {at:?}"
+                ));
             }
             next.slots[slot as usize].phase = Phase::Answering;
             next.sender = SenderPc::Store(slot, generation);
@@ -403,7 +418,8 @@ fn check(config: Config) -> Result<Checked, String> {
         }
     }
     let mut good = vec![false; states.len()];
-    let mut stack: Vec<u32> = (0..states.len() as u32).filter(|it| states[*it as usize].done(&config)).collect();
+    let mut stack: Vec<u32> =
+        (0..states.len() as u32).filter(|it| states[*it as usize].done(&config)).collect();
     for &it in &stack {
         good[it as usize] = true;
     }
@@ -416,9 +432,14 @@ fn check(config: Config) -> Result<Checked, String> {
         }
     }
     if let Some(stuck) = good.iter().position(|it| !it) {
-        return Err(format!("from {:?}, no state with every asker done is reachable", states[stuck]));
+        return Err(format!(
+            "from {:?}, no state with every asker done is reachable",
+            states[stuck]
+        ));
     }
-    let handled = config.handler().is_some_and(|handler| states.iter().any(|it| it.done(&config) && it.askers[handler] == Pc::Done));
+    let handled = config.handler().is_some_and(|handler| {
+        states.iter().any(|it| it.done(&config) && it.askers[handler] == Pc::Done)
+    });
     Ok(Checked { states: states.len(), handled })
 }
 
@@ -428,7 +449,13 @@ fn config(slots: usize, threads: usize, handler: bool) -> Config {
 
 #[test]
 fn asks_are_answered_whatever_the_interleaving() {
-    for config in [config(1, 1, false), config(1, 2, false), config(2, 2, false), config(2, 1, true), config(2, 2, true)] {
+    for config in [
+        config(1, 1, false),
+        config(1, 2, false),
+        config(2, 2, false),
+        config(2, 1, true),
+        config(2, 2, true),
+    ] {
         let checked = check(config).unwrap_or_else(|why| panic!("{config:?}: {why}"));
         assert!(checked.states > 10, "{config:?}: {} states", checked.states);
         assert_eq!(checked.handled, config.handler, "{config:?}");
@@ -437,14 +464,18 @@ fn asks_are_answered_whatever_the_interleaving() {
 
 #[test]
 fn a_handler_waits_for_ever_only_when_its_thread_holds_the_last_slot() {
-    let why = check(config(1, 1, true)).err().expect("one slot, held by the thread the handler interrupted");
+    let why = check(config(1, 1, true))
+        .err()
+        .expect("one slot, held by the thread the handler interrupted");
     assert!(why.contains("no state with every asker done"), "{why}");
 }
 
 #[test]
 fn each_mutation_is_caught() {
     let mutated = |mutation: Mutation, slots: usize, threads: usize, handler: bool| {
-        check(Config { slots, threads, handler, mutation }).err().unwrap_or_else(|| panic!("{mutation:?} was not caught"))
+        check(Config { slots, threads, handler, mutation })
+            .err()
+            .unwrap_or_else(|| panic!("{mutation:?} was not caught"))
     };
     assert!(mutated(Mutation::Lock, 2, 1, true).contains("no state with every asker done"));
     assert!(mutated(Mutation::CheckThenSet, 1, 2, false).contains("which asker"));

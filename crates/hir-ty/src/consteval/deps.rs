@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Domain, Hasher};
 use crossbeam_queue::SegQueue;
 use hir_def::{
@@ -27,6 +26,7 @@ use hir_def::{
     deps::{Held as _, ImageStore, Mode},
     nameres::frozen,
 };
+use std::alloc::Global;
 
 pub use self::codec::VERSION;
 use crate::{
@@ -142,7 +142,7 @@ pub fn set(
             it.set_kept(db).with_durability(Durability::HIGH).to(kept);
         }
         None => {
-            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(db);
+            _ = KeptConsts::new(db, Durability::HIGH, kept);
         }
     }
 }
@@ -222,7 +222,8 @@ pub(crate) fn record<'db>(
                     }
                     Err(why) => {
                         // alloc: a difference, which is a bug
-                        let what = format!("the value evaluated (the kept bytes do not read: {why})");
+                        let what =
+                            format!("the value evaluated (the kept bytes do not read: {why})");
                         compare(db, def, site.krate, &what, Some(&body[..]), &[]);
                     }
                 }

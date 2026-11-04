@@ -9,6 +9,7 @@
 use std::{fmt::Write as _, time::Instant};
 
 use base_db::{Crate, Db, all_crates};
+use blaze_query::db::{Database as _, Durability};
 use hir_def::{AdtId, ModuleDefId, TraitId, nameres::crate_def_map};
 use hir_expand::fixture;
 use hir_ty::{
@@ -16,12 +17,13 @@ use hir_ty::{
     next_solver::{SimplifiedType, SolverDefId},
 };
 use rustc_type_ir::{UintTy, fast_reject::SimplifiedType as Simplified};
-use blaze_query::db::{Database as _, Durability};
 
 const LEAVES: usize = 200;
 
 fn fixture() -> String {
-    let mut text = String::from("//- minicore: sized, copy, clone\n//- /base.rs crate:base\npub trait Shared {}\n");
+    let mut text = String::from(
+        "//- minicore: sized, copy, clone\n//- /base.rs crate:base\npub trait Shared {}\n",
+    );
     for i in 0..LEAVES {
         writeln!(text, "//- /l{i}.rs crate:l{i} deps:base").unwrap();
         writeln!(text, "pub struct S{i};\npub trait T{i} {{}}\nimpl T{i} for S{i} {{}}\nimpl base::Shared for S{i} {{}}")
@@ -80,7 +82,8 @@ fn asks(db: &Db) -> (Crate, Vec<(TraitId, SimplifiedType<'_>)>) {
 fn every_crate(db: &Db, krate: Crate, trait_: TraitId, self_ty: &SimplifiedType<'_>) -> usize {
     let mut found = 0;
     for &dep in loaded_crates(db, krate) {
-        let (impls, derives) = TraitImpls::for_crate_and_trait(db, dep, trait_).for_trait_and_self_ty(trait_, self_ty);
+        let (impls, derives) =
+            TraitImpls::for_crate_and_trait(db, dep, trait_).for_trait_and_self_ty(trait_, self_ty);
         found += impls.len() + derives.len();
     }
     found
@@ -101,7 +104,8 @@ fn main() {
     let (old, old_found) = blaze_query::db::attach(&db, || {
         let (main, asks) = asks(&db);
         let started = Instant::now();
-        let found: usize = asks.iter().map(|(trait_, ty)| every_crate(&db, main, *trait_, ty)).sum();
+        let found: usize =
+            asks.iter().map(|(trait_, ty)| every_crate(&db, main, *trait_, ty)).sum();
         (started.elapsed(), found)
     });
 
@@ -111,7 +115,15 @@ fn main() {
         let started = Instant::now();
         let found: usize = asks
             .iter()
-            .map(|(trait_, ty)| TraitImpls::in_crate_and_deps_for_trait_and_self_ty(&db, main, *trait_, SelfTyKey(*ty)).len())
+            .map(|(trait_, ty)| {
+                TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
+                    &db,
+                    main,
+                    *trait_,
+                    SelfTyKey(*ty),
+                )
+                .len()
+            })
             .sum();
         (started.elapsed(), found, asks.len())
     });
@@ -123,7 +135,15 @@ fn main() {
         let started = Instant::now();
         let found: usize = asks
             .iter()
-            .map(|(trait_, ty)| TraitImpls::in_crate_and_deps_for_trait_and_self_ty(&db, main, *trait_, SelfTyKey(*ty)).len())
+            .map(|(trait_, ty)| {
+                TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
+                    &db,
+                    main,
+                    *trait_,
+                    SelfTyKey(*ty),
+                )
+                .len()
+            })
             .sum();
         assert_eq!(found, new_found, "a revision that changed nothing finds the same impls");
         started.elapsed()

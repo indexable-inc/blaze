@@ -30,24 +30,26 @@
 //! through a vtable. What a body needs only for some passes (its preorder, its taint, its MIR)
 //! is computed the first time one asks, into buffers reused from body to body.
 
-#[cfg(test)]
-mod tests;
 mod calls;
 mod liveness;
 mod panics;
 mod patterns;
 mod reachable;
 mod recursion;
+#[cfg(test)]
+mod tests;
 mod types;
 mod unsafety;
 mod unstable_names;
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one body's lint, dropped with it, not global state"
+)]
 use std::cell::{Cell, OnceCell};
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{DefWithBody, InFile, db::HirDatabase};
@@ -66,6 +68,7 @@ use hir_ty::{
     mir::{MirBody, MirSpan},
 };
 use span::FileId;
+use std::alloc::Global;
 use syntax::{
     SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -213,7 +216,10 @@ pub(crate) struct Scratch {
 }
 
 /// One body being linted, with what it was lowered to and inferred as.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one body's lint, dropped with it, not global state"
+)]
 pub(crate) struct BodyCx<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) owner: DefWithBodyId,
@@ -240,7 +246,10 @@ pub(crate) struct BodyCx<'a, 'c, 'db> {
 impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     /// The body of `owner`, if it has one written (a variant has one only when its
     /// discriminant is).
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one body's lint, dropped with it, not global state"
+    )]
     pub(crate) fn new(cx: &'a Cx<'c, 'db>, owner: DefWithBodyId) -> Option<BodyCx<'a, 'c, 'db>> {
         let db = cx.db;
         let (body, source_map) = Body::with_source_map(db, owner);
@@ -294,7 +303,8 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
         if let Some(tainted) = self.tainted.get() {
             return tainted;
         }
-        let tainted = self.infer.diagnostics().iter().any(taints) || lowering_failed(self.db(), self.source_map);
+        let tainted = self.infer.diagnostics().iter().any(taints)
+            || lowering_failed(self.db(), self.source_map);
         self.tainted.set(Some(tainted));
         tainted
     }
@@ -334,7 +344,10 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
 
     /// The pattern a binding is first bound by, or `self`.
     pub(crate) fn binding_node(&self, binding: BindingId) -> Option<InFile<SyntaxNodePtr>> {
-        let is_self = self.body.self_param.is_some_and(|it| it.formal == binding || it.user_written == binding);
+        let is_self = self
+            .body
+            .self_param
+            .is_some_and(|it| it.formal == binding || it.user_written == binding);
         if is_self {
             return self.source_map.self_param_syntax().map(|it| it.map(|it| it.syntax_node_ptr()));
         }
@@ -382,7 +395,9 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
 
     /// The MIR of the body after drop elaboration (`MirPhase::Runtime`), if it can be built.
     pub(crate) fn runtime_mir(&self) -> Option<&'db MirBody<'db>> {
-        *self.runtime_mir.get_or_init(|| self.db().runtime_mir_body(InferBodyId::DefWithBodyId(self.owner)).ok())
+        *self
+            .runtime_mir
+            .get_or_init(|| self.db().runtime_mir_body(InferBodyId::DefWithBodyId(self.owner)).ok())
     }
 
     /// rustc's `hir_body_const_context` is some: a const, a static, a discriminant or a
@@ -390,7 +405,9 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     pub(crate) fn is_const_context(&self) -> bool {
         match self.owner {
             DefWithBodyId::FunctionId(it) => FunctionSignature::of(self.db(), it).is_const(),
-            DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => true,
+            DefWithBodyId::ConstId(_)
+            | DefWithBodyId::StaticId(_)
+            | DefWithBodyId::VariantId(_) => true,
         }
     }
 
@@ -456,7 +473,9 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     /// The item whose code the body is, with what to call it in a fact.
     fn item(&self) -> (ItemId, hir::ModuleDef) {
         match self.owner {
-            DefWithBodyId::FunctionId(it) => (ItemId::Function(it), ModuleDefId::FunctionId(it).into()),
+            DefWithBodyId::FunctionId(it) => {
+                (ItemId::Function(it), ModuleDefId::FunctionId(it).into())
+            }
             DefWithBodyId::ConstId(it) => (ItemId::Const(it), ModuleDefId::ConstId(it).into()),
             DefWithBodyId::StaticId(it) => (ItemId::Static(it), ModuleDefId::StaticId(it).into()),
             DefWithBodyId::VariantId(it) => {
@@ -505,7 +524,9 @@ fn preorder(store: &ExpressionStore, root: ExprId, out: &mut Vec<ExprId>, stack:
 fn taints(diagnostic: &InferenceDiagnostic) -> bool {
     let path = match diagnostic {
         InferenceDiagnostic::PathDiagnostic { diag, .. } => diag,
-        InferenceDiagnostic::TyDiagnostic { diag: TyLoweringDiagnostic::PathDiagnostic { diag, .. } } => diag,
+        InferenceDiagnostic::TyDiagnostic {
+            diag: TyLoweringDiagnostic::PathDiagnostic { diag, .. },
+        } => diag,
         _ => return true,
     };
     !matches!(path, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
@@ -641,11 +662,32 @@ pub(crate) trait LatePass: Default {
     fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {}
     fn check_expr(&mut self, _b: &BodyCx<'_, '_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
     /// Statement `index` of the block `block`, before what is in it.
-    fn check_stmt(&mut self, _b: &BodyCx<'_, '_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_stmt(
+        &mut self,
+        _b: &BodyCx<'_, '_, '_>,
+        _block: ExprId,
+        _index: usize,
+        _out: &mut Vec<Found>,
+    ) {
+    }
     /// The `let` statement `index` of the block `block`, after [`LatePass::check_stmt`] of it.
-    fn check_local(&mut self, _b: &BodyCx<'_, '_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_local(
+        &mut self,
+        _b: &BodyCx<'_, '_, '_>,
+        _block: ExprId,
+        _index: usize,
+        _out: &mut Vec<Found>,
+    ) {
+    }
     /// Arm `index` of the `match` `expr`, before its pattern.
-    fn check_arm(&mut self, _b: &BodyCx<'_, '_, '_>, _expr: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_arm(
+        &mut self,
+        _b: &BodyCx<'_, '_, '_>,
+        _expr: ExprId,
+        _index: usize,
+        _out: &mut Vec<Found>,
+    ) {
+    }
     fn check_pat(&mut self, _b: &BodyCx<'_, '_, '_>, _pat: PatId, _out: &mut Vec<Found>) {}
 }
 
@@ -871,7 +913,8 @@ impl Passes {
         // blaze: in a crate of `#![blaze::arbitrary_ints]`, `TypeLimits` also refuses a literal
         // out of the range of a `u3`, which is an error at every lint level, so it runs even
         // where none of its lints may fire (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
-        let arbitrary_ints = hir_def::nameres::crate_def_map(cx.db, cx.krate.base()).arbitrary_ints();
+        let arbitrary_ints =
+            hir_def::nameres::crate_def_map(cx.db, cx.krate.base()).arbitrary_ints();
         for index in 0..PASSES {
             let refuses = arbitrary_ints && matches!(passes.all[index], Pass::TypeLimits(_));
             if !refuses && !may_fire(cx, &PASS_LINTS[index]) {

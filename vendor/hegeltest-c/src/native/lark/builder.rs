@@ -298,9 +298,7 @@ fn alternative_patterns(
             "Aliasing not allowed in terminals (You used -> in the wrong place)",
         ));
     }
-    alts.iter()
-        .map(|alt| sequence_to_pattern(name, &alt.items, resolved))
-        .collect()
+    alts.iter().map(|alt| sequence_to_pattern(name, &alt.items, resolved)).collect()
 }
 
 /// One pattern matching any of `patterns`, ordered as Lark orders them:
@@ -312,12 +310,7 @@ fn join_alternatives(name: &str, mut patterns: Vec<Pattern>) -> GrammarResult<Pa
     let mut keyed = Vec::with_capacity(patterns.len());
     for pattern in patterns {
         let (min, max) = pattern_widths(name, &pattern)?;
-        keyed.push((
-            max.unwrap_or(u64::MAX),
-            min,
-            pattern.value.chars().count(),
-            pattern,
-        ));
+        keyed.push((max.unwrap_or(u64::MAX), min, pattern.value.chars().count(), pattern));
     }
     keyed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
     let joined: Vec<String> = keyed.iter().map(|k| pattern_to_regexp(&k.3)).collect();
@@ -389,15 +382,7 @@ impl<'s> GrammarBuilder<'s> {
                 type_name(is_term)
             )));
         }
-        self.insert(
-            name,
-            Definition {
-                is_term,
-                params,
-                tree,
-                options,
-            },
-        );
+        self.insert(name, Definition { is_term, params, tree, options });
         Ok(())
     }
 
@@ -473,14 +458,7 @@ impl<'s> GrammarBuilder<'s> {
                 Some(m) => m.apply(name),
                 None => name.clone(),
             };
-            self.define(
-                name,
-                true,
-                None,
-                Vec::new(),
-                DefOptions::Terminal { priority: 0 },
-                false,
-            )?;
+            self.define(name, true, None, Vec::new(), DefOptions::Terminal { priority: 0 }, false)?;
         }
         Ok(())
     }
@@ -505,9 +483,7 @@ impl<'s> GrammarBuilder<'s> {
                 true,
                 term.body,
                 Vec::new(),
-                DefOptions::Terminal {
-                    priority: term.priority,
-                },
+                DefOptions::Terminal { priority: term.priority },
             ),
         };
         match mangle {
@@ -551,11 +527,7 @@ impl<'s> GrammarBuilder<'s> {
         imported.import_stack = self.import_stack.clone();
         imported.import_stack.push(path.clone());
         imported.load_grammar(self.files.text(&path), Some(&path), Some(&mangle))?;
-        let used: Vec<String> = mangle
-            .aliases
-            .iter()
-            .map(|(k, _)| mangle.apply(k))
-            .collect();
+        let used: Vec<String> = mangle.aliases.iter().map(|(k, _)| mangle.apply(k)).collect();
         imported.remove_unused(&used);
         for name in imported.names {
             if self.definitions.contains_key(&name) {
@@ -600,12 +572,8 @@ impl<'s> GrammarBuilder<'s> {
     /// come to and keeps a chain of references linear. Rejects rules
     /// inside terminals, undefined terminals and recursive terminals.
     fn resolve_term_references(&mut self) -> GrammarResult<()> {
-        let term_names: Vec<String> = self
-            .names
-            .iter()
-            .filter(|n| self.definitions[*n].is_term)
-            .cloned()
-            .collect();
+        let term_names: Vec<String> =
+            self.names.iter().filter(|n| self.definitions[*n].is_term).cloned().collect();
         for name in &term_names {
             let Some(tree) = &self.definitions[name].tree else {
                 continue;
@@ -644,14 +612,8 @@ impl<'s> GrammarBuilder<'s> {
     /// The terminals the body of the terminal `name` references.
     fn terminal_references(&self, name: &str) -> Vec<String> {
         let mut references = Vec::new();
-        symbol_references(
-            self.definitions[name].tree.as_ref().unwrap(),
-            &mut references,
-        );
-        references
-            .into_iter()
-            .map(|symbol| symbol.name().to_string())
-            .collect()
+        symbol_references(self.definitions[name].tree.as_ref().unwrap(), &mut references);
+        references.into_iter().map(|symbol| symbol.name().to_string()).collect()
     }
 
     /// Fold the terminal `name`, and first the terminals it references,
@@ -690,9 +652,7 @@ impl<'s> GrammarBuilder<'s> {
                 )));
             }
             if tree.is_single_empty() {
-                return Err(GrammarError::new(format!(
-                    "Terminals cannot be empty ({current})"
-                )));
+                return Err(GrammarError::new(format!("Terminals cannot be empty ({current})")));
             }
             let Expr::Alternatives(alts) = tree else {
                 unreachable!("definition bodies are always alternatives")
@@ -857,11 +817,8 @@ impl<'s> GrammarBuilder<'s> {
                 }
             }
         }
-        let undefined: Vec<&String> = self
-            .ignore_names
-            .iter()
-            .filter(|n| !self.definitions.contains_key(*n))
-            .collect();
+        let undefined: Vec<&String> =
+            self.ignore_names.iter().filter(|n| !self.definitions.contains_key(*n)).collect();
         if !undefined.is_empty() {
             let names: Vec<String> = undefined.iter().map(|n| format!("'{n}'")).collect();
             return Err(GrammarError::new(format!(
@@ -893,11 +850,7 @@ impl<'s> GrammarBuilder<'s> {
                 }
             }
         }
-        Ok(BuiltGrammar {
-            rule_defs,
-            term_defs,
-            ignore: self.ignore_names,
-        })
+        Ok(BuiltGrammar { rule_defs, term_defs, ignore: self.ignore_names })
     }
 }
 
@@ -907,11 +860,9 @@ fn tree_mentions_terminal(tree: &Expr, name: &str) -> bool {
 
 fn tree_mentions(tree: &Expr, name: &str, as_terminal: bool) -> bool {
     match tree {
-        Expr::Alternatives(alts) => alts.iter().any(|alt| {
-            alt.items
-                .iter()
-                .any(|i| tree_mentions(i, name, as_terminal))
-        }),
+        Expr::Alternatives(alts) => {
+            alts.iter().any(|alt| alt.items.iter().any(|i| tree_mentions(i, name, as_terminal)))
+        }
         Expr::Symbol(symbol) => symbol.name() == name && symbol.is_terminal() == as_terminal,
         Expr::Literal(_) => false,
         Expr::Repeat { inner, .. } => tree_mentions(inner, name, as_terminal),
@@ -926,9 +877,7 @@ fn not_found(path: &str) -> GrammarError {
 }
 
 fn nesting_error() -> GrammarError {
-    GrammarError::new(format!(
-        "Grammar imports nest more than {MAX_IMPORT_NESTING} levels deep"
-    ))
+    GrammarError::new(format!("Grammar imports nest more than {MAX_IMPORT_NESTING} levels deep"))
 }
 
 /// Resolve an import to a file path, relative to `importer` for relative
@@ -967,10 +916,7 @@ pub struct GrammarFiles {
 
 impl GrammarFiles {
     pub fn new(root: String) -> GrammarResult<Self> {
-        let mut files = GrammarFiles {
-            root: String::new(),
-            files: Vec::new(),
-        };
+        let mut files = GrammarFiles { root: String::new(), files: Vec::new() };
         files.add_imports(&root, None, 0)?;
         files.root = root;
         Ok(files)
@@ -1001,9 +947,7 @@ impl GrammarFiles {
                 None => named.push((imported, stmt.relative)),
             }
         }
-        let new = named
-            .iter()
-            .any(|(p, _)| !self.files.iter().any(|f| f.path == *p));
+        let new = named.iter().any(|(p, _)| !self.files.iter().any(|f| f.path == *p));
         if new && depth >= MAX_IMPORT_NESTING {
             return Err(nesting_error());
         }
@@ -1043,9 +987,7 @@ impl GrammarFiles {
         };
         let path = file.path.clone();
         if file.text.is_some() {
-            return Err(GrammarError::new(format!(
-                "Grammar file `{path}` was already provided"
-            )));
+            return Err(GrammarError::new(format!("Grammar file `{path}` was already provided")));
         }
         let (text, bundled) = match text {
             Some(text) => (text, false),

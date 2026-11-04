@@ -611,9 +611,19 @@ mod tests {
     #[test]
     fn cmp_plain_is_the_order_of_plain() {
         let code = |pieces: &[&str]| {
-            Code(pieces.iter().enumerate().map(|(at, it)| {
-                if at % 2 == 0 { Piece::Text((*it).to_owned()) } else { Piece::Keyword((*it).to_owned()) }
-            }).collect())
+            Code(
+                pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(at, it)| {
+                        if at % 2 == 0 {
+                            Piece::Text((*it).to_owned())
+                        } else {
+                            Piece::Keyword((*it).to_owned())
+                        }
+                    })
+                    .collect(),
+            )
         };
         let all = [
             code(&[]),

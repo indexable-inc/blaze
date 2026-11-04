@@ -7,9 +7,9 @@
 use std::mem;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::StaticId;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     Address, Allocated, BasicBlockId, Evaluator, Interval, MirBody, MirEvalError, MirSpan,
@@ -91,11 +91,18 @@ pub(super) fn region_allocations<'a>(
 
 pub(super) enum Run {
     /// Not started yet: it calls `start` with `arg` when first picked.
-    Start { start: usize, arg: Address },
+    Start {
+        start: usize,
+        arg: Address,
+    },
     Runnable,
     /// Waits on `wait`, to finish the call whose destination is `destination`. `since` orders
     /// the waiters of one futex, longest-waiting first.
-    Blocked { wait: Wait, destination: Interval, since: u64 },
+    Blocked {
+        wait: Wait,
+        destination: Interval,
+        since: u64,
+    },
     /// Its start function returned and its exit destructors ran.
     Ended,
 }
@@ -162,7 +169,6 @@ impl<'db> Thread<'db> {
             origin,
         }
     }
-
 }
 
 impl<'db, M: Machine<'db>> Evaluator<'db, M> {
@@ -215,19 +221,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// each woken one goes on).
     pub(super) fn wake(&mut self, addr: usize, bitset: u32, count: usize) -> Result<'db, usize> {
         self.machine.release(addr as u64)?;
-        let mut waiters: SmallVec<[(u64, usize); 8]> = self
-            .threads
-            .iter()
-            .enumerate()
-            .filter_map(|(i, thread)| match &thread.run {
-                Run::Blocked { wait: Wait::Shim { addr: at, bitset: bits, .. }, since, .. }
-                    if *at == addr && bits & bitset != 0 =>
-                {
-                    Some((*since, i))
-                }
-                _ => None,
-            })
-            .collect(); // alloc: inline `SmallVec`, on the stack for up to eight waiters
+        let mut waiters: SmallVec<[(u64, usize); 8]> =
+            self.threads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, thread)| match &thread.run {
+                    Run::Blocked {
+                        wait: Wait::Shim { addr: at, bitset: bits, .. }, since, ..
+                    } if *at == addr && bits & bitset != 0 => Some((*since, i)),
+                    _ => None,
+                })
+                .collect(); // alloc: inline `SmallVec`, on the stack for up to eight waiters
         waiters.sort_unstable();
         let woken = waiters.len().min(count);
         for &(_, i) in &waiters[..woken] {
@@ -422,7 +426,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let thread = &mut self.threads[i];
                     thread.woken.pointer = Some((retval, result.unwrap_or(Address::invalid(0))));
                 }
-                self.threads[i].woken.result = Some((destination, OwnedBytes::from_slice(&0i32.to_le_bytes())));
+                self.threads[i].woken.result =
+                    Some((destination, OwnedBytes::from_slice(&0i32.to_le_bytes())));
             }
         }
     }
@@ -525,9 +530,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .iter()
             .enumerate()
             .filter_map(|(i, thread)| match &thread.run {
-                Run::Blocked { wait: Wait::Shim { deadline: Some(deadline), .. }, since, .. } => {
-                    Some((*deadline, *since, i))
-                }
+                Run::Blocked {
+                    wait: Wait::Shim { deadline: Some(deadline), .. }, since, ..
+                } => Some((*deadline, *since, i)),
                 _ => None,
             })
             .min();
@@ -575,7 +580,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let (body, span) = thread.origin;
             let slot = thread.result_slot;
             self.stack.push(0);
-            let Some(frame) = self.call_fn_pointer_word(start, &[arg], slot, body, span, Then::Thread)?
+            let Some(frame) =
+                self.call_fn_pointer_word(start, &[arg], slot, body, span, Then::Thread)?
             else {
                 not_supported!("a thread whose start function is a shim");
             };

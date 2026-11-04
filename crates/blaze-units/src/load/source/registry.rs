@@ -11,12 +11,12 @@ use std::rc::Rc;
 
 use anyhow::bail;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, OptVersionReq, QueryKind, Registry, SourceId,
     query_pinned,
 };
+use std::alloc::Global;
 
 use super::{IndexFile, Sources};
 use crate::index::{Lines, index_summary};
@@ -60,7 +60,10 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
     }
 
     /// A read through the view, which once cancelled fails every read after it.
-    fn read<T>(&self, read: impl FnOnce(&mut Cx<'db>) -> Result<T, Cancelled>) -> anyhow::Result<T> {
+    fn read<T>(
+        &self,
+        read: impl FnOnce(&mut Cx<'db>) -> Result<T, Cancelled>,
+    ) -> anyhow::Result<T> {
         if self.cancelled.get() {
             bail!(CANCELLED);
         }
@@ -114,8 +117,8 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
             let mut called = false;
             for line in &lines {
                 let entry = &line.entry;
-                let fetched =
-                    self.read(|cx| self.sources.is_downloaded(cx, from, &entry.name, &entry.version))?;
+                let fetched = self
+                    .read(|cx| self.sources.is_downloaded(cx, from, &entry.name, &entry.version))?;
                 if fetched && let Some(summary) = index_summary(line, source) {
                     called = true;
                     f(summary);
@@ -169,7 +172,9 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
                     called = true;
                     f(s);
                 }
-                IndexSummary::Unsupported(..) | IndexSummary::Invalid(_) | IndexSummary::Offline(_) => {}
+                IndexSummary::Unsupported(..)
+                | IndexSummary::Invalid(_)
+                | IndexSummary::Offline(_) => {}
             }
         })?;
         if called || !matches!(kind, QueryKind::AlternativeNames | QueryKind::Normalized) {

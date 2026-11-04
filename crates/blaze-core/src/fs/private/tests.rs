@@ -5,7 +5,8 @@ use crate::FileName;
 
 /// A root of its own, and the store under it, not made yet.
 fn store(what: &str) -> (PathBuf, FileName) {
-    let root = std::env::temp_dir().join(format!("blaze-core-private-{what}-{}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("blaze-core-private-{what}-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     (root.join("store"), FileName::new("store").unwrap())
@@ -55,7 +56,11 @@ mod unix {
             let (dir, name) = store(&format!("open-{refused:o}"));
             std::fs::create_dir(&dir).unwrap();
             chmod(&dir, refused);
-            assert_eq!(private(&dir, &name).unwrap(), Some((name, Access::OthersWrite)), "{refused:o}");
+            assert_eq!(
+                private(&dir, &name).unwrap(),
+                Some((name, Access::OthersWrite)),
+                "{refused:o}"
+            );
             assert_eq!(mode(&dir), refused);
         }
     }

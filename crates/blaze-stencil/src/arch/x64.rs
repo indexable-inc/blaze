@@ -77,7 +77,8 @@ impl Glue for X64 {
         if let (Some(off), Some(place)) = (frame.sret, frame::sret_place(func)?) {
             frame::param(cx.buf, frame.grow, place, ir::types::I64, super::Loc::Slot(off))?;
         }
-        let entry = func.layout.entry_block().ok_or_else(|| Error::new("a function with no blocks"))?;
+        let entry =
+            func.layout.entry_block().ok_or_else(|| Error::new("a function with no blocks"))?;
         let params = func.dfg.block_params(entry);
         if params.len() != func.signature.params.len() {
             return Err(Error::new("an entry block whose parameters are not the signature's"));

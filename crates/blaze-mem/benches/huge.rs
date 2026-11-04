@@ -97,7 +97,10 @@ mod walks {
     impl Walks {
         pub fn open() -> io::Result<Walks> {
             let Some((kind, config, event)) = event() else {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "no page walk event known for this architecture"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no page walk event known for this architecture",
+                ));
             };
             let attr = Attr {
                 kind,
@@ -111,12 +114,23 @@ mod walks {
                 bp_type: 0,
                 config1: 0,
             };
-            let (this_thread, any_cpu, no_group, no_flags): (libc::c_long, libc::c_long, libc::c_long, libc::c_long) =
-                (0, -1, -1, 0);
+            let (this_thread, any_cpu, no_group, no_flags): (
+                libc::c_long,
+                libc::c_long,
+                libc::c_long,
+                libc::c_long,
+            ) = (0, -1, -1, 0);
             // SAFETY: the kernel reads `size` bytes of `attr`, a live value of that size; every
             // other argument is a full-width integer, as the variadic `syscall` reads them.
             let fd = unsafe {
-                libc::syscall(libc::SYS_perf_event_open, &raw const attr, this_thread, any_cpu, no_group, no_flags)
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    &raw const attr,
+                    this_thread,
+                    any_cpu,
+                    no_group,
+                    no_flags,
+                )
             };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
@@ -153,12 +167,15 @@ mod walks {
 
 /// The region of `pages` with the cycle written in, or why it cannot be made.
 fn made(pages: Pages, next: &[u32]) -> Result<Region, String> {
-    let region = Region::reserve_pages(BYTES, pages, Tag::Other).map_err(|error| error.to_string())?;
+    let region =
+        Region::reserve_pages(BYTES, pages, Tag::Other).map_err(|error| error.to_string())?;
     #[cfg(target_os = "linux")]
     if pages == Pages::Base {
         // So a machine with transparent huge pages `always` still measures base pages.
         // SAFETY: the region's whole reservation, holding nothing yet; advice only.
-        unsafe { libc::madvise(region.base().as_ptr().cast(), region.reserved(), libc::MADV_NOHUGEPAGE) };
+        unsafe {
+            libc::madvise(region.base().as_ptr().cast(), region.reserved(), libc::MADV_NOHUGEPAGE)
+        };
     }
     region.ensure(BYTES).map_err(|error| error.to_string())?;
     for (line, &to) in next.iter().enumerate() {
@@ -239,6 +256,9 @@ fn main() {
     chase(&region, HOPS);
     let ns = start.elapsed().as_nanos() as f64 / HOPS as f64;
     println!("Base: {ns:.1} ns per read");
-    println!("verdict: unmeasured: {} has no huge pages for anonymous memory", std::env::consts::OS);
+    println!(
+        "verdict: unmeasured: {} has no huge pages for anonymous memory",
+        std::env::consts::OS
+    );
     std::process::exit(2);
 }

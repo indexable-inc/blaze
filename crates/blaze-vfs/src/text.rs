@@ -11,7 +11,7 @@ pub use blaze_bytes::{Text, text_of};
 use blaze_ids::ContentId;
 use blaze_image::Corrupt;
 
-use crate::{Mode, Reader, ViewId, Vfs};
+use crate::{Mode, Reader, Vfs, ViewId};
 
 /// A file's content ID and mode, and its text or why it has none.
 pub type TextFile = (ContentId, Mode, Result<Text, Utf8Error>);
@@ -43,7 +43,7 @@ mod tests {
     use blaze_ids::ContentId;
 
     use super::text_of;
-    use crate::{Bytes, FILE_DOMAIN, Mode, Op, View, Vfs};
+    use crate::{Bytes, FILE_DOMAIN, Mode, Op, Vfs, View};
 
     /// A file's text, read from bytes, a reader or a view, allocates nothing: it is the tree's
     /// bytes. So is a heap file's `Arc<str>`.
@@ -56,16 +56,20 @@ mod tests {
         assert!(shared.is_some());
 
         let mut vfs = Vfs::recover(FileName::new("state/journal").unwrap(), 0, &[]).0;
-        let ops = [Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: bytes.to_vec() }];
+        let ops =
+            [Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: bytes.to_vec() }];
         let empty = vfs.empty();
         let root = vfs.commit("main", empty, &ops).unwrap().root;
         let view = vfs.open(View { root }).unwrap();
         let reader = vfs.reader();
         // The first read registers this thread with the reclaimer; reads after it are measured.
         let _ = reader.text(root, "src/lib.rs");
-        let read = blaze_alloc_count::assert_at_most(0, "Reader::text", || reader.text(root, "src/lib.rs"));
+        let read = blaze_alloc_count::assert_at_most(0, "Reader::text", || {
+            reader.text(root, "src/lib.rs")
+        });
         assert!(read.unwrap().is_some_and(|(_, _, text)| text.is_ok()));
-        let read = blaze_alloc_count::assert_at_most(0, "Vfs::text", || vfs.text(view, "src/lib.rs"));
+        let read =
+            blaze_alloc_count::assert_at_most(0, "Vfs::text", || vfs.text(view, "src/lib.rs"));
         assert!(read.unwrap().is_some_and(|(_, _, text)| text.is_ok()));
     }
 
@@ -73,7 +77,11 @@ mod tests {
     fn a_tree_file_is_read_as_its_own_bytes() {
         let mut vfs = Vfs::recover(FileName::new("state/journal").unwrap(), 0, &[]).0;
         let ops = [
-            Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: b"mod a;\n".to_vec() },
+            Op::Write {
+                mode: Mode::Regular,
+                path: "src/lib.rs".into(),
+                bytes: b"mod a;\n".to_vec(),
+            },
             Op::Write { mode: Mode::Regular, path: "data.bin".into(), bytes: vec![0xff] },
         ];
         let empty = vfs.empty();
@@ -82,7 +90,10 @@ mod tests {
         let reader = vfs.reader();
         let (id, mode, text) = reader.text(root, "src/lib.rs").unwrap().expect("a file");
         let text = text.expect("UTF-8");
-        assert_eq!((id, mode, &*text), (ContentId::of(FILE_DOMAIN, b"mod a;\n"), Mode::Regular, "mod a;\n"));
+        assert_eq!(
+            (id, mode, &*text),
+            (ContentId::of(FILE_DOMAIN, b"mod a;\n"), Mode::Regular, "mod a;\n")
+        );
         let (_, _, bytes) = reader.file(root, "src/lib.rs").unwrap().expect("a file");
         assert_eq!(text.as_ptr(), bytes.as_ptr(), "the tree's bytes, not a copy");
         assert!(reader.text(root, "data.bin").unwrap().expect("a file").2.is_err());

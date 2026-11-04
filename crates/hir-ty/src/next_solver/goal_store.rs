@@ -125,7 +125,12 @@ pub(crate) fn lookup<'db>(interner: DbInterner<'db>, key: GoalKey) -> Option<Fou
 
 /// After solving: `key`'s answer, shareable, with what its evaluation read.
 #[inline]
-pub(crate) fn offer<'db>(interner: DbInterner<'db>, key: GoalKey, answer: Answer, reads: blaze_query::db::Reads) {
+pub(crate) fn offer<'db>(
+    interner: DbInterner<'db>,
+    key: GoalKey,
+    answer: Answer,
+    reads: blaze_query::db::Reads,
+) {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -202,7 +207,8 @@ enum Refusal {
 
 impl Store {
     fn lookup<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found> {
-        let (answer, reads) = blaze_query::db::capture_reads(interner.db, || self.find(interner, goal));
+        let (answer, reads) =
+            blaze_query::db::capture_reads(interner.db, || self.find(interner, goal));
         Some(Found { answer: answer?, reads })
     }
 
@@ -229,7 +235,9 @@ impl Store {
                     return None;
                 }
             };
-            let Some(answer_key) = self.answer_key_now(db, interner.krate(), &at, &shape) else { continue };
+            let Some(answer_key) = self.answer_key_now(db, interner.krate(), &at, &shape) else {
+                continue;
+            };
             match self.images.get(&answer_key) {
                 Ok(Some(found)) => match record::open_answer(found.bytes(), &answer_key) {
                     Ok(answer) => return Some(answer),
@@ -242,7 +250,9 @@ impl Store {
                 Ok(None) => {}
                 Err(why) => {
                     // alloc: error text
-                    self.fail(format!("reading the answer of goal {goal_key:x} in slot {n}: {why}"));
+                    self.fail(format!(
+                        "reading the answer of goal {goal_key:x} in slot {n}: {why}"
+                    ));
                     return None;
                 }
             }
@@ -266,7 +276,13 @@ impl Store {
         Some(key.finish())
     }
 
-    fn offer<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>, answer: Answer, reads: blaze_query::db::Reads) {
+    fn offer<'db>(
+        &self,
+        interner: DbInterner<'db>,
+        goal: Goal<'db>,
+        answer: Answer,
+        reads: blaze_query::db::Reads,
+    ) {
         let mut scratch = SCRATCH.take();
         scratch.facts.clear();
         scratch.values.clear();
@@ -320,7 +336,14 @@ impl Store {
             return Err(Refusal::TooLong);
         }
         let goal_key = stable::key_of(&self.version, &crate_key, &scratch.words);
-        self.pending.push(&goal_key, &self.version, answer, &scratch.words, &scratch.facts, &scratch.values);
+        self.pending.push(
+            &goal_key,
+            &self.version,
+            answer,
+            &scratch.words,
+            &scratch.facts,
+            &scratch.values,
+        );
         Ok(())
     }
 
@@ -352,7 +375,11 @@ impl Store {
                         slot = Some(at);
                         break;
                     }
-                    Err(why) => match self.images.get(&at).map_err(|why| error("reading the shape of", why))? {
+                    Err(why) => match self
+                        .images
+                        .get(&at)
+                        .map_err(|why| error("reading the shape of", why))?
+                    {
                         Some(kept) if kept.bytes() == entry.shape => {
                             slot = Some(at);
                             break;
@@ -379,7 +406,9 @@ impl Store {
             )),
             None => {
                 // alloc: the answer's bytes, once per goal written
-                self.images.put(answer_key, answer.to_vec()).map_err(|why| error("keeping the answer of", why))?;
+                self.images
+                    .put(answer_key, answer.to_vec())
+                    .map_err(|why| error("keeping the answer of", why))?;
                 Ok(Wrote::Written)
             }
         }
@@ -426,8 +455,12 @@ static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 /// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
 static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
 
-#[expect(clippy::disallowed_types, reason = "the process's one goal store reclamation pool: all unlinked stores are retired together")]
-static LIMBO: std::sync::LazyLock<Mutex<Limbo>> = std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one goal store reclamation pool: all unlinked stores are retired together"
+)]
+static LIMBO: std::sync::LazyLock<Mutex<Limbo>> =
+    std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
 
 /// Runs `f` on the goal store of `db`, if one is installed.
 #[inline]
@@ -474,7 +507,8 @@ pub fn install(
         let _task = blaze_reclaim::enter();
         for slot in &REGISTRY {
             // SAFETY: as in `with_store`, under `_task`.
-            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce) {
+            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce)
+            {
                 // alloc: error text
                 return Err(String::from("this database has a goal store installed already"));
             }
@@ -490,7 +524,10 @@ pub fn install(
         error: Mutex::new(None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
-        if slot.compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if slot
+            .compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             INSTALLED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: `Box::into_raw` never gives null.
             return Ok(Installed { at, store: unsafe { NonNull::new_unchecked(store) } });
@@ -529,15 +566,21 @@ impl Installed {
         let store = self.store();
         let (buffers, tallies) = store.pending.take();
         // alloc: flush, once per build: one entry per goal offered
-        let entries: Vec<pending::Entry<'_>> = buffers.iter().flat_map(|it| pending::entries(it)).collect();
+        let entries: Vec<pending::Entry<'_>> =
+            buffers.iter().flat_map(|it| pending::entries(it)).collect();
         // alloc: flush, as above
-        #[expect(clippy::disallowed_types, reason = "goal write results, set once per entry in this flush: not global")]
-        let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> = entries.iter().map(|_| std::sync::OnceLock::new()).collect();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "goal write results, set once per entry in this flush: not global"
+        )]
+        let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> =
+            entries.iter().map(|_| std::sync::OnceLock::new()).collect();
         store.images.for_each(entries.len(), &|at| {
             _ = results[at].set(store.write(&entries[at]));
         });
         let Tallies { inexpressible, unhashable, too_long, dropped } = tallies;
-        let mut flushed = Flushed { inexpressible, unhashable, too_long, dropped, ..Flushed::default() };
+        let mut flushed =
+            Flushed { inexpressible, unhashable, too_long, dropped, ..Flushed::default() };
         for result in results {
             let wrote = result.into_inner().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run every task of a goal store flush")

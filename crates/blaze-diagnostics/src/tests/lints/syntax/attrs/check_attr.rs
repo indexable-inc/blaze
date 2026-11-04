@@ -17,7 +17,10 @@ use crate::{
 fn ui(name: &str, edition: &str, source: &str) -> String {
     let fixture = format!("//- /{name} crate:other:main edition:{edition}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
-    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+    normalized(
+        &checked_with(&fixture, "$DIR/", &options)
+            .stderr_with(Style { ui_testing: true, ..Style::default() }),
+    )
 }
 
 /// The messages of `lint` that `source`, a library of edition 2021, gets.
@@ -167,9 +170,15 @@ fn conflicting_repr_hints_by_case() {
     assert_eq!(conflicting("#[repr(C, u8)]\nenum E { A(u8), B }\n"), Vec::<String>::new());
     assert_eq!(conflicting("#[repr(C, u8)]\nenum E { A {}, B }\n"), Vec::<String>::new());
     assert_eq!(conflicting("#[repr(C, u8)]\nenum E { A, B }\n"), [lint.clone()]);
-    assert_eq!(conflicting("#[repr(C)]\n#[repr(u8)]\nenum E { A, #[cfg(any())] B(u8) }\n"), [lint.clone()]);
+    assert_eq!(
+        conflicting("#[repr(C)]\n#[repr(u8)]\nenum E { A, #[cfg(any())] B(u8) }\n"),
+        [lint.clone()]
+    );
     assert_eq!(conflicting("#[repr(u8)]\n#[repr(i16)]\nenum E { A(u8) }\n"), [lint.clone()]);
-    assert_eq!(conflicting("#![feature(repr_simd)]\n#[repr(C, simd)]\nstruct S([f32; 4]);\n"), [lint]);
+    assert_eq!(
+        conflicting("#![feature(repr_simd)]\n#[repr(C, simd)]\nstruct S([f32; 4]);\n"),
+        [lint]
+    );
     assert_eq!(conflicting("#[repr(C, align(8))]\nstruct S(u8);\n"), Vec::<String>::new());
 }
 
@@ -246,20 +255,34 @@ error: aborting due to 3 previous errors
 #[test]
 fn inline_on_exported_functions_by_case() {
     let inline = |source: &str| messages(source, "unused_attributes");
-    let lint = "unused_attributes: `#[inline]` is ignored on externally exported functions".to_owned();
-    assert_eq!(inline("struct S;\nimpl S {\n    #[inline]\n    #[unsafe(no_mangle)]\n    fn f() {}\n}\n"), [lint.clone()]);
+    let lint =
+        "unused_attributes: `#[inline]` is ignored on externally exported functions".to_owned();
     assert_eq!(
-        inline("trait T {\n    #[inline]\n    #[unsafe(export_name = \"t_f\")]\n    fn f() {}\n}\n"),
+        inline("struct S;\nimpl S {\n    #[inline]\n    #[unsafe(no_mangle)]\n    fn f() {}\n}\n"),
         [lint.clone()]
     );
     assert_eq!(
-        inline("trait T { fn f(); }\nstruct S;\nimpl T for S {\n    #[inline]\n    #[unsafe(no_mangle)]\n    fn f() {}\n}\n"),
+        inline(
+            "trait T {\n    #[inline]\n    #[unsafe(export_name = \"t_f\")]\n    fn f() {}\n}\n"
+        ),
+        [lint.clone()]
+    );
+    assert_eq!(
+        inline(
+            "trait T { fn f(); }\nstruct S;\nimpl T for S {\n    #[inline]\n    #[unsafe(no_mangle)]\n    fn f() {}\n}\n"
+        ),
         Vec::<String>::new()
     );
     assert_eq!(inline("#[inline(never)]\n#[unsafe(no_mangle)]\nfn f() {}\n"), Vec::<String>::new());
     assert_eq!(inline("#[inline(always)]\n#[unsafe(no_mangle)]\nfn f() {}\n"), [lint.clone()]);
-    assert_eq!(inline("#[inline]\n#[unsafe(export_name = \"\")]\nfn f() {}\n"), Vec::<String>::new());
-    assert_eq!(inline("struct Info;\n#[inline]\n#[panic_handler]\nfn panic(_: &Info) -> ! { loop {} }\n"), [lint]);
+    assert_eq!(
+        inline("#[inline]\n#[unsafe(export_name = \"\")]\nfn f() {}\n"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        inline("struct Info;\n#[inline]\n#[panic_handler]\nfn panic(_: &Info) -> ! { loop {} }\n"),
+        [lint]
+    );
 }
 
 /// `tests/ui/lint/empty-lint-attributes.rs`: the item's lints before the crate's.
@@ -488,7 +511,10 @@ fn linker_messages_by_case() {
         ["unused_attributes: crate-level attribute should be in the root module"]
     );
     assert_eq!(unused("#![allow(linker_messages)]\n"), Vec::<String>::new());
-    assert_eq!(unused("#![allow(dead_code_pub_in_binary)]\n"), ["unused_attributes: unused attribute"]);
+    assert_eq!(
+        unused("#![allow(dead_code_pub_in_binary)]\n"),
+        ["unused_attributes: unused attribute"]
+    );
 }
 
 /// `tests/ui/lint/dead-code-pub-in-binary/library.rs`. The `dead_code` error is
@@ -572,9 +598,14 @@ error: aborting due to 1 previous error
 #[test]
 fn link_on_an_extern_block_of_the_rust_abi() {
     let unused = |source: &str| messages(source, "unused_attributes");
-    let lint = "unused_attributes: attribute should be applied to an `extern` block with non-Rust ABI".to_owned();
+    let lint =
+        "unused_attributes: attribute should be applied to an `extern` block with non-Rust ABI"
+            .to_owned();
     assert_eq!(unused("#[link(name = \"x\")]\nextern \"Rust\" {}\n"), [lint.clone()]);
-    assert_eq!(unused("#[link(name = \"x\")]\n#[link(name = \"y\")]\nextern \"Rust\" {}\n"), [lint]);
+    assert_eq!(
+        unused("#[link(name = \"x\")]\n#[link(name = \"y\")]\nextern \"Rust\" {}\n"),
+        [lint]
+    );
     assert_eq!(unused("#[link(name = \"x\")]\nextern \"C\" {}\n"), Vec::<String>::new());
     assert_eq!(unused("#[link(name = \"x\")]\nextern {}\n"), Vec::<String>::new());
     assert_eq!(unused("#[link(name = \"x\")]\nextern \"system\" {}\n"), Vec::<String>::new());

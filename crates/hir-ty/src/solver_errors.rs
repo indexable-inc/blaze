@@ -17,7 +17,9 @@ use rustc_type_ir::{
     BoundConstness, ClausePolarity, ClosureKind, ImplPolarity, InferTy, Interner, IsRigid,
     TypeFoldable as _, TypeVisitableExt,
     elaborate::elaborate,
-    inherent::{GenericArg as _, GenericArgs as _, GenericsOf as _, IntoKind, SliceLike, Term as _},
+    inherent::{
+        GenericArg as _, GenericArgs as _, GenericsOf as _, IntoKind, SliceLike, Term as _,
+    },
     lang_items::SolverTraitLangItem,
     reflect::{first_reflected_var, instantiate_reflected_var},
     solve::TyOrConstInferVar,
@@ -27,10 +29,10 @@ use crate::{
     InferenceDiagnostic, Span,
     comptime::ReflectedMember,
     next_solver::{
-        AliasTermKind, AnyImplId, ClauseKind, DbInterner, GenericArg, ParamEnv, PolyProjectionClause,
-        PolyTraitClause, Predicate, PredicateKind, ProjectionClause, StoredGenericArg,
-        StoredGenericArgs,
-        StoredTraitRef, StoredTy, Term, TraitClause, TyKind, Unnormalized,
+        AliasTermKind, AnyImplId, ClauseKind, DbInterner, GenericArg, ParamEnv,
+        PolyProjectionClause, PolyTraitClause, Predicate, PredicateKind, ProjectionClause,
+        StoredGenericArg, StoredGenericArgs, StoredTraitRef, StoredTy, Term, TraitClause, TyKind,
+        Unnormalized,
         infer::{
             BoundRegionConversionTime, InferCtxt,
             errors::{FulfillmentError, FulfillmentErrorCode},
@@ -174,17 +176,39 @@ pub enum StoredGoal {
         maybe_const: bool,
     },
     /// `alias == term`.
-    Projection { alias: StoredGenericArg, term: StoredGenericArg },
+    Projection {
+        alias: StoredGenericArg,
+        term: StoredGenericArg,
+    },
     /// What `alias` normalizes to, `term` an inference variable.
-    NormalizesTo { alias: StoredGenericArg, term: StoredGenericArg },
-    WellFormed { term: StoredGenericArg },
+    NormalizesTo {
+        alias: StoredGenericArg,
+        term: StoredGenericArg,
+    },
+    WellFormed {
+        term: StoredGenericArg,
+    },
     /// `a <: b`.
-    Subtype { a: StoredTy, b: StoredTy },
+    Subtype {
+        a: StoredTy,
+        b: StoredTy,
+    },
     /// `a` coerces to `b`.
-    Coerce { a: StoredTy, b: StoredTy },
-    ConstEvaluatable { ct: StoredGenericArg },
-    ConstArgHasType { ct: StoredGenericArg, ty: StoredTy },
-    ConstEquate { a: StoredGenericArg, b: StoredGenericArg },
+    Coerce {
+        a: StoredTy,
+        b: StoredTy,
+    },
+    ConstEvaluatable {
+        ct: StoredGenericArg,
+    },
+    ConstArgHasType {
+        ct: StoredGenericArg,
+        ty: StoredTy,
+    },
+    ConstEquate {
+        a: StoredGenericArg,
+        b: StoredGenericArg,
+    },
     DynCompatible {
         #[type_visitable(ignore)]
         trait_: TraitId,
@@ -195,7 +219,10 @@ pub enum StoredGoal {
         feature: Symbol,
     },
     /// `a: b`: a region or type outlives the region `b`.
-    Outlives { a: StoredGenericArg, b: StoredGenericArg },
+    Outlives {
+        a: StoredGenericArg,
+        b: StoredGenericArg,
+    },
     /// rustc's `PredicateKind::Ambiguous`.
     Ambiguous,
 }
@@ -228,15 +255,21 @@ impl StoredGoal {
             PredicateKind::Clause(ClauseKind::WellFormed(term)) => {
                 StoredGoal::WellFormed { term: arg(term.into()) }
             }
-            PredicateKind::Subtype(data) => StoredGoal::Subtype { a: data.a.store(), b: data.b.store() },
-            PredicateKind::Coerce(data) => StoredGoal::Coerce { a: data.a.store(), b: data.b.store() },
+            PredicateKind::Subtype(data) => {
+                StoredGoal::Subtype { a: data.a.store(), b: data.b.store() }
+            }
+            PredicateKind::Coerce(data) => {
+                StoredGoal::Coerce { a: data.a.store(), b: data.b.store() }
+            }
             PredicateKind::Clause(ClauseKind::ConstEvaluatable(ct)) => {
                 StoredGoal::ConstEvaluatable { ct: arg(ct.into()) }
             }
             PredicateKind::Clause(ClauseKind::ConstArgHasType(ct, ty)) => {
                 StoredGoal::ConstArgHasType { ct: arg(ct.into()), ty: ty.store() }
             }
-            PredicateKind::ConstEquate(a, b) => StoredGoal::ConstEquate { a: arg(a.into()), b: arg(b.into()) },
+            PredicateKind::ConstEquate(a, b) => {
+                StoredGoal::ConstEquate { a: arg(a.into()), b: arg(b.into()) }
+            }
             PredicateKind::DynCompatible(trait_) => StoredGoal::DynCompatible { trait_: trait_.0 },
             PredicateKind::Clause(ClauseKind::UnstableFeature(feature)) => {
                 StoredGoal::UnstableFeature { feature: feature.0 }
@@ -312,7 +345,10 @@ impl SolverDiagnostic {
             return Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind });
         }
         let goal = || {
-            StoredGoal::new(interner, infcx.deeply_resolve_ignoring_regions(error.obligation.predicate))
+            StoredGoal::new(
+                interner,
+                infcx.deeply_resolve_ignoring_regions(error.obligation.predicate),
+            )
         };
         let unreported = |code| SolverDiagnosticKind::Unreported { code };
         let kind = match &error.code {
@@ -403,7 +439,9 @@ fn reflected_member_unmet<'db>(
         .copied()
         .chain([error.obligation.predicate])
         .map(|predicate| infcx.deeply_resolve_ignoring_regions(predicate))
-        .find(|predicate| first_reflected_var::<DbInterner<'db>>(predicate.kind().bound_vars()).is_some())?;
+        .find(|predicate| {
+            first_reflected_var::<DbInterner<'db>>(predicate.kind().bound_vars()).is_some()
+        })?;
     let kind = binder.kind();
     let (index, var) = first_reflected_var::<DbInterner<'db>>(kind.bound_vars())?;
     let members = crate::comptime::reflect_members_checked(interner, var.container, var.domain)?;
@@ -460,7 +498,9 @@ fn projection_normalized<'db>(
         let _ = ocx.try_evaluate_obligations();
         ocx.eq(cause, param_env, data.term, normalized).is_err().then(|| {
             let normalized = infcx.deeply_resolve_ignoring_regions(normalized);
-            GenericArg::from(normalized).fold_with(&mut ReplaceInferWithError::new(interner)).store()
+            GenericArg::from(normalized)
+                .fold_with(&mut ReplaceInferWithError::new(interner))
+                .store()
         })
     })
 }
@@ -637,7 +677,10 @@ enum ErrorSortKey {
     WellFormed,
 }
 
-fn sizedness<'db>(interner: DbInterner<'db>, predicate: Predicate<'db>) -> Option<SolverTraitLangItem> {
+fn sizedness<'db>(
+    interner: DbInterner<'db>,
+    predicate: Predicate<'db>,
+) -> Option<SolverTraitLangItem> {
     let trait_ = match predicate.kind().skip_binder() {
         PredicateKind::Clause(ClauseKind::Trait(data)) => data.trait_ref.def_id,
         PredicateKind::Clause(ClauseKind::HostEffect(data)) => data.trait_ref.def_id,
@@ -674,7 +717,10 @@ pub(crate) fn variable_origin<'db>(
     term: Term<'db>,
 ) -> Option<(Span, GenericParamId)> {
     GenericArg::from(term).walk().find_map(|arg| {
-        named::variable_param(infcx, TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)?)
+        named::variable_param(
+            infcx,
+            TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)?,
+        )
     })
 }
 
@@ -819,7 +865,12 @@ fn applicable_candidates<'db>(
                     clause,
                 );
                 if ocx
-                    .eq(&ObligationCause::dummy(), param_env, placeholder.trait_ref, clause.trait_ref)
+                    .eq(
+                        &ObligationCause::dummy(),
+                        param_env,
+                        placeholder.trait_ref,
+                        clause.trait_ref,
+                    )
                     .is_err()
                 {
                     return false;
@@ -859,9 +910,13 @@ fn applicable_impls_to_mention<'db>(
 ) -> Option<Vec<AmbiguityCandidate>> {
     let interner = infcx.interner;
     let mut candidates = applicable_candidates(infcx, param_env, trait_pred);
-    let has_known_type = trait_pred.skip_binder().trait_ref.args.iter().filter_map(|arg| arg.as_type()).any(|ty| {
-        !matches!(ty.kind(), TyKind::Infer(InferTy::TyVar(_) | InferTy::IntVar(_) | InferTy::FloatVar(_)))
-    });
+    let has_known_type =
+        trait_pred.skip_binder().trait_ref.args.iter().filter_map(|arg| arg.as_type()).any(|ty| {
+            !matches!(
+                ty.kind(),
+                TyKind::Infer(InferTy::TyVar(_) | InferTy::IntVar(_) | InferTy::FloatVar(_))
+            )
+        });
     let is_concrete = |candidate: &AmbiguityCandidate| match *candidate {
         AmbiguityCandidate::Impl(impl_) => interner.generics_of(impl_.into()).count() == 0,
         AmbiguityCandidate::ParamEnv { .. } => true,
@@ -895,7 +950,9 @@ pub(crate) fn ambiguity_diagnostics<'db>(
                 continue;
             }
             let (error, cond) = (&errors[index].obligation, &errors[other].obligation);
-            if error_implies(infcx, cond, error) && !(other >= index && error_implies(infcx, error, cond)) {
+            if error_implies(infcx, cond, error)
+                && !(other >= index && error_implies(infcx, error, cond))
+            {
                 is_suppressed[index] = true;
                 break;
             }
@@ -905,10 +962,14 @@ pub(crate) fn ambiguity_diagnostics<'db>(
     let infer_var = |error: &FulfillmentError<'db>| {
         ambiguity_term(infcx.deeply_resolve_ignoring_regions(error.obligation.predicate))
             .and_then(|term| {
-                GenericArg::from(term).walk().find_map(TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>)
+                GenericArg::from(term)
+                    .walk()
+                    .find_map(TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>)
             })
             .map(|var| match var {
-                TyOrConstInferVar::Ty(vid) => TyOrConstInferVar::Ty(infcx.sub_unification_table_root_var(vid)),
+                TyOrConstInferVar::Ty(vid) => {
+                    TyOrConstInferVar::Ty(infcx.sub_unification_table_root_var(vid))
+                }
                 other => other,
             })
     };
@@ -918,7 +979,9 @@ pub(crate) fn ambiguity_diagnostics<'db>(
         let error = &errors[other].obligation;
         error.cause.span() == span
             && match error.predicate.kind().skip_binder() {
-                PredicateKind::Clause(ClauseKind::Trait(_)) => sizedness(interner, error.predicate).is_none(),
+                PredicateKind::Clause(ClauseKind::Trait(_)) => {
+                    sizedness(interner, error.predicate).is_none()
+                }
                 PredicateKind::Clause(ClauseKind::Projection(_)) => true,
                 _ => false,
             }
@@ -935,7 +998,9 @@ pub(crate) fn ambiguity_diagnostics<'db>(
             let span = error.obligation.cause.span();
             let group: Vec<usize> = match infer_vars[index] {
                 // alloc: error path
-                Some(var) => (0..errors.len()).filter(|&other| other != index && infer_vars[other] == Some(var)).collect(),
+                Some(var) => (0..errors.len())
+                    .filter(|&other| other != index && infer_vars[other] == Some(var))
+                    .collect(),
                 None => Vec::new(), // alloc: none, empty
             };
             let related: Vec<&FulfillmentError<'db>> = group
@@ -1014,9 +1079,18 @@ fn report_ambiguity<'db>(
                 }
                 let self_ty = data.trait_ref.self_ty();
                 // alloc: none, empty
-                return Some(diagnostic(TypeAnnotationNeeded::E0282, Some(self_ty.into()), Vec::new(), Vec::new()));
+                return Some(diagnostic(
+                    TypeAnnotationNeeded::E0282,
+                    Some(self_ty.into()),
+                    Vec::new(),
+                    Vec::new(),
+                ));
             }
-            let candidates = applicable_impls_to_mention(infcx, obligation.param_env, predicate.kind().rebind(data));
+            let candidates = applicable_impls_to_mention(
+                infcx,
+                obligation.param_env,
+                predicate.kind().rebind(data),
+            );
             match candidates {
                 // Two where clauses or impls equal but for regions: not worth a second error.
                 Some(_) if tainted && term.is_none() => return None,
@@ -1061,12 +1135,18 @@ fn report_ambiguity<'db>(
         }
         mentioned.push(goal.clone()); // clone: error path
         let candidates = match related_pred.kind().skip_binder() {
-            PredicateKind::Clause(ClauseKind::Trait(data)) if sizedness(interner, related_pred).is_none() => {
+            PredicateKind::Clause(ClauseKind::Trait(data))
+                if sizedness(interner, related_pred).is_none() =>
+            {
                 if matches!(data.self_ty().kind(), TyKind::Infer(_)) || tainted {
                     Vec::new() // alloc: none, empty
                 } else {
-                    applicable_impls_to_mention(infcx, related.obligation.param_env, related_pred.kind().rebind(data))
-                        .unwrap_or_default()
+                    applicable_impls_to_mention(
+                        infcx,
+                        related.obligation.param_env,
+                        related_pred.kind().rebind(data),
+                    )
+                    .unwrap_or_default()
                 }
             }
             PredicateKind::Clause(ClauseKind::Projection(_)) => Vec::new(), // alloc: none, empty

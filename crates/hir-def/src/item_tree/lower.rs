@@ -1,12 +1,8 @@
 //! AST -> `ItemTree` lowering code.
 
-use std::{
-    cell::Cell,
-    hash::Hash,
-    mem,
-};
+use std::{cell::Cell, hash::Hash, mem};
 
-use base_db::{Db, Crate, FxIndexSet};
+use base_db::{Crate, Db, FxIndexSet};
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     HirFileId,
@@ -384,16 +380,25 @@ pub(super) struct Ctx<'db> {
     tree: TreeBuilder,
     ids: &'db AstIdMap,
     /// The file's span map, read when first wanted.
-    #[expect(clippy::disallowed_types, reason = "the file span map, set once per lowering context: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the file span map, set once per lowering context: not global"
+    )]
     span_map: std::cell::OnceCell<SpanMap<'db>>,
     file: HirFileId,
-    #[expect(clippy::disallowed_types, reason = "crate cfg options, set once per lowering context: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "crate cfg options, set once per lowering context: not global"
+    )]
     cfg_options: std::cell::OnceCell<&'db CfgOptions>,
     krate: Crate,
 }
 
 impl<'db> Ctx<'db> {
-    #[expect(clippy::disallowed_types, reason = "span map and cfg options, set once per lowering context: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "span map and cfg options, set once per lowering context: not global"
+    )]
     pub(super) fn new(db: &'db Db, file: HirFileId, krate: Crate) -> Self {
         Self {
             db,
@@ -409,7 +414,10 @@ impl<'db> Ctx<'db> {
     /// [`Ctx::new`] with the maps of a part of `file` parsed alone (a body's
     /// [`crate::expr_store::BodySyntax`]), whose ids and spans are the file's: what is lowered
     /// reads that part and not the whole file.
-    #[expect(clippy::disallowed_types, reason = "span map and cfg options, set once per lowering context: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "span map and cfg options, set once per lowering context: not global"
+    )]
     pub(super) fn with_maps(
         db: &'db Db,
         file: HirFileId,
@@ -830,8 +838,12 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility(use_item);
         let ast_id = self.ids.ast_id_of_view::<tag::Use>(use_item);
         let span_map = self.span_map();
-        let mut lowering =
-            UseTreeLowering { db: self.db, mapping: None, tree: &mut self.tree, file: Some(self.file) };
+        let mut lowering = UseTreeLowering {
+            db: self.db,
+            mapping: None,
+            tree: &mut self.tree,
+            file: Some(self.file),
+        };
         let use_tree = lowering.lower_use_tree(use_item.use_tree()?, &mut |range| {
             span_map.span_for_range(range).ctx
         })?;
@@ -848,8 +860,11 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility(extern_crate);
         let ast_id = self.ids.ast_id_of_view::<tag::ExternCrate>(extern_crate);
 
-        let res =
-            ExternCrate { name: self.tree.name(name), alias: self.tree.alias(alias.as_ref()), visibility };
+        let res = ExternCrate {
+            name: self.tree.name(name),
+            alias: self.tree.alias(alias.as_ref()),
+            visibility,
+        };
         let data = push(&mut self.tree.extern_crates, res);
         Some(self.tree.item(ItemKind::ExternCrate, ast_id.upcast(), data))
     }
@@ -867,7 +882,9 @@ impl<'db> Ctx<'db> {
             Ok(hir_expand::ExpandTo::Expr) => return None,
             Ok(it) => it,
             Err(parent) => {
-                unreachable!("an item tree lowers the calls of item lists and statements, not of a `{parent:?}`")
+                unreachable!(
+                    "an item tree lowers the calls of item lists and statements, not of a `{parent:?}`"
+                )
             }
         };
         let ast_id = self.ids.ast_id_of_view::<tag::MacroCall>(m);

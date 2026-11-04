@@ -11,11 +11,11 @@ use hir_def::{
     hir::{Expr, ExprId, Literal, RangeOp},
     lang_item::{LangItemTarget, lang_items},
 };
-use intern::sym;
 use hir_ty::{
     InferenceResult,
     next_solver::{Ty, TyKind},
 };
+use intern::sym;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 
 use crate::check::Cx;
@@ -311,8 +311,7 @@ impl<'db> Chain<'db> {
 
     /// The work of one item's trip through the adaptors, past what their closures run.
     pub(crate) fn overhead(&self) -> u64 {
-        4 * (1 + self.steps.len() as u64)
-            + self.others.iter().map(Chain::overhead).sum::<u64>()
+        4 * (1 + self.steps.len() as u64) + self.others.iter().map(Chain::overhead).sum::<u64>()
     }
 
     /// Whether rayon has every adaptor with the same name and the rewrite is the source's
@@ -354,7 +353,12 @@ pub(crate) struct Head {
 
 impl Head {
     /// The head that starts at `expr`, the receiver of a consumer or a `for` loop's iterable.
-    pub(crate) fn of(db: &base_db::Db, body: &Body, infer: &InferenceResult<'_>, expr: ExprId) -> Head {
+    pub(crate) fn of(
+        db: &base_db::Db,
+        body: &Body,
+        infer: &InferenceResult<'_>,
+        expr: ExprId,
+    ) -> Head {
         let mut head = Head::default();
         let mut takes: Option<u128> = None;
         let mut chunk: Option<u128> = None;
@@ -435,12 +439,26 @@ fn literal(body: &Body, expr: ExprId) -> Option<u128> {
 /// The start, the end and the kind of a range expression as it is lowered: a struct literal of
 /// a range lang item (`a..b` is `Range { start: a, end: b }`), or `RangeInclusive::new(a, b)`
 /// for `a..=b`. Source code cannot name a lang item, so no other expression is one of these.
-fn range_bounds(db: &base_db::Db, body: &Body, expr: ExprId) -> Option<(Option<ExprId>, Option<ExprId>, RangeOp)> {
+fn range_bounds(
+    db: &base_db::Db,
+    body: &Body,
+    expr: ExprId,
+) -> Option<(Option<ExprId>, Option<ExprId>, RangeOp)> {
     match body.expr(expr) {
-        Expr::RecordLit { path: Path::LangItem(LangItemTarget::StructId(id), _), fields, .. } => {
+        Expr::RecordLit {
+            path: Path::LangItem(LangItemTarget::StructId(id), _), fields, ..
+        } => {
             let lang = lang_items(db, id.krate(db));
-            let exclusive = [lang.Range, lang.RangeFrom, lang.RangeTo, lang.RangeFull, lang.RangeCopy, lang.RangeFromCopy];
-            let inclusive = [lang.RangeToInclusive, lang.RangeInclusiveCopy, lang.RangeToInclusiveCopy];
+            let exclusive = [
+                lang.Range,
+                lang.RangeFrom,
+                lang.RangeTo,
+                lang.RangeFull,
+                lang.RangeCopy,
+                lang.RangeFromCopy,
+            ];
+            let inclusive =
+                [lang.RangeToInclusive, lang.RangeInclusiveCopy, lang.RangeToInclusiveCopy];
             let op = if exclusive.contains(&Some(id)) {
                 RangeOp::Exclusive
             } else if inclusive.contains(&Some(id)) {

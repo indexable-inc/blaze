@@ -159,7 +159,9 @@ fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
 /// segment of the pointer before and 8 past it.
 pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
     let addrs = sorted(addrs);
-    if let Some(twice) = par::find_map_first(par::windows(&addrs, 2), |it| (it[0] == it[1]).then_some(it)) {
+    if let Some(twice) =
+        par::find_map_first(par::windows(&addrs, 2), |it| (it[0] == it[1]).then_some(it))
+    {
         // alloc: error path
         return Err(format!("the address {:#x} is to be slid twice", twice[0]));
     }
@@ -179,7 +181,10 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
             // A pointer in no segment before the cut is an error of the piece before.
             let cursor = from.checked_sub(1).and_then(|before| {
                 let addr = addrs[before];
-                spans.iter().position(|it| (it.start..it.end).contains(&addr)).map(|segment| (segment, addr + 8))
+                spans
+                    .iter()
+                    .position(|it| (it.start..it.end).contains(&addr))
+                    .map(|segment| (segment, addr + 8))
             });
             // alloc: once per piece of CHUNK pointers
             let mut piece = Vec::with_capacity((to - from) * 3 + 16);
@@ -193,7 +198,12 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
 
 /// The opcodes of the runs of `addrs` (sorted, distinct, starting a run), from dyld's cursor
 /// at `cursor` (its segment and address).
-fn rebase_runs(addrs: &[u64], mut cursor: Option<(usize, u64)>, spans: &[Span], out: &mut Vec<u8>) -> Result<(), String> {
+fn rebase_runs(
+    addrs: &[u64],
+    mut cursor: Option<(usize, u64)>,
+    spans: &[Span],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     let mut rest = addrs;
     while let Some(&first) = rest.first() {
         let segment = segment_of(spans, first, "a pointer to slide")?;
@@ -227,7 +237,11 @@ fn rebase_runs(addrs: &[u64], mut cursor: Option<(usize, u64)>, spans: &[Span], 
 }
 
 /// Appends the bind opcodes of `binds`, sorted here by symbol so each symbol is named once.
-pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
+pub(super) fn binds(
+    binds: &mut [Bind<'_>],
+    spans: &[Span],
+    out: &mut Vec<u8>,
+) -> Result<usize, String> {
     if binds.is_empty() {
         return Ok(0);
     }
@@ -241,7 +255,8 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -
     // The addresses are distinct, so with the address last this is a total order: the same
     // as a stable sort by symbol of the binds in address order, without its buffer.
     binds.sort_unstable_by(|a, b| {
-        (a.ordinal, a.name, a.weak, a.addend, a.addr).cmp(&(b.ordinal, b.name, b.weak, b.addend, b.addr))
+        (a.ordinal, a.name, a.weak, a.addend, a.addr)
+            .cmp(&(b.ordinal, b.name, b.weak, b.addend, b.addr))
     });
     let start = out.len();
     // Each bind's address and opcode take about 3 bytes; each symbol its name and 2.
@@ -333,7 +348,10 @@ const _: () = assert!(size_of::<Node>() == 16 && size_of::<Edge>() == 16);
 /// of its first and last name). Every node but the root ends a name or has two edges, so there
 /// are at most `2n` nodes and edges for `n` names: four scratch columns sized so once (nodes,
 /// edges, the work stack and the depth-first order), nothing allocated per node or edge.
-pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)], out: &mut Vec<u8>) -> Result<usize, String> {
+pub(super) fn trie<N: AsRef<[u8]> + Ord>(
+    exports: &mut [(N, u64, u64)],
+    out: &mut Vec<u8>,
+) -> Result<usize, String> {
     if exports.is_empty() {
         return Ok(0);
     }
@@ -406,7 +424,9 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)], out: &mu
             uleb_len(*flags) + uleb_len(*addr)
         }
     };
-    let label = |edge: &Edge| &exports[edge.export as usize].0.as_ref()[edge.from as usize..edge.to as usize];
+    let label = |edge: &Edge| {
+        &exports[edge.export as usize].0.as_ref()[edge.from as usize..edge.to as usize]
+    };
     let edges_of = |node: &Node| &edges[node.edges as usize..(node.edges + node.count) as usize];
 
     let mut len;
@@ -422,7 +442,8 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)], out: &mu
             let info = info_len(it);
             len += uleb_len(info) + info + 1;
             for edge in edges_of(it) {
-                len += u64::from(edge.to - edge.from) + 1
+                len += u64::from(edge.to - edge.from)
+                    + 1
                     + uleb_len(u64::from(nodes[edge.child as usize].offset));
             }
         }
@@ -468,7 +489,11 @@ pub(super) fn function_starts(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> us
     } else {
         let pieces = par::map(0..cuts.len(), |nth| {
             let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
-            let last = from.checked_sub(1).map(|before| addrs[before]).filter(|it| *it > text).unwrap_or(text);
+            let last = from
+                .checked_sub(1)
+                .map(|before| addrs[before])
+                .filter(|it| *it > text)
+                .unwrap_or(text);
             // alloc: once per piece of CHUNK functions
             let mut piece = Vec::with_capacity((to - from) * 2 + 8);
             starts_from(text, last, &addrs[from..to], &mut piece);
@@ -653,7 +678,10 @@ mod tests {
             ];
             let mut rng = SplitMix64::new(11);
             let mut addrs = pointers(&mut rng, 4 * CHUNK, CONST, false);
-            assert!(addrs[CHUNK] < LOCKED && *addrs.last().unwrap() > HOLE, "the pointers span the bad segments");
+            assert!(
+                addrs[CHUNK] < LOCKED && *addrs.last().unwrap() > HOLE,
+                "the pointers span the bad segments"
+            );
             let (pieces, one) = both(&addrs, &spans);
             let error = one.unwrap_err();
             assert!(error.contains("__LOCKED"), "{error}");

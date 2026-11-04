@@ -28,16 +28,22 @@ use std::{
 
 use blaze_core::{exit::Exit, utf8::push_lossy};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_usercode::trace::{self, Seen};
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-#[allow(unsafe_code, reason = "a `link_section` constructor that runs a test's sandbox before `main`")]
+#[allow(
+    unsafe_code,
+    reason = "a `link_section` constructor that runs a test's sandbox before `main`"
+)]
 mod alone;
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code, reason = "the Linux driver: forks and closes by number; its calls are in `linux/raw.rs`")]
+#[allow(
+    unsafe_code,
+    reason = "the Linux driver: forks and closes by number; its calls are in `linux/raw.rs`"
+)]
 pub mod linux;
 
 #[cfg(target_os = "macos")]
@@ -51,7 +57,10 @@ mod signal;
 pub use signal::pass_signals_to;
 
 #[cfg(windows)]
-#[allow(unsafe_code, reason = "the Win32 driver: AppContainers, job objects, DACLs, change watches")]
+#[allow(
+    unsafe_code,
+    reason = "the Win32 driver: AppContainers, job objects, DACLs, change watches"
+)]
 pub mod windows;
 
 pub mod v2;
@@ -504,7 +513,8 @@ impl Recorder {
     pub fn live(&mut self, file: &Path) -> Result<(), String> {
         let opened = std::fs::OpenOptions::new().append(true).open(file);
         // alloc: the error, once, and the sandbox is not made.
-        self.live = Some(opened.map_err(|e| format!("opening the live record {}: {e}", file.display()))?);
+        self.live =
+            Some(opened.map_err(|e| format!("opening the live record {}: {e}", file.display()))?);
         Ok(())
     }
 
@@ -603,7 +613,8 @@ impl Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn ended(&mut self) {
         // alloc: once, as the run ends: the processes never traced, sorted by process id.
-        let mut pending: Vec<(u64, (u32, u32))> = std::mem::take(&mut self.pending).into_iter().collect();
+        let mut pending: Vec<(u64, (u32, u32))> =
+            std::mem::take(&mut self.pending).into_iter().collect();
         blaze_ids::radix::sort_by_key(&mut pending, |it| it.0);
         let mut why = std::mem::take(&mut self.text);
         for (_, (program, scope)) in pending {
@@ -799,7 +810,8 @@ impl Recorder {
     /// read set names itself (a test's fork server's socket).
     pub fn may_connect(&self, path: &str) -> bool {
         let seen_as_is = ["/proc", "/sys", "/dev"].iter().any(|it| under(path, it));
-        (self.may_write(path) && (!seen_as_is || under(path, "/dev/shm"))) || self.readable.iter().any(|it| it == path)
+        (self.may_write(path) && (!seen_as_is || under(path, "/dev/shm")))
+            || self.readable.iter().any(|it| it == path)
     }
 
     /// The sandbox refused `thread` a write to `path`.
@@ -899,7 +911,11 @@ fn backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
 /// [`backend`] on Windows, by [`windows::run`]: an AppContainer has no overlays and no views,
 /// and traces nothing, so a record is one `X` line.
 #[cfg(windows)]
-fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
+fn windows_backend(
+    spec: &Spec,
+    program: Option<&[OsString]>,
+    also: Also<'_>,
+) -> Result<i32, String> {
     if !spec.overlays.is_empty() {
         // alloc: the error, once: no sandbox is made.
         return Err("there are no overlays on Windows: a test's sandbox can't be made".to_owned());
@@ -917,8 +933,8 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
         program: PathBuf::from(name),
         args: args.to_vec(), // alloc: once per run, the launcher's spec.
         env: spec.env.iter().map(|(k, v)| (k.into(), v.into())).collect(), // alloc: as `args`.
-        dir: spec.cwd.clone(),        // clone: as `args`.
-        read: spec.readable.clone(),  // clone: as `args`.
+        dir: spec.cwd.clone(), // clone: as `args`.
+        read: spec.readable.clone(), // clone: as `args`.
         write: spec.writable.clone(), // clone: as `args`.
         network: also.network,
         trace: false,
@@ -926,6 +942,7 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
         live: PathBuf::new(),
         report: PathBuf::new(),
         not_inputs: Vec::with_capacity(0),
+        given: None,
     };
     let code = windows::run(&confined, windows::Given::own())?;
     if let Some(file) = &spec.record {
@@ -1008,11 +1025,15 @@ fn probe(kind: Probe) -> Result<(), String> {
     // The probe's spec, once per process: the directory is each of its parts.
     let spec = match kind {
         // clone: the probe's spec, once per process.
-        Probe::Overlays => Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() },
+        Probe::Overlays => {
+            Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() }
+        }
         // clone: the probe's spec, once per process.
-        Probe::Writable => Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() },
+        Probe::Writable => {
+            Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() }
+        }
         Probe::V2 => Spec {
-            cwd: dir.clone(),           // clone: the probe's spec, once per process.
+            cwd: dir.clone(),            // clone: the probe's spec, once per process.
             writable: vec![dir.clone()], // clone: the probe's spec, once per process.
             record_reads: true,
             ..Spec::default()
@@ -1022,7 +1043,8 @@ fn probe(kind: Probe) -> Result<(), String> {
     let also = match kind {
         Probe::V2 => {
             // alloc: the error, once.
-            std::fs::write(&live.path, "").map_err(|it| format!("{}: {it}", live.path.display()))?;
+            std::fs::write(&live.path, "")
+                .map_err(|it| format!("{}: {it}", live.path.display()))?;
             Also { network: false, live: Some(&live), env: None, services: &[] }
         }
         Probe::Writable | Probe::Overlays => Also::default(),
@@ -1178,10 +1200,13 @@ mod tests {
     /// kept.
     #[test]
     fn a_name_is_read_as_lossy_text_into_its_room() {
-        let names: [&[u8]; 6] = [b"", b"tests::a", b"\xff", b"a\xffb\xfe", b"\xe2\x82", "é".as_bytes()];
+        let names: [&[u8]; 6] =
+            [b"", b"tests::a", b"\xff", b"a\xffb\xfe", b"\xe2\x82", "é".as_bytes()];
         let mut out = String::with_capacity(64);
         for name in names {
-            blaze_alloc_count::assert_at_most(0, "a name read as text", || lossy_into(name, &mut out));
+            blaze_alloc_count::assert_at_most(0, "a name read as text", || {
+                lossy_into(name, &mut out)
+            });
             assert_eq!(out, String::from_utf8_lossy(name), "{name:?}");
         }
     }
@@ -1361,7 +1386,8 @@ mod tests {
         let want: Vec<_> = sorted
             .iter()
             .map(|it| {
-                let why = format!("/bin/p{it} ran without the interposer, so what it read is not known");
+                let why =
+                    format!("/bin/p{it} ran without the interposer, so what it read is not known");
                 trace::Line::new(Seen::Incomplete, "", &why)
             })
             .collect();

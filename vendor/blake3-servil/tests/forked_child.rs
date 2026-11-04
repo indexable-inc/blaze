@@ -13,15 +13,25 @@ fn a_forked_childs_multithreaded_calls_panic_and_its_single_threaded_ones_work()
     let blocks = vec![Block([7u8; 64]); (1 << 20) / 64];
     let bytes: Vec<u8> = blocks.iter().flat_map(|b| b.0).collect();
     let want = convenience::hash(&bytes);
-    assert_eq!(performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len()), want, "the parent, before the fork");
+    assert_eq!(
+        performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len()),
+        want,
+        "the parent, before the fork"
+    );
     // Sound: the child only hashes, catches a panic and exits.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
         let single = convenience::hash(&bytes) == want;
-        let multi = std::panic::catch_unwind(|| performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len()));
+        let multi = std::panic::catch_unwind(|| {
+            performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len())
+        });
         let says = match &multi {
-            Err(e) => e.downcast_ref::<&str>().map(|m| m.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).is_some_and(|m| m.contains("forked")),
+            Err(e) => e
+                .downcast_ref::<&str>()
+                .map(|m| m.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .is_some_and(|m| m.contains("forked")),
             Ok(_) => false,
         };
         // Sound: _exit ends the child at once, with no handlers.
@@ -41,6 +51,14 @@ fn a_forked_childs_multithreaded_calls_panic_and_its_single_threaded_ones_work()
     // Sound: waits for the child above.
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert!(libc::WIFEXITED(status), "the child exited (status {status})");
-    assert_eq!(libc::WEXITSTATUS(status), 0, "1: a panic without the message, 2: the single-threaded hash wrong, 3: no panic");
-    assert_eq!(performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len()), want, "the parent, after the fork");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "1: a panic without the message, 2: the single-threaded hash wrong, 3: no panic"
+    );
+    assert_eq!(
+        performance::hash_multithreaded(Mode::Plain, &blocks, bytes.len()),
+        want,
+        "the parent, after the fork"
+    );
 }

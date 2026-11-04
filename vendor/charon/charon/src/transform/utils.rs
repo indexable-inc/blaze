@@ -6,9 +6,7 @@ use enum_as_inner::EnumAsInner;
 use std::fmt::{self, Debug};
 
 /// Each `GenericArgs` is meant for a corresponding `GenericParams`; this describes which one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(EnumAsInner)]
-#[derive(Drive, DriveMut)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EnumAsInner, Drive, DriveMut)]
 pub enum GenericsSource {
     /// A top-level item.
     Item(ItemId),

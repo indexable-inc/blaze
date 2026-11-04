@@ -6,8 +6,8 @@
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, HasModule, TraitId, signatures::ImplSignature};
-use rustc_type_ir::{IntTy, fast_reject::SimplifiedType as Simplified};
 use hir_expand::fixture;
+use rustc_type_ir::{IntTy, fast_reject::SimplifiedType as Simplified};
 
 use super::{RelevantImplsKey, SelfTyKey, TraitImpls, relevant_impls};
 use crate::next_solver::{AnyImplId, SimplifiedType, SolverDefId};
@@ -207,7 +207,8 @@ fn a_warm_read_of_the_relevant_impls_allocates_nothing() {
         .find(|(_, self_tys)| !self_tys.is_empty())
         .expect("a trait with an impl for a self type");
     let self_ty = Some(SelfTyKey(self_tys[0]));
-    let read = || relevant_impls(&db, RelevantImplsKey::new(&db, main, trait_, self_ty)).all().len();
+    let read =
+        || relevant_impls(&db, RelevantImplsKey::new(&db, main, trait_, self_ty)).all().len();
     let warm = read();
     blaze_alloc_count::assert_at_most(0, "a warm read of the relevant impls", || {
         assert_eq!(std::hint::black_box(read()), warm);

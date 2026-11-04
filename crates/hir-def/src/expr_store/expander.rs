@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use cfg::CfgOptions;
 use drop_bomb::DropBomb;
 use hir_expand::{

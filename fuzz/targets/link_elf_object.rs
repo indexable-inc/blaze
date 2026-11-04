@@ -17,10 +17,13 @@ use std::time::Duration;
 use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
-use object::write::{Comdat, Object as Builder, Relocation, SectionId, StandardSection, Symbol, SymbolId, SymbolSection};
+use object::write::{
+    Comdat, Object as Builder, Relocation, SectionId, StandardSection, Symbol, SymbolId,
+    SymbolSection,
+};
 use object::{
-    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags, SectionKind, SymbolFlags,
-    SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationFlags, SectionFlags, SectionKind,
+    SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
 const TARGET: Target = Target {
@@ -72,7 +75,8 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) = blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Elf, arch, KIND, aligned));
+    let (largest, read) =
+        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Elf, arch, KIND, aligned));
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -181,9 +185,19 @@ fn tls(b: &mut Builder<'_>, name: &str) -> SymbolId {
     symbol
 }
 
-fn relocate(b: &mut Builder<'_>, section: SectionId, at: u64, symbol: SymbolId, addend: i64, r_type: elf::RelocationType) {
-    b.add_relocation(section, Relocation { offset: at, symbol, addend, flags: RelocationFlags::Elf { r_type } })
-        .expect("a relocation inside its section");
+fn relocate(
+    b: &mut Builder<'_>,
+    section: SectionId,
+    at: u64,
+    symbol: SymbolId,
+    addend: i64,
+    r_type: elf::RelocationType,
+) {
+    b.add_relocation(
+        section,
+        Relocation { offset: at, symbol, addend, flags: RelocationFlags::Elf { r_type } },
+    )
+    .expect("a relocation inside its section");
 }
 
 /// Sets the `sh_flags` of `section`, keeping the `sh_type` its kind gives it.
@@ -207,16 +221,21 @@ fn x86_64() -> Vec<u8> {
     flags(&mut b, keep, elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_GNU_RETAIN);
     let init = b.add_section(Vec::new(), b".init_array.00100".to_vec(), SectionKind::Data);
     b.append_section_data(init, &[0; 8], 8);
-    b.section_mut(init).flags = SectionFlags::Elf { sh_type: elf::SHT_INIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
+    b.section_mut(init).flags = SectionFlags::Elf {
+        sh_type: elf::SHT_INIT_ARRAY,
+        sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE,
+    };
     let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 24], 8);
-    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
+    b.section_mut(eh_frame).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
     let debug = b.add_section(Vec::new(), b".debug_info".to_vec(), SectionKind::Debug);
     b.append_section_data(debug, &[0; 16], 1);
 
     let f = define(&mut b, "f", text, 0, 16, SymbolKind::Text, SymbolScope::Dynamic, false);
     let g = define(&mut b, "g", text, 16, 8, SymbolKind::Text, SymbolScope::Linkage, false);
-    let local = define(&mut b, "local", text, 24, 4, SymbolKind::Text, SymbolScope::Compilation, false);
+    let local =
+        define(&mut b, "local", text, 24, 4, SymbolKind::Text, SymbolScope::Compilation, false);
     let ext = undefined(&mut b, "ext", false);
     let weak = undefined(&mut b, "wk", true);
     let got = undefined(&mut b, "_GLOBAL_OFFSET_TABLE_", false);
@@ -269,7 +288,8 @@ fn aarch64() -> Vec<u8> {
     b.append_section_data(data, &[0; 8], 8);
     let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 16], 8);
-    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
+    b.section_mut(eh_frame).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
     let f = define(&mut b, "f", text, 0, 80, SymbolKind::Text, SymbolScope::Dynamic, false);
     let ext = undefined(&mut b, "ext", false);
     let var = define(&mut b, "var", data, 0, 8, SymbolKind::Data, SymbolScope::Dynamic, false);
@@ -338,7 +358,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, arch, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Elf, arch, KIND, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Elf, arch, KIND, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

@@ -4,13 +4,13 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
 use rustc_type_ir::{
     ClauseKind, OutlivesClause, RegionKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _},
 };
+use std::alloc::Global;
 
 use hir_ty::{
     db::HirDatabase,
@@ -616,9 +616,7 @@ fn expand<'db>(
         TyKind::Adt(def, args) => {
             let adt = def.def_id();
             if def.is_box() || def.is_phantom_data() {
-                if let Some(GenericArgKind::Type(inner)) =
-                    args.iter().next().map(|it| it.kind())
-                {
+                if let Some(GenericArgKind::Type(inner)) = args.iter().next().map(|it| it.kind()) {
                     children.push(inner);
                 }
                 return;
@@ -657,10 +655,8 @@ fn expand<'db>(
         // another alias holds what its bounds and captures let it, as for liveness.
         TyKind::Alias(_, alias) => {
             let normalized = match alias.kind {
-                rustc_type_ir::AliasTyKind::Projection { .. } => {
-                    super::regions::normalize(ctx, ty)
-                        .filter(|it| !matches!(it.kind(), TyKind::Alias(_, _) | TyKind::Infer(_)))
-                }
+                rustc_type_ir::AliasTyKind::Projection { .. } => super::regions::normalize(ctx, ty)
+                    .filter(|it| !matches!(it.kind(), TyKind::Alias(_, _) | TyKind::Infer(_))),
                 _ => None,
             };
             match normalized {
@@ -846,8 +842,7 @@ fn live_regions_of<'db>(
                     self.ctx.db,
                     alias.kind,
                     alias.args.len(),
-                )
-                {
+                ) {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
                             rustc_type_ir::TypeVisitable::visit_with(&arg, self);
@@ -897,8 +892,7 @@ fn alias_bound<'db>(
             .collect();
     let mut found: Option<Option<Rv>> = None;
     for clause in item_bounds.into_iter().chain(ctx.env.caller_bounds()) {
-        let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =
-            clause.kind().skip_binder()
+        let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) = clause.kind().skip_binder()
         else {
             continue;
         };

@@ -25,7 +25,10 @@ pub(super) fn pack(job: &Job, lowered: &mut Lowered, program: &str) -> Result<Ve
     let unit = program_unit(&job.input.units, program)?;
     let Some(krate) = lowered.krate(unit) else {
         // alloc: an error, once
-        return Err(ApiError::new(format!("package `{program}`'s crate was not lowered"), Some(program.to_owned())));
+        return Err(ApiError::new(
+            format!("package `{program}`'s crate was not lowered"),
+            Some(program.to_owned()),
+        ));
     };
     let pack = blaze_wasm_pack::record(lowered.served_db(), krate, |db, crates| {
         for &it in crates {
@@ -38,23 +41,32 @@ pub(super) fn pack(job: &Job, lowered: &mut Lowered, program: &str) -> Result<Ve
         });
     })
     // alloc: an error, once
-    .map_err(|what| ApiError::new(format!("packing `{program}`: {what}"), Some(program.to_owned())))?;
+    .map_err(|what| {
+        ApiError::new(format!("packing `{program}`: {what}"), Some(program.to_owned()))
+    })?;
     // alloc: the pack, once
-    serde_json::to_vec(&pack).map_err(|error| ApiError::new(format!("the pack of `{program}` as JSON: {error}"), None))
+    serde_json::to_vec(&pack)
+        .map_err(|error| ApiError::new(format!("the pack of `{program}` as JSON: {error}"), None))
 }
 
 /// The unit of package `program` the pack is of: its binary, or with none its library. A
 /// package with more than one binary is refused, naming them.
 pub(super) fn program_unit(units: &Units, program: &str) -> Result<usize, ApiError> {
-    let named = |unit: &Unit| units.packages.iter().any(|it| it.name == program && it.id == unit.pkg_id);
+    let named =
+        |unit: &Unit| units.packages.iter().any(|it| it.name == program && it.id == unit.pkg_id);
     let checked = |unit: &Unit| unit.mode == Mode::Check && !unit.checked_as_test;
-    let kind = |unit: &Unit, kinds: &[&str]| unit.target.kind.iter().any(|it| kinds.contains(&it.as_str()));
-    let candidates = || units.graph.units.iter().enumerate().filter(|(_, it)| named(it) && checked(it));
+    let kind = |unit: &Unit, kinds: &[&str]| {
+        unit.target.kind.iter().any(|it| kinds.contains(&it.as_str()))
+    };
+    let candidates =
+        || units.graph.units.iter().enumerate().filter(|(_, it)| named(it) && checked(it));
     let mut bins = candidates().filter(|(_, it)| kind(it, &["bin"]));
     if let Some((at, first)) = bins.next() {
         if let Some((_, second)) = bins.next() {
             let (first, second) = (&first.target.name, &second.target.name);
-            let what = format!("package `{program}` has more than one binary (`{first}`, `{second}`): a pack is of one program"); // alloc: an error, once
+            let what = format!(
+                "package `{program}` has more than one binary (`{first}`, `{second}`): a pack is of one program"
+            ); // alloc: an error, once
             return Err(ApiError::new(what, Some(program.to_owned()))); // alloc: an error, once
         }
         return Ok(at);
@@ -63,7 +75,9 @@ pub(super) fn program_unit(units: &Units, program: &str) -> Result<usize, ApiErr
     if let Some((at, _)) = candidates().find(|(_, it)| kind(it, &libs)) {
         return Ok(at);
     }
-    let what = format!("the check names no binary or library of package `{program}`: ask it with `-p {program}`"); // alloc: an error, once
+    let what = format!(
+        "the check names no binary or library of package `{program}`: ask it with `-p {program}`"
+    ); // alloc: an error, once
     Err(ApiError::new(what, Some(program.to_owned()))) // alloc: an error, once
 }
 
@@ -84,13 +98,18 @@ fn bodies(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
 
 /// The bodies of the items of `def_map`'s modules and their `impl`s.
 fn items(db: &Db, def_map: &DefMap, bodies: &mut Vec<DefWithBodyId>) {
-    let outside = |container: ItemContainerId| matches!(container, ItemContainerId::ExternBlockId(_));
+    let outside =
+        |container: ItemContainerId| matches!(container, ItemContainerId::ExternBlockId(_));
     for (_, module) in def_map.modules(db) {
         let scope = module.scope(db);
         for def in scope.declarations() {
             match def {
-                ModuleDefId::FunctionId(id) if !outside(id.lookup(db).container) => bodies.push(id.into()),
-                ModuleDefId::StaticId(id) if !outside(id.lookup(db).container) => bodies.push(id.into()),
+                ModuleDefId::FunctionId(id) if !outside(id.lookup(db).container) => {
+                    bodies.push(id.into())
+                }
+                ModuleDefId::StaticId(id) if !outside(id.lookup(db).container) => {
+                    bodies.push(id.into())
+                }
                 ModuleDefId::ConstId(id) => bodies.push(id.into()),
                 _ => {}
             }

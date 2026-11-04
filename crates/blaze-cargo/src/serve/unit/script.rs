@@ -67,7 +67,9 @@ fn verifies_in(env: &[(String, String)]) -> Result<bool, ApiError> {
         None => Ok(false),
         Some((_, value)) if value == "verify" => Ok(true),
         Some((_, value)) => Err(ApiError::new(
-            format!("{ELIDE}={value} is not a value blaze takes: `verify` runs an inert build script as well, unset runs none"),
+            format!(
+                "{ELIDE}={value} is not a value blaze takes: `verify` runs an inert build script as well, unset runs none"
+            ),
             None,
         )),
     }
@@ -112,7 +114,9 @@ pub(crate) struct Applied {
 pub(crate) fn compile_of(units: &Units, run: usize) -> Option<usize> {
     let unit = units.graph.units.get(run)?;
     unit.dependencies.iter().map(|it| it.index).find(|at| {
-        units.graph.units.get(*at).is_some_and(|it| it.target.is_custom_build() && !matches!(it.mode, Mode::RunCustomBuild))
+        units.graph.units.get(*at).is_some_and(|it| {
+            it.target.is_custom_build() && !matches!(it.mode, Mode::RunCustomBuild)
+        })
     })
 }
 
@@ -165,7 +169,8 @@ fn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {
 /// it depends on end.
 fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
     let units = job.units();
-    let u = units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
+    let u =
+        units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
     let package = package_of(units, u).map_err(|it| it.what)?;
     let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
     let root = u.target.src_path.to_string_lossy();
@@ -175,13 +180,18 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
         Err(error) => Err(format!("{path}: {error}")),
     };
     let which = stdlib::scripts::identify(&package.name, &root, read).map_err(failed)?;
-    let mut runs = (0..units.graph.units.len())
-        .filter(|at| units.graph.units[*at].mode == Mode::RunCustomBuild && compile_of(units, *at) == Some(compile));
+    let mut runs = (0..units.graph.units.len()).filter(|at| {
+        units.graph.units[*at].mode == Mode::RunCustomBuild
+            && compile_of(units, *at) == Some(compile)
+    });
     let (Some(run), None) = (runs.next(), runs.next()) else {
-        return Err(failed(format!("unit {compile} compiles it, and the build does not run it exactly once")));
+        return Err(failed(format!(
+            "unit {compile} compiles it, and the build does not run it exactly once"
+        )));
     };
     let (unit, vars) = script_env(job, run).map_err(failed)?;
-    let printed = stdlib::scripts::printed(which, &vars, &unit.package.manifest_dir).map_err(failed)?;
+    let printed =
+        stdlib::scripts::printed(which, &vars, &unit.package.manifest_dir).map_err(failed)?;
     Ok(script::elided(printed))
 }
 
@@ -189,7 +199,8 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
 /// the whole environment it is started in, sorted by name.
 fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>), String> {
     let units = job.units();
-    let compile = compile_of(units, run).ok_or_else(|| format!("the run of unit {run} has no build script compiled"))?;
+    let compile = compile_of(units, run)
+        .ok_or_else(|| format!("the run of unit {run} has no build script compiled"))?;
     let of = Of {
         units,
         host: &job.input.config.host,
@@ -200,7 +211,11 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);
+    let env = inherited(
+        &job.input.config.invocation.env,
+        job.plan(run).map_err(|it| it.what)?,
+        !outside(job, run),
+    );
     let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
     Ok((unit, vars))
 }
@@ -215,7 +230,10 @@ pub(crate) struct Of<'a> {
     /// The compiled script.
     pub(crate) program: PathBuf,
     /// What each run told cargo, by its unit; a slot not set is a run not ended.
-    #[expect(clippy::disallowed_types, reason = "the job's slots, one per unit, each set once by its run: per job, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the job's slots, one per unit, each set once by its run: per job, not global"
+    )]
     pub(crate) scripts: &'a [std::sync::OnceLock<Applied>],
     /// The build's pinned native inputs, laid out ([`crate::serve::work::JobInput::native`]).
     pub(crate) native: &'a [NativeDir],
@@ -223,8 +241,13 @@ pub(crate) struct Of<'a> {
 
 /// The pinned native inputs of `native` the build script of `unit` (its package, the target
 /// it is built for, its features) is given ([`blaze_units::query::NativeInput::gives`]).
-pub(crate) fn given<'a>(native: &'a [NativeDir], unit: &'a bs::Unit) -> impl Iterator<Item = &'a NativeDir> + 'a {
-    native.iter().filter(move |it| it.input.target == unit.target && it.input.gives(&unit.package.name, &unit.features))
+pub(crate) fn given<'a>(
+    native: &'a [NativeDir],
+    unit: &'a bs::Unit,
+) -> impl Iterator<Item = &'a NativeDir> + 'a {
+    native.iter().filter(move |it| {
+        it.input.target == unit.target && it.input.gives(&unit.package.name, &unit.features)
+    })
 }
 
 /// The variables of the pinned native inputs the build script of `package`, built for
@@ -232,9 +255,16 @@ pub(crate) fn given<'a>(native: &'a [NativeDir], unit: &'a bs::Unit) -> impl Ite
 /// environment says of it (`force`), so the script is pointed at the verified layout and never
 /// at a place the machine names. An input the load said the run is given that was not laid out
 /// is an error naming it: nothing else is put in its place.
-fn native_env(of: &Of<'_>, package: &str, target: &str, features: &[String]) -> Result<Vec<bs::ConfigEnv>, String> {
+fn native_env(
+    of: &Of<'_>,
+    package: &str,
+    target: &str,
+    features: &[String],
+) -> Result<Vec<bs::ConfigEnv>, String> {
     let mut out = Vec::new(); // alloc: a run's few variables, once a run
-    for input in of.units.native.iter().filter(|it| it.target == target && it.gives(package, features)) {
+    for input in
+        of.units.native.iter().filter(|it| it.target == target && it.gives(package, features))
+    {
         let laid = of.native.iter().find(|it| it.input == *input).ok_or_else(|| {
             format!(
                 "pinned native input `{}` for target `{target}`, which `{package}`'s build script is given in `{}`, \
@@ -243,7 +273,11 @@ fn native_env(of: &Of<'_>, package: &str, target: &str, features: &[String]) -> 
             )
         })?;
         let value = laid.dir.to_str().ok_or_else(|| {
-            format!("pinned native input `{}` is laid out at {}, which is not UTF-8", input.name, laid.dir.display())
+            format!(
+                "pinned native input `{}` is laid out at {}, which is not UTF-8",
+                input.name,
+                laid.dir.display()
+            )
         })?;
         // clone: the run's own variable, once an input a run
         out.push(bs::ConfigEnv { name: input.env.clone(), value: value.to_owned(), force: true });
@@ -259,14 +293,16 @@ fn var<'a>(plan: &'a UnitPlan, name: &str) -> Option<&'a str> {
 pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     let units = of.units;
     let unit = units.graph.units.get(run).ok_or_else(|| format!("the build has no unit {run}"))?;
-    let plan = units.plans.get(run).ok_or_else(|| format!("the build has no plan of unit {run}"))?;
+    let plan =
+        units.plans.get(run).ok_or_else(|| format!("the build has no plan of unit {run}"))?;
     let package = package_of(units, unit).map_err(|it| it.what)?;
     let out_dir = plan
         .out_dir
         .clone()
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
     let manifest_path = PathBuf::from(&package.manifest_path);
-    let manifest_dir = manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
+    let manifest_dir =
+        manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
     let targets = targets(units, &unit.pkg_id);
     let text = |name: &str| var(plan, name).filter(|it| !it.is_empty()).map(str::to_owned);
     let descr = match &package.source {
@@ -280,22 +316,22 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
     let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
     let profile = &unit.profile;
-    let release = var(plan, "PROFILE")
-        .ok_or_else(|| UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string())?
-        == "release";
+    let release = var(plan, "PROFILE").ok_or_else(|| {
+        UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string()
+    })? == "release";
     let debuginfo = !matches!(&profile.debuginfo, DebugInfo::Level(0))
         && !matches!(&profile.debuginfo, DebugInfo::Named(name) if name == "none" || name == "false");
     let dependencies = unit
         .dependencies
         .iter()
-        .filter_map(|dep| of.scripts.get(dep.index).and_then(|it| it.get()).map(|applied| (dep, applied)))
+        .filter_map(|dep| {
+            of.scripts.get(dep.index).and_then(|it| it.get()).map(|applied| (dep, applied))
+        })
         .map(|(dep, applied)| {
             let count = units.graph.units.len();
-            let it = units
-                .graph
-                .units
-                .get(dep.index)
-                .ok_or_else(|| UnitError::Dependency { unit: run, dep: dep.index, count }.to_string())?;
+            let it = units.graph.units.get(dep.index).ok_or_else(|| {
+                UnitError::Dependency { unit: run, dep: dep.index, count }.to_string()
+            })?;
             let package = package_of(units, it).map_err(|it| it.what)?;
             Ok(bs::Dependency::of(&package.name, applied.links.as_deref(), &applied.output))
         })
@@ -306,14 +342,20 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .find(|it| it.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .ok_or_else(|| UnitError::ProfileDir { package: package.name.clone(), out_dir: out_dir.clone() }.to_string())?;
+        .ok_or_else(|| {
+            UnitError::ProfileDir { package: package.name.clone(), out_dir: out_dir.clone() }
+                .to_string()
+        })?;
     // A share of the daemon's budget, not all of it: a build script's `cc` starts `NUM_JOBS`
     // compilers of its own (blaze gives it no jobserver), and up to the budget's scripts run at
     // once as plane work, so each told the whole budget would run its square. A fixed share of
     // the setting, never of how many run now: `NUM_JOBS` is part of what a script reads, so of
     // its key ([`blaze_core::cores::NESTED`]).
     let jobs = blaze_core::cores::get()
-        .map_err(|error| UnitError::Parallelism { package: package.name.clone(), error: error.to_string() }.to_string())?
+        .map_err(|error| {
+            UnitError::Parallelism { package: package.name.clone(), error: error.to_string() }
+                .to_string()
+        })?
         .split(blaze_core::cores::NESTED)
         .get();
     let jobs = u32::try_from(jobs).unwrap_or(u32::MAX);
@@ -404,16 +446,51 @@ fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {
 /// that reads its whole environment (`env::vars()`) would otherwise be traced reading
 /// `BLAZE_SCRIPT_CACHE=check`, and its check would miss what an unchecked build kept and
 /// compare with nothing.
-pub(crate) const JOB_ONLY: &[&str] = &[ELIDE, SCRIPT_CACHE, pure::PURE, proc_macro_api::kept::CACHE];
+pub(crate) const JOB_ONLY: &[&str] =
+    &[ELIDE, SCRIPT_CACHE, pure::PURE, proc_macro_api::kept::CACHE];
+
+/// The names a process's temporary directory goes by: POSIX's `TMPDIR`, the `TMP`, `TEMP` and
+/// `TEMPDIR` older programs look up, and nix's `NIX_BUILD_TOP` (a nix shell's build directory,
+/// which is its temporary one). A sandboxed run has a temporary directory of its own, an empty
+/// one, and the job's is not in its view at all, so none of the job's values names anything
+/// the run can see: on unix ([`inherited`]) a sandboxed run is given none of the job's `TMPDIR`
+/// (each sandbox gives the program its own, and reads the one it is given to choose it, so a
+/// value of the job's would decide what the sandbox binds), and the others, where the job has
+/// them, as [`SANDBOX_TEMP`]. This is the sandbox's own directory, not a list of variables
+/// that change from shell to shell: what a run is keyed by of the rest of the job's
+/// environment is what it read of it, each variable lent to it and traced as it is read
+/// ([`blaze_usercode::confine::GIVEN`]). So no shell's temporary directory, a fresh
+/// `/tmp/nix-shell.XXXXXX` for each `nix develop`, is in a key or in what a run prints.
+pub(crate) const TEMP_NAMES: &[&str] = &["NIX_BUILD_TOP", "TEMP", "TEMPDIR", "TMP", "TMPDIR"];
+
+/// What a sandboxed run's [`TEMP_NAMES`] but `TMPDIR` are: the sandbox's own empty `/tmp`, the
+/// same in every shell.
+pub(crate) const SANDBOX_TEMP: &str = "/tmp";
 
 /// The environment a script is started in: the job's whole environment but [`JOB_ONLY`], what
-/// cargo sets for the unit over it.
-pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan) -> Vec<(OsString, OsString)> {
+/// cargo sets for the unit over it. A `sandboxed` run (not [`outside`]) on unix has the job's
+/// [`TEMP_NAMES`] as that says, the sandbox's temporary directory; what cargo sets (a `[env]`
+/// value) is never rewritten. A run outside the sandbox, or on Windows (whose sandbox sets
+/// `TMP` and `TEMP` itself), has the job's as they are.
+pub(crate) fn inherited(
+    job: &[(String, String)],
+    plan: &UnitPlan,
+    sandboxed: bool,
+) -> Vec<(OsString, OsString)> {
+    let own_temp = cfg!(unix) && sandboxed;
+    let job = job.iter().filter(|it| !JOB_ONLY.contains(&it.0.as_str())).filter_map(
+        |(name, value)| match (own_temp && TEMP_NAMES.contains(&name.as_str()), name.as_str()) {
+            (false, _) => Some((name.as_str(), value.as_str())),
+            (true, "TMPDIR") => None,
+            (true, _) => Some((name.as_str(), SANDBOX_TEMP)),
+        },
+    );
     // cargo's first, then a stable sort by name and the first of each name kept: cargo's over
     // the job's, in one sort with no map.
-    let mut env: Vec<&(String, String)> = Vec::with_capacity(plan.env.len() + job.len());
-    env.extend(plan.env.iter().chain(job.iter().filter(|it| !JOB_ONLY.contains(&it.0.as_str()))));
-    env.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut env: Vec<(&str, &str)> =
+        Vec::with_capacity(plan.env.len() + job.size_hint().1.unwrap_or(0));
+    env.extend(plan.env.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(job));
+    env.sort_by(|a, b| a.0.cmp(b.0));
     env.dedup_by(|later, first| later.0 == first.0);
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
@@ -451,7 +528,8 @@ pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> 
         link_dirs,
     };
     let refused = crate::directives::refused(stdout, &ran);
-    (!refused.is_empty()).then(|| crate::directives::refused_report(&unit.package.name, script_at(unit), &refused))
+    (!refused.is_empty())
+        .then(|| crate::directives::refused_report(&unit.package.name, script_at(unit), &refused))
 }
 
 /// The most lines of what a failed run printed that its report shows, from each stream's end.
@@ -508,7 +586,13 @@ pub(crate) fn judge(
 /// (`build-script:error`), or printed what can't be read (`build-script:output`). What the
 /// script says of itself in `cargo:blaze-report=` lines ([`blaze_report::script`]) is the
 /// report's headline, rule, facts and fixes; blaze's words of the run stay as facts under it.
-fn failure(unit: &bs::Unit, status: blaze_build_script::run::Ended, failed: &Failed, stdout: &[u8], stderr: &[u8]) -> Report {
+fn failure(
+    unit: &bs::Unit,
+    status: blaze_build_script::run::Ended,
+    failed: &Failed,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Report {
     let printed = String::from_utf8_lossy(stdout);
     let said = blaze_report::script::read(&printed);
     let errors: Vec<&str> = (failed.log_messages.iter())
@@ -537,7 +621,10 @@ fn failure(unit: &bs::Unit, status: blaze_build_script::run::Ended, failed: &Fai
             report
         }
         (true, many) => {
-            let headline = Text::new().words("the build script logged ").count(many.len() as u64).words(" errors");
+            let headline = Text::new()
+                .words("the build script logged ")
+                .count(many.len() as u64)
+                .words(" errors");
             let mut report = Report::error(headline).rule("build-script:error");
             for error in many {
                 report = report.fact("error", Text::marked(error));
@@ -569,9 +656,8 @@ fn failure(unit: &bs::Unit, status: blaze_build_script::run::Ended, failed: &Fai
 /// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact
 /// under `key`.
 fn tail(mut report: Report, key: &str, text: &str) -> Report {
-    let lines: Vec<&str> = (text.lines())
-        .filter(|it| !it.trim().is_empty() && !it.starts_with("cargo:"))
-        .collect(); // alloc: a failure's, once
+    let lines: Vec<&str> =
+        (text.lines()).filter(|it| !it.trim().is_empty() && !it.starts_with("cargo:")).collect(); // alloc: a failure's, once
     for line in &lines[lines.len().saturating_sub(TAIL)..] {
         report = report.fact(key, Text::plain(*line));
     }
@@ -583,7 +669,11 @@ pub(crate) fn executed(package_id: &str, output: &Output, out_dir: &str) -> Buil
     BuildScriptRan {
         package_id: package_id.to_owned(),
         linked_libs: output.library_links.clone(),
-        linked_paths: output.library_paths.iter().map(|it| it.path().to_string_lossy().into_owned()).collect(),
+        linked_paths: output
+            .library_paths
+            .iter()
+            .map(|it| it.path().to_string_lossy().into_owned())
+            .collect(),
         cfgs: output.cfgs.clone(),
         env: output.env.clone(),
         out_dir: out_dir.to_owned(),
@@ -604,17 +694,24 @@ fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         let at = dir.join(&rel);
         let entries = match std::fs::read_dir(&at) {
             Ok(it) => it,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && rel.as_os_str().is_empty() => return Ok(out),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && rel.as_os_str().is_empty() =>
+            {
+                return Ok(out);
+            }
             Err(error) => return Err(format!("{}: {error}", at.display())),
         };
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?;
             let rel = rel.join(entry.file_name());
-            let kind = entry.file_type().map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
             if kind.is_dir() {
                 pending.push(rel);
             } else if kind.is_file() {
-                let bytes = std::fs::read(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|error| format!("{}: {error}", entry.path().display()))?;
                 out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
             }
         }
@@ -639,12 +736,19 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         How::Inert => true,
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => false,
+        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
+            false
+        }
         How::Sandboxed(prepared) => {
             let guard = blaze_cas::enter();
             let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut start.disk);
             matches!(
-                blaze_usercode::index::find(&job.input.store, &guard, &prepared.spec.key, &mut inputs),
+                blaze_usercode::index::find(
+                    &job.input.store,
+                    &guard,
+                    &prepared.spec.key,
+                    &mut inputs
+                ),
                 Ok(blaze_usercode::index::Found::Hit { .. })
             )
         }
@@ -680,15 +784,21 @@ enum How {
 
 /// Whether run `run` is outside the sandbox: `BLAZE_SANDBOX=off`, or the workspace took its
 /// package out by name.
-fn outside(job: &Job, run: usize) -> bool {
+pub(crate) fn outside(job: &Job, run: usize) -> bool {
     job.sandbox_off() || job.plan(run).is_ok_and(|it| it.unsandboxed)
 }
 
 /// The path build script compile `compile` writes its program at: its first output, named
 /// before it is built.
 pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, ApiError> {
-    let plan = units.plans.get(compile).ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
-    plan.outputs.first().map(PathBuf::from).ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
+    let plan = units
+        .plans
+        .get(compile)
+        .ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
+    plan.outputs
+        .first()
+        .map(PathBuf::from)
+        .ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
 }
 
 /// The roots every build script run of `job` has besides its own package and `OUT_DIR`
@@ -710,17 +820,25 @@ pub(crate) fn build_roots(job: &Job) -> RootMap {
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
 pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
-    build_roots(job).with(Role::Package, &unit.package.manifest_dir).with(Role::OutDir, &unit.out_dir)
+    build_roots(job)
+        .with(Role::Package, &unit.package.manifest_dir)
+        .with(Role::OutDir, &unit.out_dir)
 }
 
 /// Run `run` ready to begin; none while its script is not built.
 fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let units = job.units();
     let Some(compile) = compile_of(units, run) else {
-        return Err(ApiError::new(format!("the run of unit {run} has no build script compiled"), None));
+        return Err(ApiError::new(
+            format!("the run of unit {run} has no build script compiled"),
+            None,
+        ));
     };
     // `BLAZE_SCRIPT_CACHE=check` reruns a pure key's hit too, compared as an elided one is.
-    let verify = !ported(job, run) && (verifies(job)? || pure::verifies(job)? || (rechecks(job)? && pure::hit(job, run).is_some()));
+    let verify = !ported(job, run)
+        && (verifies(job)?
+            || pure::verifies(job)?
+            || (rechecks(job)? && pure::hit(job, run).is_some()));
     // clone: the run's own, kept with it until it ends; once per run of an inert script.
     let elided = inert(job, run)?.or_else(|| pure::hit(job, run)).cloned();
     let program = match (&elided, verify) {
@@ -744,8 +862,9 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         scripts: &job.scripts,
         native: &job.input.native,
     };
-    let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
+    let unit = script_unit(&of, run)
+        .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
+    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
     let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new());
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
@@ -783,7 +902,12 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     // The variable the script reads is the layout, whatever else set it (a check, not a
     // fallback: `native_env` forces it).
     for laid in given(&job.input.native, &unit) {
-        let set = prepared.spec.command.env.iter().find(|(name, _)| name.as_os_str() == laid.input.env.as_str());
+        let set = prepared
+            .spec
+            .command
+            .env
+            .iter()
+            .find(|(name, _)| name.as_os_str() == laid.input.env.as_str());
         if set.is_none_or(|(_, value)| Path::new(value) != laid.dir) {
             return Err(ApiError::new(
                 format!(
@@ -799,7 +923,13 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
     let how = match outside(job, run) {
-        true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
+        true => {
+            // Outside the sandbox nothing is lent: the program is given its whole environment,
+            // without the launcher's variable.
+            let mut command = Command { sandbox: Sandbox::Off, ..prepared.spec.command };
+            command.env.retain(|it| it.0 != blaze_usercode::confine::GIVEN);
+            How::Outside(command)
+        }
         false => How::Sandboxed(prepared),
     };
     Ok(Some(Start { unit, env, disk, how, elided }))
@@ -824,7 +954,14 @@ pub(crate) struct ScriptRun {
 enum State {
     Ready(Box<Start>),
     /// `quiet` is a sandboxed run's bound; `stuck` says why it was killed past it.
-    Running { start: Box<Start>, run: Option<Run>, began: SystemTime, cancelled: bool, quiet: Option<Quiet>, stuck: Option<String> },
+    Running {
+        start: Box<Start>,
+        run: Option<Run>,
+        began: SystemTime,
+        cancelled: bool,
+        quiet: Option<Quiet>,
+        stuck: Option<String>,
+    },
     Writing(Box<Writing>),
     Done,
 }
@@ -890,7 +1027,12 @@ impl Quiet {
         names.push(live);
         effects.push(Effect::Timer { after: LOOK_EVERY, tag: Tag(tag.0 + TICK) });
         // alloc: as above.
-        Quiet { live: Arc::new(names), last: Stamp::GONE, quiet: Duration::ZERO, ran: Duration::ZERO }
+        Quiet {
+            live: Arc::new(names),
+            last: Stamp::GONE,
+            quiet: Duration::ZERO,
+            ran: Duration::ZERO,
+        }
     }
 
     /// Whether `completion` of the run `tag` is a look's.
@@ -900,11 +1042,17 @@ impl Quiet {
 
     /// A look's `completion`: the next asked while the record moves, [`Stuck`] once it has not
     /// for [`QUIET_MOST`]. A look that fails is an error: the bound can't be kept.
-    fn step(&mut self, tag: Tag, completion: Completion, effects: &mut Vec<Effect>) -> Result<Option<Stuck>, String> {
+    fn step(
+        &mut self,
+        tag: Tag,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Option<Stuck>, String> {
         match (completion.tag.0.wrapping_sub(tag.0), completion.done) {
             (TICK, Done::Fired) => {
                 self.ran += LOOK_EVERY;
-                effects.push(Effect::Stamp { files: Arc::clone(&self.live), tag: Tag(tag.0 + LOOK) });
+                effects
+                    .push(Effect::Stamp { files: Arc::clone(&self.live), tag: Tag(tag.0 + LOOK) });
                 Ok(None)
             }
             (LOOK, Done::Stamped(stamps)) => {
@@ -922,14 +1070,20 @@ impl Quiet {
                 Ok(None)
             }
             (_, Done::Failed(error)) => Err(format!("a look at its live record failed: {error}")), // alloc: error path
-            (own, other) => Err(format!("a look at its live record (tag +{own}) ended as {other:?}")), // alloc: error path
+            (own, other) => {
+                Err(format!("a look at its live record (tag +{own}) ended as {other:?}"))
+            } // alloc: error path
         }
     }
 }
 
 /// Why run unit `unit` was not reused, for `blaze why`, under its unit's subject
 /// ([`super::compile::unit_subject`]): `missed` of its subject, or why it has none.
-fn run_miss(job: &Job, unit: usize, missed: impl FnOnce(blaze_ids::ContentId, String) -> blaze_kernel::Miss) -> blaze_kernel::Miss {
+fn run_miss(
+    job: &Job,
+    unit: usize,
+    missed: impl FnOnce(blaze_ids::ContentId, String) -> blaze_kernel::Miss,
+) -> blaze_kernel::Miss {
     let (item, subject) = match job.unit(unit) {
         Ok(u) => (super::compile::span_unit(u), super::compile::unit_subject(job, u)),
         Err(error) => (format!("unit {unit}"), Err(error.what)), // alloc: once a miss
@@ -963,7 +1117,9 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
         let mut hasher = blaze_ids::Hasher::new("blaze v2 why run key 1");
         hasher.id(&key.code).id(&key.given);
         let parts = std::iter::once(Part::new("the build script's code", Some(key.code)))
-            .chain(prepared.made.parts().into_iter().map(|(name, hash)| Part::new(name, Some(hash))))
+            .chain(
+                prepared.made.parts().into_iter().map(|(name, hash)| Part::new(name, Some(hash))),
+            )
             // alloc: once a miss
             .collect();
         let mut miss = blaze_kernel::Miss::of_parts(RUN, subject, item, hasher.finish(), parts);
@@ -975,7 +1131,10 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
 /// `spec`, of a sandboxed run of `unit`, with its live record named ([`blaze_usercode::confine::LIVE`])
 /// at [`LIVE_FILE`] beside its `OUT_DIR`, so its bound can look at it ([`Quiet`]); an earlier
 /// run's record there removed. With the record's name.
-fn live_record(unit: &bs::Unit, spec: &blaze_usercode::run::Spec) -> Result<(blaze_usercode::run::Spec, FileName), String> {
+fn live_record(
+    unit: &bs::Unit,
+    spec: &blaze_usercode::run::Spec,
+) -> Result<(blaze_usercode::run::Spec, FileName), String> {
     let Some(dir) = unit.out_dir.parent() else {
         return Err(format!("{}: its OUT_DIR is in no directory", unit.package.descr())); // alloc: error path
     };
@@ -983,7 +1142,9 @@ fn live_record(unit: &bs::Unit, spec: &blaze_usercode::run::Spec) -> Result<(bla
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("{}: an earlier run's live record: {error}", path.display())), // alloc: error path
+        Err(error) => {
+            return Err(format!("{}: an earlier run's live record: {error}", path.display()));
+        } // alloc: error path
     }
     let name = file_name(&path)?;
     // clone: once per sandboxed run, the spec the run owns
@@ -994,15 +1155,18 @@ fn live_record(unit: &bs::Unit, spec: &blaze_usercode::run::Spec) -> Result<(bla
 
 /// `path` as the driver names it, under its root `/`.
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str()
-        .and_then(|it| FileName::new(it.trim_start_matches('/')))
-        .ok_or_else(|| format!("{} is not a path blaze can write cargo's files of a run at", path.display()))
+    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
+        format!("{} is not a path blaze can write cargo's files of a run at", path.display())
+    })
 }
 
 pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {
     let u = job.unit(unit)?;
     if !matches!(u.mode, Mode::RunCustomBuild) {
-        return Err(ApiError::new(format!("unit {unit} (`{}`) is no build script's run", u.target.name), None));
+        return Err(ApiError::new(
+            format!("unit {unit} (`{}`) is no build script's run", u.target.name),
+            None,
+        ));
     }
     let kept = job.starts.get(unit).and_then(|it| it.lock().take());
     let start = match kept {
@@ -1063,7 +1227,10 @@ impl ScriptRun {
     /// run is killed and ends through its spawn's completion with the error. One that comes
     /// after the run ended, or once it is being killed, is dropped.
     fn looked(&mut self, completion: Completion, effects: &mut Vec<Effect>) {
-        let State::Running { start, quiet: Some(quiet), cancelled: false, stuck: stuck @ None, .. } = &mut self.state else {
+        let State::Running {
+            start, quiet: Some(quiet), cancelled: false, stuck: stuck @ None, ..
+        } = &mut self.state
+        else {
             return;
         };
         let what = match quiet.step(self.tag, completion, effects) {
@@ -1080,7 +1247,10 @@ impl ScriptRun {
                 QUIET_MOST.as_secs()
             ),
             // alloc: error path
-            Err(why) => format!("the build script of `{}`: its bound can't be kept: {why}", start.unit.package.descr()),
+            Err(why) => format!(
+                "the build script of `{}`: its bound can't be kept: {why}",
+                start.unit.package.descr()
+            ),
         };
         *stuck = Some(what);
         effects.push(Effect::Kill { tag: self.tag });
@@ -1108,7 +1278,10 @@ impl ScriptRun {
         if let Some(elided) = &start.elided
             && let Err(error) = script::verify_elided(elided, &value)
         {
-            return self.error(format!("the build script of `{}`: {}", start.unit.package.descr(), error.0), out);
+            return self.error(
+                format!("the build script of `{}`: {}", start.unit.package.descr(), error.0),
+                out,
+            );
         }
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let link_dirs: Vec<PathBuf> = match start.how {
@@ -1121,7 +1294,10 @@ impl ScriptRun {
                     it
                 }
                 Err(why) => {
-                    return self.error(format!("the build script of `{}`: {why}", start.unit.package.descr()), out);
+                    return self.error(
+                        format!("the build script of `{}`: {why}", start.unit.package.descr()),
+                        out,
+                    );
                 }
             },
         };
@@ -1149,9 +1325,17 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
-        let ran = blaze_lower::Ran { cfgs: output.cfgs.clone(), env: output.env.clone(), out_dir: out_dir.clone(), files };
+        let ran = blaze_lower::Ran {
+            cfgs: output.cfgs.clone(),
+            env: output.env.clone(),
+            out_dir: out_dir.clone(),
+            files,
+        };
         let Some(writer) = writer else {
-            let what = format!("the build script run of unit {} was given no writer to apply it with", self.unit);
+            let what = format!(
+                "the build script run of unit {} was given no writer to apply it with",
+                self.unit
+            );
             return self.error(what, out);
         };
         if let Err(error) = writer.ran(self.unit, ran) {
@@ -1165,7 +1349,10 @@ impl ScriptRun {
         let links = start.unit.package.links.clone();
         let applied = Applied { package_id, links, output, out_dir };
         if job.scripts[self.unit].set(applied).is_err() {
-            return self.error(format!("the build script run of unit {} ended twice in one job", self.unit), out);
+            return self.error(
+                format!("the build script run of unit {} ended twice in one job", self.unit),
+                out,
+            );
         }
         match Writing::begin(&start.unit, stdout, stderr, began, self.tag, effects) {
             Ok(writing) => {
@@ -1177,7 +1364,13 @@ impl ScriptRun {
     }
 
     /// A completion of one of [`Writing`]'s effects: the run ends ok once none is left.
-    fn written(&mut self, mut writing: Box<Writing>, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn written(
+        &mut self,
+        mut writing: Box<Writing>,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         match writing.step(self.tag, completion, effects) {
             Ok(true) => {
                 self.state = State::Done;
@@ -1203,28 +1396,46 @@ impl Writing {
         tag: Tag,
         effects: &mut Vec<Effect>,
     ) -> Result<Writing, String> {
-        let at = blaze_build_script::run::files(unit, &[], &[])
-            .map_err(|error| format!("cargo's files of the build script run of `{}`: {error}", unit.package.descr()))?;
-        let files = [file_name(&at.printed.0)?, file_name(&at.stderr.0)?, file_name(&at.root_output.0)?];
+        let at = blaze_build_script::run::files(unit, &[], &[]).map_err(|error| {
+            format!("cargo's files of the build script run of `{}`: {error}", unit.package.descr())
+        })?;
+        let files =
+            [file_name(&at.printed.0)?, file_name(&at.stderr.0)?, file_name(&at.root_output.0)?];
         // alloc: the effect owns what it writes; `OUT_DIR`'s path, once per run.
         let root_output = at.root_output.1.to_vec();
         let since = began.duration_since(SystemTime::UNIX_EPOCH).ok();
-        let modified_ns = since
-            .and_then(|it| u64::try_from(it.as_nanos()).ok())
-            .ok_or_else(|| format!("{}: the run began at {began:?}, which is no time a file can be given", files[0]))?;
+        let modified_ns =
+            since.and_then(|it| u64::try_from(it.as_nanos()).ok()).ok_or_else(|| {
+                format!(
+                    "{}: the run began at {began:?}, which is no time a file can be given",
+                    files[0]
+                )
+            })?;
         for (n, file) in (0u64..).zip(&files) {
             // clone: a file's name for each effect of it, three files once per run.
-            effects.push(Effect::Truncate { file: file.clone(), len: 0, tag: Tag(tag.0 + CUT + n) });
+            effects.push(Effect::Truncate {
+                file: file.clone(),
+                len: 0,
+                tag: Tag(tag.0 + CUT + n),
+            });
         }
         Ok(Writing { files, bytes: [stdout, stderr, root_output], modified_ns, left: 3 })
     }
 
     /// `completion` of one of its effects, the run's tag being `tag`: the next effect of its
     /// file asked, and true once none is left.
-    fn step(&mut self, tag: Tag, completion: Completion, effects: &mut Vec<Effect>) -> Result<bool, String> {
+    fn step(
+        &mut self,
+        tag: Tag,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Result<bool, String> {
         let own = completion.tag.0.wrapping_sub(tag.0);
         if !(CUT..=TIMED).contains(&own) {
-            return Err(format!("cargo's files of a build script run were told of tag {} they never asked for", completion.tag.0));
+            return Err(format!(
+                "cargo's files of a build script run were told of tag {} they never asked for",
+                completion.tag.0
+            ));
         }
         let file = ((own - CUT) % 3) as usize;
         match completion.done {
@@ -1232,14 +1443,23 @@ impl Writing {
                 let bytes = std::mem::take(&mut self.bytes[file]);
                 // clone: as for its cut.
                 let name = self.files[file].clone();
-                effects.push(Effect::WriteAt { file: name, at: 0, bytes, tag: Tag(tag.0 + BYTES + file as u64) });
+                effects.push(Effect::WriteAt {
+                    file: name,
+                    at: 0,
+                    bytes,
+                    tag: Tag(tag.0 + BYTES + file as u64),
+                });
                 self.left += 1;
             }
             // `output` has all its bytes: it is dated now, so no write of it comes after.
             Done::Truncated | Done::Written if file == 0 => {
                 // clone: as for its cut.
                 let name = self.files[0].clone();
-                effects.push(Effect::Times { file: name, modified_ns: self.modified_ns, tag: Tag(tag.0 + TIMED) });
+                effects.push(Effect::Times {
+                    file: name,
+                    modified_ns: self.modified_ns,
+                    tag: Tag(tag.0 + TIMED),
+                });
                 self.left += 1;
             }
             Done::Truncated | Done::Written | Done::Timed => {}
@@ -1298,7 +1518,9 @@ impl ScriptRun {
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
-        let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else { return None };
+        let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else {
+            return None;
+        };
         // cargo's start of a run: `OUT_DIR` made, `invoked.timestamp` written, and the time it
         // began, which its `output` is given.
         let began = match blaze_build_script::run::begin(&start.unit) {
@@ -1308,17 +1530,24 @@ impl ScriptRun {
         match &start.how {
             How::Inert => {
                 let Some(value) = start.elided.take() else {
-                    let what = format!("the build script of `{}` is inert, but elision said nothing of it", start.unit.package.descr());
+                    let what = format!(
+                        "the build script of `{}` is inert, but elision said nothing of it",
+                        start.unit.package.descr()
+                    );
                     return self.error(what, out);
                 };
                 if let Err(what) = blaze_usercode::run::restore(&start.unit.out_dir, &value.files) {
-                    let what = format!("the build script of `{}`: its OUT_DIR: {what}", start.unit.package.descr());
+                    let what = format!(
+                        "the build script of `{}`: its OUT_DIR: {what}",
+                        start.unit.package.descr()
+                    );
                     return self.error(what, out);
                 }
                 self.finish(&start, value, began, writer, effects, out)
             }
             How::Outside(command) => {
-                let miss = run_miss(&self.job, self.unit, |subject, item| blaze_kernel::Miss {
+                let miss = run_miss(&self.job, self.unit, |subject, item| {
+                    blaze_kernel::Miss {
                     step: RUN,
                     subject,
                     item,
@@ -1332,10 +1561,18 @@ impl ScriptRun {
                     // alloc: none
                     parts: Vec::new(),
                     beyond: None,
+                }
                 });
                 self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
-                self.state = State::Running { start, run: None, began, cancelled: false, quiet: None, stuck: None };
+                self.state = State::Running {
+                    start,
+                    run: None,
+                    began,
+                    cancelled: false,
+                    quiet: None,
+                    stuck: None,
+                };
                 None
             }
             How::Sandboxed(prepared) => {
@@ -1345,16 +1582,28 @@ impl ScriptRun {
                 };
                 let begun = Run::begin(spec, store, &mut start.disk, self.tag, effects);
                 match begun {
-                    Ok(Begun::Reused(value)) => self.finish(&start, value, began, writer, effects, out),
+                    Ok(Begun::Reused(value)) => {
+                        self.finish(&start, value, began, writer, effects, out)
+                    }
                     Ok(Begun::Running(run)) => {
                         let miss = run_missed(&self.job, self.unit, prepared);
                         self.puts.misses.push(miss);
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));
-                        self.state = State::Running { start, run: Some(run), began, cancelled: false, quiet, stuck: None };
+                        self.state = State::Running {
+                            start,
+                            run: Some(run),
+                            began,
+                            cancelled: false,
+                            quiet,
+                            stuck: None,
+                        };
                         None
                     }
                     Err(error) => {
-                        let what = format!("the build script of `{}`: {error}", start.unit.package.descr());
+                        let what = format!(
+                            "the build script of `{}`: {error}",
+                            start.unit.package.descr()
+                        );
                         self.error(what, out)
                     }
                 }
@@ -1375,14 +1624,17 @@ impl ScriptRun {
             self.looked(completion, effects);
             return None;
         }
-        let (mut start, run, began, cancelled, stuck) = match std::mem::replace(&mut self.state, State::Done) {
-            State::Running { start, run, began, cancelled, stuck, .. } => (start, run, began, cancelled, stuck),
-            State::Writing(writing) => return self.written(writing, completion, effects, out),
-            other => {
-                self.state = other;
-                return None;
-            }
-        };
+        let (mut start, run, began, cancelled, stuck) =
+            match std::mem::replace(&mut self.state, State::Done) {
+                State::Running { start, run, began, cancelled, stuck, .. } => {
+                    (start, run, began, cancelled, stuck)
+                }
+                State::Writing(writing) => return self.written(writing, completion, effects, out),
+                other => {
+                    self.state = other;
+                    return None;
+                }
+            };
         if cancelled {
             // A run killed is no result: nothing of it is kept or applied.
             return Some(false);
@@ -1414,7 +1666,14 @@ impl ScriptRun {
                         // A pure key's hit verified across checkouts, run again and otherwise:
                         // retracted before the run is kept under the pure key, which then
                         // keeps this checkout's own here alone.
-                        let differed = match pure::retract(&job, run_unit, unit, store, &prepared.spec.roots, &value) {
+                        let differed = match pure::retract(
+                            &job,
+                            run_unit,
+                            unit,
+                            store,
+                            &prepared.spec.roots,
+                            &value,
+                        ) {
                             Ok(None) => None,
                             Ok(Some((what, puts))) => {
                                 self.puts.extend(puts);
@@ -1425,7 +1684,16 @@ impl ScriptRun {
                                 return self.error(what, out);
                             }
                         };
-                        match pure::keep(&job, run_unit, unit, checked, store, prepared.script_env(), &prepared.spec.roots, &value) {
+                        match pure::keep(
+                            &job,
+                            run_unit,
+                            unit,
+                            checked,
+                            store,
+                            prepared.script_env(),
+                            &prepared.spec.roots,
+                            &value,
+                        ) {
                             Ok(puts) => self.puts.extend(puts),
                             Err((what, puts)) => {
                                 self.puts.extend(puts);
@@ -1446,7 +1714,8 @@ impl ScriptRun {
                     }
                     Err(error) => {
                         // alloc: error path
-                        let mut what = format!("the build script of `{}`: {error}", unit.package.descr());
+                        let mut what =
+                            format!("the build script of `{}`: {error}", unit.package.descr());
                         // What it put before it failed is in the store: waited for as any put, and
                         // a retraction among it flushed at once, whichever error carried it.
                         self.puts.kept(error.landed().iter().copied());
@@ -1458,7 +1727,14 @@ impl ScriptRun {
                             // retracts it, before the run is kept under the pure key, which then
                             // keeps this checkout's own here alone. A failure of either is said
                             // with the difference, which the build fails with all the same.
-                            match pure::retract(&job, run_unit, unit, store, &prepared.spec.roots, ran) {
+                            match pure::retract(
+                                &job,
+                                run_unit,
+                                unit,
+                                store,
+                                &prepared.spec.roots,
+                                ran,
+                            ) {
                                 Ok(None) => {}
                                 Ok(Some((differs, puts))) => {
                                     self.puts.extend(puts);
@@ -1474,7 +1750,16 @@ impl ScriptRun {
                                     what = format!("{what}; and {more}"); // alloc: error path
                                 }
                             }
-                            match pure::keep(&job, run_unit, unit, checked, store, prepared.script_env(), &prepared.spec.roots, ran) {
+                            match pure::keep(
+                                &job,
+                                run_unit,
+                                unit,
+                                checked,
+                                store,
+                                prepared.script_env(),
+                                &prepared.spec.roots,
+                                ran,
+                            ) {
                                 Ok(puts) => self.puts.extend(puts),
                                 Err((more, puts)) => {
                                     self.puts.extend(puts);
@@ -1487,9 +1772,13 @@ impl ScriptRun {
                 }
             }
             _ => match completion.done {
-                Done::Exited(exit) => {
-                    Value { code: exit.code, signal: exit.signal, stdout: exit.stdout, stderr: exit.stderr, files: Vec::new() }
-                }
+                Done::Exited(exit) => Value {
+                    code: exit.code,
+                    signal: exit.signal,
+                    stdout: exit.stdout,
+                    stderr: exit.stderr,
+                    files: Vec::new(),
+                },
                 Done::Failed(error) => {
                     let what = format!(
                         "failed to run custom build command for `{}`\n\nCaused by:\n  could not execute process `{}` \
@@ -1499,7 +1788,9 @@ impl ScriptRun {
                     );
                     return self.error(what, out);
                 }
-                other => return self.error(format!("the build script's spawn ended as {other:?}"), out),
+                other => {
+                    return self.error(format!("the build script's spawn ended as {other:?}"), out);
+                }
             },
         };
         self.finish(&start, value, began, writer, effects, out)

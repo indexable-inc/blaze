@@ -18,7 +18,6 @@ use base_db::{
     CrateTypes, CrateWorkspaceData, Db, Env, FileId,
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::Durability;
 use blaze_units::{
@@ -31,6 +30,7 @@ use hir_expand::proc_macro::{ProcMacro, ProcMacros};
 use hir_ty_mir::const_macro::{CONST_AST, CONST_AST_NAME};
 use intern::Symbol;
 use span::Edition;
+use std::alloc::Global;
 use triomphe::Arc;
 
 use super::{LowerError, Lowering, crates, files};
@@ -86,7 +86,11 @@ pub(crate) struct Loaded {
 
 /// The macro crates `units` need: one for each package with const macros and platform a unit of
 /// it compiles for but its build script.
-pub(crate) fn plan(units: &Units, package_of: &HashMap<&str, usize, Global>, whats: &[String]) -> Result<Plan, LowerError> {
+pub(crate) fn plan(
+    units: &Units,
+    package_of: &HashMap<&str, usize, Global>,
+    whats: &[String],
+) -> Result<Plan, LowerError> {
     let all = &units.graph.units;
     let mut plan = Plan {
         group_of: vec![None; all.len()],
@@ -140,16 +144,23 @@ fn group_of(
         .enumerate()
         .filter(|(_, unit)| unit.pkg_id == id && unit.built_for() == built_for)
         .filter(|(_, unit)| unit.mode != Mode::RunCustomBuild && !unit.target.is_custom_build())
-        .min_by_key(|&(index, unit)| (crates::is_test(unit, &units.plans[index]), !unit.target.is_lib(), index))
+        .min_by_key(|&(index, unit)| {
+            (crates::is_test(unit, &units.plans[index]), !unit.target.is_lib(), index)
+        })
         .map(|(index, _)| index);
     let Some(anchor) = anchor else {
-        return Err(LowerError::at(format!("the build compiles no crate of `{}` its const macros are of", plan.name), file));
+        return Err(LowerError::at(
+            format!("the build compiles no crate of `{}` its const macros are of", plan.name),
+            file,
+        ));
     };
     let deps = all[anchor]
         .dependencies
         .iter()
         .map(|dep| dep.index)
-        .filter(|&on| all.get(on).is_some_and(|it| it.mode != Mode::RunCustomBuild && it.pkg_id != id))
+        .filter(|&on| {
+            all.get(on).is_some_and(|it| it.mode != Mode::RunCustomBuild && it.pkg_id != id)
+        })
         .collect();
     let standard = |name: &str| {
         all.iter()
@@ -248,7 +259,13 @@ pub(crate) fn make(
     let name = |text: &str| CrateName::new(text).expect("a crate's name");
     let made = |at: usize| {
         cx.lowerings[at].krate.ok_or_else(|| {
-            LowerError::at(format!("the const macros of {what} depend on {}, which has no crate", cx.whats[at]), file)
+            LowerError::at(
+                format!(
+                    "the const macros of {what} depend on {}, which has no crate",
+                    cx.whats[at]
+                ),
+                file,
+            )
         })
     };
 
@@ -257,7 +274,10 @@ pub(crate) fn make(
         Some(&krate) => krate,
         None => {
             let Some(const_ast_root) = cx.const_ast_root else {
-                return Err(LowerError::at("blaze's copy of `const-ast` is not among the front end's files", cx.const_ast_dir));
+                return Err(LowerError::at(
+                    "blaze's copy of `const-ast` is not among the front end's files",
+                    cx.const_ast_dir,
+                ));
             };
             let core = BuiltDependency::with_prelude(name("core"), made(core)?, true, true);
             let data = base_db::BuiltCrateData {
@@ -278,10 +298,20 @@ pub(crate) fn make(
                 built_for: crates::built_for(unit.built_for()),
             };
             let mut cfg = CfgOptions::default();
-            for it in target::target_cfg(cx.triple, &CfgArgs::default()).map_err(|why| LowerError::at(why, cx.triple))? {
+            for it in target::target_cfg(cx.triple, &CfgArgs::default())
+                .map_err(|why| LowerError::at(why, cx.triple))?
+            {
                 cfg.extend([crates::atom(&it).map_err(|why| LowerError::at(why, cx.triple))?]);
             }
-            let krate = Crate::create(db, data, extra, cx.workspace.clone(), cfg, Env::default(), Durability::HIGH);
+            let krate = Crate::create(
+                db,
+                data,
+                extra,
+                cx.workspace.clone(),
+                cfg,
+                Env::default(),
+                Durability::HIGH,
+            );
             all.push(krate);
             plan.const_ast.insert(platform, krate);
             krate
@@ -295,7 +325,12 @@ pub(crate) fn make(
         dependencies.push(crates::dependency(unit, on, dep, made(dep.index)?, what)?);
     }
     if !dependencies.iter().any(|it| it.name.as_str() == "proc_macro") {
-        dependencies.push(BuiltDependency::with_prelude(name("proc_macro"), made(proc_macro)?, true, true));
+        dependencies.push(BuiltDependency::with_prelude(
+            name("proc_macro"),
+            made(proc_macro)?,
+            true,
+            true,
+        ));
     }
     dependencies.push(BuiltDependency::with_prelude(name(CONST_AST_NAME), const_ast, true, false));
 
@@ -343,7 +378,10 @@ pub(crate) fn dependency_name(file: &str) -> Result<CrateName, LowerError> {
         && stem.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-');
     match is_name {
         true => Ok(CrateName::normalize_dashes(stem)),
-        false => Err(LowerError::at(format!("the const macros' file `{file}` has no crate's name for a stem"), file)),
+        false => Err(LowerError::at(
+            format!("the const macros' file `{file}` has no crate's name for a stem"),
+            file,
+        )),
     }
 }
 
@@ -371,9 +409,16 @@ pub(crate) fn set_macros(db: &mut Db, made: Vec<(Crate, Vec<ProcMacro>)>) {
 impl Loaded {
     /// Its macros listed again if its file changed since; none when it did not. An error when
     /// the file is gone from the front end.
-    pub(crate) fn reload(&mut self, db: &Db, paths: &std::collections::HashMap<FileId, String>) -> Result<Option<Vec<ProcMacro>>, LowerError> {
+    pub(crate) fn reload(
+        &mut self,
+        db: &Db,
+        paths: &std::collections::HashMap<FileId, String>,
+    ) -> Result<Option<Vec<ProcMacro>>, LowerError> {
         if !paths.contains_key(&self.root) {
-            return Err(LowerError::at("the file of the const macros is gone from its package's files", self.what.clone()));
+            return Err(LowerError::at(
+                "the file of the const macros is gone from its package's files",
+                self.what.clone(),
+            ));
         }
         let input = db.file_text(self.root);
         let content = input.content(db);
@@ -386,5 +431,6 @@ impl Loaded {
 }
 
 fn abs(path: &str) -> Result<AbsPathBuf, LowerError> {
-    AbsPathBuf::try_from(path).map_err(|_| LowerError::at(format!("`{path}` is not an absolute path"), path))
+    AbsPathBuf::try_from(path)
+        .map_err(|_| LowerError::at(format!("`{path}` is not an absolute path"), path))
 }

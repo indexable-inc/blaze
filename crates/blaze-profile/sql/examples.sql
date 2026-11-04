@@ -41,18 +41,22 @@ JOIN earlier ON earlier.name = later.name
 ORDER BY slower_ms DESC
 LIMIT $limit
 
--- name: memo_hit_rate_per_crate
--- says: of the queries a build verified or reran, per crate, how many the memo kept (verified, or reran to the same output)
+-- name: memo_hit_rate_per_query_kind
+-- says: per query function in a build, what the memo kept and what ran and why (`query_counts`): rows verified without running, runs, and runs by cause (a first run, a read changed, an untracked read, a cycle, an evicted value asked for again), with the share kept; null causes are a history from before schema 4
 SELECT
-    crate,
-    count(*) FILTER (WHERE outcome = 'verified') AS verified,
-    count(*) FILTER (WHERE outcome = 'reran-same-output') AS same_output,
-    count(*) FILTER (WHERE outcome = 'reran') AS reran,
-    round(count(*) FILTER (WHERE outcome <> 'reran') / count(*), 3) AS hit_rate
-FROM provenance
+    query,
+    verified,
+    executed,
+    ran_new,
+    ran_changed,
+    ran_untracked,
+    ran_cycle,
+    evicted_asked,
+    round(verified / greatest(verified + executed, 1), 3) AS hit_rate
+FROM query_counts
 WHERE build_id = $build
-GROUP BY crate
-ORDER BY reran DESC
+ORDER BY coalesce(ran_changed, 0) + coalesce(ran_untracked, 0) + coalesce(ran_cycle, 0) + evicted_asked DESC, executed DESC, query
+LIMIT $limit
 
 -- name: critical_path
 -- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
@@ -168,11 +172,118 @@ GROUP BY query_kind
 ORDER BY alloc_bytes DESC NULLS LAST
 
 -- name: what_reran
--- says: the queries a build reran, slowest first, with the input or query whose change made each rerun
-SELECT kind, query_key, outcome, cause, dur_ns / 1e6 AS ms, crate, unit
+-- says: the memos a build ran again, each with its cause and the read whose change made it run (`provenance`); first runs are only counted (`query_counts.ran_new`), verified rows too
+SELECT kind, query_key, cause, view, cause_key, cause_kind
 FROM provenance
-WHERE build_id = $build AND outcome <> 'verified'
-ORDER BY dur_ns DESC
+WHERE build_id = $build AND outcome = 'ran'
+ORDER BY kind, query_key, view
+LIMIT $limit
+
+-- name: why_reran
+-- says: what a build's reruns come down to: each memo's chain of changed reads followed through the memos that changed to the input field, untracked read or cycle at its root, and how many memos each root made run again
+WITH RECURSIVE ran AS (
+    SELECT DISTINCT query_key, cause, cause_key, cause_kind
+    FROM provenance
+    WHERE build_id = $build AND outcome = 'ran'
+), chain AS (
+    SELECT query_key AS memo, cause, cause_key, cause_kind, 0 AS depth
+    FROM ran
+    UNION ALL
+    SELECT chain.memo AS memo, ran.cause AS cause, ran.cause_key AS cause_key, ran.cause_kind AS cause_kind, chain.depth + 1 AS depth
+    FROM chain
+    JOIN ran ON ran.query_key = chain.cause_key
+    WHERE chain.cause_kind = 'function' AND chain.depth < 64
+), roots AS (
+    SELECT memo, arg_max(cause, depth) AS root_cause, arg_max(cause_key, depth) AS root, arg_max(cause_kind, depth) AS root_kind, max(depth) AS depth
+    FROM chain
+    GROUP BY memo
+)
+SELECT root_cause, root_kind, root, count(DISTINCT memo) AS memos, max(depth) AS deepest, min(memo) AS example
+FROM roots
+GROUP BY root_cause, root_kind, root
+ORDER BY memos DESC, root_cause, root
+LIMIT $limit
+
+-- name: untracked_reads
+-- says: a build's untracked reads by name (`Untracked { what }`): each memo that made one runs again in every view, so these are the reruns no input change explains
+SELECT what, kind, count(DISTINCT query_key) AS memos, min(query_key) AS example
+FROM provenance
+WHERE build_id = $build AND outcome = 'untracked read'
+GROUP BY what, kind
+ORDER BY memos DESC, what, kind
+LIMIT $limit
+
+-- name: cycle_reruns
+-- says: the memos a build ran again for a cycle, with their runs and views: one that ran many times in one view is a cycle that took many rounds to settle, or never did
+SELECT kind, query_key, count(*) AS runs, count(DISTINCT view) AS views
+FROM provenance
+WHERE build_id = $build AND outcome = 'ran' AND cause = 'cycle'
+GROUP BY kind, query_key
+ORDER BY runs DESC, kind, query_key
+LIMIT $limit
+
+-- name: key_part_diff
+-- says: why a thing missed in build `after`: the parts of its key (`key_parts`) whose hash differs from the last earlier build at or before `before` that computed it too, or that only one of the two has
+WITH later AS (
+    SELECT step, item, part, hash, names, beyond FROM key_parts WHERE build_id = $after
+), latest AS (
+    SELECT step, item, max(build_id) AS build
+    FROM key_parts
+    WHERE build_id <= $before AND item IN (SELECT item FROM later)
+    GROUP BY step, item
+), earlier AS (
+    SELECT key_parts.step AS step, key_parts.item AS item, part, hash, names, beyond, build_id
+    FROM key_parts
+    JOIN latest ON latest.step = key_parts.step AND latest.item = key_parts.item AND latest.build = key_parts.build_id
+)
+SELECT
+    coalesce(later.step, earlier.step) AS step,
+    coalesce(later.item, earlier.item) AS item,
+    coalesce(later.part, earlier.part) AS part,
+    earlier.build_id AS earlier_build,
+    earlier.hash AS earlier_hash,
+    later.hash AS later_hash,
+    coalesce(later.names, earlier.names) AS names,
+    coalesce(later.beyond, earlier.beyond) AS beyond
+FROM earlier
+FULL JOIN later
+    ON later.step = earlier.step AND later.item = earlier.item AND later.part IS NOT DISTINCT FROM earlier.part
+WHERE earlier.hash IS DISTINCT FROM later.hash
+    AND coalesce(later.item, earlier.item) IN (SELECT item FROM earlier)
+ORDER BY step, item, part
+LIMIT $limit
+
+-- name: task_memory
+-- says: a build's daemon tasks by kind (`task` spans): how many ran, the memory the plane granted them against the most they held, how many held more than granted, how many memory held back, and their time
+SELECT
+    function AS task,
+    count(*) AS tasks,
+    round(sum(granted_bytes) / 1048576, 1) AS granted_mib,
+    round(sum(peak_bytes) / 1048576, 1) AS peak_mib,
+    round(max(peak_bytes) / 1048576, 1) AS largest_peak_mib,
+    count(*) FILTER (WHERE peak_bytes > granted_bytes) AS over_grant,
+    count(*) FILTER (WHERE passed > 0) AS held_back,
+    max(passed) AS most_passed,
+    round(sum(dur_ns) / 1e6, 1) AS ms
+FROM spans
+WHERE build_id = $build AND name = 'task'
+GROUP BY function
+ORDER BY peak_mib DESC NULLS LAST, task
+
+-- name: admission_waits
+-- says: what a build's daemon tasks waited for before they started (`admission` spans, from ready to start): per task kind and what held it back (memory, a work or io thread, nothing), how many, their whole and longest wait, and the times memory passed them over; a null waited_for never started
+SELECT
+    function AS task,
+    awaits AS waited_for,
+    count(*) AS tasks,
+    round(sum(dur_ns) / 1e6, 1) AS waited_ms,
+    round(max(dur_ns) / 1e6, 1) AS longest_ms,
+    sum(passed) AS passed,
+    round(max(granted_bytes) / 1048576, 1) AS largest_grant_mib
+FROM spans
+WHERE build_id = $build AND name = 'admission'
+GROUP BY function, awaits
+ORDER BY waited_ms DESC, task, waited_for
 LIMIT $limit
 
 -- name: busiest_threads

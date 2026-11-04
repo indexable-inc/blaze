@@ -1,9 +1,0 @@
-# The stable blaze is pinned to (`harness/toolchain`). blaze computes layouts and `TypeId`s
-# the way this rustc does, and the two must agree for what it links into the module rustc
-# built: `downcast` across the two is one thing that depends on it.
-[toolchain]
-channel = "1.99.0"
-# rust-src: `blaze-wasm pack` packs the source of the std this toolchain links the program
-# with (BLAZE_LIBRARY in ../build-dioxus.sh); blaze itself compiles its own library/.
-components = ["rust-src"]
-targets = ["wasm32-unknown-unknown"]

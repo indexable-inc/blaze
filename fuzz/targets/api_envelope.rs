@@ -115,7 +115,11 @@ fn envelope<T: Serialize + DeserializeOwned + PartialEq + fmt::Debug>(
 ) {
     let name = std::any::type_name::<T>();
     let (most, decoded) = blaze_fuzz::largest_allocation(|| frames::decode::<T>(data));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "decoding {} bytes as a {name} asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "decoding {} bytes as a {name} asked for {most} at once",
+        data.len()
+    );
     let read = cbor::from_slice::<Envelope<T>>(data);
     assert_eq!(
         read,
@@ -143,10 +147,17 @@ fn envelope<T: Serialize + DeserializeOwned + PartialEq + fmt::Debug>(
     match (decoded, expected) {
         (Ok(envelope), None) => {
             assert_eq!(read.as_ref(), Ok(&envelope), "decode reads what from_slice does");
-            assert_eq!(head.as_ref().map(|head| head.id), Ok(envelope.id), "decode reads the id its head has");
+            assert_eq!(
+                head.as_ref().map(|head| head.id),
+                Ok(envelope.id),
+                "decode reads the id its head has"
+            );
         }
         (Err(refused), Some(expected)) => {
-            assert_eq!(refused, expected, "decode refuses an envelope of {name} under its head's id, naming why");
+            assert_eq!(
+                refused, expected,
+                "decode refuses an envelope of {name} under its head's id, naming why"
+            );
         }
         (decoded, expected) => panic!("decode gave {decoded:?} where {expected:?} was due"),
     }
@@ -154,11 +165,23 @@ fn envelope<T: Serialize + DeserializeOwned + PartialEq + fmt::Debug>(
     if let Ok(envelope) = &read {
         let frame = frames::encode(envelope).expect("a decoded envelope has an encoding");
         let item = &frame[4..];
-        assert_eq!(frame[..4], (item.len() as u32).to_be_bytes(), "a frame starts with its item's length");
+        assert_eq!(
+            frame[..4],
+            (item.len() as u32).to_be_bytes(),
+            "a frame starts with its item's length"
+        );
         assert_eq!(cbor::to_vec(envelope).as_deref(), Ok(item), "encode writes what to_vec does");
-        assert_eq!(reference::to_vec(envelope).as_deref(), Ok(item), "encode writes what the reference does");
+        assert_eq!(
+            reference::to_vec(envelope).as_deref(),
+            Ok(item),
+            "encode writes what the reference does"
+        );
         assert_eq!(cbor::check(item), Ok(()), "encode writes canonical bytes");
-        assert_eq!(cbor::from_slice::<Envelope<T>>(item).as_ref(), Ok(envelope), "an encoded envelope decodes back to itself");
+        assert_eq!(
+            cbor::from_slice::<Envelope<T>>(item).as_ref(),
+            Ok(envelope),
+            "an encoded envelope decodes back to itself"
+        );
     }
 }
 
@@ -224,7 +247,11 @@ fn fact() -> FactRead {
 /// Every request and every response, each as the client or the daemon writes its item.
 fn seeds() -> Vec<Vec<u8>> {
     let ops = vec![
-        Op::Write { mode: Mode::Regular, path: "src/lib.rs".to_owned(), bytes: b"fn f() {}\n".to_vec() },
+        Op::Write {
+            mode: Mode::Regular,
+            path: "src/lib.rs".to_owned(),
+            bytes: b"fn f() {}\n".to_vec(),
+        },
         Op::Edit { at: 3, len: 1, path: "src/lib.rs".to_owned(), bytes: b"g".to_vec() },
         Op::Delete { path: "src/old.rs".to_owned() },
         Op::Rename { to: "src/b.rs".to_owned(), from: "src/a.rs".to_owned() },
@@ -247,7 +274,12 @@ fn seeds() -> Vec<Vec<u8>> {
             filter: vec!["tests::a".to_owned()],
             targets: targets(false),
         },
-        Request::Run { bin: Some("a".to_owned()), args: Vec::new(), view: head(), targets: targets(true) },
+        Request::Run {
+            bin: Some("a".to_owned()),
+            args: Vec::new(),
+            view: head(),
+            targets: targets(true),
+        },
         Request::Diff { to: head(), from: ViewRef::Root(View { root: id(3) }) },
         Request::Why { view: head(), query: key(3, 4) },
         Request::Open { view: what_if.clone() },
@@ -329,7 +361,11 @@ fn seeds() -> Vec<Vec<u8>> {
     let responses = vec![
         Response::Committed { root: id(7), rebased: true },
         Response::Diagnostic(diagnostic),
-        Response::Built { members: 2, profile: "`dev` profile".to_owned(), artifacts: vec![artifact] },
+        Response::Built {
+            members: 2,
+            profile: "`dev` profile".to_owned(),
+            artifacts: vec![artifact],
+        },
         Response::Unit(UnitStarted {
             name: "a".to_owned(),
             verb: Verb::Compiling,
@@ -378,7 +414,11 @@ fn seeds() -> Vec<Vec<u8>> {
         Response::TestResult(TestResult {
             name: "tests::b".to_owned(),
             binary: "a".to_owned(),
-            cached: Some(Cached { basis: Basis::Executed, millis: 3, outcome: TestOutcome::Failed }),
+            cached: Some(Cached {
+                basis: Basis::Executed,
+                millis: 3,
+                outcome: TestOutcome::Failed,
+            }),
             millis: 0,
             output: Vec::new(),
             outcome: TestOutcome::Unreached,
@@ -400,14 +440,24 @@ fn seeds() -> Vec<Vec<u8>> {
             executable: 1,
         }),
         Response::Ran { code: Some(-1), stderr: b"e".to_vec(), stdout: Vec::new() },
-        Response::Diff { changes: vec![Change { kind: ChangeKind::Modified, path: "a".to_owned() }] },
+        Response::Diff {
+            changes: vec![Change { kind: ChangeKind::Modified, path: "a".to_owned() }],
+        },
         Response::Why(Why {
             query: key(1, 1),
-            chain: vec![Changed { key: key(2, 2), was: Fingerprint(1), now: Fingerprint(u128::MAX) }],
+            chain: vec![Changed {
+                key: key(2, 2),
+                was: Fingerprint(1),
+                now: Fingerprint(u128::MAX),
+            }],
             input: Some(Input::File("src/lib.rs".to_owned())),
         }),
         Response::Why(Why { query: key(1, 2), chain: Vec::new(), input: Some(Input::Config) }),
-        Response::Why(Why { query: key(1, 3), chain: Vec::new(), input: Some(Input::Dir("src".to_owned())) }),
+        Response::Why(Why {
+            query: key(1, 3),
+            chain: Vec::new(),
+            input: Some(Input::Dir("src".to_owned())),
+        }),
         Response::Status(Status {
             pid: 4242,
             bugs: Vec::new(),

@@ -12,7 +12,10 @@ use either::Either;
 use hir::{HasVisibility as _, InFile, LangItem, PathResolution};
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasGenericParams as _, HasName as _, HasTypeBounds as _, PathSegmentKind, UnaryOp},
+    view::{
+        self as ast, AstNode as _, HasGenericParams as _, HasName as _, HasTypeBounds as _,
+        PathSegmentKind, UnaryOp,
+    },
 };
 
 use super::{
@@ -62,7 +65,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MethodCallIllegalSizedBound) -> Ve
     {
         let printed = cx.ty(ty);
         // alloc: the error's text, for an error hir found
-        let message = format!("you need `{}` instead of `{printed}`", inverted(&printed, mutability));
+        let message =
+            format!("you need `{}` instead of `{printed}`", inverted(&printed, mutability));
         match receiver.and_then(|it| param_ref_type(cx, it)) {
             Some(at) => {
                 diag.suggestion_verbose(at, message, "mut ", Applicability::MachineApplicable);
@@ -94,12 +98,16 @@ fn sized_bound(cx: &Cx<'_, '_>, def: hir::GenericDef) -> Option<Span> {
             let source = cx.vsema.source(it)?;
             (source.file_id, source.value.where_clause(), None)
         }
-        other => unreachable!("hir gives a `Self: Sized` bound of a method, trait or impl, not of {other:?}"),
+        other => unreachable!(
+            "hir gives a `Self: Sized` bound of a method, trait or impl, not of {other:?}"
+        ),
     };
     let on_self = where_clause.into_iter().flat_map(|it| it.predicates()).filter_map(|pred| {
         let Some(ast::Type::PathType(ty)) = pred.ty() else { return None };
         let segment = ty.path()?.as_single_segment()?;
-        matches!(segment.kind(), Some(PathSegmentKind::SelfTypeKw)).then(|| pred.type_bound_list()).flatten()
+        matches!(segment.kind(), Some(PathSegmentKind::SelfTypeKw))
+            .then(|| pred.type_bound_list())
+            .flatten()
     });
     for bound in supertraits.into_iter().chain(on_self).flat_map(|it| it.bounds()) {
         if bound.question_mark_token().is_some() {
@@ -118,7 +126,13 @@ fn sized_bound(cx: &Cx<'_, '_>, def: hir::GenericDef) -> Option<Span> {
 
 /// rustc's help on the traits a probe of every crate's traits picks the method from, with
 /// `suggest_use_candidates`' `use` of each at the module's `inject_use_span`.
-fn use_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, method: &str, candidates: &[hir::Trait]) {
+fn use_candidates(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    module: hir::Module,
+    method: &str,
+    candidates: &[hir::Trait],
+) {
     let s = if candidates.len() == 1 { "" } else { "s" };
     // alloc: the error's text, for an error hir found
     let help = format!(
@@ -145,16 +159,32 @@ fn use_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, method:
             ", perhaps add a `use` for {}:",
             if suggs.len() == 1 { "it" } else { "one_of_them" }
         );
-        diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+        diag.suggestions(
+            &span,
+            message,
+            suggs,
+            Applicability::MaybeIncorrect,
+            SuggestionStyle::ShowAlways,
+        );
     };
     let for_privacy = |diag: &mut Diag, mut message: String, suggs: Vec<String>| {
         if let [only] = suggs.as_slice() {
             // alloc: the error's text, for an error hir found
-            diag.help(format!("trait `{}` provides `{method}` is implemented but not reachable", only.trim()));
+            diag.help(format!(
+                "trait `{}` provides `{method}` is implemented but not reachable",
+                only.trim()
+            ));
         } else {
             // alloc: the error's text, for an error hir found
-            message += &format!(" but {} not reachable", if suggs.len() == 1 { "is" } else { "are" });
-            diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+            message +=
+                &format!(" but {} not reachable", if suggs.len() == 1 { "is" } else { "are" });
+            diag.suggestions(
+                &span,
+                message,
+                suggs,
+                Applicability::MaybeIncorrect,
+                SuggestionStyle::ShowAlways,
+            );
         }
     };
     if accessible.is_empty() {
@@ -197,7 +227,9 @@ fn param_ref_type<'db>(cx: &Cx<'_, 'db>, receiver: ast::Expr<'db>) -> Option<Spa
         };
     }
     let ast::Expr::PathExpr(path) = expr else { return None };
-    let Some(PathResolution::Local(local)) = cx.vsema.resolve_path(path.path()?) else { return None };
+    let Some(PathResolution::Local(local)) = cx.vsema.resolve_path(path.path()?) else {
+        return None;
+    };
     let source = local.primary_source_view(cx.db);
     let file = source.source.file_id;
     let at = match source.source.value {
@@ -210,7 +242,9 @@ fn param_ref_type<'db>(cx: &Cx<'_, 'db>, receiver: ast::Expr<'db>) -> Option<Spa
             ty.ty()?.syntax().text_range().start()
         }
         Either::Right(param) => match param.ty() {
-            Some(ast::Type::RefType(ty)) if ty.mut_token().is_none() => ty.ty()?.syntax().text_range().start(),
+            Some(ast::Type::RefType(ty)) if ty.mut_token().is_none() => {
+                ty.ty()?.syntax().text_range().start()
+            }
             Some(_) => return None,
             None if param.amp_token().is_some() && param.mut_token().is_none() => {
                 param.name()?.syntax().text_range().start()

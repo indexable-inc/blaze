@@ -11,7 +11,7 @@ use crate::{
         assoc::{ImplItems, TraitItems},
         crate_def_map,
         demand::{
-            body_blocks, bodies_declaring_roots, crate_body_owners, every_body,
+            bodies_declaring_roots, body_blocks, crate_body_owners, every_body,
             macros_declaring_roots, may_declare_roots,
         },
         frozen::{Dec, Enc},
@@ -55,15 +55,14 @@ pub fn plain() -> u8 { 1 }
 fn crate_named(db: &TestDB, name: &str) -> Crate {
     *all_crates(db)
         .iter()
-        .find(|it| {
-            it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name)
-        })
+        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
         .unwrap()
 }
 
 /// The queries of `executed` that lower a body or read what one lowered to.
 fn lowering(executed: &[String]) -> Vec<&String> {
-    const WORDS: &[&str] = &["body", "block_def_map", "exprscopes", "expr_scopes", "expressionstore"];
+    const WORDS: &[&str] =
+        &["body", "block_def_map", "exprscopes", "expr_scopes", "expressionstore"];
     let lowers = |it: &&String| {
         let it = it.to_lowercase();
         WORDS.iter().any(|word| it.contains(word))
@@ -78,9 +77,10 @@ fn bodies_lowered(executed: &[String]) -> usize {
 fn owner_name(db: &TestDB, owner: DefWithBodyId) -> String {
     match owner {
         DefWithBodyId::FunctionId(it) => FunctionSignature::of(db, it).name.as_str().to_owned(),
-        DefWithBodyId::ConstId(it) => {
-            ConstSignature::of(db, it).name.as_ref().map_or("_".to_owned(), |it| it.as_str().to_owned())
-        }
+        DefWithBodyId::ConstId(it) => ConstSignature::of(db, it)
+            .name
+            .as_ref()
+            .map_or("_".to_owned(), |it| it.as_str().to_owned()),
         DefWithBodyId::StaticId(it) => StaticSignature::of(db, it).name.as_str().to_owned(),
         DefWithBodyId::VariantId(it) => it.lookup(db).name.as_str().to_owned(),
     }
@@ -263,8 +263,10 @@ pub enum Twice { A() = 1, A }
         // The name keeps its first place and the last variant's discriminant.
         ("Twice", true, vec![false]),
     ];
-    let expected: Vec<_> =
-        expected.into_iter().map(|(name, free, explicit)| (name.to_owned(), free, explicit)).collect();
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|(name, free, explicit)| (name.to_owned(), free, explicit))
+        .collect();
     assert_eq!(found, expected);
     for &it in &enums {
         let variants = &EnumVariants::of(&db, it).0;
@@ -351,7 +353,8 @@ fn the_blocks_of_a_body_lower_only_it() {
 fn every_body_reaches_the_bodies_in_bodies() {
     let db = fixture::db(BLOCKS).into_db();
     let krate = crate_named(&db, "lib");
-    let mut names: Vec<_> = every_body(&db, krate).into_iter().map(|it| owner_name(&db, it)).collect();
+    let mut names: Vec<_> =
+        every_body(&db, krate).into_iter().map(|it| owner_name(&db, it)).collect();
     names.sort();
     let mut expected: Vec<_> = OWNERS.iter().map(|&(it, _)| it.to_owned()).collect();
     expected.extend(["nested", "plain"].map(str::to_owned));

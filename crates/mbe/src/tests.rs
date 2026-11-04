@@ -68,11 +68,10 @@ fn check_(
     }
     let (node, map) =
         syntax_bridge::token_tree_to_syntax_node(res.value.0.view(), parse, &mut |_| def_edition);
-    let (old_node, old_map) = syntax_bridge::reference::token_tree_to_syntax_node(
-        &res.value.0,
-        parse,
-        &mut |_| def_edition,
-    );
+    let (old_node, old_map) =
+        syntax_bridge::reference::token_tree_to_syntax_node(&res.value.0, parse, &mut |_| {
+            def_edition
+        });
     assert_eq!(node.debug_dump(), old_node.debug_dump(), "the tree the old conversion parses");
     assert!(map == old_map, "the span map of the tree the old conversion parses");
     format_to!(
@@ -577,8 +576,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
         let text = "x ".repeat(trees);
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
         let expand = || {
-            let expanded =
-                mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
             assert!(expanded.err.is_none());
             expanded.value.0.view().token_trees().len()
         };
@@ -624,7 +622,6 @@ fn an_expansion_into_a_frame_allocates_nothing() {
         assert!(expanded.value.0 == global && !expanded.value.0.keeps_words());
     });
 }
-
 
 /// A `stmt` or a `block` is one thing to rustc, so it goes out in a group without delimiters
 /// spanned by its metavariable, and the syntax tree's fragment keeps that span: rustc lints a

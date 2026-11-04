@@ -39,7 +39,9 @@ use crate::{
     hir::{
         ExprId, PatId,
         col::{SlabLayout, SlabWriter},
-        columns::{Checked, ColumnVec, Frozen, Growing, below, entry, idx, len, list, raw, take_exact},
+        columns::{
+            Checked, ColumnVec, Frozen, Growing, below, entry, idx, len, list, raw, take_exact,
+        },
     },
 };
 
@@ -459,9 +461,7 @@ impl<V: ColumnVec> TypeColumns<V> {
                 let [start, count] = self.pair(d)?;
                 TypeRef::DynTrait(list(&self.bounds, start, count, BOUNDS)?)
             }
-            TypeRefKind::TypeParam => {
-                TypeRef::TypeParam(*entry(&self.type_params, d, TYPE_PARAM)?)
-            }
+            TypeRefKind::TypeParam => TypeRef::TypeParam(*entry(&self.type_params, d, TYPE_PARAM)?),
             TypeRefKind::PatternType => {
                 let [ty, pat] = self.pair(d)?;
                 TypeRef::PatternType(idx(ty), idx(pat))
@@ -512,7 +512,10 @@ impl TypeColumns<Growing> {
             }
             TypeRef::Path(path) => raw(self.paths.push_view(path)),
             TypeRef::RawPtr(inner, mutability) => {
-                assert!(raw(inner) >> (u32::BITS - 1) == 0, "a type id too large to share its word");
+                assert!(
+                    raw(inner) >> (u32::BITS - 1) == 0,
+                    "a type id too large to share its word"
+                );
                 raw(inner) << 1 | mutability as u32
             }
             TypeRef::Reference(ref_type) => push_one(&mut self.refs, *ref_type),
@@ -725,10 +728,10 @@ impl TypeColumns<Frozen> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_query::db::FromId;
     use hir_expand::mod_path::{ModPath, PathKind};
     use intern::Symbol;
     use la_arena::RawIdx;
-    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{FunctionId, GenericDefId, TypeOrConstParamId};
@@ -912,16 +915,20 @@ mod tests {
         assert_eq!(columns.check(0, 0, 0), Err(LIST));
 
         let v = values();
-        let mut columns =
-            columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0])), TypeRef::ImplTrait(&v.bounds)])
-                .freeze_into();
+        let mut columns = columns_of(&[
+            TypeRef::Path(Path::BarePath(&v.mod_paths[0])),
+            TypeRef::ImplTrait(&v.bounds),
+        ])
+        .freeze_into();
         columns.extra[1] = v.bounds.len() as u32 + 1;
         assert_eq!(columns.check(0, 0, 1), Err(BOUNDS));
 
         let binder = [TypeBound::ForLifetime(Names { start: 0, len: 2 }, PathId(t(0)))];
-        let columns =
-            columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0])), TypeRef::ImplTrait(&binder)])
-                .freeze_into();
+        let columns = columns_of(&[
+            TypeRef::Path(Path::BarePath(&v.mod_paths[0])),
+            TypeRef::ImplTrait(&binder),
+        ])
+        .freeze_into();
         assert_eq!(columns.check(0, 0, 0), Err("a name run past its table"));
 
         let binder = TypeRef::UnsafeBinder { lifetimes: Names { start: 0, len: 2 }, ty: t(0) };
@@ -931,7 +938,8 @@ mod tests {
         columns.data[1] = 1;
         assert_eq!(columns.check(0, 0, 0), Err(EXTRA));
 
-        let mut columns = columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0]))]).freeze_into();
+        let mut columns =
+            columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0]))]).freeze_into();
         columns.data[0] = 1;
         assert_eq!(columns.check(0, 0, 0), Err(PATH));
 

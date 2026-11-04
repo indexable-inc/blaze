@@ -111,7 +111,8 @@ pub fn of_side(bytes: &[u8]) -> Result<Vec<Row>, String> {
         return Ok(Vec::new());
     }
     // alloc: the error's message
-    let (section, left) = postcard::take_from_bytes::<Section>(rest).map_err(|e| format!("its report: {e}"))?;
+    let (section, left) =
+        postcard::take_from_bytes::<Section>(rest).map_err(|e| format!("its report: {e}"))?;
     if section.version != VERSION {
         // alloc: the error's message
         return Err(format!("a report of version {}, not {VERSION}", section.version));
@@ -138,11 +139,16 @@ pub(crate) fn rows(
     use crate::llvm::report::{Called, Found, Heat as Seen};
 
     let at = |line: u32| -> Result<Option<SpanRef>, String> {
-        let Some(statement) = crate::debuginfo::LineRow::span_of_line(line) else { return Ok(None) };
+        let Some(statement) = crate::debuginfo::LineRow::span_of_line(line) else {
+            return Ok(None);
+        };
         match spans.get(statement as usize) {
             Some(span) => Ok(Some(*span)),
             // alloc: the error's message
-            None => Err(format!("LLVM reports line {line}, of statement {statement}, and it has {}", spans.len())),
+            None => Err(format!(
+                "LLVM reports line {line}, of statement {statement}, and it has {}",
+                spans.len()
+            )),
         }
     };
     let heat = |seen: Seen| match seen {
@@ -161,19 +167,30 @@ pub(crate) fn rows(
             Found::Kept { callee } => {
                 let callee = match callee {
                     Called::Request(request) => {
-                        let target = funcs.get(request as usize).and_then(|&it| refs.get(it as usize));
+                        let target =
+                            funcs.get(request as usize).and_then(|&it| refs.get(it as usize));
                         match target {
-                            Some(blaze_codegen::Target::Function(key) | blaze_codegen::Target::Direct(key)) => {
-                                Callee::Function(*key)
-                            }
+                            Some(
+                                blaze_codegen::Target::Function(key)
+                                | blaze_codegen::Target::Direct(key),
+                            ) => Callee::Function(*key),
                             // clone: the outside symbol's name, once a row
-                            Some(blaze_codegen::Target::Extern(name) | blaze_codegen::Target::Weak(name)) => {
-                                Callee::Extern(name.clone())
+                            Some(
+                                blaze_codegen::Target::Extern(name)
+                                | blaze_codegen::Target::Weak(name),
+                            ) => Callee::Extern(name.clone()),
+                            // alloc: the error's message
+                            Some(other) => {
+                                return Err(format!(
+                                    "a panic path calls request {request}, a {other:?}"
+                                ));
                             }
                             // alloc: the error's message
-                            Some(other) => return Err(format!("a panic path calls request {request}, a {other:?}")),
-                            // alloc: the error's message
-                            None => return Err(format!("a panic path calls request {request}, which nothing places")),
+                            None => {
+                                return Err(format!(
+                                    "a panic path calls request {request}, which nothing places"
+                                ));
+                            }
                         }
                     }
                     Called::Named(name) => Callee::Extern(name),
@@ -190,7 +207,9 @@ pub(crate) fn rows(
             // Interleaving is the vectorizer's other half: a loop it left scalar says so too.
             Found::Analysis { name, .. } if name.starts_with("Interleav") => {}
             Found::Missed { name, .. } if name.starts_with("Interleav") => {}
-            Found::Analysis { message, .. } => why.push((raw.line, raw.loop_line, raw.heat, message)),
+            Found::Analysis { message, .. } => {
+                why.push((raw.line, raw.loop_line, raw.heat, message))
+            }
             Found::Missed { message, .. } => {
                 let said = message.strip_prefix("loop not vectorized").unwrap_or(&message);
                 let said = said.trim_start_matches(':').trim();
@@ -291,15 +310,20 @@ fn reported(
         // alloc: empty, no allocation
         return Ok(Vec::new());
     }
-    let mut owners: blaze_hash::HashSet<hir_def::DefWithBodyId, Global> = blaze_hash::HashSet::new_in(Global);
+    let mut owners: blaze_hash::HashSet<hir_def::DefWithBodyId, Global> =
+        blaze_hash::HashSet::new_in(Global);
     for &item in &built.items {
         use blaze_items::{ItemId, key::Resolved};
         let owner = match blaze_items::resolve(db, item) {
-            Some(Resolved::Item(ItemId::Function(func))) => hir_def::DefWithBodyId::FunctionId(func),
+            Some(Resolved::Item(ItemId::Function(func))) => {
+                hir_def::DefWithBodyId::FunctionId(func)
+            }
             Some(Resolved::Item(ItemId::Static(it))) => hir_def::DefWithBodyId::StaticId(it),
             Some(Resolved::Item(ItemId::Const(it))) => hir_def::DefWithBodyId::ConstId(it),
             Some(Resolved::Variant(it)) => hir_def::DefWithBodyId::VariantId(it),
-            Some(Resolved::Closure { store: hir_def::ExpressionStoreOwnerId::Body(owner), .. }) => owner,
+            Some(Resolved::Closure {
+                store: hir_def::ExpressionStoreOwnerId::Body(owner), ..
+            }) => owner,
             _ => continue,
         };
         owners.insert(owner);
@@ -335,14 +359,21 @@ fn reported(
             };
             let Some(Some((owner, table))) = wanted.get(&at.anchor).copied() else {
                 // alloc: the error's message
-                return Err(format!("`{function}`'s finding names span table {:?}, which no body of the build has", at.anchor));
+                return Err(format!(
+                    "`{function}`'s finding names span table {:?}, which no body of the build has",
+                    at.anchor
+                ));
             };
             let body = super::linked::positions(db, owner).as_ref().map_err(Clone::clone)?;
             let start = body.starts[table] as usize;
             let end = body.starts[table + 1] as usize;
             let Some(&(file, line, column)) = body.rows[start..end].get(at.index as usize) else {
                 // alloc: the error's message
-                return Err(format!("`{function}`'s finding is span {} of a table of {}", at.index, end - start));
+                return Err(format!(
+                    "`{function}`'s finding is span {} of a table of {}",
+                    at.index,
+                    end - start
+                ));
             };
             if !files.contains_key(&file) {
                 files.insert(file, hashes.file_name(db, file)?);
@@ -360,7 +391,9 @@ fn reported(
     }
     out.sort_unstable();
     // The same finding of two instances of one generic function: one line.
-    out.dedup_by(|a, b| (&a.file, a.line, a.column, &a.message) == (&b.file, b.line, b.column, &b.message));
+    out.dedup_by(|a, b| {
+        (&a.file, a.line, a.column, &a.message) == (&b.file, b.line, b.column, &b.message)
+    });
     Ok(out)
 }
 
@@ -405,8 +438,11 @@ fn message<'a>(row: &Row, name_of: &dyn Fn(InstanceKey) -> &'a str) -> String {
 
 /// Which check a panic path is, by the name of what it calls.
 fn check_of(name: &str) -> &'static str {
-    if name.contains("panic_bounds_check") || name.contains("slice_index") || name.contains("slice_start_index")
-        || name.contains("slice_end_index") || name.contains("str_index")
+    if name.contains("panic_bounds_check")
+        || name.contains("slice_index")
+        || name.contains("slice_start_index")
+        || name.contains("slice_end_index")
+        || name.contains("str_index")
     {
         "a bounds check"
     } else if name.contains("div_by_zero") || name.contains("rem_by_zero") {
@@ -439,7 +475,10 @@ mod tests {
         let rows = vec![Row {
             at: Some(span(3)),
             loop_at: Some(span(1)),
-            what: What::Scalar { said: "call instruction cannot be vectorized".into(), why: vec!["x".into()] },
+            what: What::Scalar {
+                said: "call instruction cannot be vectorized".into(),
+                why: vec!["x".into()],
+            },
             heat: Heat::Hot(9000),
         }];
         let (bytes, _) = with_side(None, rows.clone()).unwrap().unwrap();

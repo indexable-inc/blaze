@@ -62,7 +62,12 @@ pub struct Seen {
 
 impl Seen {
     pub fn new(verdict: Verdict) -> Seen {
-        Seen { verdict, ran: AtomicBool::new(false), first: AtomicBool::new(false), retained: AtomicBool::new(false) }
+        Seen {
+            verdict,
+            ran: AtomicBool::new(false),
+            first: AtomicBool::new(false),
+            retained: AtomicBool::new(false),
+        }
     }
 
     /// The store's verdict when the crate loaded.
@@ -92,7 +97,8 @@ impl Seen {
                 Some((SETTLES, contradicted))
             }
             Left::Moved => {
-                if self.retained.swap(true, Ordering::Relaxed) || self.verdict == Verdict::Stateful {
+                if self.retained.swap(true, Ordering::Relaxed) || self.verdict == Verdict::Stateful
+                {
                     return None;
                 }
                 Some((STATEFUL, contradicted))
@@ -151,7 +157,8 @@ mod tests {
                     for i in 0..6 {
                         let retained = runs >> i & 1 == 1;
                         let left = if retained { Left::Moved } else { Left::Nothing };
-                        let told = old.saw(verdict, retained).map(|contradicted| (STATEFUL, contradicted));
+                        let told =
+                            old.saw(verdict, retained).map(|contradicted| (STATEFUL, contradicted));
                         assert_eq!(seen.saw(left), told);
                         if flushes >> i & 1 == 1 {
                             assert_eq!(seen.flush(), old.flush(verdict));

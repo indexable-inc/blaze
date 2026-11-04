@@ -10,19 +10,19 @@
 //! `AtomicOrderingStore`, `AtomicOrderingFence`, `InvalidAtomicOrderingDiag`) (MIT or
 //! Apache-2.0).
 
-use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     AdtId, AttrDefId, FunctionId, ItemContainerId, Lookup as _, ModuleDefId,
     hir::{Expr, ExprId},
     resolver::ValueNs,
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::TyKind;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -68,7 +68,13 @@ impl LatePass for InvalidAtomicOrdering {
 
 impl InvalidAtomicOrdering {
     /// rustc's `check_memory_fence`.
-    fn check_fence(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, args: &[ExprId], out: &mut Vec<Found>) {
+    fn check_fence(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        expr: ExprId,
+        args: &[ExprId],
+        out: &mut Vec<Found>,
+    ) {
         let Some((def, _)) = util::called_fn(b, expr) else { return };
         if self.fences.of(b.db(), def).is_none() {
             return;
@@ -77,14 +83,22 @@ impl InvalidAtomicOrdering {
         if ordering(b, arg) != Some(Ordering::Relaxed) {
             return;
         }
-        let Some(mut diag) = diag(b, arg, "memory fences cannot have `Relaxed` ordering") else { return };
+        let Some(mut diag) = diag(b, arg, "memory fences cannot have `Relaxed` ordering") else {
+            return;
+        };
         diag.help("consider using ordering modes `Acquire`, `Release`, `AcqRel` or `SeqCst`");
         emit(b, expr, def, diag, out);
     }
 }
 
 /// rustc's `check_atomic_load_store`.
-fn check_load_store(b: &BodyCx<'_, '_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
+fn check_load_store(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    method: &str,
+    args: &[ExprId],
+    out: &mut Vec<Found>,
+) {
     let (index, invalid, message, help) = match method {
         "load" => (
             0,
@@ -112,7 +126,13 @@ fn check_load_store(b: &BodyCx<'_, '_, '_>, expr: ExprId, method: &str, args: &[
 }
 
 /// rustc's `check_atomic_compare_exchange`.
-fn check_compare_exchange(b: &BodyCx<'_, '_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
+fn check_compare_exchange(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    method: &str,
+    args: &[ExprId],
+    out: &mut Vec<Found>,
+) {
     let index = match method {
         "update" | "try_update" | "fetch_update" => 1,
         "compare_exchange" | "compare_exchange_weak" => 3,
@@ -144,7 +164,8 @@ fn inherent_atomic_method(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Functi
     if db.impl_trait(impl_).is_some() {
         return None;
     }
-    let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip().kind() else {
+    let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip().kind()
+    else {
         return None;
     };
     let atomic = util::diagnostic_item(db, AttrDefId::AdtId(adt.def_id()))?;
@@ -175,10 +196,19 @@ fn diag(b: &BodyCx<'_, '_, '_>, arg: ExprId, message: impl Into<String>) -> Opti
 }
 
 /// The lint found at the call `expr` of `def`.
-fn emit(b: &BodyCx<'_, '_, '_>, expr: ExprId, def: FunctionId, mut diag: Diag, out: &mut Vec<Found>) {
+fn emit(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    def: FunctionId,
+    mut diag: Diag,
+    out: &mut Vec<Found>,
+) {
     let Some(at) = b.expr_node(expr) else { return };
     let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
     // alloc: the lint's diagnostic
-    diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
+    diag.fact(
+        Fact::Signature(b.cx.key(ItemId::Function(def))),
+        format!("the signature of `{called}`"),
+    );
     out.push(b.lint(diag, Phase::Late, at));
 }

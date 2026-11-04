@@ -4,10 +4,8 @@
 //! [`BodyFacts::def_key`], not by the crate's portable table: a stored body may be of any crate,
 //! the workspace's included, whose def-map indices move on edits.
 
-use std::{
-    mem::{self, offset_of},
-};
 use blaze_hash::hash_map::Entry;
+use std::mem::{self, offset_of};
 
 use base_db::Db;
 use blaze_format::{
@@ -15,13 +13,13 @@ use blaze_format::{
     schema_of,
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule, ImplId, StaticId,
     StructId, TraitId, TypeAliasId, UnionId, expr_store::Body,
 };
+use std::alloc::Global;
 
 use super::{BodyFacts, INSTALLED, Lookup, Step};
 use crate::{
@@ -88,7 +86,11 @@ pub(crate) fn inference<'db>(
 }
 
 #[inline(never)]
-fn stored<'db>(db: &'db Db, def: DefWithBodyId, run: impl FnOnce() -> InferenceResult<'db>) -> InferenceResult<'db> {
+fn stored<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    run: impl FnOnce() -> InferenceResult<'db>,
+) -> InferenceResult<'db> {
     match lookup_inference(db, def) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
@@ -100,7 +102,12 @@ fn stored<'db>(db: &'db Db, def: DefWithBodyId, run: impl FnOnce() -> InferenceR
         Lookup::Hit { value, verify: true } => {
             let fresh = ran(run);
             if fresh != value {
-                super::fail(db, def, Step::Infer, format_args!("stored, it differs from inferring it"));
+                super::fail(
+                    db,
+                    def,
+                    Step::Infer,
+                    format_args!("stored, it differs from inferring it"),
+                );
             }
             fresh
         }
@@ -108,7 +115,10 @@ fn stored<'db>(db: &'db Db, def: DefWithBodyId, run: impl FnOnce() -> InferenceR
 }
 
 /// `def`'s stored inference result, made in this database.
-pub(crate) fn lookup_inference<'db>(db: &'db Db, def: DefWithBodyId) -> Lookup<InferenceResult<'db>> {
+pub(crate) fn lookup_inference<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+) -> Lookup<InferenceResult<'db>> {
     super::lookup(db, def, Step::Infer, SCHEMA, |facts, bytes| decode(db, facts, def, bytes))
 }
 
@@ -119,10 +129,15 @@ pub(crate) fn offer_inference<'db>(
     result: &InferenceResult<'db>,
     reads: Option<blaze_query::db::Reads>,
 ) {
-    super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| encode(db, facts, def, result, out));
+    super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| {
+        encode(db, facts, def, result, out)
+    });
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of every read, which hands it the error by value"
+)]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason an answer does not read
     error.to_string()
@@ -140,7 +155,8 @@ pub(super) fn encode<'db>(
 ) -> R {
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = Table::default();
-    let record = ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
+    let record =
+        ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
     let mut locs = TyTableWriter::new(interner);
     let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
@@ -158,7 +174,11 @@ pub(super) fn encode<'db>(
     let field = |offset: usize| at + offset as u64;
     let root = InferRoot {
         locs,
-        record: Slice::between(field(offset_of!(InferRoot, record)), record_at as u64, record.len()),
+        record: Slice::between(
+            field(offset_of!(InferRoot, record)),
+            record_at as u64,
+            record.len(),
+        ),
         ids: words.slice(field(offset_of!(InferRoot, ids))),
         items: keys.slice(field(offset_of!(InferRoot, items))),
         kinds: kinds.slice(field(offset_of!(InferRoot, kinds))),
@@ -192,7 +212,8 @@ pub(super) fn decode<'db>(
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
     let nodes = Nodes::of(Body::of(db, def));
-    ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes)).map_err(format_error)
+    ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes))
+        .map_err(format_error)
 }
 
 /// The items a [`Keyed`] table listed (`keys`, each of the kind at the same index of `kinds`),
@@ -261,7 +282,14 @@ impl<'a, 'db> Keyed<'a, 'db> {
         body: DefWithBodyId,
     ) -> Keyed<'a, 'db> {
         // alloc: empty until an item is named; once per body offered
-        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: HashMap::new_in(Global) }
+        Keyed {
+            db,
+            facts,
+            body,
+            keys: Vec::new(),
+            kinds: Vec::new(),
+            seen: HashMap::new_in(Global),
+        }
     }
 }
 
@@ -272,7 +300,8 @@ impl ItemSink for Keyed<'_, '_> {
 
     fn index(&mut self, kind: IdKind, bits: u64) -> R<u32> {
         // alloc: the reason a result is not stored
-        let def = solver_def(kind, bits).ok_or_else(|| format!("a {kind:?} of id bits {bits} is no item"))?;
+        let def = solver_def(kind, bits)
+            .ok_or_else(|| format!("a {kind:?} of id bits {bits} is no item"))?;
         let key = self.facts.def_key(self.db, self.body, def);
         match self.seen.entry(key) {
             Entry::Occupied(found) => match *found.get() {

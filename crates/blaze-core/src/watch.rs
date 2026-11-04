@@ -28,8 +28,8 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{RegionVec, Tag as MemTag};
+use std::alloc::Global;
 
 use crate::{Done, FileName, utf8::push_lossy};
 
@@ -131,7 +131,11 @@ impl Tree {
     /// has been read. Nothing else may read the descriptor meanwhile; the caller holds every
     /// other reader off (the threads driver reads it on this thread only; the ring driver
     /// only once the ring's read of it has completed).
-    pub(crate) fn drain(&mut self, buffer: &mut [u8], mut each: impl FnMut(Done)) -> io::Result<()> {
+    pub(crate) fn drain(
+        &mut self,
+        buffer: &mut [u8],
+        mut each: impl FnMut(Done),
+    ) -> io::Result<()> {
         loop {
             let mut fds = [libc::pollfd { fd: self.raw(), events: libc::POLLIN, revents: 0 }];
             let ready = match crate::raw::poll(&mut fds, 0) {
@@ -254,7 +258,10 @@ impl Strings {
         if span.len == 0 {
             return Span::default();
         }
-        let at = self.moves.binary_search_by_key(&span.start, |it| it.0).expect("kept through the squeeze");
+        let at = self
+            .moves
+            .binary_search_by_key(&span.start, |it| it.0)
+            .expect("kept through the squeeze");
         Span { start: self.moves[at].2, len: span.len }
     }
 
@@ -289,7 +296,10 @@ impl Batch {
         let names = names.as_str();
         spans.sort_unstable_by(|a, b| at(names, a).cmp(at(names, b)));
         spans.dedup_by(|a, b| at(names, a) == at(names, b));
-        let files = spans.iter().map(|it| FileName::new(at(names, it)).expect("checked as it was pushed")).collect(); // alloc: the completion's payload, one per name changed.
+        let files = spans
+            .iter()
+            .map(|it| FileName::new(at(names, it)).expect("checked as it was pushed"))
+            .collect(); // alloc: the completion's payload, one per name changed.
         self.names.clear();
         self.spans.clear();
         Done::Changed { files, lost }
@@ -416,7 +426,8 @@ fn list(fd: RawFd, buffer: &mut [u8], mut each: impl FnMut(&[u8], bool)) {
     loop {
         // SAFETY: an open directory and a buffer of `buffer.len()` bytes, which the call
         // writes at most.
-        let got = unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        let got =
+            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
         if got <= 0 {
             return;
         }
@@ -454,7 +465,9 @@ fn is_dir_at(dir: RawFd, name: &[u8]) -> bool {
     c[..name.len()].copy_from_slice(name);
     let mut stat = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: an open directory, a NUL-terminated name and a `stat` to fill.
-    let got = unsafe { libc::fstatat(dir, c.as_ptr().cast(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    let got = unsafe {
+        libc::fstatat(dir, c.as_ptr().cast(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
     // SAFETY: the call succeeded, so it filled the `stat`.
     got == 0 && unsafe { stat.assume_init_ref() }.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
@@ -496,7 +509,12 @@ impl Room {
 
 impl Inotify {
     /// Watches `dir` under `root` and every directory under it, into `room`'s tables.
-    fn new(root: &Path, dir: &FileName, nonblocking: bool, room: Option<Room>) -> io::Result<Inotify> {
+    fn new(
+        root: &Path,
+        dir: &FileName,
+        nonblocking: bool,
+        room: Option<Room>,
+    ) -> io::Result<Inotify> {
         let flags = libc::IN_CLOEXEC | if nonblocking { libc::IN_NONBLOCK } else { 0 };
         // SAFETY: no pointers; a descriptor of its own or -1.
         let fd = unsafe { libc::inotify_init1(flags) };

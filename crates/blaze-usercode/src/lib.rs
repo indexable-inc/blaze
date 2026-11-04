@@ -142,7 +142,10 @@ impl Given {
     /// passed to its server with each expansion): one part, hashed in name order as they are
     /// lent, with no copy. Named twice, the last value is kept. [`Given::sets`] and
     /// [`Given::vars`] don't name them.
-    pub fn env_keyed<'a>(&mut self, vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> &mut Given {
+    pub fn env_keyed<'a>(
+        &mut self,
+        vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> &mut Given {
         self.env_keyed_ported(vars, roots::Roots::none())
     }
 
@@ -161,7 +164,12 @@ impl Given {
 
     /// [`Given::part`] of `bytes` written against `roots` ([`roots::Roots::port`]), hashed as it
     /// is ported, with no copy: the same in every checkout whose roots are where its paths are.
-    pub fn ported(&mut self, name: &'static str, bytes: &[u8], roots: &roots::Roots<'_>) -> &mut Given {
+    pub fn ported(
+        &mut self,
+        name: &'static str,
+        bytes: &[u8],
+        roots: &roots::Roots<'_>,
+    ) -> &mut Given {
         let mut hasher = Hasher::new(Given::PART);
         if roots.is_empty() && !bytes.contains(&0) {
             hasher.update(bytes);
@@ -227,7 +235,11 @@ impl Given {
         match self.parts[..len].binary_search_by(|it| it.0.cmp(name)) {
             Ok(at) => self.parts[at].1 = hash,
             Err(at) => {
-                assert!(len < Given::PARTS, "a run is given at most {} parts; `{name}` is one more", Given::PARTS);
+                assert!(
+                    len < Given::PARTS,
+                    "a run is given at most {} parts; `{name}` is one more",
+                    Given::PARTS
+                );
                 self.parts.copy_within(at..len, at + 1);
                 self.parts[at] = (name, hash);
                 self.len = len + 1;
@@ -347,7 +359,10 @@ mod tests {
     use super::*;
 
     fn key() -> RunKey {
-        RunKey { code: ContentId::of("blaze v2 test 1", b"script"), given: Given::new(RunKind::BuildScript).finish() }
+        RunKey {
+            code: ContentId::of("blaze v2 test 1", b"script"),
+            given: Given::new(RunKind::BuildScript).finish(),
+        }
     }
 
     #[test]
@@ -412,13 +427,20 @@ mod tests {
         let long = vec![b'x'; Batched::LEN + 3];
         let edge = vec![b'y'; Batched::LEN - 20];
         let names: Vec<String> = (0..200).map(|it| format!("VAR_{it:03}")).collect();
-        let mut vars: Vec<(&[u8], &[u8])> = names.iter().map(|it| (it.as_bytes(), b"value".as_slice())).collect();
+        let mut vars: Vec<(&[u8], &[u8])> =
+            names.iter().map(|it| (it.as_bytes(), b"value".as_slice())).collect();
         vars.push((b"WIDE".as_slice(), long.as_slice()));
         vars.push((b"ZEDGE".as_slice(), edge.as_slice()));
         vars.push((b"ZZ".as_slice(), b"".as_slice()));
         // Names that tie on their first sixteen bytes, one a prefix of others, and a short one
         // that ties with a zero byte after it: ordered as their bytes are.
-        for name in [&b"CARGO_CFG_TARGET_OS"[..], b"CARGO_CFG_TARGET_ARCH", b"CARGO_CFG_TARGET_", b"A", b"A\0"] {
+        for name in [
+            &b"CARGO_CFG_TARGET_OS"[..],
+            b"CARGO_CFG_TARGET_ARCH",
+            b"CARGO_CFG_TARGET_",
+            b"A",
+            b"A\0",
+        ] {
             vars.push((name, b"v".as_slice()));
         }
         vars.sort_by(|a, b| a.0.cmp(b.0));
@@ -449,7 +471,11 @@ mod tests {
     fn macro_given() -> Given {
         let vars = [("CARGO_PKG_NAME", "a"), ("A", "1"), ("CARGO_PKG_NAME", "b")];
         let mut given = Given::new(RunKind::ProcMacro);
-        given.part("name", b"derive").part("kind", &[0]).part("input", b"tokens").part("dir", b"/w");
+        given
+            .part("name", b"derive")
+            .part("kind", &[0])
+            .part("input", b"tokens")
+            .part("dir", b"/w");
         given.env_keyed(vars.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
         given
     }
@@ -457,13 +483,16 @@ mod tests {
     #[test]
     fn a_macros_given_and_its_finish_allocate_nothing() {
         let warm = macro_given().finish();
-        let again = blaze_alloc_count::assert_at_most(0, "a proc macro's given, made and finished", || {
-            macro_given().finish()
-        });
+        let again =
+            blaze_alloc_count::assert_at_most(0, "a proc macro's given, made and finished", || {
+                macro_given().finish()
+            });
         assert_eq!(warm, again);
         let mut script = Given::new(RunKind::BuildScript);
         script.arg("build").env("OUT_DIR", "/o").stdin(b"").part("target", b"x86_64");
-        blaze_alloc_count::assert_at_most(0, "a build script's given, finished", || script.finish());
+        blaze_alloc_count::assert_at_most(0, "a build script's given, finished", || {
+            script.finish()
+        });
     }
 
     #[test]
@@ -480,11 +509,13 @@ mod tests {
         unsorted.files.push(unsorted.files[0].clone());
         let key = key();
         let warm = (key.traced(&normal), key.traced(&unsorted));
-        let normal_key =
-            blaze_alloc_count::assert_at_most(0, "the key of a normal Traced", || key.traced(&normal));
-        let unsorted_key = blaze_alloc_count::assert_at_most(0, "the key of a Traced not normal", || {
-            key.traced(&unsorted)
+        let normal_key = blaze_alloc_count::assert_at_most(0, "the key of a normal Traced", || {
+            key.traced(&normal)
         });
+        let unsorted_key =
+            blaze_alloc_count::assert_at_most(0, "the key of a Traced not normal", || {
+                key.traced(&unsorted)
+            });
         assert_eq!(warm, (normal_key, unsorted_key));
         assert_eq!(normal_key, unsorted_key);
     }

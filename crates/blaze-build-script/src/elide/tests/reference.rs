@@ -63,9 +63,9 @@ fn printed(tokens: &[Token<'_>]) -> Option<String> {
         };
         let start = at + 3;
         let end = start
-            + tokens[start..].iter().position(|it| {
-                matches!(it.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}'))
-            })?;
+            + tokens[start..]
+                .iter()
+                .position(|it| matches!(it.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}')))?;
         if !tokens[end].is_punct(close) {
             return None;
         }

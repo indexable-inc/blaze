@@ -19,7 +19,9 @@ use hir_ty::{
     next_solver::{GenericArgs, ParamEnv},
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_identity::{CodeId, CompileIdentity, Compiled, Instance, Subject, code_id, instance_identity};
+use hir_ty_identity::{
+    CodeId, CompileIdentity, Compiled, Instance, Subject, code_id, instance_identity,
+};
 use hir_ty_mir::mir::dispatch::Body;
 
 use super::{Edit, LIBRARIES, Model, TestDB, Width, edits, run_cases};
@@ -121,15 +123,17 @@ fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
     let db = fixture::db(text).into_db();
     blaze_query::db::attach(&db, || {
         let env: StoredParamEnvAndCrate =
-            ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(&db) }.store();
+            ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(&db) }
+                .store();
         let instance = |name: &str| Instance {
             subject: Subject::Body(Body::Fn(function(&db, name))),
             args: GenericArgs::new_from_slice(&[]).store(),
         };
-        let compiled = |name: &str, how: Compiled| match instance_identity(&db, &instance(name), &env, how) {
-            Ok(it) => *it,
-            Err(why) => panic!("`{name}` has no compile identity: {why}\n{text}"),
-        };
+        let compiled =
+            |name: &str, how: Compiled| match instance_identity(&db, &instance(name), &env, how) {
+                Ok(it) => *it,
+                Err(why) => panic!("`{name}` has no compile identity: {why}\n{text}"),
+            };
         let mut roots = ROOTS;
         if let Order::BottomUp = order {
             roots.reverse();
@@ -137,8 +141,8 @@ fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
         roots
             .into_iter()
             .map(|name| {
-                let code =
-                    code_id(&db, &instance(name), &env).unwrap_or_else(|why| panic!("`{name}` has no CodeId: {why}\n{text}"));
+                let code = code_id(&db, &instance(name), &env)
+                    .unwrap_or_else(|why| panic!("`{name}` has no CodeId: {why}\n{text}"));
                 let ids = Ids {
                     debug: compiled(name, DEBUG),
                     moved: compiled(name, MOVED),
@@ -160,7 +164,9 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
         // alloc: a test's lookup, one module's declarations
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => Some(it),
+            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
             _ => None,
         })
         .collect();
@@ -182,15 +188,22 @@ fn identities_keep_or_change(edits: &[Edit]) {
         let mut found = Vec::new();
         let elsewhere = identities(&model.at("/b/elsewhere/src/lib.rs"), Order::BottomUp);
         if elsewhere != now {
-            found.push(format!("checked out elsewhere and asked bottom-up: {elsewhere:?}, against {now:?}"));
+            found.push(format!(
+                "checked out elsewhere and asked bottom-up: {elsewhere:?}, against {now:?}"
+            ));
         }
         for root in ROOTS {
             let (then, here) = (was[root], now[root]);
             let changed = before.reached(root) != model.reached(root);
             if edit.is_cosmetic() && then != here {
-                found.push(format!("`{root}`: {edit:?} changed no code and changed {then:?} to {here:?}"));
+                found.push(format!(
+                    "`{root}`: {edit:?} changed no code and changed {then:?} to {here:?}"
+                ));
             } else if changed && then.code == here.code {
-                found.push(format!("`{root}`: {edit:?} changed what it runs and kept its CodeId {:?}", here.code));
+                found.push(format!(
+                    "`{root}`: {edit:?} changed what it runs and kept its CodeId {:?}",
+                    here.code
+                ));
             } else if !edit.is_cosmetic() && !changed && then.code != here.code {
                 found.push(format!(
                     "`{root}`: {edit:?} changed nothing it reaches and changed its CodeId from {:?} to {:?}",

@@ -136,7 +136,7 @@ mod engine {
     impl InQuery {
         pub(crate) fn new(scattered: bool) -> InQuery {
             let Hits { db, order } = Hits::new(scattered);
-            let input = Sweep::builder(0, order).durability(Durability::LOW).new(&db);
+            let input = Sweep::new(&db, Durability::LOW, 0, order);
             std::hint::black_box(sweep(&db, input));
             InQuery { db, input, tick: 0 }
         }
@@ -192,17 +192,16 @@ mod engine {
         /// `same`: the unrelated input is of the readers' durability, else of a lower one.
         pub(crate) fn new(same: bool) -> Verify {
             let db = Db::new();
-            let pool: Vec<Leaf> = (0..POOL)
-                .map(|i| Leaf::builder(i as u32).durability(Durability::MEDIUM).new(&db))
-                .collect();
+            let pool: Vec<Leaf> =
+                (0..POOL).map(|i| Leaf::new(&db, Durability::MEDIUM, i as u32)).collect();
             let readers: Vec<Reader> = (0..READERS)
                 .map(|r| {
                     let picks = (0..EDGES).map(|e| pool[pick(r, e)]).collect();
-                    Reader::builder(picks).durability(Durability::MEDIUM).new(&db)
+                    Reader::new(&db, Durability::MEDIUM, picks)
                 })
                 .collect();
             let durability = if same { Durability::MEDIUM } else { Durability::LOW };
-            let other = Other::builder(0).durability(durability).new(&db);
+            let other = Other::new(&db, durability, 0);
             let expected = readers.iter().map(|&reader| read_all(&db, reader)).sum();
             Verify { db, readers, other, durability, tick: 0, expected }
         }
@@ -259,16 +258,15 @@ mod engine {
     impl Deep {
         pub(crate) fn new() -> Deep {
             let mut db = Db::new();
-            let leaves: Vec<Leaf> = (0..LEAVES)
-                .map(|i| Leaf::builder(i as u32).durability(Durability::MEDIUM).new(&db))
-                .collect();
+            let leaves: Vec<Leaf> =
+                (0..LEAVES).map(|i| Leaf::new(&db, Durability::MEDIUM, i as u32)).collect();
             let nodes: Vec<Node> = (0..=LAYERS)
                 .flat_map(|layer| (0..WIDTH).map(move |index| (layer as u32, index as u32)))
                 .map(|(layer, index)| Node::new(&db, layer, index))
                 .collect();
             let top = nodes[LAYERS * WIDTH];
-            let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&mut db);
-            let other = Other::builder(0).durability(Durability::MEDIUM).new(&db);
+            let _ = Graph::new(&mut db, Durability::MEDIUM, leaves, nodes);
+            let other = Other::new(&db, Durability::MEDIUM, 0);
             let expected = node(&db, top);
             Deep { db, top, other, tick: 0, expected }
         }
@@ -348,7 +346,7 @@ mod engine {
     impl Cycle {
         pub(crate) fn new() -> Cycle {
             let db = Db::new();
-            let seed = Seed::new(&db, 3);
+            let seed = Seed::new(&db, Durability::LOW, 3);
             assert_eq!(c0(&db, seed), 3);
             Cycle { db, seed, cap: 3 }
         }

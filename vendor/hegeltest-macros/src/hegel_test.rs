@@ -12,10 +12,7 @@ fn is_test_attribute(attr: &Attribute) -> bool {
         syn::Meta::Path(path) => path,
         _ => return false,
     };
-    let candidates = [
-        ["core", "prelude", "*", "test"],
-        ["std", "prelude", "*", "test"],
-    ];
+    let candidates = [["core", "prelude", "*", "test"], ["std", "prelude", "*", "test"]];
     if path.leading_colon.is_none()
         && path.segments.len() == 1
         && path.segments[0].arguments.is_none()
@@ -34,11 +31,7 @@ fn is_test_attribute(attr: &Attribute) -> bool {
 
 pub fn expand_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let test_args: SettingsAttrArgs = if attr.is_empty() {
-        SettingsAttrArgs {
-            settings: None,
-            profile: None,
-            settings_args: Vec::new(),
-        }
+        SettingsAttrArgs { settings: None, profile: None, settings_args: Vec::new() }
     } else {
         match syn::parse2(attr) {
             Ok(args) => args,

@@ -16,7 +16,6 @@ use blaze_format::{
     ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
 };
@@ -31,6 +30,7 @@ use rustc_type_ir::{
     reflect::{ReflectedDomain, ReflectedVar},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     AdtDef, AliasTermKind, AliasTyKind, AnonConstIdWrapper, Binder, BoundConst,
@@ -214,7 +214,9 @@ impl<'db> Source<'db> for Row<'_> {
         let def = SolverDefId::get(self)?;
         let bits = self.word()?;
         let adt = match def {
-            SolverDefId::AdtId(id) => u8::try_from(bits).ok().and_then(|bits| AdtDef::from_parts(id, bits)),
+            SolverDefId::AdtId(id) => {
+                u8::try_from(bits).ok().and_then(|bits| AdtDef::from_parts(id, bits))
+            }
             _ => None,
         };
         Ok(adt.expect("a row's ADT is one `AdtDef::new` made"))
@@ -425,7 +427,8 @@ fn put_id<'db>(sink: &mut impl Sink<'db>, id: blaze_query::db::Id) {
 }
 
 /// What a nonzero generation word after an id's index is refused as: query IDs have none.
-const GENERATION: &str = "an id's generation word, which is always 0 (query ids have no generation)";
+const GENERATION: &str =
+    "an id's generation word, which is always 0 (query ids have no generation)";
 
 fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<blaze_query::db::Id, S::Error> {
     let index = source.word()?;
@@ -1886,8 +1889,16 @@ impl<'db> TyTableWriter<'db> {
         let at = out.next::<TableRec>();
         let field = |offset: usize| at + offset as u64;
         out.push(&TableRec {
-            nodes: Slice::between(field(std::mem::offset_of!(TableRec, nodes)), nodes, self.nodes.len()),
-            words: Slice::between(field(std::mem::offset_of!(TableRec, words)), words, self.words.len()),
+            nodes: Slice::between(
+                field(std::mem::offset_of!(TableRec, nodes)),
+                nodes,
+                self.nodes.len(),
+            ),
+            words: Slice::between(
+                field(std::mem::offset_of!(TableRec, words)),
+                words,
+                self.words.len(),
+            ),
         })
     }
 
@@ -1906,7 +1917,8 @@ impl<'db> TyTableWriter<'db> {
     fn add<N: Node<'db>>(&mut self, key: (Kind, NonZeroU32), node: N) -> u32 {
         let start = self.pending.len();
         ensure_sufficient_stack(|| node.put_node(&mut Children { writer: self }));
-        let place = u32::try_from(self.nodes.len()).expect("a type table of fewer than 2^32 values");
+        let place =
+            u32::try_from(self.nodes.len()).expect("a type table of fewer than 2^32 values");
         let at = u32::try_from(self.words.len()).expect("a type table of fewer than 2^32 words");
         self.nodes.push(NodeRec { kind: N::KIND as u32, at });
         self.words.extend_from_slice(&self.pending[start..]);
@@ -1966,11 +1978,7 @@ pub struct TyTableReader<'a, 'db> {
 impl<'a, 'db> TyTableReader<'a, 'db> {
     /// The table [`TyTableWriter::write`] wrote at `at` in `buffer`. An ADT's flags are read
     /// from `interner`'s database.
-    pub fn open(
-        interner: DbInterner<'db>,
-        buffer: &'a [u8],
-        at: u64,
-    ) -> Result<Self, FormatError> {
+    pub fn open(interner: DbInterner<'db>, buffer: &'a [u8], at: u64) -> Result<Self, FormatError> {
         Self::open_with(buffer, at, |id| crate::check_cache::outside(|| AdtDef::new(id, interner)))
     }
 
@@ -1985,18 +1993,21 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
         let words = table.words.follow(buffer)?;
         let mut values = Vec::with_capacity(nodes.len());
         for (place, node) in nodes.iter().enumerate() {
-            let at = (node as *const NodeRec as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
+            let at =
+                (node as *const NodeRec as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
             let start = node.at as usize;
             let end = nodes.get(place + 1).map_or(words.len(), |next| next.at as usize);
             if start > end || end > words.len() {
-                return Err(FormatError::Invalid { at, what: "a type table value's words out of order" });
+                return Err(FormatError::Invalid {
+                    at,
+                    what: "a type table value's words out of order",
+                });
             }
             let kind = KINDS
                 .get(node.kind as usize)
                 .copied()
                 .ok_or(FormatError::Invalid { at, what: "a type table value of no kind" })?;
-            let mut source =
-                Reading { values: &values, words: &words[start..end], adt: &adt, at };
+            let mut source = Reading { values: &values, words: &words[start..end], adt: &adt, at };
             // A value's children are places of values read before it, so reading one is
             // shallow: no stack check.
             let row = match kind {
@@ -2017,7 +2028,10 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
                 Kind::Clauses => Clauses::get_node(&mut source).map(Node::row),
             }?;
             if !source.words.is_empty() {
-                return Err(FormatError::Invalid { at, what: "a type table value with words left over" });
+                return Err(FormatError::Invalid {
+                    at,
+                    what: "a type table value with words left over",
+                });
             }
             values.push((kind, row));
         }
@@ -2051,10 +2065,13 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
     fn value<N: Node<'db>>(&self, at: u32) -> Result<N, FormatError> {
         match self.values.get(at as usize) {
             Some(&(kind, row)) if kind == N::KIND => Ok(N::at(row)),
-            Some(_) => {
-                Err(FormatError::Invalid { at: u64::from(at), what: "a type table value of another kind" })
+            Some(_) => Err(FormatError::Invalid {
+                at: u64::from(at),
+                what: "a type table value of another kind",
+            }),
+            None => {
+                Err(FormatError::Invalid { at: u64::from(at), what: "a place past the type table" })
             }
-            None => Err(FormatError::Invalid { at: u64::from(at), what: "a place past the type table" }),
         }
     }
 }
@@ -2194,9 +2211,12 @@ mod tests {
         let statik = region(RegionKind::ReStatic);
         let function: FunctionId = id(3);
         let generic = GenericDefId::FunctionId(function);
-        let param = TypeParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(0) });
-        let const_param =
-            ConstParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(1) });
+        let param =
+            TypeParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(0) });
+        let const_param = ConstParamId::from_unchecked(TypeOrConstParamId {
+            parent: generic,
+            local_id: local(1),
+        });
         let lifetime = LifetimeParamId { parent: generic, local_id: local(0) };
         let trait_ = TraitIdWrapper(id(4));
         let alias: TypeAliasId = id(5);
@@ -2244,7 +2264,10 @@ mod tests {
             TyKind::Slice(u8),
             TyKind::RawPtr(u8, Mutability::Mut),
             TyKind::Ref(statik, u8, Mutability::Not),
-            TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), Binder::dummy(args)),
+            TyKind::FnDef(
+                CallableIdWrapper(CallableDefId::FunctionId(function)),
+                Binder::dummy(args),
+            ),
             TyKind::FnDef(
                 CallableIdWrapper(CallableDefId::FunctionId(function)),
                 Binder::bind_with_vars(args, vars),
@@ -2304,7 +2327,10 @@ mod tests {
                 IsRigid::Yes,
                 alias_ty(AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(id(10)) }),
             ),
-            TyKind::Alias(IsRigid::No, alias_ty(AliasTyKind::Free { def_id: FreeTyAliasId(alias) })),
+            TyKind::Alias(
+                IsRigid::No,
+                alias_ty(AliasTyKind::Free { def_id: FreeTyAliasId(alias) }),
+            ),
             TyKind::Param(ParamTy { id: param, index: 0 }),
             TyKind::Bound(BoundVarIndexKind::Bound(INNERMOST), bound_ty(4, BoundTyKind::Anon)),
             TyKind::Bound(
@@ -2330,7 +2356,10 @@ mod tests {
                 BoundVarIndexKind::Bound(DebruijnIndex::from_u32(1)),
                 bound_region(2, BoundRegionKind::Named(SolverDefId::FunctionId(function))),
             ),
-            RegionKind::ReBound(BoundVarIndexKind::Canonical, bound_region(0, BoundRegionKind::Anon)),
+            RegionKind::ReBound(
+                BoundVarIndexKind::Canonical,
+                bound_region(0, BoundRegionKind::Anon),
+            ),
             RegionKind::ReLateParam(LateParamRegion {
                 scope: SolverDefId::FunctionId(function),
                 kind: bound_region(1, BoundRegionKind::ClosureEnv),
@@ -2339,7 +2368,10 @@ mod tests {
             RegionKind::ReVar(RegionVid::from_u32(9)),
             RegionKind::RePlaceholder(PlaceholderRegion::new(
                 UniverseIndex::from_u32(1),
-                bound_region(0, BoundRegionKind::NamedForPrinting(Symbol(intern::sym::tick_static))),
+                bound_region(
+                    0,
+                    BoundRegionKind::NamedForPrinting(Symbol(intern::sym::tick_static)),
+                ),
             )),
             RegionKind::ReErased,
             RegionKind::ReError(ErrorGuaranteed),
@@ -2349,7 +2381,10 @@ mod tests {
             ConstKind::Param(ParamConst { id: const_param, index: 1 }),
             ConstKind::Infer(InferConst::Var(ConstVid::from_u32(3))),
             ConstKind::Infer(InferConst::Fresh(2)),
-            ConstKind::Bound(BoundVarIndexKind::Bound(INNERMOST), BoundConst::new(BoundVar::from_u32(6))),
+            ConstKind::Bound(
+                BoundVarIndexKind::Bound(INNERMOST),
+                BoundConst::new(BoundVar::from_u32(6)),
+            ),
             ConstKind::Bound(BoundVarIndexKind::Canonical, BoundConst::new(BoundVar::from_u32(0))),
             ConstKind::Placeholder(PlaceholderConst::new(
                 UniverseIndex::ROOT,
@@ -2372,7 +2407,10 @@ mod tests {
                 alias_const(AliasConstKind::Free { def_id: FreeConstAliasId(id(6)) }),
             ),
             ConstKind::Alias(IsRigid::Yes, alias_const(AliasConstKind::Anon { def_id: anon })),
-            ConstKind::Value(ValueConst::new(u8, ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8))))),
+            ConstKind::Value(ValueConst::new(
+                u8,
+                ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8))),
+            )),
             ConstKind::Value(ValueConst::new(
                 Ty::intern(TyKind::Tuple(pair)),
                 ValTree::new(ValTreeKind::Branch(Consts::new_from_slice(&[seven, seven]))),
@@ -2383,42 +2421,72 @@ mod tests {
 
         let patterns = vec![
             range,
-            PatternKind::Or(PatList::new_from_slice(&[Pattern::intern(range), Pattern::intern(PatternKind::NotNull)])),
+            PatternKind::Or(PatList::new_from_slice(&[
+                Pattern::intern(range),
+                Pattern::intern(PatternKind::NotNull),
+            ])),
             PatternKind::NotNull,
         ];
 
         let clause = |kind| Binder::dummy(PredicateKind::Clause(kind));
         let normalizes = |kind, term| {
-            Binder::dummy(PredicateKind::NormalizesTo(NormalizesTo { alias: alias_term(kind), term }))
+            Binder::dummy(PredicateKind::NormalizesTo(NormalizesTo {
+                alias: alias_term(kind),
+                term,
+            }))
         };
         let predicates = vec![
-            clause(ClauseKind::Trait(TraitClause { trait_ref, polarity: ClausePolarity::Positive })),
-            clause(ClauseKind::Trait(TraitClause { trait_ref, polarity: ClausePolarity::Negative })),
+            clause(ClauseKind::Trait(TraitClause {
+                trait_ref,
+                polarity: ClausePolarity::Positive,
+            })),
+            clause(ClauseKind::Trait(TraitClause {
+                trait_ref,
+                polarity: ClausePolarity::Negative,
+            })),
             clause(ClauseKind::RegionOutlives(rustc_type_ir::OutlivesClause(statik, statik))),
             clause(ClauseKind::TypeOutlives(rustc_type_ir::OutlivesClause(u8, statik))),
             clause(ClauseKind::Projection(ProjectionClause {
-                projection_term: alias_term(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(alias) }),
+                projection_term: alias_term(AliasTermKind::ProjectionTy {
+                    def_id: TraitAssocTyId::from(alias),
+                }),
                 term: u8.into(),
             })),
             clause(ClauseKind::ConstArgHasType(seven, u8)),
             clause(ClauseKind::WellFormed(u8.into())),
             clause(ClauseKind::ConstEvaluatable(seven)),
-            clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Const })),
-            clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Maybe })),
+            clause(ClauseKind::HostEffect(HostEffectClause {
+                trait_ref,
+                constness: BoundConstness::Const,
+            })),
+            clause(ClauseKind::HostEffect(HostEffectClause {
+                trait_ref,
+                constness: BoundConstness::Maybe,
+            })),
             clause(ClauseKind::UnstableFeature(name("generic_const_items"))),
             clause(ClauseKind::UnstableFeature(name("const_fn"))),
             clause(ClauseKind::UnstableFeature(name(""))),
             Binder::dummy(PredicateKind::DynCompatible(trait_)),
-            Binder::dummy(PredicateKind::Subtype(SubtypePredicate { a_is_expected: true, a: u8, b: u8 })),
+            Binder::dummy(PredicateKind::Subtype(SubtypePredicate {
+                a_is_expected: true,
+                a: u8,
+                b: u8,
+            })),
             Binder::dummy(PredicateKind::Coerce(CoercePredicate { a: u8, b: u8 })),
             Binder::dummy(PredicateKind::ConstEquate(seven, seven)),
             Binder::dummy(PredicateKind::Ambiguous),
             normalizes(AliasTermKind::InherentTy { def_id: InherentAssocTyId(alias) }, u8.into()),
             normalizes(AliasTermKind::OpaqueTy { def_id: OpaqueTyIdWrapper(id(10)) }, u8.into()),
             normalizes(AliasTermKind::FreeTy { def_id: FreeTyAliasId(alias) }, u8.into()),
-            normalizes(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(alias) }, u8.into()),
+            normalizes(
+                AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(alias) },
+                u8.into(),
+            ),
             normalizes(AliasTermKind::AnonConst { def_id: anon }, seven.into()),
-            normalizes(AliasTermKind::ProjectionConst { def_id: TraitAssocConstId(id(6)) }, seven.into()),
+            normalizes(
+                AliasTermKind::ProjectionConst { def_id: TraitAssocConstId(id(6)) },
+                seven.into(),
+            ),
             normalizes(AliasTermKind::FreeConst { def_id: FreeConstAliasId(id(6)) }, seven.into()),
             normalizes(
                 AliasTermKind::InherentConstSelf { def_id: InherentAssocConstId(id(6)) },
@@ -2556,7 +2624,9 @@ mod tests {
         assert_eq!(region(RegionKind::ReErased).flags(), TypeFlags::HAS_RE_ERASED);
         assert_eq!(
             region(RegionKind::ReVar(RegionVid::from_u32(0))).flags(),
-            TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_FREE_LOCAL_REGIONS | TypeFlags::HAS_RE_INFER
+            TypeFlags::HAS_FREE_REGIONS
+                | TypeFlags::HAS_FREE_LOCAL_REGIONS
+                | TypeFlags::HAS_RE_INFER
         );
         let bound = region(RegionKind::ReBound(
             BoundVarIndexKind::Bound(DebruijnIndex::from_u32(1)),
@@ -2575,7 +2645,10 @@ mod tests {
             let leaf = Ty::intern(TyKind::Infer(InferTy::FreshTy(n % 64)));
             match n % 3 {
                 0 => TyKind::Slice(Ty::intern(TyKind::Infer(InferTy::FreshTy(n)))),
-                1 => TyKind::Tuple(Tys::new_from_slice(&[leaf, Ty::intern(TyKind::Infer(InferTy::FreshIntTy(n)))])),
+                1 => TyKind::Tuple(Tys::new_from_slice(&[
+                    leaf,
+                    Ty::intern(TyKind::Infer(InferTy::FreshIntTy(n))),
+                ])),
                 _ => TyKind::Array(leaf, konst(ConstKind::Infer(InferConst::Fresh(n)))),
             }
         };
@@ -2610,7 +2683,11 @@ mod tests {
         let regions: Vec<_> = samples.regions.iter().map(|&kind| region(kind)).collect();
         let consts: Vec<_> = samples.consts.iter().map(|&kind| konst(kind)).collect();
         let clauses = Clauses::new_from_slice(
-            &samples.predicates.iter().map(|&kind| Clause(Predicate::intern(kind))).collect::<Vec<_>>(),
+            &samples
+                .predicates
+                .iter()
+                .map(|&kind| Clause(Predicate::intern(kind)))
+                .collect::<Vec<_>>(),
         );
         let patterns: Vec<_> = samples
             .patterns
@@ -2659,8 +2736,16 @@ mod tests {
         let at = out.next::<TableRec>();
         let field = |offset: usize| at + offset as u64;
         let table = out.push(&TableRec {
-            nodes: Slice::between(field(std::mem::offset_of!(TableRec, nodes)), nodes_at, nodes.len()),
-            words: Slice::between(field(std::mem::offset_of!(TableRec, words)), words_at, words.len()),
+            nodes: Slice::between(
+                field(std::mem::offset_of!(TableRec, nodes)),
+                nodes_at,
+                nodes.len(),
+            ),
+            words: Slice::between(
+                field(std::mem::offset_of!(TableRec, words)),
+                words_at,
+                words.len(),
+            ),
         });
         let buffer = Aligned::copy_from(&out.finish(table));
         TyTableReader::open_with(&buffer, table, adt).is_ok()

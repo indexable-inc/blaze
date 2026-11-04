@@ -52,12 +52,12 @@ pub mod attr_resolution;
 mod batch;
 pub(crate) mod def_site;
 pub use def_site::{
-    binding_key_at, def_binding_key, import_binding_key, param_name, path_param_name,
+    assoc_item_binding_name, for_each_hygienic_trait_in_scope, implemented_name, implements,
+    trait_item_is_written, trait_item_name, trait_item_written, written_key, written_name,
 };
 pub use def_site::{assoc_item_is, assoc_item_key, impl_item_name};
 pub use def_site::{
-    assoc_item_binding_name, for_each_hygienic_trait_in_scope, implemented_name, implements,
-    trait_item_is_written, trait_item_name, trait_item_written, written_key, written_name,
+    binding_key_at, def_binding_key, import_binding_key, param_name, path_param_name,
 };
 pub use def_site::{impl_expansion, privacy_scope, variant_expansion};
 pub mod delta;
@@ -70,8 +70,8 @@ pub use hir_expand::proc_macro::may_have_session_macros;
 mod mod_resolution;
 pub mod named;
 mod path_resolution;
-mod trait_items;
 pub mod proc_macro;
+mod trait_items;
 pub mod uses;
 
 #[cfg(test)]
@@ -86,7 +86,6 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -97,6 +96,7 @@ use intern::{Symbol, sym};
 use itertools::Itertools;
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
+use std::alloc::Global;
 use stdx::format_to;
 use syntax::{
     AstNode, SmolStr, TextSize, ToSmolStr, ast,
@@ -117,9 +117,9 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
+pub(crate) use self::def_site::Hygienic;
 pub use self::facts::impls::{ModuleImpls, module_impls};
 pub use self::path_resolution::ResolvePathResultPrefixInfo;
-pub(crate) use self::def_site::Hygienic;
 
 #[cfg(test)]
 thread_local! {
@@ -156,7 +156,7 @@ pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
             it.set_expand(db).with_durability(Durability::HIGH).to(expand);
         }
         None => {
-            _ = BuiltinDerives::builder(expand).durability(Durability::HIGH).new(db);
+            _ = BuiltinDerives::new(db, Durability::HIGH, expand);
         }
     }
     db.note_crates_changed();
@@ -261,7 +261,8 @@ pub struct DefMap {
     // FIXME: Figure out a better way for the IDE layer to resolve these?
     derive_helpers_in_scope: DeriveHelpers,
 
-    /// Whether collecting declarations ran a macro with compilation-local state.
+    /// Whether collecting declarations ran a proc-macro call whose output may depend on its
+    /// session's state (`hir_expand::proc_macro::StateUse::Session`).
     pub session_macros: bool,
 
     /// What the paths of this def map's imports and macro calls resolved through.
@@ -281,8 +282,11 @@ pub struct DefMap {
     data: Arc<DefMapCrateData>,
 }
 
-type DeriveHelpers =
-    HashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>, Global>;
+type DeriveHelpers = HashMap<
+    AstId<ast::Item>,
+    Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>,
+    Global,
+>;
 
 /// What a collected def map recorded that no resolution reads: how its imports and macro calls
 /// resolved, its diagnostics and the derive helpers in scope of its items.
@@ -675,14 +679,13 @@ pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
 pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
     let pair = crate_local_def_map(db, krate);
     let def_map = pair.def_map(db);
-    let shadows = |scope: &ItemScope| {
-        scope.types().any(|(name, _)| BuiltinType::by_name(name).is_some())
-    };
+    let shadows =
+        |scope: &ItemScope| scope.types().any(|(name, _)| BuiltinType::by_name(name).is_some());
     def_map.modules(db).any(|(_, module)| shadows(module.scope(db)))
         || pair.local(db).extern_prelude().any(|(name, _)| BuiltinType::by_name(name).is_some())
-        || def_map.prelude().is_some_and(|(prelude, _)| {
-            shadows(prelude.def_map(db).module(db, prelude).scope(db))
-        })
+        || def_map
+            .prelude()
+            .is_some_and(|(prelude, _)| shadows(prelude.def_map(db).module(db, prelude).scope(db)))
 }
 
 #[blaze_query::tracked]
@@ -703,7 +706,8 @@ fn crate_display_name(db: &Db, krate: Crate) -> SmolStr {
 
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let _p = tracing::info_span!("crate_def_map_query", krate = ?crate_display_name(db, crate_id)).entered();
+    let _p = tracing::info_span!("crate_def_map_query", krate = ?crate_display_name(db, crate_id))
+        .entered();
 
     if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
         return DefMapPair::new(db, def_map, local_def_map);
@@ -760,7 +764,11 @@ impl Unmaintained {
     }
 }
 
-fn write_crate(f: &mut std::fmt::Formatter<'_>, krate: Crate, name: Option<&str>) -> std::fmt::Result {
+fn write_crate(
+    f: &mut std::fmt::Formatter<'_>,
+    krate: Crate,
+    name: Option<&str>,
+) -> std::fmt::Result {
     match name {
         Some(name) => write!(f, "`{name}` ({krate:?})"),
         None => write!(f, "{krate:?}"),
@@ -1217,11 +1225,7 @@ impl DefMap {
 
     /// Returns the module containing `local_mod`, either the parent `mod`, or the module (or block) containing
     /// the block, if `self` corresponds to a block expression.
-    pub fn containing_module(
-        &self,
-        db: &Db,
-        local_mod: ModuleIdLt<'_>,
-    ) -> Option<ModuleId> {
+    pub fn containing_module(&self, db: &Db, local_mod: ModuleIdLt<'_>) -> Option<ModuleId> {
         match self.module(db, local_mod).parent {
             Some(parent) => Some(parent),
             None => self.block.map(|BlockInfo { parent, .. }| parent),
@@ -1267,13 +1271,7 @@ impl DefMap {
         go(&mut buf, db, current_map, "crate", current_map.root);
         return buf;
 
-        fn go(
-            buf: &mut String,
-            db: &Db,
-            map: &DefMap,
-            path: &str,
-            module: ModuleId,
-        ) {
+        fn go(buf: &mut String, db: &Db, map: &DefMap, path: &str, module: ModuleId) {
             format_to!(buf, "{}\n", path);
 
             map.module(db, module).scope(db).dump(db, buf);
@@ -1301,7 +1299,9 @@ impl DefMap {
         self.prelude
     }
 
-    pub(crate) fn macro_use_prelude(&self) -> &HashMap<Name, (MacroId, Option<ExternCrateId>), Global> {
+    pub(crate) fn macro_use_prelude(
+        &self,
+    ) -> &HashMap<Name, (MacroId, Option<ExternCrateId>), Global> {
         &self.macro_use_prelude
     }
 
@@ -1455,11 +1455,7 @@ impl SourcePosition {
     }
 
     /// The last of `macros`, which are in definition order, that is defined before `node`.
-    fn latest_before(
-        db: &Db,
-        macros: &[MacroId],
-        node: ErasedAstId,
-    ) -> Option<MacroId> {
+    fn latest_before(db: &Db, macros: &[MacroId], node: ErasedAstId) -> Option<MacroId> {
         match macros {
             [] => None,
             [only] => Some(*only),
@@ -1495,12 +1491,7 @@ impl ModuleData {
         visibility: Visibility,
         parent: Option<ModuleId>,
     ) -> Self {
-        ModuleData {
-            origin,
-            visibility,
-            parent,
-            scope: ScopeSlot::Building(Box::default()),
-        }
+        ModuleData { origin, visibility, parent, scope: ScopeSlot::Building(Box::default()) }
     }
 
     /// A module of a `DefMap` being built whose scope and children are already known (a frozen
@@ -1582,10 +1573,7 @@ impl ModuleData {
     }
 
     /// The traits in scope in this module; depends on those only.
-    pub fn traits_in_scope<'a>(
-        &'a self,
-        db: &'a Db,
-    ) -> impl Iterator<Item = crate::TraitId> + 'a {
+    pub fn traits_in_scope<'a>(&'a self, db: &'a Db) -> impl Iterator<Item = crate::TraitId> + 'a {
         let (building, collected) = match &self.scope {
             ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
             ScopeSlot::Input(input) => {
@@ -1594,10 +1582,12 @@ impl ModuleData {
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
                 None,
                 Some(
-                    <ModuleScope<'a> as blaze_query::db::FromId>::from_id(self.scope.handle(db).expect("a handed-over slot"))
-                        .traits(db)
-                        .iter()
-                        .copied(),
+                    <ModuleScope<'a> as blaze_query::db::FromId>::from_id(
+                        self.scope.handle(db).expect("a handed-over slot"),
+                    )
+                    .traits(db)
+                    .iter()
+                    .copied(),
                 ),
             ),
         };
@@ -1621,7 +1611,7 @@ impl ModuleData {
             ScopeSlot::Building(building) => &mut building.children,
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
                 panic!("the children of a collected module are read-only")
-            },
+            }
         }
     }
 
@@ -1631,7 +1621,7 @@ impl ModuleData {
             ScopeSlot::Building(building) => &mut building.scope,
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
                 panic!("the scope of a collected module is read-only")
-            },
+            }
         }
     }
 
@@ -1677,10 +1667,7 @@ impl ModuleData {
     }
 
     /// [`ModuleData::declaration_source`] as a view.
-    pub fn declaration_source_view<'db>(
-        &self,
-        db: &'db Db,
-    ) -> Option<InFile<view::Module<'db>>> {
+    pub fn declaration_source_view<'db>(&self, db: &'db Db) -> Option<InFile<view::Module<'db>>> {
         let decl = self.origin.declaration()?;
         Some(InFile::new(decl.file_id, decl.to_view(db)))
     }
@@ -1749,11 +1736,7 @@ pub(crate) fn macro_styles_from_id(db: &Db, macro_id: MacroId) -> MacroCallStyle
 /// We ignore resolutions from one sub-namespace when searching names in scope for another.
 ///
 /// [rustc]: https://github.com/rust-lang/rust/blob/1.69.0/compiler/rustc_resolve/src/macros.rs#L75
-fn sub_namespace_match(
-    db: &Db,
-    macro_id: MacroId,
-    expected: Option<MacroSubNs>,
-) -> bool {
+fn sub_namespace_match(db: &Db, macro_id: MacroId, expected: Option<MacroSubNs>) -> bool {
     let candidate = macro_styles_from_id(db, macro_id);
     match expected {
         Some(MacroSubNs::Bang) => candidate.contains(MacroCallStyles::FN_LIKE),

@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use intern::{Symbol, sym};
 use span::{Edition, Span, SyntaxContext};
+use std::alloc::Global;
 use tt::{
     MAX_GLUED_PUNCT_LEN,
     iter::{TtElement, TtIter},
@@ -112,13 +112,35 @@ pub(crate) enum Op {
         spec: Option<Symbol>,
         decl: Span,
     },
-    Ignore { name: MetaVar, id: Span, binder: Binder },
-    Index { depth: usize },
-    Len { depth: usize },
-    Count { name: MetaVar, depth: usize, binder: Binder },
-    Concat { elements: Box<[ConcatMetaVarExprElem]>, span: Span },
-    Repeat { tokens: MetaTemplate, kind: RepeatKind, separator: Option<Arc<Separator>> },
-    Subtree { tokens: MetaTemplate, delimiter: tt::Delimiter },
+    Ignore {
+        name: MetaVar,
+        id: Span,
+        binder: Binder,
+    },
+    Index {
+        depth: usize,
+    },
+    Len {
+        depth: usize,
+    },
+    Count {
+        name: MetaVar,
+        depth: usize,
+        binder: Binder,
+    },
+    Concat {
+        elements: Box<[ConcatMetaVarExprElem]>,
+        span: Span,
+    },
+    Repeat {
+        tokens: MetaTemplate,
+        kind: RepeatKind,
+        separator: Option<Arc<Separator>>,
+    },
+    Subtree {
+        tokens: MetaTemplate,
+        delimiter: tt::Delimiter,
+    },
     Literal(tt::Literal),
     Punct(Box<ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>),
     Ident(tt::Ident),
@@ -425,7 +447,8 @@ fn kleene_or_separator(src: &mut TtIter<'_>) -> Result<Result<RepeatKind, Separa
                 [tt::Punct { char: '?', .. }] => Ok(RepeatKind::ZeroOrOne),
                 // A lifetime is one token to rustc.
                 [quote @ tt::Punct { char: '\'', .. }] => {
-                    let name = src.expect_ident_or_underscore().map_err(|()| ParseError::InvalidRepeat)?;
+                    let name =
+                        src.expect_ident_or_underscore().map_err(|()| ParseError::InvalidRepeat)?;
                     Err(Separator::Lifetime(*quote, name))
                 }
                 _ => Err(Separator::Puncts(puncts)),

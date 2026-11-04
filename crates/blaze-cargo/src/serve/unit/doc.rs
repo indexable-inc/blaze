@@ -6,19 +6,24 @@
 use blaze_api::{ApiError, Diagnostic, Documented, DocumentedCrate, Level, Response};
 use blaze_doc::{Asked, TestOnly, html::Pages, model::Warning};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_lower::Lowered;
 use blaze_units::{
     query::{PackagePlan, Units},
     schema::Mode,
 };
+use std::alloc::Global;
 
 use super::Job;
 
 /// The documentation of the check's root units, and unless `no_deps` of every library they
 /// depend on: what is documented and where, each file, then the warnings rustdoc would give of
 /// the crates asked for.
-pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool) -> Result<Vec<Response>, ApiError> {
+pub(super) fn doc(
+    job: &Job,
+    lowered: &mut Lowered,
+    no_deps: bool,
+    private: bool,
+) -> Result<Vec<Response>, ApiError> {
     let units = &job.input.units;
     let asked = asked(units, lowered, private)?;
     let packages = packages(units, lowered);
@@ -26,8 +31,12 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
     // a member's dev-dependencies is in the crate graph to leave out.
     let test_only = TestOnly::default();
     let db = lowered.served_db();
-    let crates = blaze_query::db::attach(db, || blaze_doc::crates_to_document(db, &asked, no_deps, &test_only))
-        .map_err(|unnamed| ApiError::new(format!("{unnamed} has no name to file its pages under"), None))?;
+    let crates = blaze_query::db::attach(db, || {
+        blaze_doc::crates_to_document(db, &asked, no_deps, &test_only)
+    })
+    .map_err(|unnamed| {
+        ApiError::new(format!("{unnamed} has no name to file its pages under"), None)
+    })?;
     if crates.is_empty() {
         return Err(ApiError::new("nothing to document", None));
     }
@@ -45,7 +54,8 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
         .iter()
         .map(|it| {
             let krate = base_db::Crate::from(it.krate);
-            let package = packages.get(&krate).map_or_else(|| it.name.clone(), |plan| described(plan));
+            let package =
+                packages.get(&krate).map_or_else(|| it.name.clone(), |plan| described(plan));
             let asked = asked.iter().any(|one| one.krate == it.krate);
             DocumentedCrate { name: it.name.clone(), package, asked }
         })
@@ -61,8 +71,14 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
         pages: written.pages as u64,
         source_pages: written.source_pages as u64,
     }));
-    out.extend(files.into_iter().map(|page| Response::DocPage { path: page.path, page: page.bytes }));
-    out.extend(warnings(&model.warnings, &job.input.config.invocation.cwd).into_iter().map(Response::Diagnostic));
+    out.extend(
+        files.into_iter().map(|page| Response::DocPage { path: page.path, page: page.bytes }),
+    );
+    out.extend(
+        warnings(&model.warnings, &job.input.config.invocation.cwd)
+            .into_iter()
+            .map(Response::Diagnostic),
+    );
     Ok(out)
 }
 
@@ -87,14 +103,21 @@ fn asked(units: &Units, lowered: &Lowered, private: bool) -> Result<Vec<Asked>, 
         asked.push(Asked { krate: hir::Crate::from(krate), private: private || !lib });
     }
     if asked.is_empty() {
-        return Err(ApiError::new("no library or binary to document in the packages asked for", None));
+        return Err(ApiError::new(
+            "no library or binary to document in the packages asked for",
+            None,
+        ));
     }
     Ok(asked)
 }
 
 /// Each lowered crate's package.
-fn packages<'a>(units: &'a Units, lowered: &Lowered) -> HashMap<base_db::Crate, &'a PackagePlan, Global> {
-    let by_id: HashMap<&str, &PackagePlan, Global> = units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
+fn packages<'a>(
+    units: &'a Units,
+    lowered: &Lowered,
+) -> HashMap<base_db::Crate, &'a PackagePlan, Global> {
+    let by_id: HashMap<&str, &PackagePlan, Global> =
+        units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
     let mut out = HashMap::new_in(Global);
     for (at, unit) in units.graph.units.iter().enumerate() {
         if let (Some(krate), Some(plan)) = (lowered.krate(at), by_id.get(unit.pkg_id.as_str())) {

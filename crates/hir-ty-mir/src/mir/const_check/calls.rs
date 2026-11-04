@@ -348,10 +348,32 @@ impl<'db> Checker<'_, 'db> {
     fn is_operator(&self, trait_: TraitId) -> bool {
         let l = self.lang;
         [
-            l.Add, l.Sub, l.Mul, l.Div, l.Rem, l.Neg, l.Not, l.BitXor, l.BitAnd, l.BitOr, l.Shl,
-            l.Shr, l.AddAssign, l.SubAssign, l.MulAssign, l.DivAssign, l.RemAssign,
-            l.BitXorAssign, l.BitAndAssign, l.BitOrAssign, l.ShlAssign, l.ShrAssign, l.Index,
-            l.IndexMut, l.PartialEq, l.PartialOrd,
+            l.Add,
+            l.Sub,
+            l.Mul,
+            l.Div,
+            l.Rem,
+            l.Neg,
+            l.Not,
+            l.BitXor,
+            l.BitAnd,
+            l.BitOr,
+            l.Shl,
+            l.Shr,
+            l.AddAssign,
+            l.SubAssign,
+            l.MulAssign,
+            l.DivAssign,
+            l.RemAssign,
+            l.BitXorAssign,
+            l.BitAndAssign,
+            l.BitOrAssign,
+            l.ShlAssign,
+            l.ShrAssign,
+            l.Index,
+            l.IndexMut,
+            l.PartialEq,
+            l.PartialOrd,
         ]
         .contains(&Some(trait_))
     }
@@ -374,18 +396,23 @@ impl<'db> Checker<'_, 'db> {
         match stability::const_stability(db, Item::Fn(callee)) {
             None => {
                 if !const_stable_indirect && self.recursive {
-                    let path = described(db, self.krate, callee, GenericArgs::new_from_slice(&[])).1;
+                    let path =
+                        described(db, self.krate, callee, GenericArgs::new_from_slice(&[])).1;
                     self.report(ConstCheckKind::UnmarkedIntrinsicExposed { path }, span);
                 }
             }
             Some(stability::ConstStability {
-                level: stability::Level::Unstable { feature, .. }, ..
+                level: stability::Level::Unstable { feature, .. },
+                ..
             }) => {
-                if const_stable_indirect && stability::allows_unstable(db, self.owner, span, feature) {
+                if const_stable_indirect
+                    && stability::allows_unstable(db, self.owner, span, feature)
+                {
                     return;
                 }
                 // clone: a `Symbol`, a count bumped
-                let kind = ConstCheckKind::UnstableIntrinsic { name: name(), feature: feature.clone() };
+                let kind =
+                    ConstCheckKind::UnstableIntrinsic { name: name(), feature: feature.clone() };
                 let status = Status::Unstable {
                     // clone: a `Symbol`, a count bumped
                     gate: feature.clone(),
@@ -410,12 +437,9 @@ impl<'db> Checker<'_, 'db> {
                     // A sysroot trait's name is unique, which rustc's trimmed path writes alone.
                     // alloc: the text of a diagnostic, made when it is reported
                     true => name.to_owned(),
-                    false => super::def_path(
-                        db,
-                        krate,
-                        hir_def::HasModule::module(&trait_, db),
-                        name,
-                    ),
+                    false => {
+                        super::def_path(db, krate, hir_def::HasModule::module(&trait_, db), name)
+                    }
                 }
             }
         };
@@ -534,7 +558,9 @@ fn has_const_conditions(db: &base_db::Db, callee: FunctionId) -> bool {
     }
     match callee.lookup(db).container {
         ItemContainerId::TraitId(trait_) => trait_is_const(db, trait_),
-        ItemContainerId::ImplId(impl_) => impl_is_const(db, impl_.into()) && maybe_const(impl_.into()),
+        ItemContainerId::ImplId(impl_) => {
+            impl_is_const(db, impl_.into()) && maybe_const(impl_.into())
+        }
         _ => false,
     }
 }

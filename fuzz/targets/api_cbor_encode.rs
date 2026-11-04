@@ -51,7 +51,11 @@ const DEEPEST: u32 = 8;
 fn check(data: &[u8]) {
     let shape = Program { bytes: data, at: 0, nodes: 0 }.shape(DEEPEST);
     let new = cbor::to_vec(&shape);
-    assert_eq!(new, reference::to_vec(&shape), "the encoder writes what the reference does, or refuses as it does");
+    assert_eq!(
+        new,
+        reference::to_vec(&shape),
+        "the encoder writes what the reference does, or refuses as it does"
+    );
 
     let mut writer = Writer::new();
     let mut out = vec![0xee];
@@ -63,30 +67,55 @@ fn check(data: &[u8]) {
     let framed = blaze_protocol::append_frame(&mut writer, &mut frame, &shape);
     match &new {
         Ok(bytes) => {
-            assert_eq!((&first, &second, &alone), (&Ok(()), &Ok(()), &Ok(())), "every writer writes what to_vec does");
+            assert_eq!(
+                (&first, &second, &alone),
+                (&Ok(()), &Ok(()), &Ok(())),
+                "every writer writes what to_vec does"
+            );
             assert_eq!(out.len(), 1 + 2 * bytes.len(), "a kept writer appends the value's bytes");
             assert_eq!(out[0], 0xee, "a writer leaves the bytes before it alone");
             assert_eq!(&out[1..1 + bytes.len()], &bytes[..], "a writer appends what to_vec writes");
-            assert_eq!(&out[1 + bytes.len()..], &bytes[..], "a kept writer writes the same bytes again");
+            assert_eq!(
+                &out[1 + bytes.len()..],
+                &bytes[..],
+                "a kept writer writes the same bytes again"
+            );
             assert_eq!(appended[1..], bytes[..], "append writes what to_vec does");
             framed.expect("a value of a few kilobytes has a frame");
             assert_eq!(frame[..3], [1, 2, 3], "append_frame leaves the bytes before it alone");
-            assert_eq!(frame[3..7], (bytes.len() as u32).to_be_bytes(), "a frame starts with its length");
+            assert_eq!(
+                frame[3..7],
+                (bytes.len() as u32).to_be_bytes(),
+                "a frame starts with its length"
+            );
             assert_eq!(frame[7..], bytes[..], "a frame's item is what to_vec writes");
             let read = blaze_protocol::read_frame(&mut &frame[3..]).expect("a written frame reads");
-            assert_eq!(read.as_ref(), Some(bytes), "read_frame reads back the item append_frame wrote");
+            assert_eq!(
+                read.as_ref(),
+                Some(bytes),
+                "read_frame reads back the item append_frame wrote"
+            );
 
             assert_eq!(cbor::check(bytes), Ok(()), "what the encoder writes is canonical");
-            let value = cbor::from_slice::<Value<'_>>(bytes).expect("what the encoder writes decodes");
+            let value =
+                cbor::from_slice::<Value<'_>>(bytes).expect("what the encoder writes decodes");
             assert_eq!(
                 reference::from_slice::<Value<'_>>(bytes).as_ref(),
                 Ok(&value),
                 "the two decoders read what the encoder writes alike"
             );
-            assert_eq!(cbor::to_vec(&value).as_ref(), Ok(bytes), "what the encoder writes reads back to itself");
+            assert_eq!(
+                cbor::to_vec(&value).as_ref(),
+                Ok(bytes),
+                "what the encoder writes reads back to itself"
+            );
         }
         Err(error) => {
-            assert_eq!((first.as_ref(), second.as_ref(), alone.as_ref()), (Err(error), Err(error), Err(error)), "every writer refuses what to_vec does");
+            assert_eq!(
+                (first.as_ref(), second.as_ref(), alone.as_ref()),
+                (Err(error), Err(error), Err(error)),
+                "every writer refuses what to_vec does"
+            );
             assert_eq!(out, [0xee], "a refused value leaves the buffer as it was");
             assert_eq!(appended, [0xee], "a refused value leaves the buffer as it was");
             assert!(framed.is_err(), "append_frame refuses what to_vec does");

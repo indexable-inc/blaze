@@ -162,8 +162,10 @@ impl Uring {
             Kind::Close => {}
             kind if on_path(kind) => self.path_end(&hot, cold),
             Kind::Watch => {
-                let Watching { tree, buffer, mut flushes, .. } =
-                    self.watchings.remove(Handle::from_bits(hot.of)).expect("a watch's read's watching");
+                let Watching { tree, buffer, mut flushes, .. } = self
+                    .watchings
+                    .remove(Handle::from_bits(hot.of))
+                    .expect("a watch's read's watching");
                 self.give_back(buffer);
                 let spare = tree.end();
                 if self.trees.len() < SPARES {
@@ -204,9 +206,13 @@ impl Uring {
         let user_data = data(id, 0);
         let done = hot.done as usize;
         // What of its buffer is still to go: where it starts and how long it is.
-        let rest = || (buf[done..].as_ptr() as u64, (buf.len() - done).min(u32::MAX as usize) as u32);
-        let kept = || self.kept.get(Handle::from_bits(hot.of)).expect("held by its request").fixed.target();
-        let socket = || self.conns.get(conn_of(Conn(hot.of))).expect("used by its request").socket.target();
+        let rest =
+            || (buf[done..].as_ptr() as u64, (buf.len() - done).min(u32::MAX as usize) as u32);
+        let kept = || {
+            self.kept.get(Handle::from_bits(hot.of)).expect("held by its request").fixed.target()
+        };
+        let socket =
+            || self.conns.get(conn_of(Conn(hot.of))).expect("used by its request").socket.target();
         // Every buffer and address below stays where it is until the request's last
         // completion: the columns and the slabs are reserved memory that never moves, and
         // what a request holds in them stays until it ends (`Uring::end`).
@@ -219,14 +225,26 @@ impl Uring {
             Kind::Append => {
                 let ((fd, flags), (addr, len)) = (kept(), rest());
                 // The file's position, which is its end: it is open for appending.
-                Sqe { opcode: OP_WRITE, flags, fd, off: u64::MAX, addr, len, user_data, ..Sqe::default() }
+                Sqe {
+                    opcode: OP_WRITE,
+                    flags,
+                    fd,
+                    off: u64::MAX,
+                    addr,
+                    len,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             Kind::Sync => {
                 let (fd, flags) = kept();
                 Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
             }
             Kind::Watch => {
-                let watching = self.watchings.get(Handle::from_bits(hot.of)).expect("a watch's read's watching");
+                let watching = self
+                    .watchings
+                    .get(Handle::from_bits(hot.of))
+                    .expect("a watch's read's watching");
                 Sqe {
                     opcode: OP_READ,
                     fd: watching.tree.raw(),
@@ -237,10 +255,21 @@ impl Uring {
                     ..Sqe::default()
                 }
             }
-            Kind::Cancel => Sqe { opcode: OP_ASYNC_CANCEL, fd: -1, addr: hot.of, user_data, ..Sqe::default() },
+            Kind::Cancel => {
+                Sqe { opcode: OP_ASYNC_CANCEL, fd: -1, addr: hot.of, user_data, ..Sqe::default() }
+            }
             Kind::Exit => {
-                let spawn = self.spawns.get(Handle::from_bits(hot.of)).expect("an exit's spawn, in flight while it is");
-                Sqe { opcode: OP_POLL_ADD, fd: spawn.pidfd.as_raw_fd(), op_flags: libc::POLLIN as u32, user_data, ..Sqe::default() }
+                let spawn = self
+                    .spawns
+                    .get(Handle::from_bits(hot.of))
+                    .expect("an exit's spawn, in flight while it is");
+                Sqe {
+                    opcode: OP_POLL_ADD,
+                    fd: spawn.pidfd.as_raw_fd(),
+                    op_flags: libc::POLLIN as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             // A pipe has no position.
             Kind::Output => Sqe {
@@ -254,12 +283,24 @@ impl Uring {
             },
             Kind::Input => {
                 let (addr, len) = rest();
-                Sqe { opcode: OP_WRITE, fd: raw(&cold.fds[0]), off: u64::MAX, addr, len, user_data, ..Sqe::default() }
+                Sqe {
+                    opcode: OP_WRITE,
+                    fd: raw(&cold.fds[0]),
+                    off: u64::MAX,
+                    addr,
+                    len,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             Kind::Accept => Sqe {
                 opcode: OP_ACCEPT,
                 ioprio: ACCEPT_MULTISHOT,
-                fd: self.listeners.get(Handle::from_bits(hot.of)).expect("an accept's listener").fd(),
+                fd: self
+                    .listeners
+                    .get(Handle::from_bits(hot.of))
+                    .expect("an accept's listener")
+                    .fd(),
                 // No SOCK_CLOEXEC: a direct (fixed-slot) descriptor has no entry in the fd table to
                 // close on exec, and the kernel refuses the flag with a file slot (EINVAL,
                 // io_accept_prep), so the daemon could not listen on Linux at all.
@@ -270,7 +311,10 @@ impl Uring {
                 ..Sqe::default()
             },
             Kind::Connect => {
-                let connecting = self.connectings.get(Handle::from_bits(hot.of)).expect("a connect's connecting");
+                let connecting = self
+                    .connectings
+                    .get(Handle::from_bits(hot.of))
+                    .expect("a connect's connecting");
                 let (fd, flags) = connecting.socket.as_ref().expect("a connect's socket").target();
                 Sqe {
                     opcode: OP_CONNECT,
@@ -298,11 +342,27 @@ impl Uring {
             Kind::Send => {
                 let ((fd, flags), (addr, len)) = (socket(), rest());
                 let opcode = if hot.flags & ZERO_COPY != 0 { OP_SEND_ZC } else { OP_SEND };
-                Sqe { opcode, flags, fd, addr, len, op_flags: libc::MSG_NOSIGNAL as u32, user_data, ..Sqe::default() }
+                Sqe {
+                    opcode,
+                    flags,
+                    fd,
+                    addr,
+                    len,
+                    op_flags: libc::MSG_NOSIGNAL as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             Kind::Shutdown => {
                 let (fd, flags) = socket();
-                Sqe { opcode: OP_SHUTDOWN, flags, fd, len: libc::SHUT_RDWR as u32, user_data, ..Sqe::default() }
+                Sqe {
+                    opcode: OP_SHUTDOWN,
+                    flags,
+                    fd,
+                    len: libc::SHUT_RDWR as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             Kind::Wake => Sqe {
                 opcode: OP_READ,
@@ -387,7 +447,9 @@ impl Uring {
             hot.flags |= ABANDONED;
             match hot.kind {
                 Kind::Watch => {
-                    let watching = watchings.get_mut(Handle::from_bits(hot.of)).expect("a watch's read's watching");
+                    let watching = watchings
+                        .get_mut(Handle::from_bits(hot.of))
+                        .expect("a watch's read's watching");
                     ready.extend(watching.flushes.drain(..).map(failed));
                     ready.push(failed(hot.tag));
                 }
@@ -415,7 +477,8 @@ impl Uring {
         // Timers need no ring, but end with it as everything in flight does.
         self.timers.drain(|_, tag| self.ready.push(failed(tag)));
         // alloc: the error path, once.
-        let mut spawns: Vec<(u64, Handle<Spawning>)> = self.spawning.drain().map(|(tag, it)| (tag.0, it)).collect();
+        let mut spawns: Vec<(u64, Handle<Spawning>)> =
+            self.spawning.drain().map(|(tag, it)| (tag.0, it)).collect();
         radix::sort_copy_by_key(&mut spawns, |it| it.0);
         for (_, spawn) in spawns {
             let mut spawn = self.spawns.remove(spawn).expect("in flight");
@@ -580,8 +643,10 @@ impl Uring {
                 if res < 0 {
                     return Step::Ends(failed(res));
                 }
-                let connecting =
-                    self.connectings.get_mut(Handle::from_bits(hot.of)).expect("a connect's connecting");
+                let connecting = self
+                    .connectings
+                    .get_mut(Handle::from_bits(hot.of))
+                    .expect("a connect's connecting");
                 let socket = connecting.socket.take().expect("a connect's socket");
                 let tcp = connecting.tcp;
                 let conn = self.add(socket, tcp);
@@ -812,7 +877,10 @@ impl Uring {
         let (tag, kind, of) = (hot.tag, hot.kind, hot.of);
         match kind {
             Kind::Watch => {
-                let watching = self.watchings.get_mut(Handle::from_bits(of)).expect("a watch's read's watching");
+                let watching = self
+                    .watchings
+                    .get_mut(Handle::from_bits(of))
+                    .expect("a watch's read's watching");
                 if mem::replace(&mut watching.stopping, true) {
                     return;
                 }
@@ -833,7 +901,10 @@ impl Uring {
         let done = match kind {
             Kind::Watch => {
                 self.watches.remove(&tag);
-                let watching = self.watchings.get_mut(Handle::from_bits(of)).expect("a watch's read's watching");
+                let watching = self
+                    .watchings
+                    .get_mut(Handle::from_bits(of))
+                    .expect("a watch's read's watching");
                 unflushed(&mut self.ready, &mut watching.flushes);
                 Done::Unwatched
             }
@@ -896,13 +967,21 @@ impl Uring {
         let of = spawn.to_bits();
         self.start(Hot::new(tag, Kind::Exit, of), ops::NO_BYTES, Cold::EMPTY);
         let buffer = self.buffer();
-        self.start(Hot::new(tag, Kind::Output, of), buffer, Cold { fds: [Some(stdout), None], ..Cold::EMPTY });
+        self.start(
+            Hot::new(tag, Kind::Output, of),
+            buffer,
+            Cold { fds: [Some(stdout), None], ..Cold::EMPTY },
+        );
         let buffer = self.buffer();
         let mut hot = Hot::new(tag, Kind::Output, of);
         hot.flags |= STDERR;
         self.start(hot, buffer, Cold { fds: [Some(stderr), None], ..Cold::EMPTY });
         if let Some(fd) = stdin {
-            self.start(Hot::new(tag, Kind::Input, of), input, Cold { fds: [Some(fd), None], ..Cold::EMPTY });
+            self.start(
+                Hot::new(tag, Kind::Input, of),
+                input,
+                Cold { fds: [Some(fd), None], ..Cold::EMPTY },
+            );
         }
         Ok(())
     }
@@ -965,7 +1044,8 @@ impl Uring {
     /// Shuts `conn` both ways through the ring, its waiting receives answered empty, and lets
     /// it go once nothing in flight uses it.
     pub(super) fn hang_up(&mut self, conn: Conn, tag: Tag) -> io::Result<()> {
-        let connection = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
+        let connection =
+            self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
         connection.hung = true;
         connection.inbox.clear();
         connection.users += 1;
@@ -990,8 +1070,10 @@ impl Uring {
         let tree = crate::watch::Tree::reusing(spare, &self.root, &dir, true)?;
         let buffer = self.buffer();
         let journal = journal.then_some(dir);
-        let watch = self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal });
-        let id = self.start(Hot::new(tag, Kind::Watch, watch.to_bits()), ops::NO_BYTES, Cold::EMPTY);
+        let watch =
+            self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal });
+        let id =
+            self.start(Hot::new(tag, Kind::Watch, watch.to_bits()), ops::NO_BYTES, Cold::EMPTY);
         self.watches.insert(tag, id);
         Ok(())
     }
@@ -1040,7 +1122,8 @@ impl Drop for Uring {
         self.load_waiting.clear();
         drop(self.lent.clear_waiting());
         // alloc: drop, once.
-        let mut owed: HashMap<Id, usize, std::alloc::Global> = self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();
+        let mut owed: HashMap<Id, usize, std::alloc::Global> =
+            self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();
         // Those the kernel holds nothing of: never handed to it, or every completion in.
         owed.retain(|&id, left| {
             if *left == 0 {

@@ -10,9 +10,9 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_expand::name::Name;
+use std::alloc::Global;
 
 use super::{
     reads::{self, Read},
@@ -72,7 +72,8 @@ pub(super) fn run(
         false => state.env.clone(),
     };
     let mut reads = Vec::new(); // alloc: the run's reads, at the size the run makes
-    let (mut out, outside) = reads::capture(&mut reads, || run_in(db, frame, krate, state, region, env, outside));
+    let (mut out, outside) =
+        reads::capture(&mut reads, || run_in(db, frame, krate, state, region, env, outside));
     out.reads = reads;
     (out, outside)
 }
@@ -130,7 +131,8 @@ fn run_in<'db>(
 
     // Round 0: each group's log in group order, as the facts schedule replays a component's.
     let mut sides: FrameVec<'_, SideTables> = Vec::with_capacity_in(region.len(), frame);
-    let mut pending: FrameVec<'_, FrameVec<'_, MacroOp>> = Vec::with_capacity_in(region.len(), frame);
+    let mut pending: FrameVec<'_, FrameVec<'_, MacroOp>> =
+        Vec::with_capacity_in(region.len(), frame);
     for &group in region {
         let _reading = reads::reading(group);
         let decls = queries::module_decls(db, state.groups[&group].key);
@@ -146,7 +148,9 @@ fn run_in<'db>(
                 // clone: a directive the run owns until it resolves, once per directive
                 DeclOp::Macro(it) if it.module == group => directives.push(it.clone()),
                 DeclOp::Diagnostic(it) => out.diagnostics.push(copy_diagnostic(it)),
-                DeclOp::NotIntroducing(_) | DeclOp::ResolvedMacroPath { .. } | DeclOp::DeriveHelperUse(_) => {
+                DeclOp::NotIntroducing(_)
+                | DeclOp::ResolvedMacroPath { .. }
+                | DeclOp::DeriveHelperUse(_) => {
                     out.uses_include |= reads_a_file(op);
                     out.records.push(clone_op(op));
                 }
@@ -178,8 +182,13 @@ fn run_in<'db>(
             let (mut progress, mut deferred_eager) = (false, false);
             for (at, &group) in region.iter().enumerate() {
                 sink.group = group;
-                let result =
-                    macros::resolve_round(&cx, &mut sink, &mut sides[at], &mut pending[at], eager_with_errors);
+                let result = macros::resolve_round(
+                    &cx,
+                    &mut sink,
+                    &mut sides[at],
+                    &mut pending[at],
+                    eager_with_errors,
+                );
                 progress |= result.progress;
                 deferred_eager |= result.deferred_eager;
             }
@@ -193,7 +202,8 @@ fn run_in<'db>(
             eager_with_errors = false;
             rounds += 1;
             if rounds > FIXED_POINT_LIMIT {
-                let imports = sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
+                let imports =
+                    sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
                 fixpoint_limit(db, krate, false, rounds, pending.iter().flatten(), imports).throw();
             }
         }
@@ -229,7 +239,8 @@ fn run_in<'db>(
         let group = match group_outs.contains_key(&module) {
             true => module,
             false => {
-                let parent = row.parent.expect("nameres delta: a module an expansion made has a parent");
+                let parent =
+                    row.parent.expect("nameres delta: a module an expansion made has a parent");
                 group_of[&parent]
             }
         };
@@ -262,7 +273,12 @@ fn run_in<'db>(
             prelude_holder = Some(group);
         }
         // clone: the group's imports, which the crate's records and diagnostics are made from
-        modules.get_mut(&group).expect("a group of the region").0.imports.push((import.clone(), status));
+        modules
+            .get_mut(&group)
+            .expect("a group of the region")
+            .0
+            .imports
+            .push((import.clone(), status));
     }
     let prelude = unit.def_map().prelude();
     let def_map = unit.into_def_map();
@@ -339,7 +355,9 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
 
     fn apply(&mut self, op: DeclOp) {
         match op {
-            DeclOp::ExternPrelude { .. } | DeclOp::MacroUsePrelude { .. } | DeclOp::Prelude { .. } => {
+            DeclOp::ExternPrelude { .. }
+            | DeclOp::MacroUsePrelude { .. }
+            | DeclOp::Prelude { .. } => {
                 if let Some(next) = self.env.after(&op) {
                     self.unit.set_env(&next);
                     self.env = next;
@@ -349,9 +367,13 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
             DeclOp::ExportedDerive { .. } | DeclOp::ProcMacroFn { .. } | DeclOp::SessionMacros => {
                 self.out().crate_ops.push(op);
             }
-            DeclOp::UnresolvedExternCrate { name } => self.out().unresolved_extern_crates.push(name),
+            DeclOp::UnresolvedExternCrate { name } => {
+                self.out().unresolved_extern_crates.push(name)
+            }
             DeclOp::Diagnostic(it) => self.out().diagnostics.push(it),
-            op @ (DeclOp::NotIntroducing(_) | DeclOp::ResolvedMacroPath { .. } | DeclOp::DeriveHelperUse(_)) => {
+            op @ (DeclOp::NotIntroducing(_)
+            | DeclOp::ResolvedMacroPath { .. }
+            | DeclOp::DeriveHelperUse(_)) => {
                 let out = self.out();
                 out.uses_include |= reads_a_file(&op);
                 out.records.push(op);

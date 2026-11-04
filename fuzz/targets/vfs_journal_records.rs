@@ -23,7 +23,7 @@ use std::time::Duration;
 use blaze_core::{Completion, Done, Effect, FileName};
 use blaze_fuzzer::Target;
 use blaze_ids::{ContentId, Hasher};
-use blaze_vfs::{DIR_DOMAIN, FILE_DOMAIN, Mode, Op, Recovered, Ticket, View, Vfs};
+use blaze_vfs::{DIR_DOMAIN, FILE_DOMAIN, Mode, Op, Recovered, Ticket, Vfs, View};
 
 const TARGET: Target = Target {
     name: "vfs_journal_records",
@@ -182,7 +182,8 @@ fn framed(data: &[u8]) -> Vec<u8> {
                     payload.extend_from_slice(name);
                     payload.extend_from_slice(&code.to_le_bytes());
                     payload.extend_from_slice(&child.0);
-                    let code = if dir { DIR_MODE } else { Mode::from_git(code).map_or(code, Mode::git) };
+                    let code =
+                        if dir { DIR_MODE } else { Mode::from_git(code).map_or(code, Mode::git) };
                     entries.push((name, code, child));
                 }
                 frame(&mut out, DIR, &payload);
@@ -233,8 +234,7 @@ fn journal() -> FileName {
 }
 
 fn recover(bytes: &[u8]) -> (Vfs, Recovered) {
-    let (largest, recovered) =
-        blaze_fuzz::largest_allocation(|| Vfs::recover(journal(), 0, bytes));
+    let (largest, recovered) = blaze_fuzz::largest_allocation(|| Vfs::recover(journal(), 0, bytes));
     let allowed = blaze_fuzz::allowed(bytes.len());
     assert!(
         largest <= allowed,
@@ -265,9 +265,11 @@ fn walk(vfs: &mut Vfs, root: ContentId) {
         _ = vfs.lookup(view, &path);
         _ = vfs.follow(view, &path);
         match vfs.list(view, &path) {
-            Some(entries) => paths.extend(entries.into_iter().map(|(name, _)| {
-                if path.is_empty() { name } else { format!("{path}/{name}") }
-            })),
+            Some(entries) => paths.extend(
+                entries
+                    .into_iter()
+                    .map(|(name, _)| if path.is_empty() { name } else { format!("{path}/{name}") }),
+            ),
             None => _ = vfs.read(view, &path),
         }
     }
@@ -292,7 +294,10 @@ fn moved_and_settled(mut vfs: Vfs, mut file: Vec<u8>, data: &[u8]) {
         }
     };
     let durable = settle(&mut vfs, &mut file);
-    assert!(durable.contains(&ticket), "settling makes the move durable: {ticket:?} of {durable:?}");
+    assert!(
+        durable.contains(&ticket),
+        "settling makes the move durable: {ticket:?} of {durable:?}"
+    );
     let (back, _) = recover(&file);
     assert_eq!(
         state(&back),
@@ -323,7 +328,9 @@ fn settle(vfs: &mut Vfs, file: &mut Vec<u8>) -> Vec<Ticket> {
                 *file = bytes;
                 Done::Written
             }
-            other => panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}"),
+            other => {
+                panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}")
+            }
         };
         durable.extend(vfs.complete(Completion { tag, done }, &mut effects));
     }

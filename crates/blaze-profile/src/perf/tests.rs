@@ -66,7 +66,15 @@ fn profile(build: &str, start_unix_ns: i64, stacks: &[(&[u64], u64)]) -> Vec<u8>
         let stack = interner.stack(frames).unwrap();
         for _ in 0..*count {
             t_ns += 1;
-            samples.push(CpuSample { process: 1, thread: 1, t_ns, stack, span_id: None, on_cpu: true, weight_ns: PERIOD });
+            samples.push(CpuSample {
+                process: 1,
+                thread: 1,
+                t_ns,
+                stack,
+                span_id: None,
+                on_cpu: true,
+                weight_ns: PERIOD,
+            });
         }
     }
     let profile = Profile {
@@ -83,7 +91,13 @@ fn profile(build: &str, start_unix_ns: i64, stacks: &[(&[u64], u64)]) -> Vec<u8>
             cpu_sampler: "test".to_owned(),
             ..Meta::default()
         },
-        threads: vec![Thread { process: 1, process_name: PROGRAM.to_owned(), thread: 1, thread_name: None, cpu_ns: None }],
+        threads: vec![Thread {
+            process: 1,
+            process_name: PROGRAM.to_owned(),
+            thread: 1,
+            thread_name: None,
+            cpu_ns: None,
+        }],
         frames: interner.frame_rows,
         stacks: interner.stack_rows,
         cpu_samples: samples,
@@ -93,7 +107,12 @@ fn profile(build: &str, start_unix_ns: i64, stacks: &[(&[u64], u64)]) -> Vec<u8>
 }
 
 fn inputs(perf: &Path) -> Inputs {
-    Inputs { perf: perf.to_owned(), tree: Ok("7".repeat(64)), blaze: "b".repeat(64), host: "test-host".to_owned() }
+    Inputs {
+        perf: perf.to_owned(),
+        tree: Ok("7".repeat(64)),
+        blaze: "b".repeat(64),
+        host: "test-host".to_owned(),
+    }
 }
 
 const BUILD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -101,11 +120,20 @@ const BUILD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// Two reps of a run of build `build`, `main` at `main` calling `work` at `work`: `main` runs
 /// `own` samples itself and `work` 50.
-fn run(perf: &Path, build: &str, start: i64, main: u64, work: u64, own: [u64; 2]) -> (RunRow, Vec<FnRow>) {
+fn run(
+    perf: &Path,
+    build: &str,
+    start: i64,
+    main: u64,
+    work: u64,
+    own: [u64; 2],
+) -> (RunRow, Vec<FnRow>) {
     let reps: Vec<Vec<u8>> = own
         .iter()
         .enumerate()
-        .map(|(at, own)| profile(build, start + at as i64, &[(&[main + 4, work + 8], 50), (&[main + 4], *own)]))
+        .map(|(at, own)| {
+            profile(build, start + at as i64, &[(&[main + 4, work + 8], 50), (&[main + 4], *own)])
+        })
         .collect();
     record::record(&reps, &inputs(perf)).unwrap()
 }
@@ -115,23 +143,42 @@ fn a_function_whose_code_did_not_change_lines_up_across_two_builds() {
     let dir = scratch("lines-up");
     let perf = dir.join("perf");
     // The same code at other addresses, under another build id.
-    link(&perf, BUILD_A, vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 2, 0x1100, &[])]);
-    link(&perf, BUILD_B, vec![node("app::main", 1, 1, 0x3000, &[1]), node("app::work", 2, 2, 0x2000, &[])]);
+    link(
+        &perf,
+        BUILD_A,
+        vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 2, 0x1100, &[])],
+    );
+    link(
+        &perf,
+        BUILD_B,
+        vec![node("app::main", 1, 1, 0x3000, &[1]), node("app::work", 2, 2, 0x2000, &[])],
+    );
     let a = run(&perf, BUILD_A, 1_000, 0x1000, 0x1100, [10, 12]);
     let b = run(&perf, BUILD_B, 2_000, 0x3000, 0x2000, [11, 10]);
     assert_eq!(a.0.unmapped, 0, "every sample is in a mapped function: {:?}", a.0.gaps);
     assert_eq!(b.0.unmapped, 0, "every sample is in a mapped function: {:?}", b.0.gaps);
-    assert_eq!(run(&perf, BUILD_A, 1_000, 0x1000, 0x1100, [10, 12]), a, "the same profiles record the same rows");
+    assert_eq!(
+        run(&perf, BUILD_A, 1_000, 0x1000, 0x1100, [10, 12]),
+        a,
+        "the same profiles record the same rows"
+    );
 
     let work = |rows: &[FnRow]| rows.iter().find(|it| it.function == "app::work").cloned().unwrap();
     let (wa, wb) = (work(&a.1), work(&b.1));
-    assert_eq!((&wa.identity, &wa.code, &wa.key, &wa.deep), (&wb.identity, &wb.code, &wb.key, &wb.deep));
+    assert_eq!(
+        (&wa.identity, &wa.code, &wa.key, &wa.deep),
+        (&wb.identity, &wb.code, &wb.key, &wb.deep)
+    );
 
     let diff = diff::compare((&b.0, &b.1), (&a.0, &a.1)).unwrap();
     assert_eq!(diff.rows.len(), 2, "one row a function, joined by identity: {:#?}", diff.rows);
     for row in &diff.rows {
         assert_eq!(row.cause, Cause::SameCodeAndCallees, "{}", row.function);
-        assert!(row.self_ns.base > 0.0 && row.self_ns.run > 0.0, "{} has time on both sides", row.function);
+        assert!(
+            row.self_ns.base > 0.0 && row.self_ns.run > 0.0,
+            "{} has time on both sides",
+            row.function
+        );
     }
 }
 
@@ -139,9 +186,17 @@ fn a_function_whose_code_did_not_change_lines_up_across_two_builds() {
 fn a_changed_function_is_classed_its_code_changed() {
     let dir = scratch("code-changed");
     let perf = dir.join("perf");
-    link(&perf, BUILD_A, vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 2, 0x1100, &[])]);
+    link(
+        &perf,
+        BUILD_A,
+        vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 2, 0x1100, &[])],
+    );
     // `work`'s code changed; `main`'s did not, but it calls `work`.
-    link(&perf, BUILD_B, vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 3, 0x1100, &[])]);
+    link(
+        &perf,
+        BUILD_B,
+        vec![node("app::main", 1, 1, 0x1000, &[1]), node("app::work", 2, 3, 0x1100, &[])],
+    );
     let a = run(&perf, BUILD_A, 1_000, 0x1000, 0x1100, [10, 11]);
     let b = run(&perf, BUILD_B, 2_000, 0x1000, 0x1100, [300, 310]);
     let diff = diff::compare((&b.0, &b.1), (&a.0, &a.1)).unwrap();
@@ -207,7 +262,8 @@ fn a_difference_inside_the_noise_bound_is_reported_as_noise() {
     base_rows.extend(fn_rows(base, "app::doubled", 2, &[100, 100, 100]));
     let mut run_rows = fn_rows(run, "app::steady", 1, &[101, 99, 103]);
     run_rows.extend(fn_rows(run, "app::doubled", 2, &[200, 200, 200]));
-    let diff = diff::compare((&run_row(run, 3), &run_rows), (&run_row(base, 3), &base_rows)).unwrap();
+    let diff =
+        diff::compare((&run_row(run, 3), &run_rows), (&run_row(base, 3), &base_rows)).unwrap();
     let row = |name: &str| diff.rows.iter().find(|it| it.function == name).unwrap();
     let steady = row("app::steady");
     assert_eq!(steady.verdict, Verdict::WithinNoise, "{:?}", steady.self_ns);
@@ -234,15 +290,19 @@ fn perf_rows_round_trip_through_parquet() {
     std::fs::create_dir_all(&history).unwrap();
     let map = Map {
         image: IMAGE.to_owned(),
-        nodes: vec![node("app::main", 1, 1, 0x1000, &[1, 2]), node("app::work", 2, 2, 0x1100, &[1]), Node {
-            address: 0,
-            size: 0,
-            identity: None,
-            key: id(9),
-            code: id(9),
-            name: "a static".to_owned(),
-            edges: vec![],
-        }],
+        nodes: vec![
+            node("app::main", 1, 1, 0x1000, &[1, 2]),
+            node("app::work", 2, 2, 0x1100, &[1]),
+            Node {
+                address: 0,
+                size: 0,
+                identity: None,
+                key: id(9),
+                code: id(9),
+                name: "a static".to_owned(),
+                edges: vec![],
+            },
+        ],
     };
     assert_eq!(Map::decode(&map.encode()).unwrap(), map, "a code map reads back as written");
     map::write(&perf, BUILD_A, &map).unwrap();

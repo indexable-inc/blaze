@@ -27,7 +27,7 @@ of about PART_SECS each, per host, by the seconds FAST says each takes on the
 slowest host, so a new or slower harness moves the others, not the time of the tier. The full
 tier, the release train's (every push to main) and by hand, is every harness, in the parts
 core-1 ... core-N (packed as the fast tier is, to about CORE_SECS by the seconds CORE says),
-keys-N, store-kills, store and daemon (docs/harness.md, "CI").
+keys-N, store-kills, store, daemon and incremental (docs/harness.md, "CI").
 
 Each harness runs with a BLAZE_HOME of its own (a harness may set its own over it), so no
 daemon, socket or store (`<home>/v2/store`) of one harness is seen by the next.
@@ -162,6 +162,11 @@ HARNESSES = [
     ("store", ["storerevisions.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), None),
     ("daemon", ["stress.py"], {}, DAEMON, 2),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
+    # What an incremental `blaze check` of blaze's own workspace re-executes, by count: nothing
+    # for a no-op from another shell and after a SIGKILL restore, a bounded set after a body
+    # edit of blaze-format, and the daemon's heap given back. A part of its own: its first check
+    # is a cold one of the whole workspace. The flake's DuckDB reads the history (nix is there).
+    ("incremental", ["incremental.py", arg({"blaze": BLAZE_CLI})], {}, DAEMON, None),
 ]
 
 

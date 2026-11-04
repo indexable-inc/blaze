@@ -91,12 +91,8 @@ impl UllbcPass for Transform {
 
         // Look for locals that are assigned exactly once with a non-retagging copy. A local is
         // eligible only if every use is beneath a dereference or a metadata projection.
-        let mut collector = UseCollector {
-            body,
-            copies: &mut copies,
-            has_candidate: false,
-            current_st: None,
-        };
+        let mut collector =
+            UseCollector { body, copies: &mut copies, has_candidate: false, current_st: None };
         for (block, data) in body.body.iter_enumerated() {
             for (statement, st) in data.statements.iter().enumerate() {
                 collector.current_st = Some(StmtLoc::new(block, statement));

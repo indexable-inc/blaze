@@ -20,7 +20,8 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 fn leading_blocks_are_alike_at_every_width() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
     for blocks in 1..CHUNK_LEN / BLOCK_LEN {
-        let inputs: Vec<Vec<u8>> = (0..37).map(|n| noise(blocks * BLOCK_LEN + 1 + n % 60, n as u64)).collect();
+        let inputs: Vec<Vec<u8>> =
+            (0..37).map(|n| noise(blocks * BLOCK_LEN + 1 + n % 60, n as u64)).collect();
         let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
         for count in [0, 1, 7, 8, 9, 15, 16, 17, 37] {
             let members: Vec<u32> = (0..count as u32).rev().collect();
@@ -55,7 +56,8 @@ fn scalar_columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
 fn register_transposes_are_the_scalar_one() {
     let mut rng = crate::rng::SplitMix64::new(7);
     for _ in 0..64 {
-        let rows: [[u32; 16]; 16] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
+        let rows: [[u32; 16]; 16] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
         assert_eq!(columns(&rows), scalar_columns(&rows));
         let eight: [[u32; 16]; 8] = std::array::from_fn(|lane| rows[lane]);
         assert_eq!(columns(&eight), scalar_columns(&eight));
@@ -73,11 +75,14 @@ fn back_transposes_are_the_scalar_one() {
     }
     let mut rng = crate::rng::SplitMix64::new(11);
     for _ in 0..64 {
-        let sixteen: [[u32; 16]; 8] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
+        let sixteen: [[u32; 16]; 8] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
         assert_eq!(rows_of(&sixteen), scalar(&sixteen));
-        let eight: [[u32; 8]; 8] = std::array::from_fn(|word| std::array::from_fn(|lane| sixteen[word][lane]));
+        let eight: [[u32; 8]; 8] =
+            std::array::from_fn(|word| std::array::from_fn(|lane| sixteen[word][lane]));
         assert_eq!(rows_of(&eight), scalar(&eight));
-        let four: [[u32; 4]; 8] = std::array::from_fn(|word| std::array::from_fn(|lane| sixteen[word][lane]));
+        let four: [[u32; 4]; 8] =
+            std::array::from_fn(|word| std::array::from_fn(|lane| sixteen[word][lane]));
         assert_eq!(rows_of(&four), scalar(&four));
         let one: [[u32; 1]; 8] = std::array::from_fn(|word| [sixteen[word][0]]);
         assert_eq!(rows_of(&one), scalar(&one));
@@ -109,15 +114,19 @@ fn last_block_alone(input: &[u8], cv: &[u32; 8], group: usize) -> ContentId {
 fn last_blocks_are_alike_at_every_width_and_on_every_path() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
     for group in 0..CHUNK_LEN / BLOCK_LEN {
-        let inputs: Vec<Vec<u8>> =
-            (0..37).map(|n| noise(group * BLOCK_LEN + 1 + (n * 7) % BLOCK_LEN, n as u64 + 100)).collect();
+        let inputs: Vec<Vec<u8>> = (0..37)
+            .map(|n| noise(group * BLOCK_LEN + 1 + (n * 7) % BLOCK_LEN, n as u64 + 100))
+            .collect();
         let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
         let mut rng = crate::rng::SplitMix64::new(group as u64);
-        let after: Vec<[u32; 8]> = (0..37).map(|_| std::array::from_fn(|_| rng.next_u64() as u32)).collect();
+        let after: Vec<[u32; 8]> =
+            (0..37).map(|_| std::array::from_fn(|_| rng.next_u64() as u32)).collect();
         for count in [0, 1, 7, 8, 9, 15, 16, 17, 37] {
             let members: Vec<u32> = (0..count as u32).rev().collect();
-            let starts: [(Start<'_>, &str); 2] =
-                [(Start::Key(&key), "from the key"), (Start::After(&after[..count]), "after leading blocks")];
+            let starts: [(Start<'_>, &str); 2] = [
+                (Start::Key(&key), "from the key"),
+                (Start::After(&after[..count]), "after leading blocks"),
+            ];
             for (start, from) in starts {
                 let cv_of = |n: usize| match start {
                     Start::Key(key) => *key,
@@ -133,17 +142,32 @@ fn last_blocks_are_alike_at_every_width_and_on_every_path() {
                     out
                 };
                 let what = format!("group {group}, {count} members, {from}");
-                assert_eq!(run(&|out| last_blocks_of::<8>(&inputs, &members, start, group, out)), expected, "{what}, 8");
-                assert_eq!(run(&|out| last_blocks_of::<16>(&inputs, &members, start, group, out)), expected, "{what}, 16");
-                assert_eq!(run(&|out| last_blocks(&inputs, &members, start, group, out)), expected, "{what}, dispatched");
+                assert_eq!(
+                    run(&|out| last_blocks_of::<8>(&inputs, &members, start, group, out)),
+                    expected,
+                    "{what}, 8"
+                );
+                assert_eq!(
+                    run(&|out| last_blocks_of::<16>(&inputs, &members, start, group, out)),
+                    expected,
+                    "{what}, 16"
+                );
+                assert_eq!(
+                    run(&|out| last_blocks(&inputs, &members, start, group, out)),
+                    expected,
+                    "{what}, dispatched"
+                );
                 #[cfg(target_arch = "x86_64")]
                 {
                     if std::arch::is_x86_feature_detected!("avx512f") {
-                        let wide = run(&|out| x86::last_blocks_avx512(&inputs, &members, start, group, out));
+                        let wide = run(&|out| {
+                            x86::last_blocks_avx512(&inputs, &members, start, group, out)
+                        });
                         assert_eq!(wide, expected, "{what}, AVX-512");
                     }
                     if std::arch::is_x86_feature_detected!("avx2") {
-                        let narrow = run(&|out| x86::last_blocks_avx2(&inputs, &members, start, group, out));
+                        let narrow =
+                            run(&|out| x86::last_blocks_avx2(&inputs, &members, start, group, out));
                         assert_eq!(narrow, expected, "{what}, AVX2");
                     }
                 }
@@ -160,6 +184,10 @@ fn one_lane_from_the_key_is_blake3() {
         let input = noise(len, len as u64);
         let mut expected = blake3::Hasher::new_derive_key("blaze v2 many lanes 1");
         expected.update(&input);
-        assert_eq!(last_block_alone(&input, &key, 0), ContentId(*expected.finalize().as_bytes()), "{len} bytes");
+        assert_eq!(
+            last_block_alone(&input, &key, 0),
+            ContentId(*expected.finalize().as_bytes()),
+            "{len} bytes"
+        );
     }
 }

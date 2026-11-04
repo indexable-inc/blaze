@@ -34,7 +34,16 @@ pub(crate) struct Ui<'a> {
 
 impl Default for Ui<'_> {
     fn default() -> Self {
-        Ui { name: "", edition: "2015", mode: Mode::Other, core: "", std: None, flags: &[], library: &[], source: "" }
+        Ui {
+            name: "",
+            edition: "2015",
+            mode: Mode::Other,
+            core: "",
+            std: None,
+            flags: &[],
+            library: &[],
+            source: "",
+        }
     }
 }
 
@@ -56,7 +65,8 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
                 )
                 .unwrap();
             }
-            writeln!(fixture, "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}").unwrap();
+            writeln!(fixture, "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}")
+                .unwrap();
             String::from(" deps:std")
         }
         None => String::new(),
@@ -66,8 +76,14 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
         let sep = if deps.is_empty() { " deps:" } else { "," };
         write!(deps, "{sep}{}", crate::tests::LIBRARY_FEATURES).unwrap();
     }
-    write!(fixture, "//- /{} crate:other:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
-    let args: Vec<String> = ui.flags.iter().flat_map(|flag| flag.split(' ')).map(str::to_owned).collect();
+    write!(
+        fixture,
+        "//- /{} crate:other:main edition:{}{deps}\n{}",
+        ui.name, ui.edition, ui.source
+    )
+    .unwrap();
+    let args: Vec<String> =
+        ui.flags.iter().flat_map(|flag| flag.split(' ')).map(str::to_owned).collect();
     let lints = CommandLine::parse(&args).expect("the test's flags are rustc's");
     let options = crate::tests::compiletest(ui.mode, &Options { lints, ..Options::default() });
     let stderr = crate::tests::checked_with(&fixture, "$DIR/", &options)
@@ -78,6 +94,12 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
 /// [`ui`] of a UI test without compile flags that uses std: core is minicore with `flags`, and
 /// `std` a crate of `std`'s two parts, what its prelude has beyond core's and the items of std
 /// the test uses.
-pub(crate) fn ui_std(name: &str, edition: &str, flags: &str, std: (&str, &str), source: &str) -> String {
+pub(crate) fn ui_std(
+    name: &str,
+    edition: &str,
+    flags: &str,
+    std: (&str, &str),
+    source: &str,
+) -> String {
     ui(Ui { name, edition, core: flags, std: Some(std), source, ..Ui::default() })
 }

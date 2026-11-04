@@ -37,7 +37,8 @@ impl Coll {
 /// The collection `adt` is, when it is one of [`Coll`]'s.
 pub(super) fn coll(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Coll> {
     let db = cx.db();
-    let item = |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+    let item =
+        |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
     if item("Vec") {
         return Some(Coll::Vec);
     }
@@ -56,7 +57,11 @@ pub(super) fn coll(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Coll> {
 
 /// What the call `init` makes: the collection and the constructor's name, when it is a
 /// [`Coll`]'s `new`, `default` or `with_capacity` (also what `vec![]` expands to).
-pub(super) fn made(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, init: ExprId) -> Option<(Coll, &'static str)> {
+pub(super) fn made(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    init: ExprId,
+) -> Option<(Coll, &'static str)> {
     let db = cx.db();
     let body = analysis.body();
     if !matches!(body.expr(init), Expr::Call { .. }) {
@@ -88,7 +93,10 @@ pub(super) fn lets(body: &Body, block: ExprId) -> Vec<Let> {
     let mut out = Vec::new();
     let Expr::Block { statements, .. } = body.expr(block) else { return out };
     for (at, statement) in statements.iter().enumerate() {
-        let Statement::Let { pat, initializer: Some(init), else_branch: None, .. } = statement else { continue };
+        let Statement::Let { pat, initializer: Some(init), else_branch: None, .. } = statement
+        else {
+            continue;
+        };
         let Pat::Bind { id, subpat: None } = body.pat(pat) else { continue };
         out.push(Let { local: id, init, at });
     }
@@ -108,7 +116,13 @@ pub(super) struct LocalUses {
 }
 
 /// How the body of `def` uses `local`.
-pub(super) fn uses(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>, parents: &facts::Parents, local: BindingId) -> LocalUses {
+pub(super) fn uses(
+    db: &Db,
+    def: DefWithBodyId,
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &facts::Parents,
+    local: BindingId,
+) -> LocalUses {
     let body = analysis.body();
     let infer = analysis.infer();
     let mut out = LocalUses { only_borrowed: true, grown: false, count: 0 };
@@ -122,12 +136,21 @@ pub(super) fn uses(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>
                 if let Some((f, _)) = written_callee(infer, body, call)
                     && matches!(
                         FunctionSignature::of(db, f).name.as_str(),
-                        "push" | "push_str" | "insert" | "extend" | "extend_from_slice" | "append" | "entry" | "resize"
+                        "push"
+                            | "push_str"
+                            | "insert"
+                            | "extend"
+                            | "extend_from_slice"
+                            | "append"
+                            | "entry"
+                            | "resize"
                     )
                 {
                     out.grown = true;
                 }
-                infer.expr_adjustment(id).is_some_and(|it| it.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))))
+                infer
+                    .expr_adjustment(id)
+                    .is_some_and(|it| it.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))))
             }
             Some((_, Expr::Ref { .. })) => true,
             Some((_, Expr::Index { base, .. })) => base == id,
@@ -139,10 +162,17 @@ pub(super) fn uses(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>
 }
 
 /// Whether some expression under `root` names `local`.
-pub(super) fn mentions(db: &Db, def: DefWithBodyId, body: &Body, root: ExprId, local: BindingId) -> bool {
+pub(super) fn mentions(
+    db: &Db,
+    def: DefWithBodyId,
+    body: &Body,
+    root: ExprId,
+    local: BindingId,
+) -> bool {
     let mut found = false;
     let walked = general_facts::walk(body, root, |it| {
-        found |= matches!(body.expr(it), Expr::Path(_)) && local_of(db, def, body, it) == Some(local);
+        found |=
+            matches!(body.expr(it), Expr::Path(_)) && local_of(db, def, body, it) == Some(local);
     });
     // Out of fuel: taken as naming it, so the lint asking stays quiet.
     found || walked == general_facts::Walked::OutOfFuel
@@ -165,7 +195,9 @@ pub(super) struct For {
 pub(super) fn for_loop(body: &Body, expr: ExprId) -> Option<For> {
     let Expr::Match { expr: iterator, arms } = body.expr(expr) else { return None };
     let [arm] = arms else { return None };
-    let Expr::Loop { body: inner, source: LoopSource::ForLoop, .. } = body.expr(arm.expr) else { return None };
+    let Expr::Loop { body: inner, source: LoopSource::ForLoop, .. } = body.expr(arm.expr) else {
+        return None;
+    };
     let Expr::Call { args: [head], .. } = body.expr(iterator) else { return None };
     let Expr::Block { tail: Some(tail), .. } = body.expr(inner) else { return None };
     let Expr::Match { arms, .. } = body.expr(tail) else { return None };

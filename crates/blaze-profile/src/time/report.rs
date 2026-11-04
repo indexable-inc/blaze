@@ -101,7 +101,11 @@ pub fn rows(model: &Model, by: By, matching: Option<&str>) -> Vec<Row> {
 }
 
 /// The row of `key`, unless it does not hold `matching`.
-fn row<'a>(rows: &'a mut HashMap<String, Row, Global>, matching: Option<&str>, key: String) -> Option<&'a mut Row> {
+fn row<'a>(
+    rows: &'a mut HashMap<String, Row, Global>,
+    matching: Option<&str>,
+    key: String,
+) -> Option<&'a mut Row> {
     if matching.is_some_and(|it| !key.contains(it)) {
         return None;
     }
@@ -153,7 +157,8 @@ pub fn core_busy(model: &Model, width_ns: i64) -> Vec<CoreBusy> {
     let buckets = usize::try_from((end - start + width - 1) / width).unwrap_or(0).max(1);
     // A BTreeMap: the rows are in core order.
     // alloc: once a report
-    let mut cores: std::collections::BTreeMap<(u32, u32), Vec<i64>> = std::collections::BTreeMap::new();
+    let mut cores: std::collections::BTreeMap<(u32, u32), Vec<i64>> =
+        std::collections::BTreeMap::new();
     for lane in &model.lanes {
         for it in &lane.intervals {
             let State::Running { core: Some(core), .. } = it.state else { continue };
@@ -174,7 +179,13 @@ pub fn core_busy(model: &Model, width_ns: i64) -> Vec<CoreBusy> {
     for ((process, core), busy) in cores {
         for (b, running_ns) in busy.into_iter().enumerate() {
             let t0_ns = start + b as i64 * width;
-            out.push(CoreBusy { process, core, t0_ns, t1_ns: (t0_ns + width).min(end), running_ns });
+            out.push(CoreBusy {
+                process,
+                core,
+                t0_ns,
+                t1_ns: (t0_ns + width).min(end),
+                running_ns,
+            });
         }
     }
     out
@@ -270,7 +281,12 @@ pub fn summary(model: &Model, out: &mut String) {
         super::BoundsFrom::Record => "its first and last rows (no builds row with a duration)",
     };
     // Writing to a `String` does not fail.
-    _ = writeln!(out, "build {}: {:.1} s wall, from {bounds}", model.build, s(model.bounds.wall_ns()));
+    _ = writeln!(
+        out,
+        "build {}: {:.1} s wall, from {bounds}",
+        model.build,
+        s(model.bounds.wall_ns())
+    );
     _ = writeln!(
         out,
         "cores: {} ran jobs, busy {:.1}% on average ({:.1} s running of {:.1} s cores x wall)",
@@ -368,7 +384,9 @@ pub fn path(model: &Model, path: &Path, top: usize, out: &mut String) {
         // alloc: a label
         Reached::BuildStart => "the build's start".to_owned(),
         // alloc: a label
-        Reached::LaneStart { lane } => format!("the start of {} (the record names no spawner of it)", model.lanes[lane].id),
+        Reached::LaneStart { lane } => {
+            format!("the start of {} (the record names no spawner of it)", model.lanes[lane].id)
+        }
         // alloc: a label
         Reached::Fuel { steps } => format!("its bound of {steps} steps: the path is cut short"),
         // alloc: a label
@@ -384,7 +402,13 @@ pub fn path(model: &Model, path: &Path, top: usize, out: &mut String) {
     for kind in LinkKind::ALL {
         let ns: i64 = path.links.iter().filter(|it| it.kind == kind).map(Link::dur_ns).sum();
         if ns > 0 {
-            _ = writeln!(out, "  {:<10} {:>9.1} s {:>5.1}%", kind.name(), s(ns), pct(ns, path.len_ns()));
+            _ = writeln!(
+                out,
+                "  {:<10} {:>9.1} s {:>5.1}%",
+                kind.name(),
+                s(ns),
+                pct(ns, path.len_ns())
+            );
         }
     }
     // alloc: once a report
@@ -393,7 +417,11 @@ pub fn path(model: &Model, path: &Path, top: usize, out: &mut String) {
     longest.truncate(top);
     longest.sort_unstable();
     _ = writeln!(out, "  its {} longest links, in path order:", longest.len());
-    _ = writeln!(out, "  {:>9} {:>9} {:<7} {:<12} {:>5}  {}", "at s", "dur s", "link", "lane", "core", "item");
+    _ = writeln!(
+        out,
+        "  {:>9} {:>9} {:<7} {:<12} {:>5}  {}",
+        "at s", "dur s", "link", "lane", "core", "item"
+    );
     for i in longest {
         let link = &path.links[i];
         let lane = &model.lanes[link.lane];
@@ -405,7 +433,11 @@ pub fn path(model: &Model, path: &Path, top: usize, out: &mut String) {
         };
         let woke = link.wakes.map_or(String::new(), |wait| {
             // alloc: a cell
-            format!(", then woke {} ({})", model.lanes[model.waits[wait].lane].id, model.wait_label(&model.waits[wait]))
+            format!(
+                ", then woke {} ({})",
+                model.lanes[model.waits[wait].lane].id,
+                model.wait_label(&model.waits[wait])
+            )
         });
         _ = writeln!(
             out,
@@ -431,12 +463,23 @@ pub fn cores(model: &Model, buckets: usize, out: &mut String) {
     for it in &busy {
         *by_bucket.entry(it.t0_ns).or_default() += it.running_ns;
     }
-    _ = writeln!(out, "cores busy over the build ({} cores, {:.1} s a line):", util.cores, s(width));
+    _ = writeln!(
+        out,
+        "cores busy over the build ({} cores, {:.1} s a line):",
+        util.cores,
+        s(width)
+    );
     for (t0, running) in by_bucket {
         let span = (width.min(model.bounds.end_ns - t0)).max(1);
         let busy = running as f64 / span as f64;
         let bar = (busy * 40.0 / f64::from(util.cores.max(1))).round() as usize;
-        _ = writeln!(out, "  {:>8.1} s {:>5.1} {}", s(t0 - model.bounds.start_ns), busy, "#".repeat(bar));
+        _ = writeln!(
+            out,
+            "  {:>8.1} s {:>5.1} {}",
+            s(t0 - model.bounds.start_ns),
+            busy,
+            "#".repeat(bar)
+        );
     }
 }
 
@@ -453,11 +496,20 @@ pub fn scheduling(model: &Model, path: &Path, top: usize, out: &mut String) {
         s(idle.idle_ns),
         100.0 * idle.share(idle.with_work_ns),
         s(idle.with_work_ns),
-        if idle.submits_said { "" } else { ", the record saying no submit's wait (no `queued_ns`): only waits after a `ready` row or a move" }
+        if idle.submits_said {
+            ""
+        } else {
+            ", the record saying no submit's wait (no `queued_ns`): only waits after a `ready` row or a move"
+        }
     );
     let on_path = super::path::by_query(model, path);
     let ran: i64 = on_path.iter().map(|it| it.ns).sum();
-    _ = writeln!(out, "critical path by query: {:.1} s running, its {} longest:", s(ran), top.min(on_path.len()));
+    _ = writeln!(
+        out,
+        "critical path by query: {:.1} s running, its {} longest:",
+        s(ran),
+        top.min(on_path.len())
+    );
     for it in on_path.iter().take(top) {
         let label = match (&it.name, &it.subject) {
             // alloc: a cell
@@ -467,7 +519,13 @@ pub fn scheduling(model: &Model, path: &Path, top: usize, out: &mut String) {
             // alloc: a cell
             (None, _) => "inside no span".to_owned(),
         };
-        _ = writeln!(out, "  {:>9.1} s {:>5.1}% {:>7}x  {label}", s(it.ns), pct(it.ns, ran), it.stretches);
+        _ = writeln!(
+            out,
+            "  {:>9.1} s {:>5.1}% {:>7}x  {label}",
+            s(it.ns),
+            pct(it.ns, ran),
+            it.stretches
+        );
     }
     let transcript = super::sim::Transcript::of(model);
     _ = writeln!(
@@ -535,6 +593,13 @@ pub fn scheduling(model: &Model, path: &Path, top: usize, out: &mut String) {
         (workers.saturating_mul(2), super::sim::Policy::Fifo),
     ] {
         let it = transcript.replay(cores, policy, calibration.overhead_ns);
-        _ = writeln!(out, "  {:>4} cores, {}: wall {:.1} s, idle {:.1}%", cores, policy.name(), s(it.wall_ns), 100.0 * it.idle_share());
+        _ = writeln!(
+            out,
+            "  {:>4} cores, {}: wall {:.1} s, idle {:.1}%",
+            cores,
+            policy.name(),
+            s(it.wall_ns),
+            100.0 * it.idle_share()
+        );
     }
 }

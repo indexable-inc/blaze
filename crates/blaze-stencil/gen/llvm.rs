@@ -16,8 +16,7 @@ use llvm_sys::{
         LLVMGetBufferStart, LLVMSetDataLayout, LLVMSetTarget,
     },
     disassembler::{
-        LLVMCreateDisasmCPUFeatures, LLVMDisasmContextRef, LLVMDisasmDispose,
-        LLVMDisasmInstruction,
+        LLVMCreateDisasmCPUFeatures, LLVMDisasmContextRef, LLVMDisasmDispose, LLVMDisasmInstruction,
     },
     ir_reader::LLVMParseIRInContext2,
     prelude::{LLVMMemoryBufferRef, LLVMModuleRef},
@@ -31,8 +30,8 @@ use llvm_sys::{
     },
     target_machine::{
         LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMCreateTargetDataLayout,
-        LLVMCreateTargetMachine, LLVMDisposeTargetMachine, LLVMGetTargetFromTriple,
-        LLVMRelocMode, LLVMTargetMachineEmitToMemoryBuffer, LLVMTargetRef,
+        LLVMCreateTargetMachine, LLVMDisposeTargetMachine, LLVMGetTargetFromTriple, LLVMRelocMode,
+        LLVMTargetMachineEmitToMemoryBuffer, LLVMTargetRef,
     },
 };
 
@@ -184,7 +183,9 @@ unsafe fn emit(
     // SAFETY: a live `CString` and two places for LLVM to write its answers.
     if unsafe { LLVMGetTargetFromTriple(triple.as_ptr(), &mut target, &mut error) } != 0 {
         // SAFETY: what the lookup left in `error`, null or LLVM's to free.
-        return Err(format!("LLVM has no target {}: {}", machine.triple, unsafe { message(error) }));
+        return Err(format!("LLVM has no target {}: {}", machine.triple, unsafe {
+            message(error)
+        }));
     }
     // SAFETY: the target LLVM just gave and live `CString`s; the machine is disposed below.
     let tm = unsafe {

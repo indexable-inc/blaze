@@ -78,7 +78,13 @@ pub fn status_word(out: &mut String, word: &str, color: bool) {
 
 /// `level: ` and the text `what` writes, and its newline, into `out`, as cargo-util-terminal's
 /// `message_stderr` writes an unjustified status: the level in `style`, the colon plain.
-pub fn leveled_with(out: &mut String, style: &str, level: &str, color: bool, what: impl FnOnce(&mut String)) {
+pub fn leveled_with(
+    out: &mut String,
+    style: &str,
+    level: &str,
+    color: bool,
+    what: impl FnOnce(&mut String),
+) {
     if color {
         out.push_str(style);
     }
@@ -114,11 +120,21 @@ pub fn note_into(out: &mut String, what: &str, color: bool) {
 fn words_into(out: &mut String, severity: blaze_report::Severity, what: &str, color: bool) {
     // alloc: a line said once, never per unit
     let report = blaze_report::Report::new(severity, blaze_report::Text::plain(what));
-    report_into(out, &report, blaze_report::Caps { color, links: false, width: None }, &blaze_report::Roots::NONE);
+    report_into(
+        out,
+        &report,
+        blaze_report::Caps { color, links: false, width: None },
+        &blaze_report::Roots::NONE,
+    );
 }
 
 /// `report` as the terminal `caps` describes gets it, paths shown from `roots`.
-pub fn report_into(out: &mut String, report: &blaze_report::Report, caps: blaze_report::Caps, roots: &blaze_report::Roots<'_>) {
+pub fn report_into(
+    out: &mut String,
+    report: &blaze_report::Report,
+    caps: blaze_report::Caps,
+    roots: &blaze_report::Roots<'_>,
+) {
     blaze_report::render_into(out, report, caps, roots);
 }
 
@@ -191,7 +207,9 @@ pub fn target_named_into<'a>(out: &mut String, target: impl Into<Named<'a>>) {
     let kind = match target.kind {
         TargetKind::CustomBuild => return out.push_str("build script"),
         TargetKind::Lib => return out.push_str("lib"),
-        kind @ (TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::Example) => kind.name(),
+        kind @ (TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::Example) => {
+            kind.name()
+        }
     };
     out.push_str(kind);
     out.push_str(" \"");
@@ -215,7 +233,12 @@ pub fn unit_named<'a>(package: &str, target: impl Into<Named<'a>>, test: bool) -
 }
 
 /// [`unit_named`] into `out`.
-pub fn unit_named_into<'a>(out: &mut String, package: &str, target: impl Into<Named<'a>>, test: bool) {
+pub fn unit_named_into<'a>(
+    out: &mut String,
+    package: &str,
+    target: impl Into<Named<'a>>,
+    test: bool,
+) {
     let target = target.into();
     out.push('`');
     out.push_str(package);
@@ -260,7 +283,13 @@ pub struct Warned {
 /// script, and always names the package (cargo since "fix(check): ... always using -p"). It
 /// names blaze's own command, which makes the suggestions blaze gave, never `cargo fix`, which
 /// would run rustc for its own (useful-not-parity).
-pub fn generated<'a>(package: &str, target: impl Into<Named<'a>>, test: bool, local: bool, warned: Warned) -> Option<String> {
+pub fn generated<'a>(
+    package: &str,
+    target: impl Into<Named<'a>>,
+    test: bool,
+    local: bool,
+    warned: Warned,
+) -> Option<String> {
     let target = target.into();
     let mut out = String::with_capacity(package.len() * 2 + target.name.len() + 96);
     generated_into(&mut out, package, target, test, local, warned).then_some(out)
@@ -311,7 +340,13 @@ pub fn generated_into<'a>(
 
 /// `` could not compile `foo` (lib) due to 1 previous error; 1 warning emitted ``: what follows
 /// `error:` for a unit that failed (`core/compiler/mod.rs`, `rustc`).
-pub fn could_not_compile<'a>(package: &str, target: impl Into<Named<'a>>, test: bool, errors: u32, warnings: u32) -> String {
+pub fn could_not_compile<'a>(
+    package: &str,
+    target: impl Into<Named<'a>>,
+    test: bool,
+    errors: u32,
+    warnings: u32,
+) -> String {
     let target = target.into();
     let mut out = String::with_capacity(package.len() + target.name.len() + 80);
     could_not_compile_into(&mut out, package, target, test, errors, warnings);
@@ -334,7 +369,12 @@ pub fn could_not_compile_into<'a>(
 
 /// `` could not compile `foo` (lib doctest) due to 1 previous error ``: a library's doc tests
 /// that failed to build, named as its doc tests and not as the library, whose unit built.
-pub fn doctests_could_not_compile_into(out: &mut String, package: &str, errors: u32, warnings: u32) {
+pub fn doctests_could_not_compile_into(
+    out: &mut String,
+    package: &str,
+    errors: u32,
+    warnings: u32,
+) {
     out.push_str("could not compile `");
     out.push_str(package);
     out.push_str("` (lib doctest)");
@@ -370,7 +410,8 @@ pub fn escape(arg: &str) -> String {
 
 /// `shell_escape::unix::escape`.
 pub fn escape_unix(arg: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '/' | ',' | '.' | '+');
+    let plain =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '/' | ',' | '.' | '+');
     if !arg.is_empty() && arg.chars().all(plain) {
         return arg.to_owned();
     }
@@ -433,7 +474,9 @@ pub fn command_line(program: &str, args: &[String]) -> String {
 /// `set K=V&& ` before each on Windows. Only cargo's own variables are ever here, never the
 /// user's environment.
 pub fn command_line_with(env: &[(String, String)], program: &str, args: &[String]) -> String {
-    let mut line = String::with_capacity(program.len() + 2 + args.iter().map(|it| it.len() + 3).sum::<usize>());
+    let mut line = String::with_capacity(
+        program.len() + 2 + args.iter().map(|it| it.len() + 3).sum::<usize>(),
+    );
     line.push('`');
     let mut sorted: Vec<&(String, String)> = env.iter().collect();
     sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -487,7 +530,9 @@ impl Ended {
 pub fn ended(ended: Ended) -> String {
     match ended {
         // alloc: a message for the terminal, once per process that ended
-        Ended::Signal(signal) => format!("signal: {signal}{}", blaze_core::signal::described(signal)),
+        Ended::Signal(signal) => {
+            format!("signal: {signal}{}", blaze_core::signal::described(signal))
+        }
         Ended::Code(code) => code_named(code),
     }
 }

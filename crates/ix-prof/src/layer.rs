@@ -108,7 +108,10 @@ where
         if !crate::recording() {
             return;
         }
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0)) else { return };
+        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
+        else {
+            return;
+        };
         crate::alloc::quiet(|| {
             let mut fields = Fields::default();
             values.record(&mut fields);
@@ -120,9 +123,14 @@ where
         if !crate::recording() {
             return;
         }
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0)) else { return };
+        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
+        else {
+            return;
+        };
         let (now, usage) = (clock::now_ns(), usage());
-        crate::alloc::quiet(|| crate::with_recorder(|r| r.span_enter(mine, clock::os_tid(), now, usage)));
+        crate::alloc::quiet(|| {
+            crate::with_recorder(|r| r.span_enter(mine, clock::os_tid(), now, usage))
+        });
     }
 
     fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
@@ -130,8 +138,13 @@ where
             return;
         }
         let (now, usage) = (clock::now_ns(), usage());
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0)) else { return };
-        crate::alloc::quiet(|| crate::with_recorder(|r| r.span_exit(mine, clock::os_tid(), now, usage)));
+        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
+        else {
+            return;
+        };
+        crate::alloc::quiet(|| {
+            crate::with_recorder(|r| r.span_exit(mine, clock::os_tid(), now, usage))
+        });
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -139,7 +152,10 @@ where
             return;
         }
         let now = clock::now_ns();
-        let Some(mine) = ctx.span(&id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0)) else { return };
+        let Some(mine) = ctx.span(&id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
+        else {
+            return;
+        };
         crate::alloc::quiet(|| crate::with_recorder(|r| r.span_close(mine, now)));
     }
 }

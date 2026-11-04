@@ -105,10 +105,13 @@ impl Region {
     /// Never decommitted ([`Region::decommit_after`] refuses).
     pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
         let granule = os::page_size().max(64 << 10);
-        let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(
-            MemError::TooLarge { tag, what: "a reservation", wanted: bytes },
-        )?;
-        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
+        let reserved = crate::align::checked_align_up(bytes.max(1), granule)
+            .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
+        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve {
+            tag,
+            bytes: reserved,
+            os,
+        })?;
         tag::reserved(tag, reserved);
         tag::base_pages(reserved);
         let region = Region {
@@ -134,9 +137,8 @@ impl Region {
     fn placed(bytes: usize, pages: Pages, node: Option<u32>, tag: Tag) -> Result<Region, MemError> {
         let granule = os::page_size().max(64 << 10);
         let whole = if pages.is_huge() { huge_unit() } else { granule };
-        let reserved = crate::align::checked_align_up(bytes.max(1), whole).ok_or(
-            MemError::TooLarge { tag, what: "a reservation", wanted: bytes },
-        )?;
+        let reserved = crate::align::checked_align_up(bytes.max(1), whole)
+            .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
         let transparent = pages == Pages::Transparent;
         let base = match node {
             Some(node) => os::reserve_on(reserved, transparent, node),
@@ -147,7 +149,16 @@ impl Region {
         if pages == Pages::Base {
             tag::base_pages(reserved);
         }
-        Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, pages, node, sparse: false, tag })
+        Ok(Region {
+            base,
+            reserved,
+            committed: AtomicUsize::new(0),
+            granule,
+            pages,
+            node,
+            sparse: false,
+            tag,
+        })
     }
 
     /// The unit a commit or decommit ending at `len` is rounded to: whole huge pages past the
@@ -275,7 +286,11 @@ impl Region {
     /// the region stands now: for an owner that reserves the growth from a limit first.
     pub fn committed_after(&self, len: usize) -> Result<usize, MemError> {
         if len > self.reserved {
-            return Err(MemError::Exhausted { tag: self.tag, reserved: self.reserved, wanted: len });
+            return Err(MemError::Exhausted {
+                tag: self.tag,
+                reserved: self.reserved,
+                wanted: len,
+            });
         }
         let from = self.committed.load(Ordering::Acquire);
         if len <= from {
@@ -307,8 +322,10 @@ impl Region {
         let start = crate::align::align_down(from, self.granule);
         // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
         // reservation (`target <= reserved`), which lives as long as `self`.
-        unsafe { os::commit(self.at(start), target - start) }.map_err(|os| {
-            MemError::Commit { tag: self.tag, bytes: target - start, os }
+        unsafe { os::commit(self.at(start), target - start) }.map_err(|os| MemError::Commit {
+            tag: self.tag,
+            bytes: target - start,
+            os,
         })?;
         let unit = huge_unit();
         if self.pages == Pages::Transparent && from > 0 && from < unit && target > unit {
@@ -335,9 +352,8 @@ impl Region {
             // SAFETY: `[start, base_end)` is granule-aligned and inside the reservation; the
             // first huge page's worth is never mapped from the pool, so this only changes the
             // protection of reserved space.
-            unsafe { os::commit(self.at(start), base_end - start) }.map_err(|os| {
-                MemError::Commit { tag: self.tag, bytes: base_end - start, os }
-            })?;
+            unsafe { os::commit(self.at(start), base_end - start) }
+                .map_err(|os| MemError::Commit { tag: self.tag, bytes: base_end - start, os })?;
         }
         let huge_from = from.max(unit);
         if target > huge_from {
@@ -395,7 +411,10 @@ impl Region {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 // alloc: the error of a refused decommit, once
-                format!("a sparse {:?} region of {} bytes is never decommitted: its owner reads past what it committed", self.tag, self.reserved),
+                format!(
+                    "a sparse {:?} region of {} bytes is never decommitted: its owner reads past what it committed",
+                    self.tag, self.reserved
+                ),
             ));
         }
         let keep = crate::align::checked_align_up(keep, self.unit(keep))
@@ -435,7 +454,8 @@ impl Region {
     pub unsafe fn purge(&self, from: usize, len: usize) -> usize {
         let page = os::page_size();
         let Some(start) = crate::align::checked_align_up(from, page) else { return 0 };
-        let mut end = crate::align::align_down(from.saturating_add(len), page).min(self.committed());
+        let mut end =
+            crate::align::align_down(from.saturating_add(len), page).min(self.committed());
         if self.pages == Pages::Reserved {
             end = end.min(huge_unit());
         }
@@ -460,7 +480,8 @@ impl Region {
     pub fn reuse(&self, from: usize, len: usize) -> Result<(), MemError> {
         let page = os::page_size();
         let start = crate::align::align_down(from, page);
-        let end = crate::align::checked_align_up(from.saturating_add(len), page).unwrap_or(usize::MAX);
+        let end =
+            crate::align::checked_align_up(from.saturating_add(len), page).unwrap_or(usize::MAX);
         let committed = self.committed();
         assert!(
             end <= committed,
@@ -473,8 +494,11 @@ impl Region {
         }
         // SAFETY: `[start, end)` is page-aligned, inside the committed prefix of this live
         // reservation (checked just above).
-        unsafe { os::reuse(self.at(start), end - start) }
-            .map_err(|os| MemError::Commit { tag: self.tag, bytes: end - start, os })
+        unsafe { os::reuse(self.at(start), end - start) }.map_err(|os| MemError::Commit {
+            tag: self.tag,
+            bytes: end - start,
+            os,
+        })
     }
 }
 

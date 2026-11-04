@@ -30,10 +30,7 @@ mod unused;
 use base_db::Db;
 use blaze_items::ItemId;
 use hir::InFile;
-use hir_def::{
-    expr_store::Body,
-    nameres::demand::every_body,
-};
+use hir_def::{expr_store::Body, nameres::demand::every_body};
 use syntax::{TextRange, TextSize, view};
 
 use crate::{
@@ -125,7 +122,8 @@ pub(crate) fn head_range_view(node: view::Node<'_>) -> TextRange {
     let head = &written[..written.find('{').unwrap_or(written.len())];
     // The length up to its last character that is not white space, and whether a line ends
     // before that.
-    let (mut len, mut at, mut newline, mut multiline) = (TextSize::new(0), TextSize::new(0), false, false);
+    let (mut len, mut at, mut newline, mut multiline) =
+        (TextSize::new(0), TextSize::new(0), false, false);
     for c in head.chars() {
         at += TextSize::of(c);
         if c == '\n' {

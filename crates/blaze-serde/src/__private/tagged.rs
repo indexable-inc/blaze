@@ -4,7 +4,10 @@
 use std::fmt;
 
 use serde::{
-    de::{self, Deserialize, DeserializeSeed, Deserializer, Expected, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    de::{
+        self, Deserialize, DeserializeSeed, Deserializer, Expected, IgnoredAny, MapAccess,
+        SeqAccess, Visitor,
+    },
     ser::{self, Impossible, Serialize, SerializeMap, SerializeStruct, Serializer},
 };
 
@@ -34,7 +37,8 @@ pub fn tagged<'de, D: Deserializer<'de>>(
 ) -> Result<(usize, Content<'de>), D::Error> {
     let human = deserializer.is_human_readable();
     let variant = |content: &Content<'de>| {
-        VariantSeed { names: variants, other }.deserialize(ContentRefDeserializer::<D::Error>::new(content, human))
+        VariantSeed { names: variants, other }
+            .deserialize(ContentRefDeserializer::<D::Error>::new(content, human))
     };
     match Content::deserialize(deserializer)? {
         Content::Map(entries) => {
@@ -256,14 +260,23 @@ impl<S: Serializer> Serializer for TaggedSerializer<S> {
         self.tag_alone()
     }
 
-    fn serialize_unit_variant(self, _name: &'static str, _index: u32, inner: &'static str) -> Result<S::Ok, S::Error> {
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        inner: &'static str,
+    ) -> Result<S::Ok, S::Error> {
         let mut state = self.delegate.serialize_map(Some(2))?;
         state.serialize_entry(self.tag, self.key)?;
         state.serialize_entry(inner, &())?;
         state.end()
     }
 
-    fn serialize_newtype_struct<T: Serialize + ?Sized>(self, _name: &'static str, value: &T) -> Result<S::Ok, S::Error> {
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<S::Ok, S::Error> {
         value.serialize(self)
     }
 
@@ -288,7 +301,11 @@ impl<S: Serializer> Serializer for TaggedSerializer<S> {
         Err(self.cannot("a tuple"))
     }
 
-    fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeTupleStruct, S::Error> {
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, S::Error> {
         Err(self.cannot("a tuple struct"))
     }
 
@@ -308,7 +325,11 @@ impl<S: Serializer> Serializer for TaggedSerializer<S> {
         Ok(state)
     }
 
-    fn serialize_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeStruct, S::Error> {
+    fn serialize_struct(
+        self,
+        name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStruct, S::Error> {
         let mut state = self.delegate.serialize_struct(name, len + 1)?;
         state.serialize_field(self.tag, self.key)?;
         Ok(state)

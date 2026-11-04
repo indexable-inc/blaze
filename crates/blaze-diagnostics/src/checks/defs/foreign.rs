@@ -34,7 +34,8 @@ pub(super) fn check(cx: &Cx<'_, '_>, func: hir::Function) -> Option<Found> {
     let name = if eii { "externally implementable items" } else { "foreign items" };
     let span = cx.span(source.with_value(def_range_view(source.value.syntax())));
     // alloc: the error's message
-    let mut diag = Diag::error(Some("E0044"), format!("{name} may not have {kinds} parameters"), span.clone());
+    let mut diag =
+        Diag::error(Some("E0044"), format!("{name} may not have {kinds} parameters"), span.clone());
     // alloc: the error's label
     diag.span_label(span, format!("can't have {kinds} parameters"));
     // alloc: the error's help

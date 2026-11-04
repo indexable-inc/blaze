@@ -141,18 +141,28 @@ impl Outcomes<'_> {
     fn fail(&mut self, asked: Asked, why: &str) {
         let host = self.host;
         // alloc: an error's message, made only when it fails.
-        let failed = |key: &Key| format!("the global cache at {host}: {why}; asked for {:x}", key.0);
+        let failed =
+            |key: &Key| format!("the global cache at {host}: {why}; asked for {:x}", key.0);
         match asked {
-            Asked::Fetch(keys) => self.store.extend(
-                keys.iter().map(|(tag, key)| Completion { tag: *tag, done: Done::Failed(IoError(failed(key))) }),
-            ),
-            Asked::Publish(keys) => self
-                .published
-                .extend(keys.iter().map(|(tag, key)| Published { tag: *tag, key: *key, result: Err(failed(key)) })),
-            Asked::Bundle(tag, id) => self.got.push(GotBundle { tag, id, result: Err(failed(&Key(id.0))) }),
-            Asked::BundlePublish(tag, id) => {
-                self.published.push(Published { tag, key: Key(id.0), result: Err(failed(&Key(id.0))) })
+            Asked::Fetch(keys) => self.store.extend(keys.iter().map(|(tag, key)| Completion {
+                tag: *tag,
+                done: Done::Failed(IoError(failed(key))),
+            })),
+            Asked::Publish(keys) => {
+                self.published.extend(keys.iter().map(|(tag, key)| Published {
+                    tag: *tag,
+                    key: *key,
+                    result: Err(failed(key)),
+                }))
             }
+            Asked::Bundle(tag, id) => {
+                self.got.push(GotBundle { tag, id, result: Err(failed(&Key(id.0))) })
+            }
+            Asked::BundlePublish(tag, id) => self.published.push(Published {
+                tag,
+                key: Key(id.0),
+                result: Err(failed(&Key(id.0))),
+            }),
         }
     }
 }
@@ -200,7 +210,12 @@ impl<C: Channels> Client<C> {
     /// fetching it. The store's completion is among what [`Client::complete`] returns. A value
     /// no machine may publish ([`crate::public::fetchable`]) is refused before the store keeps
     /// it, so no build reads it.
-    pub fn fetch(&mut self, store: &mut Store, public: &Public, effects: &mut Vec<Effect>) -> Option<Tag> {
+    pub fn fetch(
+        &mut self,
+        store: &mut Store,
+        public: &Public,
+        effects: &mut Vec<Effect>,
+    ) -> Option<Tag> {
         self.fetch_many(store, std::iter::once(public), effects).pop().map(|(_, tag)| tag)
     }
 
@@ -218,7 +233,9 @@ impl<C: Channels> Client<C> {
         for public in publics {
             let key = public.key();
             self.allowed = Some(key);
-            tags.extend(store.fetch(&key, self, crate::public::fetchable, effects).map(|tag| (key, tag)));
+            tags.extend(
+                store.fetch(&key, self, crate::public::fetchable, effects).map(|tag| (key, tag)),
+            );
         }
         self.allowed = None;
         self.batching = false;
@@ -239,7 +256,8 @@ impl<C: Channels> Client<C> {
         effects: &mut Vec<Effect>,
     ) -> Result<Tag, Private> {
         secrets.check(public.key(), &value)?;
-        crate::public::fetchable(public.kind(), &value).map_err(|why| Private { key: public.key(), why })?;
+        crate::public::fetchable(public.kind(), &value)
+            .map_err(|why| Private { key: public.key(), why })?;
         let signed = publisher.sign(Record::of(public.key(), public.kind(), &value));
         let tag = self.tags.next();
         self.publishes.push_back((tag, signed, value));
@@ -282,7 +300,11 @@ impl<C: Channels> Client<C> {
 
     /// Takes a completion of its own. Returns the store's: each the completion of a tag
     /// [`Store::fetch`] asked with, for [`Store::complete`].
-    pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Completion> {
+    pub fn complete(
+        &mut self,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<Completion> {
         let mut answers = std::mem::take(&mut self.undelivered);
         let Completion { tag, done } = completion;
         match self.role(tag) {
@@ -317,9 +339,15 @@ impl<C: Channels> Client<C> {
                     }
                 },
                 // alloc: an error's message, made only when it fails.
-                Done::Failed(error) => self.connect_failed(at, &format!("could not connect: {error}"), &mut answers),
+                Done::Failed(error) => {
+                    self.connect_failed(at, &format!("could not connect: {error}"), &mut answers)
+                }
                 // alloc: an error's message, made only when it fails.
-                other => self.connect_failed(at, &format!("a connect completed as {other:?}"), &mut answers),
+                other => self.connect_failed(
+                    at,
+                    &format!("a connect completed as {other:?}"),
+                    &mut answers,
+                ),
             },
             Role::Send(at) => match done {
                 Done::Sent(spare) => {
@@ -337,7 +365,12 @@ impl<C: Channels> Client<C> {
                     self.drop_link(at, &format!("sending failed: {error}"), &mut answers, effects)
                 }
                 // alloc: an error's message, made only when it fails.
-                other => self.drop_link(at, &format!("a send completed as {other:?}"), &mut answers, effects),
+                other => self.drop_link(
+                    at,
+                    &format!("a send completed as {other:?}"),
+                    &mut answers,
+                    effects,
+                ),
             },
             Role::Recv(at) => {
                 if let Link::Up(up) = &mut self.links[at] {
@@ -349,15 +382,30 @@ impl<C: Channels> Client<C> {
                     }
                     Done::Read(bytes) => match self.received(at, &bytes, &mut answers) {
                         Ok(true) => self.pump_all(&mut answers, effects),
-                        Ok(false) => self.drop_link(at, "the server closed the connection", &mut answers, effects),
+                        Ok(false) => self.drop_link(
+                            at,
+                            "the server closed the connection",
+                            &mut answers,
+                            effects,
+                        ),
                         Err(why) => self.drop_link(at, &why, &mut answers, effects),
                     },
                     Done::Broken { error, .. } | Done::Failed(error) => {
                         // alloc: an error path.
-                        self.drop_link(at, &format!("receiving failed: {error}"), &mut answers, effects)
+                        self.drop_link(
+                            at,
+                            &format!("receiving failed: {error}"),
+                            &mut answers,
+                            effects,
+                        )
                     }
                     // alloc: an error's message, made only when it fails.
-                    other => self.drop_link(at, &format!("a receive completed as {other:?}"), &mut answers, effects),
+                    other => self.drop_link(
+                        at,
+                        &format!("a receive completed as {other:?}"),
+                        &mut answers,
+                        effects,
+                    ),
                 }
             }
             Role::Stale => {}
@@ -399,28 +447,41 @@ impl<C: Channels> Client<C> {
 
     /// Fails everything not yet asked.
     fn fail_queued(&mut self, why: &str, answers: &mut Vec<Completion>) {
-        let mut outcomes =
-            Outcomes { host: &self.endpoint.host, store: answers, published: &mut self.published, got: &mut self.got };
+        let mut outcomes = Outcomes {
+            host: &self.endpoint.host,
+            store: answers,
+            published: &mut self.published,
+            got: &mut self.got,
+        };
         // alloc: an error path: what was queued fails once no connection is left.
         let fetches: Vec<(Tag, Key)> = self.fetches.drain(..).collect();
         if !fetches.is_empty() {
             outcomes.fail(Asked::Fetch(fetches), why);
         }
         // alloc: an error path: what was queued fails once no connection is left.
-        let publishes: Vec<(Tag, Key)> = self.publishes.drain(..).map(|(tag, signed, _)| (tag, signed.record.key)).collect();
+        let publishes: Vec<(Tag, Key)> =
+            self.publishes.drain(..).map(|(tag, signed, _)| (tag, signed.record.key)).collect();
         if !publishes.is_empty() {
             outcomes.fail(Asked::Publish(publishes), why);
         }
         for work in self.bundles.drain(..) {
             match work {
                 BundleWork::Get { tag, id } => outcomes.fail(Asked::Bundle(tag, id), why),
-                BundleWork::Publish { tag, manifest } => outcomes.fail(Asked::BundlePublish(tag, manifest.id), why),
+                BundleWork::Publish { tag, manifest } => {
+                    outcomes.fail(Asked::BundlePublish(tag, manifest.id), why)
+                }
             }
         }
     }
 
     /// Gives up link `at`, failing what it owes. What is queued goes on another link.
-    fn drop_link(&mut self, at: usize, why: &str, answers: &mut Vec<Completion>, effects: &mut Vec<Effect>) {
+    fn drop_link(
+        &mut self,
+        at: usize,
+        why: &str,
+        answers: &mut Vec<Completion>,
+        effects: &mut Vec<Effect>,
+    ) {
         match self.links.remove(at) {
             Link::Connecting(tag) => self.abandoned.push(tag),
             Link::Up(up) => {
@@ -449,7 +510,12 @@ impl<C: Channels> Client<C> {
 
     /// Takes bytes received on link `at` and answers each whole response. `Ok(false)` when
     /// the server is done with the connection.
-    fn received(&mut self, at: usize, bytes: &[u8], answers: &mut Vec<Completion>) -> Result<bool, String> {
+    fn received(
+        &mut self,
+        at: usize,
+        bytes: &[u8],
+        answers: &mut Vec<Completion>,
+    ) -> Result<bool, String> {
         let Client { links, trust, listed, fetches, published, got, endpoint, .. } = self;
         let Link::Up(up) = &mut links[at] else { return Ok(true) };
         let up = &mut **up;
@@ -478,10 +544,13 @@ impl<C: Channels> Client<C> {
             start += head.head + head.body;
             if head.status != 200 {
                 // alloc: an error's message, made only when it fails.
-                let said = String::from_utf8_lossy(&body[..body.len().min(wire::REASON_MOST)]).into_owned();
+                let said = String::from_utf8_lossy(&body[..body.len().min(wire::REASON_MOST)])
+                    .into_owned();
                 // alloc: an error's message, made only when it fails.
                 outcomes.fail(asked, &format!("it answered {}: {said}", head.status));
-            } else if let Err(why) = answer(asked, body, trust, listed, &mut up.recv_window, fetches, &mut outcomes) {
+            } else if let Err(why) =
+                answer(asked, body, trust, listed, &mut up.recv_window, fetches, &mut outcomes)
+            {
                 break Err(why);
             }
             if head.close {
@@ -534,7 +603,8 @@ impl<C: Channels> Client<C> {
                 Err(why) => self.drop_link(at, &why, answers, effects),
             }
         }
-        let connecting = self.links.iter().filter(|link| matches!(link, Link::Connecting(_))).count();
+        let connecting =
+            self.links.iter().filter(|link| matches!(link, Link::Connecting(_))).count();
         let more = self.queued_requests().div_ceil(PIPELINE).saturating_sub(connecting);
         self.connect(more, effects);
     }
@@ -551,7 +621,9 @@ impl<C: Channels> Client<C> {
 
     /// About how many requests what is queued goes in.
     fn queued_requests(&self) -> usize {
-        self.bundles.len() + usize::from(!self.publishes.is_empty()) + self.fetches.len().div_ceil(BATCH_KEYS)
+        self.bundles.len()
+            + usize::from(!self.publishes.is_empty())
+            + self.fetches.len().div_ceil(BATCH_KEYS)
     }
 
     /// Asks one request of what is queued on link `at`, if it is up and has room: whether it
@@ -604,7 +676,8 @@ impl<C: Channels> Client<C> {
             while let Some((_, key)) = fetches.front() {
                 let len = listed.get(key).map(|it| it.len);
                 let most = if len.is_some() { BATCH_MOST } else { BATCH_KEYS };
-                if !keys.is_empty() && (keys.len() >= most || !wire::takes(bytes, len.unwrap_or(0))) {
+                if !keys.is_empty() && (keys.len() >= most || !wire::takes(bytes, len.unwrap_or(0)))
+                {
                     break;
                 }
                 bytes += len.unwrap_or(0);
@@ -633,7 +706,11 @@ impl<C: Channels> Client<C> {
         if up.sending.is_none() && !up.staged.is_empty() {
             let tag = tags.next();
             up.sending = Some(tag);
-            effects.push(Effect::Send { conn: up.conn, bytes: std::mem::take(&mut up.staged), tag });
+            effects.push(Effect::Send {
+                conn: up.conn,
+                bytes: std::mem::take(&mut up.staged),
+                tag,
+            });
         }
         if up.recv.is_none() {
             let tag = tags.next();
@@ -665,10 +742,22 @@ fn answer(
         Asked::Fetch(keys) => {
             let mut answered = 0;
             let mut reader = Reader::new(body);
-            let result = fetched(&keys, &mut answered, &mut reader, trust, listed, window, fetches, outcomes);
+            let result = fetched(
+                &keys,
+                &mut answered,
+                &mut reader,
+                trust,
+                listed,
+                window,
+                fetches,
+                outcomes,
+            );
             if let Err(why) = &result {
                 // alloc: an error's message, made only when it fails.
-                outcomes.fail(Asked::Fetch(keys[answered..].to_vec()), &format!("a malformed answer: {why}"));
+                outcomes.fail(
+                    Asked::Fetch(keys[answered..].to_vec()),
+                    &format!("a malformed answer: {why}"),
+                );
             }
             result
         }
@@ -714,10 +803,12 @@ fn answer(
         }
         Asked::BundlePublish(tag, id) => {
             let key = Key(id.0);
-            let checked = wire::parse_publish_answer(body, 1).and_then(|statuses| match <[_; 1]>::try_from(statuses) {
-                Ok([(said, result)]) if said == key => Ok(result),
-                // alloc: an error's message, made only when it fails.
-                _ => Err("an answer for another bundle".to_owned()),
+            let checked = wire::parse_publish_answer(body, 1).and_then(|statuses| {
+                match <[_; 1]>::try_from(statuses) {
+                    Ok([(said, result)]) if said == key => Ok(result),
+                    // alloc: an error's message, made only when it fails.
+                    _ => Err("an answer for another bundle".to_owned()),
+                }
             });
             match checked {
                 Ok(result) => {
@@ -726,7 +817,8 @@ fn answer(
                 }
                 Err(why) => {
                     // alloc: an error's message, made only when it fails.
-                    outcomes.fail(Asked::BundlePublish(tag, id), &format!("a malformed answer: {why}"));
+                    outcomes
+                        .fail(Asked::BundlePublish(tag, id), &format!("a malformed answer: {why}"));
                     Err(why)
                 }
             }
@@ -734,7 +826,11 @@ fn answer(
     }
 }
 
-fn bundle_answer(reader: &mut Reader<'_>, id: BundleId, trust: &Trust) -> Result<Option<Manifest>, String> {
+fn bundle_answer(
+    reader: &mut Reader<'_>,
+    id: BundleId,
+    trust: &Trust,
+) -> Result<Option<Manifest>, String> {
     reader.header(wire::BUNDLE_ANSWER, "a bundle's answer")?;
     let manifest = match reader.u8().map_err(wire::truncated)? {
         wire::MISSING => None,
@@ -745,7 +841,9 @@ fn bundle_answer(reader: &mut Reader<'_>, id: BundleId, trust: &Trust) -> Result
                 return Err(format!("the manifest of {:x} in place of {:x}", manifest.id.0, id.0));
             }
             // alloc: an error's message, made only when it fails.
-            manifest.verify(trust).map_err(|why| format!("the manifest of {:x} is refused: {why}", id.0))?;
+            manifest
+                .verify(trust)
+                .map_err(|why| format!("the manifest of {:x} is refused: {why}", id.0))?;
             Some(manifest)
         }
         // alloc: an error's message, made only when it fails.
@@ -785,7 +883,10 @@ fn fetched(
             }
             match which {
                 wire::MISSING => {
-                    outcomes.store.push(Completion { tag, done: Done::Read(Answer::Missing { key }.encode_framed()) });
+                    outcomes.store.push(Completion {
+                        tag,
+                        done: Done::Read(Answer::Missing { key }.encode_framed()),
+                    });
                 }
                 wire::DEFERRED => deferred.push((tag, key)),
                 wire::FOUND => {
@@ -793,11 +894,17 @@ fn fetched(
                     let record = signed.record;
                     if record.key != key {
                         // alloc: an error's message, made only when it fails.
-                        return Err(format!("a record of {:x} in an answer for {:x}", record.key.0, key.0));
+                        return Err(format!(
+                            "a record of {:x} in an answer for {:x}",
+                            record.key.0, key.0
+                        ));
                     }
                     let checked = match listed.get(&key) {
                         Some(listed) if *listed == record => Ok(()),
-                        Some(_) => Err(Refused { key, what: "its record is not the one its bundle's manifest lists".into() }),
+                        Some(_) => Err(Refused {
+                            key,
+                            what: "its record is not the one its bundle's manifest lists".into(),
+                        }),
                         None => trust.verify(&signed),
                     };
                     let value = window.read(reader, record.len, checked.is_ok())?;
@@ -808,13 +915,25 @@ fn fetched(
                         Err(refused) => Done::Failed(IoError(refused.to_string())),
                         Ok(()) => {
                             let bytes = value.expect("a value whose record is checked is kept");
-                            Done::Read(Answer::Value { key, kind: record.kind, content: record.content, bytes }.encode_framed())
+                            Done::Read(
+                                Answer::Value {
+                                    key,
+                                    kind: record.kind,
+                                    content: record.content,
+                                    bytes,
+                                }
+                                .encode_framed(),
+                            )
                         }
                     };
                     outcomes.store.push(Completion { tag, done });
                 }
                 // alloc: an error's message, made only when it fails.
-                other => return Err(format!("an unknown answer {other} (0 missing, 1 deferred, 2 found)")),
+                other => {
+                    return Err(format!(
+                        "an unknown answer {other} (0 missing, 1 deferred, 2 found)"
+                    ));
+                }
             }
             *answered += 1;
         }

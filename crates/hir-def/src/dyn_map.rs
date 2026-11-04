@@ -201,16 +201,11 @@ impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstPtr, ast};
     use hir_expand::fixture;
+    use syntax::{AstPtr, ast};
 
     use super::{DynMap, keys};
-    use crate::{
-        Lookup,
-        src::HasSource,
-        test_db::TestDBExt,
-        test_items,
-    };
+    use crate::{Lookup, src::HasSource, test_db::TestDBExt, test_items};
 
     #[test]
     fn each_key_has_its_own_map() {

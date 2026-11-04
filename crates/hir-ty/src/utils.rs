@@ -6,8 +6,8 @@ use std::{borrow::Cow, iter::Enumerate};
 use base_db::Db;
 use base_db::target::{self, TargetData};
 use hir_def::{
-    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, expr_store::ExpressionStore,
-    hir::PatId, lang_item::LangItems, signatures::FunctionSignature,
+    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, expr_store::ExpressionStore, hir::PatId,
+    lang_item::LangItems, signatures::FunctionSignature,
 };
 use rustc_abi::TargetDataLayout;
 use rustc_ast_ir::Mutability;
@@ -138,8 +138,8 @@ pub fn detect_variant_from_bytes<'a>(
                         }
                         false => tag,
                     };
-                    let index =
-                        crate::consteval::discriminants::enum_discriminants(db, e).variant_of(tag)?;
+                    let index = crate::consteval::discriminants::enum_discriminants(db, e)
+                        .variant_of(tag)?;
                     let var_idx = RustcEnumVariantIdx(index);
                     assert!(var_idx.0 < variants.len());
                     let def = e.enum_variants(db).variants[index].0;

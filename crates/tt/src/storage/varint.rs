@@ -5,11 +5,11 @@
 //!
 //! The bytes are the old ones; the writer and reader are safe versions of the old ones.
 
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use intern::Symbol;
-use blaze_hash::HashMap;
-use std::alloc::Global;
 use span::{Span, TextRange, TextSize};
+use std::alloc::Global;
 
 use super::CompressedSpanPart;
 use crate::{
@@ -136,7 +136,12 @@ fn encode_span_no_map(
     w.u32(first_u32);
 }
 
-fn encode_symbol(w: &mut Writer, symbol: &Symbol, tag: u32, symbols_map: &HashMap<Symbol, usize, Global>) {
+fn encode_symbol(
+    w: &mut Writer,
+    symbol: &Symbol,
+    tag: u32,
+    symbols_map: &HashMap<Symbol, usize, Global>,
+) {
     let symbol_idx = symbols_map[symbol] as u32;
     if symbol_idx <= n_bits_mask(6) {
         w.u8(((symbol_idx << 2) | tag) as u8);
@@ -349,8 +354,9 @@ impl VarintTree {
                         }
                         Leaf::Punct(_) => {}
                     }
-                    *span_frequencies.entry(CompressedSpanPart::from_span(leaf.span())).or_insert(0) +=
-                        1;
+                    *span_frequencies
+                        .entry(CompressedSpanPart::from_span(leaf.span()))
+                        .or_insert(0) += 1;
                 }
                 TokenTree::Subtree(subtree) => {
                     *span_frequencies
@@ -400,7 +406,9 @@ fn encode_all(
             let len = compressed_spans.len();
             let compressed_spans = &mut compressed_spans[..len - 2];
             if compressed_span_frequencies.len() > n_bits_mask(4) as usize {
-                radix::sort_by_key(compressed_spans, |span| !(compressed_span_frequencies[span] as u64));
+                radix::sort_by_key(compressed_spans, |span| {
+                    !(compressed_span_frequencies[span] as u64)
+                });
             }
             for (index, span) in compressed_spans.iter().enumerate() {
                 *compressed_span_frequencies.get_mut(span).unwrap() = index;
@@ -502,8 +510,7 @@ fn decode(r: &mut Reader<'_>, compressed: &[CompressedSpanPart], symbols: &[Symb
 
     if span_and_extra & 0b1 == 0b1 {
         let char_and_half_spacing = r.u8();
-        let spacing =
-            spacing((span_and_extra & 0b10) | (u32::from(char_and_half_spacing) & 0b1));
+        let spacing = spacing((span_and_extra & 0b10) | (u32::from(char_and_half_spacing) & 0b1));
         let char = char::from(char_and_half_spacing >> 1);
         return TokenTree::Leaf(Leaf::Punct(Punct { char, spacing, span }));
     } else if span_and_extra & 0b10 == 0b10 {

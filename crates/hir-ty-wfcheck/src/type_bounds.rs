@@ -11,9 +11,9 @@ mod tests;
 
 use hir_def::{AssocItemId, FunctionId, ImplId, TypeAliasId};
 use rustc_type_ir::{
-    AliasTermKind, AliasTyKind, ClauseKind, IsRigid, OutlivesClause, TypeFoldable as _,
-    TypeFolder, TypeSuperFoldable as _, TypeSuperVisitable as _, TypeVisitable as _,
-    TypeVisitableExt as _, TypeVisitor,
+    AliasTermKind, AliasTyKind, ClauseKind, IsRigid, OutlivesClause, TypeFoldable as _, TypeFolder,
+    TypeSuperFoldable as _, TypeSuperVisitable as _, TypeVisitable as _, TypeVisitableExt as _,
+    TypeVisitor,
     inherent::{GenericArgs as _, IntoKind as _, Ty as _},
 };
 
@@ -172,7 +172,8 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
             let site = match value.kind() {
                 TyKind::Alias(_, alias)
                     if let AliasTyKind::Opaque { def_id } = alias.kind
-                        && let ImplTraitId::ReturnTypeImplTrait(owner, index) = def_id.0.loc(db)
+                        && let ImplTraitId::ReturnTypeImplTrait(owner, index) =
+                            def_id.0.loc(db)
                         && owner == impl_fn =>
                 {
                     Site::Opaque(impl_fn, index.into_raw().into_u32())

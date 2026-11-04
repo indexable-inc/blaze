@@ -517,10 +517,7 @@ fn what_each_form_prints() {
             "cargo:a=1\ncargo:b=2\ncargo:c=3\n",
         ),
         ("fn main() { println!(\"cargo:a=1\") }", "cargo:a=1\n"),
-        (
-            "fn main ( ) { println /* a comment */ ! ( \"cargo:a=1\" ) ; }",
-            "cargo:a=1\n",
-        ),
+        ("fn main ( ) { println /* a comment */ ! ( \"cargo:a=1\" ) ; }", "cargo:a=1\n"),
         ("fn main() { println!(\"cargo:a=\\\n      1\"); }", "cargo:a=1\n"),
         ("fn main() { println!(\"cargo:a=1\ncargo:b=2\"); }", "cargo:a=1\ncargo:b=2\n"),
         ("fn main() { println!(\"cargo:a=é\u{301}✓\"); }", "cargo:a=é\u{301}✓\n"),
@@ -562,13 +559,16 @@ fn read_as_a_runs_output() {
     )
     .unwrap();
     let output = output::parse(printed.as_bytes(), &cx).unwrap();
-    assert_eq!(output, Output {
-        cfgs: vec!["foo".into()],
-        check_cfgs: vec!["cfg(foo)".into()],
-        metadata: vec![("links".into(), "1".into())],
-        rerun_if_changed: vec!["build.rs".into()],
-        ..Output::default()
-    });
+    assert_eq!(
+        output,
+        Output {
+            cfgs: vec!["foo".into()],
+            check_cfgs: vec!["cfg(foo)".into()],
+            metadata: vec![("links".into(), "1".into())],
+            rerun_if_changed: vec!["build.rs".into()],
+            ..Output::default()
+        }
+    );
 }
 
 #[test]

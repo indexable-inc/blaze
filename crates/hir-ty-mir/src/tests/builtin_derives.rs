@@ -1,8 +1,8 @@
 use expect_test::{Expect, expect};
 use hir_def::nameres::crate_def_map;
+use hir_expand::fixture;
 use itertools::Itertools;
 use stdx::format_to;
-use hir_expand::fixture;
 
 use crate::{builtin_derive::impl_trait, next_solver::DbInterner};
 

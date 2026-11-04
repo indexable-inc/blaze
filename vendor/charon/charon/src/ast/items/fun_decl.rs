@@ -5,8 +5,7 @@ use serde_state::DeserializeState;
 use serde_state::SerializeState;
 
 /// A function definition
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 pub struct FunDecl {
     pub def_id: FunDeclId,
     /// The meta data associated with the declaration.
@@ -21,8 +20,20 @@ pub struct FunDecl {
 }
 
 /// A function signature.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct FunSig {
     /// Is the function unsafe or not
     pub is_unsafe: bool,
@@ -34,9 +45,21 @@ pub struct FunSig {
     pub output: Ty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(stateless)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Abi"))]
 pub enum Abi {
@@ -47,8 +70,7 @@ pub enum Abi {
 }
 
 /// Where a given function came from.
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Fun"))]
 pub enum FunSource {
     /// A normal function.
@@ -95,25 +117,11 @@ pub enum FunSource {
 impl FunDecl {
     /// Replace the generic parameters of this function with the ones given by the binder.
     pub fn substitute_params(self, subst: Binder<GenericArgs>) -> Self {
-        let FunDecl {
-            def_id,
-            item_meta,
-            generics: _,
-            signature,
-            src,
-            body,
-        } = self;
+        let FunDecl { def_id, item_meta, generics: _, signature, src, body } = self;
         let signature = signature.substitute(&subst.skip_binder);
         let src = src.substitute(&subst.skip_binder);
         let body = body.substitute(&subst.skip_binder);
-        FunDecl {
-            def_id,
-            item_meta,
-            generics: subst.params,
-            signature,
-            src,
-            body,
-        }
+        FunDecl { def_id, item_meta, generics: subst.params, signature, src, body }
     }
 
     /// Whether this function is unsafe to call, because it is declared `unsafe` (safety.unsafe-call),
@@ -152,18 +160,13 @@ impl FunDecl {
         let mut regions = IndexVec::new();
         let late_regions = self.generics.regions.map_ref(|param| {
             if param.late_bound {
-                Some(regions.push_with(|index| RegionParam {
-                    index,
-                    ..param.clone()
-                }))
+                Some(regions.push_with(|index| RegionParam { index, ..param.clone() }))
             } else {
                 None
             }
         });
         let mut signature = self.signature.as_ref().clone().move_under_binder();
-        signature.visit_vars(&mut RebindLateRegions {
-            late_regions: &late_regions,
-        });
+        signature.visit_vars(&mut RebindLateRegions { late_regions: &late_regions });
         RegionBinder {
             regions,
             // Late-bound regions are guaranteed to not be involved in any non-implied outlives

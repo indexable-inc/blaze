@@ -6,8 +6,8 @@
 
 use anyhow::bail;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_resolve::{CRATES_IO_REGISTRY, SourceId, SourceKind};
+use std::alloc::Global;
 
 #[derive(Clone)]
 struct Replacement {
@@ -50,7 +50,12 @@ impl SourceMap {
 
     /// `[source.<name>]` at `id`, replaced by `with` (that source's name and where its
     /// `replace-with` is defined), as cargo's `SourceConfigMap::add`.
-    pub fn add(&mut self, name: &str, id: SourceId, with: Option<(String, String)>) -> anyhow::Result<()> {
+    pub fn add(
+        &mut self,
+        name: &str,
+        id: SourceId,
+        with: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
         if let Some(old) = self.names.insert(id, name.to_owned()) // alloc: setup, one name per `[source]` table
             && name != CRATES_IO_REGISTRY
         {
@@ -166,12 +171,12 @@ pub fn describe(id: SourceId) -> String {
         }
         SourceKind::Directory => match id.url().to_file_path() {
             Ok(path) => format!("directory source `{}`", path.display()), // alloc: message text, at the edge
-            Err(()) => id.to_string(), // alloc: as above
+            Err(()) => id.to_string(),                                    // alloc: as above
         },
         SourceKind::Git(_) => format!("Git repository {id}"), // alloc: as above
         SourceKind::Path => match id.url().to_file_path() {
             Ok(path) => path.display().to_string(), // alloc: as above
-            Err(()) => id.to_string(), // alloc: as above
+            Err(()) => id.to_string(),              // alloc: as above
         },
     }
 }
@@ -220,7 +225,12 @@ mod tests {
             )
         );
         // crates.io may be defined again at its own location.
-        map.add(CRATES_IO_REGISTRY, SourceId::crates_io_sparse(), Some(("x".to_owned(), "c".to_owned()))).unwrap();
+        map.add(
+            CRATES_IO_REGISTRY,
+            SourceId::crates_io_sparse(),
+            Some(("x".to_owned(), "c".to_owned())),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -228,7 +238,10 @@ mod tests {
         let map = SourceMap::new(SourceId::crates_io_sparse());
         assert_eq!(map.crates_io(), SourceId::crates_io_sparse());
         assert_eq!(map.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io_sparse());
-        assert_eq!(map.replacement(SourceId::crates_io_sparse()).unwrap(), SourceId::crates_io_sparse());
+        assert_eq!(
+            map.replacement(SourceId::crates_io_sparse()).unwrap(),
+            SourceId::crates_io_sparse()
+        );
         assert!(!map.is_replaced(SourceId::crates_io()));
         let git = SourceMap::new(SourceId::crates_io());
         assert_eq!(git.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io());
@@ -245,15 +258,23 @@ mod tests {
     #[test]
     fn a_replacement_may_be_a_registry_by_name() {
         let mut map = SourceMap::new(SourceId::crates_io_sparse());
-        map.add(CRATES_IO_REGISTRY, SourceId::crates_io_sparse(), Some(("mine".to_owned(), "/w/.cargo/config.toml".to_owned())))
-            .unwrap();
+        map.add(
+            CRATES_IO_REGISTRY,
+            SourceId::crates_io_sparse(),
+            Some(("mine".to_owned(), "/w/.cargo/config.toml".to_owned())),
+        )
+        .unwrap();
         assert_eq!(map.unknown_replacements(), ["mine"]);
         assert_eq!(
             error(map.replacement(SourceId::crates_io())),
             "could not find a configured source with the name `mine` when attempting to lookup \
              `crates-io` (configuration in `/w/.cargo/config.toml`)"
         );
-        let mine = SourceId::for_alt_registry(&"sparse+https://mine.example.com/index/".parse().unwrap(), "mine").unwrap();
+        let mine = SourceId::for_alt_registry(
+            &"sparse+https://mine.example.com/index/".parse().unwrap(),
+            "mine",
+        )
+        .unwrap();
         map.add_registry("mine".to_owned(), mine);
         assert_eq!(map.replacement(SourceId::crates_io()).unwrap(), mine);
         assert!(map.is_replaced(SourceId::crates_io()));
@@ -265,9 +286,16 @@ mod tests {
 
     #[test]
     fn sources_describe_themselves_as_cargos_do() {
-        let git = SourceId::for_git(&"https://github.com/o/r".parse().unwrap(), blaze_resolve::GitReference::DefaultBranch).unwrap();
+        let git = SourceId::for_git(
+            &"https://github.com/o/r".parse().unwrap(),
+            blaze_resolve::GitReference::DefaultBranch,
+        )
+        .unwrap();
         assert_eq!(describe(git), format!("Git repository {git}"));
-        assert_eq!(describe(SourceId::crates_io_sparse()), SourceId::crates_io_sparse().display_index());
+        assert_eq!(
+            describe(SourceId::crates_io_sparse()),
+            SourceId::crates_io_sparse().display_index()
+        );
         #[cfg(unix)]
         {
             let dir = SourceId::for_directory(std::path::Path::new("/w/vendor")).unwrap();

@@ -13,7 +13,6 @@
 //! (`Span::find_ancestor_inside_same_ctxt`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     AdtId, ModuleDefId,
@@ -22,6 +21,7 @@ use hir_def::{
 };
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_type_ir::inherent::IntoKind as _;
+use std::alloc::Global;
 
 use super::FnItems;
 use crate::{
@@ -69,7 +69,13 @@ impl LatePass for DropForgetUseless {
         self.semi_stmt = None;
     }
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, _out: &mut Vec<Found>) {
+    fn check_stmt(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        _out: &mut Vec<Found>,
+    ) {
         self.semi_stmt = match b.store().expr(block) {
             Expr::Block { statements, .. } => match statements.get(index) {
                 Some(Statement::Expr { expr, has_semi: true }) => Some(expr),
@@ -79,7 +85,13 @@ impl LatePass for DropForgetUseless {
         };
     }
 
-    fn check_arm(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, index: usize, _out: &mut Vec<Found>) {
+    fn check_arm(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        expr: ExprId,
+        index: usize,
+        _out: &mut Vec<Found>,
+    ) {
         let store = b.store();
         // Only a call is looked up in `arm_values`.
         if let Expr::Match { arms, .. } = store.expr(expr)
@@ -123,7 +135,8 @@ impl LatePass for DropForgetUseless {
             ),
             _ => return,
         };
-        let (Some(at), Some(call), Some(arg_span)) = (b.expr_node(expr), util::span(b, expr), util::span(b, arg))
+        let (Some(at), Some(call), Some(arg_span)) =
+            (b.expr_node(expr), util::span(b, expr), util::span(b, arg))
         else {
             return;
         };
@@ -168,7 +181,10 @@ impl LatePass for DropForgetUseless {
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
         // alloc: the lint's diagnostic
-        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
+        diag.fact(
+            Fact::Signature(b.cx.key(ItemId::Function(def))),
+            format!("the signature of `{called}`"),
+        );
         out.push(b.lint(diag, Phase::Late, at));
     }
 }
@@ -176,7 +192,11 @@ impl LatePass for DropForgetUseless {
 /// rustc's `AdtDef::is_manually_drop`.
 fn is_manually_drop<'db>(solver: &util::Solver<'db>, ty: Ty<'db>) -> bool {
     let TyKind::Adt(def, _) = ty.kind() else { return false };
-    solver.interner().lang_items().ManuallyDrop.is_some_and(|it| def.def_id() == AdtId::StructId(it))
+    solver
+        .interner()
+        .lang_items()
+        .ManuallyDrop
+        .is_some_and(|it| def.def_id() == AdtId::StructId(it))
 }
 
 /// rustc's `Span::find_ancestor_inside_same_ctxt`: `span`, or the call of the macro it came
@@ -204,13 +224,13 @@ fn can_have_side_effects(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
         | Expr::Field { expr, .. }
         | Expr::Ref { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::UnsafeBinderCast { expr, .. } => {
-            can_have_side_effects(b, expr)
-        }
+        | Expr::UnsafeBinderCast { expr, .. } => can_have_side_effects(b, expr),
         Expr::Index { base, .. } => can_have_side_effects(b, base),
-        Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::ArithOp(_) | BinaryOp::LogicOp(_) | BinaryOp::CmpOp(_)) } => {
-            can_have_side_effects(b, lhs) || can_have_side_effects(b, rhs)
-        }
+        Expr::BinaryOp {
+            lhs,
+            rhs,
+            op: Some(BinaryOp::ArithOp(_) | BinaryOp::LogicOp(_) | BinaryOp::CmpOp(_)),
+        } => can_have_side_effects(b, lhs) || can_have_side_effects(b, rhs),
         Expr::RecordLit { fields, spread, .. } => {
             fields.iter().any(|it| can_have_side_effects(b, it.expr))
                 || matches!(spread, RecordSpread::Expr(it) if can_have_side_effects(b, it))
@@ -227,7 +247,11 @@ fn can_have_side_effects(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
 /// that names the constructor of a tuple struct or a tuple variant.
 fn is_fn_ctor(b: &BodyCx<'_, '_, '_>, callee: ExprId) -> bool {
     let Expr::Path(path) = b.store().expr(callee) else { return false };
-    let type_relative =
-        path.type_anchor().is_some() || path.segments().first().is_some_and(|it| it.name.as_str() == "Self");
-    !type_relative && matches!(util::path_value(b, callee), Some(ValueNs::StructId(_) | ValueNs::EnumVariantId(_)))
+    let type_relative = path.type_anchor().is_some()
+        || path.segments().first().is_some_and(|it| it.name.as_str() == "Self");
+    !type_relative
+        && matches!(
+            util::path_value(b, callee),
+            Some(ValueNs::StructId(_) | ValueNs::EnumVariantId(_))
+        )
 }

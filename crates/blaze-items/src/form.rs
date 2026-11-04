@@ -21,7 +21,6 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{
     ContentId,
     bits::{self, Bits},
@@ -61,9 +60,8 @@ use hir_ty::{
     },
     next_solver::{
         AliasConstKind, Allocation, AssocTyId, Binder, BoundRegion, Clause, Const, ConstKind,
-        DbInterner,
-        FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term,
-        TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
+        DbInterner, FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy,
+        Term, TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
@@ -77,6 +75,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -174,7 +173,9 @@ pub(crate) struct Sub {
 
 // The digest and `missed` (33 bytes) and a boxed slice, padded to a word: 56 bytes on a 64-bit
 // target.
-const _: () = assert!(size_of::<Sub>() == (33 + size_of::<Box<[ItemId]>>()).next_multiple_of(align_of::<usize>()));
+const _: () = assert!(
+    size_of::<Sub>() == (33 + size_of::<Box<[ItemId]>>()).next_multiple_of(align_of::<usize>())
+);
 
 /// A body's form and the hash of the positions (MirSpans) of its code, in order: read by what
 /// fills positions in, never by a hash of the item.
@@ -845,7 +846,10 @@ impl<'db> Cx<'db> {
     /// is written with what [`Cx::held`] reads of each coroutine in it, so after its own body
     /// this looks in the closures and coroutines those hidden types hold (an `async fn`'s
     /// future), where the item itself may have no body.
-    pub(crate) fn mir_lowering_error(&self, id: ItemId) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
+    pub(crate) fn mir_lowering_error(
+        &self,
+        id: ItemId,
+    ) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
         let db = self.db;
         let mut scratch = Form::quiet();
         let mut nested = Nests::default();
@@ -891,9 +895,9 @@ impl<'db> Cx<'db> {
             at += 1;
             let body = match next {
                 Nested::Closure(it) => db.mir_body_for_closure(it),
-                Nested::Coroutine(it) => {
-                    db.mir_body_for_coroutine(it).and_then(|body| db.runtime_mir_body_for_coroutine(it).map(|_| body))
-                }
+                Nested::Coroutine(it) => db
+                    .mir_body_for_coroutine(it)
+                    .and_then(|body| db.runtime_mir_body_for_coroutine(it).map(|_| body)),
             };
             match body {
                 Ok(body) => self.mir(scratch, body, nested),
@@ -920,7 +924,10 @@ impl<'db> Cx<'db> {
                 let mut first = |variant: VariantId, name: Option<&str>| {
                     let types = db.field_types(variant);
                     for (field, data) in variant.fields(db).fields().iter() {
-                        if types.get(field).is_none_or(|it| it.ty().skip_binder().references_error()) {
+                        if types
+                            .get(field)
+                            .is_none_or(|it| it.ty().skip_binder().references_error())
+                        {
                             let field = data.name.symbol().as_str();
                             _ = match name {
                                 Some(variant) => write!(said, "field `{variant}.{field}`"),
@@ -3340,10 +3347,7 @@ enum Named {
 pub fn observes_names(db: &Db, func: FunctionId) -> bool {
     // A call of an unknown intrinsic is refused when it is lowered; keying it on the names
     // as well misses no input.
-    matches!(
-        intrinsic_of(db, func),
-        Ok(Some(Intrinsic::TypeName | Intrinsic::TypeId)) | Err(_)
-    )
+    matches!(intrinsic_of(db, func), Ok(Some(Intrinsic::TypeName | Intrinsic::TypeId)) | Err(_))
 }
 
 fn same_kind(a: AssocItemId, b: AssocItemId) -> bool {
@@ -3383,21 +3387,11 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
         ItemId::Function(it) => AssocItemId::FunctionId(it).assoc_visibility(db),
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),
         ItemId::Alias(it) => AssocItemId::TypeAliasId(it).assoc_visibility(db),
-        ItemId::Static(it) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::StructId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::EnumId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::UnionId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Trait(it) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
+        ItemId::Static(it) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::StructId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::EnumId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::UnionId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Trait(it) => written_visibility(db, it, it.lookup(db).id),
         // An impl is wherever its types and trait are.
         ItemId::Impl(_) => Visibility::Public,
         // A `macro_rules!` is in scope by text below it, or everywhere once exported.
@@ -3408,9 +3402,7 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
                 Visibility::PubCrate(it.krate(db))
             }
         }
-        ItemId::Macro(MacroId::Macro2Id(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
+        ItemId::Macro(MacroId::Macro2Id(it)) => written_visibility(db, it, it.lookup(db).id),
         ItemId::Macro(MacroId::ProcMacroId(_)) => Visibility::Public,
     }
 }
@@ -3502,9 +3494,8 @@ impl<'b, 'db> Canon<'b, 'db> {
         let blocks = &c.blocks;
         c.unwinds.extend(body.panic_unwinds.iter().filter_map(|&(block, at, to)| {
             let number = blocks[block_index(block)];
-            (number != UNREACHED && blocks[block_index(to)] != UNREACHED).then_some((
-                number, at, to,
-            ))
+            (number != UNREACHED && blocks[block_index(to)] != UNREACHED)
+                .then_some((number, at, to))
         }));
         radix::sort_copy_by_key(&mut c.unwinds, |&(number, at, _)| {
             radix::pack_64(u64::from(number), at as u64)
@@ -3634,10 +3625,7 @@ pub(crate) mod check {
 
     /// The locals the first walk finds used, by index: with the quiet form it walks with, and
     /// with a form that writes everything, as it walked before.
-    pub(crate) fn uses<'db>(
-        db: &'db Db,
-        body: &MirBody<'db>,
-    ) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn uses<'db>(db: &'db Db, body: &MirBody<'db>) -> (Vec<usize>, Vec<usize>) {
         let used = |mut form: Form| {
             let cx = Cx::new(db);
             let canon = Canon::new(body);

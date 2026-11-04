@@ -11,10 +11,10 @@
 //! hir-ty's `adt_unused_params`, through `hir::Adt::unused_params`.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::PathResolution;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     TextRange, WalkEvent,
     view::{
@@ -116,12 +116,16 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt) -> Vec<Found> {
             continue;
         }
         // alloc: only for an ADT with a bivariant parameter, mostly the error
-        let mut diag = Diag::error(Some("E0392"), format!("{kind} `{name}` is never used"), span.clone());
+        let mut diag =
+            Diag::error(Some("E0392"), format!("{kind} `{name}` is never used"), span.clone());
         // alloc: only for an ADT with a bivariant parameter, mostly the error
         diag.span_label(span, format!("unused {kind}"));
         for usage in usages {
             // alloc: only for an ADT with a bivariant parameter, mostly the error
-            diag.span_label(usage, format!("`{name}` is named here, but is likely unused in the containing type"));
+            diag.span_label(
+                usage,
+                format!("`{name}` is named here, but is likely unused in the containing type"),
+            );
         }
         diag.help(help);
         if let ast::GenericParam::TypeParam(it) = node
@@ -151,7 +155,9 @@ pub(super) fn check_alias<'db>(cx: &Cx<'_, 'db>, alias: hir::TypeAlias) -> Vec<F
     let params: SmallVec<[(hir::GenericParam, ast::TypeParam<'db>); 4]> = list
         .type_or_const_params()
         .filter_map(|it| match it {
-            ast::TypeOrConstParam::Type(it) => Some((hir::GenericParam::TypeParam(cx.vsema.to_def(it)?), it)),
+            ast::TypeOrConstParam::Type(it) => {
+                Some((hir::GenericParam::TypeParam(cx.vsema.to_def(it)?), it))
+            }
             ast::TypeOrConstParam::Const(_) => None,
         })
         // alloc: inline up to 4 parameters
@@ -202,7 +208,9 @@ pub(super) fn check_alias<'db>(cx: &Cx<'_, 'db>, alias: hir::TypeAlias) -> Vec<F
             Diag::error(Some("E0091"), format!("type parameter `{name_text}` is never used"), span.clone());
         diag.span_label(span, "unused type parameter");
         // alloc: the error's help
-        diag.help(format!("consider removing `{name_text}` or referring to it in the body of the type alias"));
+        diag.help(format!(
+            "consider removing `{name_text}` or referring to it in the body of the type alias"
+        ));
         let none = *none.get_or_insert_with(|| {
             params.iter().all(|&(def, node)| {
                 let (relaxed, written) = written_bounds(cx, source.value, node, def);
@@ -256,7 +264,11 @@ fn written_bounds<'db>(
 
 /// The parameters named anywhere in `node`, inside projections and constants too (rustc's
 /// `parameters_for` with `include_nonconstraining`, as E0091 walks the alias's type).
-fn params_in<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>, out: &mut impl Extend<hir::GenericParam>) {
+fn params_in<'db>(
+    cx: &Cx<'_, 'db>,
+    node: ast::Node<'db>,
+    out: &mut impl Extend<hir::GenericParam>,
+) {
     for event in node.preorder() {
         let WalkEvent::Enter(node) = event else { continue };
         if ast::Lifetime::can_cast(node.kind()) {
@@ -288,7 +300,9 @@ fn field_types(node: ast::Adt<'_>) -> Vec<ast::Type<'_>> {
         // alloc: only for an ADT with a bivariant parameter
         ast::Adt::Struct(it) => it.field_list().into_iter().collect(),
         // alloc: only for an ADT with a bivariant parameter
-        ast::Adt::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList).into_iter().collect(),
+        ast::Adt::Union(it) => {
+            it.record_field_list().map(ast::FieldList::RecordFieldList).into_iter().collect()
+        }
         ast::Adt::Enum(it) => it
             .variant_list()
             .into_iter()
@@ -301,22 +315,32 @@ fn field_types(node: ast::Adt<'_>) -> Vec<ast::Type<'_>> {
     let mut types = Vec::new();
     for list in lists {
         match list {
-            ast::FieldList::RecordFieldList(it) => types.extend(it.fields().filter_map(|it| it.ty())),
-            ast::FieldList::TupleFieldList(it) => types.extend(it.fields().filter_map(|it| it.ty())),
+            ast::FieldList::RecordFieldList(it) => {
+                types.extend(it.fields().filter_map(|it| it.ty()))
+            }
+            ast::FieldList::TupleFieldList(it) => {
+                types.extend(it.fields().filter_map(|it| it.ty()))
+            }
         }
     }
     types
 }
 
 /// rustc's `CollectUsageSpans`: where the fields name `param`, or `Self`.
-fn usage_spans<'db>(cx: &Cx<'_, 'db>, fields: &[ast::Type<'db>], param: hir::GenericParam) -> Vec<TextRange> {
+fn usage_spans<'db>(
+    cx: &Cx<'_, 'db>,
+    fields: &[ast::Type<'db>],
+    param: hir::GenericParam,
+) -> Vec<TextRange> {
     // alloc: only for an ADT with a bivariant parameter
     let mut spans = Vec::new();
     for ty in fields {
         for ty in ty.syntax().descendants().filter_map(ast::PathType::cast) {
             let Some(path) = ty.path() else { continue };
             let Some(first) = path.first_segment() else { continue };
-            let Some(first_path) = first.syntax().parent().and_then(ast::Path::cast) else { continue };
+            let Some(first_path) = first.syntax().parent().and_then(ast::Path::cast) else {
+                continue;
+            };
             if first.generic_arg_list().is_some() || first.type_anchor().is_some() {
                 continue;
             }
@@ -373,7 +397,8 @@ impl Invalid {
         let mut lifetimes: SmallVec<[ast::Lifetime<'t>; 4]> = SmallVec::new();
         let mut names: SmallVec<[ast::Name<'t>; 4]> = SmallVec::new();
         // alloc: empty unless a parameter is declared twice, an error
-        let mut invalid = Invalid { names: HashSet::new_in(Global), lifetimes: HashSet::new_in(Global) };
+        let mut invalid =
+            Invalid { names: HashSet::new_in(Global), lifetimes: HashSet::new_in(Global) };
         for param in list.generic_params() {
             match param {
                 ast::GenericParam::LifetimeParam(it) => {
@@ -407,10 +432,16 @@ impl Invalid {
     /// Whether `fields` name a type or const declared twice, rustc's `Res::Err`.
     fn named_in(&self, fields: &[ast::Type<'_>]) -> bool {
         !self.names.is_empty()
-            && fields.iter().flat_map(|ty| ty.syntax().descendants().filter_map(ast::Path::cast)).any(|path| {
-                path.qualifier().is_none()
-                    && path.segment().and_then(|it| it.name_ref()).is_some_and(|it| self.names.contains(it.text()))
-            })
+            && fields
+                .iter()
+                .flat_map(|ty| ty.syntax().descendants().filter_map(ast::Path::cast))
+                .any(|path| {
+                    path.qualifier().is_none()
+                        && path
+                            .segment()
+                            .and_then(|it| it.name_ref())
+                            .is_some_and(|it| self.names.contains(it.text()))
+                })
     }
 }
 
@@ -425,7 +456,11 @@ fn is_probably_cyclical(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
 }
 
 /// Every type in the fields of `adt` and, once each, of the ADTs they hold, until `stop` says.
-fn walk_fields(cx: &Cx<'_, '_>, adt: hir::Adt, mut stop: impl FnMut(&hir::Type<'_>, Option<hir::Adt>) -> bool) {
+fn walk_fields(
+    cx: &Cx<'_, '_>,
+    adt: hir::Adt,
+    mut stop: impl FnMut(&hir::Type<'_>, Option<hir::Adt>) -> bool,
+) {
     let mut seen = HashSet::from_iter_in([adt], Global);
     // alloc: only for an ADT with a bivariant parameter
     let mut queue = vec![adt];
@@ -456,6 +491,8 @@ fn adt_fields(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<hir::Field> {
         hir::Adt::Struct(it) => it.fields(cx.db),
         hir::Adt::Union(it) => it.fields(cx.db),
         // alloc: only for an ADT with a bivariant parameter
-        hir::Adt::Enum(it) => it.variants_iter(cx.db).flat_map(|it| it.fields_iter(cx.db)).collect(),
+        hir::Adt::Enum(it) => {
+            it.variants_iter(cx.db).flat_map(|it| it.fields_iter(cx.db)).collect()
+        }
     }
 }

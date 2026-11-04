@@ -83,27 +83,18 @@ fn with_env(settings: Settings, key: &'static str, value: &'static str) -> Setti
 }
 
 fn env_error(key: &'static str, value: &'static str) -> String {
-    Settings::base(false)
-        .with_env_overrides_from(only(key, value))
-        .unwrap_err()
+    Settings::base(false).with_env_overrides_from(only(key, value)).unwrap_err()
 }
 
 #[test]
 fn env_overrides_leave_settings_alone_when_nothing_is_set() {
-    let s = Settings::base(false)
-        .test_cases(5)
-        .with_env_overrides_from(|_| None)
-        .unwrap();
+    let s = Settings::base(false).test_cases(5).with_env_overrides_from(|_| None).unwrap();
     assert_eq!(s.test_cases, 5);
 }
 
 #[test]
 fn env_override_replaces_test_cases() {
-    let s = with_env(
-        Settings::base(false).test_cases(5),
-        "HEGEL_TEST_CASES",
-        "17",
-    );
+    let s = with_env(Settings::base(false).test_cases(5), "HEGEL_TEST_CASES", "17");
     assert_eq!(s.test_cases, 17);
 }
 
@@ -128,17 +119,9 @@ fn env_override_test_cases_rejects_non_numeric_and_zero() {
 #[test]
 fn env_override_database_disabled_keyword_and_path() {
     let custom = || Settings::base(false).database(Some("custom".to_string()));
+    assert_eq!(with_env(custom(), "HEGEL_DATABASE", "disabled").database, Database::Disabled);
     assert_eq!(
-        with_env(custom(), "HEGEL_DATABASE", "disabled").database,
-        Database::Disabled
-    );
-    assert_eq!(
-        with_env(
-            Settings::base(false).database(None),
-            "HEGEL_DATABASE",
-            "my-db"
-        )
-        .database,
+        with_env(Settings::base(false).database(None), "HEGEL_DATABASE", "my-db").database,
         Database::Path("my-db".to_string())
     );
     assert_eq!(
@@ -153,12 +136,8 @@ fn env_override_statistics_turns_reporting_on_unless_zero_or_empty() {
     assert!(!with_env(Settings::base(false), "HEGEL_STATISTICS", "0").show_statistics);
     assert!(!with_env(Settings::base(false), "HEGEL_STATISTICS", "").show_statistics);
     assert!(
-        with_env(
-            Settings::base(false).show_statistics(true),
-            "HEGEL_STATISTICS",
-            "0"
-        )
-        .show_statistics,
+        with_env(Settings::base(false).show_statistics(true), "HEGEL_STATISTICS", "0")
+            .show_statistics,
         "0 does not turn the statistics off"
     );
 }
@@ -185,23 +164,12 @@ fn env_override_derandomize_accepts_the_boolean_vocabulary() {
     }
     for value in ["false", "0", "no"] {
         assert!(
-            !with_env(
-                Settings::base(false).derandomize(true),
-                "HEGEL_DERANDOMIZE",
-                value
-            )
-            .derandomize,
+            !with_env(Settings::base(false).derandomize(true), "HEGEL_DERANDOMIZE", value)
+                .derandomize,
             "{value:?}"
         );
     }
-    assert!(
-        with_env(
-            Settings::base(false).derandomize(true),
-            "HEGEL_DERANDOMIZE",
-            ""
-        )
-        .derandomize
-    );
+    assert!(with_env(Settings::base(false).derandomize(true), "HEGEL_DERANDOMIZE", "").derandomize);
     assert_eq!(
         env_error("HEGEL_DERANDOMIZE", "maybe"),
         "HEGEL_DERANDOMIZE must be true or false, got \"maybe\""
@@ -211,12 +179,7 @@ fn env_override_derandomize_accepts_the_boolean_vocabulary() {
 #[test]
 fn env_override_print_blob_replaces_the_setting() {
     assert!(
-        with_env(
-            Settings::base(false).print_blob(false),
-            "HEGEL_PRINT_BLOB",
-            "true"
-        )
-        .print_blob
+        with_env(Settings::base(false).print_blob(false), "HEGEL_PRINT_BLOB", "true").print_blob
     );
     assert!(!with_env(Settings::base(false), "HEGEL_PRINT_BLOB", "false").print_blob);
     assert!(with_env(Settings::base(false), "HEGEL_PRINT_BLOB", "").print_blob);
@@ -299,9 +262,7 @@ fn env_overrides_report_the_first_malformed_variable() {
         _ => None,
     };
     assert_eq!(
-        Settings::base(false)
-            .with_env_overrides_from(env)
-            .unwrap_err(),
+        Settings::base(false).with_env_overrides_from(env).unwrap_err(),
         "HEGEL_SEED must be an integer or 'none', got \"x\""
     );
 }
@@ -332,24 +293,15 @@ fn is_in_ci_from_detects_presence_variables_even_when_empty() {
 
 #[test]
 fn is_in_ci_from_requires_the_expected_value_for_value_variables() {
-    assert!(is_in_ci_from(
-        |key| (key == "TF_BUILD").then(|| "true".to_string())
-    ));
-    assert!(!is_in_ci_from(
-        |key| (key == "TF_BUILD").then(|| "false".to_string())
-    ));
-    assert!(!is_in_ci_from(
-        |key| (key == "GITHUB_ACTIONS").then(String::new)
-    ));
+    assert!(is_in_ci_from(|key| (key == "TF_BUILD").then(|| "true".to_string())));
+    assert!(!is_in_ci_from(|key| (key == "TF_BUILD").then(|| "false".to_string())));
+    assert!(!is_in_ci_from(|key| (key == "GITHUB_ACTIONS").then(String::new)));
 }
 
 #[test]
 fn output_debug_names_the_destination() {
     assert_eq!(format!("{:?}", Output::stderr()), "Output(stderr)");
-    assert_eq!(
-        format!("{:?}", Output::callback(|_| {})),
-        "Output(callback)"
-    );
+    assert_eq!(format!("{:?}", Output::callback(|_| {})), "Output(callback)");
 }
 
 #[test]
@@ -394,10 +346,7 @@ fn choice_bound_defaults_to_buffer_size_and_can_be_removed() {
 fn suppressing_test_cases_too_large_removes_the_choice_bound() {
     let s = Settings::new().suppress_health_check([HealthCheck::TestCasesTooLarge]);
     assert_eq!(s.choice_bound(), usize::MAX);
-    assert_eq!(
-        Settings::base(true).choice_bound(),
-        crate::native::core::BUFFER_SIZE
-    );
+    assert_eq!(Settings::base(true).choice_bound(), crate::native::core::BUFFER_SIZE);
     let s = Settings::new().suppress_health_check([HealthCheck::TooSlow]);
     assert_eq!(s.choice_bound(), crate::native::core::BUFFER_SIZE);
 }

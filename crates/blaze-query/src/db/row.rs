@@ -51,8 +51,12 @@ pub(crate) const PROVISIONAL: u32 = 1 << 30;
 
 /// `meta`: the row's durability (the lowest kind it read).
 pub(crate) const DURABILITY: u32 = 0b11;
-/// `meta`: made inside a cycle: never backdated, and verified only on the claimed path, which
-/// assumes the cycle's other rows (on its stack) unchanged until all of them are proved.
+/// `meta`: made inside a cycle: never backdated. Once final it is verified as any row is, by
+/// its edges: a head's are what its whole cycle read outside itself over every round, in read
+/// order (a run's reads sit where its reader read it; a run met only by a verify comes after
+/// its round), and a member's one edge is its head, so a cycle whose reads are unchanged is
+/// reused whole and one whose reads changed runs again from its head (`function::hand_over`,
+/// `function::finalize`).
 pub(crate) const CYCLE: u32 = 1 << 2;
 /// `meta`: made an untracked read, so it runs again in every view.
 pub(crate) const UNTRACKED: u32 = 1 << 3;

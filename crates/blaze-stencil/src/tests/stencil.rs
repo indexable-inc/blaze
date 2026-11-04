@@ -113,7 +113,9 @@ fn combos<T: Copy>(lists: &[Vec<T>], cap: usize, rng: &mut Rng) -> Vec<Vec<T>> {
                 out.push(lists.iter().map(|list| list[k % list.len()]).collect());
             }
             while out.len() < cap {
-                out.push(lists.iter().map(|list| list[rng.below(list.len() as u64) as usize]).collect());
+                out.push(
+                    lists.iter().map(|list| list[rng.below(list.len() as u64) as usize]).collect(),
+                );
             }
         }
     }
@@ -235,18 +237,24 @@ fn bakeds(shape: Shape, budget: &Budget, rng: &mut Rng) -> Vec<Baked> {
         Op::Iconst => iconst_values(shape, budget.baked, rng).into_iter().map(one).collect(),
         Op::Fconst => fconst_values(shape, budget.baked, rng).into_iter().map(one).collect(),
         Op::Vconst => {
-            let mut out: Vec<Baked> =
-                edges(shape.ty).iter().map(|edge| Baked { imms: [0; 3], bytes: padded(edge) }).collect();
+            let mut out: Vec<Baked> = edges(shape.ty)
+                .iter()
+                .map(|edge| Baked { imms: [0; 3], bytes: padded(edge) })
+                .collect();
             out.truncate(budget.baked.saturating_sub(budget.baked / 3).max(1));
             while out.len() < budget.baked {
                 out.push(Baked { imms: [0; 3], bytes: rng.value(shape.ty) });
             }
             out
         }
-        Op::Shuffle => masks(budget.baked, rng).into_iter().map(|bytes| Baked { imms: [0; 3], bytes }).collect(),
+        Op::Shuffle => masks(budget.baked, rng)
+            .into_iter()
+            .map(|bytes| Baked { imms: [0; 3], bytes })
+            .collect(),
         _ => {
             let mut imms: Vec<usize> = (0..3).filter(|n| shape.srcs[*n] == Src::Imm).collect();
-            let mut lists: Vec<Vec<i64>> = imms.iter().map(|n| imm_values(shape, *n, budget.baked, rng)).collect();
+            let mut lists: Vec<Vec<i64>> =
+                imms.iter().map(|n| imm_values(shape, *n, budget.baked, rng)).collect();
             if let Some(offsets) = confined_offsets(shape) {
                 imms.push(OFFSET);
                 lists.push(offsets);
@@ -282,7 +290,9 @@ fn confined_offsets(shape: Shape) -> Option<Vec<i64>> {
 fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
     match panic.downcast::<String>() {
         Ok(text) => *text,
-        Err(panic) => panic.downcast_ref::<&str>().map_or_else(|| "a panic".to_owned(), |it| (*it).to_owned()),
+        Err(panic) => {
+            panic.downcast_ref::<&str>().map_or_else(|| "a panic".to_owned(), |it| (*it).to_owned())
+        }
     }
 }
 
@@ -319,7 +329,9 @@ fn has_stencil(code: &[u8], stencil: &Stencil<'_>) -> bool {
 fn selected(code: &Code, library: &Library, shape: Shape) -> Result<(), String> {
     match library.find(shape) {
         Some(stencil) if has_stencil(&code.bytes, &stencil) => Ok(()),
-        Some(_) => Err(format!("the code has no `{shape}` stencil: the patcher selected another shape")),
+        Some(_) => {
+            Err(format!("the code has no `{shape}` stencil: the patcher selected another shape"))
+        }
         None => Err(format!("the {:?} library has no `{shape}` stencil", library.variant())),
     }
 }
@@ -392,7 +404,10 @@ fn compiles_where_cranelift_does(target: Target) {
             (Err(_), Err(_)) => {}
         }
     }
-    fail_with(&failures, &format!("shapes compile differently from Cranelift for {}", host::triple(&target)));
+    fail_with(
+        &failures,
+        &format!("shapes compile differently from Cranelift for {}", host::triple(&target)),
+    );
 }
 
 #[test]
@@ -433,7 +448,11 @@ fn hole_problems(shape: Shape, stencil: &Stencil<'_>, a64: bool) -> Vec<String> 
             out.push(format!("a {form:?} field in a stencil of the other architecture"));
         }
         if usize::from(hole.at) + usize::from(form.bytes()) > stencil.code.len() {
-            out.push(format!("a {kind:?} hole at {} past the {} bytes", hole.at, stencil.code.len()));
+            out.push(format!(
+                "a {kind:?} hole at {} past the {} bytes",
+                hole.at,
+                stencil.code.len()
+            ));
         }
         if a64 && hole.at % 4 != 0 {
             out.push(format!("a {kind:?} hole at {}, inside an instruction", hole.at));
@@ -448,27 +467,29 @@ fn hole_problems(shape: Shape, stencil: &Stencil<'_>, a64: bool) -> Vec<String> 
             }
             HoleKind::Result0 => matches!(shape.dst, Dst::Slot | Dst::Both),
             HoleKind::Result1 => info.results == 2,
-            HoleKind::Offset => matches!(
-                op,
-                Op::Load
-                    | Op::Store
-                    | Op::Uload8
-                    | Op::Sload8
-                    | Op::Istore8
-                    | Op::Uload16
-                    | Op::Sload16
-                    | Op::Istore16
-                    | Op::Uload32
-                    | Op::Sload32
-                    | Op::Istore32
-                    | Op::Uload8x8
-                    | Op::Sload8x8
-                    | Op::Uload16x4
-                    | Op::Sload16x4
-                    | Op::Uload32x2
-                    | Op::Sload32x2
-                    | Op::StackAddr
-            ) || confined_offsets(shape).is_some(),
+            HoleKind::Offset => {
+                matches!(
+                    op,
+                    Op::Load
+                        | Op::Store
+                        | Op::Uload8
+                        | Op::Sload8
+                        | Op::Istore8
+                        | Op::Uload16
+                        | Op::Sload16
+                        | Op::Istore16
+                        | Op::Uload32
+                        | Op::Sload32
+                        | Op::Istore32
+                        | Op::Uload8x8
+                        | Op::Sload8x8
+                        | Op::Uload16x4
+                        | Op::Sload16x4
+                        | Op::Uload32x2
+                        | Op::Sload32x2
+                        | Op::StackAddr
+                ) || confined_offsets(shape).is_some()
+            }
             HoleKind::Next | HoleKind::Rodata => true,
             HoleKind::Target => info.branches,
             HoleKind::Trap | HoleKind::TrapOverflow => info.traps,
@@ -545,7 +566,11 @@ fn every_library_has_exactly_the_set() {
             }
         });
         if reader.len() as usize != shapes.len() {
-            failures.push(format!("{variant:?}: {} stencils for {} shapes", reader.len(), shapes.len()));
+            failures.push(format!(
+                "{variant:?}: {} stencils for {} shapes",
+                reader.len(),
+                shapes.len()
+            ));
         }
         let mut indexed = vec![false; reader.len() as usize];
         for shape in &shapes {
@@ -555,7 +580,9 @@ fn every_library_has_exactly_the_set() {
             };
             match indexed.get_mut(index as usize) {
                 Some(seen) if !*seen => *seen = true,
-                _ => failures.push(format!("{variant:?}: `{shape}` finds stencil {index}, which another shape found")),
+                _ => failures.push(format!(
+                    "{variant:?}: `{shape}` finds stencil {index}, which another shape found"
+                )),
             }
             let stencil = reader.stencil(index);
             for problem in hole_problems(*shape, &stencil, a64) {
@@ -610,7 +637,13 @@ mod run {
 
     /// The inputs a function is run on: edge combinations, then seeded random values. An
     /// `atomic_cas` is given its memory as the expected value every other time.
-    fn input_sets(op: Op, inputs: &[Input], pairs: usize, random: usize, rng: &mut Rng) -> Vec<Vec<[u8; 16]>> {
+    fn input_sets(
+        op: Op,
+        inputs: &[Input],
+        pairs: usize,
+        random: usize,
+        rng: &mut Rng,
+    ) -> Vec<Vec<[u8; 16]>> {
         if inputs.is_empty() {
             return vec![Vec::new()];
         }
@@ -632,7 +665,12 @@ mod run {
         inputs
             .iter()
             .zip(set)
-            .map(|(input, bytes)| DataValue::read_from_slice_le(&input.xform.apply(input.ty, *bytes), ir_ty(input.xform.param(input.ty))))
+            .map(|(input, bytes)| {
+                DataValue::read_from_slice_le(
+                    &input.xform.apply(input.ty, *bytes),
+                    ir_ty(input.xform.param(input.ty)),
+                )
+            })
             .collect()
     }
 
@@ -653,7 +691,9 @@ mod run {
 
     /// [`interp::run`] of the one function, with a panic as its error.
     fn interpret(func: &ir::Function, args: &[DataValue]) -> Result<Run, String> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interp::run(&[func], 0, args))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            interp::run(&[func], 0, args)
+        })) {
             Ok(it) => it,
             Err(panic) => Err(format!("panicked: {}", panic_text(panic))),
         }
@@ -662,7 +702,10 @@ mod run {
     /// Whether the interpreter has the op: not the x86-only ones, which `cranelift-interpreter`
     /// 0.136 does not implement. Their stencils are held to Cranelift's code alone.
     fn interpreted(op: Op) -> bool {
-        !matches!(op, Op::X86Cvtt2dq | Op::X86Pshufb | Op::X86Pmulhrsw | Op::X86Pmaddubsw | Op::Blendv)
+        !matches!(
+            op,
+            Op::X86Cvtt2dq | Op::X86Pshufb | Op::X86Pmulhrsw | Op::X86Pmaddubsw | Op::Blendv
+        )
     }
 
     /// Every failure of one function of a shape, after its CLIF.
@@ -703,7 +746,13 @@ mod run {
         }));
         let (stencil, cranelift) = match calls {
             Ok(it) => it,
-            Err(panic) => return Some(format!("inputs {}: calling the code panicked: {}", hex(&built.inputs, set), panic_text(panic))),
+            Err(panic) => {
+                return Some(format!(
+                    "inputs {}: calling the code panicked: {}",
+                    hex(&built.inputs, set),
+                    panic_text(panic)
+                ));
+            }
         };
         let mut problems = Vec::new();
         match (&stencil, &cranelift) {
@@ -713,8 +762,12 @@ mod run {
                 }
             }
             (Outcome::Trapped(_), Outcome::Trapped(_)) => {}
-            (Outcome::Trapped(_), Outcome::Returned(_)) => problems.push("the stencil code traps and Cranelift's returns".to_owned()),
-            (Outcome::Returned(_), Outcome::Trapped(_)) => problems.push("the stencil code returns and Cranelift's traps".to_owned()),
+            (Outcome::Trapped(_), Outcome::Returned(_)) => {
+                problems.push("the stencil code traps and Cranelift's returns".to_owned())
+            }
+            (Outcome::Returned(_), Outcome::Trapped(_)) => {
+                problems.push("the stencil code returns and Cranelift's traps".to_owned())
+            }
         }
         match &reference {
             Some(Ok(run)) => {
@@ -739,7 +792,13 @@ mod run {
     }
 
     /// Every failure of `shape` on the host, or `None`.
-    fn check(shape: Shape, target: &Target, isa: &dyn TargetIsa, library: &Library, budget: &Budget) -> Option<String> {
+    fn check(
+        shape: Shape,
+        target: &Target,
+        isa: &dyn TargetIsa,
+        library: &Library,
+        budget: &Budget,
+    ) -> Option<String> {
         let seed = seed(shape);
         let mut rng = Rng::new(seed);
         let bakeds = bakeds(shape, budget, &mut rng);
@@ -756,8 +815,11 @@ mod run {
             let mut failures = Failures { built: &built, lines: Vec::new() };
             match (host::cranelift_caught(&built.func, isa), compile_caught(&built.func, target)) {
                 (Err(_), Err(_)) => {}
-                (Ok(_), Err(e)) => failures.push(format!("Cranelift compiles it and the stencil backend refuses: {e}")),
-                (Err(e), Ok(_)) => failures.push(format!("Cranelift refuses it ({e}) and the stencil backend compiles it")),
+                (Ok(_), Err(e)) => failures
+                    .push(format!("Cranelift compiles it and the stencil backend refuses: {e}")),
+                (Err(e), Ok(_)) => failures.push(format!(
+                    "Cranelift refuses it ({e}) and the stencil backend compiles it"
+                )),
                 (Ok(compiled), Ok(code)) => {
                     if let Err(e) = selected(&code, library, shape) {
                         failures.push(e);
@@ -765,22 +827,30 @@ mod run {
                     let link = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Exec::link(&Link {
                             isa,
-                            units: &[Unit::Stencil(&code, &built.sig), Unit::Cranelift(&compiled, &built.sig)],
+                            units: &[
+                                Unit::Stencil(&code, &built.sig),
+                                Unit::Cranelift(&compiled, &built.sig),
+                            ],
                             data: &[],
                             host: &[],
                         })
                     }));
                     match link {
                         Ok(exec) => {
-                            let (pairs, random) =
-                                if baked_alone { (budget.pairs, budget.random) } else { (budget.per_baked, budget.per_baked / 2) };
-                            for set in input_sets(shape.op, &built.inputs, pairs, random, &mut rng) {
+                            let (pairs, random) = if baked_alone {
+                                (budget.pairs, budget.random)
+                            } else {
+                                (budget.per_baked, budget.per_baked / 2)
+                            };
+                            for set in input_sets(shape.op, &built.inputs, pairs, random, &mut rng)
+                            {
                                 if let Some(line) = run_one(shape.op, &built, &exec, &set) {
                                     failures.push(format!("  {baked:?} {line}"));
                                 }
                             }
                         }
-                        Err(panic) => failures.push(format!("linking the code panicked: {}", panic_text(panic))),
+                        Err(panic) => failures
+                            .push(format!("linking the code panicked: {}", panic_text(panic))),
                     }
                 }
             }
@@ -816,7 +886,10 @@ mod run {
                 failures.push(failure);
             }
         }
-        fail_with(&failures, &format!("stencils (shard {k} of {SHARDS}) differ from Cranelift or the interpreter"));
+        fail_with(
+            &failures,
+            &format!("stencils (shard {k} of {SHARDS}) differ from Cranelift or the interpreter"),
+        );
     }
 
     #[test]
@@ -884,7 +957,12 @@ fn immediates_fold_and_constants_fit_their_aux() {
                 }
             }
             if matches!(shape.op, Op::Iconst | Op::Fconst) && shape.ty.bytes() == 8 {
-                assert_eq!(i32::try_from(baked.imms[0]).is_err(), shape.aux == 1, "{shape}: {:#x}", baked.imms[0]);
+                assert_eq!(
+                    i32::try_from(baked.imms[0]).is_err(),
+                    shape.aux == 1,
+                    "{shape}: {:#x}",
+                    baked.imms[0]
+                );
             }
         }
     });
@@ -913,7 +991,10 @@ fn every_shape_has_a_function() {
                 }
                 let params = built.func.signature.params.len();
                 if params != built.inputs.len() {
-                    failures.push(format!("{shape}: {params} parameters for {} inputs", built.inputs.len()));
+                    failures.push(format!(
+                        "{shape}: {params} parameters for {} inputs",
+                        built.inputs.len()
+                    ));
                 }
             }
             Err(why) => failures.push(format!("{shape}: {why}")),

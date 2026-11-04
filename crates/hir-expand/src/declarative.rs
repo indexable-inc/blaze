@@ -2,7 +2,7 @@
 
 use std::ops::ControlFlow;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use span::{Edition, Span, SyntaxContext};
 use syntax::{
@@ -105,11 +105,7 @@ impl DeclarativeMacroExpander {
 impl AstId<ast::Macro> {
     /// Fetches (and compiles) the expander of this decl macro.
     #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
-    pub fn decl_macro_expander(
-        self,
-        db: &Db,
-        def_crate: Crate,
-    ) -> DeclarativeMacroExpander {
+    pub fn decl_macro_expander(self, db: &Db, def_crate: Crate) -> DeclarativeMacroExpander {
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let id = self;
             let map = id.file_id.span_map(db);
@@ -204,8 +200,7 @@ impl AstId<ast::Macro> {
                             "expected a token tree".into(),
                         )),
                     },
-                    transparency(view::AnyHasAttrs::new(macro_def))
-                        .unwrap_or(Transparency::Opaque),
+                    transparency(view::AnyHasAttrs::new(macro_def)).unwrap_or(Transparency::Opaque),
                 ),
             };
             DeclarativeMacroExpander { mac, transparency, edition }
