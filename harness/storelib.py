@@ -14,7 +14,8 @@ The daemon is started here, not by the first `blaze build` (crates/blaze-cargo/s
 `blaze build` that finds no daemon listening starts one of its own, logging to
 `<home>/v2/serve.log`: `Daemon.stray` tells of that and stops it.
 
-`scratch` and `run` are what other harnesses take from here too.
+`scratch` and `run` are what other harnesses take from here too, and `worked` and `links`, what
+a build's `blaze-work` lines say the daemon did and how it linked each image.
 """
 import concurrent.futures, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
 
@@ -162,6 +163,36 @@ def artifact(stdout, program):
         if message.get("reason") == "compiler-artifact" and message.get("executable") \
                 and message.get("target", {}).get("name") == program:
             found = message["executable"]
+    return found
+
+
+def worked(stdout):
+    """The `blaze-work` lines of what `blaze build --message-format=json` printed: what the
+    daemon did for the build (crates/blaze-ui/src/api.rs, `work_json`), one a build it served."""
+    found = []
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict) and message.get("reason") == "blaze-work":
+            found.append(message)
+    return found
+
+
+def links(stdout, program):
+    """How each image of `program` the build linked was linked, in order, from its `blaze-work`
+    lines: `first`, `spliced`, `unchanged`, or `full: <why>, ...` (blaze_api::LinkHow). A link
+    names the output before it is uplifted, cargo's `deps/<program>-<metadata>`."""
+    own = re.compile(rf"{re.escape(program)}(?:-[0-9a-f]+)?(?:\.exe)?")
+    found = []
+    for work in worked(stdout):
+        for link in work.get("links", []):
+            if own.fullmatch(os.path.basename(link.get("path", ""))):
+                why = link.get("why") or []
+                found.append(f"{link.get('how')}: {', '.join(why)}" if why else str(link.get("how")))
     return found
 
 

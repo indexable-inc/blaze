@@ -9,8 +9,9 @@ A splice moves the program's `__unwind_info` into the room Apple's linker leaves
 load commands, which is as much as `-headerpad` says. A program of a few hundred crates has
 more table than the 1 MiB the daemon starts with; here a small one is made short of room the
 cheap way, by a `-headerpad` of its own in `.cargo/config.toml` that asks for 256 bytes.
-The program is built with `blaze build` until the daemon serves the build, then
-edited a few times. The first link is told the room the unwind information of what it links
+The program is built with `blaze build`, which the daemon serves, then edited a few times;
+how each build linked the program is what its `blaze-work` line says (`--message-format=json`,
+storelib.links). The first link is told the room the unwind information of what it links
 wants, so it is linked once (#173: a large program was linked a second time, 260 s more), and
 every edit after the first one (which writes the whole object again) has to be spliced, and
 print what the source says.
@@ -21,16 +22,16 @@ fixups as chains unless the daemon's link line says otherwise; a splice declines
 
 Python 3, stdlib only.
 """
-import glob
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import links, worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 FILES = {
@@ -50,21 +51,25 @@ EDITS = 4
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    """`blaze build`: how it linked the program (storelib.links), in order. A build with no
+    `blaze-work` line was not the daemon's, and stops the harness."""
+    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    return said
+    if not worked(ran.stdout):
+        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
+    return links(ran.stdout, "spad")
 
 
-def links(home):
-    """The `link:` lines of the workers' logs, in order. A worker that was a spare keeps the
-    spare's log."""
-    lines = []
-    for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))):
-        lines += re.findall(r"^link: \S+ \((.*)\)$", open(log, errors="replace").read(), re.M)
-    return lines
+def first_link(made):
+    """The verdict on the links of a daemon's first build of the program: one link, not two."""
+    if not made:
+        return "NO LINK"
+    if len(made) > 1:
+        return f"LINKED AGAIN: {made[1]}"
+    return "ok"
 
 
 def main():
@@ -86,50 +91,29 @@ def main():
     program, source = os.path.join(ws, "target", "debug", "spad"), os.path.join(ws, "src", "main.rs")
     wrong = 0
     try:
-        build(ws, env, "first build")
-        for _ in range(240):
-            if "[blaze]" in build(ws, env, "wait for the daemon"):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
-        made = links(home)
-        again = [it for it in made if "again with -Wl,-headerpad" in it]
-        verdict = "NO LINK" if not made else f"LINKED AGAIN: {again[0]}" if again else "ok"
+        made = build(ws, env, "first build")
+        verdict = first_link(made)
         print(f"{'the first link':30} {verdict:12} {made[0][:110] if made else ''}")
         wrong += verdict != "ok"
         for n in range(1, EDITS + 1):
             text = open(source).read()
             open(source, "w").write(text.replace(f"    {n}\n}}", f"    {n + 1}\n}}", 1))
-            seen = len(links(home))
-            said = build(ws, env, f"edit {n}")
+            made = build(ws, env, f"edit {n}")
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
-            made = links(home)[seen:]
             how = made[-1] if made else "no link"
             verdict = "ok"
             if printed != str(n + 1):
                 verdict = f"PRINTED {printed!r}, NOT {n + 1}"
-            elif "[blaze]" not in said:
-                verdict = "NOT SERVED BY THE DAEMON"
             elif n > 1 and not how.startswith("spliced"):
                 verdict = "NOT SPLICED"
             wrong += verdict != "ok"
             print(f"{f'edit {n}':30} {verdict:12} {how[:110]}", flush=True)
         # A daemon started anew links with the room the last one found, and no more than once.
         subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
-        # The next daemon's workers write their logs where these were.
-        for log in glob.glob(os.path.join(home, "*", "*", "log")):
-            os.rename(log, log + ".old")
-        for _ in range(240):
-            if "[blaze]" in build(ws, env, "wait for the next daemon"):
-                break
-            time.sleep(0.5)
         text = open(source).read()
         open(source, "w").write(text.replace(f"    {EDITS + 1}\n}}", f"    {EDITS + 2}\n}}", 1))
-        build(ws, env, "an edit for the next daemon")
-        made = links(home)
-        again = [it for it in made if "again with -Wl,-headerpad" in it]
-        verdict = "NO LINK" if not made else f"LINKED AGAIN: {again[0]}" if again else "ok"
+        made = build(ws, env, "an edit for the next daemon")
+        verdict = first_link(made)
         print(f"{'a new daemon':30} {verdict:12} {made[0][:110] if made else ''}")
         wrong += verdict != "ok"
     finally:

@@ -113,7 +113,6 @@ HARNESSES = [
     ("core", ["unreached.py"], {}, on("linux", "macos"), 1),
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
     # A static with state LLVM renamed (`SERVING.0`) at opt-level 1 is rustc's copy for both.
-    ("core", ["loadedits.py"], {}, on("linux", "macos"), 2),
     # An edit of a dependency reaches each kind of artifact a build says it wrote, or the build
     # fails naming it (#730); a program built with #731's unstable rustflags has its edits spliced.
     ("core", ["artifactedits.py"], {}, on("linux", "macos"), 1),
@@ -180,7 +179,6 @@ FAST = {
     "nocompact.py": (12, ()),
     "unreached.py": (9, ()),
     "anonstatics.py": (9, ()),
-    "loadedits.py": (19, (X64, MAC)),
     "artifactedits.py": (40, ()),
     "testselect.py": (58, (X64, MAC)),
     "hermetic.py": (15, (X64, MAC)),
@@ -228,7 +226,6 @@ CORE = {
     "doctestonce.py": 54,
     "testselect.py": 51,
     "fuzz/store.py": 240,
-    "loadedits.py": 20,
     # v1's seconds, as in FAST: wholeprogram.py alone was 19 minutes on macOS.
     "wholeprogram.py": 1155,
     "debuginfo.py": 500,

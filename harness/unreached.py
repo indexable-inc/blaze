@@ -8,25 +8,26 @@ A patch calls the code of the executable by name, also code the executable's own
 reach when it was linked: here `<u16 as Debug>::fmt` and the formatting it calls, which a
 generic function of a library first calls for `u16` in an edit. blaze's link takes out what
 nothing reaches (`-dead_strip` on macOS, `--gc-sections` on Linux), and a splice that does
-not find what the patch calls declines ("... is not in the executable"): the worker then
-builds the program in full and links it again, as the object alone does not have the edit.
+not find what the patch calls declines: the daemon then lays the program out in full.
 
 The program is built with `blaze build`, then edited. Every edit after the first one
-(which writes the whole object again) has to be spliced or built in full, as the worker's
-log says, and the program has to print what the source says.
+(which writes the whole object again) has to be spliced or laid out in full, as the build's
+`blaze-work` line says (`--message-format=json`, storelib.links), and the program has to print
+what the source says.
 
 Python 3, stdlib only.
 """
 import glob
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import links, worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 FILES = {
@@ -52,30 +53,16 @@ STEPS = [
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    """`blaze build`: how it linked the program (storelib.links), in order. A build with no
+    `blaze-work` line was not the daemon's, and stops the harness."""
+    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    return said
-
-
-def links(home):
-    """The `link:` lines of the workers' logs, in order. A worker that was a spare keeps the
-    spare's log."""
-    lines = []
-    for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))):
-        lines += re.findall(r"^link: \S+ \((.*)\)$", open(log, errors="replace").read(), re.M)
-    return lines
-
-
-def full_builds(home):
-    """How many builds the workers' logs say were in full, as a splice declined."""
-    found = 0
-    for log in glob.glob(os.path.join(home, "*", "*", "log")):
-        found += len(re.findall(r"^the patch was not spliced into the program.*: built in full$",
-                                open(log, errors="replace").read(), re.M))
-    return found
+    if not worked(ran.stdout):
+        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
+    return links(ran.stdout, "uapp")
 
 
 def main():
@@ -96,32 +83,20 @@ def main():
     wrong = 0
     try:
         build(ws, env, "first build")
-        for _ in range(240):
-            if "[blaze]" in build(ws, env, "wait for the daemon"):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         for n, (what, edits, expected) in enumerate(STEPS):
             text = open(source).read()
             for old, new in edits:
                 assert old in text, (what, old)
                 text = text.replace(old, new, 1)
             open(source, "w").write(text)
-            seen, full = len(links(home)), full_builds(home)
-            said = build(ws, env, what)
+            made = build(ws, env, what)
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
-            made = links(home)[seen:]
             how = made[-1] if made else "no link"
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-            elif "[blaze]" not in said:
-                verdict = "NOT SERVED BY THE DAEMON"
-            elif n > 0 and not how.startswith("spliced") and full_builds(home) == full:
+            elif n > 0 and not how.startswith(("spliced", "full")):
                 verdict = "NOT SPLICED"
-            if not how.startswith("spliced") and full_builds(home) > full:
-                how = f"built in full; {how}"
             wrong += verdict != "ok"
             print(f"{what:42} {verdict:12} {how[:140]}", flush=True)
     finally:

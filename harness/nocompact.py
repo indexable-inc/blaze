@@ -8,24 +8,25 @@ usage: nocompact.py    (BLAZE_BIN names the blaze built; blaze is found next
 Such a program has `__eh_frame` and no `__unwind_info`, and the unwinder looks for every
 frame in `__eh_frame`, to its end; bun links so. (What has only a compact entry, as most of
 std has on AArch64, then has no frame at all, and a panic aborts, cargo's build too.) The
-program is built with `blaze build` until the daemon serves the build, then edited a
-few times: every edit after the first (which writes the whole object again) has to be
+program is built with `blaze build`, which the daemon serves, then edited a few times (how
+each build linked it is what its `blaze-work` line says, storelib.links): every edit after the first (which writes the whole object again) has to be
 spliced, print what the source says, and have the unwinder find the frame of the edited
 function where its symbol now is (`_Unwind_Find_FDE`). It is built for macOS 14, as nix's
 shell builds.
 
 Python 3, stdlib only.
 """
-import glob
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import links, worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 FILES = {
@@ -66,20 +67,16 @@ MANY = 1000
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    """`blaze build`: how it linked the program (storelib.links), in order. A build with no
+    `blaze-work` line was not the daemon's, and stops the harness."""
+    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    return said
-
-
-def links(home):
-    """The `link:` lines of the workers' logs, in order."""
-    lines = []
-    for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))):
-        lines += re.findall(r"^link: \S+ \((.*)\)$", open(log, errors="replace").read(), re.M)
-    return lines
+    if not worked(ran.stdout):
+        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
+    return links(ran.stdout, "ncu")
 
 
 def address_of(program, name):
@@ -104,21 +101,17 @@ def starts(program):
     return {name: int(at, 16) for name, at in found.items()}
 
 
-def edit(ws, env, home, program, step, want):
+def edit(ws, env, program, step, want):
     """Builds, runs the program and says what is wrong with it, or "ok"."""
-    seen = len(links(home))
-    said = build(ws, env, step)
+    made = build(ws, env, step)
     at = address_of(program, "answer")
     ran = subprocess.run([program, at or "0"], capture_output=True, text=True, timeout=60)
-    made = links(home)[seen:]
     how = made[-1] if made else "no link"
     verdict = "ok"
     if at is None:
         verdict = "NO SYMBOL OF `answer`"
     elif ran.returncode != 0 or ran.stdout.strip() != f"{want} framed":
         verdict = f"PRINTED {ran.stdout.strip()!r} (exit {ran.returncode}), NOT {want} framed"
-    elif "[blaze]" not in said:
-        verdict = "NOT SERVED BY THE DAEMON"
     elif not how.startswith("spliced"):
         verdict = "NOT SPLICED"
     return verdict, how
@@ -144,12 +137,6 @@ def main():
     wrong = 0
     try:
         build(ws, env, "first build")
-        for _ in range(240):
-            if "[blaze]" in build(ws, env, "wait for the daemon"):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         found = sections(program)
         verdict = "ok" if found == {"__eh_frame"} else f"SECTIONS {sorted(found)}"
         print(f"{'the link':30} {verdict:12} {'__eh_frame and no __unwind_info'}")
@@ -157,7 +144,7 @@ def main():
         for n in range(1, EDITS + 1):
             text = open(source).read()
             open(source, "w").write(text.replace(f"    {n}\n}}", f"    {n + 1}\n}}", 1))
-            verdict, how = edit(ws, env, home, program, f"edit {n}", n + 1)
+            verdict, how = edit(ws, env, program, f"edit {n}", n + 1)
             # The first edit writes the whole object again.
             if n == 1 and verdict == "NOT SPLICED":
                 verdict = "ok"
@@ -168,7 +155,7 @@ def main():
         named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(MANY))
         used = "fn answer() -> u32 {\n" + named
         open(source, "w").write(text.replace("fn answer() -> u32 {\n", many + used, 1))
-        verdict, how = edit(ws, env, home, program, f"{MANY} functions added", EDITS + 1)
+        verdict, how = edit(ws, env, program, f"{MANY} functions added", EDITS + 1)
         at = starts(program)
         if verdict == "ok" and not at.get("__eh_frame", 0) < at.get("__text", 0):
             verdict = "FRAMES NOT MOVED"
