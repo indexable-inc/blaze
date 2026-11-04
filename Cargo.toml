@@ -340,6 +340,8 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
+# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
@@ -449,8 +451,6 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-# blaze-registry's HTTP/1 client: TLS over a tokio socket, rustls on ring as above, no `logging`.
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 # The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a
 # self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;
 # no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).
@@ -578,10 +578,10 @@ foldhash = "0.2.0"
 fst = { version = "0.4.7", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 glob = "0.3.4"
-http-body-util = "0.1.5"
-# A request's method, status and header names, hyper's own (blaze-registry, with or without `net`).
+# A request's method, status and header names (blaze-http, and blaze-registry with or without `net`).
 http = "1.5.0"
-hyper = { version = "1.12.0", default-features = false }
+# blaze-http's parsing of an answer's head.
+httparse = "1.10.1"
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }

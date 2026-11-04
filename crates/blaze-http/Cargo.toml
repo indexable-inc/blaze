@@ -1,0 +1,42 @@
+[package]
+name = "blaze-http"
+description = "blaze's HTTP/1.1 client: a sans-IO core (requests, answers, keep-alive pool, redirects, gzip, TLS through rustls's own sans-IO connection, deadlines on an injected clock) and a thin tokio driver"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Gzip bodies, decoded as they come; the pure-Rust backend, as blaze-engine's.
+flate2 = { workspace = true, features = ["rust_backend"] }
+# A request's method.
+http.workspace = true
+# An answer's head.
+httparse.workspace = true
+# TLS, sans-IO (`ClientConnection` driven by hand), on ring.
+rustls.workspace = true
+# The machine's roots (`roots::native`), read once as a client is made; not the core's.
+rustls-native-certs.workspace = true
+# Addresses and where their redirects lead.
+url.workspace = true
+# The tokio driver's sockets, DNS, timers and channels.
+tokio = { workspace = true, optional = true, features = ["io-util", "net", "rt", "sync", "time"] }
+
+[features]
+default = []
+# `tokio_driver`. Without it the crate is the core alone, with no runtime under it.
+tokio = ["dep:tokio"]
+
+[dev-dependencies]
+# The certificate of the in-memory rustls server the TLS test speaks to.
+rcgen.workspace = true
+
+[lints]
+workspace = true

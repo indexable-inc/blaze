@@ -558,24 +558,31 @@ it on every toolchain bump; `vendor/charon/blaze.diff` takes charon's, including
 
 | crate | who pulls it | action |
 |---|---|---|
-| hyper-util 0.1.21 | blaze-registry (`client-legacy`), hyper-rustls 0.27 | **dropped**, with hyper-rustls (6.1) |
+| hyper-util 0.1.21 | blaze-registry (`client-legacy`), hyper-rustls 0.27 | **dropped**, with hyper-rustls and hyper (6.1) |
 | quinn 0.11.12, quinn-proto 0.11.19 | wtransport, from blaze-explore | vendored with a patch series (6.2) |
 | quinn-udp 0.5.16 | quinn | its `tracing` feature turned off by the quinn patch; no vendor copy |
 | wtransport 0.7.2 | blaze-explore | vendored with a patch series (6.2) |
 | ra-ap-rustc_pattern_analysis 0.179.0 | hir-ty-matchck | vendored with a patch series (6.2) |
 | charon (vendor) | hir-ty-charon | `blaze.diff` (5.2) |
 
-### 6.1 One HTTP/1 client, no hyper-util
+### 6.1 One HTTP/1 client, sans-IO, no hyper
 
-blaze-registry's `HyperHttp` (`crates/blaze-registry/src/http/client.rs` ~line 57) is the only
-user of hyper-util's `client::legacy::Client` and of hyper-rustls. It becomes a pooled HTTP/1
-client written on `hyper::client::conn::http1` and `tokio-rustls` (both already in the lock, with
-`rustls-native-certs` for the machine's roots): a pool keyed by (scheme, host, port) holding idle
-`SendRequest`s, at most `IN_FLIGHT` connections, each connection's driver a task on the client's
-runtime, a connection dropped from the pool when its driver ends or a request on it fails. The
-redirect loop, bounds and timeouts stay as they are. `hyper-util` and `hyper-rustls` leave
-`blaze-registry`'s manifest and the lock. Rejected: vendoring hyper-util to cut `dep:tracing`
-(126 lines of patch kept forever for a pool of about 150 lines).
+blaze-registry's `HyperHttp` (`crates/blaze-registry/src/http/client.rs`) is the only user of
+hyper-util's `client::legacy::Client`, of hyper-rustls, and of hyper itself. It moves onto a new
+crate, `crates/blaze-http`: a sans-IO HTTP/1.1 client core (`blaze_http::Client`, a synchronous
+state machine on an injected clock that owns no socket, runtime or timer) and a thin tokio driver
+(`blaze_http::tokio_driver`, sockets, DNS and timers only). The core writes requests, parses
+answers with `httparse` (`Content-Length`, `chunked`, read to close), keeps connections between
+requests in a pool keyed by (scheme, host, port) with hyper-util's limits (64 idle, 90 seconds),
+follows at most 10 redirects, decodes gzip with `flate2`, holds bodies to their bound, speaks TLS
+through rustls's own sans-IO `ClientConnection` (ring, the machine's roots, no ALPN), and turns
+every timeout into a deadline. Its IO contract (connect, send, receive, close, each with its
+completion) is the one an io_uring driver is written against later, with no change to the core.
+`HyperHttp`'s API, redirect rules, bounds and timeouts stay as they are. `hyper`, `hyper-util`,
+`hyper-rustls`, `http-body-util` and `tokio-rustls` leave the manifests and the lock. Rejected:
+vendoring hyper-util to cut `dep:tracing` (126 lines of patch kept forever for a pool of about
+150 lines), and a pool on `hyper::client::conn::http1` with `tokio-rustls` (the first pass: it
+ties the client to tokio's IO traits, so an io_uring driver would be a rewrite).
 
 ### 6.2 Vendored patch series
 
@@ -815,7 +822,7 @@ independent of blaze-trace and land on their own, any time.
 
 | lane | phase | files | what |
 |---|---|---|---|
-| T1 `http1-client` | any | `crates/blaze-registry/**` | 6.1: hyper-util and hyper-rustls out, pooled client on `hyper::client::conn::http1` + `tokio-rustls` |
+| T1 `http1-client` | any | `crates/blaze-http/**` (new), `crates/blaze-registry/**` | 6.1: hyper, hyper-util, hyper-rustls, http-body-util and tokio-rustls out; `HyperHttp` on blaze-http's sans-IO core and tokio driver |
 | T2 `vendor-third-party` | any | `vendor/quinn/**`, `vendor/quinn-proto/**`, `vendor/wtransport/**`, `vendor/ra-ap-rustc_pattern_analysis/**`, `tools/vendor/**` | 6.2: patch series, `sync.py`, each crate's own tests under blaze |
 | 0.1 `trace-core` | 0 | `crates/blaze-trace/**` (new), `crates/blaze-profile/**` | sections 1-3, 2.1 registry with `events` and `Devirt`, 3.2 ordering and its stress test, 4's read side and `child_env`, 8.1 coexistence, `testing::{capture, print_tree}`, the wasm32-wasip1 build; blaze-profile's own sites converted; files the TLSDESC issue |
 | 0.2 `trace-graph` | 0 | `crates/blaze-graph/**` except `clippy.toml` | hooks become direct `blaze_trace` calls; `WaitKind` moves out |

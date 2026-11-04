@@ -41,36 +41,25 @@ blaze-fetch.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true
-# The HTTP stack the rest of blaze uses (crates/blaze-engine/Cargo.toml): hyper 1 over rustls with ring.
-hyper = { workspace = true, optional = true, features = ["client", "http1"] }
-# The method, status and header names `api` asks with, which the seed has without hyper and tokio.
+# The method, status and header names `api` asks with, which the seed has without the client.
 http.workspace = true
-http-body-util = { workspace = true, optional = true }
-# `http::client`'s own pool of HTTP/1 connections (no hyper-util: it pulls in `tracing`), its TLS
-# with the machine's roots, and the socket under both.
-rustls = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+# `http::HyperHttp`: blaze's sans-IO HTTP/1.1 client and its tokio driver (sockets, DNS, timers),
+# TLS through rustls on ring with the machine's roots.
+blaze-http = { workspace = true, optional = true, features = ["tokio"] }
+# The runtime `HyperHttp` drives its client on and asks it from.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [features]
 default = ["net"]
-# `http::HyperHttp` over hyper and rustls on ring. Without it (the seed profile, which builds
+# `http::HyperHttp` over blaze-http, rustls on ring. Without it (the seed profile, which builds
 # offline from vendored sources) every request is `http::NoNet`, naming its URL.
-net = [
-    "dep:hyper",
-    "dep:http-body-util",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:tokio-rustls",
-    "dep:tokio",
-]
+net = ["dep:blaze-http", "dep:tokio"]
 
 [dev-dependencies]
-# The keep-alive server `http::client`'s pool test asks.
+# The keep-alive server `http::client`'s test of the tokio driver asks.
 tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [lints]
