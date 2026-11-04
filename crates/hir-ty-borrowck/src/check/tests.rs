@@ -71,6 +71,38 @@ fn e0597() {
 }
 "#;
 
+#[test]
+fn a_question_mark_with_an_uninhabited_output_does_not_leave_an_uninitialized_binding() {
+    let fx = fixture::db(r#"
+//- minicore: sized, copy, result, try, future, from
+enum Void {}
+enum Entered { Model(Void) }
+fn read() -> Result<Void, u32> { Err(1) }
+async fn read_async() -> Result<Void, u32> { Err(1) }
+fn enter() -> Result<Entered, u32> {
+    let definition = read()?;
+    Ok(Entered::Model(definition))
+}
+async fn enter_async() -> Result<Entered, u32> {
+    let definition = read_async().await?;
+    Ok(Entered::Model(definition))
+}
+fn uninitialized() -> u32 { let value; value }
+fn initialized() -> Result<u32, u32> { let value = Ok::<u32, u32>(1)?; Ok(value) }
+"#);
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    for name in ["enter", "enter_async", "initialized"] {
+        for mode in [Mode::Nll, Mode::Polonius, Mode::PoloniusFlow] {
+            let result = borrowck_in_mode(&db, function(&db, name), mode);
+            assert!(result.skipped.is_none() && result.not_checked.is_none(), "{name}: {result:?}");
+            assert!(result.diagnostics.iter().all(|it| !it.code.starts_with('E')), "{name}: {:?}", result.diagnostics);
+        }
+    }
+    let bad = crate::borrowck(&db, function(&db, "uninitialized"));
+    assert!(bad.diagnostics.iter().any(|it| it.code == "E0381"), "{:?}", bad.diagnostics);
+}
+
 fn function(db: &Db, name: &str) -> DefWithBodyId {
     for &krate in all_crates(db).iter() {
         let def_map = crate_def_map(db, krate);

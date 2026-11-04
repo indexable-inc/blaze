@@ -716,9 +716,9 @@ fn legacy_retired(dir: &Path) -> Result<Retired, HistoryError> {
         Ok(it) => it,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Retired::default()),
         Err(error) => {
-            return Err(io_error(&path, "reading the retired files of a history before manifests")(
-                error,
-            ));
+            return Err(
+                io_error(&path, "reading the retired files of a history before manifests")(error),
+            );
         }
     };
     let refused =

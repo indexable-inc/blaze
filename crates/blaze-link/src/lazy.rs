@@ -901,7 +901,10 @@ fn def_value(image: &Image, mut sym: Sym) -> Result<Value, String> {
             }
             // alloc: error path
             Def::TpOff(_) => {
-                return Err(format!("{} is a thread-local of another image", symbols.describe(sym)));
+                return Err(format!(
+                    "{} is a thread-local of another image",
+                    symbols.describe(sym)
+                ));
             }
             // alloc: error path
             Def::Special(_) => {

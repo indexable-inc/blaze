@@ -53,6 +53,7 @@ include = [
   "tools/similar",
   "tools/typed-input",
   "tools/v2",
+  "tools/vendor",
 ]
 
 # These harnesses arrange their sibling imports after computing HERE. Their runtime
@@ -90,6 +91,7 @@ include = [
   "tools/layout",
   "tools/typed-input",
   "tools/v2",
+  "tools/vendor",
 ]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
