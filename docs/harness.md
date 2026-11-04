@@ -420,6 +420,16 @@ commits through `.github/scripts/bench_commit.py`, which draws them again on top
 one typed JSON input (`{"blaze": PATH, "program": "probe" | "life" | "bevy" | "egui", "edits": 10,
 "json": PATH}`; the fields are in its docstring); its JSON goes to `benchhistory.py live`. The
 numbers once measured on a MacBook are in [live.md](live.md#latency-under-typing) (superseded).
+`netbench.py` compares HTTP/2 and HTTP/3 through blaze's one HTTP client
+([networking.md](networking.md)), with one typed JSON input (`{"blaze": PATH, "protocols":
+["off", "require"], "runs": 3, "concurrency": 16, "passes": 2, "json": PATH}`; the fields are in
+its docstring). It builds `crates/blaze-registry/examples/netbench.rs` with `blaze build` and runs
+it with `blaze run` once per protocol and run, each a fresh client over the pinned URLs of
+`harness/netbench.json` (20 crates.io sparse-index files, 10 `.crate` downloads, 20 small GETs to
+a Cloudflare host as the remote cache asks): the first pass cold (DNS, handshakes), the rest warm
+(connections reused). It prints, per protocol, pass and group, the requests, failures, p50 and
+p95, and the median wall time of each pass, and with `json` every request's time. It needs the
+network; it measures and checks nothing, and is how `net.http3`'s default is chosen.
 `nix develop .#bench` has everything `bench.py` and `live_latency.py` need: blaze's stage 0,
 the pinned LLVM, mold, wild and bevy's libraries, and no Rust toolchain (blaze brings its own);
 zed's libraries are in `.#bench-zed`, since every library directory slows each link.

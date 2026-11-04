@@ -41,6 +41,7 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
+  "harness/netbench.py",
   "harness/own_inputs.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
@@ -78,6 +79,7 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
+  "harness/netbench.py",
   "harness/own_inputs.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
@@ -90,5 +92,7 @@ include = [
 ]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
-# harness/v2's scripts import `engine`, `report`, `blaze_cli` and `cases` as siblings off `sys.path`.
-extraPaths = ["harness", "harness/v2", "harness/v2/frontend"]
+# harness/v2's scripts import `engine`, `report`, `blaze_cli` and `cases` as siblings off `sys.path`;
+# `typed_input` (the workspace member tools/typed-input) resolves from its source as well as from
+# the environment `uv sync` installs it in, so a pyright outside that environment finds it too.
+extraPaths = ["harness", "harness/v2", "harness/v2/frontend", "tools/typed-input/src"]

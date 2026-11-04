@@ -28,6 +28,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use blaze_manifest::user_config::{self, UserConfigError};
 use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp};
 use serde_json::Value;
 
@@ -62,10 +63,8 @@ pub(crate) enum UpdateError {
     NoHome,
     /// A file that is there and can't be read.
     Unread { file: PathBuf, error: std::io::Error },
-    /// `config.toml` that is not TOML.
-    NotToml { file: PathBuf, error: toml::de::Error },
-    /// A setting that is none of the values it takes.
-    Setting { file: PathBuf, key: String, wants: &'static str, got: String },
+    /// `config.toml` that can't be read, is not TOML, or sets `[update]` to what it doesn't take.
+    Config(UserConfigError),
     /// `update/state.json` that is not what the daemon writes.
     State { file: PathBuf, why: String },
     /// `default` that names no release.
@@ -80,12 +79,7 @@ impl std::fmt::Display for UpdateError {
                  there is none (`BLAZE_HOME` names where)",
             ),
             UpdateError::Unread { file, error } => write!(f, "reading {}: {error}", file.display()),
-            UpdateError::NotToml { file, error } => {
-                write!(f, "{} is not TOML, so blaze's update settings can't be told: {error}", file.display())
-            }
-            UpdateError::Setting { file, key, wants, got } => {
-                write!(f, "{} sets `{key}` to {got}, which is not {wants}", file.display())
-            }
+            UpdateError::Config(error) => std::fmt::Display::fmt(error, f),
             UpdateError::State { file, why } => write!(
                 f,
                 "{} is not what blaze's daemon writes ({why}); the daemon writes it again at its next check",
@@ -103,13 +97,9 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
-/// blaze's home: where `versions/` is.
+/// blaze's home: where `versions/` and `config.toml` are.
 fn home() -> Result<PathBuf, UpdateError> {
-    pin::versions().and_then(|it| it.parent().map(Path::to_owned)).ok_or(UpdateError::NoHome)
-}
-
-fn config_file(home: &Path) -> PathBuf {
-    home.join("config.toml")
+    user_config::home().ok_or(UpdateError::NoHome)
 }
 
 fn state_file(home: &Path) -> PathBuf {
@@ -153,19 +143,15 @@ impl Config {
 /// `[update]`, or a value none of those it takes, is an error naming it; other tables are not
 /// this module's.
 fn config(home: &Path) -> Result<Config, UpdateError> {
-    let file = config_file(home);
-    let Some(text) = text(&file)? else { return Ok(Config::DEFAULT) };
-    let table = toml::from_str::<toml::Table>(&text)
-        .map_err(|error| UpdateError::NotToml { file: file.clone(), error })?;
+    let file = user_config::file(home);
+    let Some(table) = user_config::read(&file).map_err(UpdateError::Config)? else { return Ok(Config::DEFAULT) };
     let mut config = Config::DEFAULT;
-    let Some(update) = table.get("update") else { return Ok(config) };
-    let bad = |key: &str, wants, got: &toml::Value| UpdateError::Setting {
-        file: file.clone(),
-        key: key.to_owned(),
-        wants,
-        got: got.to_string(),
+    let Some(update) = user_config::section(&table, &file, "update").map_err(UpdateError::Config)? else {
+        return Ok(config);
     };
-    let update = update.as_table().ok_or_else(|| bad("update", "a table", update))?;
+    let bad = |key: &str, wants: &str, got: &toml::Value| {
+        UpdateError::Config(UserConfigError::setting(&file, key, wants, got))
+    };
     for (key, value) in update {
         match key.as_str() {
             "mode" => {
@@ -194,7 +180,7 @@ fn config(home: &Path) -> Result<Config, UpdateError> {
 
 /// `config.toml` under `home` with `[update] key = value`, the rest of it as it was.
 fn set(home: &Path, key: &str, value: &str) -> anyhow::Result<()> {
-    let file = config_file(home);
+    let file = user_config::file(home);
     let shown = file.display();
     let mut doc: toml_edit::DocumentMut =
         text(&file)?.unwrap_or_default().parse().with_context(|| format!("reading {shown}"))?;
@@ -720,7 +706,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         bail!(
             "{} sets `[update] mode = \"offline\"`: blaze makes no network calls for its updates, and \
              `blaze update` is one (`blaze update --mode warn` turns them on)",
-            config_file(&home).display()
+            user_config::file(&home).display()
         );
     }
     refresh(true)?;

@@ -293,11 +293,7 @@ pub(crate) fn is_version(version: &str) -> bool {
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in
 /// the user's home.
 pub(crate) fn versions() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home).join("versions"));
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(PathBuf::from(home).join(".blaze").join("versions"))
+    Some(blaze_manifest::user_config::home()?.join("versions"))
 }
 
 /// The `blaze` of `version` where [`versions`] keeps it.
