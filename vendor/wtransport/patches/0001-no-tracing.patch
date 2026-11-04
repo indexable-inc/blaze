@@ -1,0 +1,283 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 5b8c6f2..293377d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -171,9 +171,6 @@ features = [
+ ]
+ default-features = false
+ 
+-[dependencies.tracing]
+-version = "0.1.37"
+-
+ [dependencies.url]
+ version = "2.4.0"
+ 
+@@ -198,10 +195,6 @@ version = "1.28.1"
+ features = ["rt-multi-thread"]
+ default-features = false
+ 
+-[dev-dependencies.tracing-subscriber]
+-version = "0.3.17"
+-features = ["env-filter"]
+-
+ [lints.clippy]
+ manual_is_variant_and = "warn"
+ manual_let_else = "warn"
+diff --git a/src/driver/mod.rs b/src/driver/mod.rs
+index dc68f04..ab96063 100644
+--- a/src/driver/mod.rs
++++ b/src/driver/mod.rs
+@@ -16,11 +16,6 @@ use crate::stream::OpeningUniStream;
+ use crate::SessionId;
+ use tokio::sync::mpsc;
+ use tokio::sync::Mutex;
+-use tracing::debug;
+-use tracing::debug_span;
+-use tracing::instrument;
+-use tracing::trace;
+-use tracing::Instrument;
+ use utils::BiChannelEndpoint;
+ use wtransport_proto::error::ErrorCode;
+ use wtransport_proto::frame::Frame;
+@@ -64,8 +59,7 @@ impl Driver {
+                 ready_datagrams.0,
+                 driver_result.0,
+             )
+-            .run()
+-            .instrument(debug_span!("Driver", quic_id = quic_connection.stable_id())),
++            .run(),
+         );
+ 
+         Self {
+@@ -130,12 +124,6 @@ impl Driver {
+                 return Ok(stream);
+             }
+ 
+-            debug!(
+-                "Discarding WT stream (stream_id: {}, session_id: {})",
+-                stream.id(),
+-                stream.session_id()
+-            );
+-
+             stream
+                 .into_stream()
+                 .stop(ErrorCode::BufferedStreamRejected.to_code())
+@@ -155,12 +143,6 @@ impl Driver {
+                 return Ok(stream);
+             }
+ 
+-            debug!(
+-                "Discarding WT stream (stream_id: {}, session_id: {})",
+-                stream.id(),
+-                stream.session_id()
+-            );
+-
+             stream
+                 .into_stream()
+                 .1
+@@ -180,11 +162,6 @@ impl Driver {
+             if datagram.session_id() == session_id {
+                 return Ok(datagram);
+             }
+-
+-            debug!(
+-                "Incoming datagram discarded (session_id: {})",
+-                datagram.session_id()
+-            );
+         }
+     }
+ 
+@@ -295,15 +272,11 @@ mod worker {
+         }
+ 
+         pub async fn run(mut self) {
+-            debug!("Started");
+-
+             let error = self
+                 .run_impl()
+                 .await
+                 .expect_err("Worker must return an error");
+ 
+-            debug!("Ended with error: {:?}", error);
+-
+             match &error {
+                 DriverError::ApplicationClosed(_) => {
+                     // Termination procedure
+@@ -414,7 +387,6 @@ mod worker {
+             ready_uni_h3_streams: &mpsc::Sender<Result<StreamUniRemoteH3, DriverError>>,
+             ready_uni_wt_streams: &mpsc::Sender<StreamUniRemoteWT>,
+         ) -> Result<(), DriverError> {
+-            trace!("H3 uni queue capacity: {}", ready_uni_h3_streams.capacity());
+             let h3_slot = ready_uni_h3_streams
+                 .clone()
+                 .reserve_owned()
+@@ -430,9 +402,6 @@ mod worker {
+                 .await
+                 .ok_or(DriverError::NotConnected)?;
+ 
+-            let stream_id = stream_quic.id();
+-            debug!("New incoming uni stream ({})", stream_id);
+-
+             tokio::spawn(
+                 async move {
+                     let stream_h3 = match stream_quic.upgrade().await {
+@@ -447,7 +416,6 @@ mod worker {
+                     };
+ 
+                     let stream_kind = stream_h3.kind();
+-                    debug!("Type: {:?}", stream_kind);
+ 
+                     if matches!(stream_kind, StreamKind::WebTransport) {
+                         let stream_wt = stream_h3.upgrade();
+@@ -455,8 +423,7 @@ mod worker {
+                     } else {
+                         h3_slot.send(Ok(stream_h3));
+                     }
+-                }
+-                .instrument(debug_span!("Stream", "id={}", stream_id)),
++                },
+             );
+ 
+             Ok(())
+@@ -469,7 +436,6 @@ mod worker {
+             >,
+             ready_bi_wt_streams: &mpsc::Sender<StreamBiRemoteWT>,
+         ) -> Result<(), DriverError> {
+-            trace!("H3 bi queue capacity: {}", ready_bi_h3_streams.capacity());
+             let h3_slot = ready_bi_h3_streams
+                 .clone()
+                 .reserve_owned()
+@@ -485,9 +451,6 @@ mod worker {
+                 .await
+                 .ok_or(DriverError::NotConnected)?;
+ 
+-            let stream_id = stream_quic.id();
+-            debug!("New incoming bi stream ({})", stream_id);
+-
+             tokio::spawn(
+                 async move {
+                     let mut stream_h3 = stream_quic.upgrade();
+@@ -495,7 +458,6 @@ mod worker {
+                     let frame = loop {
+                         match stream_h3.read_frame().await {
+                             Ok(frame) => {
+-                                debug!("Frame kind: {:?}", frame.kind());
+                                 if !matches!(frame.kind(), FrameKind::Exercise(_)) {
+                                     break frame;
+                                 }
+@@ -510,8 +472,6 @@ mod worker {
+                         }
+                     };
+ 
+-                    debug!("First frame: {:?}", frame);
+-
+                     match frame.session_id() {
+                         Some(session_id) => {
+                             let stream_wt = stream_h3.upgrade(session_id);
+@@ -521,8 +481,7 @@ mod worker {
+                             h3_slot.send(Ok((stream_h3, frame)));
+                         }
+                     }
+-                }
+-                .instrument(debug_span!("Stream", "id={}", stream_id)),
++                },
+             );
+ 
+             Ok(())
+@@ -547,11 +506,6 @@ mod worker {
+                 Err(error_code) => return Err(DriverError::Proto(error_code)),
+             };
+ 
+-            trace!(
+-                "New incoming datagram (session_id: {})",
+-                datagram.session_id()
+-            );
+-
+             slot.send(datagram);
+ 
+             Ok(())
+@@ -587,7 +541,6 @@ mod worker {
+             Ok(())
+         }
+ 
+-        #[instrument(skip_all, name = "Stream", fields(id = %stream.id()))]
+         fn handle_bi_h3_stream(
+             &mut self,
+             mut stream: StreamBiRemoteH3,
+@@ -603,8 +556,6 @@ mod worker {
+                         Err(error_code) => return Err(DriverError::Proto(error_code)),
+                     };
+ 
+-                    debug!("Headers: {:?}", headers);
+-
+                     let stream_session = match SessionRequest::try_from(headers) {
+                         Ok(session_request) => stream.into_session(session_request),
+                         Err(HeadersParseError::MethodNotConnect) => {
+@@ -625,7 +576,6 @@ mod worker {
+                     match self.ready_sessions.try_send(stream_session) {
+                         Ok(()) => {}
+                         Err(TrySendError::Full(mut stream)) => {
+-                            debug!("Discarding session request: sessions queue is full");
+                             stream
+                                 .stop(ErrorCode::RequestRejected.to_code())
+                                 .expect("Stream not already stopped");
+@@ -660,8 +610,6 @@ mod worker {
+         }
+ 
+         fn handle_remote_settings(&mut self, settings: Settings) -> Result<(), DriverError> {
+-            debug!("Received: {:?}", settings);
+-
+             match self.ready_settings.try_send(settings) {
+                 Ok(()) => Ok(()),
+                 Err(mpsc::error::TrySendError::Closed(_)) => Err(DriverError::NotConnected),
+diff --git a/src/driver/streams/connect.rs b/src/driver/streams/connect.rs
+index bce6db1..5db28f2 100644
+--- a/src/driver/streams/connect.rs
++++ b/src/driver/streams/connect.rs
+@@ -1,4 +1,3 @@
+-use tracing::debug;
+ use wtransport_proto::bytes::IoReadError;
+ use wtransport_proto::capsule::capsules;
+ use wtransport_proto::capsule::Capsule;
+@@ -40,7 +39,6 @@ impl ConnectStream {
+             return match stream.read_frame().await {
+                 Ok(frame) => {
+                     if !matches!(frame.kind(), FrameKind::Data) {
+-                        debug!("Skipping non-data frame of kind {:?}", frame.kind());
+                         continue;
+                     }
+ 
+@@ -55,12 +53,6 @@ impl ConnectStream {
+                         }
+                         // Unknown capsule, skip it
+                         _ => {
+-                            debug!(
+-                                "Unknown capsule of kind {:?} of {}B",
+-                                frame.kind(),
+-                                frame.payload().len()
+-                            );
+-
+                             continue;
+                         }
+                     };
+diff --git a/src/endpoint.rs b/src/endpoint.rs
+index 0e7d9e6..65eae30 100644
+--- a/src/endpoint.rs
++++ b/src/endpoint.rs
+@@ -22,7 +22,6 @@ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::task::Context;
+ use std::task::Poll;
+-use tracing::debug;
+ use url::Host;
+ use url::Url;
+ use wtransport_proto::error::ErrorCode;
+@@ -149,8 +148,6 @@ impl Endpoint<endpoint_side::Server> {
+             .await
+             .expect("Endpoint cannot be closed");
+ 
+-        debug!("New incoming QUIC connection");
+-
+         IncomingSession(quic_incoming)
+     }
+ 

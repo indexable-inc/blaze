@@ -1,0 +1,16 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index fde2288..e6a7f75 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -179,3 +179,11 @@ unfulfilled_lint_expectations = "deny"
+ unit_bindings = "deny"
+ unsafe_op_in_unsafe_fn = "deny"
+ unused_qualifications = "warn"
++
++# blaze: run on its own (`blaze test` in vendor/wtransport, excluded from blaze's workspace), the
++# tests build against the patched siblings, as blaze's own build does through its root manifest.
++[patch.crates-io.quinn]
++path = "../quinn"
++
++[patch.crates-io.quinn-proto]
++path = "../quinn-proto"

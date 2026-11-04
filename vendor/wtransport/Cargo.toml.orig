@@ -1,0 +1,105 @@
+[package]
+name = "wtransport"
+version = "0.7.2"
+license = "MIT OR Apache-2.0"
+authors = ["Biagio Festa"]
+description = "Implementation of the WebTransport (over HTTP3) protocol"
+repository = "https://github.com/BiagioFesta/wtransport"
+keywords = ["webtransport"]
+categories = [ "network-programming", "asynchronous" ]
+edition = "2021"
+readme = "../README.md"
+workspace = ".."
+rust-version = "1.88"
+
+[[example]]
+name = "client"
+required-features = ["dangerous-configuration"]
+
+[[example]]
+name = "full"
+required-features = ["self-signed"]
+
+[[example]]
+name = "server"
+required-features = ["self-signed"]
+
+[[example]]
+name = "gencert"
+required-features = ["self-signed"]
+
+[dependencies]
+bytes = "1.4.0"
+pem = "3.0.4"
+quinn = { version = "0.11.6", default-features = false, features = ["runtime-tokio"] }
+rcgen = { version = "0.14.5", default-features = false, optional = true }
+rustls = { version = "0.23.23", default-features = false }
+rustls-native-certs = "0.8.0"
+rustls-pki-types = "1.13.2"
+sha2 = "0.11.0"
+socket2 = "0.6.3"
+thiserror = "2.0.3"
+time = "0.3.21"
+tokio = { version = "1.28.1", default-features = false, features = ["macros", "fs", "io-util"] }
+tracing = "0.1.37"
+url = "2.4.0"
+wtransport-proto = { version = "0.7.2", path = "../wtransport-proto", features = ["async"] }
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+anyhow = "1.0.71"
+axum = "0.7.1"
+hyper = "1.0.1"
+tokio = { version = "1.28.1", default-features = false, features = ["rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+
+[features]
+default = ["self-signed", "ring"]
+aws-lc-rs = ["quinn/aws-lc-rs", "quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs", "rcgen?/aws_lc_rs"]
+aws-lc-rs-fips = ["quinn/aws-lc-rs-fips", "quinn/rustls-aws-lc-rs-fips", "rustls/fips", "rcgen?/fips"]
+dangerous-configuration = []
+fips = ["aws-lc-rs-fips"]
+quinn = []
+quinn-log = ["quinn/log"]
+ring = ["quinn/ring", "quinn/rustls", "rustls/ring", "rcgen?/ring"]
+self-signed = ["dep:rcgen"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "bytes::bytes::Bytes",
+    "quinn",
+    "quinn::connection::Connecting",
+    "quinn::connection::Connection",
+    "quinn::incoming::Incoming",
+    "quinn::recv_stream::ReadError",
+    "quinn::recv_stream::RecvStream",
+    "quinn::send_stream::SendStream",
+    "quinn::send_stream::WriteError",
+    "quinn_proto::config::ClientConfig",
+    "quinn_proto::config::EndpointConfig",
+    "quinn_proto::config::ServerConfig",
+    "quinn_proto::config::transport::TransportConfig",
+    "quinn_proto::connection::ConnectionError",
+    "rustls",
+    "rustls::client::client_conn::ClientConfig",
+    "rustls::server::server_conn::ServerConfig",
+    "rustls::verify::ServerCertVerifier",
+    "rustls::webpki::anchors::RootCertStore",
+    "time",
+    "time::Duration",
+    "time::offset_date_time::OffsetDateTime",
+    "tokio::io::async_read::AsyncRead",
+    "tokio::io::async_write::AsyncWrite",
+    "wtransport_proto",
+    "wtransport_proto::WEBTRANSPORT_ALPN",
+    "wtransport_proto::ids::SessionId",
+    "wtransport_proto::ids::StreamId",
+    "wtransport_proto::varint::VarInt",
+]
