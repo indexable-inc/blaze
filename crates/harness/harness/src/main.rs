@@ -10,18 +10,16 @@ mod profiles;
 mod proto;
 mod queries;
 mod runs;
-mod web;
-mod wt;
 
 use anyhow::{Result, bail};
 use serde_json::json;
 
 const USAGE: &str = "\
-harness                       start the daemon if needed, open the web UI, return
+harness                       start the daemon if needed, open the native app, return
 harness claude|codex|cursor|shell [args...]
-                              start a locked-down agent in this directory, open it in the web UI
+                              start a locked-down agent in this directory, open it in the native app
 harness tui [claude|codex|cursor|shell [args...]]
-                              terminal UI instead of the browser (ctrl-] returns to the tree)
+                              terminal UI instead of the native app (ctrl-] returns to the tree)
 harness ls [--all]            print the session tree (--all: past sessions too, from the index)
 harness send <id> <text...>   type a message into a session and press Enter
 harness screen <id>           print a session's current screen
@@ -31,8 +29,8 @@ harness run '<cmd>'           run a shell command through the daemon (every pipe
 harness runs [N]              list the N (default 20) most recent runs of every agent
 harness out <run> [stage] [--err]
                               print a run's stored output: the caller-visible stdout, or one stage's
-harness web                   print the web UI addresses and open ix.dev/harness (HARNESS_UI=local: localhost)
-harness daemon [--port N]     run the daemon in the foreground (normally started automatically)
+harness app                   open the native app
+harness daemon                run the daemon in the foreground (normally started automatically)
 harness stop                  stop the daemon and every session";
 
 #[tokio::main]
@@ -40,7 +38,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
     match args.first().map(String::as_str) {
-        None => open_web(None).await,
+        None => open_app(None),
         Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((140, 45));
             let cwd = std::env::current_dir()?.display().to_string();
@@ -48,19 +46,13 @@ async fn main() -> Result<()> {
                 .await?
                 .req(json!({"op": "spawn", "kind": kind, "args": &args[1..], "cwd": cwd, "cols": cols, "rows": rows}))
                 .await?;
-            open_web(v["id"].as_u64()).await
+            open_app(v["id"].as_u64())
         }
         Some("tui") => match args.get(1).map(String::as_str) {
             Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => client::run(Some((kind.to_string(), args[2..].to_vec()))).await,
             _ => client::run(None).await,
         },
-        Some("daemon") => {
-            let port = match args.iter().position(|a| a == "--port") {
-                Some(i) => arg(i + 1).parse()?,
-                None => std::env::var("HARNESS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4747),
-            };
-            daemon::run(port).await
-        }
+        Some("daemon") => daemon::run().await,
         Some("ls") => {
             let all = args.get(1).is_some_and(|a| a == "--all" || a == "-a");
             let v = client::Ctl::connect().await?.req(json!({"op": "list", "all": all})).await?;
@@ -83,8 +75,8 @@ async fn main() -> Result<()> {
             client::Ctl::connect().await?.req(json!({"op": "kill", "id": arg(1).parse::<u64>()?})).await?;
             Ok(())
         }
-        Some("web") => {
-            open_web(None).await
+        Some("app") => {
+            open_app(None)
         }
         Some("stop") => {
             let mut ctl = client::Ctl::connect().await?;
@@ -133,40 +125,23 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Print the web UI addresses (deep-linked to a session if given) and open one in the browser:
-/// ix.dev/harness over WebTransport by default, http://localhost:4747 with HARNESS_UI=local.
-async fn open_web(session: Option<u64>) -> Result<()> {
-    let base = client::Ctl::connect().await?.req(json!({"op": "info"})).await?["web"].as_str().unwrap_or("").to_string();
-    let local = match session {
-        Some(id) => format!("{base}/#{id}"),
-        None => base,
-    };
-    // The daemon writes its WebTransport link into daemon.json a moment after it starts listening.
-    let mut remote = None;
-    for _ in 0..20 {
-        let info: serde_json::Value = std::fs::read(paths::info()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        if let Some(link) = info["wt_link"].as_str() {
-            remote = Some(match session {
-                Some(id) => format!("{link}&object=s{id}"),
-                None => link.to_string(),
-            });
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+/// Open the native app (harness-native, built next to this binary), selecting a session if given. It connects to the
+/// daemon itself; this returns at once.
+fn open_app(session: Option<u64>) -> Result<()> {
+    if std::env::var_os("HARNESS_NO_OPEN").is_some() {
+        return Ok(());
     }
-    let want_local = std::env::var("HARNESS_UI").is_ok_and(|v| v == "local");
-    let url = match (&remote, want_local) {
-        (Some(r), false) => r.clone(),
-        _ => local.clone(),
-    };
-    if let Some(r) = &remote {
-        println!("{r}");
+    let app = std::env::current_exe()?.with_file_name("harness-native");
+    if !app.exists() {
+        bail!("{} is not built: cargo build --release -p harness-native", app.display());
     }
-    println!("{local}");
-    if std::env::var_os("HARNESS_NO_OPEN").is_none() {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        let _ = std::process::Command::new(opener).arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let mut cmd = std::process::Command::new(&app);
+    if let Some(id) = session {
+        cmd.env("HARNESS_NATIVE_SELECT", format!("s{id}"));
     }
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.spawn()?;
     Ok(())
 }
 

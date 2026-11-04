@@ -1,7 +1,7 @@
 //! harnessd: owns every agent PTY, mirrors each into a vt100 emulator (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{archive, db, messages, paths, profiles, proto, queries, runs, web};
+use crate::{archive, db, messages, paths, profiles, proto, queries, runs};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -106,7 +106,6 @@ pub struct Daemon {
     pub sessions: Mutex<BTreeMap<u64, Arc<Session>>>,
     next: AtomicU64,
     pub last: Mutex<Option<u64>>,
-    pub web_port: u16,
 }
 
 #[derive(Deserialize)]
@@ -308,7 +307,7 @@ impl Daemon {
                 db::repl_task(&task)?;
                 json!({ "ok": true })
             }
-            Req::Info => json!({ "pid": std::process::id(), "web": format!("http://127.0.0.1:{}", self.web_port), "sock": paths::sock() }),
+            Req::Info => json!({ "pid": std::process::id(), "sock": paths::sock() }),
             Req::Last => {
                 let last = *self.last.lock().unwrap();
                 let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().unwrap().is_none()).map(|s| s.id);
@@ -363,7 +362,7 @@ impl Daemon {
     }
 }
 
-pub async fn run(web_port: u16) -> Result<()> {
+pub async fn run() -> Result<()> {
     std::fs::create_dir_all(paths::home())?;
     let sock = paths::sock();
     if UnixStream::connect(&sock).await.is_ok() {
@@ -371,8 +370,6 @@ pub async fn run(web_port: u16) -> Result<()> {
     }
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    let web = tokio::net::TcpListener::bind(("127.0.0.1", web_port)).await.with_context(|| format!("bind web port {web_port}"))?;
-    let web_port = web.local_addr()?.port();
     // The object index: session ids continue after the last one ever used; sessions the last daemon
     // left running are lost; older runs get indexed, finished objects compacted, transcripts mirrored.
     db::mark_lost_sessions();
@@ -382,11 +379,9 @@ pub async fn run(web_port: u16) -> Result<()> {
         archive::compact_pending();
     });
     std::thread::spawn(messages::poll);
-    let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(next), last: Mutex::new(None), web_port });
-    std::fs::write(paths::info(), json!({ "pid": std::process::id(), "web": format!("http://127.0.0.1:{web_port}") }).to_string())?;
-    eprintln!("harnessd pid {} socket {} web http://127.0.0.1:{web_port}", std::process::id(), sock.display());
-    tokio::spawn(web::serve(d.clone(), web));
-    tokio::spawn(crate::wt::serve(d.clone()));
+    let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(next), last: Mutex::new(None) });
+    std::fs::write(paths::info(), json!({ "pid": std::process::id(), "sock": sock }).to_string())?;
+    eprintln!("harnessd pid {} socket {}", std::process::id(), sock.display());
     loop {
         let (stream, _) = listener.accept().await?;
         let d = d.clone();

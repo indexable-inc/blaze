@@ -82,13 +82,11 @@ struct Ui {
     ctl: Ctl,
     keys: mpsc::UnboundedReceiver<Vec<u8>>,
     winch: tokio::signal::unix::Signal,
-    web: String,
     cwd: String,
 }
 
 pub async fn run(spawn: Option<(String, Vec<String>)>) -> Result<()> {
     let mut ctl = Ctl::connect().await?;
-    let web = ctl.req(json!({"op": "info"})).await?["web"].as_str().unwrap_or("").to_string();
     let cwd = std::env::current_dir()?.display().to_string();
     let mut target = match &spawn {
         Some((kind, args)) => {
@@ -111,7 +109,7 @@ pub async fn run(spawn: Option<(String, Vec<String>)>) -> Result<()> {
         }
     });
     let winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-    let mut ui = Ui { ctl, keys, winch, web, cwd };
+    let mut ui = Ui { ctl, keys, winch, cwd };
 
     crossterm::terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
@@ -259,7 +257,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
             let [head, body, foot] = Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(3)]).areas(f.area());
             f.render_widget(
                 Paragraph::new(vec![
-                    Line::from(vec![Span::from("harness").bold(), Span::from(format!("  {} sessions  ·  {}", rows.len(), ui.web)).dim()]),
+                    Line::from(vec![Span::from("harness").bold(), Span::from(format!("  {} sessions", rows.len())).dim()]),
                     Line::from(""),
                 ]),
                 head,
