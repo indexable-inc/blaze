@@ -19,8 +19,9 @@ Apache-2.0), copyright the verus-analyzer and rust-analyzer developers.
 
 harness (crates/harness, its own cargo workspace; crates/harness/README.md) carries its own
 licenses: its crates say theirs in their Cargo.toml. Third-party code and data it vendors:
-- Flecs (MIT), copyright Sander Mertens: crates/harness/vendor/flecs, license text
-  crates/harness/vendor/flecs/LICENSE; SOURCE.md there names the version and the patches.
+- Flecs (MIT), copyright Sander Mertens: not copied in, but compiled into the app from the
+  indexable-inc/flecs fork at the rev pinned in crates/harness/vendor/hyperion-flecs-c/Cargo.toml
+  (that comment names the version and the patches); license text is the fork's LICENSE.
 - Inter (SIL OFL 1.1), copyright the Inter Project Authors: crates/harness/harness-native/fonts/inter.
 - JetBrains Mono (SIL OFL 1.1), copyright the JetBrains Mono Project Authors:
   crates/harness/harness-native/fonts/jetbrains-mono.
