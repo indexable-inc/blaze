@@ -7,6 +7,7 @@ mod gpu;
 mod link;
 mod look;
 mod pack;
+mod pane;
 mod prefs;
 mod shot;
 mod single;

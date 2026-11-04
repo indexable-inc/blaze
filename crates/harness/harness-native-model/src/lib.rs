@@ -12,7 +12,8 @@
 //! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
 //! - [`Archived`] on an object takes it (and what is under it) out of the tree and into the sidebar's Archive.
-//! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
+//! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
+//!   `(Shows, object)`: what it draws. The focused pane's `Shows` follows `Selected`; a second pane is a second node.
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
@@ -152,9 +153,39 @@ pub struct Created {
     pub ms: u64,
 }
 
-/// `(Viewing, object)` on the app entity: the object the main pane shows.
+/// `(Selected, object)` on the app entity: the selected object (exclusive). The focused pane shows it.
 #[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Viewing;
+pub struct Selected;
+
+/// `(Shows, object)` on a pane node of the view: the object that pane draws (exclusive). Every pane draws from its own.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Shows;
+
+/// Which pane prefab draws an object, by its Kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneKind {
+    /// A terminal (Claude, Codex, CursorAgent, Shell, and a session of a kind the model does not know).
+    Term,
+    /// A run's or stage's output (Proc, Stage).
+    Run,
+    /// A group's runs (Group).
+    Group,
+}
+
+/// The pane kind for `e`. A session whose kind the daemon named something unknown is `(Kind, Proc)` too, but it is a
+/// terminal: Proc picks the run pane only for a run.
+#[must_use]
+pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
+    let w = e.world();
+    let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
+    if k == *w.component_id::<Group>() {
+        PaneKind::Group
+    } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
+        PaneKind::Run
+    } else {
+        PaneKind::Term
+    }
+}
 
 /// An attached object's terminal: its grid in cells, how many rows it is scrolled back, and a count that moves whenever
 /// its screen changed (what the view redraws on).
@@ -221,7 +252,8 @@ pub fn register(world: &World) {
     world.component::<Collapsed>();
     world.component::<Archived>();
     world.component::<GroupKey>().writable();
-    world.component::<Viewing>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
+    world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
+    world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
     world.component::<Inbox>().writable();
     world.set(Inbox::default());
@@ -797,7 +829,27 @@ pub fn toggle_fold(world: WorldRef<'_>, parent: u64) {
 /// The selected object, if any.
 #[must_use]
 pub fn selected(world: WorldRef<'_>) -> Option<EntityView<'_>> {
-    world.lookup(APP).target(Viewing::id(), 0).filter(|e| e.is_alive())
+    world.lookup(APP).target(Selected::id(), 0).filter(|e| e.is_alive())
+}
+
+/// What pane node `pane` shows, if anything.
+#[must_use]
+pub fn shows(world: WorldRef<'_>, pane: u64) -> Option<EntityView<'_>> {
+    world.entity_from_id(pane).target(Shows::id(), 0).filter(|e| e.is_alive())
+}
+
+/// Point pane node `pane` at `obj` (or at nothing).
+pub fn show(world: WorldRef<'_>, pane: u64, obj: Option<u64>) {
+    let p = world.entity_from_id(pane);
+    match obj {
+        Some(o) if p.target(Shows::id(), 0).is_none_or(|t| *t.id() != o) => {
+            p.add((Shows::id(), o));
+        }
+        None if p.target(Shows::id(), 0).is_some() => {
+            p.remove((Shows::id(), flecs::Wildcard::ID));
+        }
+        _ => {}
+    }
 }
 
 /// Select `obj` (or nothing).
@@ -805,10 +857,10 @@ pub fn select(world: WorldRef<'_>, obj: Option<u64>) {
     let app = world.lookup(APP);
     match obj {
         Some(o) => {
-            app.add((Viewing::id(), o));
+            app.add((Selected::id(), o));
         }
         None => {
-            app.remove((Viewing::id(), flecs::Wildcard::ID));
+            app.remove((Selected::id(), flecs::Wildcard::ID));
         }
     }
 }

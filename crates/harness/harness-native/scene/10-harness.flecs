@@ -21,6 +21,12 @@ prefab hn.TitleBar : ui.Row {
     Fill: $tone_term_ink
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
   }
+  // The shown object's directory and state, muted after its name (src/app.rs); dimmed with the title while the window is
+  // not key.
+  sub : ui.Words {
+    Fill: $tone_term_muted
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
 }
 
 // The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
@@ -76,14 +82,12 @@ prefab hn.ArchiveRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
     HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
   }
-  name : ui.Words, Muted {
-    OneLine
+  name : ui.Line, Muted {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
   // The count pulses when an object is archived.
-  count : ui.Words, Faint {
-    OneLine
+  count : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
   }
@@ -106,8 +110,7 @@ prefab hn.Badge : ui.Row {
   Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
   Padding: {l: 0, r: 0, t: 0, b: 0}
-  code : ui.Words {
-    OneLine
+  code : ui.Line {
     Fill: $tone_failed
     TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
   }
@@ -119,14 +122,12 @@ prefab hn.DeviceRow : ui.Row {
   Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  name : ui.Words, Faint {
-    OneLine
+  name : ui.Line, Faint {
     TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
   }
   dot : hn.Dot {}
   spacer : ui.Spacer {}
-  count : ui.Words, Faint {
-    OneLine
+  count : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -149,13 +150,11 @@ prefab hn.ObjRow : ui.Row {
   glyph : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Ink {
-    OneLine
+  name : ui.Line, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
-    OneLine
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   badge : hn.Badge {}
@@ -180,13 +179,11 @@ prefab hn.RunRow : ui.Row {
   glyph : ui.Symbol, Faint {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Muted {
-    OneLine
+  name : ui.Line, Muted {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
-    OneLine
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -209,13 +206,11 @@ prefab hn.GroupRow : ui.Row {
   glyph : ui.Symbol, Muted {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Ink {
-    OneLine
+  name : ui.Line, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
-    OneLine
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   chevron : ui.Symbol, Faint {
@@ -240,27 +235,111 @@ prefab hn.MoreRow : ui.Row {
   glyph : ui.Node {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  name : ui.Words, Faint {
-    OneLine
+  name : ui.Line, Faint {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
 }
 
-// The main card: the selected object's terminal, an opaque plate in the terminal's ground from the window's top edge to
-// its right and bottom edges (the window's corners round it). The title-bar strip lies over its top (the host pads the
-// card down by the strip's height); a soft shadow on its left is the seam with the sidebar.
-prefab hn.Main : ui.Column, Plate {
+// The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
+// bottom edges (the window's corners round it). The title-bar strip lies over its top (the host pads the card down by
+// the strip's height); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
+// per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
+// a split is a second node.
+prefab hn.Main : ui.Row, Plate {
   Fill: $tone_term_ground
   Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
   Shape: {radius: 0, n: 4, border: 0, feather: 0}
   Lift: {blur: $seam_blur, alpha: $seam_alpha, dy: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+}
+
+// A pane: clear on the card's terminal ground, no header (the title bar names what it shows).
+prefab hn.Pane : ui.Column {
+  PaneNode
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-  // No header: the title bar names the object.
-  // The terminal: drawn by the host into this node's rect (src/term.rs), where its clear plate comes in paint order.
-  term : ui.Node {
-    Fill: $tone_clear
+}
+
+// The terminal primitive: the host draws its grid into this node's rect (src/term.rs) from its own components
+// (TermGrid, TermCursor, TermSelection, TermScroll, MarkedText, TermFocus; src/pane.rs). Its cells are GPU instances,
+// not entities.
+prefab hn.Terminal : ui.Node {
+  TermNode
+  Fill: $tone_clear
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+}
+
+// A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane.
+prefab hn.TermPane : hn.Pane {
+  term : hn.Terminal {}
+}
+
+// A run or a stage (Proc, Stage): a few lines of what it is (its command; how it ended, how long it ran, where), its
+// stages as rows, then its output, stdout and stderr in the order they were written, stderr tinted. Part of the body,
+// in its margins, not a header row.
+prefab hn.RunPane : hn.Pane {
+  info : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 18, r: 18, t: 16, b: 0}
+    cmd : ui.Words, Strong {
+      TextStyle: {size: $size_body, line: 18, role: 9, bold: 0}
+    }
+    meta : ui.Words, Muted {
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    }
+    stages : ui.List {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    }
+  }
+  term : hn.Terminal {}
+}
+
+// A group of runs (REPL runs, other runs): its name and count, then its runs, newest first.
+prefab hn.GroupPane : hn.Pane {
+  info : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 18, r: 18, t: 16, b: 10}
+    name : ui.Words, Strong {
+      TextStyle: {size: $size_body, line: 18, role: 0, bold: 1}
+    }
+    meta : ui.Words, Muted {
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    }
+  }
+  runs : ui.List {
+    Clip
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 10, r: 10, t: 0, b: 10}
+  }
+}
+
+// A row of a pane's list (a run's stages, a group's runs): status dot, its id, its command in the code face, and on the
+// right how it ended and how long it ran. Pressed, it selects that run or stage.
+prefab hn.PaneRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+  Padding: {l: 8, r: 8, t: 0, b: 0}
+  dot : hn.Dot {}
+  id : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+  }
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  meta : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
 

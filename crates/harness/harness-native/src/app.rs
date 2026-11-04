@@ -9,6 +9,7 @@ use crate::draw::{ATLAS_SIZE, Draw};
 use crate::link::Link;
 use crate::pack::{Frame, GlyphInst, PanelInst};
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
+use crate::pane::TermNode;
 use harness_vt::MouseTracking;
 use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
 use harness_native_api::spring::{Spring, Tune};
@@ -27,6 +28,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+mod panes;
+
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 const TOKENS: &str = include_str!("../scene/00-tokens.flecs");
@@ -40,15 +43,6 @@ const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
 
 pub use crate::term::Mods as KeyMods;
-
-/// What a press-and-drag selects by: cells, words (double click) or lines (triple click).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Unit {
-    #[default]
-    Cell,
-    Word,
-    Line,
-}
 
 /// What a palette entry does.
 #[derive(Clone, Debug)]
@@ -68,15 +62,16 @@ struct Palette {
 struct Ids {
     tree: u64,
     device: u64,
+    /// `hn.Main`: the row of pane nodes.
     main: u64,
-    term: u64,
     /// The Archive pinned to the sidebar's bottom: its list of objects and its row.
     archive_list: u64,
     archive_row: u64,
     palette: Option<u64>,
-    /// The title-bar strip's root (`hn.TitleBar`) and its label.
+    /// The title-bar strip's root (`hn.TitleBar`), its label and the muted words after it.
     bar: u64,
     bar_title: u64,
+    bar_sub: u64,
 }
 
 /// The window's title-bar strip as AppKit lays it out, in points: how tall it is (0 in fullscreen, where it is hidden)
@@ -114,14 +109,16 @@ pub struct App {
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
-    /// The run or stage entity whose output the link follows.
-    watching: Option<u64>,
+    /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
+    watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
     side_w: Option<f32>,
     /// Dragging the sidebar's edge.
     resizing: bool,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
+    /// A group of runs to select once the runs make it, by its key (`repl:<id>`, `other`).
+    pending_group: Option<String>,
     link: Link,
     grid: Grid,
     zoom: usize,
@@ -131,31 +128,10 @@ pub struct App {
     /// Frames to draw before the window may stop: anything that changed asks for a few, so layout settles.
     pending: u32,
     palette: Option<Palette>,
-    /// The terminal's rectangle (layout points), from the last frame.
-    term_rect: Option<[f32; 4]>,
-    sel: Option<Sel>,
-    selecting: bool,
-    /// The unit a drag selects by, and the span the press selected (a drag keeps it whole).
-    unit: Unit,
-    anchor: ((i64, u16), (i64, u16)),
-    /// The program's mouse button held down (its mouse mode is on), and the cell last reported.
-    report: Option<Button>,
-    reported: Option<(u16, u16)>,
-    /// Wheel lines not yet sent as keys or reports.
-    wheel: f32,
-    /// The fraction of a row scrolled back past the model's whole rows (smooth trackpad scrolling).
-    scroll_frac: f32,
-    /// Where the last frame drew the grid's first row (layout points; above the pane when a fraction of a row is
-    /// scrolled) and how many rows back that viewport was.
-    term_top: f32,
-    term_shift: i64,
-    /// The keyboard encoder, and the terminal modes and sizes input reads (from the last snapshot).
+    /// The keyboard encoder (set from the focused terminal's `TermInput` before each key).
     keys: term::Keys,
-    input: term::Input,
     /// Keys whose press went to the program, so it hears their releases (kitty's event types).
     pressed: Vec<u16>,
-    /// An input method's uncommitted text, drawn at the cursor.
-    marked: Option<String>,
     /// Session ids attached since launch: an ended one is attached again only when it is still running.
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
@@ -242,6 +218,7 @@ impl App {
         harness_native_ui_prims::register(&world);
         harness_native_api::register(&world);
         model::register(&world);
+        crate::pane::register(&world);
         crate::look::register(&world);
         world.component::<HoverLift>().writable();
         world.component::<Bump>();
@@ -301,11 +278,12 @@ impl App {
                 p.set(Bump::default());
             }
         }
+        // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         let main = root.child("hn.Main");
-        let term = main.part("term").map_or(0, View::id);
         let bar = View::root(w, "hn.TitleBar");
         let bar_title = bar.part("title").map_or(0, View::id);
-        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, archive_list: archive_list.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title };
+        let bar_sub = bar.part("sub").map_or(0, View::id);
+        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_list: archive_list.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
         Ok(Self {
@@ -315,8 +293,9 @@ impl App {
             layouts: HashMap::new(),
             terms,
             run_terms,
-            watching: None,
+            watching: HashMap::new(),
             pending_run: None,
+            pending_group: None,
             side_w,
             resizing: false,
             link,
@@ -327,21 +306,8 @@ impl App {
             time: 0.0,
             pending: 4,
             palette: None,
-            term_rect: None,
-            sel: None,
-            selecting: false,
-            unit: Unit::Cell,
-            anchor: ((0, 0), (0, 0)),
-            report: None,
-            reported: None,
-            wheel: 0.0,
-            scroll_frac: 0.0,
-            term_top: 0.0,
-            term_shift: 0,
             keys: term::Keys::new(),
-            input: term::Input::default(),
             pressed: Vec::new(),
-            marked: None,
             tried: HashMap::new(),
             spawned: Arc::default(),
             restore: Some(crate::prefs::get("selected").and_then(|v| v.as_u64())),
@@ -470,11 +436,13 @@ impl App {
 
     fn select(&mut self, e: Option<u64>) {
         if e != self.selected() {
-            self.sel = None;
-            self.scroll_frac = 0.0;
-            self.report = None;
+            self.reset_focused_term();
             self.pressed.clear();
             model::select(self.world.world_ref(), e);
+            // The focused pane follows the selection.
+            if let Some(p) = self.focused_pane() {
+                model::show(self.world.world_ref(), p, e);
+            }
         }
         self.poke();
     }
@@ -506,6 +474,18 @@ impl App {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
+            }
+        }
+        if let Some(key) = self.pending_group.clone() {
+            let mut found = None;
+            self.world.new_query::<&model::GroupKey>().each_entity(|e, g| {
+                if g.s.as_str() == key {
+                    found = Some(*e.id());
+                }
+            });
+            if found.is_some() {
+                model::select(w, found);
+                self.pending_group = None;
             }
         }
         if let Some((n, k)) = self.pending_run {
@@ -597,8 +577,10 @@ impl App {
             };
             let o = w.entity_from_id(e);
             if model::is_group(w, e) {
-                // A group of runs without a listed session: pressing it folds it.
-                row.action(&format!("collapse:{e}"));
+                // A group of runs without a listed session: pressing it shows it (its runs in a group pane); pressing it
+                // again folds it.
+                row.action(&format!("group:{e}"));
+                set_if(row, if sel == Some(e) { chosen } else { clear });
                 indent(row, depth);
                 let open = !o.has(model::Collapsed::id());
                 if let Some(p) = row.part("glyph") {
@@ -638,7 +620,7 @@ impl App {
             }
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             if let Some(p) = row.part("name") {
-                // One line (the part is `OneLine`: drawing cuts it with an ellipsis to the room its row leaves it).
+                // One line: the part is a ui.Line, cut with an ellipsis to the room its row leaves it when drawn.
                 p.text(&name.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             if run.is_some()
@@ -649,72 +631,69 @@ impl App {
                 crate::look::hover_show(p.entity(), row.id(), failed || matches!(status, "lost" | "pending" | "skipped"));
             }
         });
+        self.sync_panes();
+        self.sync_title();
+        self.sync_archive();
+        self.sync_palette();
+        self.save_selected();
+    }
+
+    /// The title bar and the window title from the selected object (what the focused pane shows): its name, then its
+    /// directory and state as muted words after it; both dimmed while the window is not key.
+    fn sync_title(&mut self) {
         let w = self.world.world_ref();
-        // The window title from the selected object; the main card's header parts are written only when the scene has
-        // them (hn.Main has no head row now).
-        let main = View::of(w.entity_from_id(self.ids.main));
-        let head = main.part("head");
-        let part = |n: &str| head.and_then(|h| h.part(n));
-        let (glyph, title, sub, state, dot, window) = match sel.map(|e| w.entity_from_id(e)) {
+        let sel = self.selected();
+        let (title, sub) = match sel.map(|e| w.entity_from_id(e)) {
             Some(o) => {
+                let e = *o.id();
                 let kind = model::kind_name(o);
                 let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let t = o.try_cloned::<&model::Title>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let cwd = o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
-                // The program-set title (OSC 0/2) is kept on the entity but never names anything: agents' titles are
-                // spinner frames and "Claude Code", so only a shell's title shows, as the header's dim secondary text.
-                let sub = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
-                let e = *o.id();
-                let state = match (self.run_of(e), self.status_of(e), code) {
-                    (Some(_), s, c) => {
-                        let s = if s == "exited" { format!("exited {}", c.unwrap_or(0)) } else { s.to_owned() };
-                        match self.run_took(e) {
-                            Some(t) if s != "pending" && s != "skipped" => format!("{s} \u{00B7} {t}"),
-                            _ => s,
-                        }
-                    }
-                    (None, "exited", Some(c)) => format!("exited {c}"),
-                    (None, s, _) => s.to_owned(),
-                };
-                let (glyph, title, sub) = match self.run_of(e) {
-                    // A run: its id and command (one line), its directory under it.
-                    Some((n, stage)) => {
+                let join = |v: Vec<String>| v.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  ");
+                match (self.run_of(e), model::pane_kind(o)) {
+                    // A run: its id and command (one line), then where and how it stands.
+                    (Some((n, stage)), _) => {
                         let id = stage.map_or(format!("r{n}"), |k| format!("r{n}.{k}"));
                         let cmd = name.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let cwd = o.try_cloned::<&model::Cwd>().or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>())).map(|c| tilde(c.s.as_str())).unwrap_or_default();
-                        ("$", clip_text(&format!("{id}  {cmd}"), 70), cwd)
+                        (format!("{id}  {cmd}"), join(vec![self.run_cwd(e), self.run_state(e)]))
                     }
-                    None => (kind_glyph(kind), name.clone(), sub),
-                };
-                let window = format!("{} \u{2014} harness", clip_text(&title, 60));
-                (glyph, title, clip_text(&sub, 70), state, self.dot_tone(e), window)
+                    (None, model::PaneKind::Group) => {
+                        let n = model::run_count(w, e);
+                        (name, format!("{n} run{}", if n == 1 { "" } else { "s" }))
+                    }
+                    _ => {
+                        // The program-set title (OSC 0/2) never names anything (agents' titles are spinner frames and
+                        // "Claude Code"): only a shell's shows, in place of its directory.
+                        let place = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
+                        let state = match (self.status_of(e), code) {
+                            ("exited", Some(c)) => format!("exited {c}"),
+                            (s, _) => s.to_owned(),
+                        };
+                        (name, join(vec![place, state]))
+                    }
+                }
             }
-            None => ("", "No objects".to_owned(), "\u{2318}T new claude   \u{2318}\u{21E7}T new codex   \u{2318}K palette".to_owned(), String::new(), tone(w, "exited"), "harness".to_owned()),
+            None => ("harness".to_owned(), String::new()),
         };
-        if let Some(p) = part("glyph") {
-            p.text(glyph);
+        self.title = if sel.is_some() { format!("{} \u{2014} harness", clip_text(&title, 60)) } else { "harness".to_owned() };
+        // The prefab's ink while the window is key, at half its alpha while it is not.
+        let focused = self.focused;
+        let ink = |part: &str| {
+            let mut f = view::prefab(w, "hn.TitleBar").and_then(|p| p.lookup_child(part)).and_then(|c| c.try_cloned::<&Fill>()).unwrap_or_default();
+            if !focused {
+                f.dark.a *= 0.5;
+                f.light.a *= 0.5;
+            }
+            f
+        };
+        for (id, text, part) in [(self.ids.bar_title, clip_text(&title, 80), "title"), (self.ids.bar_sub, clip_text(&sub, 90), "sub")] {
+            if id != 0 {
+                let v = View::of(w.entity_from_id(id)).text(&text);
+                set_if(v, ink(part));
+            }
         }
-        if let Some(p) = part("title") {
-            p.text(&title);
-        }
-        if let Some(p) = part("sub") {
-            p.text(&sub);
-        }
-        if let Some(p) = part("state") {
-            p.text(&state);
-        }
-        if let Some(p) = part("dot") {
-            set_if(p, dot);
-        }
-        self.title = window;
-        if self.ids.bar_title != 0 {
-            let t = if sel.is_some() { clip_text(&title, 80) } else { "harness".to_owned() };
-            View::of(w.entity_from_id(self.ids.bar_title)).text(&t);
-        }
-        self.sync_archive();
-        self.sync_palette();
-        self.save_selected();
     }
 
     /// Write the selected object's session id to native.json when it changed.
@@ -1006,7 +985,7 @@ impl App {
         if self.world.try_get::<&Clock>(|c| c.moving).unwrap_or(false) {
             self.poke();
         }
-        self.sync_term();
+        self.sync_terms();
         let mut d = Draw {
             frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: f32::from(u8::from(self.dark)), live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0; 4] },
             // Clear: the window's vibrancy shows through everywhere the scene paints nothing.
@@ -1049,8 +1028,8 @@ impl App {
         }
         self.chrome_laid = Some((self.chrome, z, width));
         let top = self.chrome.strip / z;
-        // The sidebar keeps its open width (its rows never relayout mid-fold); its clip takes the spring's width and
-        // slides it left by the part folded away.
+        // The sidebar keeps its open width (its rows never relayout mid-fold); its clip (hn.SideClip) takes the
+        // spring's width and slides it left by the part folded away.
         if let Some(side) = w.entity_from_id(self.ids.device).parent() {
             let mut size = side.try_cloned::<&Size>().unwrap_or(full);
             size.w = Sizing::fixed(open);
@@ -1179,8 +1158,12 @@ impl App {
             self.poke();
             if let Some(e) = a.strip_prefix("select:").and_then(|s| s.parse().ok()) {
                 self.select(Some(e));
-            } else if let Some(g) = a.strip_prefix("collapse:").and_then(|s| s.parse().ok()) {
-                model::toggle_collapse(self.world.world_ref(), g);
+            } else if let Some(g) = a.strip_prefix("group:").and_then(|s| s.parse().ok()) {
+                if self.selected() == Some(g) {
+                    model::toggle_collapse(self.world.world_ref(), g);
+                } else {
+                    self.select(Some(g));
+                }
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
             } else if a == "archive:toggle" {
@@ -1206,104 +1189,6 @@ impl App {
         self.poke();
     }
 
-    // ---- the terminal ----
-
-    /// Attach the selected object's terminal, and keep its grid the size of the pane.
-    fn sync_term(&mut self) {
-        let Some(e) = self.selected() else { return };
-        if self.watching.is_some_and(|w| w != e) {
-            // Another object took the pane: stop following the run it showed.
-            self.link.unwatch_run();
-            if let Some(w) = self.watching.take() {
-                self.run_terms.borrow_mut().remove(&w);
-            }
-        }
-        let laid = self.world.entity_from_id(self.ids.term).try_cloned::<&Laid>();
-        let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { return };
-        // Fit the grid inside the padding, then split what is left of a cell evenly into the padding on both sides
-        // (Ghostty's window-padding-balance), snapped to whole device pixels so every cell starts on one.
-        let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
-        let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
-        let snap = |v: f32| (v * self.grid.scale).floor() / self.grid.scale;
-        let rect = [snap(l.x + (l.w - gw) * 0.5), snap(l.y + (l.h - gh) * 0.5), gw, gh];
-        self.term_rect = Some(rect);
-        let o = self.world.entity_from_id(e);
-        if let Some((n, stage)) = self.run_of(e) {
-            // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
-            if self.watching != Some(e) {
-                self.watching = Some(e);
-                self.run_terms.borrow_mut().remove(&e);
-                o.set(model::Term { cols, rows, scroll: 0, seq: 0 });
-                self.link.watch_run(n, stage);
-                return;
-            }
-            if let Some(mut t) = o.try_cloned::<&model::Term>().filter(|t| (t.cols, t.rows) != (cols, rows)) {
-                t.cols = cols;
-                t.rows = rows;
-                o.set(t);
-                if let Some(p) = self.run_terms.borrow_mut().get_mut(&e) {
-                    p.resize(cols, rows);
-                }
-            }
-            return;
-        }
-        let Some(sid) = self.session_of(e) else { return };
-        let running = self.status_of(e) == "running";
-        // Attach when it is not: a running object again a second after its last try, an ended one once (its last screen).
-        let last = self.tried.get(&sid).copied();
-        let due = if running { last.is_none_or(|t| self.time - t > 1.0) } else { last.is_none() };
-        if !self.link.attached(sid) && due {
-            self.tried.insert(sid, self.time);
-            // A fresh parser for the snapshot the attach starts with.
-            self.terms.borrow_mut().remove(&sid);
-            o.set(model::Term { cols, rows, scroll: 0, seq: 0 });
-            self.link.attach(sid, cols, rows);
-            return;
-        }
-        let Some(mut t) = o.try_cloned::<&model::Term>() else { return };
-        if (t.cols, t.rows) != (cols, rows) {
-            t.cols = cols;
-            t.rows = rows;
-            o.set(t);
-            if let Some(p) = self.terms.borrow_mut().get_mut(&sid) {
-                p.resize(cols, rows);
-            }
-            self.link.resize(sid, cols, rows);
-        }
-    }
-
-    /// The selected object's parser map and key in it: a session's by its id, a run's or stage's by its entity.
-    fn parser_key(&self) -> Option<(&model::Terms, u64)> {
-        let e = self.selected()?;
-        match self.session_of(e) {
-            Some(sid) => Some((&self.terms, sid)),
-            None => self.run_of(e).map(|_| (&self.run_terms, e)),
-        }
-    }
-
-    fn with_parser<R>(&self, f: impl FnOnce(&mut harness_vt::Term, u64) -> R) -> Option<R> {
-        let (terms, key) = self.parser_key()?;
-        let mut map = terms.borrow_mut();
-        map.get_mut(&key).map(|p| f(p, key))
-    }
-
-    fn scroll(&self) -> usize {
-        self.selected().and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Term>()).map_or(0, |t| t.scroll as usize)
-    }
-
-    fn set_scroll(&mut self, s: usize) {
-        if let Some(e) = self.selected() {
-            let o = self.world.entity_from_id(e);
-            if let Some(mut t) = o.try_cloned::<&model::Term>() {
-                if t.scroll as usize != s {
-                    t.scroll = s as u32;
-                    o.set(t);
-                }
-            }
-        }
-        self.poke();
-    }
-
     // ---- drawing ----
 
     fn emit(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
@@ -1321,7 +1206,8 @@ impl App {
             let Some(laid) = e.try_cloned::<&Laid>() else { continue };
             // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
             p.alpha *= crate::look::alpha(w, e, lo);
-            if p.alpha <= 0.002 && id != self.ids.term {
+            let is_term = e.has(TermNode::id());
+            if p.alpha <= 0.002 && !is_term {
                 continue;
             }
             if p.clipped && (p.clip_w <= 0.0 || p.clip_h <= 0.0) {
@@ -1369,8 +1255,8 @@ impl App {
                     if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held == Some(id)) {
                         d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                     }
-                    if id == self.ids.term {
-                        self.emit_term(d, sc, upload);
+                    if is_term {
+                        self.emit_term(id, d, sc, upload);
                     }
                 }
                 PaintKind::Glyphs => {
@@ -1431,381 +1317,6 @@ impl App {
         }
     }
 
-    fn emit_term(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
-        let Some(rect) = self.term_rect else { return };
-        let Some((terms, key)) = self.parser_key() else { return };
-        let terms = terms.clone();
-        // A fraction of a row back: the viewport one row further back, lifted by what is left of that row.
-        let want = self.scroll() + usize::from(self.scroll_frac > 0.0);
-        let mut map = terms.borrow_mut();
-        let Some(parser) = map.get_mut(&key) else { return };
-        parser.set_scrollback(want);
-        let shown = parser.scrollback();
-        let snap = term::snapshot(parser, &term::DARK);
-        parser.set_scrollback(0);
-        drop(map);
-        let lift = if self.scroll_frac > 0.0 && shown == want { (1.0 - self.scroll_frac) * self.grid.ch } else { 0.0 };
-        self.input = snap.input;
-        self.term_top = rect[1] - lift;
-        self.term_shift = shown as i64;
-        let (np, ng) = (d.panels.len(), d.glyphs.len());
-        let paint = term::Paint {
-            origin: (rect[0], self.term_top),
-            scale: sc,
-            focused: self.focused && self.palette.is_none(),
-            sel: self.sel,
-            scroll: shown,
-            theme: &term::DARK,
-            time: self.time,
-            marked: self.marked.as_deref(),
-        };
-        term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
-        if lift > 0.0 {
-            let band = [rect[1], rect[1] + rect[3]];
-            for p in &mut d.panels[np..] {
-                p.clip[..2].copy_from_slice(&band);
-            }
-            for g in &mut d.glyphs[ng..] {
-                g.clip[..2].copy_from_slice(&band);
-            }
-        }
-        if self.grid.animating {
-            // The cursor fades on the app clock: keep drawing.
-            self.poke();
-        }
-    }
-
-    // ---- input ----
-
-    fn set_pointer(&mut self, x: f32, y: f32) {
-        let z = self.zoom();
-        self.pointer.x = x / z;
-        self.pointer.y = y / z;
-    }
-
-    /// The viewport cell under the pointer (row, column), clamped to the grid when `clamp`, else only within the pane.
-    fn pointer_cell(&self, clamp: bool) -> Option<(i64, u16)> {
-        let r = self.term_rect?;
-        let (x, y) = (self.pointer.x, self.pointer.y);
-        if !clamp && (x < r[0] - 4.0 || y < r[1] - 4.0 || x > r[0] + r[2] + 4.0 || y > r[1] + r[3] + 4.0) {
-            return None;
-        }
-        let (cols, rows) = self.input.size;
-        let col = ((x - r[0]) / self.grid.cw).floor().clamp(0.0, f32::from(cols.max(1) - 1)) as u16;
-        let row = ((y - self.term_top) / self.grid.ch).floor().clamp(0.0, f32::from(rows.max(1) - 1)) as i64;
-        Some((row, col))
-    }
-
-    /// The pointer's cell as a mouse report addresses it (viewport column and row).
-    fn report_cell(&self) -> Option<(u16, u16)> {
-        self.pointer_cell(true).map(|(r, c)| (c, r as u16))
-    }
-
-    /// Whether the pointer goes to the program: it turned a mouse mode on, and Shift is not held to select instead.
-    fn reporting(&self, m: KeyMods) -> bool {
-        self.input.modes.mouse != MouseTracking::None && !m.shift && self.palette.is_none()
-    }
-
-    fn report_mouse(&mut self, b: Button, act: MouseAct, m: KeyMods) {
-        let Some((col, row)) = self.report_cell() else { return };
-        if act == MouseAct::Motion && self.reported == Some((col, row)) {
-            return;
-        }
-        self.reported = Some((col, row));
-        let bytes = term::mouse(b, act, col, row, m, &self.input.modes);
-        if !bytes.is_empty() {
-            self.send(&bytes);
-        }
-    }
-
-    /// The pointer moved to `(x, y)` (window points).
-    pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
-        self.set_pointer(x, y);
-        if self.resizing {
-            if let Some(side) = self.sidebar() {
-                let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
-                let v = (self.pointer.x - left).clamp(SIDE_MIN, SIDE_MAX).round();
-                set_side_width(side, v);
-                self.side_w = Some(v);
-            }
-            self.poke();
-            return;
-        }
-        if let Some(b) = self.report {
-            self.report_mouse(b, MouseAct::Motion, m);
-        } else if self.selecting {
-            if let Some((vr, col)) = self.pointer_cell(true) {
-                let at = (vr - self.term_shift, col);
-                let span = self.unit_span(at, self.unit);
-                let (a0, a1) = self.anchor;
-                self.sel = Some(if span.0 < a0 { Sel { a: a1, b: span.0 } } else { Sel { a: a0, b: span.1 } });
-            }
-        } else if self.input.modes.mouse == MouseTracking::Any && self.reporting(m) && self.pointer_cell(false).is_some() {
-            self.report_mouse(Button::None, MouseAct::Motion, m);
-        }
-        self.poke();
-    }
-
-    /// A button went down at `(x, y)`: the `clicks`th in a row.
-    pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
-        self.set_pointer(x, y);
-        self.poke();
-        // On the sidebar's right edge: drag it wider or narrower.
-        if b == Button::Left && self.palette.is_none() && self.side_open && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
-            if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
-                self.resizing = true;
-                return;
-            }
-        }
-        if b == Button::Left {
-            self.pointer.down = true;
-            self.pointer.went_down = true;
-        }
-        if self.palette.is_some() {
-            return;
-        }
-        let Some((vr, col)) = self.pointer_cell(false) else { return };
-        if self.reporting(m) {
-            self.sel = None;
-            self.report = Some(b);
-            self.reported = None;
-            self.report_mouse(b, MouseAct::Press, m);
-            return;
-        }
-        if b != Button::Left {
-            return;
-        }
-        if m.alt && !m.cmd {
-            self.click_move(vr, col);
-            return;
-        }
-        let at = (vr - self.term_shift, col);
-        self.unit = match clicks {
-            ..=1 => Unit::Cell,
-            2 => Unit::Word,
-            _ => Unit::Line,
-        };
-        self.anchor = self.unit_span(at, self.unit);
-        self.sel = Some(Sel { a: self.anchor.0, b: self.anchor.1 });
-        self.selecting = true;
-    }
-
-    pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
-        self.set_pointer(x, y);
-        if self.resizing {
-            self.resizing = false;
-            if let Some(v) = self.side_w {
-                crate::prefs::set("sidebar_width", serde_json::json!(v));
-            }
-            self.poke();
-            return;
-        }
-        if b == Button::Left {
-            self.pointer.down = false;
-            self.pointer.went_up = true;
-        }
-        if self.report == Some(b) {
-            self.report = None;
-            self.report_mouse(b, MouseAct::Release, m);
-        } else if self.selecting && b == Button::Left {
-            self.selecting = false;
-            if self.unit == Unit::Cell && self.sel.is_some_and(|s| s.a == s.b) {
-                self.sel = None;
-            }
-        }
-        self.poke();
-    }
-
-    /// Option-click: move the cursor to viewport cell `(row, col)` with arrow keys (along the line in a shell, which
-    /// wraps a long prompt; up/down then across in a full-screen program).
-    fn click_move(&mut self, row: i64, col: u16) {
-        if self.term_shift != 0 {
-            return;
-        }
-        let modes = self.input.modes;
-        let (crow, ccol) = (i64::from(self.input.cursor.0), i64::from(self.input.cursor.1));
-        let cols = i64::from(self.input.size.0);
-        let col = i64::from(col);
-        let mut out = Vec::new();
-        let mut step = |code: u16, n: i64, keys: &mut term::Keys| out.extend(keys.press(code, &modes).repeat(n.unsigned_abs() as usize));
-        if modes.alt_screen {
-            step(if row > crow { term::DOWN } else { term::UP }, row - crow, &mut self.keys);
-            step(if col > ccol { term::RIGHT } else { term::LEFT }, col - ccol, &mut self.keys);
-        } else {
-            let d = (row - crow) * cols + (col - ccol);
-            step(if d > 0 { term::RIGHT } else { term::LEFT }, d, &mut self.keys);
-        }
-        self.sel = None;
-        self.send(&out);
-    }
-
-    /// Screen row `s` (negative: history) as the terminal holds it.
-    fn row_at(&self, s: i64) -> Option<harness_vt::Row> {
-        self.with_parser(|p, _| {
-            p.set_scrollback(usize::try_from(-s).unwrap_or(0));
-            let n = p.scrollback() as i64;
-            let (rows, _) = p.rows();
-            p.set_scrollback(0);
-            usize::try_from(s + n).ok().and_then(|i| rows.into_iter().nth(i))
-        })
-        .flatten()
-    }
-
-    /// The span a press at screen cell `at` selects by `unit`: the cell, its word, or its line (soft wraps followed).
-    fn unit_span(&self, at: (i64, u16), unit: Unit) -> ((i64, u16), (i64, u16)) {
-        match unit {
-            Unit::Cell => (at, at),
-            Unit::Word => self
-                .row_at(at.0)
-                .map(|row| {
-                    let cells: Vec<&str> = row.cells.iter().map(|c| c.text.as_str()).collect();
-                    let (a, b) = term::word_span(&cells, usize::from(at.1));
-                    ((at.0, a as u16), (at.0, b as u16))
-                })
-                .unwrap_or((at, at)),
-            Unit::Line => {
-                let (mut r0, mut r1) = (at.0, at.0);
-                for _ in 0..256 {
-                    if !self.row_at(r0 - 1).is_some_and(|r| r.wrapped) {
-                        break;
-                    }
-                    r0 -= 1;
-                }
-                for _ in 0..256 {
-                    if !self.row_at(r1).is_some_and(|r| r.wrapped) {
-                        break;
-                    }
-                    r1 += 1;
-                }
-                ((r0, 0), (r1, self.input.size.0.saturating_sub(1)))
-            }
-        }
-    }
-
-    /// Command-A: everything, history and screen.
-    fn select_all(&mut self) {
-        let (cols, rows) = self.input.size;
-        if rows == 0 {
-            return;
-        }
-        self.unit = Unit::Cell;
-        self.sel = Some(Sel { a: (-(self.input.history as i64), 0), b: (i64::from(rows) - 1, cols.saturating_sub(1)) });
-    }
-
-    /// A scroll of `dy` (points when `precise`, else lines; positive: back into the history). The primary screen
-    /// scrolls its history by the pixel; a program with a mouse mode gets wheel reports, a full-screen one arrows.
-    pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
-        let lines = if precise { dy / self.grid.ch } else { dy };
-        let modes = self.input.modes;
-        let report = self.reporting(m);
-        if report || modes.alt_screen {
-            self.wheel += lines;
-            let n = self.wheel.trunc();
-            if n == 0.0 {
-                return;
-            }
-            self.wheel -= n;
-            let count = n.abs() as usize;
-            let bytes = if report {
-                let (col, row) = self.report_cell().unwrap_or((0, 0));
-                term::mouse(if n > 0.0 { Button::WheelUp } else { Button::WheelDown }, MouseAct::Press, col, row, m, &modes).repeat(count)
-            } else {
-                self.keys.press(if n > 0.0 { term::UP } else { term::DOWN }, &modes).repeat(count)
-            };
-            self.send(&bytes);
-            return;
-        }
-        let max = self.input.history as f32;
-        let s = (self.scroll() as f32 + self.scroll_frac + lines).clamp(0.0, max);
-        let s = if precise { s } else { s.round() };
-        let whole = s.floor();
-        self.scroll_frac = s - whole;
-        self.set_scroll(whole as usize);
-    }
-
-    fn to_bottom(&mut self) {
-        self.scroll_frac = 0.0;
-        self.set_scroll(0);
-    }
-
-    fn send(&mut self, bytes: &[u8]) {
-        if let Some(sid) = self.selected().and_then(|e| self.session_of(e)) {
-            self.link.input(sid, bytes);
-        }
-    }
-
-    /// A key: into the palette when it is open, else natural text editing or the program's own encoding.
-    pub fn key(&mut self, k: &term::KeyIn<'_>) {
-        self.poke();
-        if self.palette.is_some() {
-            if k.action != KeyAction::Release {
-                self.palette_key(k.code, k.text);
-            }
-            return;
-        }
-        if k.action == KeyAction::Release {
-            // Only keys whose press the program heard; the encoder sends nothing unless kitty's event types are on.
-            if let Some(i) = self.pressed.iter().position(|&c| c == k.code) {
-                self.pressed.swap_remove(i);
-                let bytes = self.keys.encode(k, &self.input.modes);
-                self.send(&bytes);
-            }
-            return;
-        }
-        if let Some(bytes) = term::natural_edit(k.code, k.unshifted, k.mods) {
-            self.sel = None;
-            self.to_bottom();
-            self.send(bytes);
-            return;
-        }
-        let bytes = self.keys.encode(k, &self.input.modes);
-        if bytes.is_empty() {
-            return;
-        }
-        if !self.pressed.contains(&k.code) {
-            self.pressed.push(k.code);
-        }
-        self.sel = None;
-        self.to_bottom();
-        self.send(&bytes);
-    }
-
-    /// Text an input method, the emoji picker or dictation committed: sent as typed.
-    pub fn commit_text(&mut self, text: &str) {
-        self.marked = None;
-        self.poke();
-        if let Some(p) = self.palette.as_mut() {
-            p.query.push_str(text);
-            p.at = 0;
-            return;
-        }
-        self.sel = None;
-        self.to_bottom();
-        self.send(text.as_bytes());
-    }
-
-    /// An input method's uncommitted text (None: none).
-    pub fn set_marked(&mut self, text: Option<String>) {
-        self.marked = text.filter(|t| !t.is_empty());
-        self.poke();
-    }
-
-    pub fn marked(&self) -> Option<&str> {
-        self.marked.as_deref()
-    }
-
-    /// Where typed text goes (window points): the cell after the cursor and any marked text, for the input method's
-    /// candidate window.
-    pub fn caret_rect(&self) -> Option<[f32; 4]> {
-        let rect = self.term_rect?;
-        let (r, c) = self.input.cursor;
-        let z = self.zoom();
-        let col = f32::from(c) + self.marked.as_deref().map_or(0, term::columns) as f32;
-        let x = rect[0] + col * self.grid.cw;
-        let y = self.term_top + (i64::from(r) + self.term_shift) as f32 * self.grid.ch;
-        Some([x * z, y * z, self.grid.cw * z, self.grid.ch * z])
-    }
-
     fn palette_key(&mut self, code: u16, chars: &str) {
         let n = self.entries().len();
         let Some(p) = self.palette.as_mut() else { return };
@@ -1840,8 +1351,7 @@ impl App {
         if self.palette.is_none()
             && let Some(bytes) = term::natural_edit(code, key.chars().next(), m)
         {
-            self.sel = None;
-            self.to_bottom();
+            self.typed();
             self.send(bytes);
             return true;
         }
@@ -1915,7 +1425,7 @@ impl App {
 
     fn spawn(&mut self, kind: &'static str) {
         let cwd = self.selected().and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>()).map(|c| c.s.as_str().to_owned()).filter(|c| !c.is_empty()).or_else(|| std::env::var("HOME").ok());
-        let (cols, rows) = self.term_rect.map_or((120, 40), |r| self.grid.fit(r[2], r[3]));
+        let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();
         self.link.spawn(kind, cwd, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
     }
@@ -1931,25 +1441,6 @@ impl App {
         self.select(next);
     }
 
-    /// The text of the terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
-    pub fn copy(&self) -> Option<String> {
-        let sel = self.sel?;
-        self.with_parser(|p, _| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
-    }
-
-    pub fn paste(&mut self, text: &str) {
-        if self.palette.is_some() {
-            if let Some(p) = self.palette.as_mut() {
-                p.query.push_str(text.lines().next().unwrap_or(""));
-            }
-            self.poke();
-            return;
-        }
-        let bracketed = self.input.modes.bracketed_paste;
-        self.to_bottom();
-        self.send(&term::paste(text, bracketed));
-    }
-
     /// Select the object of daemon session `sid` once the list has it (the shot's `HARNESS_NATIVE_SHOT_SELECT`).
     pub fn select_session(&mut self, sid: u64) {
         *self.spawned.lock().unwrap() = Some(sid);
@@ -1958,6 +1449,11 @@ impl App {
     /// Select run `r{n}` (or its stage `k`) once the runs show it (the shot's `HARNESS_NATIVE_SHOT_SELECT=r12[.0]`).
     pub fn select_run(&mut self, n: u64, k: Option<u32>) {
         self.pending_run = Some((n, k));
+    }
+
+    /// Select the group of runs keyed `key` once the runs make it (the shot's `HARNESS_NATIVE_SHOT_SELECT=g:repl:<id>`).
+    pub fn select_group(&mut self, key: &str) {
+        self.pending_group = Some(key.to_owned());
     }
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
