@@ -1,6 +1,6 @@
 //! Component traits (Final, Singleton, (OnInstantiate, Inherit), Sparse, ...) declared safely.
 //!
-//! flecs 4.1.6 aborts the process (`flecs_assert_relation_unused`, "cannot change trait ... component is already in use") when a trait is
+//! flecs (4.1.6 and 4.2.0) aborts the process (`flecs_assert_relation_unused`, "cannot change trait ... component is already in use") when a trait is
 //! added to a component or relationship that already has instances or pairs, and (debug builds) when it is already queried. Adding a trait twice, or late, was the hazard; [`World::traits`] is the one place that adds traits:
 //!
 //! * idempotent: a trait the component already has is skipped without touching the world;
@@ -23,8 +23,8 @@ pub enum Trait {
     Inherit,
     /// `(OnInstantiate, DontInherit)`.
     DontInherit,
-    /// `(OnInstantiate, Override)`: instances copy the prefab's value (the default).
-    Override,
+    /// `(OnInstantiate, Copy)`: instances copy the prefab's value (the default; `Override` before flecs 4.2).
+    Copy,
     /// Sparse storage (stable pointers, no archetype move).
     Sparse,
     /// The relationship does not fragment tables.
@@ -99,7 +99,7 @@ impl Trait {
                 Trait::Singleton => sys::EcsSingleton,
                 Trait::Inherit => pair(sys::EcsOnInstantiate, sys::EcsInherit),
                 Trait::DontInherit => pair(sys::EcsOnInstantiate, sys::EcsDontInherit),
-                Trait::Override => pair(sys::EcsOnInstantiate, sys::EcsOverride),
+                Trait::Copy => pair(sys::EcsOnInstantiate, sys::EcsCopy),
                 Trait::Sparse => sys::EcsSparse,
                 Trait::DontFragment => sys::EcsDontFragment,
                 Trait::Exclusive => sys::EcsExclusive,
@@ -135,7 +135,7 @@ impl Trait {
             Trait::Singleton => "Singleton",
             Trait::Inherit => "(OnInstantiate, Inherit)",
             Trait::DontInherit => "(OnInstantiate, DontInherit)",
-            Trait::Override => "(OnInstantiate, Override)",
+            Trait::Copy => "(OnInstantiate, Copy)",
             Trait::Sparse => "Sparse",
             Trait::DontFragment => "DontFragment",
             Trait::Exclusive => "Exclusive",

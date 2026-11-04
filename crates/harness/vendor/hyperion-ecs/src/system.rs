@@ -54,21 +54,21 @@ impl<'a> Iter<'a> {
         self.raw.count as usize
     }
     pub fn world(&self) -> World {
-        // SAFETY: the iterator's world is the live world.
-        unsafe { World::from_raw(self.raw.real_world.cast()) }
+        // SAFETY: the iterator's world is the live world (flecs 4.2: `it->world` is the real world, `it->stage` the stage).
+        unsafe { World::from_raw(self.raw.world.cast()) }
     }
-    /// The STAGE world of the thread running this callback (`it->world`). Inside a `.threaded()` system every `ecs_*` call must go
+    /// The STAGE world of the thread running this callback (`it->stage`). Inside a `.threaded()` system every `ecs_*` call must go
     /// through this world: writes made through it are deferred into this thread's own command queue and merged at the end of the sync
     /// point; the real world ([`Iter::world`]) writes into stage 0's queue and races. Outside worker threads it is the stage of the main
     /// thread, so it is always safe to prefer. Reads through it see the main storage, not this tick's own deferred writes.
     pub fn stage(&self) -> World {
-        // SAFETY: the iterator's world is a live world or stage pointer for the duration of the callback.
-        unsafe { World::from_raw(self.raw.world.cast()) }
+        // SAFETY: the iterator's stage is a live stage pointer for the duration of the callback.
+        unsafe { World::from_raw(self.raw.stage.cast()) }
     }
     /// 0 on the main thread, 1.. on a flecs worker thread. A `.threaded()` system runs on every index in the same sync point.
     pub fn stage_id(&self) -> i32 {
         // SAFETY: valid iterator world.
-        unsafe { sys::ecs_stage_get_id(self.raw.world) }
+        unsafe { sys::ecs_stage_get_id(self.raw.stage) }
     }
     pub fn delta_time(&self) -> f32 {
         self.raw.delta_time

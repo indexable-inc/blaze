@@ -1,9 +1,11 @@
 // The primitives (docs/ui-model.md section 2): every view is a tree of instances of these prefabs. Each is made of small
 // components and says only what it adds to its base; an instance says only what differs from its prefab.
 //
-// They live in the `ui` scope (`ui.Row`, `ui.Words`) and are declared with dotted names, not inside a `ui { }` block: a
-// block would make `Text: {...}` inside `ui.Words` resolve to the prefab instead of the component. Instances write
-// `title : ui.Words { Text: {s: "Hello"} }`. Loaded after 00-tokens (it uses the tones, radii and sizes there).
+// They live in the `ui` scope (`ui.Row`, `ui.Words`), declared inside a `ui { }` block (flecs 4.2 refuses dotted names
+// in declarations). `Text: {...}` inside `ui.Words` is still the component: a world alias wins over the script's own
+// declarations (the indexable-inc/flecs fork). `@tree ChildOf` keeps the prefabs' children in ChildOf tables, as in 4.1,
+// instead of 4.2's default Parent storage for prefab scopes. Instances write `title : ui.Words { Text: {s: "Hello"} }`
+// (two statements on one line need a `;` between them). Loaded after 00-tokens (it uses the tones, radii and sizes).
 //
 // Layout (harness-native-ui-layout) reads Flex, Size, Padding, Aspect and Intrinsic and writes Laid; draw reads the looks (Fill,
 // Edge, Shape, Lift, Frost, TextStyle) and the content (Text, Icon, Picture); input reads Pressable, Focusable and
@@ -13,204 +15,212 @@
 // `value` as weight (0 counts as 1); Fixed is `value` points; Percent is `value` (0 to 1) of the parent's inner size;
 // `max` of 0 is no maximum.
 
-// The root of every primitive: a Node whose children keep their order.
-prefab ui.Node {
-  Node
-  OrderedChildren
+@tree ChildOf
+ui {
+  // The root of every primitive: a Node whose children keep their order.
+  prefab Node {
+    Node
+    OrderedChildren
+  }
+
+  // A flex container along a row.
+  prefab Row : ui.Node {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // A flex container down a column.
+  prefab Column : ui.Node {
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // Children on top of one another, each aligned inside it.
+  prefab ZStack : ui.Node {
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // Takes the room that is left, on either axis it is a child along.
+  prefab Spacer : ui.Node {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // A plate with room inside it: Fill, Edge and Shape from Plate; a place that wants a shadow or frost adds Lift or Frost.
+  prefab Box : ui.Column, Plate {
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+  }
+
+  // Words, wrapping at the width layout gives them. The ink is the Fill, so `: ui.Words, Strong` sets it.
+  prefab Words : ui.Node, Ink {
+    Text: {s: ""}
+    Intrinsic: {w: 0, h: 0, at: 0}
+    TextStyle: {size: $size_body, line: 22, role: 0, bold: 0}
+  }
+
+  // Words on one line, never wrapped: cut with an ellipsis to the width layout gives them (a sidebar row's name, a count).
+  prefab Line : ui.Words {
+    OneLine
+  }
+
+  // A row's leading words (its name): a ui.Line that gives up its room first when the row is short of it, so its counts
+  // and badges keep theirs.
+  prefab Lead : ui.Line {
+    ShrinkFirst
+  }
+
+  // A glyph of den's icon set, 16 points, in the muted ink.
+  prefab Symbol : ui.Node, Muted {
+    Icon: {glyph: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
+  // A vector mark by name (a brand's: `Mark: {name: "claude"}`), 16 points, drawn from its outline so it is crisp at every
+  // zoom, sized by its ink rather than its bounds, in its Fill (the ink unless set).
+  prefab Icon : ui.Node, Ink {
+    Mark: {name: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
+  // A picture from the media cache, square until an instance sets another Aspect or a Size.
+  prefab Image : ui.Node {
+    Picture: {handle: ""}
+    Aspect: {ratio: 1}
+  }
+
+  // A button: a Row that can be hovered, pressed and focused (Pressable brings Hoverable and Focusable), with its label and
+  // icon as child Text and Icon. `Action` names what it does when activated.
+  prefab Button : ui.Row, Wash {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Hand}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Padding: {l: 12, r: 12, t: 6, b: 6}
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  }
+
+  // An icon button: a square that hugs its one symbol, its hover and press wash on the square only (never the row it
+  // sits in), with an optional Tooltip. Children: `icon : ui.Symbol`.
+  prefab IconButton : ui.Row, Wash {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Hand}
+    AlignSelf: {align: Start}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  }
+
+  // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
+  prefab Toggle : ui.Button {
+    OnLook: {dark: $tone_switch_on.dark, light: $tone_switch_on.light}
+  }
+
+  // A text field: a Box laid along a row with an editable buffer and a placeholder (Editable brings Focusable).
+  prefab Field : ui.Box {
+    Editable: {buffer: "", caret: 0}
+    Cursor: {shape: Text}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 0, b: 0}
+    OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
+  }
+
+  // Content larger than it is shown: it clips its children and shifts them by ScrollState.
+  prefab Scroll : ui.Column {
+    Clip
+    ScrollState: {x: 0, y: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // A column whose rows are instances of a row prefab kept by key from `source` (a feature fills it).
+  prefab List : ui.Column {
+    Repeat: {source: "", key: ""}
+  }
+
+  // A floating node placed against `(AnchoredTo, node)` on its Side, flipped and clamped to stay on screen: menus, tips,
+  // hover cards, toasts, sheets. It draws in the Overlay layer, above the base.
+  prefab Overlay : ui.Column, Plate {
+    Layer: {level: Overlay}
+    Side: {edge: Bottom, dx: 0, dy: 4}
+    Padding: {l: 8, r: 8, t: 8, b: 8}
+  }
+
+  // A hairline across its container.
+  prefab Divider : ui.Node {
+    Fill: $tone_plate_line
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+
+  // A section label: small, muted, bold words.
+  prefab Label : ui.Words, Muted {
+    TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}
+  }
+
+  // ---- SwiftUI's layout vocabulary (examples in scene/examples, drawn by HARNESS_NATIVE_GALLERY=1) ----
+
+  // A table: rows are ui.GridRow, cells their children; columns as wide as their widest cell. A ui.GridColumn child (not a
+  // node) per column says its alignment and width; a child that is not a GridRow (a ui.Divider) spans every column.
+  prefab Grid : ui.Node {
+    Grid: {hgap: 12, vgap: 6, align: Start, valign: Center}
+  }
+  prefab GridRow : ui.Node {
+    GridRow
+  }
+  prefab GridColumn {
+    GridColumn: {align: Start, w: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // Adaptive columns (LazyVGrid's .adaptive): as many columns of at least `min` as fit, each at most `max` (0: no max).
+  prefab AdaptiveGrid : ui.Column {
+    GridColumns: {min: 120, max: 0}
+    Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A virtualized column (LazyVStack): `count` rows `row` tall, of which only those in view (and `overscan` more) exist,
+  // kept by harness_native_ui_view::lazy_for_each. Put it in a ui.Scroll.
+  prefab LazyColumn : ui.Column {
+    Lazy: {count: 0, row: 24, overscan: 4}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A lazy adaptive grid: GridColumns and Lazy together (rows of `row` points, as many tiles across as fit).
+  prefab LazyGrid : ui.LazyColumn {
+    GridColumns: {min: 120, max: 0}
+    Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+  }
+
+  // The first child variant that fits the width it is given (widest first); the rest are hidden.
+  prefab ViewThatFits : ui.Node {
+    ViewThatFits
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // Words on one line cut in the middle (a path), or at the start (a tail that matters).
+  prefab LineMiddle : ui.Line {
+    Truncate: {mode: Middle}
+  }
+  prefab LineHead : ui.Line {
+    Truncate: {mode: Head}
+  }
 }
 
-// A flex container along a row.
-prefab ui.Row : ui.Node {
-  Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
-}
-
-// A flex container down a column.
-prefab ui.Column : ui.Node {
-  Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
-}
-
-// Children on top of one another, each aligned inside it.
-prefab ui.ZStack : ui.Node {
-  Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
-}
-
-// Takes the room that is left, on either axis it is a child along.
-prefab ui.Spacer : ui.Node {
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-}
-
-// A plate with room inside it: Fill, Edge and Shape from Plate; a place that wants a shadow or frost adds Lift or Frost.
-prefab ui.Box : ui.Column, Plate {
-  Padding: {l: 12, r: 12, t: 12, b: 12}
-}
-
-// Words, wrapping at the width layout gives them. The ink is the Fill, so `: ui.Words, Strong` sets it.
-prefab ui.Words : ui.Node, Ink {
-  Text: {s: ""}
-  Intrinsic: {w: 0, h: 0, at: 0}
-  TextStyle: {size: $size_body, line: 22, role: 0, bold: 0}
-}
-
-// Words on one line, never wrapped: cut with an ellipsis to the width layout gives them (a sidebar row's name, a count).
-prefab ui.Line : ui.Words {
-  OneLine
-}
-
-// A row's leading words (its name): a ui.Line that gives up its room first when the row is short of it, so its counts
-// and badges keep theirs.
-prefab ui.Lead : ui.Line {
-  ShrinkFirst
-}
-
-// A glyph of den's icon set, 16 points, in the muted ink.
-prefab ui.Symbol : ui.Node, Muted {
-  Icon: {glyph: ""}
-  Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
-}
-
-// A vector mark by name (a brand's: `Mark: {name: "claude"}`), 16 points, drawn from its outline so it is crisp at every
-// zoom, sized by its ink rather than its bounds, in its Fill (the ink unless set).
-prefab ui.Icon : ui.Node, Ink {
-  Mark: {name: ""}
-  Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
-}
-
-// A picture from the media cache, square until an instance sets another Aspect or a Size.
-prefab ui.Image : ui.Node {
-  Picture: {handle: ""}
-  Aspect: {ratio: 1}
-}
-
-// A button: a Row that can be hovered, pressed and focused (Pressable brings Hoverable and Focusable), with its label and
-// icon as child Text and Icon. `Action` names what it does when activated.
-prefab ui.Button : ui.Row, Wash {
-  Pressable
-  Action: {name: ""}
-  Cursor: {shape: Hand}
-  Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
-  Padding: {l: 12, r: 12, t: 6, b: 6}
-  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-}
-
-// An icon button: a square that hugs its one symbol, its hover and press wash on the square only (never the row it
-// sits in), with an optional Tooltip. Children: `icon : ui.Symbol`.
-prefab ui.IconButton : ui.Row, Wash {
-  Pressable
-  Action: {name: ""}
-  Cursor: {shape: Hand}
-  AlignSelf: {align: Start}
-  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-  Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
-  Padding: {l: 0, r: 0, t: 0, b: 0}
-  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-}
-
-// A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
-prefab ui.Toggle : ui.Button {
-  OnLook: {dark: $tone_switch_on.dark, light: $tone_switch_on.light}
-}
-
-// A text field: a Box laid along a row with an editable buffer and a placeholder (Editable brings Focusable).
-prefab ui.Field : ui.Box {
-  Editable: {buffer: "", caret: 0}
-  Cursor: {shape: Text}
-  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
-  Padding: {l: 10, r: 10, t: 0, b: 0}
-  OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
-}
-
-// Content larger than it is shown: it clips its children and shifts them by ScrollState.
-prefab ui.Scroll : ui.Column {
-  Clip
-  ScrollState: {x: 0, y: 0}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-}
-
-// A column whose rows are instances of a row prefab kept by key from `source` (a feature fills it).
-prefab ui.List : ui.Column {
-  Repeat: {source: "", key: ""}
-}
-
-// A floating node placed against `(AnchoredTo, node)` on its Side, flipped and clamped to stay on screen: menus, tips,
-// hover cards, toasts, sheets. It draws in the Overlay layer, above the base.
-prefab ui.Overlay : ui.Column, Plate {
-  Layer: {level: Overlay}
-  Side: {edge: Bottom, dx: 0, dy: 4}
-  Padding: {l: 8, r: 8, t: 8, b: 8}
-}
-
-// A hairline across its container.
-prefab ui.Divider : ui.Node {
-  Fill: $tone_plate_line
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-}
-
-// A section label: small, muted, bold words.
-prefab ui.Label : ui.Words, Muted {
-  TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}
-}
-
-// ---- SwiftUI's layout vocabulary (examples in scene/examples, drawn by HARNESS_NATIVE_GALLERY=1) ----
-
-// A table: rows are ui.GridRow, cells their children; columns as wide as their widest cell. A ui.GridColumn child (not a
-// node) per column says its alignment and width; a child that is not a GridRow (a ui.Divider) spans every column.
-prefab ui.Grid : ui.Node {
-  Grid: {hgap: 12, vgap: 6, align: Start, valign: Center}
-}
-prefab ui.GridRow : ui.Node {
-  GridRow
-}
-prefab ui.GridColumn {
-  GridColumn: {align: Start, w: {kind: Fit, value: 0, min: 0, max: 0}}
-}
-
-// Adaptive columns (LazyVGrid's .adaptive): as many columns of at least `min` as fit, each at most `max` (0: no max).
-prefab ui.AdaptiveGrid : ui.Column {
-  GridColumns: {min: 120, max: 0}
-  Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-}
-
-// A virtualized column (LazyVStack): `count` rows `row` tall, of which only those in view (and `overscan` more) exist,
-// kept by harness_native_ui_view::lazy_for_each. Put it in a ui.Scroll.
-prefab ui.LazyColumn : ui.Column {
-  Lazy: {count: 0, row: 24, overscan: 4}
-  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-}
-
-// A lazy adaptive grid: GridColumns and Lazy together (rows of `row` points, as many tiles across as fit).
-prefab ui.LazyGrid : ui.LazyColumn {
-  GridColumns: {min: 120, max: 0}
-  Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
-}
-
-// The first child variant that fits the width it is given (widest first); the rest are hidden.
-prefab ui.ViewThatFits : ui.Node {
-  ViewThatFits
-  Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
-}
-
-// Words on one line cut in the middle (a path), or at the start (a tail that matters).
-prefab ui.LineMiddle : ui.Line {
-  Truncate: {mode: Middle}
-}
-prefab ui.LineHead : ui.Line {
-  Truncate: {mode: Head}
-}
-
-// The springs the generic motion falls back on when a node has no Motion of its own.
-prefab ui.spring.transition {
-  Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
-}
-prefab ui.spring.matched {
-  Motion: {omega: $spring_matched_omega, zeta: $spring_matched_zeta}
-}
-prefab ui.spring.layout {
-  Motion: {omega: $spring_layout_omega, zeta: $spring_layout_zeta}
+@tree ChildOf
+ui {
+  spring {
+    // The springs the generic motion falls back on when a node has no Motion of its own.
+    prefab transition {
+      Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
+    }
+    prefab matched {
+      Motion: {omega: $spring_matched_omega, zeta: $spring_matched_zeta}
+    }
+    prefab layout {
+      Motion: {omega: $spring_layout_omega, zeta: $spring_layout_zeta}
+    }
+  }
 }

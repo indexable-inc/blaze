@@ -58,7 +58,7 @@ pub trait Component: Default + Clone + 'static {}
 impl<T: Default + Clone + 'static> Component for T {}
 
 /// The most ancestors an entity may have. flecs asserts `depth < FLECS_DAG_DEPTH_MAX + 1` when it records a parent
-/// (`flecs_component_update_childof_w_depth`); measured on 4.1.6: an entity with 128 ancestors is fine, a 129th aborts.
+/// (`flecs_component_update_childof_w_depth`); measured on 4.1.6 (same limit and assert in 4.2.0): an entity with 128 ancestors is fine, a 129th aborts.
 pub const MAX_DEPTH: usize = sys::FLECS_DAG_DEPTH_MAX as usize;
 
 /// The largest alignment a component may have. flecs stores components in blocks it carves from `ecs_os_malloc`
