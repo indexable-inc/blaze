@@ -268,13 +268,15 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let precise = event.hasPreciseScrollingDeltas();
-            let dy = event.scrollingDeltaY() as f32;
+            let ev = crate::app::Wheel {
+                dx: event.scrollingDeltaX() as f32,
+                dy: event.scrollingDeltaY() as f32,
+                precise: event.hasPreciseScrollingDeltas(),
+                phase: event.phase().0 as usize,
+                momentum: event.momentumPhase().0 as usize,
+            };
             let m = mods_of(event.modifierFlags());
-            with(|st| {
-                let z = st.app.zoom();
-                st.app.wheel(if precise { dy / z } else { dy }, precise, m);
-            });
+            with(|st| st.app.scroll_wheel(ev, m));
             wake();
         }
 
@@ -695,7 +697,12 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false }));
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
-    effect.setMaterial(NSVisualEffectMaterial::Sidebar);
+    // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
+    effect.setMaterial(match std::env::var("HARNESS_NATIVE_MATERIAL").as_deref() {
+        Ok("sidebar") => NSVisualEffectMaterial::Sidebar,
+        Ok("hud") => NSVisualEffectMaterial::HUDWindow,
+        _ => NSVisualEffectMaterial::UnderWindowBackground,
+    });
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     // HARNESS_NATIVE_VIBRANCY=active: always the active material (captures of a window that never takes the keyboard).
     effect.setState(if std::env::var("HARNESS_NATIVE_VIBRANCY").as_deref() == Ok("active") { NSVisualEffectState::Active } else { NSVisualEffectState::FollowsWindowActiveState });

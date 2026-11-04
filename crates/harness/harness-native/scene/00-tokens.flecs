@@ -23,6 +23,8 @@ export const more_h = 22
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
+// A tree row's disclosure slot: the chevron's hit target, left of the row's icon.
+export const disclose_w = 18
 // The seam between the sidebar and the main card: a soft shadow off the card's left edge.
 export const seam_blur = 14
 export const seam_alpha = 0.28
@@ -48,6 +50,14 @@ export const turn_zeta = 0.78
 export const pill_omega = 32
 export const pill_zeta = 0.86
 export const sidebar_omega = 24
+// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
+export const tree_glide_omega = 22
+export const tree_fold_omega = 26
+export const tree_fold_zeta = 1
+export const tree_glide_zeta = 1
+export const tree_reveal_margin = 8
+export const tree_fade_len = 22
+export const knob_width = 6
 export const sidebar_zeta = 1
 // The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
 export const lights_omega = 26
@@ -75,10 +85,13 @@ export const tone_ink_4 = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_accent = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 
 export const tone_wash = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
-export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.045}}
+export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_select = Fill: {dark: {0.580, 0.600, 1.0, 0.16}, light: {0.369, 0.384, 0.902, 0.13}}
+export const tone_knob = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_select = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+// The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
+export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 0.75}, light: {0.965, 0.965, 0.970, 0.6}}
 // Nothing: a node that paints no fill.
 export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.

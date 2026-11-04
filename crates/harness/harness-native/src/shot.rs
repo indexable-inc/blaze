@@ -60,6 +60,9 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session).
     let mut key = std::env::var("HARNESS_NATIVE_SHOT_KEY").ok().and_then(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
+    // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t`: a trackpad swipe of `dy` points (negative: toward the end) over (x, y) from t
+    // seconds: a began, changed events over 8 frames, an ended.
+    let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL").ok().map(|s| nums(&s)).filter(|v| v.len() == 4).map(|v| (v, 0usize));
     let mut at = (0.0f32, 0.0f32);
     let (left, none) = (crate::term::Button::Left, crate::app::KeyMods::default());
     let start = Instant::now();
@@ -68,6 +71,21 @@ pub fn run(path: &str) -> Result<(), String> {
         let t = start.elapsed().as_secs_f32();
         if let Some(h) = hover.take_if(|h| t >= h[2]) {
             app.pointer_move(h[0], h[1], crate::app::KeyMods::default());
+        }
+        if let Some((v, n)) = wheel.as_mut().filter(|(v, _)| t >= v[3]) {
+            if *n == 0 {
+                app.pointer_move(v[0], v[1], none);
+            }
+            let (phase, dy) = match *n {
+                0 => (1, 0.0),
+                1..=8 => (4, v[2] / 8.0),
+                _ => (8, 0.0),
+            };
+            app.scroll_wheel(crate::app::Wheel { dx: 0.0, dy, precise: true, phase, momentum: 0 }, none);
+            *n += 1;
+            if *n > 9 {
+                wheel = None;
+            }
         }
         if let Some((k, _)) = key.take_if(|k| t >= k.1) {
             app.shortcut(&k, 0, crate::app::KeyMods { cmd: true, ..Default::default() });

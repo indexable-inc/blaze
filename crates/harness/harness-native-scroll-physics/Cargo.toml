@@ -1,0 +1,9 @@
+[package]
+name = "harness-native-scroll-physics"
+description = "macOS scroll physics 1:1 with a default NSScrollView: AppKit's scroll animator, the Cates momentum coast and the per-surface engine, std only (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

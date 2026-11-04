@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
     AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, FixedSize, Flex, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
-    LazyIndex, LazyRange, LayoutPriority, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollState, Side, Size, Sizing, Viewport,
+    LazyIndex, LazyRange, LayoutPriority, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollState, ShrinkFirst, Side, Size, Sizing, Viewport,
     ViewThatFits,
 };
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed};
@@ -58,7 +58,8 @@ fn read(e: EntityView<'_>) -> Item {
         centre: e.try_cloned::<&Centre>().map(|c| c.at),
         align_self: e.try_cloned::<&AlignSelf>().map(|a| a.align),
         guide: e.try_cloned::<&AlignmentGuide>().map_or([0.0; 2], |g| [g.dx, g.dy]),
-        priority: e.try_cloned::<&LayoutPriority>().map_or(0.0, |p| p.value),
+        // `ShrinkFirst` (ui.Lead) is a priority below the default 0, unless the node says its own.
+        priority: e.try_cloned::<&LayoutPriority>().map_or(if e.has(ShrinkFirst::id()) { -1.0 } else { 0.0 }, |p| p.value),
         fixed: [fixed.h, fixed.v],
         role,
         grid,

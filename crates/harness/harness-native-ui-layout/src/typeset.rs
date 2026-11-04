@@ -5,7 +5,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Intrinsic, Padding};
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_node_api::Laid;
-use harness_native_ui_text_api::{Text, Truncate, TruncateMode};
+use harness_native_ui_text_api::{OneLine, Text, Truncate, TruncateMode};
 
 /// The host's typesetter, seen from layout: how wide a string runs on one line and how tall it is wrapped at a width. `node`
 /// is the entity the text is on, for a typesetter that keeps its shaping per node.
@@ -58,8 +58,11 @@ pub struct Wanted {
     /// The width layout last gave the node, less its horizontal padding (none before layout has run).
     pub at: Option<f32>,
     pub now: Intrinsic,
-    /// It is one line cut to fit (`Truncate`): measured at its one-line width whatever width layout gave it.
+    /// It is one line cut to fit (`Truncate`, or `OneLine` as a `Tail` cut): measured at its one-line width whatever
+    /// width layout gave it.
     pub truncate: Option<TruncateMode>,
+    /// `truncate.is_some()`: one line tall at any width (the host cuts it with an ellipsis when it draws).
+    pub one_line: bool,
 }
 
 impl Wanted {
@@ -86,7 +89,8 @@ pub fn wanted(world: WorldRef<'_>) -> Vec<Wanted> {
             style: e.try_cloned::<&TextStyle>().unwrap_or_default(),
             at: e.try_cloned::<&Laid>().filter(|l| l.w > 0.0).map(|l| (l.w - pad).max(0.0)),
             now: *now,
-            truncate: e.try_cloned::<&Truncate>().map(|t| t.mode),
+            truncate: e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail)),
+            one_line: e.has(OneLine::id()) || e.has(Truncate::id()),
         });
     });
     out
