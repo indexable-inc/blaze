@@ -2,6 +2,7 @@ mod archive;
 mod client;
 mod db;
 mod messages;
+mod object;
 mod daemon;
 mod paths;
 mod profiles;

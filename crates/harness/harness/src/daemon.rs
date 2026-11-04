@@ -41,6 +41,8 @@ pub struct Session {
     pub cwd: String,
     pub argv: Vec<String>,
     pub created_ms: u64,
+    /// The agent process (for `signal`).
+    pub pid: Option<u32>,
     pub term: Mutex<vt100::Parser<TitleCb>>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -148,6 +150,18 @@ pub enum Req {
         #[serde(flatten)]
         task: Value,
     },
+    /// The object API (object.rs): get-or-create any kind, one object's record, and RPC to it.
+    SpawnObject {
+        #[serde(flatten)]
+        opts: Value,
+    },
+    Object { id: String },
+    Rpc {
+        id: String,
+        method: String,
+        #[serde(default)]
+        args: Value,
+    },
     /// Shell runs with every pipeline stage's output stored: run, run_status, runs, run_read, run_kill, run_wait.
     #[serde(untagged)]
     Runs(runs::RunReq),
@@ -170,13 +184,13 @@ impl Daemon {
         self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
         cols: u16, rows: u16,
     ) -> Result<u64> {
-        self.spawn_named(kind, args, parent, cwd, prompt, None, cols, rows)
+        self.spawn_named(kind, args, parent, cwd, prompt, None, &BTreeMap::new(), cols, rows)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_named(
         self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
-        name: Option<String>, cols: u16, rows: u16,
+        name: Option<String>, env: &BTreeMap<String, String>, cols: u16, rows: u16,
     ) -> Result<u64> {
         if let Some(n) = &name {
             db::check_name(n)?;
@@ -206,7 +220,7 @@ impl Daemon {
                 cmd.env_remove(k.as_ref());
             }
         }
-        for (k, v) in &launch.env {
+        for (k, v) in launch.env.iter().chain(env) {
             cmd.env(k, v);
         }
         if let Some(p) = parent {
@@ -220,6 +234,7 @@ impl Daemon {
         let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("{e}"))?;
         let writer = pair.master.take_writer().map_err(|e| anyhow!("{e}"))?;
         let killer = child.clone_killer();
+        let pid = child.process_id();
         let (tx, _) = broadcast::channel(4096);
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
@@ -230,7 +245,7 @@ impl Daemon {
             id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta,
         });
         let session = Arc::new(Session {
-            id, kind: kind.into(), name, parent, cwd, argv, created_ms,
+            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid,
             term: Mutex::new(vt100::Parser::new_with_callbacks(
                 NonZeroU16::new(rows).unwrap_or(NonZeroU16::new(24).unwrap()),
                 NonZeroU16::new(cols).unwrap_or(NonZeroU16::new(80).unwrap()),
@@ -299,8 +314,11 @@ impl Daemon {
                 let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().unwrap().is_none()).map(|s| s.id);
                 json!({ "id": alive })
             }
+            Req::SpawnObject { opts } => crate::object::spawn(self, &opts)?,
+            Req::Object { id } => crate::object::info(self, &id)?,
+            Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
             Req::Spawn { kind, args, parent, cwd, prompt, name, cols, rows } => {
-                let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, cols.unwrap_or(120), rows.unwrap_or(40))?;
+                let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40))?;
                 json!({ "id": id })
             }
             Req::Send { id, text, raw, submit } => {
