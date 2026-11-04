@@ -2348,7 +2348,9 @@ impl<S: Steps> Job<S> {
         // Its front end's run log, named with its database in hand, before the front end is
         // kept or dropped: why each of its queries ran again.
         let provenance = match &self.stage {
-            Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.run_log()),
+            Stage::Units(build) => {
+                super::observe::provenance_rows(build_id, build.writer.run_log())
+            }
             _ => Vec::new(),
         };
         Ended {
