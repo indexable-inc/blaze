@@ -6,13 +6,17 @@
 use std::collections::HashMap;
 
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{AnchoredTo, Aspect, Centre, Flex, Intrinsic, Padding, ScrollState, Side, Size, Sizing, Viewport};
-use harness_native_ui_node_api::{Offscreen, Hosted, Laid, Node, Placed};
+use harness_native_ui_layout_api::{
+    AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, FixedSize, Flex, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
+    LazyIndex, LazyRange, LayoutPriority, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollState, Side, Size, Sizing, Viewport,
+    ViewThatFits,
+};
+use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed};
 
 pub mod solve;
 pub mod typeset;
-pub use solve::{Item, anchored, shift, solve};
-pub use typeset::{Estimate, Measure, typeset};
+pub use solve::{GridSpec, Item, LazySpec, Role, anchored, lazy_range, shift, solve};
+pub use typeset::{Estimate, Measure, elide, typeset};
 
 /// Read one node's layout components into an [`Item`] (inherited values included).
 fn read(e: EntityView<'_>) -> Item {
@@ -20,6 +24,27 @@ fn read(e: EntityView<'_>) -> Item {
     let pad = e.try_cloned::<&Padding>().unwrap_or_default();
     let intr = e.try_cloned::<&Intrinsic>().unwrap_or_default();
     let scroll = e.try_cloned::<&ScrollState>().unwrap_or_default();
+    let fixed = e.try_cloned::<&FixedSize>().unwrap_or_default();
+    let safe = e.try_cloned::<&SafeAreaInset>().unwrap_or_default();
+    let safe_pad = e.try_cloned::<&SafeAreaPadding>().unwrap_or_default();
+    let role = if e.has(Background::id()) {
+        Role::Background
+    } else if e.has(Overlay::id()) {
+        Role::Overlay
+    } else {
+        Role::Flow
+    };
+    let grid = e.try_cloned::<&Grid>().map(|g| {
+        // Its columns are the GridColumn children (not Nodes), in the order they were declared.
+        let mut cols: Vec<(u64, GridColumn)> = Vec::new();
+        e.each_child(|c| {
+            if let Some(col) = c.try_cloned::<&GridColumn>() {
+                cols.push((*c.id(), col));
+            }
+        });
+        cols.sort_by_key(|(id, _)| *id);
+        GridSpec { hgap: g.hgap, vgap: g.vgap, align: g.align, valign: g.valign, cols: cols.into_iter().map(|(_, c)| (c.align, c.w)).collect() }
+    });
     Item {
         id: *e.id(),
         size: [size.w, size.h],
@@ -27,8 +52,24 @@ fn read(e: EntityView<'_>) -> Item {
         pad: [pad.l, pad.r, pad.t, pad.b],
         aspect: e.try_cloned::<&Aspect>().map_or(0.0, |a| a.ratio),
         intrinsic: [intr.w, intr.h],
+        baseline: [intr.base, intr.last],
         scroll: [scroll.x, scroll.y],
+        scrolls: e.has(ScrollState::id()),
         centre: e.try_cloned::<&Centre>().map(|c| c.at),
+        align_self: e.try_cloned::<&AlignSelf>().map(|a| a.align),
+        guide: e.try_cloned::<&AlignmentGuide>().map_or([0.0; 2], |g| [g.dx, g.dy]),
+        priority: e.try_cloned::<&LayoutPriority>().map_or(0.0, |p| p.value),
+        fixed: [fixed.h, fixed.v],
+        role,
+        grid,
+        grid_row: e.has(GridRow::id()),
+        adaptive: e.try_cloned::<&GridColumns>().map(|g| [g.min, g.max]),
+        lazy: e.try_cloned::<&Lazy>().map(|l| LazySpec { count: l.count, row: l.row, overscan: l.overscan }),
+        lazy_index: e.try_cloned::<&LazyIndex>().map(|l| l.i),
+        fits: e.has(ViewThatFits::id()),
+        clip: e.has(Clip::id()),
+        safe: [safe.l, safe.r, safe.t, safe.b],
+        safe_pad: [safe_pad.l, safe_pad.r, safe_pad.t, safe_pad.b],
         ..Item::default()
     }
 }
@@ -71,8 +112,34 @@ fn inputs(items: &[Item], room: [f32; 2], given: Option<Laid>, anchor: Option<(L
         h = mix(h, it.pad.iter().chain(&it.intrinsic).chain(&it.scroll).chain([&it.aspect]).map(|v| u64::from(v.to_bits())));
         h = mix(h, [it.centre.map_or(u64::MAX, |c| u64::from(c.to_bits())), it.children.len() as u64]);
         h = mix(h, it.children.iter().map(|&c| c as u64));
+        h = mix(h, extras(it));
     }
     h
+}
+
+/// The SwiftUI-vocabulary inputs of one item (alignment, priority, grid, lazy, safe area), as words for [`inputs`].
+fn extras(it: &Item) -> Vec<u64> {
+    let f = |v: f32| u64::from(v.to_bits());
+    let mut v = vec![
+        it.align_self.map_or(u64::MAX, |a| a as u64),
+        f(it.guide[0]),
+        f(it.guide[1]),
+        f(it.priority),
+        u64::from(it.fixed[0]) | u64::from(it.fixed[1]) << 1 | u64::from(it.grid_row) << 2 | u64::from(it.fits) << 3 | u64::from(it.clip) << 4 | u64::from(it.scrolls) << 5,
+        it.role as u64,
+        f(it.baseline[0]),
+        f(it.baseline[1]),
+        it.lazy_index.map_or(u64::MAX, u64::from),
+    ];
+    v.extend(it.safe.iter().map(|&s| f(s)));
+    v.extend(it.safe_pad.iter().map(|&b| u64::from(b)));
+    v.extend(it.adaptive.into_iter().flatten().map(f));
+    v.extend(it.lazy.into_iter().flat_map(|l| [u64::from(l.count), f(l.row), u64::from(l.overscan)]));
+    if let Some(g) = &it.grid {
+        v.extend([f(g.hgap), f(g.vgap), g.align as u64, g.valign as u64]);
+        v.extend(g.cols.iter().flat_map(|(a, s)| [*a as u64, s.kind as u64, f(s.value), f(s.min), f(s.max)]));
+    }
+    v
 }
 
 /// Create the layout system in the module scope; deleting that scope removes it before unloading.
@@ -118,6 +185,19 @@ pub fn install(world: WorldRef<'_>) {
             let ent = w.entity_from_id(item.id);
             if ent.try_cloned::<&Laid>() != Some(item.out) {
                 ent.set(item.out);
+            }
+            if item.hidden != ent.has(Hidden::id()) {
+                if item.hidden {
+                    ent.add(Hidden::id());
+                } else {
+                    ent.remove(Hidden::id());
+                }
+            }
+            if let Some((first, last)) = item.range {
+                let r = LazyRange { first, last };
+                if ent.try_cloned::<&LazyRange>() != Some(r) {
+                    ent.set(r);
+                }
             }
         }
     });

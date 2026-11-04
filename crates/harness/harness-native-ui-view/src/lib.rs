@@ -4,15 +4,17 @@
 //! its children are views too, in order. Instancing a composite instantiates its named parts with it, so a feature sets only
 //! what differs ([`View::part`]). Layout, drawing and hit testing are the generic passes': nothing here computes a rect.
 //!
-//! Lists are [`for_each`]: one row per key, made the first time the key is seen, deleted when it goes, kept in order.
+//! Lists are [`for_each`]: one row per key, made the first time the key is seen, deleted when it goes (or sent out on its
+//! `Transition`, [`leave`]), kept in order. A long list is [`lazy_for_each`]: rows only for the keys in view.
 //!
 //! A plain library linked into each module that uses it: an edit swaps those modules in, as an edit of their own code does.
 use std::collections::HashSet;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::Action;
-use harness_native_ui_layout_api::AnchoredTo;
-use harness_native_ui_node_api::Node;
+use harness_native_ui_layout_api::{AnchoredTo, Lazy, LazyIndex, LazyRange};
+use harness_native_ui_motion_api::{Leaving, Transition};
+use harness_native_ui_node_api::{Node, Placed};
 use harness_native_ui_text_api::{Icon, Text};
 
 /// A node of a view tree, by entity.
@@ -158,7 +160,7 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
         if old.is_none()
             && let Some(stale) = parent.part(key)
         {
-            stale.0.destruct();
+            leave(stale);
         }
         let (row, new) = match old {
             Some(row) => (row, false),
@@ -169,8 +171,8 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
     }
     let kept: HashSet<u64> = order.iter().copied().collect();
     parent.0.each_child(|c| {
-        if !kept.contains(&*c.id()) {
-            c.destruct();
+        if !kept.contains(&*c.id()) && !c.has(Leaving::id()) {
+            leave(View(c));
         }
     });
     // Read again: outside a system the stale rows are gone now and the new ones are children; inside one neither has
@@ -183,4 +185,64 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
         let full: Vec<u64> = order.iter().copied().chain(rest).collect();
         parent.0.set_child_order(&full);
     }
+}
+
+/// Remove a view: at once, or, when it has a `Transition`, by sending it out on it (SwiftUI's removal transition). A leaving
+/// view keeps the place it was laid out at (`Placed`), loses its name (so its key can come back as a new row while it goes)
+/// and is deleted by motion once its spring reaches 0.
+pub fn leave(v: View<'_>) {
+    let e = v.0;
+    if !e.has(Transition::id()) {
+        e.destruct();
+        return;
+    }
+    if !e.has(Leaving::id()) {
+        let id = *e.id();
+        e.set_name(&format!("leaving_{id}"));
+        e.add(Placed::id());
+        e.add(Leaving::id());
+    }
+}
+
+/// Keep a `Lazy` container's rows to the ones in view (SwiftUI's `LazyVStack { ForEach }`): `count` rows in all, row `i`
+/// named `key(i)`. Rows whose index is in the `LazyRange` layout wrote are kept by key; a row that scrolled out is
+/// recycled for one that scrolled in (renamed, re-indexed, `update` told it is fresh) and the rest are deleted. `update`
+/// runs for every row in view with its index and whether it was just made or rebound. Before layout has said a range, the
+/// first `overscan` + 16 rows are made. Returns how many rows exist.
+pub fn lazy_for_each<'a, K: AsRef<str>>(parent: View<'a>, prefab: &str, count: u32, key: impl Fn(u32) -> K, mut update: impl FnMut(View<'a>, u32, bool)) -> usize {
+    let e = parent.0;
+    let mut lazy = e.try_cloned::<&Lazy>().unwrap_or_default();
+    if lazy.count != count {
+        lazy.count = count;
+        e.set(lazy);
+    }
+    let range = e.try_cloned::<&LazyRange>().map_or(0..count.min(lazy.overscan + 16), |r| r.first.min(count)..r.last.min(count));
+    let want: Vec<(u32, String)> = range.map(|i| (i, key(i).as_ref().to_owned())).collect();
+    let wanted: HashSet<&str> = want.iter().map(|(_, k)| k.as_str()).collect();
+    // Rows no longer in view, free to be bound again.
+    let mut spare: Vec<EntityView<'a>> = Vec::new();
+    e.each_child(|c| {
+        if c.has(Node::id()) && !c.has(Leaving::id()) && !wanted.contains(c.name().as_str()) {
+            spare.push(c);
+        }
+    });
+    let mut live = 0;
+    for (i, k) in &want {
+        let (row, fresh) = match parent.part(k) {
+            Some(row) => (row, false),
+            None => match spare.pop() {
+                Some(c) => (View(c).named(k), true),
+                None => (parent.child(prefab).named(k), true),
+            },
+        };
+        if row.0.try_cloned::<&LazyIndex>().is_none_or(|l| l.i != *i) {
+            row.0.set(LazyIndex { i: *i });
+        }
+        update(row, *i, fresh);
+        live += 1;
+    }
+    for c in spare {
+        c.destruct();
+    }
+    live
 }

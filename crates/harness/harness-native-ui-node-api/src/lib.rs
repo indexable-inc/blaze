@@ -63,6 +63,11 @@ impl Laid {
     }
 }
 
+/// A node layout left out this frame (a `ViewThatFits` variant that was not chosen): draw and hit testing skip it and
+/// everything under it. Written by layout. A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Hidden;
+
 /// Children are cut to this node's `Laid` (a `Scroll`, a rounded plate). A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Clip;
@@ -92,6 +97,7 @@ hyperion_api_layouts::api_layouts! {
     "Offscreen" => alias Offscreen,
     "Laid" => alias Laid,
     "Clip" => alias Clip,
+    "Hidden" => alias Hidden,
     "Layer" => alias Layer,
     Level,
 }
@@ -128,5 +134,6 @@ pub fn register(world: &World) {
     world.component::<Offscreen>().writable();
     world.component::<Laid>().writable();
     world.component::<Clip>().writable();
+    world.component::<Hidden>();
     world.component::<Layer>().writable();
 }

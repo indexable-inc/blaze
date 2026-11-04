@@ -12,6 +12,7 @@ harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
 harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
 
 [lints.rust]
 unsafe_code = "forbid"
