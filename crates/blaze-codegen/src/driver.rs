@@ -2851,17 +2851,20 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
         // alloc: per build, sized by its units
         let mut unsummarized = Vec::new();
-        for job in jobs {
-            let read = out.read(store, &keys::summary(&job.summarized()), &job.unit, |it| {
-                // alloc: an error
-                serde_json::from_slice::<Summary>(it).map_err(|e| e.to_string())
-            });
-            match read {
-                Read::Hit(summary) => {
-                    summaries.insert(job.name, summary);
+        {
+            let _span = tracing::info_span!(target: "blaze", "codegen summaries read", functions = jobs.len()).entered();
+            for job in jobs {
+                let read = out.read(store, &keys::summary(&job.summarized()), &job.unit, |it| {
+                    // alloc: an error
+                    Summary::decode(it).map_err(|e| e.to_string())
+                });
+                match read {
+                    Read::Hit(summary) => {
+                        summaries.insert(job.name, summary);
+                    }
+                    Read::Miss => unsummarized.push(job.name),
+                    Read::Failed => {}
                 }
-                Read::Miss => unsummarized.push(job.name),
-                Read::Failed => {}
             }
         }
         let summarize = |made: Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)>,
@@ -2895,7 +2898,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             });
             match summarized {
                 Ok((summary, export, made)) => {
-                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
+                    let bytes = summary.encode();
                     piece.put(By::node(job.name, &job.unit), keys::summary(&job.summarized()), Kind::Query, bytes);
                     let flight = summary_flight(&name);
                     piece.used(flight.0);
@@ -3267,7 +3270,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         for ((name, flight), summary) in flown.into_iter().zip(self.memo.flights().summaries(&keys)) {
             match summary {
                 Some(summary) => {
-                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
+                    let bytes = summary.encode();
                     out.put(By::node(name, &by_name[&name].unit), keys::summary(&by_name[&name].summarized()), Kind::Query, bytes);
                     out.used(flight.0);
                     summaries.insert(name, summary);
