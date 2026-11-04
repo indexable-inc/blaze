@@ -737,6 +737,8 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     };
     let engine = engine(serving, ready.as_mut())?;
     let mut running = start(engine, "blaze serve", ready.as_mut())?;
+    // blaze's update check (docs/install.md, "Updates"), off the loop, for the daemon's life.
+    let _updates = crate::release::watch_updates().context("starting the daemon's update check thread")?;
     let ran = listen(&mut running.daemon, ready);
     let marked = match ran {
         Ok(()) => running.stopped(),

@@ -38,8 +38,15 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     Ok(())
 }
 
-/// The `blaze` of the release `version`, fetched when it is not there yet.
+/// The `blaze` of the release `version`, fetched when it is not there yet, for a pin.
 pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
+    fetch_for(version, "which this workspace pins")
+}
+
+/// The `blaze` of the release `version`, fetched when it is not there yet, saying it fetches it
+/// and `why` ("which this workspace pins"; `blaze update`'s). Every release blaze runs comes
+/// through here: the pinned ones, the default `blaze update` installs, and `auto`'s.
+pub(crate) fn fetch_for(version: &str, why: &str) -> anyhow::Result<PathBuf> {
     if !pin::is_version(version) {
         bail!("{version} is not a version of blaze (`0.YYYYMMDD.N`)");
     }
@@ -49,7 +56,7 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
         return Ok(exe);
     }
     let host = hir_ty_codegen::Target::host();
-    eprintln!("blaze: fetching blaze {version} for {host}, which this workspace pins");
+    eprintln!("blaze: fetching blaze {version} for {host}, {why}");
     fetched(version, host, &exe, |name| read_at(&format!("v{version}"), name))?;
     Ok(exe)
 }
@@ -138,10 +145,20 @@ fn fetched(
     Ok(())
 }
 
-/// `blaze pin`: this blaze's version under `[workspace.metadata.blaze]` in the workspace's
-/// root manifest, the rest of the manifest as it was.
+/// `blaze pin [VERSION]`: `VERSION` (a release's version or a channel), else this blaze's,
+/// under `[workspace.metadata.blaze]` in the workspace's root manifest, the rest of the
+/// manifest as it was. A version given is fetched and checked first, so a pin names a release
+/// that is there.
 pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
-    if !pin::is_version(pin::OURS) {
+    let given = named(args)?;
+    if let Some(given) = &given {
+        if pin::is_version(given) {
+            fetch_for(given, "which `blaze pin` pins")?;
+        } else if !pin::is_channel(given) {
+            bail!("`blaze pin {given}`: {given} is not a release of blaze (`0.YYYYMMDD.N`) or a channel (stable, canary)");
+        }
+    }
+    if given.is_none() && !pin::is_version(pin::OURS) {
         bail!(
             "this blaze is {}, a build of blaze's source tree and no release, so there is \
              nothing to pin: run `blaze pin` with a release (install.sh, or `blaze-v<version>` \
@@ -159,15 +176,32 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
     let mut doc: toml_edit::DocumentMut =
         text.parse().with_context(|| format!("reading {shown}"))?;
     let was = pin::pinned(&manifest).ok().flatten();
-    pinned_in(&mut doc, pin::OURS).with_context(|| format!("pinning blaze in {shown}"))?;
+    let ours = given.as_deref().unwrap_or(pin::OURS);
+    pinned_in(&mut doc, ours).with_context(|| format!("pinning blaze in {shown}"))?;
     std::fs::write(&manifest, doc.to_string()).with_context(|| format!("writing {shown}"))?;
-    let ours = pin::OURS;
     match was {
         Some(was) if was == ours => eprintln!("{shown} pins blaze {ours} already"),
         Some(was) => eprintln!("{shown} pins blaze {ours}, in place of {was}"),
         None => eprintln!("{shown} pins blaze {ours}"),
     }
     Ok(0)
+}
+
+/// The version or channel `blaze pin` is given: its one word that is no flag and no flag's
+/// value (`--manifest-path PATH`).
+fn named(args: &[String]) -> anyhow::Result<Option<String>> {
+    let mut words = args.iter();
+    let mut named = None;
+    while let Some(word) = words.next() {
+        if word == "--manifest-path" {
+            words.next();
+        } else if word.starts_with('-') {
+            continue;
+        } else if let Some(first) = named.replace(word.clone()) {
+            bail!("`blaze pin` pins one release, and is given {first} and {word}");
+        }
+    }
+    Ok(named)
 }
 
 /// `doc` with `version` under `[workspace.metadata.blaze]`.
@@ -231,27 +265,46 @@ pub(crate) fn why_this_one(given: bool) -> String {
     }
 }
 
-/// The asset `name` of the release tagged `tag`, `None` when it has none.
-fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+/// Where blaze's releases are read from: GitHub, or what [`RELEASES_FROM`] names.
+pub(crate) enum Source {
+    /// [`RELEASES`], and `latest.json` from blaze's site (`update.rs`).
+    GitHub,
+    /// A directory of `v<version>` directories of each release's assets, `latest.json` beside them.
+    Dir(PathBuf),
+    /// An `https://` mirror laid out as [`RELEASES`], `latest.json` at its top.
+    Mirror(String),
+}
+
+/// Where blaze's releases are read from now: one reading of [`RELEASES_FROM`] for the pins'
+/// fetches, the channels' pointers and `latest.json`.
+pub(crate) fn source() -> Result<Source, FetchError> {
     let given = match std::env::var(RELEASES_FROM) {
         Ok(given) => Some(given).filter(|it| !it.is_empty()),
         Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(value)) => return Err(FetchError::ReleasesNotText(value).into()),
+        Err(std::env::VarError::NotUnicode(value)) => return Err(FetchError::ReleasesNotText(value)),
     };
-    if let Some(given) =
-        given.as_ref().filter(|it| it.contains("://") && !it.starts_with("https://"))
-    {
-        return Err(FetchError::NotHttps(given.clone()).into());
-    }
-    if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
-        let file = Path::new(dir).join(tag).join(name);
-        return match std::fs::read(&file) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
-        };
-    }
-    let base = given.unwrap_or_else(|| RELEASES.to_owned());
+    Ok(match given {
+        None => Source::GitHub,
+        Some(given) if !given.contains("://") => Source::Dir(PathBuf::from(given)),
+        Some(given) if given.starts_with("https://") => Source::Mirror(given),
+        Some(given) => return Err(FetchError::NotHttps(given)),
+    })
+}
+
+/// The asset `name` of the release tagged `tag`, `None` when it has none.
+fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let base = match source()? {
+        Source::Dir(dir) => {
+            let file = dir.join(tag).join(name);
+            return match std::fs::read(&file) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+            };
+        }
+        Source::GitHub => RELEASES.to_owned(),
+        Source::Mirror(base) => base,
+    };
     let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;
     let http = HyperHttp::new(PATIENCE)?;
     let bounds = Bounds { most: MOST, https_only: true };
@@ -289,18 +342,28 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
         );
     }
     let file = pin::channel_file(channel).ok_or(FetchError::NoHome)?;
-    let kept = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
-        let staged = file.with_extension(format!("{}", std::process::id()));
-        std::fs::write(&staged, format!("{version}\n"))?;
-        std::fs::rename(&staged, &file)
-    });
-    kept.map_err(|error| FetchError::ChannelUnkept { channel: channel.to_owned(), file, error })?;
+    kept(&file, format!("{version}\n").as_bytes())
+        .map_err(|error| FetchError::ChannelUnkept { channel: channel.to_owned(), file, error })?;
     Ok(version)
+}
+
+/// `file` holding `bytes`, written beside it and renamed into place, so a reader sees the whole
+/// of what was there or the whole of this, never part: what a channel named, the default
+/// release, the update state.
+pub(crate) fn kept(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut staged = file.as_os_str().to_owned();
+    staged.push(format!(".{}", std::process::id()));
+    let staged = PathBuf::from(staged);
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(&staged, file).inspect_err(|_| _ = std::fs::remove_file(&staged))
 }
 
 /// What a fetch of a release or a channel can't do, which no other path does in its place.
 #[derive(Debug)]
-enum FetchError {
+pub(crate) enum FetchError {
     /// [`RELEASES_FROM`] is set to what is not text.
     ReleasesNotText(std::ffi::OsString),
     /// [`RELEASES_FROM`] is set to an address that is not `https://`.

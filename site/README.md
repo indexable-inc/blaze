@@ -81,14 +81,17 @@ bun run deploy   # build + wrangler deploy
 
 The site is the Cloudflare Worker `blaze` (account Indexable). `.github/workflows/site.yaml` deploys it on a push
 to main once the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set (the token needs Workers
-Scripts, Workers Routes and D1 edit on the account and the ix.dev zone); until then it only builds, and the site is
+Scripts, Workers Routes and D1 edit on the account and the ix.dev zone, and Workers R2 Storage edit for the bucket
+below); until then it only builds, and the site is
 deployed by hand from an up-to-date main, logged in with `wrangler login`:
 
 ```
 cd site && uv run --script renderer/fetch.py && bunx wrangler deploy
 ```
 
-(`wrangler deploy` runs the build itself.) The move to ix.dev/blaze was deployed that way on 2026-10-27 (version
+(`wrangler deploy` runs the build itself.) The worker serves `/latest.json` (docs/release.md, "latest.json") from the
+R2 bucket `blaze-releases` (binding `RELEASES`), which the release workflows write; the bucket is made once by hand,
+`bunx wrangler r2 bucket create blaze-releases`, before the first deploy that binds it. The move to ix.dev/blaze was deployed that way on 2026-10-27 (version
 2f7138f1-5ae3-42cf-b417-8538770f446e); nothing was changed in the Cloudflare dashboard or API by hand.
 
 It is reached three ways, all declared in `wrangler.jsonc` `routes`, so `wrangler deploy` creates them:
