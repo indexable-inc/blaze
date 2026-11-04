@@ -165,7 +165,8 @@ jobs:
       - run: nix develop --command blaze build --release -p blaze-engine --locked
       - run: blaze stop
       - name: edit a running program
-        run: python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\"}"
+        run: |
+          python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\"}"
       - name: crash reports
         if: failure()
         run: |

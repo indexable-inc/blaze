@@ -443,7 +443,8 @@ fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String
     let named: Vec<String> = on.iter().cloned().collect();
     for feature in &named {
         let llvm = crate::target::renamed_for_llvm(target.arch, feature, true);
-        let llvm = llvm.unwrap_or(std::slice::from_ref(&feature.as_str()));
+        let own = feature.as_str();
+        let llvm = llvm.unwrap_or(std::slice::from_ref(&own));
         if llvm.iter().any(|it| lacks.contains(it)) {
             turn_off(&mut on, implies, feature);
         }

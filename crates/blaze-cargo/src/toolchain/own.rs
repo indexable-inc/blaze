@@ -16,7 +16,7 @@ use std::{
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;
@@ -235,7 +235,7 @@ fn fetch_from(
         release.version,
         release.megabytes()
     );
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     // A span in the client's flight recorder, which the client's rows take to the history.
     let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));

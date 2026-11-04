@@ -15,7 +15,6 @@ use qlog::{
     },
     streamer::QlogStreamer,
 };
-#[cfg(feature = "qlog")]
 
 use crate::{
     ConnectionId, Instant,

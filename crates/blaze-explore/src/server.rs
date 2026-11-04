@@ -130,9 +130,6 @@ pub enum StartError {
     Bind(std::io::Error),
     Thread(std::io::Error),
     Config(h3::Error),
-    /// jank(2026-11-04): this blaze is built without the explorer's HTTP/3 transport; see
-    /// [`start`]. Remove with it.
-    Unbuilt,
 }
 
 impl std::fmt::Display for StartError {
@@ -149,10 +146,6 @@ impl std::fmt::Display for StartError {
                 write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}")
             }
             StartError::Thread(why) => write!(f, "the explorer's thread did not start: {why}"),
-            StartError::Unbuilt => write!(
-                f,
-                "this blaze has no explorer: its HTTP/3 transport (blaze-http on quinn-proto) is left out until the next stage-0 promotion, as stage 0 0.20261030.1 cannot compile quinn-proto"
-            ),
             StartError::Config(why) => {
                 write!(f, "the explorer's HTTP/3 endpoint refused its config: {why}")
             }
@@ -163,19 +156,7 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 
 /// Starts an explorer; it serves until the [`Explorer`] is dropped.
-///
-/// jank(2026-11-04): refused with [`StartError::Unbuilt`], so that nothing blaze-engine runs
-/// reaches quinn-proto, which stage 0 0.20261030.1 cannot compile (`quinn_proto::Connection`'s
-/// methods: layout of {type error}), refusing the whole of blaze-engine. [`start_h3`] is the real
-/// start. Undo (rename `start_h3` back to `start`, drop `Unbuilt`) after the next stage-0
-/// promotion.
-pub fn start(_config: Config) -> Result<Explorer, StartError> {
-    Err(StartError::Unbuilt)
-}
-
-/// The explorer's real start ([`start`]): it serves until the [`Explorer`] is dropped.
-#[allow(dead_code, reason = "jank(2026-11-04): unreached until `start` calls it again")]
-pub(crate) fn start_h3(config: Config) -> Result<Explorer, StartError> {
+pub fn start(config: Config) -> Result<Explorer, StartError> {
     let rotation = Rotation::new(unix_now_s()?);
     let cert = Cert::make(rotation.current()).map_err(StartError::Cert)?;
     let identity = cert.identity().map_err(StartError::Cert)?;
@@ -679,7 +660,7 @@ mod tests {
 
     fn explorer() -> Explorer {
         let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
-        start_h3(Config { history, world: None, dev_origin: false, daemon: "test" }).unwrap()
+        start(Config { history, world: None, dev_origin: false, daemon: "test" }).unwrap()
     }
 
     /// A client pinning the explorer's certificate, as the page does; on the runtime it is
@@ -835,7 +816,7 @@ mod tests {
     fn a_session_from_the_dev_server_is_taken_only_when_asked() {
         let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
         let explorer =
-            start_h3(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
+            start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let client = client(&explorer);

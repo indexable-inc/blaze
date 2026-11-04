@@ -21,6 +21,7 @@ blaze-diagnostics.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-usercode.workspace = true
 hir-ty.workspace = true
@@ -33,7 +34,6 @@ toml.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-items.workspace = true
 
 [features]
 default = ["net"]

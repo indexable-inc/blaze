@@ -140,141 +140,67 @@ impl Requests {
         };
         // Dropping the answer before its end cancels the request, closing its connection.
         let mut answer = self.driver.ask(request);
-        // jank(2026-11-04): the answer is read by `Fetching`, a plain state machine, and this
-        // coroutine only awaits the next event: stage 0 (0.20261030.1) could not lower the MIR of
-        // this coroutine with the reading written inline (its layout said `Unknown`), refusing
-        // every request blaze-registry makes. Inline it again after the next stage-0 promotion.
-        let mut fetching = Fetching {
-            url,
-            streamed,
-            bounds,
-            head: None,
-            sinking: false,
-            // alloc: one per answer, its body for the caller.
-            bytes: Vec::new(),
-        };
-        loop {
-            let event = next(&mut answer, fetching.said()).await?;
-            if let Some(response) = fetching.on(event, &mut sink)? {
-                // Dropped before its end, as a streamed request's error body past its first
-                // `ERROR_BODY_MOST` bytes is: the request is cancelled, its connection closed.
-                drop(answer);
-                return fetching.finish(response);
-            }
-        }
-    }
-}
-
-/// One request's answer as its events come ([`Requests::fetch`]).
-struct Fetching<'u> {
-    /// The address asked.
-    url: &'u str,
-    /// Whether a 200's body goes to the sink, not into the answer.
-    streamed: bool,
-    bounds: Bounds,
-    /// The head, once it came: the address that answered (redacted), the status and headers.
-    head: Option<(String, u16, Vec<(String, String)>)>,
-    /// Whether the body goes to the sink: a 200 of a streamed request.
-    sinking: bool,
-    /// The body read so far, when it does not go to the sink.
-    bytes: Vec<u8>,
-}
-
-impl Fetching<'_> {
-    /// The address an error says: the one that answered once the head came, else the one asked.
-    fn said(&self) -> &str {
-        match &self.head {
-            Some((said, _, _)) => said,
-            None => self.url,
-        }
-    }
-
-    /// The most of the body that is kept: a streamed request's other answers are read for their
-    /// error alone, their first `ERROR_BODY_MOST` bytes (so no server can fill the daemon's
-    /// memory with a 404 page); any other request is held to its bounds by the client.
-    fn most(&self) -> u64 {
-        if self.streamed { ERROR_BODY_MOST.min(self.bounds.most) } else { self.bounds.most }
-    }
-
-    /// Takes `event`: the answer when it is whole (its body not yet decoded: [`Self::finish`]).
-    fn on(&mut self, event: Event, sink: &mut Option<Sink<'_>>) -> anyhow::Result<Option<Response>> {
-        let Some((said, status, headers)) = &self.head else {
-            match event {
-                Event::Head { url, status, headers, .. } => {
-                    let said = redact(&url);
-                    if status == 200 && sink.is_some() {
-                        let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
-                        // A server's answer, not a lost connection: asking again gets the
-                        // same, so it is no `Transport` error and never tried again.
-                        if let Some((_, encoding)) =
-                            encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
-                        {
-                            anyhow::bail!(
-                                "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
-                            );
-                        }
-                        self.sinking = true;
-                    }
-                    self.head = Some((said, status, headers));
-                    return Ok(None);
-                }
-                Event::Failed { error, .. } => return Err(failed(error)),
-                Event::Body { .. } | Event::Done { .. } => {
-                    anyhow::bail!(
-                        "{}: blaze-http's client told of a body before its head",
-                        redact(self.url)
-                    )
-                }
+        // `said`, with no userinfo, query or fragment (a redirect's `X-Amz-Signature`), is the
+        // only form of the address that answered any message holds.
+        let (said, status, headers) = match next(&mut answer, url).await? {
+            Event::Head { url, status, headers, .. } => (redact(&url), status, headers),
+            Event::Failed { error, .. } => return Err(failed(error)),
+            Event::Body { .. } | Event::Done { .. } => {
+                anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
             }
         };
-        let (status, piece) = (*status, body(event, said)?);
-        let Some(piece) = piece else {
-            let headers = headers.clone(); // alloc: the head, once per answer, for the caller
-            let body = std::mem::take(&mut self.bytes);
-            return Ok(Some(Response { status, headers, body }));
-        };
-        if self.sinking {
+        if let Some(sink) = sink.as_mut().filter(|_| status == 200) {
+            let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
+            // A server's answer, not a lost connection: asking again gets the same, so it is
+            // no `Transport` error and never tried again.
+            if let Some((_, encoding)) =
+                encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
+            {
+                anyhow::bail!(
+                    "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
+                );
+            }
             // Held to `bounds.most` by the client, as sent (nothing is decoded).
-            if let Some(sink) = sink.as_mut() {
+            while let Some(piece) = next_piece(&mut answer, &said).await? {
                 sink(&piece).with_context(|| format!("keeping the body of {said}"))?;
             }
-            return Ok(None);
+            return Ok(Response { status, headers, body: Vec::new() });
         }
-        let most = self.most();
+        // A streamed request's other answers are read for their error alone: their first
+        // `ERROR_BODY_MOST` bytes, the rest left unread (the answer dropped, its connection
+        // closed), so no server can fill the daemon's memory with a 404 page. Any other request
+        // is held to its bounds by the client.
+        let most = if streamed { ERROR_BODY_MOST.min(bounds.most) } else { bounds.most };
         let room = usize::try_from(most).unwrap_or(usize::MAX);
-        let left = room.saturating_sub(self.bytes.len());
-        // Stage 0 (blaze 0.20261030.1) finds no `len` on `[u8]` in this body; Vec's own works.
-        if Vec::len(&piece) > left {
-            if !self.streamed {
-                // The client holds the body to `most` itself; past it is its bug, said here.
-                let refused =
-                    Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
-                return Err(refused.into());
+        // alloc: one per answer, its body for the caller.
+        let mut bytes = Vec::new();
+        while let Some(piece) = next_piece(&mut answer, &said).await? {
+            let left = room.saturating_sub(bytes.len());
+            if piece.len() > left {
+                if !streamed {
+                    // The client holds the body to `most` itself; past it is its bug, said here.
+                    let refused =
+                        Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
+                    return Err(refused.into());
+                }
+                bytes.extend_from_slice(&piece[..left]);
+                break;
             }
-            self.bytes.extend_from_slice(&piece[..left]);
-            let headers = headers.clone(); // alloc: the head, once per answer, for the caller
-            let body = std::mem::take(&mut self.bytes);
-            return Ok(Some(Response { status, headers, body }));
+            bytes.extend_from_slice(&piece);
         }
-        self.bytes.extend_from_slice(&piece);
-        Ok(None)
-    }
-
-    /// `response`, whole: gzip a streamed request did not ask for, on an error's body, decoded
-    /// for its message, as far as `most`. Any other request's gzip the client decoded.
-    fn finish(&self, mut response: Response) -> anyhow::Result<Response> {
-        if self.streamed
-            && !self.sinking
+        drop(answer);
+        let mut response = Response { status, headers, body: bytes };
+        // gzip a streamed request did not ask for, on an error's body: decoded for its message,
+        // as far as `most`. Any other request's gzip the client decoded.
+        if streamed
             && response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
         {
-            let most = self.most();
-            let room = usize::try_from(most).unwrap_or(usize::MAX);
             // alloc: one per gzip error body, at most `most` bytes and one.
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(&response.body[..])
                 .take(most.saturating_add(1))
                 .read_to_end(&mut decoded)
-                .map_err(|e| Transport(format!("{} sent gzip that is not: {e}", self.said())))?;
+                .map_err(|e| Transport(format!("{said} sent gzip that is not: {e}")))?;
             decoded.truncate(room);
             response.body = decoded;
         }
@@ -292,10 +218,9 @@ async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
     })
 }
 
-/// The piece of the body `event` (the answer's next) is, `None` at its end; `said` is the
-/// address that answered.
-fn body(event: Event, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    match event {
+/// The next piece of `answer`'s body, `None` at its end; `said` is the address that answered.
+async fn next_piece(answer: &mut Answer, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    match next(answer, said).await? {
         Event::Body { bytes, .. } => Ok(Some(bytes)),
         Event::Done { .. } => Ok(None),
         Event::Failed { error, .. } => Err(failed(error)),
