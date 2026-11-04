@@ -545,8 +545,10 @@ pub enum HotWaitKind {
     Scope,
 }
 
-/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table one Arrow IPC
-/// stream of the schema's table of that name.
+/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table the next bytes of
+/// the subscription's one long-lived Arrow IPC stream of the schema's table of that name
+/// (`live::Encoder`; empty when it has no rows), which a client reads with one `live::Decoder`
+/// a table across the frames, in order.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct LiveFrame {
     /// Spans not recorded since the daemon began.

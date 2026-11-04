@@ -789,8 +789,15 @@ reader slower than the writers skips what was written over, counted.
 
 `blaze debug live` and the explorer's live stream each get a `live::Feed` of their own on the
 daemon. Every 250 ms it takes what the rings got since its last frame, plus the `open` table,
-and sends a frame: `at_ns`, `skipped`, `lost`, then the `spans`, `counters` and `open` tables,
-each as one Arrow IPC stream compressed with zstd. A subscriber that can't take a frame on time
+and sends a frame: `at_ns`, `skipped`, `lost`, then the `spans`, `counters` and `open` tables.
+Each table is one long-lived Arrow IPC stream per subscriber, compressed with zstd
+(`live::Encoder`): the schema and each dictionary's values cross once, and each frame with rows
+carries its batch and a delta of only the dictionary values it names first, so a span's name,
+target, crate and thread cross once. A frame with no rows has no bytes for that table. When a
+stream's dictionaries pass `live::Cap::LIVE` (65,536 values or 1 MiB a table), the next frame
+with rows ends the stream with the IPC end-of-stream marker and starts a new one with a fresh
+schema and dictionaries; the client's `live::Decoder` (one a table) follows it. Same rows in,
+same bytes out. A subscriber that can't take a frame on time
 misses that tick. Its cursor keeps its place, and rows written over meanwhile show up as
 `skipped`, so the daemon holds at most one frame per subscriber. The client folds frames into
 `live::Top`, which renders:
