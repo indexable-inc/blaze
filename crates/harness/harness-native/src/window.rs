@@ -1,7 +1,7 @@
 //! The window: raw AppKit (NSApplication, one NSWindow, one flipped layer-hosting NSView over a CAMetalLayer), after
 //! den-native's window.rs. Frames come from a `CAMetalDisplayLink`, paused whenever the app is idle; the daemon's threads
 //! wake it through the main queue.
-use crate::app::{App, KeyMods};
+use crate::app::{App, Chrome, KeyMods};
 use crate::gpu::{self, Dest, Renderer};
 use crate::single::{self, Ask};
 use dispatch2::DispatchQueue;
@@ -10,7 +10,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSPasteboard, NSPasteboardTypeString, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const INITIAL: (f64, f64) = (1180.0, 760.0);
+/// From the zoom button's right edge to the title's first ink, as Ghostty's title bar sets it (measured on Tahoe).
+const TITLE_GAP: f64 = 16.0;
 
 struct State {
     app: App,
@@ -223,6 +225,12 @@ define_class!(
             wake();
         }
 
+        /// The window resized or went in or out of fullscreen: AppKit has laid the title bar out again.
+        #[unsafe(method(windowChromeChanged:))]
+        fn chrome_changed(&self, _note: &NSNotification) {
+            self.sync_chrome();
+        }
+
         #[unsafe(method(windowDidResignKey:))]
         fn did_resign_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -266,7 +274,18 @@ impl HarnessView {
         Some(menu)
     }
 
+    /// Tell the app where the title bar is (Ghostty's layout: the traffic lights centred in a strip as tall as AppKit's
+    /// title bar, the title past them on the same line), re-centring the lights when AppKit has put them elsewhere.
+    fn sync_chrome(&self) {
+        with(|st| {
+            let c = chrome(&st.window);
+            st.app.set_chrome(c);
+            st.link.setPaused(false);
+        });
+    }
+
     fn sync_size(&self) {
+        self.sync_chrome();
         let points = self.bounds().size;
         let pixels = self.convertSizeToBacking(points);
         if points.width <= 0.0 || points.height <= 0.0 {
@@ -301,6 +320,62 @@ impl HarnessView {
             }
         });
     }
+}
+
+/// The title-bar strip of `window` (none in fullscreen, where AppKit hides it), its traffic lights moved to its centre line.
+fn chrome(window: &NSWindow) -> Chrome {
+    if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+        return Chrome::default();
+    }
+    let height = window.frame().size.height;
+    let strip = (height - window.contentLayoutRect().size.height).max(0.0);
+    let mut right: f64 = 0.0;
+    for kind in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+        let Some(b) = window.standardWindowButton(kind) else { continue };
+        // In window coordinates: origin at the bottom left, `height` tall.
+        let r = b.convertRect_toView(b.bounds(), None);
+        let centre = height - (r.origin.y + r.size.height / 2.0);
+        let d = strip / 2.0 - centre;
+        if d.abs() > 0.25 {
+            let mut o = b.frame().origin;
+            // SAFETY: a button in the window's title bar has a superview while the window lives (we hold it).
+            let flipped = unsafe { b.superview() }.is_some_and(|v| v.isFlipped());
+            o.y += if flipped { d } else { -d };
+            b.setFrameOrigin(o);
+        }
+        right = right.max(r.origin.x + r.size.width);
+    }
+    if std::env::var_os("HARNESS_NATIVE_CHROME_LOG").is_some() {
+        eprintln!("harness-native: chrome strip={strip} lights_right={right}");
+    }
+    Chrome { strip: strip as f32, title_x: if right > 0.0 { (right + TITLE_GAP) as f32 } else { 0.0 } }
+}
+
+/// `HARNESS_NATIVE_CHROME_TEST`: resize this app's own window (no focus taken), logging the title bar after it, so a
+/// capture after about 3 s shows the title bar as AppKit lays it out again. Fullscreen is not exercised here: it takes
+/// a Space (and the screen); `windowChromeChanged:` handles its exit the same way.
+fn chrome_test(_window: &NSWindow) {
+    fn later(secs: f64, f: fn(&NSWindow)) {
+        let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs)).expect("a short delay");
+        let _ = DispatchQueue::main().after(when, move || {
+            let w = with(|st| st.window.clone());
+            if let Some(w) = w {
+                f(&w);
+                eprintln!("harness-native: chrome test step at {secs}s: {:?}", chrome(&w));
+            }
+        });
+    }
+    later(2.0, |w| {
+        let mut f = w.frame();
+        f.size = NSSize::new(980.0, 640.0);
+        w.setFrame_display(f, true);
+    });
+}
+
+/// `HARNESS_NATIVE_NO_ACTIVATE`: show the window behind whatever has focus, without activating the app or taking the
+/// keyboard (for captures while someone is using the Mac).
+fn no_activate() -> bool {
+    std::env::var_os("HARNESS_NATIVE_NO_ACTIVATE").is_some()
 }
 
 fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
@@ -355,11 +430,22 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     unsafe {
         center.addObserver_selector_name_object(&view, sel!(windowDidBecomeKey:), Some(objc2_app_kit::NSWindowDidBecomeKeyNotification), Some(&window));
         center.addObserver_selector_name_object(&view, sel!(windowDidResignKey:), Some(objc2_app_kit::NSWindowDidResignKeyNotification), Some(&window));
+        // AppKit lays the title bar (and the traffic lights) out again after these.
+        for name in [objc2_app_kit::NSWindowDidResizeNotification, objc2_app_kit::NSWindowDidEnterFullScreenNotification, objc2_app_kit::NSWindowDidExitFullScreenNotification] {
+            center.addObserver_selector_name_object(&view, sel!(windowChromeChanged:), Some(name), Some(&window));
+        }
     }
     window.center();
     window.makeFirstResponder(Some(&view));
-    window.makeKeyAndOrderFront(None);
+    if no_activate() {
+        window.orderBack(None);
+    } else {
+        window.makeKeyAndOrderFront(None);
+    }
     view.sync_size();
+    if std::env::var_os("HARNESS_NATIVE_CHROME_TEST").is_some() {
+        chrome_test(&window);
+    }
     Ok(())
 }
 
@@ -380,7 +466,9 @@ define_class!(
                 eprintln!("harness-native: {e}");
                 std::process::exit(1);
             }
-            NSApplication::sharedApplication(mtm).activate();
+            if !no_activate() {
+                NSApplication::sharedApplication(mtm).activate();
+            }
         }
 
         #[unsafe(method(applicationWillTerminate:))]
@@ -455,7 +543,7 @@ pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u6
         single::serve(l, asked);
     }
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.setActivationPolicy(if no_activate() { NSApplicationActivationPolicy::Accessory } else { NSApplicationActivationPolicy::Regular });
     app.setMainMenu(Some(&main_menu(mtm)));
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

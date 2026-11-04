@@ -69,6 +69,17 @@ struct Ids {
     main: u64,
     term: u64,
     palette: Option<u64>,
+    /// The title-bar strip's root (`hn.TitleBar`) and its label.
+    bar: u64,
+    bar_title: u64,
+}
+
+/// The window's title-bar strip as AppKit lays it out, in points: how tall it is (0 in fullscreen, where it is hidden)
+/// and where the title starts (past the traffic lights).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Chrome {
+    pub strip: f32,
+    pub title_x: f32,
 }
 
 pub struct App {
@@ -113,6 +124,9 @@ pub struct App {
     pub persist: bool,
     pub focused: bool,
     pub title: String,
+    /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
+    chrome: Chrome,
+    chrome_laid: Option<(Chrome, f32)>,
 }
 
 /// The fill a tone prefab of the scene holds (`hn.ToneRunning`).
@@ -211,7 +225,9 @@ impl App {
         let tree = side.child("hn.Tree");
         let main = root.child("hn.Main");
         let term = main.part("term").map_or(0, View::id);
-        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, palette: None };
+        let bar = View::root(w, "hn.TitleBar");
+        let bar_title = bar.part("title").map_or(0, View::id);
+        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, palette: None, bar: bar.id(), bar_title };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
         Ok(Self {
@@ -244,6 +260,8 @@ impl App {
             persist: true,
             focused: true,
             title: "harness".into(),
+            chrome: Chrome::default(),
+            chrome_laid: None,
         })
     }
 
@@ -598,6 +616,10 @@ impl App {
             set_if(p, dot);
         }
         self.title = window;
+        if self.ids.bar_title != 0 {
+            let t = if sel.is_some() { clip_text(&title, 80) } else { "harness".to_owned() };
+            View::of(w.entity_from_id(self.ids.bar_title)).text(&t);
+        }
         self.sync_palette();
         self.save_selected();
     }
@@ -726,6 +748,7 @@ impl App {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
             self.grid = Grid::new(&mut self.fonts, TERM_SIZE, scale);
         }
+        self.lay_chrome(z);
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
@@ -775,6 +798,39 @@ impl App {
             self.layouts.clear();
         }
         d
+    }
+
+    /// The window's title-bar strip (from AppKit, in points; see window.rs): the view leaves it clear and sets the title in it.
+    pub fn set_chrome(&mut self, c: Chrome) {
+        if c != self.chrome {
+            self.chrome = c;
+            self.poke();
+        }
+    }
+
+    /// Write the strip into the view at zoom `z`: the window row starts below it, and the title bar is its height,
+    /// its label starting past the traffic lights (vertically centred on their line by the row's Center alignment).
+    fn lay_chrome(&mut self, z: f32) {
+        use harness_native_ui_layout_api::Padding;
+        if self.chrome_laid == Some((self.chrome, z)) {
+            return;
+        }
+        self.chrome_laid = Some((self.chrome, z));
+        let w = self.world.world_ref();
+        let Chrome { strip, title_x } = self.chrome;
+        if let Some(root) = w.entity_from_id(self.ids.device).parent().and_then(|side| side.parent()) {
+            let pad = root.try_cloned::<&Padding>().unwrap_or_default();
+            // No strip (fullscreen): the scene's own top margin.
+            let t = if strip > 0.0 { strip / z } else { view::prefab(w, "hn.Window").and_then(|p| p.try_cloned::<&Padding>()).map_or(pad.t, |p| p.t) };
+            root.set(Padding { t, ..pad });
+        }
+        let bar = w.entity_from_id(self.ids.bar);
+        if let Some(mut size) = bar.try_cloned::<&Size>() {
+            size.h = Sizing { kind: SizeKind::Fixed, value: strip / z, min: 0.0, max: 0.0 };
+            bar.set(size);
+        }
+        let pad = bar.try_cloned::<&Padding>().unwrap_or_default();
+        bar.set(Padding { l: title_x / z, ..pad });
     }
 
     /// `text` cut (with an ellipsis) to the longest front that the typesetter sets within `room` points.
@@ -1249,7 +1305,9 @@ impl App {
         }
         // The window keeps no left margin beside the sidebar; without it the main card gets the same margin as its other sides.
         if let (Some(root), Some(win)) = (side.parent(), view::prefab(w, "hn.Window").and_then(|p| p.try_cloned::<&Padding>())) {
-            root.set(Padding { l: if show { win.l } else { win.r }, ..win });
+            // The top stays where the title-bar strip put it.
+            let t = root.try_cloned::<&Padding>().map_or(win.t, |p| p.t);
+            root.set(Padding { l: if show { win.l } else { win.r }, t, ..win });
         }
     }
 
