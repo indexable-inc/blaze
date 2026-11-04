@@ -209,7 +209,9 @@ prefab hn.RunRow : ui.Row {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
+  // Room goes as on a session row: how long it took gives way first, then the command (ui.Lead, -1).
   meta : ui.Line, Faint {
+    LayoutPriority: {value: -2}
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -410,11 +412,13 @@ prefab hn.ArchRow : ui.Row {
   name : ui.Lead, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
+  // Room goes by priority: where it ran gives way first, then the name (ui.Lead, -1); the status badge never does.
   under : ui.Lead, Faint {
+    LayoutPriority: {value: -2}
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
-  status : hn.Badge {}
+  status : hn.Badge { LayoutPriority: {value: 1} }
   took : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
     Size: {w: {kind: Fixed, value: $arch_took_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
