@@ -57,13 +57,13 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 21. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
     ran on. Skill: `build-and-test`.
 22. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
-    `build-and-test`.
+    `testing`.
 23. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
     the tree compiles at every save point. Skill: `changing-code`.
 24. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
 25. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
-    fresh build; a restore never silently starts empty. Skill: `changing-code`.
+    fresh build; a restore never silently starts empty. Skill: `testing`.
 26. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
 27. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
@@ -98,6 +98,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
 41. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
+42. **dst-not-review**: Prove concurrent, durable, crash-recovering, billing and data-deletion code with
+    a Hegel deterministic simulation test whose oracle checks the invariant; a code review is not
+    evidence. Skill: `testing`.
 
 ## Code Review Rules
 
@@ -123,6 +126,15 @@ approval; they replace neither.
 - Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an
   unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap),
   unless a comment states the invariant and where it is upheld.
+
+### Durability and concurrency
+
+- Flag a change to concurrent, durable, crash-recovering, billing or data-deleting code (atomics,
+  locks, lock-free rings, an fsync, a rename used as a commit, a recovery path, a retire or delete,
+  a usage count) that adds or changes behavior without a Hegel deterministic simulation test
+  covering it: one that crashes it, fails its syncs and interleaves it, and checks an oracle stating
+  the invariant, with a planted bug the oracle catches (`dst-not-review`, the `testing` skill). A
+  reviewer's own reasoning about the interleavings is a lead for that test, not a substitute for it.
 
 ### Security
 

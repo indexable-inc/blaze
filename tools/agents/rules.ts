@@ -24,7 +24,7 @@ const skills = {
 	"build-and-test": {
 		title: "Building, testing and measuring blaze",
 		description:
-			"How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up, measuring the exact tree and testing a causal claim. Load before any build, check, test, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane.",
+			"How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up and measuring the exact tree. How tests are written (Hegel property tests, deterministic simulation, testing a causal claim) is the `testing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane.",
 	},
 	"compiler-correctness": {
 		title: "Compiler correctness",
@@ -44,12 +44,17 @@ const skills = {
 	"changing-code": {
 		title: "Changing code across blaze",
 		description:
-			"How a change that spans the tree is made: moves through blaze-lints bans and `blaze check --fix`/`--replace`, whole ports of shared signatures, one concept in one home, the best long-term design, and round-trip tests for persisted state. Load before renaming or moving a type, path or API, changing a shared signature, removing a duplicate, choosing a design, or touching the daemon image, the store or other persisted state.",
+			"How a change that spans the tree is made: moves through blaze-lints bans and `blaze check --fix`/`--replace`, whole ports of shared signatures, one concept in one home, the best long-term design, and a spec before a design. Load before renaming or moving a type, path or API, changing a shared signature, removing a duplicate, or choosing a design. Tests for persisted, durable or concurrent state are the `testing` skill.",
 	},
 	landing: {
 		title: "Landing changes",
 		description:
 			"How a change gets to main: `land.py` and its merge gate, taking any open pull request or issue to done, and crediting people with `Co-authored-by:`. Load before committing, opening or finishing a pull request, or picking up someone else's.",
+	},
+	testing: {
+		title: "Testing blaze",
+		description:
+			"How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct.",
 	},
 	"docs-and-scripts": {
 		title: "Docs, scripts and agent interfaces",
@@ -185,7 +190,7 @@ export const rules = [
 		id: "sans-io-cores",
 		skill: "runtime-code",
 		line: "Every core is a synchronous state machine on an injected clock that owns no IO; drivers do the IO and stay thin.",
-		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped.",
+		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock, and a deterministic simulation test drives the core through `blaze_core::sim::Sim` (`testing` skill): a core that does its own IO cannot be simulated, so it cannot be proven. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped.",
 		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake. Andrew, 2026-11-04, on the registry's HTTP client: \"is that sans io so u can have multiple io impl? like io uring on linux\" — a client built on hyper and tokio-rustls cannot move to io_uring without a rewrite.",
 	},
 	{
@@ -239,7 +244,7 @@ export const rules = [
 	},
 	{
 		id: "test-the-cause",
-		skill: "build-and-test",
+		skill: "testing",
 		line: "Test a causal claim by removing the cause and watching the effect go.",
 		info: "A causal claim (this change caused the regression, this lock causes the convoy, this index makes it fast) is tested by removing the cause and watching the effect go, not by checking that its premises hold. Pin a load-bearing one with a test named for the property.",
 		reason: "2026-11-01: part D was blamed for the codegen convoy on timing alone; one run with part D's files reverted took codegen from 1,485 s to 473 s and the over-30 s units from 18 to 0, which is what made it a finding.",
@@ -260,9 +265,9 @@ export const rules = [
 	},
 	{
 		id: "persisted-state-round-trips",
-		skill: "changing-code",
+		skill: "testing",
 		line: "Anything persisted has a restore test equal byte for byte to a fresh build; a restore never silently starts empty.",
-		info: "Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores it and checks the result equals a fresh build byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a failure the daemon reports, naming why.",
+		info: "Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores it and checks the result equals a fresh build byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a failure the daemon reports, naming why. A format that is written while blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.",
 		reason: "2026-11-01: the self-build home held a 1.8 GB image while the daemon log said \"the database starts empty: there is no daemon image\", and nothing measured whether a restart used it.",
 	},
 	{
@@ -276,7 +281,7 @@ export const rules = [
 		id: "best-long-term-design",
 		skill: "changing-code",
 		line: "Pick the best long-term design, not the least work, and spend the effort proving it right.",
-		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, and fuzzing of blaze's own invariants.",
+		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of hostile bytes.",
 		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right. Andrew, 2026-10-30, deleting the harnesses that compared blaze with rustc or cargo: \"we use other ppl['s] test[s] [of] the other crates ... it over-constrains us\".",
 		link: "docs/contributing.md#rules-for-code",
 	},
@@ -284,7 +289,7 @@ export const rules = [
 		id: "spec-then-build",
 		skill: "changing-code",
 		line: "A change that needs a design gets a spec first, then the same lane builds it right away; a spec is never the deliverable.",
-		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
+		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven: for concurrent, durable, billing or data-deleting code, the DST and the invariant its oracle checks). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
 		reason: "Andrew, 2026-11-04: \"by default write a spec but also do it right away (don't just write and not do)\". A plan written and left alone goes stale while the code moves, and the work it describes never happens.",
 		link: "docs/contributing.md#rules-for-code",
 	},
@@ -382,6 +387,13 @@ export const rules = [
 		info: "A script takes one JSON value (a file path, `-` or inline), parsed into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment variables. An existing script moves to this when next changed.",
 		reason: "Andrew, 2026-10-28: \"for parser things it should be typed like json instead of cli args, json through a file or stdin or a single value\". Flags drift and are untyped; one JSON value is checkable and the same from a workflow, a person or another script.",
 	},
+	{
+		id: "dst-not-review",
+		skill: "testing",
+		line: "Prove concurrent, durable, crash-recovering, billing and data-deletion code with a Hegel deterministic simulation test whose oracle checks the invariant; a code review is not evidence.",
+		info: "Code that is concurrent (atomics, locks, lock-free rings, two threads or processes sharing state), durable (anything written to disk that must survive), crash-recovering, billing or data-deleting is proven by a deterministic simulation test (DST): one Hegel test that draws an operation sequence, the fault classes to turn on, crash points and schedules, runs the code as a sans-IO core in the simulation (`blaze_core::sim::Sim` today, `hegel::sim` as it lands), and checks an oracle that states the invariant (\"every row recorded appears exactly once after any crash\"), with planted-bug controls the oracle must catch and a failing seed that replays. A code review is not evidence that such code is right: it finds candidates, and each one it finds becomes a case the DST must catch before the fix lands. A change to such code without a DST that covers it is unfinished, whoever reviewed it.",
+		reason: "Andrew, 2026-11-04. That day a review of blaze-profile's history (the manifest commit and the postmortem mmap rings) found eight bug classes, from a missing fsync before a rename to a lost `flushed` update between two atomics, in code that had already landed with tests; none of its tests could have caught them, because none crashed it, failed a sync or interleaved its atomics. A review reads one schedule in its head; a DST runs thousands and keeps the one that fails.",
+	},
 ] as const satisfies readonly Rule[];
 
 /**
@@ -399,6 +411,10 @@ These guide Codex code review on pull requests. They add to the harnesses and a 
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower backend, an older cached result). Safe path: stop with an error that names what and where.
 - Flag a cache key, code-identity hash or live-patch check that misses an input the output depends on (source, cfg, features, target, toolchain, layout of a type it uses), so stale code can be reused or a patch applied after a layout or ABI change.
 - Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap), unless a comment states the invariant and where it is upheld.
+
+### Durability and concurrency
+
+- Flag a change to concurrent, durable, crash-recovering, billing or data-deleting code (atomics, locks, lock-free rings, an fsync, a rename used as a commit, a recovery path, a retire or delete, a usage count) that adds or changes behavior without a Hegel deterministic simulation test covering it: one that crashes it, fails its syncs and interleaves it, and checks an oracle stating the invariant, with a planted bug the oracle catches (\`dst-not-review\`, the \`testing\` skill). A reviewer's own reasoning about the interleavings is a lead for that test, not a substitute for it.
 
 ### Security
 
