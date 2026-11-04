@@ -1,0 +1,7 @@
+[package]
+name = "hyperion-ecs-sys"
+description = "flecs v4.1.6 declarations (bindgen output from hyperion, checked in); declarations only, the C is linked by hyperion-flecs-c."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"

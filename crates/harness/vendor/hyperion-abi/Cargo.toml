@@ -1,0 +1,10 @@
+[package]
+name = "hyperion-abi"
+description = "The frozen boundary header between a host and its module dylibs (Info, Entry, Step, version constants, BUILD_ID), from hyperion."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+build = "build.rs"
+
+[dependencies]

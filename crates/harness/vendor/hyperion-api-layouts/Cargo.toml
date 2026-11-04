@@ -1,0 +1,12 @@
+[package]
+name = "hyperion-api-layouts"
+description = "ApiComponent and LocalComponent (the types a module may name) and the layout hash of an api crate, from hyperion."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+hyperion-abi = { path = "../hyperion-abi" }
+hyperion-layout = { path = "../hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-wyhash = { path = "../hyperion-wyhash" }

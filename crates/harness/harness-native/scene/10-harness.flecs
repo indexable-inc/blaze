@@ -1,0 +1,182 @@
+// harness-native's views, composites of den's primitives (prims.flecs). The world's objects become rows of these by key
+// (src/view.rs, harness_native_ui_view::for_each); layout, drawing and hit testing are the generic passes'.
+
+// The window: the sidebar beside the main card, which is inset from the window's edges by a hairline-bordered margin.
+prefab hn.Window : ui.Row {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 0, r: 8, t: 8, b: 8}
+}
+
+// The sidebar: the device, then its objects as a tree. Room at the top for the traffic lights.
+prefab hn.Sidebar : ui.Column {
+  Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 8, r: 8, t: 38, b: 8}
+}
+
+// The sidebar's tree: one hn.ObjRow per object, kept by key (src/view.rs).
+prefab hn.Tree : ui.Column {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+}
+
+// A status dot.
+prefab hn.Dot : ui.Node {
+  Fill: $tone_exited
+  Size: {w: {kind: Fixed, value: 6, min: 0, max: 0}, h: {kind: Fixed, value: 6, min: 0, max: 0}}
+  Shape: {radius: 3, n: 2, border: 0, feather: 0}
+}
+
+// A section label over the tree: the device's name and how it is linked.
+prefab hn.DeviceRow : ui.Row {
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+  Padding: {l: 8, r: 8, t: 0, b: 0}
+  dot : hn.Dot {}
+  name : ui.Words, Muted {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 1}
+  }
+  spacer : ui.Spacer {}
+  count : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// One object of the tree: indent, status dot, the kind's glyph, its name, and on the right its exit code or shortcut.
+prefab hn.ObjRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+  Padding: {l: 8, r: 8, t: 0, b: 0}
+  indent : ui.Node {
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  glyph : ui.Words, Muted {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  meta : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+  dot : hn.Dot {}
+}
+
+// The main card: the selected object's header over its terminal.
+prefab hn.Main : ui.Column, Plate {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  head : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 40, min: 0, max: 0}}
+    Padding: {l: 16, r: 16, t: 0, b: 0}
+    glyph : ui.Words, Muted {
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+    title : ui.Words, Strong {
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
+    }
+    sub : ui.Words, Muted {
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    state : ui.Words, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+    dot : hn.Dot {}
+  }
+  rule : ui.Divider {}
+  // The terminal: drawn by the host into this node's rect (src/term.rs), where its clear plate comes in paint order.
+  term : ui.Node {
+    Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+}
+
+// The command palette (cmd+K): a card near the top of the window over everything.
+prefab hn.Palette : ui.Column {
+  Layer: {level: Overlay}
+  // A press beside the card closes it; the window dims under it.
+  Pressable
+  Action: {name: "pal:close"}
+  Fill: {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 96, b: 0}
+  card : ui.Column, Plate {
+    Hoverable
+    Fill: {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+    Lift: {blur: 24, alpha: 0.5, dy: 8}
+    Shape: {radius: 12, n: 4, border: 1, feather: 0}
+    Size: {w: {kind: Fixed, value: 560, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 6, r: 6, t: 6, b: 6}
+    query : ui.Row {
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 38, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 0, b: 0}
+      text : ui.Words, Strong {
+        TextStyle: {size: 15, line: 20, role: 0, bold: 0}
+      }
+    }
+    rule : ui.Divider {}
+    items : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 4, b: 0}
+    }
+  }
+}
+
+// One palette entry.
+prefab hn.PalRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
+  Padding: {l: 10, r: 10, t: 0, b: 0}
+  glyph : ui.Words, Muted {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  hint : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// Tones the host reads by name and copies onto nodes (src/app.rs `tone`): a dot's status, the selected row.
+prefab hn.ToneRunning {
+  Fill: $tone_running
+}
+prefab hn.ToneExited {
+  Fill: $tone_exited
+}
+prefab hn.ToneFailed {
+  Fill: $tone_failed
+}
+prefab hn.ToneLost {
+  Fill: $tone_lost
+}
+prefab hn.ToneSelected {
+  Fill: $tone_select
+}
+prefab hn.ToneClear {
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+}
+prefab hn.ToneAccent {
+  Fill: $tone_accent
+}

@@ -1,0 +1,9 @@
+[package]
+name = "hyperion-panic"
+description = "Per-image panic capture from hyperion: catch at every FFI edge, quarantine, the take-panic body. Linked statically into every image, so the slot is per image."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]

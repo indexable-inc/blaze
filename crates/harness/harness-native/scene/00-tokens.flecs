@@ -1,0 +1,53 @@
+// harness-native's tokens: the names den's primitives (harness-native-ui-prims, prims.flecs) read, and the app's own.
+// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws, in a quieter, denser,
+// Linear-like palette: near-black ground, hairline edges, four inks, one violet accent. Colours are sRGB 0..1,
+// `{r, g, b, a}`; every Fill and Edge has a dark and a light.
+
+export const size_caption = 11
+export const size_body = 13
+
+export const radius_control = 6
+export const radius_card = 10
+
+export const tone_ink_1 = Fill: {dark: {0.929, 0.929, 0.937, 1}, light: {0.098, 0.098, 0.110, 1}}
+export const tone_ink_2 = Fill: {dark: {0.792, 0.792, 0.812, 1}, light: {0.231, 0.231, 0.255, 1}}
+export const tone_ink_3 = Fill: {dark: {0.545, 0.545, 0.580, 1}, light: {0.447, 0.447, 0.486, 1}}
+export const tone_ink_4 = Fill: {dark: {0.361, 0.361, 0.392, 1}, light: {0.635, 0.635, 0.667, 1}}
+export const tone_accent = Fill: {dark: {0.533, 0.553, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+
+export const tone_wash = Fill: {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.05}}
+export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
+export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.08}}
+export const tone_select = Fill: {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.065}}
+export const tone_plate = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
+export const tone_plate_line = Fill: {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.09}}
+export const tone_switch_on = Fill: {dark: {0.533, 0.553, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+
+export const tone_running = Fill: {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
+export const tone_exited = Fill: {dark: {0.361, 0.361, 0.392, 1}, light: {0.635, 0.635, 0.667, 1}}
+export const tone_failed = Fill: {dark: {0.922, 0.420, 0.420, 1}, light: {0.80, 0.26, 0.26, 1}}
+export const tone_lost = Fill: {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
+
+prefab Strong {
+  Fill: $tone_ink_1
+}
+prefab Ink {
+  Fill: $tone_ink_2
+}
+prefab Muted {
+  Fill: $tone_ink_3
+}
+prefab Faint {
+  Fill: $tone_ink_4
+}
+prefab Accent {
+  Fill: $tone_accent
+}
+prefab Wash {
+  Fill: $tone_wash
+}
+prefab Plate {
+  Fill: $tone_plate
+  Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+  Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
+}
