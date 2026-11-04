@@ -34,6 +34,7 @@ harness-native-ui-prims = { path = "../harness-native-ui-prims" }
 harness-native-ui-view = { path = "../harness-native-ui-view" }
 hyperion-flecs-c = { path = "../../vendor/hyperion-flecs-c", features = ["pipeline", "script"] }
 harness-vt = { path = "../harness-vt" }
+harness-ghostty-config = { path = "../harness-ghostty-config" }
 serde_json = "1"
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"

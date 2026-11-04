@@ -718,6 +718,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-ghostty-config"
+version = "0.1.0"
+
+[[package]]
 name = "harness-native"
 version = "0.1.0"
 dependencies = [
@@ -725,6 +729,7 @@ dependencies = [
  "bytemuck",
  "dispatch2",
  "harfrust",
+ "harness-ghostty-config",
  "harness-native-api",
  "harness-native-ecs",
  "harness-native-flecs",
@@ -980,6 +985,7 @@ dependencies = [
 name = "harness-vt"
 version = "0.1.0"
 dependencies = [
+ "harness-ghostty-config",
  "libghostty-vt",
 ]
 

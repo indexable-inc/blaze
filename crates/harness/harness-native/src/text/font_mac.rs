@@ -61,6 +61,20 @@ impl FontSource for Font {
         (f.post_script_name() == name).then_some(f)
     }
 
+    fn family(family: &str, size: f32) -> Option<Self> {
+        let name = CFString::from_str(family);
+        // SAFETY: a plain read of CoreText's key constant.
+        let key = unsafe { objc2_core_text::kCTFontFamilyNameAttribute };
+        let attrs = CFDictionary::<CFType, CFType>::from_slices(&[cf(key)], &[cf(&*name)]);
+        // SAFETY: a dictionary of descriptor attributes.
+        let desc = unsafe { CTFontDescriptor::with_attributes(attrs.as_opaque()) };
+        // SAFETY: a live descriptor; a null matrix is the identity.
+        let f = Self(unsafe { CTFont::with_font_descriptor(&desc, CGFloat::from(size), std::ptr::null()) });
+        // SAFETY: a plain getter on a live font.
+        let got = unsafe { f.0.family_name() }.to_string();
+        got.eq_ignore_ascii_case(family).then_some(f)
+    }
+
     fn system(size: f32, bold: bool) -> Self {
         let kind = if bold { CTFontUIFontType::EmphasizedSystem } else { CTFontUIFontType::System };
         // SAFETY: valid UI font type and size; None language means the current one.

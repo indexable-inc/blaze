@@ -15,61 +15,77 @@ use std::rc::Rc;
 /// A colour as the shaders take it (straight RGBA, sRGB).
 pub type Rgba = [f32; 4];
 
-/// The grid's look: default ink and ground, the 16 ANSI colours, cursor, the default cursor's accent and selection.
+/// The grid's look: default ink and ground, the 256-colour palette, cursor (and the glyph under a block cursor), the
+/// default cursor's accent and blink, and selection. From the user's Ghostty theme ([`Theme::from_ghostty`]), else the
+/// built-in dark one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub fg: Rgba,
     pub bg: Rgba,
-    pub ansi: [Rgba; 16],
+    pub palette: [Rgba; 256],
     pub cursor: Rgba,
+    /// The glyph's ink under a block cursor (Ghostty's cursor-text); None: the ground.
+    pub cursor_text: Option<Rgba>,
     /// The default cursor (a thin bar) when the program has not set one.
     pub accent: Rgba,
+    /// Whether that default cursor blinks (Ghostty's cursor-style-blink = true).
+    pub blink: bool,
+    /// Laid over a selected cell's ground (an opaque colour replaces it: Ghostty's selection-background).
     pub select: Rgba,
+    /// A selected cell's ink (Ghostty's selection-foreground); None: its own.
+    pub select_fg: Option<Rgba>,
 }
 
 const fn hex(v: u32) -> Rgba {
     [((v >> 16) & 0xff) as f32 / 255.0, ((v >> 8) & 0xff) as f32 / 255.0, (v & 0xff) as f32 / 255.0, 1.0]
 }
 
-pub const DARK: Theme = Theme {
-    fg: hex(0xdcdce0),
-    bg: hex(0x121214),
-    ansi: [
-        hex(0x2a2a2e),
-        hex(0xeb6b6b),
-        hex(0x4cb782),
-        hex(0xf2bb52),
-        hex(0x6e8cff),
-        hex(0xc48cff),
-        hex(0x5ec4d6),
-        hex(0xc9c9cf),
-        hex(0x5c5c64),
-        hex(0xff8a8a),
-        hex(0x6fd6a0),
-        hex(0xffd27a),
-        hex(0x93a9ff),
-        hex(0xd7aaff),
-        hex(0x86dbe8),
-        hex(0xededf0),
-    ],
-    cursor: hex(0xd0d0ff),
-    accent: hex(0x8b9cff),
-    select: [0.533, 0.553, 1.0, 0.28],
-};
+/// A Ghostty colour as the shaders take it.
+#[must_use]
+pub fn rgb([r, g, b]: [u8; 3]) -> Rgba {
+    [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0]
+}
 
-/// The 256-colour palette's colour `i` (16..=255: the 6x6x6 cube, then the greys).
-fn idx(theme: &Theme, i: u8) -> Rgba {
-    match i {
-        0..=15 => theme.ansi[usize::from(i)],
-        16..=231 => {
-            let i = i - 16;
-            let step = |c: u8| if c == 0 { 0.0 } else { (55.0 + 40.0 * f32::from(c)) / 255.0 };
-            [step(i / 36), step((i / 6) % 6), step(i % 6), 1.0]
-        }
-        _ => {
-            let v = (8.0 + 10.0 * f32::from(i - 232)) / 255.0;
-            [v, v, v, 1.0]
+impl Theme {
+    /// harness's own dark theme (with no Ghostty config, in both appearances).
+    #[must_use]
+    pub fn builtin() -> Self {
+        let b = harness_ghostty_config::builtin();
+        Self {
+            fg: rgb(b.fg),
+            bg: rgb(b.bg),
+            palette: b.palette.map(rgb),
+            cursor: hex(0xd0d0ff),
+            cursor_text: None,
+            accent: hex(0x8b9cff),
+            blink: false,
+            select: [0.533, 0.553, 1.0, 0.28],
+            select_fg: None,
         }
     }
+
+    /// One appearance's Ghostty theme; what it leaves unset (cursor, selection) stays the built-in theme's.
+    #[must_use]
+    pub fn from_ghostty(t: &harness_ghostty_config::Theme, blink: bool) -> Self {
+        let b = Self::builtin();
+        let cursor = t.cursor.map(rgb);
+        Self {
+            fg: rgb(t.fg),
+            bg: rgb(t.bg),
+            palette: t.palette.map(rgb),
+            cursor: cursor.unwrap_or(b.cursor),
+            cursor_text: t.cursor_text.map(rgb),
+            accent: cursor.unwrap_or(b.accent),
+            blink,
+            select: t.selection_bg.map_or(b.select, rgb),
+            select_fg: t.selection_fg.map(rgb),
+        }
+    }
+}
+
+/// The 256-colour palette's colour `i`.
+fn idx(theme: &Theme, i: u8) -> Rgba {
+    theme.palette[usize::from(i)]
 }
 
 fn colour(theme: &Theme, c: harness_vt::Color, fg: bool) -> Option<Rgba> {
@@ -209,6 +225,17 @@ impl Grid {
             blink: Blink::default(),
             animating: false,
         }
+    }
+
+    /// A cell's width and height, device pixels.
+    #[must_use]
+    pub fn cwp(&self) -> i32 {
+        self.cwp
+    }
+
+    #[must_use]
+    pub fn chp(&self) -> i32 {
+        self.chp
     }
 
     /// Columns and rows that fit in `w` x `h` points.
@@ -418,20 +445,24 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     let look = snap.cursor_look;
     // The program's DECSCUSR shape and blink (1, 3, 5 blink), else the default (no DECSCUSR, or 0, which Ghostty reads as
     // "the configured default"): a steady thin bar in the accent colour, so an idle pane draws no frames.
-    let (shape, blinking, cursor_ink) = if look.explicit { (look.shape, look.blinking, theme.cursor) } else { (harness_vt::CursorShape::Bar, false, theme.accent) };
+    let (shape, blinking, cursor_ink) = if look.explicit { (look.shape, look.blinking, theme.cursor) } else { (harness_vt::CursorShape::Bar, theme.blink, theme.accent) };
     let alpha = grid.cursor_alpha(snap, p, blinking, show_cursor);
     let inverts = show_cursor && p.focused && shape == harness_vt::CursorShape::Block;
     let mut sprites: Vec<SpriteInst> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
     let ink_at = |cell: &Cell, r: u16, c: u16| {
-        let mut ink = cell.fg;
+        let mut ink = match theme.select_fg {
+            Some(f) if p.sel.is_some_and(|s| s.holds(i64::from(r) - p.scroll as i64, c)) => f,
+            _ => cell.fg,
+        };
         if cell.dim {
             ink[3] *= 0.6;
         }
         if inverts && (r, c) == cursor {
-            // The glyph under a block cursor in the ground's colour, as solid as the cursor is.
+            // The glyph under a block cursor in the cursor-text colour (else the ground's), as solid as the cursor is.
+            let under = theme.cursor_text.unwrap_or(theme.bg);
             for k in 0..3 {
-                ink[k] += (theme.bg[k] - ink[k]) * alpha;
+                ink[k] += (under[k] - ink[k]) * alpha;
             }
         }
         ink

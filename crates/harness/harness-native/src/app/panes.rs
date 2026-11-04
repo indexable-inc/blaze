@@ -266,10 +266,11 @@ impl App {
             // Fit the grid inside the padding, pinned to its top-left inset (snapped to a whole device pixel so every cell
             // starts on one); what is left of a cell goes to the right and bottom. Balancing it on both sides would
             // re-centre the text by half a cell each time the column count changes (a jolt at the end of a cmd+S fold).
-            let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
+            let [pl, pr, pt, pb] = self.look.pad;
+            let (cols, rows) = self.grid.fit(l.w - pl - pr, l.h - pt - pb);
             let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
             let snap = |v: f32| (v * self.grid.scale).round() / self.grid.scale;
-            self.put(t, TermGrid { x: snap(l.x + TERM_PAD.0), y: snap(l.y + TERM_PAD.1), w: gw, h: gh, cols, rows });
+            self.put(t, TermGrid { x: snap(l.x + pl), y: snap(l.y + pt), w: gw, h: gh, cols, rows });
             let o = w.entity_from_id(e);
             if let Some((n, stage)) = run {
                 // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
@@ -370,7 +371,7 @@ impl App {
         parser.set_scrollback(want);
         let shown = parser.scrollback();
         let history = if self.stats_shown() { parser.history() } else { 0 };
-        let snap = term::snapshot(parser, &term::DARK);
+        let snap = term::snapshot(parser, &self.look.themes[usize::from(self.dark)]);
         parser.set_scrollback(0);
         drop(map);
         self.stats_history(t, history);
@@ -391,7 +392,7 @@ impl App {
             focused: focus && self.focused && self.palette.is_none(),
             sel,
             scroll: shown,
-            theme: &term::DARK,
+            theme: &self.look.themes[usize::from(self.dark)],
             time: self.time,
             marked: marked.as_deref(),
         };
