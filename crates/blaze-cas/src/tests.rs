@@ -1798,15 +1798,51 @@ fn a_kind_of_short_values_trains_once_its_samples_are_full() {
         samples: vec![Vec::new(); samples],
         bytes: samples as u64 * short,
         after,
+        ..Training::default()
     };
     assert!(!kept(cold::TRAIN_VALUES, 0).ready(), "too few bytes, and samples to keep");
     assert!(!kept(cold::SAMPLES_MOST - 1, 0).ready());
     assert!(kept(cold::SAMPLES_MOST, 0).ready(), "the samples kept are full");
     assert!(!kept(cold::SAMPLES_MOST, cold::SAMPLES_MOST * 2).ready(), "it failed on these samples");
-    let long =
-        Training { samples: vec![Vec::new(); cold::TRAIN_VALUES], bytes: cold::TRAIN_BYTES, after: 0 };
+    let long = Training {
+        samples: vec![Vec::new(); cold::TRAIN_VALUES],
+        bytes: cold::TRAIN_BYTES,
+        ..Training::default()
+    };
     assert!(long.ready(), "values and bytes enough");
     assert!(!Training { samples: vec![Vec::new(); cold::TRAIN_VALUES - 1], ..long }.ready());
+}
+
+/// A short cold record of a kind with no dictionary is met by every settle, to be sampled
+/// after a reopen: it is sampled once, as a value put while the store is open is, so settles
+/// never fill the samples with copies and train on fewer values than a training needs.
+#[test]
+fn settles_sample_each_short_cold_value_once() {
+    let mut sim = Sim::new(61, quiet());
+    let mut store = open(&mut sim, "store");
+    let value = |n: u64| text(n, 200);
+    for n in 0..100 {
+        store.put(key(n), Kind::Debug, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let debug = Kind::Debug.code() as usize;
+    assert_eq!(store.training[debug].samples.len(), 100, "each put is sampled once");
+    for _ in 0..50 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(store.training[debug].samples.len(), 100, "a settle samples nothing sampled already");
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    for _ in 0..50 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(store.training[debug].samples.len(), 100, "after a reopen, settles sample each record once");
+    assert!(store.tiers[0].dictionaries.is_empty(), "100 values neither fill the samples nor reach the bytes");
+    assert_eq!(store.problems(), &[] as &[String]);
+    for n in 0..100 {
+        assert_eq!(form_of(&store, &key(n)), Form::Raw, "{n}: no dictionary, so it stays");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n));
+    }
 }
 
 #[test]
