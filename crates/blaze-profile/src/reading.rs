@@ -5,7 +5,6 @@
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use arrow_array::{
@@ -54,8 +53,8 @@ pub enum ReadingError {
         path: PathBuf,
         column: &'static str,
     },
-    /// The history could not be pinned ([`Pin`]), so which files it holds can't be told.
-    Pin(HistoryError),
+    /// The history could not be pinned and its manifest read ([`Pin`]).
+    History(HistoryError),
 }
 
 impl fmt::Display for ReadingError {
@@ -80,32 +79,34 @@ impl fmt::Display for ReadingError {
             ReadingError::Pin(error) => {
                 write!(f, "pinning the history to read its last open spans: {error}")
             }
+            ReadingError::History(error) => {
+                write!(f, "pinning the history to read its last open spans: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for ReadingError {}
 
-/// The last reading of the open spans of the process `pid` in the history `dir`, among its
-/// newest [`FILES`] `open` files; `None` where they hold none of it.
+/// The last reading of the open spans of the process `pid` in the history `dir`, among the
+/// newest [`FILES`] `open` files its manifest lists (by their latest instant, then name);
+/// `None` where they hold none of it.
 pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let schema_file = format!("schema.{}.parquet", schema::OPEN.name); // alloc: once a reading
-    // Held to the end: a merge retires `open` files, and none of these is deleted meanwhile.
-    let pin = Pin::take(dir).map_err(ReadingError::Pin)?;
-    let open = crate::history::table_at(&schema::OPEN);
+    // Held to the end: a merge or the cap retires `open` files, and none the manifest it read
+    // lists is deleted meanwhile.
+    let pin = Pin::take(dir).map_err(ReadingError::History)?;
+    let manifest = pin.manifest();
     // alloc: the history's open files, once a reading
-    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for name in pin.snapshot().files(open).iter().filter(|it| **it != schema_file) {
-        let path = dir.join(name);
-        let modified = fs::metadata(&path).and_then(|it| it.modified()).map_err(|error| {
-            ReadingError::Io { path: path.clone(), doing: "reading the time of", error }
-        })?; // clone: an error
-        files.push((modified, path));
-    }
-    // Newest first; the name (build, then flush) breaks a tie in time.
+    let mut files: Vec<(i64, &str)> = manifest
+        .entries(schema::OPEN.name)
+        .filter(|(_, entry)| entry.pid.is_none_or(|it| it == pid))
+        .map(|(name, entry)| (entry.t_ns.map_or(i64::MIN, |it| it[1]), name))
+        .collect();
     files.sort_unstable_by(|a, b| b.cmp(a));
+    // alloc: the files' paths, once a reading
+    let files: Vec<PathBuf> = files.iter().take(FILES).map(|(_, name)| dir.join(name)).collect();
     let mut best: Option<Reading> = None;
-    for (_, path) in files.iter().take(FILES) {
+    for path in &files {
         if let Some(reading) = of_file(path, pid)?
             && best.as_ref().is_none_or(|it| reading.read_ns > it.read_ns)
         {

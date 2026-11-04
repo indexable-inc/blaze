@@ -38,8 +38,6 @@ pub const STARTED_WITH: &[&str] = &[
     blaze_core::cores::VAR,
     // The DuckDB the explorer and live SQL run (`serve::engine`, read once).
     super::observe::DUCKDB,
-    // blaze-profile's const-eval following (`OnceLock`).
-    "BLAZE_PROFILE_CONST",
     // The kept expansions' check (proc-macro-api's `kept.rs`, at the daemon's setup).
     proc_macro_api::kept::CACHE,
     // Huge pages (blaze-mem's `huge.rs`, chosen once).

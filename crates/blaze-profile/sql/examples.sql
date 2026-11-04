@@ -13,19 +13,15 @@ ORDER BY dur_ns DESC
 LIMIT $limit
 
 -- name: slower_between_commits
--- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either)
-WITH runs AS (
-    SELECT builds.commit AS commit, spans.name AS name, spans.dur_ns AS dur_ns
-    FROM spans
-    JOIN builds ON builds.build_id = spans.build_id
-), earlier AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+-- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either), over each build's summary (`build_summary`): a span's median is the median of its builds' medians, so one long build counts once
+WITH earlier AS (
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $earlier)
     GROUP BY name
 ), later AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $later)
     GROUP BY name
 )
@@ -35,7 +31,9 @@ SELECT
     later.dur_ns / 1e6 AS later_ms,
     (later.dur_ns - earlier.dur_ns) / 1e6 AS slower_ms,
     earlier.runs AS earlier_runs,
-    later.runs AS later_runs
+    later.runs AS later_runs,
+    earlier.builds AS earlier_builds,
+    later.builds AS later_builds
 FROM later
 JOIN earlier ON earlier.name = later.name
 ORDER BY slower_ms DESC
@@ -408,7 +406,7 @@ GROUP BY seconds.second
 ORDER BY seconds.second
 
 -- name: uncovered_time
--- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 5%
+-- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 1% (`gate::UNCOVERED_MAX_PCT`)
 WITH bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -523,7 +521,7 @@ FROM uncovered
 ORDER BY uncovered_pct DESC
 
 -- name: raw_blocks
--- says: samples of a build's pool workers blocked in the kernel (a mutex, a condition, kevent, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
+-- says: samples of a build's pool workers blocked (off the CPU: a mutex, a condition, a poll, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
 WITH RECURSIVE bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -538,7 +536,7 @@ WITH RECURSIVE bounds AS (
     JOIN workers USING (process, thread)
     CROSS JOIN bounds
     WHERE samples.t_ns BETWEEN t0 AND t1
-        AND regexp_matches(array_to_string(samples.stack, ' > '), '(psynch_mutexwait|psynch_cvwait|kevent|__semwait_signal|(^| > )(read|__read_nocancel)\+)')
+        AND samples.cpu = 'off'
 ), up AS (
     SELECT blocked.process, blocked.span_id AS sampled, spans.span_id, spans.parent, spans.name
     FROM blocked JOIN spans ON spans.process = blocked.process AND spans.span_id = blocked.span_id
@@ -646,16 +644,18 @@ LIMIT $limit
 -- says: each region of each image a build linked, by address, as the stage that laid it out said it (`link region` events, crates/blaze-link/src/shape.rs): its section and class, address, bytes placed, room, and the bytes unused before it
 WITH regions AS (
     SELECT
-        regexp_extract(message, ' image=(\S+)', 1) AS image,
-        cast(regexp_extract(message, ' generation=(\d+)', 1) AS bigint) AS generation,
-        regexp_extract(message, ' full=(\S+)', 1) = 'true' AS whole,
-        cast(regexp_extract(message, ' addr=(\d+)', 1) AS bigint) AS addr,
-        cast(regexp_extract(message, ' size=(\d+)', 1) AS bigint) AS size,
-        cast(regexp_extract(message, ' capacity=(\d+)', 1) AS bigint) AS capacity,
-        regexp_extract(message, ' section=(\S+)', 1) AS section,
-        regexp_extract(message, ' class=(.*)$', 1) AS class
-    FROM events
-    WHERE build_id = $build AND starts_with(message, 'link region ')
+        max(v.value_text) FILTER (WHERE v.key = 'image') AS image,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'generation') AS BIGINT) AS generation,
+        max(v.value_bool) FILTER (WHERE v.key = 'full') AS whole,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'addr') AS BIGINT) AS addr,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'size') AS BIGINT) AS size,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'capacity') AS BIGINT) AS capacity,
+        max(v.value_text) FILTER (WHERE v.key = 'section') AS section,
+        max(v.value_text) FILTER (WHERE v.key = 'class') AS class
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id = $build AND e.message = 'link region'
+    GROUP BY e.process, e.event_id
 )
 SELECT
     image,
@@ -674,15 +674,17 @@ ORDER BY image, generation, addr
 -- says: the code of each image a build linked (its code, patch, stub and executable named regions), by backend (stencil, cranelift, llvm, native, linker, unsaid) and by crate (the 16 largest, then the rest as one row): pieces and bytes, as the stage that laid it out said it (`link code` events, crates/blaze-link/src/shape.rs); an incremental stage's rows count only the code it placed
 WITH code AS (
     SELECT
-        regexp_extract(message, ' image=(\S+)', 1) AS image,
-        cast(regexp_extract(message, ' generation=(\d+)', 1) AS bigint) AS generation,
-        regexp_extract(message, ' full=(\S+)', 1) = 'true' AS whole,
-        regexp_extract(message, ' by=(\S+)', 1) AS summed_by,
-        cast(regexp_extract(message, ' pieces=(\d+)', 1) AS bigint) AS pieces,
-        cast(regexp_extract(message, ' bytes=(\d+)', 1) AS bigint) AS code_bytes,
-        regexp_extract(message, ' what=(.*)$', 1) AS what
-    FROM events
-    WHERE build_id = $build AND starts_with(message, 'link code ')
+        max(v.value_text) FILTER (WHERE v.key = 'image') AS image,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'generation') AS BIGINT) AS generation,
+        max(v.value_bool) FILTER (WHERE v.key = 'full') AS whole,
+        max(v.value_text) FILTER (WHERE v.key = 'by') AS summed_by,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'pieces') AS BIGINT) AS pieces,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'bytes') AS BIGINT) AS code_bytes,
+        max(v.value_text) FILTER (WHERE v.key = 'what') AS what
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id = $build AND e.message = 'link code'
+    GROUP BY e.process, e.event_id
 )
 SELECT image, generation, whole, summed_by, what, pieces, code_bytes
 FROM code

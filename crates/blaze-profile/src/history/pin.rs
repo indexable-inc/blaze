@@ -1,5 +1,5 @@
-//! The IO of [`super::retire`]: a reader's [`Pin`] on a history's directory, and the writer's
-//! look at the pins ([`pinned`]) and read of [`RETIRED`] ([`read_retired`]).
+//! The IO of [`super::retire`]: a reader's [`Pin`] on a history's directory, holding the
+//! manifest it read, and the writer's look at the pins ([`pinned`]).
 
 use std::{
     fs, io,
@@ -9,15 +9,17 @@ use std::{
 
 use super::{
     HistoryError, io_error,
-    retire::{self, PINS, PinFile, Pinned, RETIRED, Retired, Snapshot},
+    manifest::{self, Manifest},
+    retire::{self, PINS, PinFile, Pinned},
 };
 
-/// A reader's hold on a history's directory: while it lives, no file of its [`Snapshot`] is
-/// deleted. Held until the reader's last read of those files has ended (DuckDB has exited).
+/// A reader's hold on a history's directory: while it lives, no file the manifest it read
+/// lists is deleted. Held until the reader's last read of those files has ended (DuckDB has
+/// exited).
 pub struct Pin {
-    /// Read by nothing: dropped with the pin, it lets the writer delete the snapshot's files.
+    /// Read by nothing: dropped with the pin, it lets the writer delete the manifest's files.
     _held: Held,
-    snapshot: Snapshot,
+    manifest: Manifest,
 }
 
 /// A pin's files in [`PINS`]: its lock file, held locked, and the file saying its generation.
@@ -41,10 +43,9 @@ impl Drop for Held {
 }
 
 impl Pin {
-    /// Pins the history `dir` and resolves the files of each table a reader reads there
-    /// ([`Snapshot::resolve`]): its lock file is made and locked under a hidden name and named
-    /// into [`PINS`], then [`RETIRED`] is read, then the generation read is said, then the
-    /// directory is listed (the order [`super::retire`] proves safe).
+    /// Pins the history `dir` and reads its manifest ([`manifest::read`]): its lock file is
+    /// made and locked under a hidden name and named into [`PINS`], then the manifest is read,
+    /// then the generation it is of is said (the order [`super::retire`] proves safe).
     pub fn take(dir: &Path) -> Result<Pin, HistoryError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let pins = dir.join(PINS);
@@ -92,40 +93,22 @@ impl Pin {
             held.lock_path = making;
             return Err(error);
         }
-        let retired = read_retired(dir)?;
-        let said = pins.join(PinFile::Said { id: &id, generation: retired.generation }.file_name());
+        let manifest = manifest::read(dir)?;
+        let generation = manifest.retired().generation;
+        let said = pins.join(PinFile::Said { id: &id, generation }.file_name());
         fs::write(&said, b"").map_err(io_error(&said, "saying the generation a reader read"))?;
         held.said = Some(said);
-        // alloc: the directory's names, once a pin
-        let mut listing = Vec::new();
-        for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
-            let entry = entry.map_err(io_error(dir, "listing"))?;
-            if let Ok(name) = entry.file_name().into_string() {
-                listing.push(name);
-            }
-        }
-        let snapshot = Snapshot::resolve(dir, &listing, &retired);
-        Ok(Pin { _held: held, snapshot })
+        Ok(Pin { _held: held, manifest })
     }
 
-    /// The files of each table the reader reads.
-    pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+    /// The manifest the reader read: the files it reads, which stay on disk while the pin
+    /// lives.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
     }
 }
 
-/// [`RETIRED`] of the history `dir`: none retired, generation 0, where there is no such file
-/// (a history no blaze with pins wrote).
-pub(crate) fn read_retired(dir: &Path) -> Result<Retired, HistoryError> {
-    let path = dir.join(RETIRED);
-    match fs::read_to_string(&path) {
-        Ok(text) => Retired::decode(&text).map_err(|why| HistoryError::Retired { path, why }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Retired::default()),
-        Err(error) => Err(io_error(&path, "reading")(error)),
-    }
-}
-
-/// What the live pins of the history `dir` hold, for the writer, which has published every
+/// What the live pins of the history `dir` hold, for the writer, which has committed every
 /// retirement it reaps before it calls this. A lock file no one holds is a dead reader's: it is
 /// deleted, with what that reader said, and so are a dead process's half-made pins.
 pub(crate) fn pinned(dir: &Path) -> Result<Vec<Pinned>, HistoryError> {
@@ -202,4 +185,26 @@ pub(crate) fn pinned(dir: &Path) -> Result<Vec<Pinned>, HistoryError> {
         }
     }
     Ok(retire::pinned(&live, &said))
+}
+
+/// The highest generation any reader in [`PINS`] of the history `dir` said, live or not (0:
+/// none): where an adopted history's generation starts, so no reader still running took it to
+/// cover files retired after adoption.
+pub(crate) fn said_most(dir: &Path) -> Result<u64, HistoryError> {
+    let pins = dir.join(PINS);
+    let entries = match fs::read_dir(&pins) {
+        Ok(it) => it,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_error(&pins, "listing")(error)),
+    };
+    let mut most = 0;
+    for entry in entries {
+        let entry = entry.map_err(io_error(&pins, "listing"))?;
+        if let Some(PinFile::Said { generation, .. }) =
+            entry.file_name().to_str().and_then(PinFile::parse)
+        {
+            most = most.max(generation);
+        }
+    }
+    Ok(most)
 }

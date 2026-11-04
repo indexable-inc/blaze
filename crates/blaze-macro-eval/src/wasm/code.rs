@@ -126,6 +126,7 @@ impl Codes {
                 let module = deserialize(engines, &code)?;
                 // clone: as above
                 self.memo.pin().insert(id, module.clone());
+                name_code(&module, what);
                 return Ok((Loaded { module, put: None }, ModuleFrom::Store, Some(len)));
             }
         }
@@ -145,8 +146,41 @@ impl Codes {
         let code_bytes = put.as_ref().map(|it| it.value.len() as u64);
         // clone: as above
         self.memo.pin().insert(id, module.clone());
+        name_code(&module, what);
         Ok((Loaded { module, put }, ModuleFrom::Compiled, code_bytes))
     }
+}
+
+/// Registers `module`'s machine code (its `.text`, where Wasmtime runs it) and its functions'
+/// places in it with the profiler's code maps (`ix_prof::jit`), so a CPU sample inside a proc
+/// macro names the macro's function, not `[code in no image]`. The map keeps the module, as
+/// the memo does for the daemon's life, so its range never names freed code. A module two
+/// threads compiled at once is registered for each copy; the one the memo dropped stays alive
+/// in the map.
+fn name_code(module: &Module, what: &str) {
+    let text = module.text();
+    let functions = module
+        .functions()
+        .map(|it| ix_prof::jit::Function {
+            offset: it.offset as u64,
+            len: it.len as u64,
+            name: it.name.as_deref().map(ix_prof::symbols::demangle),
+            index: it.index.as_u32(),
+        })
+        // alloc: once per module loaded, kept for the daemon's life as the module is
+        .collect();
+    ix_prof::jit::register(
+        ix_prof::jit::CodeMap {
+            start: text.as_ptr().addr() as u64,
+            len: text.len() as u64,
+            // alloc: as above
+            module: format!("wasm module {what}"),
+            functions,
+        },
+        // clone: a module shares its code, so this copies a pointer
+        // alloc: as above
+        Box::new(module.clone()),
+    );
 }
 
 /// The machine code `store` keeps under `key`, when its own directory keeps it as a

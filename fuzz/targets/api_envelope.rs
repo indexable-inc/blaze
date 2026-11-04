@@ -300,7 +300,7 @@ fn seeds() -> Vec<Vec<u8>> {
         Request::Explore { dev: true },
         Request::Profile { seconds: 60 },
         Request::Live,
-        Request::Sql { sql: "select 1".to_owned(), last_s: 30 },
+        Request::Flush,
     ];
     let span = Span {
         file: "src/lib.rs".to_owned(),
@@ -385,6 +385,7 @@ fn seeds() -> Vec<Vec<u8>> {
             linked_paths: Vec::new(),
         }),
         Response::Work(Worked {
+            build_id: Some(7),
             link: LinkKind::Patched,
             found: 1,
             green: 2,
@@ -496,7 +497,7 @@ fn seeds() -> Vec<Vec<u8>> {
             skipped: u64::MAX,
             counters: Vec::new(),
         }),
-        Response::Queried { ipc: vec![1, 2, 3], rows: 3 },
+        Response::Flushed { seq: 3 },
         Response::Done { ok: false },
         Response::Error(ApiError::new("no such head as `x`", Some("x".to_owned()))),
         Response::Opened { root: id(8) },

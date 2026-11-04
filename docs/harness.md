@@ -515,6 +515,8 @@ for each platform, each on a machine of its own kind.
 |---|---|---|---|
 | `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux x86-64 and macOS, `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from cold: nothing pushes its store); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
 | `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
+| `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
 | `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
@@ -525,7 +527,9 @@ those files, and why each: the crates (`crates/`, with their test data and the L
 `crates/hir-ty-codegen/llvm.json`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
 pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
-(which fetches the pinned LLVM), the release of blaze that builds blaze (`.github/blaze-version`,
+(which fetches the pinned LLVM), the profile gate's script and known list
+(`harness/profile_gate.py`, `harness/profile-gate-known.toml`) and the flake that pins its
+DuckDB (`flake.nix`, `flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`,
 `site/install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
 `blaze`, `blaze-remote`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
@@ -551,9 +555,10 @@ A change reaches main through a **pull request** alone
 there is no merge queue, and the branch need not be up to date with main (removed 2026-10-27:
 the queue's wait and its reruns on entries that later landed unchanged cost more than the rare
 pair of changes that pass alone and break together, which the train catches on main). The gate
-is the build and the unit tests, and the released blaze checking the workspace: a change that
-does not build, breaks a unit test, or leaves a workspace the release cannot load and check,
-does not merge. What the harnesses find, they find on main, in the train, which says
+is the build and the unit tests, the released blaze checking the workspace, and the profile's
+gate over the build's own history: a change that does not build, breaks a unit test, leaves a
+workspace the release cannot load and check, or makes a gate check fail or stop running that the
+known list does not name, does not merge. What the harnesses find, they find on main, in the train, which says
 which commits since the last green train it came in with. Before the gate was this small, a
 merge-queue run took 35 to 45 minutes, nearly all of it harnesses (harness/ci.py's `quick-2`
 on every platform), and 51 of 140 queue runs on 2026-10-25 and 26 failed, most of them on

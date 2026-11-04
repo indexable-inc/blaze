@@ -22,7 +22,7 @@ use crate::{
     ViewRef, Worked,
 };
 
-const REQUESTS: usize = 34;
+const REQUESTS: usize = 35;
 const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
@@ -305,7 +305,7 @@ impl Gen {
             24 => Request::Explore { dev: self.yes() },
             25 => Request::Profile { seconds: self.u32() },
             26 => Request::Live,
-            27 => Request::Sql { sql: self.text(), last_s: self.u32() },
+            27 => Request::Flush,
             28 => Request::Hot {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
@@ -324,6 +324,14 @@ impl Gen {
                 digest: self.text(),
                 most_bytes: if self.yes() { Some(self.wide()) } else { None },
                 out: self.maybe_text(),
+            },
+            33 => Request::ClientRows {
+                build: self.wide(),
+                events: self.bytes(),
+                folded: self.bytes(),
+                spans: self.bytes(),
+                ended_ns: self.wide() as i64,
+                started_ns: self.wide() as i64,
             },
             _ => Request::Stop,
         }
@@ -558,6 +566,7 @@ impl Gen {
                     outcome: ServedPart::ALL[(g.next() % 3) as usize],
                     package: g.text(),
                 }),
+                build_id: self.maybe(Gen::wide),
                 compiled: self.wide(),
                 steps_us: self.many(depth, |g| {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
@@ -697,7 +706,7 @@ impl Gen {
                 skipped: self.wide(),
                 counters: self.bytes(),
             }),
-            32 => Response::Queried { ipc: self.bytes(), rows: self.wide() },
+            32 => Response::Flushed { seq: self.wide() },
             33 => Response::Hot(crate::Hot {
                 keys: self.many(depth, |g| crate::HotKey {
                     span: g.text(),
@@ -933,13 +942,14 @@ fn request_index(request: &Request) -> usize {
         Request::Explore { .. } => 24,
         Request::Profile { .. } => 25,
         Request::Live => 26,
-        Request::Sql { .. } => 27,
+        Request::Flush => 27,
         Request::Hot { .. } => 28,
         Request::Gc { .. } => 29,
         Request::Rebuilt { .. } => 30,
         Request::Launch { .. } => 31,
         Request::FetchUrl { .. } => 32,
-        Request::Stop => 33,
+        Request::ClientRows { .. } => 33,
+        Request::Stop => 34,
     }
 }
 
@@ -978,7 +988,7 @@ fn response_index(response: &Response) -> usize {
         Response::Explored { .. } => 29,
         Response::Profiled { .. } => 30,
         Response::Live(_) => 31,
-        Response::Queried { .. } => 32,
+        Response::Flushed { .. } => 32,
         Response::Hot(_) => 33,
         Response::Collected { .. } => 34,
         Response::UnitBegan(_) => 35,

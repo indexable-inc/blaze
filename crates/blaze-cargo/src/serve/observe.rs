@@ -6,8 +6,10 @@
 //!   alone has them; a simulation's daemon has none, and the requests that read them fail
 //!   saying so.
 //! - [`Observe`]: what the loop holds for the requests it answers itself: the explorer
-//!   (`blaze explore`), each live subscriber's feed (`blaze debug live`) and the live SQL
-//!   queries, each run on a thread of its own (`blaze debug sql --live`).
+//!   (`blaze explore`), each live subscriber's feed (`blaze debug live`), and each reader's
+//!   ask that the history flush ([`blaze_api::Request::Flush`]), which the history's thread
+//!   answers once the flush has committed: what `blaze debug sql`, `blaze slow` and
+//!   `blaze debug time` ask first, so they read every row recorded before they asked.
 //!
 //! The explorer's link carries its session's token: it goes to the client in
 //! [`Response::Explored`] and nowhere else, never to a log.
@@ -30,7 +32,6 @@ use blaze_profile::{
     facts::{CrateDepRow, KeyPartRow, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
-    sql,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
@@ -180,6 +181,8 @@ enum Step {
     Closing = 6,
     /// Flushing the rows the history's drain thread took past [`history::FLUSH_ROWS`].
     FlushingFull = 7,
+    /// Flushing for a reader that asked ([`ToHistory::Flush`]).
+    FlushingAsked = 8,
 }
 
 impl Doing {
@@ -203,6 +206,7 @@ impl Doing {
             Step::Flushing,
             Step::Closing,
             Step::FlushingFull,
+            Step::FlushingAsked,
         ]
         .into_iter()
         .find(|step| *step as u64 == it >> 56);
@@ -227,6 +231,9 @@ impl Doing {
                     history::FLUSH_ROWS
                 )
             }
+            Some(Step::FlushingAsked) => {
+                "flushing the profile history for a reader that asked".to_owned()
+            }
             None => format!("in step {}, which this blaze does not know", it >> 56),
         }
     }
@@ -238,6 +245,11 @@ enum Told {
     Restored { torn: Option<String>, dropped: Option<u64> },
     /// A build's misses explained.
     Explained { answer: Answer, dropped: Option<u64> },
+    /// The flush a reader asked for ([`ToHistory::Flush`]) committed, with its number, or
+    /// failed, saying why.
+    Flushed { to: RequestRef, seq: Result<u64, String> },
+    /// A client's rows written, or why they were not: what its request is answered.
+    ClientWritten { to: RequestRef, written: Result<(), String> },
 }
 
 /// A build that ended, as the history's rows: its own, each image it linked, and an edge of
@@ -249,18 +261,39 @@ pub struct Ended {
     /// Why each thing it computed again was not reused, its own alone, sorted and each once
     /// ([`blaze_kernel::Miss`]): what `blaze why` explains.
     pub misses: Vec<blaze_kernel::Miss>,
+    /// The tests its runs finished, one row each.
+    pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
     /// Its front end's run log: each memo that ran again and why, each untracked read by name
     /// ([`provenance_rows`]).
     pub provenance: Vec<ProvenanceRow>,
 }
 
-/// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends.
+/// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
+/// a reader's ask for a flush.
 enum ToHistory {
     /// Its row with outcome running and no end, written at once: the row a build has if its
     /// daemon dies before it ends ([`history::writes`]).
     Started(BuildRow),
     Ended(Finished),
+    /// Flush now, and tell the loop the flush's number ([`Told::Flushed`]): every row recorded
+    /// before the ask is drained by this flush, so a reader that reads the manifest it
+    /// committed reads them.
+    Flush(RequestRef),
+    /// Flush now for the explorer's next query, and send the flush's number (or why it failed)
+    /// to the explorer's thread that waits for it ([`explorer_flush`]).
+    FlushFor(Sender<Result<u64, String>>),
+    /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
+    /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
+    Client {
+        to: RequestRef,
+        rows: history::ClientRows,
+    },
 }
+
+/// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
+/// before it fails naming what the history's thread is doing (rule 15). A flush is about
+/// 10-100 ms; a build's end flush, which merges, a few seconds.
+pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 
 /// What the `blaze-history` thread writes of a build that ended: its rows (with its misses,
 /// which it explains against `blaze why`'s ledger, and its run log) and what the query engine
@@ -405,9 +438,14 @@ impl Keeper {
     }
 }
 
-/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on;
-/// a history that does not open is the error, which fails `blaze serve`.
-pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling, Keeper), String> {
+/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on,
+/// writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]); a history that does not
+/// open is the error, which fails `blaze serve`.
+pub fn keep_history(
+    state: &Path,
+    duckdb: Option<PathBuf>,
+    events: blaze_profile::logs::Policy,
+) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
     let owner = claim(&dir).map_err(|it| it.to_string())?;
     let (ended, rows) = crossbeam_channel::unbounded();
@@ -424,7 +462,24 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             // from what this one wrote.
             let _owner = owner;
             match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
-                Ok(history) => {
+                Ok(mut history) => {
+                    history.events_policy(events);
+                    // The daemon's own panics go to its history, and a fatal signal of it to
+                    // `crash.<pid>` beside it, which the next daemon's history turns into a row.
+                    history.record_panics();
+                    if let Err(why) = blaze_profile::crash::arm(&at) {
+                        tracing::warn!("{why}");
+                        eprintln!("blaze serve: {why}");
+                    }
+                    // The recorder's rows outlive a crash from here on: the next daemon writes
+                    // what this one had not flushed. One that can't be kept is said, not fatal.
+                    if let Err(error) = history.persist_recorder() {
+                        tracing::warn!("{error}");
+                        _ = failed_to.send(error.to_string()); // alloc: error path, once a daemon
+                    }
+                    // Every child the drivers reap from now on is a `processes` row of the
+                    // history's next flush: installed only where a history takes them.
+                    blaze_profile::facts::observe_children();
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);
@@ -561,13 +616,43 @@ fn keep(
         // In a task of the profile's tag, so what a flush reads and keeps (the rings' rows,
         // the history's buffers) is named on the daemon's memory line.
         let (flushed, last) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| match next {
+            Ok(ToHistory::Flush(to)) => {
+                doing.set(Step::FlushingAsked, 0);
+                let flushed = history.flush(None);
+                let seq = match &flushed {
+                    Ok(it) => Ok(it.seq),
+                    // alloc: error path, a flush that failed
+                    Err(error) => Err(format!("the profile history's flush failed: {error}")),
+                };
+                _ = told.send(Told::Flushed { to, seq });
+                (flushed, false)
+            }
+            Ok(ToHistory::FlushFor(reply)) => {
+                doing.set(Step::FlushingAsked, 0);
+                let flushed = history.flush(None);
+                let seq = match &flushed {
+                    Ok(it) => Ok(it.seq),
+                    // alloc: error path, a flush that failed
+                    Err(error) => Err(format!("the profile history's flush failed: {error}")),
+                };
+                _ = reply.send(seq);
+                (flushed, false)
+            }
             Ok(ToHistory::Started(row)) => {
                 doing.set(Step::Flushing, row.build_id);
                 history.build_started(row);
                 (history.flush(None), false)
             }
+            Ok(ToHistory::Client { to, rows }) => {
+                let build = rows.build;
+                doing.set(Step::Flushing, build);
+                let flushed = history.client_rows(rows).and_then(|()| history.flush(Some(build)));
+                let written = flushed.as_ref().map(|_| ()).map_err(ToString::to_string);
+                _ = told.send(Told::ClientWritten { to, written });
+                (flushed, false)
+            }
             Ok(ToHistory::Ended(Finished {
-                ended: Ended { mut row, links, crate_deps, misses, provenance },
+                ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
                 query_counts,
             })) => {
                 let build = row.build_id;
@@ -600,6 +685,7 @@ fn keep(
                 history.ran(provenance);
                 history.keyed(keyed);
                 history.missed(misses);
+                history.tests_ran(test_runs);
                 history.build_ended(row);
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
@@ -614,6 +700,8 @@ fn keep(
                     tracing::error!("{error}");
                     _ = failed.send(error);
                 }
+                // Builds still under way as the daemon stops write the DEBUG events held for them.
+                history.release_held();
                 (history.flush(None), true)
             }
         });
@@ -664,16 +752,10 @@ struct Subscriber {
     frame: Frame,
 }
 
-/// A live SQL query running on its thread: a message on `stop` kills its DuckDB.
-struct Querying {
+/// A reader's flush given to the history's thread, failed at `until` on the loop's clock.
+struct Flushing {
     to: RequestRef,
-    stop: crossbeam_channel::Sender<()>,
-}
-
-/// What a query's thread answered.
-struct Answered {
-    to: RequestRef,
-    answer: Result<(Vec<u8>, u64), ApiError>,
+    until: Duration,
 }
 
 /// What the loop holds for the requests it answers itself.
@@ -685,9 +767,8 @@ pub struct Observe {
     live: Vec<Subscriber>,
     /// When the subscribers are sent their next frames, on the driver's clock.
     next_frame: Duration,
-    querying: Vec<Querying>,
-    answered_to: Sender<Answered>,
-    answered: Receiver<Answered>,
+    /// The readers' flushes given to the history's thread and not yet answered, oldest first.
+    flushing: Vec<Flushing>,
     /// The history's last error, for [`blaze_api::Status::history`].
     history_error: Option<String>,
     /// What `blaze why` is answered from: each workspace's last build's reasons.
@@ -718,19 +799,68 @@ struct Asked {
     until: Duration,
 }
 
+/// The explorer's flush before each query (decision 3: a query reads every row recorded
+/// before it was asked, as a CLI reader's [`blaze_api::Request::Flush`] does): asks the
+/// history's thread to flush ([`ToHistory::FlushFor`]) and waits for the flush's number, at
+/// most [`FLUSH_WAIT`], on the explorer's own blocking thread, never the loop. Past the wait,
+/// or with the history's thread gone, an error names what the thread is doing.
+///
+/// Queries that wait together share one flush: a query takes a ticket as it asks, and a flush
+/// that took a later ticket as it began drained every row recorded before the ask, so its
+/// number answers the query too. A page that asks for many tiles at once costs one flush, not
+/// one each.
+#[cfg(feature = "native")]
+fn explorer_flush(profiling: &Profiling) -> blaze_explore::Flush {
+    // clone: the history's sender and its step, once an explorer
+    let (ended, doing) = (profiling.ended.clone(), Arc::clone(&profiling.doing));
+    let tickets = AtomicU64::new(0);
+    // The last flush done for the explorer: the ticket it took as it began, and its number.
+    let last: parking_lot::Mutex<Option<(u64, u64)>> = parking_lot::Mutex::new(None);
+    blaze_explore::Flush::new(move || {
+        let asked = tickets.fetch_add(1, Ordering::SeqCst);
+        let _span = tracing::info_span!(target: "blaze", "wait for the profile history's flush for the explorer", asked).entered();
+        let mut last = last.lock();
+        if let Some((began, seq)) = *last
+            && began > asked
+        {
+            return Ok(seq);
+        }
+        let began = tickets.fetch_add(1, Ordering::SeqCst);
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        if ended.send(ToHistory::FlushFor(reply)).is_err() {
+            // alloc: error path
+            return Err("the profile history's thread (`blaze-history`) ended, so nothing flushes what the daemon recorded since its last flush".to_owned());
+        }
+        let seq = match answer.recv_timeout(FLUSH_WAIT) {
+            Ok(seq) => seq?,
+            // alloc: error path
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "the profile history's flush for the explorer took over {}s: its thread is {}",
+                    FLUSH_WAIT.as_secs(),
+                    doing.said()
+                ));
+            }
+            // alloc: error path
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("the profile history's thread (`blaze-history`) ended before it flushed for the explorer".to_owned());
+            }
+        };
+        *last = Some((began, seq));
+        Ok(seq)
+    })
+}
+
 impl Observe {
     pub fn new(profiling: Option<Profiling>) -> Observe {
-        let (answered_to, answered) = crossbeam_channel::unbounded();
         let answers = Answers::new(profiling.is_some());
         Observe {
             profiling,
             #[cfg(feature = "native")]
             explorer: None,
             live: Vec::new(),     // alloc: none until a subscriber
-            querying: Vec::new(), // alloc: none until a query
+            flushing: Vec::new(), // alloc: none until a reader asks
             next_frame: Duration::ZERO,
-            answered_to,
-            answered,
             history_error: None,
             answers,
             sent: 0,
@@ -802,6 +932,19 @@ impl Observe {
         }
     }
 
+    /// What the client of a build sent as it ended: handed to the history's thread, which
+    /// writes it and then has `to` answered ([`Told::ClientWritten`]). A daemon that keeps no
+    /// history answers at once and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
+    pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
+        let Some(profiling) = &self.profiling else {
+            return out.push(Reply { to, response: Response::Done { ok: true } });
+        };
+        if profiling.ended.send(ToHistory::Client { to, rows }).is_err() {
+            let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
+            fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+        }
+    }
+
     /// `blaze why`: what the last build computed again and why, in groups (each listing
     /// every item with `all`), or `item`'s chain of reasons.
     /// Asked of the last build of the workspace holding `cwd`; while builds that ended before
@@ -855,6 +998,7 @@ impl Observe {
                     // clone: two paths, once an explorer
                     duckdb: profiling.duckdb.clone(),
                     dir: profiling.dir.clone(), // clone: once an explorer
+                    flush: explorer_flush(profiling),
                 },
                 world: None,
                 dev_origin: dev,
@@ -893,60 +1037,45 @@ impl Observe {
         self.live.push(Subscriber { to, feed: Feed::new(), frame: Frame::default() });
     }
 
-    /// `blaze debug sql --live`: `sql` over the history and the last `last_s` seconds of the
-    /// flight recorder, run on a thread of its own (DuckDB's run is never the loop's).
-    pub fn query(&mut self, to: RequestRef, sql: String, last_s: u32, out: &mut Vec<Reply>) {
+    /// A reader of the history asks for a flush ([`blaze_api::Request::Flush`]): given to the
+    /// history's thread, which flushes at once (after what it is writing) and tells the loop
+    /// the flush's number ([`Told::Flushed`]); answered [`Response::Flushed`] then, or failed
+    /// past [`FLUSH_WAIT`] naming what the thread is doing.
+    pub fn flush(&mut self, to: RequestRef, now: Duration, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
             return fail(
                 out,
                 to,
-                ApiError::new(NO_PROFILING, Some("blaze debug sql --live".to_owned())),
+                ApiError::new(NO_PROFILING, Some("a read of the profile history".to_owned())),
             ); // alloc: error path
         };
-        let Some(duckdb) = &profiling.duckdb else {
-            let what = format!(
-                "the daemon was started with no {DUCKDB}: `nix run .#duckdb` names the DuckDB it runs"
+        if self.history_gone || profiling.ended.send(ToHistory::Flush(to)).is_err() {
+            let what = "the profile history's thread (`blaze-history`) ended, so nothing flushes what the daemon recorded since its last flush";
+            return fail(
+                out,
+                to,
+                ApiError::new(what, Some("a read of the profile history".to_owned())),
             ); // alloc: error path
-            return fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned()))); // alloc: error path
-        };
-        let (stop, stopped) = crossbeam_channel::bounded(1); // alloc: once a query
-        // clone: once a query, for its thread
-        let (duckdb, dir, answered) =
-            (duckdb.clone(), profiling.dir.clone(), self.answered_to.clone());
-        let window = Duration::from_secs(u64::from(last_s));
-        let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {
-            // alloc: once a query
-            let query = sql::Query { duckdb: &duckdb, history: &dir, sql: &sql };
-            let answer = sql::run_live_with(&query, window, &stopped)
-                .map_err(|error| sql_error(&error))
-                .and_then(|batches| ipc(&batches));
-            _ = answered.send(Answered { to, answer });
-        });
-        match spawned {
-            Ok(_) => self.querying.push(Querying { to, stop }),
-            Err(error) => {
-                let what = format!("starting the thread of a live query (`blaze-sql`): {error}"); // alloc: error path
-                fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned()))); // alloc: error path
-            }
         }
+        self.flushing.push(Flushing { to, until: now + FLUSH_WAIT });
     }
 
-    /// `conn` is gone: its subscriptions and waiting `blaze why`s end and its queries' DuckDBs are killed.
+    /// `conn` is gone: its subscriptions, waiting `blaze why`s and flushes end (a flush given
+    /// to the history's thread is still written; its answer goes nowhere).
     pub fn gone(&mut self, conn: Conn) {
         self.live.retain(|it| it.to.conn != conn);
         self.asked.retain(|it| it.to.conn != conn);
-        for querying in self.querying.iter().filter(|it| it.to.conn == conn) {
-            _ = querying.stop.try_send(());
-        }
+        self.flushing.retain(|it| it.to.conn != conn);
     }
 
     /// How long the loop may wait before its next [`Observe::tick`] is due: until the next
     /// frame while anyone subscribes, and no later than the first deadline of a waiting
-    /// `blaze why`.
+    /// `blaze why` or flush.
     pub fn wait(&self, now: Duration) -> Option<Duration> {
         let frame = (!self.live.is_empty()).then_some(self.next_frame);
         let asked = self.asked.iter().map(|it| it.until).min();
-        frame.into_iter().chain(asked).min().map(|at| at.saturating_sub(now))
+        let flushing = self.flushing.iter().map(|it| it.until).min();
+        frame.into_iter().chain(asked).chain(flushing).min().map(|at| at.saturating_sub(now))
     }
 
     /// One turn: the history's errors taken, the queries' answers sent, and once a tick is due
@@ -965,6 +1094,30 @@ impl Observe {
                         self.answers.add(answer, dropped);
                         self.explained += 1;
                         self.unexplained.pop_front();
+                    }
+                    Ok(Told::Flushed { to, seq }) => {
+                        // Gone or past its deadline: answered already, or to nobody.
+                        let Some(at) = self.flushing.iter().position(|it| it.to == to) else {
+                            continue;
+                        };
+                        self.flushing.remove(at);
+                        match seq {
+                            Ok(seq) => answer(out, to, Response::Flushed { seq }),
+                            Err(why) => fail(
+                                out,
+                                to,
+                                ApiError::new(
+                                    why,
+                                    Some("a read of the profile history".to_owned()),
+                                ),
+                            ), // alloc: error path
+                        }
+                    }
+                    Ok(Told::ClientWritten { to, written: Ok(()) }) => {
+                        out.push(Reply { to, response: Response::Done { ok: true } })
+                    }
+                    Ok(Told::ClientWritten { to, written: Err(why) }) => {
+                        fail(out, to, ApiError::new(why, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -1010,12 +1163,22 @@ impl Observe {
                 false
             });
         }
-        while let Ok(Answered { to, answer }) = self.answered.try_recv() {
-            self.querying.retain(|it| it.to != to);
-            match answer {
-                Ok((ipc, rows)) => self::answer(out, to, Response::Queried { ipc, rows }),
-                Err(error) => fail(out, to, error),
-            }
+        if !self.flushing.is_empty() {
+            let (gone, doing) = (self.history_gone, self.profiling.as_ref().map(|it| &*it.doing));
+            self.flushing.retain(|it| {
+                if !gone && now < it.until {
+                    return true;
+                }
+                let doing = doing.map_or_else(|| "gone".to_owned(), Doing::said); // alloc: error path
+                let what = match gone {
+                    // alloc: error path
+                    true => format!("the profile history's thread (`blaze-history`) ended before the flush asked for was written; it is {doing}"),
+                    // alloc: error path
+                    false => format!("the flush asked for was not written in {}s; the profile history's thread (`blaze-history`) is {doing}", FLUSH_WAIT.as_secs()),
+                };
+                fail(out, it.to, ApiError::new(what, Some("a read of the profile history".to_owned()))); // alloc: error path
+                false
+            });
         }
         if self.live.is_empty() || now < self.next_frame {
             return;
@@ -1048,14 +1211,15 @@ impl Observe {
         });
     }
 
-    /// The daemon stops: every subscription ends, every query is killed and the explorer
-    /// closes its sessions.
+    /// The daemon stops: every subscription ends, every flush not yet answered fails, and the
+    /// explorer closes its sessions.
     pub fn stop(&mut self, out: &mut Vec<Reply>) {
         for it in self.live.drain(..) {
             out.push(Reply { to: it.to, response: Response::Done { ok: true } });
         }
-        for querying in &self.querying {
-            _ = querying.stop.try_send(());
+        for it in self.flushing.drain(..) {
+            let what = "the daemon stopped before the flush asked for was answered; its last flush, as it stops, writes what it recorded";
+            fail(out, it.to, ApiError::new(what, Some("a read of the profile history".to_owned()))); // alloc: error path
         }
         #[cfg(feature = "native")]
         {
@@ -1066,12 +1230,14 @@ impl Observe {
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
+/// What a client's profile rows are named as in an error.
+const CLIENT_ROWS: &str = "a client's profile rows";
+
 /// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
-/// C: the explorer serves through Flecs and wtransport on ring) says to the explorer and to
-/// `blaze debug sql --live`'s Arrow IPC, whose encoder is the explorer's.
+/// C: the explorer serves through Flecs and wtransport on ring) says to the explorer.
 #[cfg(not(feature = "native"))]
 const NO_EXPLORER: &str = "this blaze is built without blaze-cargo's `native` feature (the seed profile), so it has no \
-                           explorer and no Arrow IPC encoder";
+                           explorer";
 
 /// The error of a `blaze why` past its deadline: the build it still waits for (the oldest
 /// given whose reasons have not come back) and what the history's thread is doing.
@@ -1106,34 +1272,6 @@ fn answer(out: &mut Vec<Reply>, to: RequestRef, response: Response) {
 fn fail(out: &mut Vec<Reply>, to: RequestRef, error: ApiError) {
     out.push(Reply { to, response: Response::Error(error) });
     out.push(Reply { to, response: Response::Done { ok: false } });
-}
-
-/// A query's error as the API says it, its kind ([`sql::SqlError::kind`]) where it failed.
-fn sql_error(error: &sql::SqlError) -> ApiError {
-    ApiError::new(error.to_string(), Some(error.kind().to_owned())) // alloc: error path
-}
-
-/// A query's batches as one Arrow IPC stream, and their rows; no bytes for no batches.
-#[cfg(feature = "native")]
-fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
-    let rows = batches.iter().map(|it| it.num_rows() as u64).sum();
-    // alloc: a query's answer, once a query
-    let mut out = Vec::new();
-    if let Some(first) = batches.first() {
-        blaze_explore::frame::ipc(&mut out, &first.schema(), batches).map_err(|error| {
-            ApiError::new(
-                format!("encoding a query's answer as Arrow IPC: {error}"),
-                Some("sql".to_owned()),
-            )
-        })?; // alloc: error path
-    }
-    Ok((out, rows))
-}
-
-/// [`NO_EXPLORER`]: the encoder is blaze-explore's.
-#[cfg(not(feature = "native"))]
-fn ipc(_batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
-    Err(ApiError::new(NO_EXPLORER, Some("sql".to_owned()))) // alloc: error path
 }
 
 #[cfg(test)]
@@ -1276,10 +1414,13 @@ mod tests {
                 joined: None,
                 tree: None,
                 blaze: None,
+                client_ns: None,
+                daemon_cpu_ns: None,
             },
             links: Vec::new(),
             crate_deps: Vec::new(),
             misses: Vec::new(),
+            test_runs: Vec::new(),
             provenance: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
@@ -1307,6 +1448,52 @@ mod tests {
         RequestRef { conn: Conn(conn), id }
     }
 
+    /// A reader's flush goes to the history's thread, which flushes and tells the loop the
+    /// flush's number; the manifest says that flush once it is told.
+    #[test]
+    fn a_readers_flush_is_written_then_told_with_its_number() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, failed) = crossbeam_channel::unbounded();
+        sent.send(ToHistory::Flush(to(4, 9))).unwrap();
+        drop(sent);
+        let (mut why, _) = File::restore(dir.path());
+        let (told_to, told) = crossbeam_channel::unbounded();
+        keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default());
+        assert_eq!(failed.try_recv().ok(), None);
+        let Ok(Told::Flushed { to: asker, seq: Ok(seq) }) = told.try_recv() else {
+            panic!("the flush was told")
+        };
+        assert_eq!(asker, to(4, 9));
+        assert!(
+            history::manifest::read(dir.path()).unwrap().flushed() >= seq,
+            "the manifest says the flush told"
+        );
+    }
+
+    /// A flush the history's thread never answers fails at its deadline, naming what the
+    /// thread is doing; `wait` wakes the loop for it.
+    #[test]
+    fn a_flush_past_its_deadline_fails_naming_the_history_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profiling, _keeper) =
+            keep_history(dir.path(), None, blaze_profile::logs::Policy::default()).unwrap();
+        let mut observe = Observe::new(Some(profiling));
+        let mut out = Vec::new();
+        let at = Duration::from_secs(1);
+        observe.flush(to(2, 1), at, &mut out);
+        assert_eq!(observe.wait(at), Some(FLUSH_WAIT));
+        observe.flushing[0].until = at;
+        observe.tick(at, |_| false, &mut out);
+        let failed = out.iter().any(|it| matches!(&it.response, Response::Error(error) if error.what.contains("blaze-history")));
+        assert!(
+            failed || out.iter().any(|it| matches!(it.response, Response::Flushed { .. })),
+            "{out:?}"
+        );
+    }
+
     /// Build `build` of the workspace `/w` ending well, with nothing computed again.
     fn ended_row(build: u64) -> Ended {
         let row = BuildRow {
@@ -1323,12 +1510,15 @@ mod tests {
             joined: None,
             tree: None,
             blaze: None,
+            client_ns: None,
+            daemon_cpu_ns: None,
         };
         Ended {
             row,
             links: Vec::new(),
             crate_deps: Vec::new(),
             misses: Vec::new(),
+            test_runs: Vec::new(),
             provenance: Vec::new(),
         }
     }
@@ -1516,11 +1706,11 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_with_no_profiling_refuses_the_explorer_and_live_sql_by_name() {
+    fn a_daemon_with_no_profiling_refuses_the_explorer_and_a_flush_by_name() {
         let mut observe = Observe::new(None);
         let mut out = Vec::new();
         observe.explore(to(1, 1), false, &mut out);
-        observe.query(to(1, 2), "SELECT 1".to_owned(), 30, &mut out);
+        observe.flush(to(1, 2), Duration::ZERO, &mut out);
         let refused: Vec<_> = out
             .iter()
             .filter_map(|it| match &it.response {
@@ -1528,7 +1718,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(refused, [Some("blaze explore"), Some("blaze debug sql --live")]);
+        assert_eq!(refused, [Some("blaze explore"), Some("a read of the profile history")]);
         assert_eq!(out.last().map(|it| &it.response), Some(&Response::Done { ok: false }));
         assert_eq!(observe.first_build(), 1);
     }

@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
-/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
+/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], `Request::Sql`, their
 /// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
 /// [`Request::Hot`] and [`Response::Hot`]. 24: [`Request::Gc`] and [`Response::Collected`]. 25:
 /// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
@@ -80,8 +80,12 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`].
-pub const SCHEMA: u32 = 37;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`]. 38:
+/// [`Request::Flush`] and [`Response::Flushed`] in place of `Request::Sql` (`blaze debug sql
+/// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
+/// then reads the history itself; and [`Request::ClientRows`] and [`Worked::build_id`]: a client
+/// sends its own recorder's rows of a build to the daemon, which writes them to the history.
+pub const SCHEMA: u32 = 38;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -383,13 +387,12 @@ pub enum Request {
     /// subscriber whose connection has a frame not yet sent is skipped that tick; the next
     /// frame has every row since its last. Answered by the daemon's loop, which holds the feeds.
     Live,
-    /// `blaze debug sql --live`: `sql` over the history and the last `last_s` seconds of the
-    /// daemon's flight recorder, run by the daemon (the recorder is its); answered with
-    /// [`Response::Queried`].
-    Sql {
-        sql: String,
-        last_s: u32,
-    },
+    /// A reader of the profile history (`blaze debug sql`, `blaze slow`, `blaze debug time`,
+    /// `blaze explain`) asks the daemon that writes it to flush what it has recorded, so the
+    /// history's manifest lists every row recorded before the ask; answered with
+    /// [`Response::Flushed`] once that flush has committed. Answered by the daemon's loop,
+    /// which hands it to the history's keeper.
+    Flush,
     /// `blaze debug hot`: the `top` keys (a span and what it is of) that took most time and
     /// each kind of wait's quantiles, from the daemon's live sketches (blaze-profile's `hot`),
     /// no history read; answered with [`Response::Hot`].
@@ -438,6 +441,25 @@ pub enum Request {
         digest: String,
         most_bytes: Option<u64>,
         out: Option<String>,
+    },
+    /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
+    /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
+    /// stream of the profile schema's table (empty for none), every row's `build_id` the
+    /// build's, and when it started and had its answer, on the profile's clock
+    /// (`blaze_profile::clock::mono_ns`). The daemon's loop hands them to its profile history,
+    /// which writes them as the client's process and gives the build's row the two times
+    /// (`builds.client_started_ns`, `client_ended_ns`); answered with `Done { ok: true }` once
+    /// written. A daemon that keeps no history answers at once and keeps nothing.
+    ClientRows {
+        build: u64,
+        #[serde(with = "blaze_protocol::bytes")]
+        events: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        folded: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        spans: Vec<u8>,
+        ended_ns: i64,
+        started_ns: i64,
     },
 }
 
@@ -636,8 +658,10 @@ pub enum HotWaitKind {
     Scope,
 }
 
-/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table one Arrow IPC
-/// stream of the schema's table of that name.
+/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table the next bytes of
+/// the subscription's one long-lived Arrow IPC stream of the schema's table of that name
+/// (`live::Encoder`; empty when it has no rows), which a client reads with one `live::Decoder`
+/// a table across the frames, in order.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct LiveFrame {
     /// Spans not recorded since the daemon began.
@@ -770,11 +794,10 @@ pub enum Response {
         trace: Vec<u8>,
     },
     Live(LiveFrame),
-    /// [`Request::Sql`]'s answer: one Arrow IPC stream of its batches, and its rows.
-    Queried {
-        #[serde(with = "blaze_protocol::bytes")]
-        ipc: Vec<u8>,
-        rows: u64,
+    /// [`Request::Flush`]'s answer: the number of the flush that committed, which the
+    /// history's manifest says from then on (`Manifest::flushed`).
+    Flushed {
+        seq: u64,
     },
     /// [`Request::Hot`]'s answer.
     Hot(Hot),
@@ -1065,6 +1088,10 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
+    /// The build's id in the daemon's profile history (`builds.build_id`): what the client
+    /// tags the rows it sends with ([`Request::ClientRows`]). `None` for work no build row
+    /// stands for.
+    pub build_id: Option<u64>,
     /// Functions whose code was generated.
     pub compiled: u64,
     /// The measured run time of the request's nodes, summed by kind: each kind that ran at

@@ -2167,7 +2167,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         for it in out.drain(..) {
             match &it {
                 Out::Pass(Arrived::Request {
-                    request: Request::Stop | Request::Status, ..
+                    request: Request::Stop | Request::Status | Request::ClientRows { .. },
+                    ..
                 }) => {}
                 Out::Pass(Arrived::Request { .. }) | Out::Moved { .. } => {
                     self.changed_since_settle = true
@@ -2234,9 +2235,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     let asked = super::fetch_url::Asked { url, repo, rev, digest, most_bytes, out };
                     self.fetch_urls.ask(from, asked);
                 }
-                Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
+                Out::Pass(Arrived::Request { from, request: Request::Flush }) => {
                     let mut replies = std::mem::take(&mut self.replies);
-                    self.observe.query(from, sql, last_s, &mut replies);
+                    self.observe.flush(from, self.driver.now(), &mut replies);
+                    self.send(replies);
+                }
+                Out::Pass(Arrived::Request {
+                    from,
+                    request:
+                        Request::ClientRows { build, events, folded, spans, ended_ns, started_ns },
+                }) => {
+                    let rows = blaze_profile::history::ClientRows {
+                        build,
+                        started_ns,
+                        ended_ns,
+                        spans,
+                        events,
+                        folded,
+                    };
+                    let mut replies = std::mem::take(&mut self.replies);
+                    self.observe.client_rows(from, rows, &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(Arrived::Request {
