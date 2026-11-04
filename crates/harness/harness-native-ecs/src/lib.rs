@@ -686,6 +686,11 @@ pub fn init_os_api() {
             api.log_ = Some(os_log);
             api.abort_ = Some(os_abort);
             api.flags_ &= !sys::EcsOsApiLogWithColors;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                files::DISK_FOPEN.store(api.fopen_.map_or(0, |f| f as usize), Ordering::Relaxed);
+                api.fopen_ = Some(files::os_fopen);
+            }
             sys::ecs_os_set_api(&mut api);
         }
     });
@@ -791,3 +796,54 @@ fn check_layout() {
 
 #[cfg(test)]
 mod tests;
+
+/// Files compiled into the binary that flecs reads as if they were on disk: a managed script loaded by `filename` and the
+/// scripts it `include`s (flecs resolves an include next to the including script's file name and opens it with the OS
+/// API's `fopen`). A path that is not embedded goes to the disk as before.
+#[cfg(not(target_arch = "wasm32"))]
+mod files {
+    use super::{Ordering, c_char, c_void, sys};
+    use std::collections::HashMap;
+    use std::ffi::CStr;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicUsize;
+
+    static EMBEDDED: RwLock<Option<HashMap<&'static str, &'static str>>> = RwLock::new(None);
+    /// The `fopen` flecs had before ours (0: the C library's).
+    pub(super) static DISK_FOPEN: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" {
+        fn fmemopen(buf: *mut c_void, size: usize, mode: *const c_char) -> *mut sys::FILE;
+        fn fopen(path: *const c_char, mode: *const c_char) -> *mut sys::FILE;
+    }
+
+    pub(super) fn embed(list: &[(&'static str, &'static str)]) {
+        let mut g = EMBEDDED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.get_or_insert_with(HashMap::new).extend(list.iter().copied());
+    }
+
+    pub(super) unsafe extern "C" fn os_fopen(path: *const c_char, mode: *const c_char) -> *mut sys::FILE {
+        // SAFETY: flecs passes a NUL-terminated path.
+        let p = unsafe { CStr::from_ptr(path) }.to_str().unwrap_or("");
+        let hit = EMBEDDED.read().ok().and_then(|g| g.as_ref().and_then(|m| m.get(p).copied()));
+        if let Some(src) = hit {
+            // Read-only: fmemopen with "r" never writes the buffer, and the text is 'static (an empty one opens at size 0).
+            let ptr: *const c_char = if src.is_empty() { c" ".as_ptr() } else { src.as_ptr().cast() };
+            // SAFETY: a static buffer of `src.len()` bytes, opened for reading only.
+            return unsafe { fmemopen(ptr.cast_mut().cast(), src.len(), c"r".as_ptr()) };
+        }
+        match DISK_FOPEN.load(Ordering::Relaxed) {
+            // SAFETY: the C library's fopen with flecs's arguments.
+            0 => unsafe { fopen(path, mode) },
+            // SAFETY: the hook flecs had installed, of this very type, stored as an address by `init_os_api`.
+            f => unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, *const c_char) -> *mut sys::FILE>(f)(path, mode) },
+        }
+    }
+}
+
+/// Serve `list` (`(path, text)`: `scene/widgets/rows.flecs` and its source) to flecs as files: a script made with that
+/// `filename`, or `include`d by one, reads the compiled-in text. Later lists add to earlier ones.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn embed_files(list: &[(&'static str, &'static str)]) {
+    files::embed(list);
+}

@@ -762,6 +762,7 @@ dependencies = [
  "harness-native-ui-text-api",
  "harness-native-ui-view",
  "harness-vt",
+ "hyperion-ecs",
  "hyperion-flecs-c",
  "icu_properties",
  "icu_segmenter",

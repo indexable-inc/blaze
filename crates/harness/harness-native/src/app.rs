@@ -36,13 +36,27 @@ mod keys;
 mod stats;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
+mod script;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 const TOKENS: &str = include_str!("../scene/00-tokens.flecs");
-const HARNESS: &str = include_str!("../scene/10-harness.flecs");
+/// The harness scene: 10-harness.flecs includes the widget files (scene/widgets/), each a managed script of its own. They
+/// are compiled in and served to flecs as files (harness_native_ecs::embed_files) under these names.
+const SCENE: &[(&str, &str)] = &[
+    ("scene/10-harness.flecs", include_str!("../scene/10-harness.flecs")),
+    ("scene/widgets/frame.flecs", include_str!("../scene/widgets/frame.flecs")),
+    ("scene/widgets/parts.flecs", include_str!("../scene/widgets/parts.flecs")),
+    ("scene/widgets/row.flecs", include_str!("../scene/widgets/row.flecs")),
+    ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
+    ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
+    ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
+    ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
+    ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
+    ("scene/widgets/stats.flecs", include_str!("../scene/widgets/stats.flecs")),
+];
 
 /// The terminal's font size at zoom 1 (points) when the Ghostty config sets none (src/app/ghostty.rs).
 const TERM_SIZE: f32 = 13.0;
@@ -256,20 +270,36 @@ impl App {
         archive::register(&world);
         stats::register(&world);
         crate::keys::register(&world);
+        view::register(&world);
         world.component::<HoverLift>().writable();
-        world.component::<Bump>();
+        world.component::<Bump>().writable();
+        script::install(&world);
         let app = world.entity_named(APP);
         world.set(Clock::default());
         world.set(PointerState::default());
         world.set(Paint::default());
         let mut scripts: Vec<(&str, &str)> = vec![("00-tokens", TOKENS)];
         scripts.extend(harness_native_ui_prims::SCENES.iter().copied());
-        scripts.push(("10-harness", HARNESS));
         for (name, src) in scripts {
             let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
             if let Some(err) = script_error(*e) {
                 return Err(format!("scene script {name}: {err}"));
             }
+        }
+        harness_native_ecs::embed_files(SCENE);
+        let e = world.script_named("scene::10-harness").build_from_file(SCENE[0].0);
+        if let Some(err) = script_error(*e) {
+            return Err(format!("scene script {}: {err}", SCENE[0].0));
+        }
+        // Each `include` is a managed script of its own, so its error is on its own entity, not the includer's.
+        let mut bad = None;
+        world.new_query::<&flecs::Script>().each_entity(|e, _| {
+            if bad.is_none() {
+                bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
+            }
+        });
+        if let Some(err) = bad {
+            return Err(err);
         }
         let w = world.world_ref();
         // The rule's delay for a finished run with no session, from the scene's token (seconds).
@@ -310,13 +340,8 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        let archive_row = side.child("hn.SideFoot").child("hn.ArchiveRow");
+        let archive_row = side.child("hn.SideFoot").child("hn.ArchiveRow").props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
-        for name in ["icon", "count"] {
-            if let Some(p) = archive_row.part(name) {
-                p.set(Bump::default());
-            }
-        }
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         root.child("hn.Seam");
         let main = root.child("hn.Main");
@@ -616,10 +641,6 @@ impl App {
             // A light only while the daemon is not up.
             set_if(d, if link == *w.component_id::<model::Up>() { clear } else { link_tone });
         }
-        let looks = RowLooks::of(w, clear);
-        let step = crate::look::width(w, "indent");
-        let (inset, slot) = (crate::look::width(w, "row_inset"), crate::look::width(w, "disclose"));
-        // One row per session, run and stage, with a fold row over each session's older runs.
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
         let info: Vec<(String, &str, model::Row)> = model::rows(w)
@@ -633,23 +654,8 @@ impl App {
         // Rows that left the list stay while they fold away.
         let info = self.fold.merge(info, w);
         let me = &*self;
-        // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
-        // A row padded in by its depth (its icon at the section label's edge at depth 0), its disclosure's layer padded so
-        // the slot ends at the icon: the chevron hangs in the gutter and never pushes the row's content.
-        let indent = |row: View<'_>, depth: usize| {
-            let l = inset + depth as f32 * step;
-            use harness_native_ui_layout_api::Padding;
-            let pad = row.entity().try_cloned::<&Padding>().unwrap_or_default();
-            if pad.l != l {
-                row.set(Padding { l, ..pad });
-            }
-            if let Some(h) = row.part("hang") {
-                let pad = Padding { l: l - slot, ..Padding::default() };
-                if h.entity().try_cloned::<&Padding>() != Some(pad) {
-                    h.set(pad);
-                }
-            }
-        };
+        // Each row is a template instance (scene/widgets/rows.flecs): the row's facts as props, written only when one
+        // changed (View::props), and flecs re-runs only the parts that read it.
         view::for_each_of(tree, info, |row, r, new| {
             if new {
                 row.set(HoverAmt::default());
@@ -657,47 +663,45 @@ impl App {
             let (e, depth) = match r {
                 model::Row::Obj { e, depth } => (e, depth),
                 model::Row::More { parent, hidden, depth, unfolded } => {
-                    row.action(&format!("fold:{parent}"));
-                    indent(row, depth);
-                    fold::disclosure(row, None);
-                    if let Some(p) = row.part("name") {
-                        p.text(&if unfolded { "Show fewer".to_owned() } else { format!("Show {hidden} more") });
-                    }
+                    row.props("hn.MoreRow", &[("obj", Prop::Uint(parent)), ("depth", Prop::Int(depth as i64)), ("hidden", Prop::Int(hidden as i64)), ("unfolded", Prop::Bool(unfolded))]);
                     return;
                 }
             };
             let o = w.entity_from_id(e);
-            row.action(&format!("select:{e}"));
-            fold::disclosure(row, Some(o));
-            selection(row, sel == Some(e), clear);
-            indent(row, depth);
-            let run = me.run_of(e);
             let status = me.status_of(e);
             let failed = status == "killed" || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
-            if run.is_none() {
-                looks.session(me, row, e, hint.get(&e).filter(|&&i| i < 9).map(|i| me.hint(&format!("Select{}", i + 1))).unwrap_or_default());
-            } else if let Some(p) = row.part("glyph") {
-                // A run: a small dot tinted by how it went, breathing while it runs.
-                crate::look::show_glyph(p.entity(), crate::look::RUN_ICON);
-                set_if(p, match status {
-                    "running" => looks.accent,
-                    "lost" => looks.lost,
-                    _ if failed => looks.failed,
-                    _ => looks.faint,
-                });
-                crate::look::breathe(p.entity(), status == "running");
-            }
-            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-            if let Some(p) = row.part("name") {
-                // One line: the part is a ui.Line, cut with an ellipsis to the room its row leaves it when drawn.
-                p.text(&name.split_whitespace().collect::<Vec<_>>().join(" "));
-            }
-            if run.is_some()
-                && let Some(p) = row.part("meta")
-            {
-                // How long it took (and how it failed), shown on hover; a failure's always.
-                p.text(&me.run_meta(e));
-                crate::look::hover_show(p.entity(), row.id(), failed || matches!(status, "lost" | "pending" | "skipped"));
+            // One line: the part is a ui.Line, cut with an ellipsis to the room its row leaves it when drawn.
+            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            let common = [
+                ("obj", Prop::Uint(e)),
+                ("name", Prop::Str(&name)),
+                ("selected", Prop::Bool(sel == Some(e))),
+                ("depth", Prop::Int(depth as i64)),
+                ("kids", Prop::Bool(fold::has_kids(o))),
+                ("open", Prop::Bool(!o.has(model::Collapsed::id()))),
+            ];
+            if me.run_of(e).is_some() {
+                // A run: a small dot tinted by how it went, breathing while it runs; how long it took (and how it failed)
+                // shown on hover, a failure's always.
+                let state = match status {
+                    "running" => "running",
+                    "lost" => "lost",
+                    _ if failed => "failed",
+                    _ => "faint",
+                };
+                let meta = me.run_meta(e);
+                let keep = failed || matches!(status, "lost" | "pending" | "skipped");
+                row.props("hn.RunRow", &[&common[..], &[("state", Prop::Str(state)), ("meta", Prop::Str(&meta)), ("keep", Prop::Bool(keep))]].concat());
+            } else {
+                // A session: its kind's mark, its shortcut on hover, a failure's exit code as a small red badge.
+                let hint = hint.get(&e).filter(|&&i| i < 9).map(|i| me.hint(&format!("Select{}", i + 1))).unwrap_or_default();
+                let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
+                let badge = match (status, code) {
+                    ("killed", _) => "\u{2715}".to_owned(),
+                    (_, Some(c)) => c.to_string(),
+                    _ => String::new(),
+                };
+                row.props("hn.ObjRow", &[&common[..], &[("kind", Prop::Str(model::kind_name(o))), ("badge", Prop::Str(&badge)), ("hint", Prop::Str(&hint))]].concat());
             }
         });
         self.fold.animate(self.world.entity_from_id(self.ids.tree), crate::look::tune(self.world.world_ref(), "tree_fold"));
@@ -837,29 +841,12 @@ impl App {
         }
     }
 
-    /// The Archive's row at the sidebar's bottom: its icon, how many objects it holds and a chevron on hover; lit while
-    /// the Archive, or an object opened from it, is selected.
+    /// The Archive's row at the sidebar's bottom (hn.ArchiveRow): lit while the Archive, or an object opened from it, is
+    /// selected.
     fn sync_archive(&mut self) {
         let w = self.world.world_ref();
-        let n = model::archived(w).len();
-        let sel = self.selected();
-        let row = View::of(w.entity_from_id(self.ids.archive_row));
-        if let Some(p) = row.part("icon") {
-            p.icon(crate::look::ARCHIVE_ICON);
-        }
-        if let Some(p) = row.part("name") {
-            p.text("Archive");
-        }
-        if let Some(p) = row.part("count") {
-            p.text(&if n == 0 { String::new() } else { n.to_string() });
-        }
-        if let Some(p) = row.part("chevron") {
-            p.icon(crate::look::CHEVRON);
-            crate::look::hover_show(p.entity(), row.id(), false);
-        }
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
-        let lit = sel.is_some_and(|s| s == model::archive_view(w) || w.entity_from_id(s).has(model::Archived::id()));
-        set_if(row, if lit { chosen } else { clear });
+        let lit = self.selected().is_some_and(|s| s == model::archive_view(w) || w.entity_from_id(s).has(model::Archived::id()));
+        View::of(w.entity_from_id(self.ids.archive_row)).props("hn.ArchiveRow", &[("selected", Prop::Bool(lit))]);
     }
 
     /// Close object `e` (cmd+W, a Kill): it goes to the Archive whatever the rule says (and loses its pin); the archive
@@ -1146,6 +1133,7 @@ impl App {
             self.world.progress_time(0.0);
             self.poke_why("layout");
         }
+        self.forward_clicks();
         self.actions();
         harness_native_ui_input::end_frame(self.world.world_ref());
         self.pointer.went_down = false;
@@ -1320,14 +1308,26 @@ impl App {
     }
 
     /// What was activated this frame: a row selects its object, a palette entry runs.
+    /// Tell the scripts about this frame's clicks (each `Activated` node, src/app/script.rs): a widget's
+    /// `await on.click(this)` wakes, and what it asks for (`hn.act`) runs with the actions.
+    fn forward_clicks(&mut self) {
+        let mut hit = Vec::new();
+        self.world.new_query::<&Activated>().each_entity(|e, _| hit.push(*e.id()));
+        for e in hit {
+            script::click(&self.world, e, self.press.1.alt);
+        }
+    }
+
     fn actions(&mut self) {
+        let alt = self.press.1.alt;
         let mut acts = Vec::new();
         self.world.new_query::<&Action>().each_entity(|e, a| {
-            if e.has(Activated::id()) {
-                acts.push(a.name.as_str().to_owned());
+            if e.has(Activated::id()) && !a.name.as_str().is_empty() {
+                acts.push((a.name.as_str().to_owned(), alt));
             }
         });
-        for a in acts {
+        acts.extend(script::drain());
+        for (a, alt) in acts {
             self.poke();
             if let Some(e) = a.strip_prefix("select:").and_then(|s| s.parse().ok()) {
                 // A double click on a row with rows under it folds or unfolds it too.
@@ -1335,11 +1335,11 @@ impl App {
                 self.select(Some(e));
                 self.tree_focus = true;
                 if again && fold::has_kids(self.world.entity_from_id(e)) {
-                    self.toggle_fold_of(e, self.press.1.alt);
+                    self.toggle_fold_of(e, alt);
                 }
             } else if let Some(e) = a.strip_prefix("toggle:").or_else(|| a.strip_prefix("collapse:")).and_then(|s| s.parse().ok()) {
                 self.tree_focus = true;
-                self.toggle_fold_of(e, self.press.1.alt);
+                self.toggle_fold_of(e, alt);
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
             } else if a == "archive:open" {
@@ -1708,61 +1708,6 @@ impl RowLooks {
             lost: tone(w, "lost"),
             badge_on: crate::look::padding(w, "badge_on"),
         }
-    }
-
-    /// A session's row: its kind's icon in its colour, its shortcut on hover (`hint`), a failure's exit code as a small
-    /// red badge, and a breathing accent dot while it runs (amber when lost). A clean exit shows nothing.
-    fn session(&self, me: &App, row: View<'_>, e: u64, hint: String) {
-        let w = me.world.world_ref();
-        let o = w.entity_from_id(e);
-        let kind = model::kind_name(o);
-        let status = me.status_of(e);
-        let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
-        if let Some(p) = row.part("glyph") {
-            crate::look::kind_mark(w, p.entity(), kind);
-        }
-        if let Some(p) = row.part("meta") {
-            p.text(&hint);
-            crate::look::hover_show(p.entity(), row.id(), false);
-        }
-        if let Some(b) = row.part("badge") {
-            let shown = match (status, code) {
-                ("killed", _) => Some("\u{2715}".to_owned()),
-                (_, Some(c)) => Some(c.to_string()),
-                _ => None,
-            };
-            if let Some(t) = b.part("code") {
-                t.text(shown.as_deref().unwrap_or(""));
-            }
-            set_if(b, if shown.is_some() { self.failed_wash } else { self.clear });
-            let pad = if shown.is_some() { self.badge_on } else { harness_native_ui_layout_api::Padding::default() };
-            if b.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
-                b.set(pad);
-            }
-        }
-        if let Some(d) = row.part("dot") {
-            set_if(d, match status {
-                "running" => self.accent,
-                "lost" => self.lost,
-                _ => self.clear,
-            });
-            // Breathing while its program writes, not merely while it lives: an idle shell draws nothing.
-            crate::look::breathe(d.entity(), status == "running" && o.has(model::Busy::id()));
-        }
-        let _ = self.failed;
-    }
-}
-
-/// A tree row's selection: a `hn.Selection` pill under it while selected (MatchedGeometry slides it from the row lit
-/// before), the row's own fill clear.
-fn selection(row: View<'_>, on: bool, clear: Fill) {
-    set_if(row, clear);
-    match (row.part("pill"), on) {
-        (None, true) => {
-            row.child("hn.Selection").named("pill");
-        }
-        (Some(p), false) => p.entity().destruct(),
-        _ => {}
     }
 }
 

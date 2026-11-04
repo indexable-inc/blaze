@@ -7,7 +7,7 @@ use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{Fold, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
-use harness_native_ui_look_api::Fill;
+use harness_native_ui_look_api::{Fill, HoverLook};
 use harness_native_ui_motion_api::{Motion, Reveal};
 use harness_native_ui_text_api::{Icon, Mark};
 use harness_native_ui_view as view;
@@ -19,7 +19,8 @@ pub struct Breath {
     pub up: bool,
 }
 
-/// A part shown only while row `row` is hovered (its opacity the row's hover spring), or always when `keep`.
+/// A part shown only while row `row` is hovered (its opacity the row's hover spring), or always when `keep`. Row 0: the
+/// part's nearest ancestor with a row's hover look (what a scene template writes: it cannot name its instance's id).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct HoverShow {
     pub row: u64,
@@ -34,9 +35,10 @@ pub struct Disclose {
 }
 
 pub fn register(world: &World) {
-    world.component::<Breath>();
-    world.component::<HoverShow>();
-    world.component::<Disclose>();
+    // The row templates (scene/widgets/rows.flecs) set these.
+    world.component::<Breath>().writable();
+    world.component::<HoverShow>().writable();
+    world.component::<Disclose>().writable();
 }
 
 /// The theme's `role` (`hn.Theme.<role>`, scene/10-harness.flecs). The scene is compiled in, so a role it lacks is a bug.
@@ -83,6 +85,12 @@ pub fn install(w: WorldRef<'_>) {
             b.up = !b.up;
         }
     });
+    // A chevron a template made starts turned the way it is (its Fold), so it does not swing in on its first frame.
+    w.observer_named::<&Disclose>("DiscloseFold").on_set().each_entity(|e, d| {
+        if !e.has(Fold::id()) {
+            e.set(Fold(Spring::at(f32::from(u8::from(d.open)))));
+        }
+    });
     let turn = tune(w, "turn");
     w.system_named::<(&Disclose, &mut Fold)>("Turn").each_iter(move |it, _row, (d, f)| {
         let w = it.world();
@@ -99,7 +107,12 @@ pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>, lo: f32) -> f32 {
         a *= lo + (1.0 - lo) * b.spring.x.clamp(0.0, 1.0);
     }
     if let Some(h) = e.try_cloned::<&HoverShow>().filter(|h| !h.keep) {
-        a *= w.entity_from_id(h.row).try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+        let amt = if h.row == 0 {
+            std::iter::successors(e.parent(), |n| n.parent()).take(4).find(|n| n.has(HoverLook::id())).and_then(|n| n.try_cloned::<&HoverAmt>())
+        } else {
+            w.entity_from_id(h.row).try_cloned::<&HoverAmt>()
+        };
+        a *= amt.map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
     }
     a
 }
@@ -114,19 +127,6 @@ pub fn hover_show(part: EntityView<'_>, row: u64, keep: bool) {
     let want = HoverShow { row, keep };
     if part.try_cloned::<&HoverShow>().is_none_or(|h| h.row != row || h.keep != keep) {
         part.set(want);
-    }
-}
-
-/// Let `dot` breathe (or stop).
-pub fn breathe(dot: EntityView<'_>, on: bool) {
-    match (on, dot.has(Breath::id())) {
-        (true, false) => {
-            dot.set(Breath { spring: Spring::at(1.0), up: false });
-        }
-        (false, true) => {
-            dot.remove(Breath::id());
-        }
-        _ => {}
     }
 }
 

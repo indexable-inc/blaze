@@ -1,0 +1,151 @@
+// The window's fixed frame: the window row, the title-bar strip, the sidebar and its tree, the main card and its panes.
+
+@tree ChildOf
+hn {
+  // The window, clear over the sidebar's vibrancy (src/window.rs): the sidebar full height beside the main card, which
+  // runs to the window's top, right and bottom edges. The title-bar strip lies over both (hn.TitleBar).
+  prefab Window : ui.Row {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+  }
+
+  // The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar. The traffic lights sit on the sidebar's
+  // vibrancy; the selected object's title sits on the main card's terminal ground, starting at the terminal's text inset.
+  // The host sets its height and left inset (src/app.rs lay_chrome).
+  prefab TitleBar : ui.Row {
+    Clip
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 16, t: 0, b: 0}
+    // Back to the Archive (after an object was opened from it; cmd+[ too). Zero wide while there is nowhere to go back to.
+    back : ui.Symbol {
+      Pressable
+      Action: {name: "nav:back"}
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+    }
+    title : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
+    }
+    // The shown object's directory and state, muted after its name (src/app.rs); dimmed with the title while the window is
+    // not key.
+    sub : ui.Words {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+  }
+
+  // The hairline between the sidebar and the main card: the only seam (no shadow, same ground on both sides).
+  prefab Seam : ui.Node {
+    Fill: $tone_seam
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
+  // full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
+  // width. The main card's left edge follows the clip's right edge.
+  prefab SideClip : ui.Column {
+    Clip
+    Fill: $tone_side_tint
+    Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+  }
+
+  // The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
+  // title-bar strip; SafeAreaPadding adds the strip (the window's SafeAreaInset, set by the host in lay_chrome).
+  // Its left margin is its children's (side_inset): the tree's clip runs to the sidebar's edge so a chevron can hang there.
+  prefab Sidebar : ui.Column {
+    Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 0, r: $side_inset, t: 4, b: 10}
+    SafeAreaPadding: {l: false, r: false, t: true, b: false}
+  }
+
+  // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
+  // device row and the Archive pinned under it, and clips what does not fit.
+  prefab Tree : ui.Scroll {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+  }
+
+  // The sidebar's foot (the Archive row), in from its left edge by the margin the tree pads itself with.
+  prefab SideFoot : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+  }
+
+  // The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
+  // springs from where the last one was drawn.
+  prefab Selection : ui.Node {
+    Background
+    MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
+    Fill: $tone_select
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    Motion: {omega: $pill_omega, zeta: $pill_zeta}
+  }
+
+  // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
+  // bottom edges (the window's corners round it). The title-bar strip lies over its top (the host pads the card down by
+  // the strip's height); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
+  // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
+  // a split is a second node.
+  prefab Main : ui.Row, Plate {
+    Fill: $tone_term_ground
+    Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+    Shape: {radius: 0, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    SafeAreaPadding: {l: false, r: false, t: true, b: false}
+  }
+
+  // A pane: clear on the card's terminal ground, no header (the title bar names what it shows).
+  prefab Pane : ui.Column {
+    PaneNode
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  }
+
+  // The terminal primitive: the host draws its grid into this node's rect (src/term.rs) from its own components
+  // (TermGrid, TermCursor, TermSelection, TermScroll, MarkedText, TermFocus; src/pane.rs). Its cells are GPU instances,
+  // not entities.
+  prefab Terminal : ui.Node {
+    TermNode
+    Fill: $tone_clear
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane.
+  prefab TermPane : hn.Pane {
+    term : hn.Terminal {}
+  }
+
+  // A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
+  // they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
+  prefab RunPane : hn.Pane {
+    info : ui.Column {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+      Padding: {l: 18, r: 18, t: 8, b: 0}
+      stages : ui.List {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      }
+    }
+    term : hn.Terminal {}
+  }
+
+  // A tree row's look, shared by every kind: pressable, a wash on hover and press, one row tall.
+  prefab TreeRowLook : ui.Row {
+    Pressable
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  }
+}

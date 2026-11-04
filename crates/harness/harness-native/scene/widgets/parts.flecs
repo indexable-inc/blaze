@@ -1,0 +1,81 @@
+// Small parts the rows are built of: a status dot, a failure's badge, the device row, a disclosure, each kind's mark.
+
+@tree ChildOf
+hn {
+  // A status dot: clear unless the host tints it (running breathes in the accent, lost is amber).
+  prefab Dot : ui.Node {
+    Fill: $tone_clear
+    Size: {w: {kind: Fixed, value: $dot_size, min: 0, max: 0}, h: {kind: Fixed, value: $dot_size, min: 0, max: 0}}
+    Shape: {radius: $dot_radius, n: 2, border: 0, feather: 0}
+  }
+
+  // A failure's badge: the exit code, small and red on a red wash. Clear, empty and unpadded otherwise.
+  prefab Badge : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: $badge_radius, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    code : ui.Line {
+      Fill: $tone_failed
+      TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
+    }
+  }
+
+  // A section label over the tree: the device's name (11 semibold, tertiary), how many objects, and a dot only while the
+  // daemon is offline or connecting.
+  prefab DeviceRow : ui.Row {
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+    Padding: {l: $label_inset, r: $row_pad, t: 0, b: 0}
+    name : ui.Lead, Faint {
+      TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+    }
+    dot : hn.Dot {}
+    spacer : ui.Spacer {}
+    count : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A tree row's disclosure, Finder's: a chevron left of the row's icon that folds what is under the row, its hit target
+  // the full slot (wider and taller than the glyph). The host gives it the chevron and the press only when the row has
+  // rows under it (src/app/fold.rs); else it is an empty slot that keeps the icons in line.
+  prefab Disclosure : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    icon : ui.Symbol, Faint {
+      Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+    }
+  }
+
+  // Each kind's mark, what its session shows on a tree row, an Archive row and a palette entry (src/look.rs `kind_mark`
+  // copies the kind's Mark or Icon and its Fill onto the row's glyph): Claude's starburst, OpenAI's blossom for Codex and
+  // Cursor's cube as vector outlines (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
+  prefab Kind {
+    claude : ui.Icon {
+      Mark: {name: "claude"}
+      Fill: $tone_mark_claude
+    }
+    codex : ui.Icon {
+      Mark: {name: "openai"}
+      Fill: $tone_mark_ink
+    }
+    cursor : ui.Icon {
+      Mark: {name: "cursor"}
+      Fill: $tone_mark_ink
+    }
+    shell : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_kind_shell
+    }
+    // Any other kind (a process): a small dot in the shell's tone.
+    other : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_kind_shell
+    }
+  }
+}
