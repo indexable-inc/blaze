@@ -467,6 +467,7 @@ fn seeds() -> Vec<Vec<u8>> {
             memory_bytes: 0,
             history: None,
             build: blaze_api::Build::default(),
+            settings: Vec::new(),
         }),
         Response::Status(Status {
             pid: 1,
@@ -483,6 +484,7 @@ fn seeds() -> Vec<Vec<u8>> {
             memory_bytes: 0,
             history: Some("the disk is full".to_owned()),
             build: blaze_api::Build::default(),
+            settings: vec![blaze_api::Setting { name: "BLAZE_CORES".to_owned(), value: None }],
         }),
         Response::Explored { link: "https://ix.dev/explore#x".to_owned() },
         Response::Profiled { trace: b"{}".to_vec() },
