@@ -397,8 +397,9 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     let cursor = snap.cursor;
     let show_cursor = snap.cursor_shown && p.scroll == 0;
     let look = snap.cursor_look;
-    // The program's DECSCUSR shape and blink, else the default: a thin blinking bar in the accent colour.
-    let (shape, blinking, cursor_ink) = if look.explicit { (look.shape, look.blinking, theme.cursor) } else { (harness_vt::CursorShape::Bar, true, theme.accent) };
+    // The program's DECSCUSR shape and blink (1, 3, 5 blink), else the default (no DECSCUSR, or 0, which Ghostty reads as
+    // "the configured default"): a steady thin bar in the accent colour, so an idle pane draws no frames.
+    let (shape, blinking, cursor_ink) = if look.explicit { (look.shape, look.blinking, theme.cursor) } else { (harness_vt::CursorShape::Bar, false, theme.accent) };
     let alpha = grid.cursor_alpha(snap, p, blinking, show_cursor);
     let inverts = show_cursor && p.focused && shape == harness_vt::CursorShape::Block;
     let mut sprites: Vec<SpriteInst> = Vec::new();

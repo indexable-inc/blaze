@@ -7,7 +7,7 @@ import { installCapture, inTask, newTask, type Task } from "./tasks.ts";
 import { req, daemonPresent } from "./daemon.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
-const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
+export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
 const cap = (s: string, n = 64 << 10) => (s.length > n ? s.slice(0, n) + `… [${s.length - n} more chars]` : s);
 /** Index a cell in harnessd (best effort; the REPL works without the daemon). */
 function post(t: Task) {
