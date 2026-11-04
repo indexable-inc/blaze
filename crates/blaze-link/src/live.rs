@@ -38,39 +38,56 @@ const EH_FRAME_END: [u8; 4] = [0; 4];
 /// no such export, or a descriptor that does not decode, is an error naming what is missing.
 pub fn descriptor_of(bytes: &[u8]) -> Result<Descriptor, String> {
     use object::{Object, ObjectSegment};
-    let file =
-        object::File::parse(bytes).map_err(|it| format!("reading the image's headers: {it}"))?;
+    // Plain matches, not `map_err`/`ok_or_else` chains: stage 0 (0.20261030.1) can't resolve
+    // those methods here; return to the chains after the next stage-0 promotion.
+    let file = match object::File::parse(bytes) {
+        Ok(it) => it,
+        Err(it) => return Err(format!("reading the image's headers: {it}")),
+    };
     let (prefix, name) = match file.format() {
         object::BinaryFormat::MachO => crate::macho::spelled(DESCRIPTOR),
         _ => ("", DESCRIPTOR),
     };
-    let named = |it: &[u8]| {
-        it.len() == prefix.len() + name.len()
+    let exports = match file.exports() {
+        Ok(it) => it,
+        Err(it) => return Err(format!("reading the image's exports: {it}")),
+    };
+    let mut at = None;
+    for export in &exports {
+        let it = export.name();
+        if it.len() == prefix.len() + name.len()
             && it.starts_with(prefix.as_bytes())
             && it.ends_with(name.as_bytes())
+        {
+            at = Some(export.address());
+            break;
+        }
+    }
+    let Some(at) = at else {
+        return Err(format!("the image exports no {DESCRIPTOR}: it was not linked as a live image"));
     };
-    let exports = file.exports().map_err(|it| format!("reading the image's exports: {it}"))?;
-    let at = exports
-        .iter()
-        .find(|it| named(it.name()))
-        .map(|it| it.address())
-        .ok_or_else(|| {
-            format!("the image exports no {DESCRIPTOR}: it was not linked as a live image")
-        })?;
-    let place = file.segments().find_map(|segment| {
+    let mut place = None;
+    for segment in file.segments() {
         let (offset, len) = segment.file_range();
-        let start = segment.address();
-        let within =
-            at.checked_sub(start).filter(|it| it.saturating_add(Descriptor::SIZE as u64) <= len)?;
-        Some(offset + within)
-    });
-    let place = place
-        .ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} is in no segment's bytes of the file"))?;
-    usize::try_from(place)
-        .ok()
-        .and_then(|place| bytes.get(place..)?.get(..Descriptor::SIZE))
-        .and_then(Descriptor::decode)
-        .ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} (file offset {place:#x}) is no descriptor"))
+        let Some(within) = at.checked_sub(segment.address()) else { continue };
+        if within.saturating_add(Descriptor::SIZE as u64) <= len {
+            place = Some(offset + within);
+            break;
+        }
+    }
+    let Some(place) = place else {
+        return Err(format!("{DESCRIPTOR} at {at:#x} is in no segment's bytes of the file"));
+    };
+    let no_descriptor =
+        || format!("{DESCRIPTOR} at {at:#x} (file offset {place:#x}) is no descriptor");
+    let Ok(start) = usize::try_from(place) else { return Err(no_descriptor()) };
+    let Some(window) = bytes.get(start..).and_then(|rest| rest.get(..Descriptor::SIZE)) else {
+        return Err(no_descriptor());
+    };
+    match Descriptor::decode(window) {
+        Some(it) => Ok(it),
+        None => Err(no_descriptor()),
+    }
 }
 
 impl Stage<'_> {
