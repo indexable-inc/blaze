@@ -12,7 +12,7 @@ use std::{
 };
 
 use base_db::{ContentId, Crate, Db, Env};
-use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use parking_lot::Mutex;
 use span::Span;
 use tt::TopSubtree;
@@ -24,9 +24,9 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    fn of(result: &Result<TopSubtree, ProcMacroExpansionError>) -> Outcome {
+    fn of(result: &Result<Expanded, ProcMacroExpansionError>) -> Outcome {
         match result {
-            Ok(tree) => Outcome::Expanded(tree.copy()),
+            Ok(expanded) => Outcome::Expanded(expanded.tree.copy()),
             Err(ProcMacroExpansionError::Panic(message)) => Outcome::Panicked(message.clone()),
             Err(ProcMacroExpansionError::System(why)) => Outcome::Failed(why.clone()),
         }
@@ -167,7 +167,7 @@ impl Recorder {
         ProcMacro { name, kind, expander: Arc::new(recorder), disabled }
     }
 
-    fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let start = Instant::now();
         let expanded = match calling {
             Some(krate) => self.eval.expand_in(db, krate, call),
@@ -223,11 +223,11 @@ impl ProcMacroExpander for Recorder {
         self.eval.code()
     }
 
-    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, None, call)
     }
 
-    fn expand_in(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand_in(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, Some(calling_crate), call)
     }
 

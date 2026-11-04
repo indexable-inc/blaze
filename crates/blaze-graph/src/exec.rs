@@ -6,7 +6,7 @@
 //! scheduler: it owns the [`Plane`] and steps it on a thread of its own, the owner thread, whose
 //! one wait is for the next input; it never waits for a worker. Its tasks run on the process's
 //! [`shared`] pool, near the group the plane names, each in a frame of its own
-//! ([`blaze_mem::frame::task`]) inside [`arena::measure`] and [`blaze_mem::frame::measure`],
+//! ([`blaze_mem::frame::task`]) inside [`arena::account`] and [`blaze_mem::frame::measure`],
 //! and what each held and how long it ran teach the [`Predict`] the next task's cost and
 //! memory come from.
 
@@ -731,7 +731,7 @@ impl<W> Handle<W> {
 ///
 /// A task's work runs in a frame of its own ([`blaze_mem::frame::task`], tagged with its
 /// subsystem: a pool worker's chunks are on its NUMA node, and the frame is freed when the task
-/// ends) inside [`arena::measure`] and [`blaze_mem::frame::measure`], and its `Done` gives the
+/// ends) inside [`arena::account`] and [`blaze_mem::frame::measure`], and its `Done` gives the
 /// plane the peak it held in both and the group it ran on. With a budget, the frames grow
 /// under its [`admission::share`] for [`MemTag::Frames`] ([`blaze_mem::frame::Cap`]); a task
 /// the cap cancels is posted again, as one that gives way. With a budget, the plane hears

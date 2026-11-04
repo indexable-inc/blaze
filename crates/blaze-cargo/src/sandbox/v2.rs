@@ -10,11 +10,35 @@
 //! hashed as the files are when it ends ([`Disk`]). A file read that can't be read then is no
 //! report at all: the error is on stderr, and the driver finds none.
 //!
-//! What a traced run reads of its environment is the whole of it (`E\t\t*`, every scope's):
-//! a process may walk `environ` (Rust's `env::vars`, C's `envp` and `environ`, a child given
-//! `environ` whole), which no call shows, so reads by name (the `E` lines the interposers add)
-//! can never be all of it. The variables a run is keyed by are then never fewer than it could
-//! have seen; what keys it by fewer has to make the walk seen first (a `std` that says so).
+//! What a traced run reads of its environment: a process may walk `environ` (Rust's
+//! `env::vars`, C's `envp` and `environ`), which no call shows, so reads by name (the `E` lines
+//! the interposers add) are all of it only for variables a walk can't find. A run whose spec
+//! names the variables its key has ([`confine::Spec::given`]) is lent the rest on Linux and
+//! macOS. Its program's environment holds the visible variables alone: the given ones, those
+//! the sandbox reads itself (`READ_BY_THE_SANDBOX`) and those the C library and the loader read
+//! with no call an interposer sees ([`READ_BY_THE_C_LIBRARY`]), which are in every such run's
+//! key, set or not, so the program behaves as it would with its whole environment and its key
+//! has what they change. Each other variable is an entry [`LENT`] (`__BLAZE_LENT=NAME=VALUE`),
+//! which the interposer takes out of the environment as it loads and answers `getenv` from,
+//! tracing the read. When the program walks its environment (std says so before it does,
+//! through `__blaze_environ_walked`; `system` and `popen` on Linux run a shell the interposer
+//! can't hand anything) the interposer puts every lent variable back and notes
+//! `E\t<scope>\t* <why>`: from then on it read all of them. A walk the interposer is not told
+//! of (C code reading `environ` itself) sees the visible variables alone, which the key has.
+//!
+//! A program the process runs with its own environment gets every lent variable back in its
+//! environment, as it would with no sandbox, and the visible names ([`VISIBLE`]): running it is
+//! no read by this process. The child's interposer lends itself the rest when its executable
+//! proves std alone walks its environment (the linker's export `__blaze_std_says_walks`, link's
+//! part of `docs/v2/requests/usercode.md` item 6); a child without it (a C compiler, a shell,
+//! which imports its environment through `main`'s `envp`) notes `E\t<scope>\t* <why>` as it
+//! loads. A child the interposer can't load in (a static program, one macOS protects) is the
+//! record's `X` line, as before: the run is not whole and is keyed as cargo keys it.
+//!
+//! So such a run is keyed by the variables it and its children read, and a variable none of
+//! them read (a shell's `OLDPWD`) is in no key. A run that names no given variables, and every
+//! traced run on Windows, reads the whole of its environment (`E\t\t*`, every scope's) from
+//! the start.
 
 #![deny(unsafe_code)]
 
@@ -39,6 +63,139 @@ mod raw;
 
 /// Why a traced run on Windows is not whole: what it reads is not seen there.
 pub const NOT_TRACED_ON_WINDOWS: &str = "what a program reads is not traced on Windows";
+
+/// The name of each entry a variable lent to the program is in, `__BLAZE_LENT=NAME=VALUE`,
+/// which the interposers (`linux_interpose.c`, `macos_interpose.c`) take out of the program's
+/// environment as they load.
+pub const LENT: &str = "__BLAZE_LENT";
+
+/// The variable that names, `NAME=NAME=...`, the variables a lending run keeps visible: the
+/// given ones, `READ_BY_THE_SANDBOX` and [`READ_BY_THE_C_LIBRARY`]. The interposers pass it on
+/// to each program a process runs, whose own interposer lends that program the rest when the
+/// program proves it says its walks (the module's doc).
+pub const VISIBLE: &str = "__BLAZE_VISIBLE";
+
+/// The variables the C library and the loader read themselves, with calls no interposer sees:
+/// the loader before the interposer loads, and the C library through its own `getenv`
+/// (glibc's `localtime` reads `TZ`, `setlocale` reads `LANG` and `LC_*`, `execvp` and
+/// `posix_spawnp` read `PATH`, libSystem likewise). A lending run keeps each in its program's
+/// environment, so the program behaves as with its whole environment, and is keyed by each, set
+/// or not. The one list of them, for glibc (its `unsecvars.h`, `LC_*` categories, locale,
+/// time zone, `malloc` and resolver variables, the loader's `LD_*`), dyld (`DYLD_*`, man dyld)
+/// and libmalloc (`Malloc*`); names the platform does not read are only in the key. A name
+/// added to the C library the toolchain pins is added here.
+pub const READ_BY_THE_C_LIBRARY: &[&str] = &[
+    // Programs found along it: `execvp`, `execlp`, `posix_spawnp`, `system`'s shell.
+    "PATH",
+    // Time zone.
+    "TZ",
+    "TZDIR",
+    // Locale, messages and character sets.
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_ADDRESS",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NAME",
+    "LC_NUMERIC",
+    "LC_PAPER",
+    "LC_TELEPHONE",
+    "LC_TIME",
+    "LOCPATH",
+    "NLSPATH",
+    "OUTPUT_CHARSET",
+    "GCONV_PATH",
+    "GETCONF_DIR",
+    "POSIXLY_CORRECT",
+    "DATEMSK",
+    "LIBC_FATAL_STDERR_",
+    // glibc's malloc.
+    "GLIBC_TUNABLES",
+    "MALLOC_ARENA_MAX",
+    "MALLOC_ARENA_TEST",
+    "MALLOC_CHECK_",
+    "MALLOC_MMAP_MAX_",
+    "MALLOC_MMAP_THRESHOLD_",
+    "MALLOC_PERTURB_",
+    "MALLOC_TOP_PAD_",
+    "MALLOC_TRACE",
+    "MALLOC_TRIM_THRESHOLD_",
+    // The resolver.
+    "HOSTALIASES",
+    "LOCALDOMAIN",
+    "NIS_PATH",
+    "RESOLV_HOST_CONF",
+    "RES_OPTIONS",
+    // glibc's loader.
+    "LD_ASSUME_KERNEL",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_HWCAP_MASK",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_USE_LOAD_BIAS",
+    // dyld.
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_PRINT_APIS",
+    "DYLD_PRINT_BINDINGS",
+    "DYLD_PRINT_ENV",
+    "DYLD_PRINT_INITIALIZERS",
+    "DYLD_PRINT_LIBRARIES",
+    "DYLD_PRINT_LINKS_WITH",
+    "DYLD_PRINT_LOADERS",
+    "DYLD_PRINT_SEARCHING",
+    "DYLD_PRINT_SEGMENTS",
+    "DYLD_PRINT_TO_FILE",
+    "DYLD_SHARED_CACHE_DIR",
+    "DYLD_SHARED_REGION",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    // libmalloc, which reads them from the start-up environment itself.
+    "MallocCheckHeapAbort",
+    "MallocCheckHeapEach",
+    "MallocCheckHeapSleep",
+    "MallocCheckHeapStart",
+    "MallocCorruptionAbort",
+    "MallocDebugReport",
+    "MallocDoNotProtectPostlude",
+    "MallocDoNotProtectPrelude",
+    "MallocErrorAbort",
+    "MallocGuardEdges",
+    "MallocHelp",
+    "MallocLogFile",
+    "MallocNanoZone",
+    "MallocPreScribble",
+    "MallocProbGuard",
+    "MallocScribble",
+    "MallocSpaceEfficient",
+    "MallocStackLogging",
+    "MallocStackLoggingDirectory",
+    "MallocStackLoggingNoCompact",
+    "MallocZeroOnFree",
+];
+
+/// Whether the program of `spec` is lent the variables its key does not have, rather than
+/// given its whole environment: when it is traced, its spec names them, and the platform's
+/// interposer can lend them (Linux and macOS; Windows traces nothing).
+pub fn lends(spec: &confine::Spec) -> bool {
+    cfg!(unix) && spec.trace && spec.given.is_some()
+}
 
 /// `blaze sandbox --v2 SPEC_FILE`, the rest of the arguments after `--v2`.
 pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
@@ -133,8 +290,9 @@ fn not_made(spec: &confine::Spec, why: &str) -> i32 {
 }
 
 /// Opens the live record, where this run's lines start at its present end, and appends what is
-/// known before anything runs: when the run traces, that it reads the whole environment, and
-/// what it was given that it may read without a call the sandbox sees.
+/// known before anything runs: when the run traces, that it reads the whole environment (or,
+/// when it [`lends`], the variables the sandbox, the loader and the C library read), and what it was given that it may read
+/// without a call the sandbox sees.
 fn begin(spec: &confine::Spec) -> Result<Live, String> {
     let shown = spec.live.display();
     let mut file = std::fs::OpenOptions::new()
@@ -148,7 +306,16 @@ fn begin(spec: &confine::Spec) -> Result<Live, String> {
     // Once per run, before anything runs: its first lines.
     let mut first = Vec::with_capacity(8);
     if spec.trace {
-        first.push(trace::Line::new(Seen::Env, "", trace::ALL_ENV));
+        if lends(spec) {
+            // What the sandbox, the loader and the C library read with no call traced, set or
+            // not: a value set later is one they read.
+            #[cfg(unix)]
+            first.extend(
+                READ_BY_THE_SANDBOX.iter().chain(READ_BY_THE_C_LIBRARY).map(|name| trace::Line::new(Seen::Env, "", name)),
+            );
+        } else {
+            first.push(trace::Line::new(Seen::Env, "", trace::ALL_ENV));
+        }
         first.extend(given().into_iter().map(|why| trace::Line::new(Seen::Untraceable, "", why)));
         if cfg!(windows) {
             first.push(trace::Line::new(Seen::Incomplete, "", NOT_TRACED_ON_WINDOWS));
@@ -192,8 +359,42 @@ fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
     // clone: as above.
     program.push(spec.program.clone().into_os_string());
     program.extend(spec.args.iter().cloned());
-    let also = super::Also { network: spec.network, live: Some(live), env: Some(&spec.env), services: &spec.services };
+    let env = program_env(spec);
+    let also = super::Also { network: spec.network, live: Some(live), env: Some(&*env), services: &spec.services };
     super::backend(&made, Some(&program), also)
+}
+
+/// The environment the program of `spec` is started in: [`confine::Spec::env`] as it is, or,
+/// when it [`lends`], the visible variables as they are (the given ones,
+/// `READ_BY_THE_SANDBOX`, [`READ_BY_THE_C_LIBRARY`]), each other one as an entry [`LENT`] for
+/// the interposer to lend, and [`VISIBLE`], their names, for the programs it runs.
+#[cfg(unix)]
+fn program_env(spec: &confine::Spec) -> std::borrow::Cow<'_, [(OsString, OsString)]> {
+    let Some(given) = spec.given.as_deref().filter(|_| lends(spec)) else {
+        return std::borrow::Cow::Borrowed(&spec.env);
+    };
+    let ours = || READ_BY_THE_SANDBOX.iter().chain(READ_BY_THE_C_LIBRARY).copied();
+    // Once per run, as the sandbox is set up.
+    let mut env = Vec::with_capacity(spec.env.len() + 1);
+    for (name, value) in &spec.env {
+        let visible = name.to_str().is_some_and(|it| ours().any(|ours| ours == it) || given.iter().any(|given| given == it));
+        match visible {
+            // clone: as above.
+            true => env.push((name.clone(), value.clone())),
+            false => {
+                // alloc: as above.
+                let mut entry = OsString::with_capacity(name.len() + 1 + value.len());
+                entry.push(name);
+                entry.push("=");
+                entry.push(value);
+                env.push((OsString::from(LENT), entry));
+            }
+        }
+    }
+    // alloc: as above. A given name has no `=` (`confine::given_value` refused it).
+    let names: Vec<&str> = given.iter().map(String::as_str).chain(ours()).collect();
+    env.push((OsString::from(VISIBLE), OsString::from(names.join("="))));
+    std::borrow::Cow::Owned(env)
 }
 
 #[cfg(windows)]
@@ -208,7 +409,8 @@ fn run(_spec: &confine::Spec, _live: &Live) -> Result<i32, String> {
 }
 
 /// The variables the Linux and macOS sandboxes read themselves, of the program's environment:
-/// they are taken as text.
+/// they are taken as text, and never lent (`program_env`): the program's loader reads them
+/// before anything is traced. The C library's own are [`READ_BY_THE_C_LIBRARY`].
 #[cfg(unix)]
 const READ_BY_THE_SANDBOX: &[&str] = &["TMPDIR", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
 
@@ -344,6 +546,7 @@ mod tests {
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec![program.into()],
+            given: None,
         }
     }
 
@@ -408,6 +611,58 @@ mod tests {
         let live = super::begin(&untraced).unwrap();
         assert_eq!(std::fs::read_to_string(&untraced.live).unwrap(), "");
         assert_eq!(super::finish(&untraced, &live), Ok(Report::Ran(None)));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run whose spec names the variables its key has is lent the rest: they are no
+    /// entries of its environment but [`super::LENT`] ones, for the interposer, and it reads
+    /// none of them until it reads one by name or walks its environment. What the sandbox and
+    /// the C library read themselves stays visible and is noted read from the start, set or
+    /// not; the visible names go to the programs it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_names_what_its_key_has_is_lent_the_rest() {
+        let dir = scratch("lent");
+        let mut spec = spec(&dir, "/bin/true", &[], true);
+        spec.env.push(("OLDPWD".into(), "/home/u".into()));
+        spec.env.push(("LD_PRELOAD".into(), "/l.so".into()));
+        spec.env.push(("LANG".into(), "C.UTF-8".into()));
+        spec.given = Some(vec!["OUT".into()]);
+        assert!(super::lends(&spec));
+        let env = super::program_env(&spec);
+        let (path, out) = (spec.env[0].clone(), spec.env[1].clone());
+        assert_eq!(
+            env[..env.len() - 1],
+            [
+                path,
+                out,
+                (super::LENT.into(), "OLDPWD=/home/u".into()),
+                ("LD_PRELOAD".into(), "/l.so".into()),
+                ("LANG".into(), "C.UTF-8".into()),
+            ]
+        );
+        let (name, visible) = &env[env.len() - 1];
+        assert_eq!(name, super::VISIBLE);
+        let visible: Vec<_> = visible.to_str().unwrap().split('=').collect();
+        assert!(["OUT", "PATH", "TZ", "LANG", "LC_ALL", "TMPDIR", "LD_PRELOAD"].iter().all(|it| visible.contains(it)));
+        assert!(!visible.contains(&"OLDPWD"));
+        let live = super::begin(&spec).unwrap();
+        let text = std::fs::read_to_string(&spec.live).unwrap();
+        let (lines, _) = trace::parse(&text[live.start as usize..]).unwrap();
+        assert!(!lines.iter().any(|it| it.seen == Seen::Env && trace::whole_env(&it.what)), "{text}");
+        let report = super::finish(&spec, &live).unwrap();
+        let Report::Ran(Some(traced)) = report else { panic!("{report:?}") };
+        // The sandbox's and the C library's variables, set or not, and no other.
+        let mut ours: Vec<&str> = super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY).copied().collect();
+        ours.sort_unstable();
+        ours.dedup();
+        let read: Vec<_> = traced.env.iter().map(|it| it.0.to_str().unwrap()).collect();
+        assert_eq!(read, ours);
+        let set: Vec<_> = traced.env.iter().filter(|it| it.1.is_some()).map(|it| it.0.to_str().unwrap()).collect();
+        assert_eq!(set, ["LANG", "LD_PRELOAD", "PATH"]);
+        // Untraced, or naming nothing, it is given its environment as it is.
+        spec.given = None;
+        assert!(!super::lends(&spec) && *super::program_env(&spec) == *spec.env);
         _ = std::fs::remove_dir_all(&dir);
     }
 

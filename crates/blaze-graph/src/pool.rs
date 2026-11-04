@@ -1674,11 +1674,16 @@ impl<'env> Scope<'env> {
         #[cfg(not(blaze_check))]
         // SAFETY: as above.
         let counter = unsafe { &*self.pending }.counter;
+        // The scope's work is the work of whoever opened it: its bytes are charged to that
+        // task's memory account wherever the job runs (`crate::arena::account`), so a task's
+        // peak is its fan-out's too. The account outlives the job: the scope's call waits for
+        // every job, and the task closes its account only after the call returns.
+        let account = crate::arena::current();
         let job = move |started: Started| {
             let _left = left;
             #[cfg(not(blaze_check))]
             crate::sched::count_towards(counter);
-            done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run))));
+            done(started.and_then(|()| catch_unwind(AssertUnwindSafe(|| crate::arena::charged_to(account, run)))));
         };
         // SAFETY: the job borrows only what lives for `'env`, which outlives the call of
         // `Pool::scope` this scope is of. That call returns (or unwinds) only once `finished`

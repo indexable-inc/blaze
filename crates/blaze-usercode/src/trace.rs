@@ -104,8 +104,17 @@ pub fn untraceable_of(name: &str) -> Option<Untraceable> {
     })
 }
 
-/// What an `E` line names for the whole environment.
+/// What an `E` line names for the whole environment. A process's interposer may say why after
+/// it and a space (`* gcc does not export __blaze_std_says_walks`): the line is the same line,
+/// the whole environment ([`whole_env`]), and the reason stays in the record for whoever reads
+/// why a run is keyed by all of it.
 pub const ALL_ENV: &str = "*";
+
+/// Whether an `E` line's `what` is the whole environment: [`ALL_ENV`], alone or with a reason.
+/// A variable whose name starts `* ` is taken for all of them, which keys by more, never less.
+pub fn whole_env(what: &str) -> bool {
+    what == ALL_ENV || what.starts_with("* ")
+}
 
 /// The name a [`Traced`] of a run that read the whole environment has, beside every variable,
 /// with the [`listing`] hash of the names (in hex) as its value: a variable added later is
@@ -440,7 +449,7 @@ pub fn assemble_seen<'a, I: Inputs>(
             match seen {
                 Seen::Read | Seen::Looked => files.push(what),
                 Seen::Listed => dirs.push(what),
-                Seen::Env if what == ALL_ENV => all_env = true,
+                Seen::Env if whole_env(what) => all_env = true,
                 Seen::Env => env.push(what),
                 // A name this blaze doesn't know is something it can't trace either.
                 Seen::Untraceable => untraceable.push(untraceable_of(what).unwrap_or(Untraceable::Descriptor)),
@@ -1061,6 +1070,9 @@ mod tests {
         assert_eq!(traced.env[0].0, ALL_ENV_NAME);
         assert_eq!(traced.env[0].1.as_deref(), Some(OsStr::new(&names_hash(&inputs.env))));
         assert_eq!(traced.untraceable, vec![Untraceable::Clock, Untraceable::Descriptor]);
+        // With the reason an interposer gives, it is the same whole environment.
+        let why = [Line::new(Seen::Env, "", "* cc does not export __blaze_std_says_walks")];
+        assert_eq!(assemble(&why, None, &mut fixed()).unwrap().env, traced.env);
     }
 
     /// [`Fixed`], noting what it was asked in the order it was asked.

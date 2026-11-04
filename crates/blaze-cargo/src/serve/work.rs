@@ -698,6 +698,13 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// name, with whether its check outcome and its bodies were served from the store,
     /// checked, or refused ([`blaze_api::Worked::served`]).
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError>;
+    /// On the loop, as the job's build ends and before it is kept: what its front end's query
+    /// engine logged of why its queries ran since the last take, each memo and input named
+    /// with the database in hand ([`blaze_query::db::take_log_in`]); none for a front end
+    /// with no database, and while the run log is off.
+    fn ran(&self) -> blaze_query::db::Taken {
+        blaze_query::db::Taken::default()
+    }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;

@@ -76,8 +76,24 @@ pub use release::{give_profile, profile_id};
 pub trait Hashes: Sync {
     /// Which item `item` is, by its path and kind.
     fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String>;
-    /// What a body is: its normalized MIR, each callee and type by content.
+    /// What a body is: its normalized MIR, each callee and type by content. With the key of
+    /// the store it is written in, whose span tables its positions name: two bodies written
+    /// alike in two places are two codes, so two instances ([`blaze_codegen::Instance::key`],
+    /// what the link names a function by), each reporting its own positions.
     fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
+    /// What a body is with nothing of where it is written or what it or its callees are
+    /// called: [`Hashes::code`] without the store's key. With [`Hashes::names_read`] folded in
+    /// by the front end, the code of the key its template is kept under when its positions
+    /// are its own tables' only, which the template holds by table
+    /// ([`blaze_codegen::template::own_anchor`]) and its instance fills
+    /// (docs/v2/plan/design/name-free-identity.md).
+    fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
+    /// What a compiled body reads of names beside its code, which every key of it holds: the
+    /// names of the files its `file!()` reads and, when `told` (a debugger is told of its
+    /// locals), what their types' identities read (`hir_ty_share::code::told_names`). With
+    /// whether that is all of it: not when a told local's type holds an alias, which neither
+    /// the code nor the instance's arguments key, so its template is kept under its code.
+    fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String>;
     /// A type by content: an ADT by its item and its layout's facts, never by its name.
     /// Regions are erased.
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String>;
@@ -122,6 +138,22 @@ impl Hashes for HashSource {
             HashSource::Items(it) => it.code(db, body),
             #[cfg(test)]
             HashSource::ById(it) => it.code(db, body),
+        }
+    }
+
+    fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
+        match self {
+            HashSource::Items(it) => it.template_code(db, body),
+            #[cfg(test)]
+            HashSource::ById(it) => it.template_code(db, body),
+        }
+    }
+
+    fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String> {
+        match self {
+            HashSource::Items(it) => it.names_read(db, body, told),
+            #[cfg(test)]
+            HashSource::ById(it) => it.names_read(db, body, told),
         }
     }
 

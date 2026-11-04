@@ -223,20 +223,30 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             #at_fns
 
             impl #ident {
-                /// Makes the input, every field of durability `LOW`.
+                /// Makes the input, every field of durability `durability`. There is no
+                /// default: a wrong kind silently makes verification redo work (a library
+                /// input stated `LOW` is re-verified on every workspace edit).
                 #[inline]
-                pub fn new<#database>(db: #db_ref #database, #(#required_idents: #required_tys),*) -> Self
+                pub fn new<#database>(
+                    db: #db_ref #database,
+                    durability: #db::Durability,
+                    #(#required_idents: #required_tys),*
+                ) -> Self
                 where
                     #database: ?::core::marker::Sized + #db::Database,
                 {
-                    Self::builder(#(#required_idents),*).new(db)
+                    Self::builder(durability, #(#required_idents),*).new(db)
                 }
 
-                /// A builder of the input, to set durabilities and default fields.
-                pub fn builder(#(#required_idents: #required_tys),*) -> #builder {
+                /// A builder of the input, every field of durability `durability` until a
+                /// `<field>_durability` sets one; it also sets default fields.
+                pub fn builder(
+                    durability: #db::Durability,
+                    #(#required_idents: #required_tys),*
+                ) -> #builder {
                     #builder {
                         fields: (#(#initial,)*),
-                        durabilities: [#db::Durability::LOW; #count],
+                        durabilities: [durability; #count],
                     }
                 }
 
@@ -250,13 +260,6 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             }
 
             impl #builder {
-                /// Sets the durability of every field.
-                #[must_use]
-                pub fn durability(mut self, durability: #db::Durability) -> Self {
-                    self.durabilities = [durability; #count];
-                    self
-                }
-
                 #builder_methods
 
                 /// Makes the input.

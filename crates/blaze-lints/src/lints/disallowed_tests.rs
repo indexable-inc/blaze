@@ -11,7 +11,7 @@ use std::alloc::Global;
 use hir::view::Semantics;
 use hir_expand::{
     fixture::{self, Fixture},
-    proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
+    proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
     tt::{DelimSpan, TopSubtree},
 };
 use intern::Symbol;
@@ -506,8 +506,9 @@ const SERDE: Ports<'static> = Ports {
 #[derive(Debug)]
 struct Nothing;
 impl ProcMacroExpander for Nothing {
-    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
-        Ok(TopSubtree::empty(DelimSpan { open: call.call_site, close: call.call_site }))
+    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+        let tree = TopSubtree::empty(DelimSpan { open: call.call_site, close: call.call_site });
+        Ok(Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set

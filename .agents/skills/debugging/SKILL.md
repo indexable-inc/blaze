@@ -1,0 +1,196 @@
+---
+name: debugging
+description: How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something.
+---
+
+# Debugging blaze from its profile
+
+Every `blaze serve` daemon keeps a profile history: Parquet files that say what each build
+ran, why, for how long and with how much memory. Answer "why" questions from those rows, not
+from reading code and guessing. The schema is defined once, in
+`crates/blaze-profile/src/schema.rs`, and documented column by column in `docs/profiling.md`.
+This skill says how to read it and how to turn a reading into a proved cause.
+
+Speed work also follows the `perf-and-tracing` rule (a span names the time before the fix).
+This skill is the general method behind it, for reruns, memory and cycles too.
+
+## The method
+
+1. **Reproduce.** Find the smallest build that shows it: one edit, one command, one daemon.
+   Write down the tree it ran on (commit and dirty diff; `builds.tree` and `builds.blaze` record
+   it) so the claim names an exact tree (rule `measure-the-exact-tree`).
+2. **Capture.** Run it under a daemon that keeps a history (any `blaze serve`). Use a fresh
+   `BLAZE_HOME` per experiment so the build numbers are yours: `BLAZE_HOME=$(mktemp -d) blaze
+   build`. Run the cold build, then the edit, then the warm build. Each build is a `build_id`.
+3. **Query.** Start from counts (`query_counts`, `time_by_span_name`), then go to rows
+   (`provenance`, `key_parts`, `spans`). Always filter by `build_id`.
+4. **Claim.** State one cause and one effect in numbers taken from the rows: "`infer_query` ran
+   4 120 times in build 3 because `FileText.text`(/src/lib.rs) changed, 3 900 of them through
+   `item_tree`".
+5. **Remove the cause and watch the effect go** (rule `test-the-cause`). Revert the edit, pin the
+   input, or drop the untracked read; rerun the same steps on the same tree and quote the same
+   query before and after. If the effect stays, the claim was wrong. Say so and go back to 3.
+
+Never report a cause you have not removed. Never report a speedup that has no before and
+after from the same query.
+
+## Where the files are
+
+- The history directory is `<state>/profile`. `<state>` is `$BLAZE_HOME/v2` when `BLAZE_HOME`
+  is set, else `$XDG_CACHE_HOME/blaze/v2`, else `~/.cache/blaze/v2`.
+- Each flush writes `<n>.<table>.parquet` per table. Every directory also holds an empty
+  `schema.<table>.parquet` of each table, so a glob always finds every column.
+- `owner.lock` names the daemon that writes there.
+- Files carry `blaze.schema` in their Arrow metadata. Schema 4 added `provenance` rows,
+  `key_parts` and the `query_counts.ran_*` causes. Older files read them as null.
+
+## Running DuckDB
+
+blaze never links DuckDB and never looks for it on `PATH`. `BLAZE_DUCKDB` names the binary as
+an absolute path. `nix develop` sets it, and so does the installed `blaze` wrapper. Outside
+both, run `nix run .#duckdb` (DuckDB 1.5.5, pinned in `flake.nix`) or set
+`BLAZE_DUCKDB=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb`.
+
+- `blaze debug sql "<query>"` runs one query over the history with every table and view of
+  `crates/blaze-profile/sql/views.sql` defined. `--json` prints rows as JSON for a script or a
+  CI gate. `--live` also reads the recorder's last `--last N` seconds.
+- `blaze explain <view> [name=value ...] [--json]` runs a named query from
+  `crates/blaze-profile/sql/examples.sql`. With no arguments it lists them. Each view whose
+  arguments all have defaults is also a DuckDB view of that name inside `blaze debug sql`, for
+  the last build: `blaze debug sql "SELECT * FROM what_reran"`.
+- `blaze slow [--build N]` is the one-screen answer to "what made it slow". `blaze why [ITEM]`
+  says what the daemon computed again and why, item by item.
+- For files outside a daemon (a CI artifact, another machine's home), call DuckDB directly:
+  `$BLAZE_DUCKDB -c "SELECT ... FROM read_parquet('<dir>/*.provenance.parquet', union_by_name =
+  true)"`.
+
+## The tables that answer "why"
+
+- `spans` has one row per span. `name` is the span kind (`unit bodies`, `macro expand`, `wait`,
+  `task`, ...), and `function`, `crate`, `unit` and the typed columns say of what. A `task` span
+  is one daemon plane task: `function` is its kind (`unit bodies (infer)`), plus `node`,
+  `granted_bytes` (what memory admission granted, the predicted peak), `passed` (how many times
+  another task started while its grant did not fit) and `peak_bytes` (the most it held). An
+  `admission` span is the same task's wait from ready to start, with `awaits` saying what held
+  it back: `memory`, `a work thread`, `an io thread` or `nothing` (null: it never started).
+- `query_counts` has one row per query function per build, written always. `executed` and
+  `verified` are runs and rows proved unchanged without running. `ran_new`, `ran_changed`,
+  `ran_untracked`, `ran_cycle` and `evicted_asked` are the runs by cause and add up to
+  `executed`; a mismatch is a bug in the engine. `written` is input writes, `reran` is runs
+  in a view the row already ran in, and `reads_*` are read volume.
+- `provenance` is the query engine's run log. It has one row per run that was not a first run,
+  plus one row for each run's first untracked read. Columns: `query_key` (the query and its
+  key as the key's `Debug` shows it, `` `infer_query`(DefWithBodyId(..)) ``), `kind`, `outcome`
+  (`ran` or `untracked read`), `cause` (`changed`, `evicted`, `untracked`, `cycle`), `view`,
+  `cause_key` (the read that changed: `` `FileText.text`(/src/lib.rs) `` for a file, another
+  input's field by id, or another memo's `query_key`), `cause_kind` (`input`, `tracked`,
+  `interned`, `function`) and `what` (the `Untracked { what }` name). Names are made only as
+  the build ends, with its database, so logging stays cheap. It is written while the
+  daemon keeps a history. Past 2^19 rows between two builds the rest are dropped with a
+  `warn` event, and the counts still hold every run.
+- `misses` has one row per unit, build-script run or codegen template that a build computed
+  again, with the reason in words (`cause`, `what`, `was`, `now`, `since`). `blaze why` reads
+  these rows.
+- `key_parts` has one row per part of each miss's key: `step`, `item`, `key` (hex), `part`,
+  `hash` (hex), `names` and `beyond`. Diff two builds with it, or two homes.
+- `counters` holds time series: `live bytes`, `footprint bytes`, `pool queued`, and others.
+
+## Ready queries
+
+Each query below is a named view (`blaze explain <name>`) unless it says otherwise. Defaults:
+`build` is the last build, `limit` is 20.
+
+**Top time by span.** `blaze explain time_by_span_name build=N` gives time per span kind.
+`blaze explain slowest_queries` lists the slowest query spans. For own CPU time by function:
+
+```sql
+SELECT name, function, count(*) AS spans, round(sum(self_cpu_ns) / 1e6, 1) AS self_cpu_ms
+FROM spans WHERE build_id = 3
+GROUP BY name, function ORDER BY self_cpu_ms DESC LIMIT 20
+```
+
+**What reran and why.**
+- `blaze explain memo_hit_rate_per_query_kind build=N` gives, per query, how many runs were
+  verified and how many ran, broken down by cause. Start here.
+- `blaze explain what_reran build=N` lists each memo that ran again, with its cause and the read
+  that changed.
+- `blaze explain why_reran build=N` follows each rerun's `cause_key` through the memos that
+  changed to the root (an input field, an untracked read, a cycle). It counts how many memos
+  each root made run again, so the top row is usually the answer.
+- `blaze explain untracked_reads build=N` lists the untracked reads by name. Each memo that made
+  one reruns in every view, so a name here with many memos is a missing tracked input.
+- To find what made one memo run, walk the chain by hand:
+
+```sql
+WITH RECURSIVE chain AS (
+    SELECT query_key, cause, cause_key, cause_kind, 0 AS depth
+    FROM provenance WHERE build_id = 3 AND query_key LIKE '`infer_query`(%my_fn%'
+    UNION ALL
+    SELECT p.query_key, p.cause, p.cause_key, p.cause_kind, chain.depth + 1
+    FROM chain JOIN provenance p ON p.build_id = 3 AND p.query_key = chain.cause_key
+    WHERE chain.cause_kind = 'function' AND chain.depth < 64
+)
+SELECT DISTINCT * FROM chain ORDER BY depth
+```
+
+- Units and build scripts: `blaze why`, or `SELECT step, item, cause, what FROM misses WHERE
+  build_id = 3 AND cause <> 'first'`.
+
+**Diffing two runs' keys.**
+- `blaze explain key_part_diff after=M before=N` lists, for each thing build M computed again,
+  each key part whose hash differs from the last build at or before N that computed it too.
+- No rows while `misses` still says it missed means the key was the same. Look at `beyond`
+  (process variables, traced reads) and at `misses.cause`.
+- Across two homes, for example a cache miss on CI that you don't see locally:
+
+```sql
+WITH a AS (SELECT * FROM read_parquet('/tmp/home-a/v2/profile/*.key_parts.parquet', union_by_name = true) WHERE build_id = 2),
+     b AS (SELECT * FROM read_parquet('/tmp/home-b/v2/profile/*.key_parts.parquet', union_by_name = true) WHERE build_id = 2)
+SELECT coalesce(a.item, b.item) AS item, coalesce(a.part, b.part) AS part, a.hash AS a_hash, b.hash AS b_hash
+FROM a FULL JOIN b ON a.step = b.step AND a.item = b.item AND a.part IS NOT DISTINCT FROM b.part
+WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
+```
+
+  Run it with `$BLAZE_DUCKDB -c "..."`. Build numbers differ across homes, so pick each side's
+  build first.
+
+**Memory by task.**
+- `blaze explain task_memory build=N` shows, per task kind, the memory granted against the peak
+  held, and how many tasks went over their grant. A kind that is often over its grant has a
+  forecast that is too low.
+- The whole-process line is the `live bytes` and `footprint bytes` counters
+  (`blaze explain footprint_per_build`).
+- Single tasks: `SELECT function, node, granted_bytes, peak_bytes FROM spans WHERE build_id = 3
+  AND name = 'task' ORDER BY peak_bytes DESC NULLS LAST LIMIT 20`.
+
+**Admission waits.**
+- `blaze explain admission_waits build=N` gives, per task kind and what held it back (memory,
+  a work or io thread, nothing), how many tasks waited, their whole and longest wait from ready
+  to start, and how often memory passed them over.
+- The longest single waits: `SELECT function, node, awaits, round(dur_ns / 1e6, 1) AS ms,
+  passed FROM spans WHERE build_id = 3 AND name = 'admission' ORDER BY dur_ns DESC LIMIT 20`.
+- Threads blocked inside tasks are `wait` spans: `SELECT awaits, waits_on, count(*),
+  round(sum(dur_ns) / 1e6, 1) AS ms FROM spans WHERE build_id = 3 AND name = 'wait' GROUP BY
+  ALL ORDER BY ms DESC`.
+- `blaze explain uncovered_time` and `worker_states` say whether workers were idle while tasks
+  waited.
+
+**A cycle that won't settle.**
+- `blaze explain cycle_reruns build=N` lists the memos that ran for a cycle, with their runs and
+  views. One memo with many runs in one view is a cycle iterating.
+- `SELECT kind, ran_cycle, executed FROM query_counts WHERE build_id = 3 AND ran_cycle > 0`
+  gives the count per query.
+- If the build never ends, `open` holds the spans every thread was inside at the last flush,
+  and `blaze slow` reports a build whose daemon died.
+
+## Limits to keep in mind
+
+- A key's name is its `Debug`, which may still hold ids (`FunctionId(..)`) where the type
+  prints no path, and an input other than a file's text is named by its id. Compare across
+  daemons by query and count, or through `key_parts` and `misses`, which name items by path.
+- The counts are process-wide (two overlapping builds share them); the run log is the front
+  end's own.
+- `admission` says memory only when the task was passed over for it; a wait behind another
+  task's starvation hold reads as a thread.
+- The `queries` view joins `provenance` on a span's `function`. That is a display name, so the
+  join finds nothing. Read `provenance` directly.

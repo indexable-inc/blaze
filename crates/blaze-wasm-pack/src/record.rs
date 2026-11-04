@@ -8,7 +8,7 @@ use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use cfg::CfgAtom;
-use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros};
+use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros};
 use intern::sym;
 use parking_lot::Mutex;
 
@@ -49,7 +49,7 @@ impl ProcMacroExpander for Recorder {
         self.inner.code()
     }
 
-    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let output = self.inner.expand(db, call);
         self.record(&call, &output);
         output
@@ -60,7 +60,7 @@ impl ProcMacroExpander for Recorder {
         db: &Db,
         calling_crate: Crate,
         call: ProcMacroCall<'_>,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let output = self.inner.expand_in(db, calling_crate, call);
         self.record(&call, &output);
         output
@@ -76,7 +76,9 @@ impl ProcMacroExpander for Recorder {
 }
 
 impl Recorder {
-    fn record(&self, call: &ProcMacroCall<'_>, output: &Result<tt::TopSubtree, ProcMacroExpansionError>) {
+    /// Keeps what `call` gave. What it read and its session's part are its inner expander's,
+    /// which the recorder states as they are.
+    fn record(&self, call: &ProcMacroCall<'_>, output: &Result<Expanded, ProcMacroExpansionError>) {
         let call = Call {
             krate: self.krate.clone(),
             name: self.name.clone(),
@@ -84,7 +86,7 @@ impl Recorder {
             attr: call.attrs.map(ToString::to_string),
         };
         let recorded = match output {
-            Ok(output) => Ok(output.to_string()),
+            Ok(output) => Ok(output.tree.to_string()),
             Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => Err(why.clone()),
         };
         self.expansions.lock().insert(call, recorded);

@@ -1,8 +1,10 @@
 //! The claim-free verify walk: a row of an earlier view is checked by its edges in read order,
 //! depth first, with no flight and no lock, marking each row it proves unchanged with a
 //! compare-and-swap of its `verified` word. It gives up (and the caller takes the row's flight)
-//! at the first edge that changed, or that needs a run, or a row that is running, provisional,
-//! made in a cycle or untracked: those are the claimed path's. A row whose kind did not change,
+//! at the first edge that changed, or that needs a run, or a row that is running, provisional
+//! or untracked: those are the claimed path's. A final row of a converged cycle is walked like
+//! any other: its head's edges are what the whole cycle read outside itself over every round,
+//! and a member's one edge is its head (`function::finalize`). A row whose kind did not change,
 //! or whose input summary shares no bit with the fields written since it was verified, is
 //! proved without its edges; a walked row's summary grows by its dependencies' current ones.
 //!
@@ -17,8 +19,7 @@ use super::{
     ingredient::{self, Kind},
     local::{self, Walk},
     row::{
-        CYCLE, DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at,
-        span,
+        DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at, span,
     },
     storage::{FIELD, NodeRow, Storage, color, key_parts, or},
 };
@@ -34,10 +35,7 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
         return false;
     }
     let meta = header.meta.load(Ordering::Relaxed);
-    if word & (RUNNING | PROVISIONAL) != 0
-        || meta & (CYCLE | UNTRACKED) != 0
-        || word & VIEW_MASK == 0
-    {
+    if word & (RUNNING | PROVISIONAL) != 0 || meta & UNTRACKED != 0 || word & VIEW_MASK == 0 {
         return false;
     }
     if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
@@ -123,7 +121,7 @@ fn walk(
             let word = header.verified.load(Ordering::Acquire);
             let meta = header.meta.load(Ordering::Relaxed);
             if word & (RUNNING | PROVISIONAL) != 0
-                || meta & (CYCLE | UNTRACKED) != 0
+                || meta & UNTRACKED != 0
                 || word & VIEW_MASK == 0
             {
                 return false;
@@ -153,7 +151,7 @@ fn walk(
 }
 
 /// The header of the function row whose node is `node`, if its page was made.
-fn function_header<'s>(storage: &'s Storage, node: &NodeRow) -> Option<&'s Header> {
+pub(crate) fn function_header<'s>(storage: &'s Storage, node: &NodeRow) -> Option<&'s Header> {
     let (index, id, _) = key_parts(node.key());
     let vtable = ingredient::vtable(index)?;
     if vtable.kind != Kind::Function {

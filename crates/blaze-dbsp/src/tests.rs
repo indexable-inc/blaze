@@ -226,18 +226,21 @@ enum IndexOp {
     Add(u8, u8),
     Remove(u8, u8),
     Forget(u8),
+    /// `ReadIndex::forget_many`: one at a time or by a sweep, by the share of edges it drops.
+    ForgetMany(Vec<u8>),
 }
 
-/// Adds four times as often as removes or forgets.
+/// Adds four times as often as removes, forgets or forgets of many.
 #[hegel::composite]
 fn index_op(tc: &TestCase) -> IndexOp {
-    let pick: u8 = tc.draw(gs::integers().max_value(5));
+    let pick: u8 = tc.draw(gs::integers().max_value(6));
     let k: u8 = tc.draw(gs::integers().max_value(11));
     let r: u8 = tc.draw(gs::integers().max_value(11));
     match pick {
         0..=3 => IndexOp::Add(k, r),
         4 => IndexOp::Remove(k, r),
-        _ => IndexOp::Forget(r),
+        5 => IndexOp::Forget(r),
+        _ => IndexOp::ForgetMany(tc.draw(gs::vecs(gs::integers().max_value(11)).max_size(8))),
     }
 }
 
@@ -259,6 +262,10 @@ fn read_index_matches_a_set_of_pairs(tc: TestCase) {
             IndexOp::Forget(r) => {
                 index.forget(r);
                 model.retain(|&(_, reader)| reader != r);
+            }
+            IndexOp::ForgetMany(readers) => {
+                index.forget_many(readers.iter().copied());
+                model.retain(|(_, reader)| !readers.contains(reader));
             }
         }
         assert_eq!(index.len(), model.len());

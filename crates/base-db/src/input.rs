@@ -900,9 +900,8 @@ impl Crate {
             let lints = LintOptions::default();
             let content =
                 Crate::content_of(&*db, root, &data, &extra, &workspace, &cfg, &env, &lints);
-            let krate = Crate::builder(data, extra, workspace, cfg, env, InputId(content))
-                .durability(durability)
-                .new(&*db);
+            let krate =
+                Crate::new(&*db, durability, data, extra, workspace, cfg, env, InputId(content));
             db.crates_map().lock().note(krate, root, true);
             db.set_crate_attr_files(krate, false, Some(durability));
             db.note(Note::Crates);
@@ -1398,7 +1397,9 @@ impl Walk<'_, '_> {
             &krate.env,
             &LintOptions::default(),
         );
-        let input = Crate::builder(
+        let input = Crate::new(
+            &*db,
+            Durability::MEDIUM,
             data,
             // clone: a new crate's fields (setup).
             krate.extra.clone(),
@@ -1409,9 +1410,7 @@ impl Walk<'_, '_> {
             // clone: a new crate's fields (setup).
             krate.env.clone(),
             InputId(content),
-        )
-        .durability(Durability::MEDIUM)
-        .new(&*db);
+        );
         let changed = self.crates.note(input, root, true);
         (input, changed)
     }

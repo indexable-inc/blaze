@@ -194,22 +194,32 @@ pub const WAIT_SPAN: &str = "wait";
 /// The name of a job's root span ([`crate::span::Job`]): the span that names its job and creator.
 pub const JOB_SPAN: &str = <crate::span::Job as crate::span::Span>::NAME;
 
-/// Which of a build's spans [`load::rows`] read. One build can hold hundreds of millions of
-/// spans (192 million in build 24 of a 52-minute cold build, 2026-11-03), more than the model
-/// can hold, so past [`load::SPAN_BUDGET`] it reads the spans at or past `floor_ns`, every
-/// root [`JOB_SPAN`] and [`WAIT_SPAN`] and every span the record never ended, and none of the
-/// shorter ones. Taken by duration, the spans read keep every parent they have: a child lies
-/// inside its parent, so is never longer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Which of a build's spans the model read ([`load::modelled`]). One build can hold hundreds of
+/// millions of spans (240 million in build 9 of a 186-minute self-build, 2026-11-04), more than
+/// the model can hold, so past [`load::SPAN_BUDGET`] it reads, in a first pass, the spans at or
+/// past `floor_ns` and every span the record never ended; then, in a second, the spans of the
+/// lanes that first model's critical path crosses, down to their own floor ([`PathRead`]). Taken
+/// by duration, the spans read keep every parent they have: a child lies inside its parent, so is
+/// never longer. What the first pass left out of the root `job` spans and the `wait` spans is
+/// summed in DuckDB instead ([`CutGroup`]), so a report still says what they were.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpanCut {
-    /// The least duration of a span read; 0 when every span was.
+    /// The least duration of a span the first pass read; 0 when every span was.
     pub floor_ns: i64,
     /// The build's spans, all told.
     pub spans: u64,
-    /// Of them, those read.
+    /// Of them, those read, in both passes.
     pub read: u64,
-    /// The durations of those not read, summed: a nested one's time is also its parent's.
+    /// The durations of those the first pass did not read, summed: a nested one's time is also
+    /// its parent's.
     pub cut_ns: i64,
+    /// The second pass, over the critical path's lanes; `None` when nothing was cut.
+    pub path: Option<PathRead>,
+    /// The root `job` spans and the `wait` spans under `floor_ns` by name, crate and subject
+    /// (a job's function, a wait's `awaits`): the [`load::CUT_GROUPS`] that took the most time.
+    pub groups: Vec<CutGroup>,
+    /// The same spans by name alone, every one of them: `krate` and `subject` are `None`.
+    pub totals: Vec<CutGroup>,
 }
 
 impl SpanCut {
@@ -217,6 +227,38 @@ impl SpanCut {
     pub fn cut(&self) -> u64 {
         self.spans.saturating_sub(self.read)
     }
+}
+
+/// The second pass of [`SpanCut`]: the spans of the lanes the first model's critical path
+/// crossed, read under the first pass's floor down to `floor_ns`, so the path's work, its phases
+/// and the waits on it are named from every span its lanes hold (or every one past `floor_ns`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PathRead {
+    /// The least duration of a span read for the path's lanes; 0: all of them.
+    pub floor_ns: i64,
+    /// The lanes whose spans were read.
+    pub lanes: u64,
+    /// The spans the second pass added.
+    pub spans: u64,
+    /// Lanes on the final model's critical path whose spans the second pass did not read: the
+    /// first model's path did not cross them, or they passed [`load::PATH_STRETCHES`]. Their
+    /// spans are those past `SpanCut::floor_ns` alone.
+    pub lanes_unread: u64,
+}
+
+/// Spans the first pass of [`SpanCut`] did not read, summed in DuckDB: how many, their time, the
+/// longest and their CPU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CutGroup {
+    /// [`JOB_SPAN`] or [`WAIT_SPAN`].
+    pub name: String,
+    pub krate: Option<String>,
+    /// A job span's function (its closure's type), a wait span's `awaits`.
+    pub subject: Option<String>,
+    pub spans: u64,
+    pub dur_ns: i64,
+    pub max_ns: i64,
+    pub self_cpu_ns: i64,
 }
 
 /// The name of a pool worker's span of its own work between jobs (`blaze_graph::pool::Driving`):
@@ -372,7 +414,9 @@ pub enum TimeError {
     /// so in one history. Read as one build, their workers and windows would be summed.
     ManyProcesses { build: u64, processes: Vec<OfProcess> },
     /// Build `build` holds more spans than the model reads ([`load::SPAN_BUDGET`]) even at the
-    /// highest floor tried: `read` at `floor_ns`, of `spans`.
+    /// highest floor tried: `read` at `floor_ns`, of `spans`. The highest floor keeps only the
+    /// spans the record never ended (a few for each thread), so this is the hard bound, not a
+    /// size a build reaches: every other span is read past a floor or summed in DuckDB.
     TooManySpans { build: u64, spans: u64, read: u64, floor_ns: i64, budget: u64 },
 }
 
@@ -412,9 +456,9 @@ impl fmt::Display for TimeError {
             }
             TimeError::TooManySpans { build, spans, read, floor_ns, budget } => write!(
                 f,
-                "build {build} has {spans} spans, and even taking only those of {:.1} s or more, every root job and wait \
-                 span and every unended one, the model would hold {read}, past its bound of {budget} \
-                 (time::load::SPAN_BUDGET): read it with `blaze debug sql` over the spans view instead",
+                "build {build} has {spans} spans, and even taking only those of {:.1} s or more and every unended one, \
+                 the model would hold {read}, past its bound of {budget} (time::load::SPAN_BUDGET): so many spans the \
+                 record never ended is a recorder bug; read the build with `blaze debug sql` over the spans view",
                 *floor_ns as f64 / 1e9
             ),
         }
@@ -875,11 +919,25 @@ pub struct Model {
 impl Model {
     /// The model of `input`.
     pub fn build(input: Input) -> Result<Model, TimeError> {
-        let Input { build, build_row, mut switches, spans, mut events } = input;
-        let bounds = bounds(build, build_row, &switches, &spans)?;
+        let Input { build, build_row, mut switches, spans, events } = input;
+        Model::of(build, build_row, &mut switches, spans, events)
+    }
+
+    /// The model of a build's rows, with `switches` sorted in place and left to the caller, so a
+    /// second model of the same switches and other spans needs no second read of them
+    /// ([`load::modelled`]).
+    pub fn of(
+        build: u64,
+        build_row: Option<(i64, i64)>,
+        switches: &mut [SwitchIn],
+        spans: Vec<SpanIn>,
+        mut events: Vec<EventIn>,
+    ) -> Result<Model, TimeError> {
+        let bounds = bounds(build, build_row, switches, &spans)?;
         switches.sort_by_key(|it| (it.process, it.t_ns, it.event.rank()));
-        let threads = thread_rows(&switches);
-        let workers = workers(&switches, bounds);
+        let switches: &[SwitchIn] = switches;
+        let threads = thread_rows(switches);
+        let workers = workers(switches, bounds);
         let mut builder = Builder {
             bounds,
             threads,
@@ -895,7 +953,7 @@ impl Model {
             began_as: Vec::new(),
             anomalies: Anomalies::default(),
         };
-        builder.job_lanes(&switches);
+        builder.job_lanes(switches);
         let ready_by = std::mem::take(&mut builder.ready_by);
         let spawned_by = std::mem::take(&mut builder.spawned_by);
         let mut model = builder.finish(build, spans, workers);
@@ -928,6 +986,11 @@ impl Model {
             // alloc: once a model
             .collect();
         self.events = events;
+    }
+
+    /// Its spans, the rest let go: a second model of the same build takes them ([`load::modelled`]).
+    pub fn into_spans(self) -> Vec<SpanIn> {
+        self.spans
     }
 
     /// The lane `id`, if the model has it.

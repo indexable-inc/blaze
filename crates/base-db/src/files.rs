@@ -554,7 +554,7 @@ impl Files {
             Some((module, text)) => writer.suffixes.insert(alias, (module, text.into())),
             None => _ = writer.suffixes.remove(alias),
         }
-        let durability = alias_durability(&writer, of);
+        let durability = file_durability(&writer, of);
         let text = self.text_input(of).map(|input| {
             // clone: a count of the bytes
             (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
@@ -593,7 +593,7 @@ impl Files {
         }
         let file_root = file_root.source_root_id(&*db);
         self.set_file_source_root_in(&mut writer, db, alias, file_root, Durability::MEDIUM);
-        let durability = alias_durability(&writer, of);
+        let durability = file_durability(&writer, of);
         let text = self.text_input(of).map(|input| {
             // clone: a count of the bytes, which the alias shares
             (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
@@ -702,12 +702,10 @@ impl Files {
             }
             None => {
                 let reparse = Reparse::new(&text, file);
-                let builder = FileText::builder(text, file_id, InputId(content), reparse);
-                let builder = match durability {
-                    Some(durability) => builder.durability(durability),
-                    None => builder,
-                };
-                self.text.set(raw, Some(builder.new(&*db)));
+                let durability = durability.unwrap_or_else(|| file_durability(writer, file_id));
+                let input =
+                    FileText::new(&*db, durability, text, file_id, InputId(content), reparse);
+                self.text.set(raw, Some(input));
             }
         }
         content
@@ -746,12 +744,8 @@ impl Files {
                 input
             }
             None => {
-                let builder = IncludedFile::builder(read(), InputId(content));
-                let builder = match durability {
-                    Some(durability) => builder.durability(durability),
-                    None => builder,
-                };
-                builder.new(&*db)
+                let durability = durability.unwrap_or_else(|| file_durability(writer, file_id));
+                IncludedFile::new(&*db, durability, read(), InputId(content))
             }
         };
         self.raw.set(file_id.index(), Some(input));
@@ -933,7 +927,7 @@ impl Files {
             None => {
                 let read = self.read_included(path);
                 let content = InputId(IncludedFile::content_of(read.as_deref()));
-                let file = IncludedFile::builder(read, content).durability(durability).new(db);
+                let file = IncludedFile::new(db, durability, read, content);
                 let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
                 self.included.insert(hash, |it| it.path.as_path() == path, make).0
             }
@@ -974,7 +968,7 @@ impl Files {
         }
         let (text, vfs, content) = source_text(included.file.read(db));
         let reparse = Reparse::new(&text, vfs);
-        let text = FileText::builder(text, id, InputId(content), reparse).durability(durability).new(db);
+        let text = FileText::new(db, durability, text, id, InputId(content), reparse);
         let vfs_path = VfsPath::from(path.to_path_buf());
         let root_content = one_file_root_content(is_library, id, &vfs_path, content);
         let mut files = FileSet::default();
@@ -983,11 +977,10 @@ impl Files {
             true => SourceRoot::new_library(files),
             false => SourceRoot::new_local(files),
         };
-        let root = SourceRootInput::builder(Arc::new(root), InputId(root_content))
-            .durability(durability)
+        let root = SourceRootInput::builder(durability, Arc::new(root), InputId(root_content))
             .content_durability(root_content_durability(is_library))
             .new(db);
-        let file_root = FileSourceRootInput::builder(SourceRootId(raw)).durability(durability).new(db);
+        let file_root = FileSourceRootInput::new(db, durability, SourceRootId(raw));
         // A reader that made it first at once keeps its own; this one's inputs are left unread.
         let source = included.source.get_or_init(|| IncludedSource { file: id, text, file_root, root });
         (included.file, Ok(source.file))
@@ -1227,8 +1220,7 @@ impl Files {
                     }
                 }
                 None => {
-                    let input = SourceRootInput::builder(source_root, content)
-                        .durability(durability)
+                    let input = SourceRootInput::builder(durability, source_root, content)
                         .content_durability(content_durability)
                         .new(&*db);
                     self.source_roots.set(source_root_id.0, Some(input));
@@ -1285,8 +1277,7 @@ impl Files {
                 input.set_source_root_id(db).with_durability(durability).to(source_root_id);
             }
             None => {
-                let input =
-                    FileSourceRootInput::builder(source_root_id).durability(durability).new(&*db);
+                let input = FileSourceRootInput::new(&*db, durability, source_root_id);
                 self.file_source_roots.set(id.index(), Some(input));
             }
         }
@@ -1332,9 +1323,11 @@ impl Files {
     }
 }
 
-/// What an alias of `of` is written with: as durable as a file of `of`'s source root.
-fn alias_durability(writer: &Writer, of: FileId) -> Durability {
-    let root = writer.roots_of(of).first();
+/// The kind of `file`'s inputs, by its source root: `HIGH` in a library root, else `LOW` (a
+/// workspace file, or one in no root yet). What an alias of `file` is written with, and what a
+/// file's new input is made with where its writer gave no kind ([`Files::set_file_text`]).
+fn file_durability(writer: &Writer, file: FileId) -> Durability {
+    let root = writer.roots_of(file).first();
     let is_library = root.and_then(|root| writer.root_contents.get(root)).is_some_and(|it| it.is_library);
     if is_library { Durability::HIGH } else { Durability::LOW }
 }

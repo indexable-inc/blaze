@@ -8,7 +8,12 @@
 //!   script reads of those is traced, so a `PATH` that differs only where the script never
 //!   looks keeps its result (#805). Which is which is [`blaze_build_script::Env::origin`].
 //! - **Traced**: every file, listing and variable the script and every program it ran read,
-//!   the C compiler and its headers among them (#1480).
+//!   the C compiler and its headers among them (#1480). The variables passed through are lent
+//!   to it, not given ([`crate::confine::GIVEN`]): its environment holds the given ones
+//!   alone, and what it reads of the others by name is traced by name, so a variable it never
+//!   reads (a shell's `OLDPWD` or `SHLVL`) is in no key. A script that walks its environment
+//!   (`env::vars`, a `Command` that passes it on to a program) is lent all of it then, and
+//!   read all of it.
 //! - **Portable** (docs/v2/plan/lanes/store.md, "Portable keys"): every path and value in
 //!   the key and in what is traced is written against the run's roots ([`crate::roots`]): its
 //!   package, its `OUT_DIR`, the target directory, the workspace, blaze's tools and launcher
@@ -39,6 +44,7 @@ use crate::{
     roots::{Role, RoleSet, RootMap},
     rule::CargoRule,
     run::{self, Mode, OutFile, Value},
+    confine::GIVEN,
     trace::ALL_ENV_NAME,
 };
 
@@ -82,9 +88,9 @@ pub struct Prepared {
     /// with: what the script sees but the names given ([`Prepared::given`], whose values the
     /// key has) and of the run alone ([`RUN_ONLY`]), sorted by name and each once, as
     /// [`crate::inputs::Env`] keeps it. What [`keyed`] leaves of a trace is what this
-    /// environment gives, so a run that read the whole environment (every traced run does, as
-    /// a sandbox passes it on whole to what it starts) is found again under the key it was
-    /// kept under.
+    /// environment gives, so a run that read some of it by name, or the whole of it (one that
+    /// walked it, or passed it on whole to a program it started), is found again under the
+    /// key it was kept under.
     pub env: Vec<(OsString, OsString)>,
     /// The names given, which are left out of what is traced: the key has them already.
     pub given: Vec<OsString>,
@@ -98,7 +104,10 @@ impl Prepared {
     /// find ([`script_env`]). A pure key has no given part, so [`Prepared::env`], which leaves
     /// the given names out, would keep each of them as not set and never be found again.
     pub fn script_env(&self) -> &[(OsString, OsString)] {
-        &self.spec.command.env
+        // The launcher's [`GIVEN`], which [`prepare`] adds after the script's (and the daemon
+        // adds the launcher's live record after it), is no variable of the script's.
+        let env = &self.spec.command.env;
+        &env[..env.iter().position(|it| it.0 == GIVEN).unwrap_or(env.len())]
     }
 }
 
@@ -152,10 +161,16 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     roots.bind(bound);
     let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect(); // alloc: setup, the script's environment
     let checked = checked_env(&vars, &names);
+    // The script's environment, and last the launcher's [`GIVEN`]: the names its key has,
+    // which the program's environment holds alone; every other variable is lent to it and
+    // traced as it is read.
+    let mut command_env = Vec::with_capacity(vars.len() + 1); // alloc: setup, the command's environment
+    command_env.extend(vars.iter().cloned()); // clone: setup, as above; the check keeps its own
+    command_env.push((GIVEN.into(), crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?));
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
         args: Vec::new(), // alloc: none, an empty list
-        env: vars.clone(), // clone: setup, the command's environment; the check keeps its own
+        env: command_env,
         dir: unit.package.manifest_dir.clone(), // clone: setup, the command owns its directory
         stdin: Vec::new(), // alloc: none, empty
         sandbox: Sandbox::On {
@@ -559,15 +574,22 @@ mod tests {
     /// keeps it: its shape in the run's first slot, and its result.
     #[cfg(not(windows))]
     fn kept_whole(prepared: &Prepared) -> Vec<(blaze_cas::Key, Vec<u8>)> {
+        kept_reading(prepared, &[crate::trace::ALL_ENV])
+    }
+
+    /// The store a run of `prepared` that read the variables `names` leaves (`*`: the whole
+    /// environment), as `Run::complete` keeps it.
+    #[cfg(not(windows))]
+    fn kept_reading(prepared: &Prepared, names: &[&str]) -> Vec<(blaze_cas::Key, Vec<u8>)> {
         use crate::{
             index::{self, Shape},
             inputs::Disk,
-            trace::{self, ALL_ENV, Line, Seen},
+            trace::{self, Line, Seen},
         };
 
-        // The run, as the sandbox reports it: the whole environment it was started with.
-        let lines = [Line::new(Seen::Env, "", ALL_ENV)];
-        let mut traced = trace::assemble(&lines, None, &mut Disk::new(prepared.spec.command.env.clone())).unwrap();
+        // The run, as the sandbox reports it: what it read of the environment it was started with.
+        let lines: Vec<Line> = names.iter().map(|name| Line::new(Seen::Env, "", name)).collect();
+        let mut traced = trace::assemble(&lines, None, &mut Disk::new(prepared.script_env().to_vec())).unwrap();
         keyed(prepared, &mut traced).unwrap();
         let roots = prepared.spec.roots.view();
         let (marked, stored) = roots.kept(&traced, &elided(b"cargo:rustc-cfg=x\n".to_vec())).unwrap();
@@ -575,6 +597,38 @@ mod tests {
             (index::slot(&prepared.spec.key, 0), Shape::of(&marked.local).encode()),
             (index::result_key(&prepared.spec.key, &marked.local), stored.encode()),
         ]
+    }
+
+    /// The key rule for what a script is lent (rule 20, keys cover every input): its key
+    /// holds the variables it read and no other. Two shells that differ only in variables the
+    /// run never read (`OLDPWD`, `SHLVL`, the shell's temporary directory) find the run one
+    /// kept; one whose value of a variable it read differs does not. The program's environment
+    /// holds the given names alone ([`GIVEN`]), so nothing it was not lent by a read it was
+    /// seen to make reaches it.
+    #[cfg(not(windows))] // Windows has no roots, and the check here goes through them.
+    #[test]
+    fn a_variable_passed_through_is_in_the_key_only_when_it_was_read() {
+        let shell = |path: &str, oldpwd: &str, shlvl: &str| {
+            let mut env = inherited(path);
+            env.push(("OLDPWD".into(), oldpwd.into()));
+            env.push(("SHLVL".into(), shlvl.into()));
+            env.push(("NIX_BUILD_TOP".into(), format!("/tmp/nix-shell.{oldpwd}").into()));
+            prepare(&unit(), &env, &place()).unwrap()
+        };
+        let first = shell("/a", "x", "1");
+        let given = first.spec.command.env.iter().find(|it| it.0 == GIVEN).expect("the launcher is told the given names");
+        let given: Vec<&str> = given.1.to_str().unwrap().split('=').collect();
+        assert!(given.contains(&"OUT_DIR") && given.contains(&"TARGET"), "{given:?}");
+        assert!(!given.iter().any(|it| ["PATH", "OLDPWD", "SHLVL", "CARGO_MAKEFLAGS"].contains(it)), "{given:?}");
+        assert!(!first.script_env().iter().any(|it| it.0 == GIVEN), "the launcher's variable is not the script's");
+        // It read `PATH` by name, and `TARGET`, which its key has already.
+        let store = kept_reading(&first, &["PATH", "TARGET"]);
+        assert!(finds(&store, &shell("/a", "y", "3")), "another shell, the same in what the run read, misses");
+        assert!(!finds(&store, &shell("/b", "x", "1")), "another PATH, which the run read, finds the run of another");
+        // One that read `OLDPWD` is keyed by it.
+        let store = kept_reading(&first, &["OLDPWD"]);
+        assert!(!finds(&store, &shell("/a", "y", "1")), "another OLDPWD, which the run read, finds the run of another");
+        assert!(finds(&store, &shell("/b", "x", "2")));
     }
 
     /// Whether a check of `prepared`, as the daemon makes it, finds a run in `store`.

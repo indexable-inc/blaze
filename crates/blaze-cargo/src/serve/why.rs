@@ -13,8 +13,9 @@
 //!   one step under one subject in one build are refused ([`RebuildCause::Twice`]) and
 //!   compared with nothing (rule 18).
 //! - **A miss with parts** (a key made of named parts: a dev template's toolchain, code,
-//!   settings and callees) is told apart against the parts the subject had when last computed
-//!   by a build that ended well: the parts that changed by name ([`RebuildCause::Parts`]);
+//!   settings and callees) is told apart against the parts the subject had when last computed,
+//!   by any build, one that failed or was stopped too (a keep-going build that failed still
+//!   computed what it computed, under the key it names): the parts that changed by name ([`RebuildCause::Parts`]);
 //!   the same key, so nothing is kept under it or what it is filed under past the key differs
 //!   ([`RebuildCause::Lost`], [`RebuildCause::Beyond`]); a key that changed while no named part
 //!   did ([`RebuildCause::Unnamed`]); or no record of it ([`RebuildCause::First`]). Builds
@@ -24,8 +25,8 @@
 //! - **A miss the kernel explained** (a read that changed) is its reason as the kernel gave it,
 //!   with the build that kept the entry it was compared with.
 //! - **The file** ([`LEDGER`]): a magic naming its version, then framed records (`u32`
-//!   little-endian length, then deterministic CBOR), one a build that ended well: the subjects
-//!   it computed with their parts. Only types this module owns are written, and the version is
+//!   little-endian length, then deterministic CBOR), one a build, however it ended: the
+//!   subjects it computed with their parts. Only types this module owns are written, and the version is
 //!   a hash of the encoding of a record with every field set and of [`NAMING`] ([`version`]),
 //!   so a change of any of them is a new version and an old file is moved aside, never misread.
 //!   Replayed in order, later records winning; compacted to one record once the appends pass
@@ -66,11 +67,13 @@ const WORKSPACES: usize = 16;
 /// name or a subject's makeup changes (`compile::unit_subject`, `FnNode::subject`, the part
 /// names in `blaze-codegen`'s driver and `compile::RecordInputs::parts`), so an old file's
 /// records are not compared with new ones under other names. 3: a record's "the blaze
-/// executable" part became its three makers' code identities (`RecordMakers`).
-const NAMING: u32 = 3;
+/// executable" part became its three makers' code identities (`RecordMakers`). 4: a dev
+/// template's callees that share a path and an origin are told apart by their subject, and
+/// one its build did not walk by its key.
+const NAMING: u32 = 4;
 
-/// What the ledger holds of a subject: its key and the parts of it when it was last computed
-/// by a build that ended well. Fields in the order deterministic CBOR sorts their names.
+/// What the ledger holds of a subject: its key and the parts of it when it was last computed,
+/// by a build however it ended. Fields in the order deterministic CBOR sorts their names.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Last {
     key: ContentId,
@@ -81,6 +84,10 @@ struct Last {
     parts: Vec<Kept>,
     beyond: Option<String>,
     subject: ContentId,
+    /// Whether the build that computed it did not end well (failed, or was stopped): a compute
+    /// of the same key that kept nothing then likely failed or was stopped
+    /// ([`RebuildCause::Unfinished`]).
+    unfinished: bool,
 }
 
 /// A part of a key, as the file keeps it.
@@ -149,9 +156,13 @@ pub enum Fault {
 
 impl Ledger {
     /// `build`'s misses (sorted and each once), each told apart against the ledger as it was
-    /// before the build. A build that `ended_well` moves the ledger on: its subjects' parts are
-    /// what the next build is compared with, and the record to append to the file is given;
-    /// any other build's computes may not have been kept, so it records nothing.
+    /// before the build. Every build moves the ledger on, one that failed or was stopped too:
+    /// its subjects' parts are what the next build is compared with, and the record to append
+    /// to the file is given. A build that did not `ended_well` is recorded as such: a compute
+    /// of it that failed or was stopped kept nothing under its key, which the next build's miss
+    /// of the same key says ([`RebuildCause::Unfinished`]). Recording only builds that ended
+    /// well left every subject of a run of failed builds with no record at all, each miss read
+    /// as computed first, and so explained nothing of why it was computed again.
     pub fn explain(&mut self, build: u64, ended_well: bool, misses: Vec<Miss>) -> Explained {
         // How many different misses each (step, subject) has: more than one is refused. Only
         // a miss compared by its subject counts; one that failed has no subject to speak of.
@@ -174,26 +185,25 @@ impl Ledger {
         rebuilt.sort_by(|a, b| (&a.item, &a.step).cmp(&(&b.item, &b.step)));
         // alloc: as above
         let mut items = Vec::new();
-        if ended_well {
-            let refused: Vec<bool> = misses.iter().map(|it| count(it).is_some()).collect(); // alloc: once a build
-            for (miss, refused) in misses.into_iter().zip(refused) {
-                if refused || !compared(&miss) {
-                    continue;
-                }
-                let parts = miss.parts.into_iter().map(|Part { name, hash, names }| Kept { hash, name, names }).collect();
-                let last = Last {
-                    key: miss.key,
-                    kept: miss.kept,
-                    step: miss.step.to_owned(),
-                    build,
-                    parts,
-                    beyond: miss.beyond.map(str::to_owned),
-                    subject: miss.subject,
-                };
-                // clone: the map's key and the record's copy, once a miss
-                self.items.insert((last.step.clone(), last.subject), last.clone());
-                items.push(last);
+        let refused: Vec<bool> = misses.iter().map(|it| count(it).is_some()).collect(); // alloc: once a build
+        for (miss, refused) in misses.into_iter().zip(refused) {
+            if refused || !compared(&miss) {
+                continue;
             }
+            let parts = miss.parts.into_iter().map(|Part { name, hash, names }| Kept { hash, name, names }).collect();
+            let last = Last {
+                key: miss.key,
+                kept: miss.kept,
+                step: miss.step.to_owned(),
+                build,
+                parts,
+                beyond: miss.beyond.map(str::to_owned),
+                subject: miss.subject,
+                unfinished: !ended_well,
+            };
+            // clone: the map's key and the record's copy, once a miss
+            self.items.insert((last.step.clone(), last.subject), last.clone());
+            items.push(last);
         }
         let rows = rows(build, &rebuilt);
         let record = match items.is_empty() {
@@ -366,6 +376,9 @@ impl Ledger {
             return RebuildCause::NotExplained { what: format!("{}: its key names no parts", miss.step) };
         }
         if last.key == miss.key {
+            if last.unfinished {
+                return RebuildCause::Unfinished { since };
+            }
             return match miss.beyond {
                 Some(what) => RebuildCause::Beyond { what: what.to_owned(), since },
                 None => RebuildCause::Lost { since },
@@ -546,6 +559,7 @@ pub fn version() -> ContentId {
         parts: vec![part(None), part(Some("app::render".to_owned()))],
         beyond: Some("what it read".to_owned()),
         subject: id,
+        unfinished: true,
     };
     let record = Record { gap: Some(1), build: 1, items: vec![last], dropped: Some(1) };
     let bytes = cbor::to_vec(&record).expect("a ledger record is plain data, which CBOR encodes");
@@ -622,6 +636,7 @@ fn group_of(cause: &RebuildCause) -> String {
             key
         }
         RebuildCause::Lost { .. } => "lost".to_owned(),
+        RebuildCause::Unfinished { .. } => "unfinished".to_owned(),
         RebuildCause::Beyond { what, .. } => format!("beyond\n{what}"),
         RebuildCause::Unnamed { .. } => "unnamed".to_owned(),
         RebuildCause::Read { read, .. } => format!("read\n{read}"),
@@ -702,6 +717,7 @@ fn rows(build: u64, rebuilt: &[Rebuild]) -> Vec<MissRow> {
                     (Some(u32::try_from(changed.len()).unwrap_or(u32::MAX)), Some(*parts), Some(*since));
             }
             RebuildCause::Lost { since } => (row.cause, row.since) = ("lost", Some(*since)),
+            RebuildCause::Unfinished { since } => (row.cause, row.since) = ("unfinished", Some(*since)),
             RebuildCause::Beyond { what, since } => (row.cause, row.what, row.since) = ("beyond", Some(what.clone()), Some(*since)),
             RebuildCause::Unnamed { since } => (row.cause, row.since) = ("unnamed", Some(*since)),
             RebuildCause::Read { now, was, read, names, reads, since, changed } => {
@@ -758,7 +774,7 @@ mod tests {
 
     /// A key part that changed between two builds is named, with the build it is compared
     /// with; two instances of one name are compared each with its own last compute; a build
-    /// that did not end well moves nothing on; a ledger written and replayed answers the same;
+    /// that failed moves the ledger on like any other; a ledger written and replayed answers the same;
     /// and a file cut short or of another version is told apart.
     #[test]
     fn a_changed_key_part_is_named_by_subject_and_survives_a_restore() {
@@ -778,17 +794,23 @@ mod tests {
         file.extend(explained.record);
         assert_eq!(causes(&answers, "app::render"), [RebuildCause::First, RebuildCause::First]);
         assert_eq!(answers.rebuilt(Some("/elsewhere"), None, false).build, None, "another workspace's build");
-        // A failed build's computes may not have been kept: it is compared with build 3, and
-        // compares the next one with build 3 too.
+        // A failed build (keep-going: what it computed, it computed) is compared with build 3,
+        // and the next one is compared with it.
         let explained = answered(&mut answers, &mut ledger, 4, false, vec![miss("app::render", 1, 4, &[("its code", 6), ("the toolchain", 9)])]);
-        assert!(explained.record.is_empty(), "a failed build gave a record");
+        assert!(!explained.record.is_empty(), "a failed build gave no record");
+        file.extend(explained.record);
+        // The same key again after the failed build: its compute there kept nothing.
+        let mut again = Ledger::default();
+        again.explain(4, false, vec![miss("app::render", 1, 4, &[("its code", 6), ("the toolchain", 9)])]);
+        let unfinished = again.explain(5, true, vec![miss("app::render", 1, 4, &[("its code", 6), ("the toolchain", 9)])]);
+        assert_eq!(unfinished.rebuilt[0].cause, RebuildCause::Unfinished { since: 4 });
         let explained = answered(&mut answers, &mut ledger, 5, true, vec![miss("app::render", 1, 2, &[("its code", 8), ("the toolchain", 9)])]);
         file.extend(explained.record);
-        let changed = vec![PartChanged { now: Some(id(8)), was: Some(id(7)), part: "its code".to_owned(), names: None }];
-        assert_eq!(causes(&answers, "app::render"), [RebuildCause::Parts { parts: 2, since: 3, changed }]);
-        assert_eq!((explained.rows[0].cause, explained.rows[0].since), ("parts", Some(3)));
+        let changed = vec![PartChanged { now: Some(id(8)), was: Some(id(6)), part: "its code".to_owned(), names: None }];
+        assert_eq!(causes(&answers, "app::render"), [RebuildCause::Parts { parts: 2, since: 4, changed }]);
+        assert_eq!((explained.rows[0].cause, explained.rows[0].since), ("parts", Some(4)));
         let restored = Ledger::restore(&file);
-        assert_eq!((restored.fault, restored.records), (None, 2));
+        assert_eq!((restored.fault, restored.records), (None, 3));
         assert_eq!(restored.ledger.items, ledger.items);
         assert_eq!(Ledger::restore(&restored.ledger.file()).ledger.items, ledger.items);
         // Written whole and read back, byte for byte (rule 23).

@@ -1522,6 +1522,20 @@ pub fn put_below(taken: NonZeroUsize) {
     STACK.with(|stack| stack.below.set(taken.get()));
 }
 
+/// The most the switching job's frames held since its innermost [`measure`] began
+/// ([`take_current`]): in the job's own terms (what its enclosing frames used and its frames'
+/// peaks), so it means the same on the thread that resumes it, where the thread's own is
+/// another job's.
+#[inline(never)]
+pub fn take_peak() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(STACK.try_with(|stack| stack.peak.replace(0)).unwrap_or(0))
+}
+
+#[inline(never)]
+pub fn put_peak(taken: NonZeroUsize) {
+    STACK.with(|stack| stack.peak.set(taken.get()));
+}
+
 /// Whether the switching job is unwinding from [`cancel`] ([`take_current`]).
 #[inline(never)]
 pub fn take_cancelling() -> Option<NonZeroUsize> {

@@ -158,6 +158,10 @@ impl Lowered {
                 }
             }
             db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            // The origin sets the kind of the example crate's maintained state
+            // (`base_db::crate_durability`): a registry library's examples are `Library`, so
+            // `HIGH` like it; any other's are `Local`, so `LOW`. Its file and source root stay
+            // `LOW`: they are rewritten whenever the examples are.
             let origin = match &base.origin {
                 CrateOrigin::Library { repo, .. } => {
                     // alloc: the crate's origin, once per program made

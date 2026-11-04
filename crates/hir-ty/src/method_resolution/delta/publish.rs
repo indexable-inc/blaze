@@ -27,7 +27,7 @@ use blaze_dbsp::{Pos, SliceHasher};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
-use blaze_query::db::{Setter, Slot, SlotName};
+use blaze_query::db::{Durability, Setter, Slot, SlotName};
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
@@ -238,7 +238,8 @@ pub fn install_identities(
             it.set_impl_(db).to(impl_);
             it.set_def(db).to(def);
         }
-        None => _ = ImplIdentities::new(db, impl_, def),
+        // HIGH: installed once per process, never by an edit.
+        None => _ = ImplIdentities::new(db, Durability::HIGH, impl_, def),
     }
 }
 
@@ -526,17 +527,18 @@ impl Published {
             self.directory.is_none() && self.traits.is_empty() && self.heads.is_empty() && self.names.is_empty(),
             "impls: crate {krate:?} is published already, and made anew"
         );
+        let durability = base_db::crate_durability(db, krate);
         let mut made = 1;
         for (trait_, rows) in trait_rows.drain(..) {
-            self.traits.insert(trait_, TraitImplsSlice::new(db, krate, trait_, rows));
+            self.traits.insert(trait_, TraitImplsSlice::new(db, durability, krate, trait_, rows));
             made += 1;
         }
         for (head, rows) in head_rows.drain(..) {
-            self.heads.insert(head, InherentSlice::new(db, krate, head, rows));
+            self.heads.insert(head, InherentSlice::new(db, durability, krate, head, rows));
             made += 1;
         }
         for (name, rows) in name_rows.drain(..) {
-            self.names.insert(name, CandidateSlice::new(db, krate, name, rows));
+            self.names.insert(name, CandidateSlice::new(db, durability, krate, name, rows));
             made += 1;
         }
         if let Some(modules) = body_modules {
@@ -548,6 +550,7 @@ impl Published {
         self.new_body_modules = false;
         let directory = SliceDirectory::new(
             db,
+            durability,
             krate,
             Arc::new(self.traits.clone()), // alloc: clone: the crate's first directory
             Arc::new(self.heads.clone()), // alloc: clone: as above
@@ -574,7 +577,8 @@ impl Published {
                 slice.set_rows(db).to(rows);
             }
             None => {
-                let slice = TraitImplsSlice::new(&*db, krate, trait_, rows);
+                let durability = base_db::crate_durability(&*db, krate);
+                let slice = TraitImplsSlice::new(&*db, durability, krate, trait_, rows);
                 self.traits.insert(trait_, slice);
                 self.new_traits = true;
             }
@@ -597,7 +601,8 @@ impl Published {
                 slice.set_rows(db).to(rows);
             }
             None => {
-                let slice = InherentSlice::new(&*db, krate, head, rows);
+                let durability = base_db::crate_durability(&*db, krate);
+                let slice = InherentSlice::new(&*db, durability, krate, head, rows);
                 self.heads.insert(head, slice);
                 self.new_heads = true;
             }
@@ -620,7 +625,8 @@ impl Published {
                 slice.set_rows(db).to(rows);
             }
             None => {
-                let slice = CandidateSlice::new(&*db, krate, name, rows);
+                let durability = base_db::crate_durability(&*db, krate);
+                let slice = CandidateSlice::new(&*db, durability, krate, name, rows);
                 self.names.insert(name, slice);
                 self.new_names = true;
             }
@@ -703,7 +709,8 @@ pub(crate) fn register_slots(db: &mut Db, slots: &[(Crate, DirectorySlot)]) {
             let mut crates = HashMap::new_in(Global);
             crates.extend(slots.iter().copied());
             // alloc: the singleton's map, once per database
-            _ = ImplSlices::new(db, Arc::new(crates));
+            // MEDIUM: set only when a crate is first maintained, a crate graph change.
+            _ = ImplSlices::new(db, Durability::MEDIUM, Arc::new(crates));
         }
     }
 }

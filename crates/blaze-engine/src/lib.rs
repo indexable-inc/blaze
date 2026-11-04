@@ -25,7 +25,7 @@ pub use program::main;
 /// What the general allocator still serves (startup, configuration, rare large one-offs; the
 /// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
 /// small-object allocator, mimalloc, with a heap per blaze-mem tag (`heaps.rs`). Counted, so
-/// that the plane's `arena::measure` and admission's `arena::held` see its bytes, and each
+/// that the plane's `arena::account` and admission's `arena::held` see its bytes, and each
 /// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line.
 #[cfg(all(not(test), feature = "native"))]
 #[global_allocator]

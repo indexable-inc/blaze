@@ -122,8 +122,13 @@ pub struct Served {
 /// cover, so the image would be served where the crate resolves otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
-    /// Its def map depends on the macros of the session (`#[macro_export]` from a proc macro
-    /// crate of the session): what they expand to is not in the key.
+    /// Its def map's collection ran a proc-macro call whose output may depend on its session's
+    /// state (`StateUse::Session`: its crate's state is not known, or does not settle, or the
+    /// call was not shown to give the same from either state). An image is not refused for
+    /// what such a call read (each expansion states that: `ExpansionReads`), but because an
+    /// image's expansions are not run, so the session's state is not built for the calls of
+    /// the crate a later query expands (bodies), which would then run from another state than
+    /// rustc's. A stateless crate's calls, and a settled crate's shown ones, refuse nothing.
     SessionMacros,
     /// A procedural macro's expansion of it whose reads are not known, and why.
     ProcMacro { call: String, why: &'static str },
@@ -472,7 +477,7 @@ fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {
             it.set_images(db).with_durability(Durability::HIGH).to(images);
         }
         None => {
-            _ = DepImages::builder(images).durability(Durability::HIGH).new(db);
+            _ = DepImages::new(db, Durability::HIGH, images);
         }
     }
 }

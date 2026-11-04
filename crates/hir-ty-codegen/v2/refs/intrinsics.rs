@@ -1160,6 +1160,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     "x86.avx512fp16.",
                     "x86.avx512bf16.",
                     "x86.avx2.vpdp",
+                    "x86.avx2.gather.",
                     "x86.vcvtne",
                     "x86.vbcstne",
                 ]

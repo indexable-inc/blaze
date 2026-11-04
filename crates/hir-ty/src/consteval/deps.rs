@@ -142,7 +142,7 @@ pub fn set(
             it.set_kept(db).with_durability(Durability::HIGH).to(kept);
         }
         None => {
-            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(db);
+            _ = KeptConsts::new(db, Durability::HIGH, kept);
         }
     }
 }

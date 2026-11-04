@@ -78,7 +78,7 @@ use crate::{
     builtin::quote::quote,
     files::FilePosition,
     proc_macro::{
-        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
         ProcMacroKind, ProcMacros, ProcMacrosBuilder,
     },
 };
@@ -1019,6 +1019,15 @@ fn filter_test_proc_macros(
     (proc_macros, source)
 }
 
+/// What the test proc macros below state of each call's reads: they trace none, so a crate
+/// that calls one gets no image (`hir_def::deps`); none keeps state.
+pub const FIXTURE_READS: &str = "a test fixture's proc macro, which traces nothing of what it read";
+
+/// `tree`, as a test proc macro below gives it ([`FIXTURE_READS`]).
+fn untraced(tree: TopSubtree) -> Result<Expanded, ProcMacroExpansionError> {
+    Ok(Expanded::untraced(tree, FIXTURE_READS))
+}
+
 /// Its input, as it is.
 #[derive(Debug)]
 struct IdentityProcMacroExpander;
@@ -1027,8 +1036,8 @@ impl ProcMacroExpander for IdentityProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        Ok(subtree.copy())
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        untraced(subtree.copy())
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
@@ -1045,11 +1054,11 @@ impl ProcMacroExpander for Issue18089ProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, call_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let Some(TtElement::Leaf(macro_name)) = subtree.iter().nth(1) else {
             return Err(ProcMacroExpansionError::Panic("incorrect input".to_owned()));
         };
-        Ok(quote! { call_site =>
+        untraced(quote! { call_site =>
             #[macro_export]
             macro_rules! my_macro___ {
                 ($($token:tt)*) => {{
@@ -1075,10 +1084,11 @@ impl ProcMacroExpander for AttributeInputReplaceProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { attrs, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         attrs
             .map(|it| it.copy())
             .ok_or_else(|| ProcMacroExpansionError::Panic("Expected attribute input".into()))
+            .and_then(untraced)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
@@ -1095,7 +1105,7 @@ impl ProcMacroExpander for Issue18840ProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree: fn_, def_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let mut iter = fn_.iter();
         iter.nth(2);
         let (_, mut fn_body) = iter.expect_subtree().unwrap();
@@ -1104,7 +1114,7 @@ impl ProcMacroExpander for Issue18840ProcMacroExpander {
             quote! {fixed_up_span => ::core::compile_error! { "my cool compile_error!" } };
         // So that the top subtree is kept when the fixups are reversed.
         result.set_top_subtree_delimiter_span(tt::DelimSpan::from_single(def_site));
-        Ok(result)
+        untraced(result)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
@@ -1120,7 +1130,7 @@ impl ProcMacroExpander for MirrorProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree: input, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         fn traverse(builder: &mut TopSubtreeBuilder, iter: TtIter<'_>) {
             for tt in iter.collect_vec().into_iter().rev() {
                 match tt {
@@ -1135,7 +1145,7 @@ impl ProcMacroExpander for MirrorProcMacroExpander {
         }
         let mut builder = TopSubtreeBuilder::new(input.top_subtree().delimiter);
         traverse(&mut builder, input.iter());
-        Ok(builder.build())
+        untraced(builder.build())
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
@@ -1152,7 +1162,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree: input, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let mut result = input.copy();
         for (idx, it) in input.as_token_trees().iter_flat_tokens().enumerate() {
             if let TokenTree::Leaf(mut leaf) = it {
@@ -1160,7 +1170,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
                 result.set_token(idx, leaf);
             }
         }
-        return Ok(result);
+        return untraced(result);
 
         fn modify_leaf(leaf: &mut Leaf) {
             match leaf {
@@ -1189,14 +1199,14 @@ impl ProcMacroExpander for Issue17479ProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let mut iter = subtree.iter();
         let Some(TtElement::Leaf(Leaf::Literal(lit))) = iter.next() else {
             return Err(ProcMacroExpansionError::Panic("incorrect Input".into()));
         };
         let symbol = Symbol::intern(lit.text());
         let span = lit.span;
-        Ok(quote! { span =>
+        untraced(quote! { span =>
             #symbol()
         })
     }
@@ -1214,7 +1224,7 @@ impl ProcMacroExpander for Issue18898ProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, def_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let span = subtree
             .token_trees()
             .last_span()
@@ -1242,7 +1252,7 @@ impl ProcMacroExpander for Issue18898ProcMacroExpander {
                 let a = 5;
             }
         };
-        Ok(quote! { def_site =>
+        untraced(quote! { def_site =>
             fn foo() {
                 #overly_long_subtree
             }
@@ -1262,7 +1272,7 @@ impl ProcMacroExpander for DisallowCfgProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         for tt in subtree.token_trees().iter_flat_tokens() {
             if let TokenTree::Leaf(Leaf::Ident(ident)) = tt
                 && (ident.sym == sym::cfg || ident.sym == sym::cfg_attr)
@@ -1272,7 +1282,7 @@ impl ProcMacroExpander for DisallowCfgProcMacroExpander {
                 ));
             }
         }
-        Ok(subtree.copy())
+        untraced(subtree.copy())
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
@@ -1288,7 +1298,7 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, call_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let mut iter = subtree.iter();
         let Some(TtElement::Leaf(Leaf::Ident(ident))) = iter.next() else {
             return Err(ProcMacroExpansionError::Panic("incorrect Input".into()));
@@ -1315,7 +1325,7 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
             span: ident.span,
             is_raw: tt::IdentIsRaw::No,
         };
-        Ok(quote! { call_site =>
+        untraced(quote! { call_site =>
             #subtree
 
             struct #generated_ident;

@@ -352,7 +352,7 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         &self,
         _: &base_db::Db,
         _: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
         unreachable!("a call of `#[counted]` is always in a calling crate")
     }
 
@@ -361,7 +361,7 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         _: &base_db::Db,
         _: base_db::Crate,
         call: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
         let Some(crate::tt::TtElement::Leaf(crate::tt::Leaf::Ident(name))) = call.attrs.and_then(|it| it.iter().next()) else {
             return Err(hir_expand::proc_macro::ProcMacroExpansionError::Panic("#[counted]: one identifier".into()));
         };
@@ -380,7 +380,12 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         state.count = self.run(count).1;
         state.turns.push((name.sym.as_str().to_owned(), n));
         let call_site = call.call_site;
-        Ok(hir_expand::builtin::quote::quote! { call_site => pub const #name: u32 = #n; })
+        let tree = hir_expand::builtin::quote::quote! { call_site => pub const #name: u32 = #n; };
+        Ok(hir_expand::proc_macro::Expanded {
+            tree,
+            reads: hir_expand::proc_macro::ExpansionReads::Unknown("a test's proc macro, which traces nothing of what it read"),
+            state: hir_expand::proc_macro::StateUse::Session("`#[counted]` gives the count the calls before it left"),
+        })
     }
 
     // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
