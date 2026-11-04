@@ -191,6 +191,13 @@ pub fn mono_cell(fonts: &Fonts, size: f32) -> (f32, f32, f32) {
     (if adv > 0.0 { adv } else { size * 0.6 }, f.ascent(), f.descent().abs())
 }
 
+/// The code face's underline thickness at `size`, points: box-drawing lines are drawn this thick (boxdraw.rs).
+#[must_use]
+pub fn mono_underline(fonts: &Fonts, size: f32) -> f32 {
+    let t = code_font(size * fonts.look.code_scale, 400, false).underline_thickness();
+    if t > 0.0 { t } else { size / 14.0 }
+}
+
 /// The font `name` at `size`: the installed one, else den's bundled copy.
 fn text_font(name: &str, size: f32) -> Option<Font> {
     Font::named(name, size).or_else(|| bundled(name).and_then(|bytes| Font::from_data(bytes, size)))

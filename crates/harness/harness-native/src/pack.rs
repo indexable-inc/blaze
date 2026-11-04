@@ -102,6 +102,21 @@ impl LineInst {
     }
 }
 
+/// One procedural cell (boxdraw.rs, `sprite_fs`): a block element, box-drawing line, braille pattern, sextant or
+/// powerline arrow drawn from its geometry on the device-pixel grid, so neighbouring cells meet with no seam.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct SpriteInst {
+    /// The cell: x, y, w, h in device pixels (whole pixels, so its edges are exact).
+    pub rect: [i32; 4],
+    /// The shape's kind and two parameters (`boxdraw::Shape`), then a light line's thickness in device pixels.
+    pub shape: [u32; 4],
+    /// The ink, straight RGBA (sRGB).
+    pub fg: [f32; 4],
+    /// The ground under it, straight RGBA (alpha 0: none, what is already drawn shows).
+    pub bg: [f32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GlyphInst {
