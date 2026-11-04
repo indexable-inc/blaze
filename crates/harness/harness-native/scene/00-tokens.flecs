@@ -1,32 +1,111 @@
 // harness-native's tokens: the names den's primitives (harness-native-ui-prims, prims.flecs) read, and the app's own.
-// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws, in a quieter, denser,
-// Linear-like palette: near-black ground, hairline edges, four inks, one violet accent. Colours are sRGB 0..1,
-// `{r, g, b, a}`; every Fill and Edge has a dark and a light.
+// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws, in a native macOS look:
+// the window and sidebar are clear over an NSVisualEffectView (material .sidebar), so the sidebar's inks are vibrant
+// labels (white at an alpha in the dark appearance, black at an alpha in the light one, as AppKit's label colours are)
+// rather than fixed greys; the main card is an opaque plate in the terminal's ground. Colours are sRGB 0..1, `{r, g, b,
+// a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
 
+// Type: macOS sidebar sizes in Inter. Rows 13, runs 12, section labels 11, a run's command in the code face 11.5.
 export const size_caption = 11
 export const size_body = 13
+export const size_row = 13
+export const size_run = 12
+export const size_label = 11
+export const size_code = 11.5
+// Weights (CSS numbers): a session's name medium, a section label semibold.
+export const weight_row = 500
+export const weight_label = 600
+
+// Rows: a session 28 tall, a run 24, the fold 22; children indented 16 a level; icons 14 in a 16 box.
+export const row_h = 28
+export const run_h = 24
+export const more_h = 22
+export const indent_step = 16
+export const icon_box = 16
+export const chevron_box = 12
+// The seam between the sidebar and the main card: a soft shadow off the card's left edge.
+export const seam_blur = 14
+export const seam_alpha = 0.28
+export const row_gap = 8
+export const row_pad = 8
+
+// A status dot, and a failure's badge (its exit code).
+export const dot_size = 6
+export const dot_radius = 3
+export const badge_h = 15
+export const badge_radius = 4
+export const badge_pad = 5
+export const size_badge = 10
+export const line_badge = 12
+
+// Springs (omega rad/s, zeta): a running dot's breath (slow, critically damped, dimming to breath_floor), a disclosure
+// chevron's quarter turn, the selection pill sliding between rows, the sidebar folding (cmd+S) and the hover wash.
+export const breath_omega = 3.2
+export const breath_zeta = 1
+export const breath_floor = 0.3
+export const turn_omega = 30
+export const turn_zeta = 0.78
+export const pill_omega = 32
+export const pill_zeta = 0.86
+export const sidebar_omega = 24
+export const sidebar_zeta = 1
+// The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
+export const lights_omega = 26
+export const lights_zeta = 1
+// The archive row: on hover its box rises archive_lift and grows to archive_scale; an archive bounces it (kicked up
+// archive_kick_lift, archive_kick_scale bigger, ringing at archive_omega / archive_zeta) and pulses its count.
+export const archive_lift = 1.5
+export const archive_scale = 1.08
+export const archive_kick_lift = 3
+export const archive_kick_scale = 0.12
+export const archive_omega = 22
+export const archive_zeta = 0.3
+export const count_kick_scale = 0.35
+export const count_omega = 26
+export const count_zeta = 0.35
 
 export const radius_control = 6
-export const radius_card = 10
+export const radius_card = 12
 
-export const tone_ink_1 = Fill: {dark: {0.929, 0.929, 0.937, 1}, light: {0.098, 0.098, 0.110, 1}}
-export const tone_ink_2 = Fill: {dark: {0.792, 0.792, 0.812, 1}, light: {0.231, 0.231, 0.255, 1}}
-export const tone_ink_3 = Fill: {dark: {0.545, 0.545, 0.580, 1}, light: {0.447, 0.447, 0.486, 1}}
-export const tone_ink_4 = Fill: {dark: {0.361, 0.361, 0.392, 1}, light: {0.635, 0.635, 0.667, 1}}
-export const tone_accent = Fill: {dark: {0.533, 0.553, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+// Vibrant labels: primary, secondary, tertiary, quaternary.
+export const tone_ink_1 = Fill: {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+export const tone_ink_2 = Fill: {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
+export const tone_ink_3 = Fill: {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
+export const tone_ink_4 = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_accent = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 
-export const tone_wash = Fill: {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.05}}
-export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
-export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.08}}
-export const tone_select = Fill: {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.065}}
+export const tone_wash = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
+export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.045}}
+export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// The selected row: a soft accent-tinted pill over the vibrancy.
+export const tone_select = Fill: {dark: {0.580, 0.600, 1.0, 0.16}, light: {0.369, 0.384, 0.902, 0.13}}
+// Nothing: a node that paints no fill.
+export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+// The palette's scrim over the window and its card.
+export const tone_scrim = Fill: {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
+export const tone_card = Fill: {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+// Offscreen shots only (src/shot.rs): a flat stand-in for the sidebar's vibrancy, which a texture cannot sample.
+export const tone_shot_ground = Fill: {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
 export const tone_plate = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
-export const tone_plate_line = Fill: {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.09}}
-export const tone_switch_on = Fill: {dark: {0.533, 0.553, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_plate_line = Fill: {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
+export const tone_switch_on = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+// The terminal's ground (term.rs DARK bg, #121214): the main card and the title bar over it, in both appearances.
+export const tone_term_ground = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
+// Ink over the terminal's ground (always dark): the title bar's words.
+export const tone_term_ink = Fill: {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
+export const tone_term_muted = Fill: {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
 export const tone_running = Fill: {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
-export const tone_exited = Fill: {dark: {0.361, 0.361, 0.392, 1}, light: {0.635, 0.635, 0.667, 1}}
-export const tone_failed = Fill: {dark: {0.922, 0.420, 0.420, 1}, light: {0.80, 0.26, 0.26, 1}}
+export const tone_exited = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_failed = Fill: {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
+export const tone_failed_wash = Fill: {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
 export const tone_lost = Fill: {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
+
+// The cute touch: a small warm colour per kind on its icon.
+export const tone_kind_claude = Fill: {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
+export const tone_kind_codex = Fill: {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
+export const tone_kind_cursor = Fill: {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
+export const tone_kind_shell = Fill: {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
 
 prefab Strong {
   Fill: $tone_ink_1

@@ -41,8 +41,6 @@ const TERM_SIZE: f32 = 13.0;
 const TERM_PAD: (f32, f32) = (18.0, 16.0);
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
-/// The window's ground under the sidebar.
-const GROUND: [f32; 4] = [0.043, 0.043, 0.047, 1.0];
 
 pub use crate::term::Mods as KeyMods;
 
@@ -103,14 +101,11 @@ pub struct Bump {
     pub spring: Spring,
 }
 
-/// The archive box (Symbols Nerd Font Mono, nf-md-archive).
-const ARCHIVE_GLYPH: &str = "\u{F003C}";
-
 pub struct App {
     pub world: World,
     fonts: Fonts,
     cache: GlyphCache,
-    layouts: HashMap<(String, u32, u32, bool, bool, u32), Rc<Layout>>,
+    layouts: HashMap<(String, u32, u32, bool, u8, u32), Rc<Layout>>,
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
@@ -157,12 +152,21 @@ pub struct App {
     pub title: String,
     /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
     chrome: Chrome,
-    chrome_laid: Option<(Chrome, f32)>,
+    chrome_laid: Option<(Chrome, f32, f32)>,
+    /// The dark appearance (the window's effective NSAppearance; the scene's fills pick their dark or light half).
+    pub dark: bool,
+    /// The selection pill's spring between rows.
+    pill: crate::look::Pill,
+    /// The sidebar's fold (cmd+S): open or not, and its spring (0 folded away to 1 open); the traffic lights fade with it.
+    side_open: bool,
+    side_x: harness_native_api::spring::Spring,
+    /// The traffic lights shown over the folded sidebar while the pointer rests in their corner (Dia's): 0 to 1.
+    corner_x: harness_native_api::spring::Spring,
 }
 
-/// The fill a tone prefab of the scene holds (`hn.ToneRunning`).
+/// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
 fn tone(w: WorldRef<'_>, name: &str) -> Fill {
-    view::prefab(w, name).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_default()
+    crate::look::tone(w, name)
 }
 
 fn rgba(c: Rgba) -> [f32; 4] {
@@ -215,6 +219,7 @@ impl App {
         harness_native_api::register(&world);
         model::register(&world);
         crate::pane::register(&world);
+        crate::look::register(&world);
         world.component::<HoverLift>().writable();
         world.component::<Bump>();
         let app = world.entity_named(APP);
@@ -234,6 +239,7 @@ impl App {
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
         harness_native_ui_motion::install(w);
+        crate::look::install(w);
         harness_native_ui_draw::install(w);
         // den-native-hover: each hoverable's hover spring toward whether the pointer is on it.
         let app_id = *app.id();
@@ -315,6 +321,11 @@ impl App {
             title: "harness".into(),
             chrome: Chrome::default(),
             chrome_laid: None,
+            dark: true,
+            pill: crate::look::Pill::default(),
+            side_open: true,
+            side_x: harness_native_api::spring::Spring::at(1.0),
+            corner_x: harness_native_api::spring::Spring::at(0.0),
         })
     }
 
@@ -415,11 +426,11 @@ impl App {
         let w = self.world.world_ref();
         let code = w.entity_from_id(e).try_cloned::<&model::ExitCode>().map(|c| c.code);
         match self.status_of(e) {
-            "running" => tone(w, "hn.ToneRunning"),
-            "lost" => tone(w, "hn.ToneLost"),
-            "killed" => tone(w, "hn.ToneFailed"),
-            _ if code.is_some_and(|c| c != 0) => tone(w, "hn.ToneFailed"),
-            _ => tone(w, "hn.ToneExited"),
+            "running" => tone(w, "running"),
+            "lost" => tone(w, "lost"),
+            "killed" => tone(w, "failed"),
+            _ if code.is_some_and(|c| c != 0) => tone(w, "failed"),
+            _ => tone(w, "exited"),
         }
     }
 
@@ -502,18 +513,18 @@ impl App {
             }
         }
         let sel = self.selected();
-        let (clear, chosen) = (tone(w, "hn.ToneClear"), tone(w, "hn.ToneSelected"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
         // The device row.
         let dev = w.lookup(model::LOCAL);
         let device = View::of(w.entity_from_id(self.ids.device));
         let host = dev.try_cloned::<&model::Device>().map(|d| d.host.as_str().to_owned()).unwrap_or_default();
         let link = dev.target(model::Link::id(), 0).map_or(0, |t| *t.id());
         let (link_tone, link_word) = if link == *w.component_id::<model::Up>() {
-            (tone(w, "hn.ToneRunning"), format!("{}", rows.len()))
+            (tone(w, "running"), format!("{}", rows.len()))
         } else if link == *w.component_id::<model::Down>() {
-            (tone(w, "hn.ToneFailed"), "offline".to_owned())
+            (tone(w, "failed"), "offline".to_owned())
         } else {
-            (tone(w, "hn.ToneLost"), "connecting".to_owned())
+            (tone(w, "lost"), "connecting".to_owned())
         };
         if let Some(n) = device.part("name") {
             n.text(&clip_text(&host, 26));
@@ -522,8 +533,11 @@ impl App {
             n.text(&link_word);
         }
         if let Some(d) = device.part("dot") {
-            set_if(d, link_tone);
+            // A light only while the daemon is not up.
+            set_if(d, if link == *w.component_id::<model::Up>() { clear } else { link_tone });
         }
+        let looks = RowLooks::of(w, clear);
+        let step = crate::look::width(w, "indent");
         // One row per session, run and stage, with a fold row over each session's older runs.
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
@@ -541,7 +555,7 @@ impl App {
         let mut fit: Vec<(u64, String, f32)> = Vec::new();
         let indent = |row: View<'_>, depth: usize| {
             if let Some(p) = row.part("indent") {
-                let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * 14.0, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
+                let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * step, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
                 if p.entity().try_cloned::<&Size>() != Some(s) {
                     p.set(s);
                 }
@@ -556,12 +570,8 @@ impl App {
                 model::Row::More { parent, hidden, depth, unfolded } => {
                     row.action(&format!("fold:{parent}"));
                     indent(row, depth);
-                    if let Some(p) = row.part("glyph") {
-                        // Pointing right while the runs are hidden, down while they show.
-                        p.text(if unfolded { "\u{25BE}" } else { "\u{25B8}" });
-                    }
                     if let Some(p) = row.part("name") {
-                        p.text(&if unfolded { "fewer runs".to_owned() } else { format!("{hidden} more run{}", if hidden == 1 { "" } else { "s" }) });
+                        p.text(&if unfolded { "Show fewer".to_owned() } else { format!("Show {hidden} more") });
                     }
                     return;
                 }
@@ -575,7 +585,7 @@ impl App {
                 indent(row, depth);
                 let open = !o.has(model::Collapsed::id());
                 if let Some(p) = row.part("glyph") {
-                    p.text(if open { "\u{25BE}" } else { "\u{25B8}" });
+                    p.icon(crate::look::GROUP_ICON);
                 }
                 if let Some(p) = row.part("name") {
                     p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
@@ -583,28 +593,32 @@ impl App {
                 if let Some(p) = row.part("meta") {
                     p.text(&model::run_count(w, e).to_string());
                 }
+                if let Some(p) = row.part("chevron") {
+                    p.icon(crate::look::CHEVRON);
+                    crate::look::disclose(p.entity(), open);
+                    crate::look::hover_show(p.entity(), row.id(), open);
+                }
                 return;
             }
             row.action(&format!("select:{e}"));
             set_if(row, if sel == Some(e) { chosen } else { clear });
             indent(row, depth);
-            let kind = model::kind_name(o);
             let run = me.run_of(e);
-            if let Some(p) = row.part("glyph") {
-                p.text(match run {
-                    Some((_, Some(_))) => "\u{2502}",
-                    Some(_) => "$",
-                    None => kind_glyph(kind),
+            let status = me.status_of(e);
+            let failed = status == "killed" || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
+            if run.is_none() {
+                looks.session(me, row, e, hint.get(&e).filter(|&&i| i < 9).map(|i| format!("\u{2318}{}", i + 1)).unwrap_or_default());
+            } else if let Some(p) = row.part("glyph") {
+                // A run: a small dot tinted by how it went, breathing while it runs.
+                p.icon(crate::look::RUN_ICON);
+                set_if(p, match status {
+                    "running" => looks.accent,
+                    "lost" => looks.lost,
+                    _ if failed => looks.failed,
+                    _ => looks.faint,
                 });
+                crate::look::breathe(p.entity(), status == "running");
             }
-            let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
-            let meta = match (run, me.status_of(e), code) {
-                (Some(_), ..) => me.run_meta(e),
-                (None, "lost", _) => "lost".to_owned(),
-                (None, "exited", Some(c)) if c != 0 => format!("exit {c}"),
-                (None, "exited", _) => "done".to_owned(),
-                _ => hint.get(&e).filter(|&&i| i < 9).map(|i| format!("\u{2318}{}", i + 1)).unwrap_or_default(),
-            };
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             if let Some(p) = row.part("name") {
                 match run {
@@ -620,11 +634,12 @@ impl App {
                     }
                 }
             }
-            if let Some(p) = row.part("meta") {
-                p.text(&meta);
-            }
-            if let Some(p) = row.part("dot") {
-                set_if(p, me.dot_tone(e));
+            if run.is_some()
+                && let Some(p) = row.part("meta")
+            {
+                // How long it took (and how it failed), shown on hover; a failure's always.
+                p.text(&me.run_meta(e));
+                crate::look::hover_show(p.entity(), row.id(), failed || matches!(status, "lost" | "pending" | "skipped"));
             }
         });
         for (part, text, room) in fit {
@@ -755,8 +770,8 @@ impl App {
         let items = model::archived(w);
         let sel = self.selected();
         let row = View::of(w.entity_from_id(self.ids.archive_row));
-        if let Some(p) = row.part("icon").filter(|p| p.entity().try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != ARCHIVE_GLYPH)) {
-            p.set(Icon { glyph: ARCHIVE_GLYPH.into() });
+        if let Some(p) = row.part("icon") {
+            p.icon(crate::look::ARCHIVE_ICON);
         }
         if let Some(p) = row.part("name") {
             p.text("Archive");
@@ -765,9 +780,12 @@ impl App {
             p.text(&if items.is_empty() { String::new() } else { items.len().to_string() });
         }
         if let Some(p) = row.part("chevron") {
-            p.text(if self.archive_open { "\u{25BE}" } else { "\u{25B8}" });
+            p.icon(crate::look::CHEVRON);
+            crate::look::disclose(p.entity(), self.archive_open);
+            crate::look::hover_show(p.entity(), row.id(), self.archive_open);
         }
-        let (clear, chosen) = (tone(w, "hn.ToneClear"), tone(w, "hn.ToneSelected"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
+        let looks = RowLooks::of(w, clear);
         // An archived object that is selected while the list is folded lights the archive row.
         set_if(row, if !self.archive_open && sel.is_some_and(|s| items.contains(&s)) { chosen } else { clear });
         let list = View::of(w.entity_from_id(self.ids.archive_list));
@@ -781,24 +799,10 @@ impl App {
             row.action(&format!("select:{e}"));
             set_if(row, if sel == Some(e) { chosen } else { clear });
             let o = w.entity_from_id(e);
-            if let Some(p) = row.part("glyph") {
-                p.text(kind_glyph(model::kind_name(o)));
-            }
             if let Some(p) = row.part("name") {
                 p.text(&clip_text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default(), 24));
             }
-            let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
-            if let Some(p) = row.part("meta") {
-                p.text(&match (me.status_of(e), code) {
-                    ("running", _) => "killing".to_owned(),
-                    ("lost", _) => "lost".to_owned(),
-                    (_, Some(c)) if c != 0 => format!("exit {c}"),
-                    _ => "done".to_owned(),
-                });
-            }
-            if let Some(p) = row.part("dot") {
-                set_if(p, me.dot_tone(e));
-            }
+            looks.session(me, row, e, String::new());
         });
     }
 
@@ -922,7 +926,7 @@ impl App {
                 }
                 let entries = self.entries();
                 let at = p.at.min(entries.len().saturating_sub(1));
-                let (clear, chosen) = (tone(w, "hn.ToneClear"), tone(w, "hn.ToneSelected"));
+                let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
                 if let Some(items) = card.and_then(|c| c.part("items")) {
                     let rows = entries.into_iter().enumerate().take(12).map(|(i, (k, g, n, h, _))| (k, (i, g, n, h)));
                     for_each(items, "hn.PalRow", rows, |row, (i, g, n, h), new| {
@@ -960,6 +964,8 @@ impl App {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
             self.grid = Grid::new(&mut self.fonts, TERM_SIZE, scale);
         }
+        self.pill.dt = dt;
+        self.step_sidebar(dt);
         self.lay_chrome(z);
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
@@ -997,8 +1003,9 @@ impl App {
         }
         self.sync_terms();
         let mut d = Draw {
-            frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: 1.0, live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0; 4] },
-            clear: GROUND,
+            frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: f32::from(u8::from(self.dark)), live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0; 4] },
+            // Clear: the window's vibrancy shows through everywhere the scene paints nothing.
+            clear: [0.0; 4],
             ..Draw::default()
         };
         self.emit(&mut d, scale, upload);
@@ -1020,29 +1027,79 @@ impl App {
         }
     }
 
-    /// Write the strip into the view at zoom `z`: the window row starts below it, and the title bar is its height,
-    /// its label starting past the traffic lights (vertically centred on their line by the row's Center alignment).
+    /// Lay the window's frame out at zoom `z` (Ghostty's and Finder's): the sidebar full height, its rows starting under
+    /// the title-bar strip (the traffic lights sit on its vibrancy), as wide as its fold's spring leaves it; the main
+    /// card from the window's top, its terminal padded down by the strip; the title bar the strip's height, its title at
+    /// the card's text inset.
     fn lay_chrome(&mut self, z: f32) {
         use harness_native_ui_layout_api::Padding;
-        if self.chrome_laid == Some((self.chrome, z)) {
+        use harness_native_ui_node_api::Clip;
+        let w = self.world.world_ref();
+        let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
+        let (Some(full), Some(pad)) = (proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
+        let x = self.side_x.x.clamp(0.0, 1.0);
+        let width = self.side_w.unwrap_or(full.w.value) * x;
+        if self.chrome_laid == Some((self.chrome, z, width)) {
             return;
         }
-        self.chrome_laid = Some((self.chrome, z));
-        let w = self.world.world_ref();
-        let Chrome { strip, title_x } = self.chrome;
-        if let Some(root) = w.entity_from_id(self.ids.device).parent().and_then(|side| side.parent()) {
-            let pad = root.try_cloned::<&Padding>().unwrap_or_default();
-            // No strip (fullscreen): the scene's own top margin.
-            let t = if strip > 0.0 { strip / z } else { view::prefab(w, "hn.Window").and_then(|p| p.try_cloned::<&Padding>()).map_or(pad.t, |p| p.t) };
-            root.set(Padding { t, ..pad });
+        self.chrome_laid = Some((self.chrome, z, width));
+        let top = self.chrome.strip / z;
+        if let Some(side) = w.entity_from_id(self.ids.device).parent() {
+            let mut size = side.try_cloned::<&Size>().unwrap_or(full);
+            size.w = Sizing { kind: SizeKind::Fixed, value: width, min: 0.0, max: 0.0 };
+            side.set(size);
+            side.set(Padding { l: pad.l * x, r: pad.r * x, t: top + pad.t, b: pad.b });
+            if x < 1.0 {
+                side.add(Clip::id());
+            } else {
+                side.remove(Clip::id());
+            }
         }
+        w.entity_from_id(self.ids.main).set(Padding { l: 0.0, r: 0.0, t: top, b: 0.0 });
         let bar = w.entity_from_id(self.ids.bar);
         if let Some(mut size) = bar.try_cloned::<&Size>() {
-            size.h = Sizing { kind: SizeKind::Fixed, value: strip / z, min: 0.0, max: 0.0 };
+            size.h = Sizing { kind: SizeKind::Fixed, value: top, min: 0.0, max: 0.0 };
             bar.set(size);
         }
-        let pad = bar.try_cloned::<&Padding>().unwrap_or_default();
-        bar.set(Padding { l: title_x / z, ..pad });
+        let bpad = bar.try_cloned::<&Padding>().unwrap_or_default();
+        let past_lights = self.chrome.title_x / z * self.corner_x.x.clamp(0.0, 1.0);
+        bar.set(Padding { l: (width + TERM_PAD.0).max(past_lights), ..bpad });
+    }
+
+    /// Step the sidebar's fold spring toward open or folded (cmd+S).
+    fn step_sidebar(&mut self, dt: f32) {
+        // Folded, the lights come back while the pointer is over their corner: as wide as they reach, as tall as the strip.
+        let z = self.zoom();
+        let (px, py) = (self.pointer.x, self.pointer.y);
+        let corner = !self.side_open && self.chrome.strip > 0.0 && px >= 0.0 && py >= 0.0 && px < self.chrome.title_x / z && py < self.chrome.strip / z;
+        let target = f32::from(u8::from(corner));
+        if !self.corner_x.settled(target) {
+            let tune = crate::look::tune(self.world.world_ref(), "lights");
+            if !harness_native_api::settle(&mut self.corner_x, target, tune, dt) {
+                self.corner_x = harness_native_api::spring::Spring::at(target);
+            }
+            self.chrome_laid = None;
+            self.poke();
+        }
+        let target = f32::from(u8::from(self.side_open));
+        if self.side_x.settled(target) {
+            return;
+        }
+        let tune = crate::look::tune(self.world.world_ref(), "sidebar");
+        if !harness_native_api::settle(&mut self.side_x, target, tune, dt) {
+            self.side_x = harness_native_api::spring::Spring::at(target);
+        }
+        self.poke();
+    }
+
+    /// How shown the traffic lights are (0 to 1): they live on the sidebar and fade with its fold.
+    pub fn lights(&self) -> f32 {
+        self.side_x.x.max(self.corner_x.x).clamp(0.0, 1.0)
+    }
+
+    /// Whether a running dot breathes (the window keeps drawing, at a calm rate, while the app is otherwise idle).
+    pub fn breathing(&self) -> bool {
+        crate::look::breathing(self.world.world_ref())
     }
 
     /// `text` cut (with an ellipsis) to the longest front that the typesetter sets within `room` points.
@@ -1086,11 +1143,18 @@ impl App {
     fn layout(&mut self, text: &str, style: &TextStyle, width: f32) -> Rc<Layout> {
         let st = set_of(style);
         let code = style.role == 9;
-        let key = (text.to_owned(), st.size.to_bits(), st.line.to_bits(), st.bold, code, width.to_bits());
+        let medium = !code && !st.bold && style.weight == 500;
+        let key = (text.to_owned(), st.size.to_bits(), st.line.to_bits(), st.bold, u8::from(code) | u8::from(medium) << 1, width.to_bits());
         if let Some(l) = self.layouts.get(&key) {
             return l.clone();
         }
-        let lay = Rc::new(if code { Layout::in_face(&mut self.fonts, text, Face::Code, st, width) } else { Layout::new(&mut self.fonts, text, st, width) });
+        let lay = Rc::new(if code {
+            Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
+        } else if medium {
+            Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
+        } else {
+            Layout::new(&mut self.fonts, text, st, width)
+        });
         self.layouts.insert(key, lay.clone());
         lay
     }
@@ -1143,15 +1207,26 @@ impl App {
     fn emit(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
         let held = self.world.lookup(APP).target(Pressed::id(), 0).map(|t| *t.id());
         let painted = harness_native_ui_draw::painted(self.world.world_ref());
-        for (id, p) in painted {
+        let dark = self.dark;
+        let (lo, chosen, pill_tune) = {
+            let w = self.world.world_ref();
+            (crate::look::floor(w, "breath"), tone(w, "selected"), crate::look::tune(w, "pill"))
+        };
+        let (mut lit, mut pill_moving) = (false, false);
+        for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
             let Some(laid) = e.try_cloned::<&Laid>() else { continue };
+            // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
+            p.alpha *= crate::look::alpha(w, e, lo);
+            let is_term = e.has(TermNode::id());
+            if p.alpha <= 0.002 && !is_term {
+                continue;
+            }
             if p.clipped && (p.clip_w <= 0.0 || p.clip_h <= 0.0) {
                 continue;
             }
             let rect = [laid.x, laid.y, laid.w, laid.h];
-            let is_term = e.has(TermNode::id());
             let (np, ng) = (d.panels.len(), d.glyphs.len());
             // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
             let motion = e.try_cloned::<&HoverLift>().map(|m| {
@@ -1167,22 +1242,31 @@ impl App {
                     if shape.n <= 0.0 {
                         shape.n = 4.0;
                     }
-                    let mut panel = panel_from(rgba(fill.dark), rgba(edge.dark), shape, rect, p.alpha);
+                    let (fc, ec) = if dark { (fill.dark, edge.dark) } else { (fill.light, edge.light) };
+                    let mut panel = panel_from(rgba(fc), rgba(ec), shape, rect, p.alpha);
+                    // The selected tree row's pill springs from the row it lit before.
+                    if fill == chosen && self.ids.tree != 0 && e.parent().is_some_and(|q| *q.id() == self.ids.tree) {
+                        let (y, h, moving) = self.pill.place(id, rect[1], rect[3], pill_tune);
+                        panel.rect[1] = y;
+                        panel.rect[3] = h;
+                        lit = true;
+                        pill_moving |= moving;
+                    }
                     if let Some(l) = e.try_cloned::<&Lift>() {
                         panel.fx = [l.blur, l.alpha, 0.0, 0.0];
                         panel.fx2[0] = l.dy;
                     }
-                    if fill.dark.a > 0.0 || edge.dark.a > 0.0 || panel.fx[1] > 0.0 {
+                    if fc.a > 0.0 || ec.a > 0.0 || panel.fx[1] > 0.0 {
                         d.panel(panel);
                     }
                     let wash = |c: Rgba, r: [f32; 4], radius: f32, a: f32| panel_from(rgba(c), [0.0; 4], Shape { radius, n: shape.n, border: 0.0, feather: 0.0 }, r, p.alpha * a);
                     let hover = e.try_cloned::<&HoverLook>().zip(e.try_cloned::<&HoverAmt>().map(|h| h.spring.x.clamp(0.0, 1.0)));
                     if let Some((l, h)) = hover.filter(|(_, h)| *h > 0.004) {
                         let r = [rect[0] - l.pad, rect[1] - l.pad, rect[2] + 2.0 * l.pad, rect[3] + 2.0 * l.pad];
-                        d.panel(wash(l.dark, r, if l.radius < 0.0 { shape.radius + l.pad } else { l.radius }, h));
+                        d.panel(wash(if dark { l.dark } else { l.light }, r, if l.radius < 0.0 { shape.radius + l.pad } else { l.radius }, h));
                     }
                     if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held == Some(id)) {
-                        d.panel(wash(l.dark, rect, shape.radius, 1.0));
+                        d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                     }
                     if is_term {
                         self.emit_term(id, d, sc, upload);
@@ -1191,18 +1275,26 @@ impl App {
                 PaintKind::Glyphs => {
                     let Some(text) = e.try_cloned::<&Text>() else { continue };
                     let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(f.dark));
+                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
                     let lay = self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
                     emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x, laid.y), ink, p.alpha, sc, upload);
                 }
                 PaintKind::Icon => {
                     // A ui.Symbol: its glyph (a Nerd Font icon) set by the typesetter, centred in its rect.
                     let Some(icon) = e.try_cloned::<&Icon>() else { continue };
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(f.dark));
-                    let style = TextStyle { size: laid.h.min(laid.w + 2.0) * 0.85, line: laid.h, ..TextStyle::default() };
+                    let turn = crate::look::turn(e);
+                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
+                    // 14 in a 16 box, as SF Symbols sit in a sidebar row.
+                    let style = TextStyle { size: laid.h.min(laid.w + 2.0) * 0.875, line: laid.h, ..TextStyle::default() };
                     let lay = self.layout(icon.glyph.as_str(), &style, 1.0e5);
                     let gw = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
                     emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x + (laid.w - gw) * 0.5, laid.y), ink, p.alpha, sc, upload);
+                    // A disclosure chevron turns about its middle.
+                    if let Some(turn) = turn {
+                        for g in &mut d.glyphs[ng..] {
+                            g.clip[2] = turn;
+                        }
+                    }
                 }
                 PaintKind::Picture | PaintKind::Ribbon => {}
             }
@@ -1223,6 +1315,12 @@ impl App {
                 }
             }
             let _ = Level::Base;
+        }
+        if !lit {
+            self.pill.lost();
+        }
+        if pill_moving {
+            self.poke();
         }
     }
 
@@ -1298,34 +1396,18 @@ impl App {
         self.world.entity_from_id(self.ids.device).parent()
     }
 
-    /// Command-S: fold the sidebar away (zero wide, clipped, so its rows neither draw nor take clicks; the main card
-    /// takes the window) or bring it back at the scene's size.
+    /// Command-S: fold the sidebar away (it narrows to nothing on a spring, clipped, so its rows neither draw nor take
+    /// clicks; the main card takes the window and the traffic lights fade out) or bring it back.
     fn toggle_sidebar(&mut self) {
-        use harness_native_ui_layout_api::Padding;
-        use harness_native_ui_node_api::Clip;
-        let w = self.world.world_ref();
-        let Some(side) = w.entity_from_id(self.ids.device).parent() else { return };
-        let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
-        let (Some(mut size), Some(full), Some(pad)) = (side.try_cloned::<&Size>(), proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
-        let show = size.w.value == 0.0;
-        size.w = match (show, self.side_w) {
-            (true, Some(v)) => Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 },
-            (true, None) => full.w,
-            (false, _) => Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 },
-        };
-        side.set(size);
-        side.set(if show { pad } else { Padding::default() });
-        if show {
-            side.remove(Clip::id());
-        } else {
-            side.add(Clip::id());
-        }
-        // The window keeps no left margin beside the sidebar; without it the main card gets the same margin as its other sides.
-        if let (Some(root), Some(win)) = (side.parent(), view::prefab(w, "hn.Window").and_then(|p| p.try_cloned::<&Padding>())) {
-            // The top stays where the title-bar strip put it.
-            let t = root.try_cloned::<&Padding>().map_or(win.t, |p| p.t);
-            root.set(Padding { l: if show { win.l } else { win.r }, t, ..win });
-        }
+        self.side_open = !self.side_open;
+        self.poke();
+    }
+
+    /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).
+    pub fn fold_sidebar_now(&mut self) {
+        self.side_open = false;
+        self.side_x = harness_native_api::spring::Spring::at(0.0);
+        self.poke();
     }
 
     fn step_object(&mut self, by: i64) {
@@ -1413,7 +1495,7 @@ fn name_room(row: View<'_>) -> Option<f32> {
     let gap = e.try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
     let mut others = 0.0;
     let mut parts = 0usize;
-    for name in ["indent", "glyph", "meta", "dot"] {
+    for name in ["indent", "glyph", "meta", "badge", "dot", "chevron"] {
         if let Some(p) = row.part(name) {
             others += p.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
             parts += 1;
@@ -1442,6 +1524,73 @@ fn fuzzy(s: &str, q: &str) -> bool {
 }
 
 /// Set `fill` on a node when it differs.
+/// The tones a sidebar row is tinted with, read from the scene once a sync.
+struct RowLooks {
+    clear: Fill,
+    accent: Fill,
+    failed: Fill,
+    failed_wash: Fill,
+    faint: Fill,
+    lost: Fill,
+    badge_on: harness_native_ui_layout_api::Padding,
+}
+
+impl RowLooks {
+    fn of(w: WorldRef<'_>, clear: Fill) -> Self {
+        Self {
+            clear,
+            accent: tone(w, "accent"),
+            failed: tone(w, "failed"),
+            failed_wash: tone(w, "failed_wash"),
+            faint: tone(w, "faint"),
+            lost: tone(w, "lost"),
+            badge_on: crate::look::padding(w, "badge_on"),
+        }
+    }
+
+    /// A session's row: its kind's icon in its colour, its shortcut on hover (`hint`), a failure's exit code as a small
+    /// red badge, and a breathing accent dot while it runs (amber when lost). A clean exit shows nothing.
+    fn session(&self, me: &App, row: View<'_>, e: u64, hint: String) {
+        let w = me.world.world_ref();
+        let o = w.entity_from_id(e);
+        let kind = model::kind_name(o);
+        let status = me.status_of(e);
+        let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
+        if let Some(p) = row.part("glyph") {
+            p.icon(crate::look::kind_icon(kind));
+            set_if(p, crate::look::tone(w, crate::look::kind_tone(kind)));
+        }
+        if let Some(p) = row.part("meta") {
+            p.text(&hint);
+            crate::look::hover_show(p.entity(), row.id(), false);
+        }
+        if let Some(b) = row.part("badge") {
+            let shown = match (status, code) {
+                ("killed", _) => Some("\u{2715}".to_owned()),
+                (_, Some(c)) => Some(c.to_string()),
+                _ => None,
+            };
+            if let Some(t) = b.part("code") {
+                t.text(shown.as_deref().unwrap_or(""));
+            }
+            set_if(b, if shown.is_some() { self.failed_wash } else { self.clear });
+            let pad = if shown.is_some() { self.badge_on } else { harness_native_ui_layout_api::Padding::default() };
+            if b.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
+                b.set(pad);
+            }
+        }
+        if let Some(d) = row.part("dot") {
+            set_if(d, match status {
+                "running" => self.accent,
+                "lost" => self.lost,
+                _ => self.clear,
+            });
+            crate::look::breathe(d.entity(), status == "running");
+        }
+        let _ = self.failed;
+    }
+}
+
 fn set_if(v: View<'_>, fill: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(fill) {
         v.set(fill);

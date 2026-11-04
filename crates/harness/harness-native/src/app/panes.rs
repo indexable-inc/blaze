@@ -181,7 +181,7 @@ impl App {
             });
         }
         stages.sort_unstable();
-        let (clear, chosen) = (tone(w, "hn.ToneClear"), tone(w, "hn.ToneSelected"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
         if let Some(list) = info.part("stages") {
             for_each(list, "hn.PaneRow", stages.into_iter().map(|(_, c)| (format!("s{c}"), c)), |row, c, new| {
                 if new {
@@ -213,7 +213,7 @@ impl App {
                 p.text(&format!("{} run{}", runs.len(), if runs.len() == 1 { "" } else { "s" }));
             }
         }
-        let clear = tone(w, "hn.ToneClear");
+        let clear = tone(w, "clear");
         if let Some(list) = pv.part("runs") {
             for_each(list, "hn.PaneRow", runs.into_iter().take(200).map(|(_, r)| (format!("r{r}"), r)), |row, r, new| {
                 if new {

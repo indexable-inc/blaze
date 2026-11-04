@@ -13,6 +13,13 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
+    // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
+    app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
+    if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
+        app.fold_sidebar_now();
+    }
+    // A title-bar strip as tall as AppKit's (Tahoe's, 32 points), so the shot lays the window out as the window does.
+    app.set_chrome(crate::app::Chrome { strip: 32.0, title_x: 0.0 });
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
@@ -90,7 +97,18 @@ pub fn run(path: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(16));
     }
-    let px = renderer.read(&tex);
+    let mut px = renderer.read(&tex);
+    // The window is clear where the sidebar's vibrancy shows; offscreen there is none, so stand in a flat ground for it.
+    let g = crate::look::tone(app.world.world_ref(), "shot_ground");
+    let g = if app.dark { g.dark } else { g.light };
+    let ground = [g.r, g.g, g.b];
+    for c in px.chunks_exact_mut(4) {
+        let under = 1.0 - f32::from(c[3]) / 255.0;
+        for k in 0..3 {
+            c[k] = (f32::from(c[k]) + ground[k] * 255.0 * under).round().min(255.0) as u8;
+        }
+        c[3] = 255;
+    }
     let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), (w * backing) as u32, (h * backing) as u32);
     enc.set_color(png::ColorType::Rgba);

@@ -1,48 +1,48 @@
 // harness-native's views, composites of den's primitives (prims.flecs). The world's objects become rows of these by key
 // (src/view.rs, harness_native_ui_view::for_each); layout, drawing and hit testing are the generic passes'.
 
-// The window: the sidebar beside the main card, which is inset from the window's edges by a hairline-bordered margin.
+// The window, clear over the sidebar's vibrancy (src/window.rs): the sidebar full height beside the main card, which
+// runs to the window's top, right and bottom edges. The title-bar strip lies over both (hn.TitleBar).
 prefab hn.Window : ui.Row {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
-  Padding: {l: 0, r: 8, t: 8, b: 8}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
 }
 
-// The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar (the traffic lights are centred in it),
-// the selected object's title starting past the lights on their line. The host sets its height and left inset from
-// the window's buttons (src/window.rs, App::set_chrome); the window row below starts under it.
+// The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar. The traffic lights sit on the sidebar's
+// vibrancy; the selected object's title sits on the main card's terminal ground, starting at the terminal's text inset.
+// The host sets its height and left inset (src/app.rs lay_chrome).
 prefab hn.TitleBar : ui.Row {
   Clip
-  Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
   Padding: {l: 0, r: 16, t: 0, b: 0}
-  title : ui.Words, Strong {
+  title : ui.Words {
+    Fill: $tone_term_ink
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
   }
   // The shown object's directory and state, muted after its name (src/app.rs); dimmed with the title while the window is
   // not key.
-  gap : ui.Node {
-    Size: {w: {kind: Fixed, value: 8, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  sub : ui.Words, Muted {
+  sub : ui.Words {
+    Fill: $tone_term_muted
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
   }
 }
 
-// The sidebar: the device, then its objects as a tree. It starts under the title-bar strip (the window's top padding);
-// its first row is centred on the main card's header line.
+// The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
+// title-bar strip (the host adds the strip's height).
 prefab hn.Sidebar : ui.Column {
   Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-  Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
-  Padding: {l: 8, r: 8, t: 6, b: 8}
+  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 10, r: 10, t: 4, b: 10}
 }
 
-// The sidebar's tree: one hn.ObjRow per object, kept by key (src/view.rs). It takes the sidebar's height left over by
-// the device row and the Archive pinned under it, and clips what does not fit.
+// The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
+// device row and the Archive pinned under it, and clips what does not fit.
 prefab hn.Tree : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-  Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
 
 // The hairline over the Archive, pinned to the sidebar's bottom.
@@ -52,180 +52,201 @@ prefab hn.ArchiveRule : ui.Divider {}
 prefab hn.ArchiveList : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 280}}
-  Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
 
-// The archive row at the sidebar's bottom: an archive box (ui.Symbol, a Nerd Font glyph), "Archive", how many objects it holds and a chevron; pressed to fold or
-// unfold the list over it.
+// The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a disclosure
+// chevron (on hover or while open, turning a quarter on a spring); pressed to fold or unfold the list over it.
 prefab hn.ArchiveRow : ui.Row {
   Pressable
   Action: {name: "archive:toggle"}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
-  // On the row's hover the box rises 1.5pt and grows to 1.08 (on the row's HoverAmt spring); when an object is archived
-  // it bounces (a spring kicked 3pt up, 0.12 bigger, ringing at omega 22, zeta 0.3).
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  // On the row's hover the box rises and grows (on the row's HoverAmt spring); when an object is archived it bounces.
   icon : ui.Symbol {
-    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
-    HoverLift: {lift: 1.5, scale: 1.08, kick_lift: 3, kick_scale: 0.12, omega: 22, zeta: 0.3}
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+    HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
   }
   name : ui.Words, Muted {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
-  // The count pulses (0.35 bigger at the kick) when an object is archived.
+  // The count pulses when an object is archived.
   count : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-    HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: 0.35, omega: 26, zeta: 0.35}
+    HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
   }
-  chevron : ui.Words, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  chevron : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
   }
 }
 
-// A status dot.
+// A status dot: clear unless the host tints it (running breathes in the accent, lost is amber).
 prefab hn.Dot : ui.Node {
-  Fill: $tone_exited
-  Size: {w: {kind: Fixed, value: 6, min: 0, max: 0}, h: {kind: Fixed, value: 6, min: 0, max: 0}}
-  Shape: {radius: 3, n: 2, border: 0, feather: 0}
+  Fill: $tone_clear
+  Size: {w: {kind: Fixed, value: $dot_size, min: 0, max: 0}, h: {kind: Fixed, value: $dot_size, min: 0, max: 0}}
+  Shape: {radius: $dot_radius, n: 2, border: 0, feather: 0}
 }
 
-// A section label over the tree: the device's name and how it is linked.
-prefab hn.DeviceRow : ui.Row {
-  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
-  dot : hn.Dot {}
-  name : ui.Words, Muted {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 1}
+// A failure's badge: the exit code, small and red on a red wash. Clear, empty and unpadded otherwise.
+prefab hn.Badge : ui.Row {
+  Fill: $tone_clear
+  Shape: {radius: $badge_radius, n: 4, border: 0, feather: 0}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  code : ui.Words {
+    Fill: $tone_failed
+    TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
   }
+}
+
+// A section label over the tree: the device's name (11 semibold, tertiary), how many objects, and a dot only while the
+// daemon is offline or connecting.
+prefab hn.DeviceRow : ui.Row {
+  Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  name : ui.Words, Faint {
+    TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+  }
+  dot : hn.Dot {}
   spacer : ui.Spacer {}
   count : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
 
-// One object of the tree: indent, status dot, the kind's glyph, its name, and on the right its exit code or shortcut.
+// A session: indent, its kind's icon in the kind's colour, its name (13 medium), and on the right its shortcut (on
+// hover), a failure's badge and a running dot.
 prefab hn.ObjRow : ui.Row {
   Pressable
   Action: {name: ""}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  glyph : ui.Words, Muted {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Ink {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
+  badge : hn.Badge {}
   dot : hn.Dot {}
 }
 
-// A shell run (or one of its pipeline stages) under its session: indent, status dot, its command in the code face, and on
-// the right its exit code and how long it ran. Shorter than an object row, so a session's runs read as a group under it.
+// A shell run (or one of its pipeline stages) under its session: indent, a small dot tinted by how it went, its command
+// (12 regular Inter, secondary), and on the right how long it took (on hover, or always for a failure).
 prefab hn.RunRow : ui.Row {
   Pressable
   Action: {name: ""}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $run_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  glyph : ui.Words, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  glyph : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Muted {
-    TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
-  dot : hn.Dot {}
 }
 
-// A group of runs with no listed session ("REPL runs", "other runs"): a chevron, its name and how many runs it holds;
-// pressed to fold or unfold it.
+// A group of runs with no listed session ("REPL runs", "other runs"): its icon, its name, how many runs it holds and a
+// disclosure chevron (on hover or while open, turning on a spring); pressed to fold or unfold it.
 prefab hn.GroupRow : ui.Row {
   Pressable
   Action: {name: ""}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  glyph : ui.Words, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  glyph : ui.Symbol, Muted {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Muted {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
+  chevron : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+  }
 }
 
-// The fold of a session's older runs: "N more" (or "fewer"), pressed to unfold (or fold) them.
+// The fold of a session's older runs: a quiet "Show 5 more" (or "Show fewer"), lined up with the runs' commands.
 prefab hn.MoreRow : ui.Row {
   Pressable
   Action: {name: ""}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 20, min: 0, max: 0}}
-  Padding: {l: 8, r: 8, t: 0, b: 0}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $more_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  glyph : ui.Words, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  glyph : ui.Node {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
   name : ui.Words, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
 }
 
-// The panes, side by side: one per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its
-// object's Kind picks. One today; a split is a second node.
-prefab hn.Main : ui.Row {
+// The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
+// bottom edges (the window's corners round it). The title-bar strip lies over its top (the host pads the card down by
+// the strip's height); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
+// per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
+// a split is a second node.
+prefab hn.Main : ui.Row, Plate {
+  Fill: $tone_term_ground
+  Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+  Shape: {radius: 0, n: 4, border: 0, feather: 0}
+  Lift: {blur: $seam_blur, alpha: $seam_alpha, dy: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-  Flex: {axis: Row, gap: 8, align: Stretch, justify: Start, wrap: false}
+  Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
 }
 
-// A pane: one surface in the terminal's own ground, no hairline frame (the contrast with the black window separates it)
-// and no header (the title bar names what it shows).
-prefab hn.Pane : ui.Column, Plate {
+// A pane: clear on the card's terminal ground, no header (the title bar names what it shows).
+prefab hn.Pane : ui.Column {
   PaneNode
-  Edge: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
-  Shape: {radius: 10, n: 4, border: 0, feather: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
 }
@@ -235,7 +256,7 @@ prefab hn.Pane : ui.Column, Plate {
 // not entities.
 prefab hn.Terminal : ui.Node {
   TermNode
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
 }
 
@@ -318,13 +339,13 @@ prefab hn.Palette : ui.Column {
   // A press beside the card closes it; the window dims under it.
   Pressable
   Action: {name: "pal:close"}
-  Fill: {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
+  Fill: $tone_scrim
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
   Padding: {l: 0, r: 0, t: 96, b: 0}
   card : ui.Column, Plate {
     Hoverable
-    Fill: {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+    Fill: $tone_card
     Lift: {blur: 24, alpha: 0.5, dy: 8}
     Shape: {radius: 12, n: 4, border: 1, feather: 0}
     Size: {w: {kind: Fixed, value: 560, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -351,7 +372,7 @@ prefab hn.Palette : ui.Column {
 prefab hn.PalRow : ui.Row {
   Pressable
   Action: {name: ""}
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
@@ -369,25 +390,42 @@ prefab hn.PalRow : ui.Row {
   }
 }
 
-// Tones the host reads by name and copies onto nodes (src/app.rs `tone`): a dot's status, the selected row.
-prefab hn.ToneRunning {
-  Fill: $tone_running
-}
-prefab hn.ToneExited {
-  Fill: $tone_exited
-}
-prefab hn.ToneFailed {
-  Fill: $tone_failed
-}
-prefab hn.ToneLost {
-  Fill: $tone_lost
-}
-prefab hn.ToneSelected {
-  Fill: $tone_select
-}
-prefab hn.ToneClear {
-  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
-}
-prefab hn.ToneAccent {
-  Fill: $tone_accent
+// The theme: every tone, size and spring the host reads by role (src/look.rs `role`, `hn.Theme.<role>`), one child
+// each, valued from the tokens (00-tokens.flecs). Another look is another hn.Theme.
+prefab hn.Theme {
+  // Status: a dot's or an icon's.
+  running { Fill: $tone_running }
+  exited { Fill: $tone_exited }
+  failed { Fill: $tone_failed }
+  failed_wash { Fill: $tone_failed_wash }
+  lost { Fill: $tone_lost }
+  // Rows: the selected row's pill, nothing, the accent (a running dot), the tertiary and quaternary inks.
+  selected { Fill: $tone_select }
+  clear { Fill: $tone_clear }
+  accent { Fill: $tone_accent }
+  muted { Fill: $tone_ink_3 }
+  faint { Fill: $tone_ink_4 }
+  // The cute touch: a small warm colour per kind on its icon.
+  kind_claude { Fill: $tone_kind_claude }
+  kind_codex { Fill: $tone_kind_codex }
+  kind_cursor { Fill: $tone_kind_cursor }
+  kind_shell { Fill: $tone_kind_shell }
+  // Offscreen shots' stand-in for the vibrancy (src/shot.rs).
+  shot_ground { Fill: $tone_shot_ground }
+  // A tree level's indent, and a failure badge's padding while it shows.
+  indent {
+    Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  badge_on {
+    Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
+  }
+  // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the selection pill, the sidebar's fold.
+  breath {
+    Motion: {omega: $breath_omega, zeta: $breath_zeta}
+    Reveal: {alpha0: $breath_floor, dx: 0, dy: 0, scale0: 1}
+  }
+  turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
+  pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
+  sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
+  lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
 }
