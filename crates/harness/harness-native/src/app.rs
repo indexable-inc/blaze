@@ -1041,6 +1041,10 @@ impl App {
         drop(map);
         let paint = term::Paint { origin: (rect[0], rect[1]), scale: sc, focused: self.focused && self.palette.is_none(), sel: self.sel, scroll, theme: &term::DARK, time: self.time };
         term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
+        if self.grid.animating {
+            // The cursor fades on the app clock: keep drawing.
+            self.poke();
+        }
     }
 
     // ---- input ----

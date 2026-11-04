@@ -1,0 +1,3 @@
+JetBrains Mono 2.304 (Regular, Bold, Italic, Bold Italic), from the official release
+https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304 (JetBrainsMono-2.304.zip, fonts/ttf).
+Licensed under the SIL Open Font License 1.1: see OFL.txt. Authors: AUTHORS.txt.

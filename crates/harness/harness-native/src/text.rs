@@ -21,7 +21,11 @@ use std::rc::Rc;
 
 pub mod font;
 mod font_mac;
+mod nerd;
+pub mod nerd_rules;
 mod shaper;
+
+pub use shaper::RunGlyph;
 
 /// The proportions a scene sets for type (den's `TypeLook` component, copied as plain data): code's scale, the headings,
 /// tracking, and a selected blank line's sliver.
@@ -183,12 +187,182 @@ fn code_font(size: f32, weight: u16, italic: bool) -> Font {
         .unwrap_or(regular)
 }
 
-/// The terminal's cell at `size`: the code face's advance (of `M`), ascent and descent, points.
+// ---- the terminal's fonts ------------------------------------------------------------------------------------------
+
+/// The terminal's bundled faces, written out and registered for the process ([`register_term_fonts`]): JetBrains Mono
+/// 2.304 (SIL OFL 1.1, fonts/jetbrains-mono) and Symbols Nerd Font Mono 3.5.1 (fonts/nerd-symbols). Berkeley Mono is
+/// used when installed and never bundled.
+const TERM_BUNDLED: [(&str, &[u8]); 5] = [
+    ("JetBrainsMono-Regular.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Regular.ttf")),
+    ("JetBrainsMono-Bold.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Bold.ttf")),
+    ("JetBrainsMono-Italic.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Italic.ttf")),
+    ("JetBrainsMono-BoldItalic.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf")),
+    ("SymbolsNerdFontMono-Regular.ttf", include_bytes!("../fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf")),
+];
+
+/// The Nerd Font symbols face and the colour emoji face, by PostScript name.
+const NERD_FONT: &str = "SymbolsNFM";
+const EMOJI_FONT: &str = "AppleColorEmoji";
+
+/// Register the bundled terminal faces for this process, once: each written to the user's cache directory (when it is
+/// not there already, byte for byte) and registered with `CTFontManagerRegisterFontURLs` at process scope, so CoreText
+/// finds JetBrains Mono's bold and italic by family and trait like an installed face's.
+pub fn register_term_fonts() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        let dir = std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from).join("Library/Caches/harness-native/fonts");
+        let mut paths = Vec::new();
+        for (name, bytes) in TERM_BUNDLED {
+            let p = dir.join(name);
+            let same = std::fs::metadata(&p).is_ok_and(|m| m.len() == bytes.len() as u64) && std::fs::read(&p).is_ok_and(|b| b == bytes);
+            if !same {
+                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&p, bytes)) {
+                    eprintln!("harness-native: cannot write bundled font {}: {e}", p.display());
+                    continue;
+                }
+            }
+            paths.push(p);
+        }
+        if let Err(e) = font_mac::register_fonts(&paths) {
+            eprintln!("harness-native: registering bundled fonts: {e}");
+        }
+    });
+}
+
+/// The primary face's metrics, points, read as Ghostty's CoreText face reads them (src/font/face/coretext.zig
+/// `getMetrics`): the widest advance of printable ASCII; ascent, descent (positive, down) and line gap from `hhea`, or
+/// OS/2's typo metrics when the font sets USE_TYPO_METRICS or `hhea` has none, or its win metrics; cap height from OS/2;
+/// underline position (above the baseline, negative below) and thickness from `post`.
+#[derive(Clone, Copy, Debug)]
+pub struct FaceMetrics {
+    pub advance: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub leading: f32,
+    pub cap: f32,
+    pub underline_pos: Option<f32>,
+    pub underline_thick: Option<f32>,
+}
+
+/// Big-endian reads from a font table.
+fn be_i16(t: &[u8], at: usize) -> Option<f32> {
+    t.get(at..at + 2).map(|b| f32::from(i16::from_be_bytes([b[0], b[1]])))
+}
+
+fn be_u16(t: &[u8], at: usize) -> Option<u16> {
+    t.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn face_metrics(f: &Font) -> FaceMetrics {
+    let size = f.size();
+    let upem = f.table_bytes(b"head").or_else(|| f.table_bytes(b"bhed")).and_then(|h| be_u16(&h, 18)).filter(|&u| u > 0).map_or(1000.0, f32::from);
+    let k = size / upem;
+    let hhea = f.table_bytes(b"hhea");
+    let os2 = f.table_bytes(b"OS/2");
+    let post = f.table_bytes(b"post");
+    let (ascent, descent, leading) = (|| {
+        let ct = (f.ascent(), f.descent().abs(), f.leading().max(0.0));
+        let Some(h) = hhea.as_deref() else { return ct };
+        let (ha, hd, hg) = (be_i16(h, 4).unwrap_or(0.0), be_i16(h, 6).unwrap_or(0.0), be_i16(h, 8).unwrap_or(0.0));
+        let Some(o) = os2.as_deref() else { return (ha * k, -hd * k, hg * k) };
+        let (oa, od, og) = (be_i16(o, 68).unwrap_or(0.0), be_i16(o, 70).unwrap_or(0.0), be_i16(o, 72).unwrap_or(0.0));
+        let typo = be_u16(o, 62).is_some_and(|s| s & (1 << 7) != 0);
+        if typo {
+            return (oa * k, -od * k, og * k);
+        }
+        if ha != 0.0 || hd != 0.0 {
+            return (ha * k, -hd * k, hg * k);
+        }
+        if oa != 0.0 || od != 0.0 {
+            return (oa * k, -od * k, og * k);
+        }
+        let (wa, wd) = (be_u16(o, 74).map_or(0.0, f32::from), be_u16(o, 76).map_or(0.0, f32::from));
+        (wa * k, wd * k, 0.0)
+    })();
+    let cap = os2.as_deref().filter(|o| be_u16(o, 0).is_some_and(|v| v >= 2)).and_then(|o| be_i16(o, 88)).map_or_else(|| f.cap_height(), |c| c * k);
+    let (underline_pos, underline_thick) = post.as_deref().map_or((None, None), |p| {
+        let (pos, thick) = (be_i16(p, 8).unwrap_or(0.0), be_i16(p, 10).unwrap_or(0.0));
+        let broken = thick == 0.0;
+        ((!(broken && pos == 0.0)).then_some(pos * k), (!broken).then_some(thick * k))
+    });
+    let advance = (32u8..127).map(|c| f.advance(f.glyph(char::from(c))) as f32).fold(0.0, f32::max);
+    FaceMetrics { advance: if advance > 0.0 { advance } else { size * 0.6 }, ascent, descent, leading, cap, underline_pos, underline_thick }
+}
+
+impl Fonts {
+    /// The terminal's primary face at `size` in its bold and slanted cuts: `$HARNESS_MONO`, else Berkeley Mono when
+    /// installed, else the bundled JetBrains Mono.
+    pub fn term_font(&mut self, size: f32, bold: bool, italic: bool) -> FontId {
+        register_term_fonts();
+        let f = code_font(size, if bold { 700 } else { 400 }, italic);
+        self.register(&f)
+    }
+
+    /// `id`'s metrics (an unknown id reads as zeros).
+    #[must_use]
+    pub fn term_metrics(&self, id: FontId) -> FaceMetrics {
+        let Some(f) = self.font(id) else { return FaceMetrics { advance: 0.0, ascent: 0.0, descent: 0.0, leading: 0.0, cap: 0.0, underline_pos: None, underline_thick: None } };
+        face_metrics(f)
+    }
+
+    /// Symbols Nerd Font Mono at `size`, when registered.
+    pub fn nerd_font(&mut self, size: f32) -> Option<FontId> {
+        register_term_fonts();
+        let f = Font::named(NERD_FONT, size)?;
+        Some(self.register(&f))
+    }
+
+    /// Apple Color Emoji at `size`.
+    pub fn emoji_font(&mut self, size: f32) -> Option<FontId> {
+        let f = Font::named(EMOJI_FONT, size)?;
+        Some(self.register(&f))
+    }
+
+    /// The font CoreText's cascade sets `text` in for `primary`.
+    pub fn fallback_font(&mut self, primary: FontId, text: &str) -> Option<FontId> {
+        let f = self.font(primary)?.fallback(text);
+        Some(self.register(&f))
+    }
+
+    /// Whether `id` has a glyph for every scalar of `text` that needs one.
+    pub fn covers(&mut self, id: FontId, text: &str) -> bool {
+        let Some(f) = self.font(id).cloned() else { return false };
+        shaper::covers(self, &f, text)
+    }
+
+    /// A terminal row run, one grapheme a cell, shaped in `id` ([`shaper::shape_cells`]).
+    pub fn shape_cells(&mut self, id: FontId, cells: &[&str]) -> Vec<RunGlyph> {
+        let Some(f) = self.font(id).cloned() else { return Vec::new() };
+        shaper::shape_cells(self, &f, cells)
+    }
+
+    /// `text`'s glyph in `id` as CoreText sets it (an emoji sequence joined into one glyph), when it sets one.
+    #[must_use]
+    pub fn ct_glyph(&self, id: FontId, text: &str) -> Option<u16> {
+        self.font(id)?.ct_glyphs(text).into_iter().find(|&g| g != 0)
+    }
+
+    /// `glyph`'s ink box in `id`, points from its origin (`[x, y, w, h]`, y up).
+    #[must_use]
+    pub fn glyph_bounds(&self, id: FontId, glyph: u16) -> [f64; 4] {
+        self.font(id).map_or([0.0; 4], |f| f.bounds(glyph))
+    }
+
+    /// Whether `id`'s glyphs are colour bitmaps (an emoji font).
+    #[must_use]
+    pub fn is_colour(&self, id: FontId) -> bool {
+        self.font(id).is_some_and(FontSource::colour)
+    }
+}
+
+/// Whether `text` (a grapheme cluster) asks to be drawn as an emoji: an emoji-presentation character or U+FE0F, and no
+/// text-presentation selector.
 #[must_use]
-pub fn mono_cell(fonts: &Fonts, size: f32) -> (f32, f32, f32) {
-    let f = code_font(size * fonts.look.code_scale, 400, false);
-    let adv = f.advance(f.glyph('M')) as f32;
-    (if adv > 0.0 { adv } else { size * 0.6 }, f.ascent(), f.descent().abs())
+pub fn emoji_presentation(text: &str) -> bool {
+    use icu_properties::CodePointSetData;
+    use icu_properties::props::EmojiPresentation;
+    let set = CodePointSetData::new::<EmojiPresentation>();
+    !text.contains('\u{FE0E}') && text.chars().any(|c| c == '\u{FE0F}' || set.contains(c))
 }
 
 /// The code face's underline thickness at `size`, points: box-drawing lines are drawn this thick (boxdraw.rs).
@@ -1440,6 +1614,43 @@ impl GlyphCache {
         e
     }
 
+    /// The atlas entry for `glyph` of `font` drawn scaled `sx` by `sy` pixels a point with its origin at (`tx`, `ty`)
+    /// pixels from a cell's bottom-left corner (y up): a glyph constrained into a terminal cell
+    /// ([`nerd_rules::Constraint`]). Its `left` and `top` are from that corner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_placed(&mut self, fonts: &Fonts, font: FontId, glyph: u16, sx: f64, sy: f64, tx: f64, ty: f64, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Option<AtlasGlyph> {
+        let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
+        for v in [sx, sy, tx, ty] {
+            h = (h.rotate_left(13) ^ v.to_bits()).wrapping_mul(0x0100_0000_01b3);
+        }
+        // Placed glyphs live beside plain ones under a key no plain glyph has (a plain key's last field is below SUBPX).
+        let key = (font ^ 0x5bd1_e995_0000_0000, glyph, (h >> 32) as u32, (h as u32) | 0x8000_0000);
+        if let Some(e) = self.map.get(&key) {
+            return *e;
+        }
+        let f = fonts.font(font)?;
+        let [bx, by, bw, bh] = f.bounds(glyph);
+        let b = if bw <= 0.0 || bh <= 0.0 {
+            font::Bitmap { left: 0, top: 0, w: 0, h: 0, colour: false, rgba: Vec::new() }
+        } else {
+            let colour = f.colour();
+            let x0 = (tx + bx * sx).floor() as i32 - 1;
+            let y0 = (ty + by * sy).floor() as i32 - 1;
+            let x1 = (tx + (bx + bw) * sx).ceil() as i32 + 1;
+            let y1 = (ty + (by + bh) * sy).ceil() as i32 + 1;
+            let (w, hh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+            let mut buf = vec![0u8; w * hh * if colour { 4 } else { 1 }];
+            f.draw_placed(glyph, &mut buf, w, hh, x0, y0, sx, sy, tx, ty);
+            let rgba = if colour { buf } else { buf.iter().flat_map(|&c| [c; 4]).collect() };
+            font::Bitmap { left: x0, top: y1, w: w as u32, h: hh as u32, colour, rgba }
+        };
+        let e = self.place(b, upload);
+        if e.is_some() || !self.full {
+            self.map.insert(key, e);
+        }
+        e
+    }
+
     /// A bitmap given room in the atlas and uploaded there; one that draws nothing takes no room.
     fn place(&mut self, b: font::Bitmap, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Option<AtlasGlyph> {
         if b.w == 0 || b.h == 0 {
@@ -1454,10 +1665,4 @@ impl GlyphCache {
     }
 }
 
-#[cfg(test)]
-mod reflow_tests;
-
-/// The typesetter against CoreText's recorded lines, set in the Mac's fonts.
-#[cfg(all(test, target_os = "macos"))]
-mod parity_tests;
 

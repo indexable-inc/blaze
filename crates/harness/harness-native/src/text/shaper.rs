@@ -125,6 +125,59 @@ impl Instance {
     }
 }
 
+/// One glyph of a terminal run as HarfRust shaped it: its id, the cell (cluster) it came from, and its advance and
+/// offsets, points.
+#[derive(Clone, Copy, Debug)]
+pub struct RunGlyph {
+    pub id: u16,
+    pub cell: u32,
+    pub adv: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+/// A terminal row run (`cells`, one grapheme each, all set in `system`) shaped by HarfRust with contextual alternates
+/// and ligatures on and kerning off, each glyph keeping the index of the cell it came from as its cluster: a ligature
+/// over N cells is one glyph (or N glyphs, as JetBrains Mono sets them) at the run's first cell of it.
+pub(crate) fn shape_cells(fonts: &mut super::Fonts, system: &SystemFont, cells: &[&str]) -> Vec<RunGlyph> {
+    let Some(inst) = instance(fonts, system) else { return Vec::new() };
+    let mut feats = inst.features[1].clone();
+    feats.push(Feature::new(Tag::new(b"calt"), 1, ..));
+    feats.push(Feature::new(Tag::new(b"liga"), 1, ..));
+    let mut buf = Buffer::new();
+    buf.set_direction(Direction::LeftToRight);
+    buf.set_script(Some(Script::LATIN));
+    buf.set_cluster_level(ClusterLevel::MonotoneGraphemes);
+    buf.set_flags(BufferFlags::BEGINNING_OF_TEXT | BufferFlags::END_OF_TEXT | BufferFlags::DO_NOT_INSERT_DOTTED_CIRCLE);
+    for (i, s) in cells.iter().enumerate() {
+        if s.is_empty() {
+            buf.push(u32::from(' '), i as u32);
+        }
+        for c in s.chars() {
+            buf.push(u32::from(c), i as u32);
+        }
+    }
+    let plan = ShapePlan::new(&inst.font, Direction::LeftToRight, Some(Script::LATIN), None, &feats);
+    let font = ShaperFont::new(&inst.font).with_scale(i32::from(inst.font.units_per_em()) * SUB);
+    let options = ShapeOptions::new().plan(Some(&plan)).features(&feats).point_size(Some(inst.size));
+    if harfrust::shape(&font, &mut buf, options).is_err() {
+        return Vec::new();
+    }
+    let s = inst.scale;
+    buf.glyph_infos()
+        .iter()
+        .zip(buf.glyph_positions())
+        .map(|(i, p)| RunGlyph { id: i.glyph_id as u16, cell: i.cluster, adv: (f64::from(p.x_advance) * s) as f32, dx: (f64::from(p.x_offset) * s) as f32, dy: (f64::from(p.y_offset) * s) as f32 })
+        .collect()
+}
+
+/// Whether `system`'s character map has every scalar of `text` that needs a glyph.
+pub(crate) fn covers(fonts: &mut super::Fonts, system: &SystemFont, text: &str) -> bool {
+    let Some(inst) = instance(fonts, system) else { return false };
+    let cmap = inst.font.charmap();
+    text.chars().all(|c| invisible(u32::from(c)) || cmap.map_unicode(u32::from(c)).is_some())
+}
+
 /// A character that needs no glyph of its own font to be set: controls, joiners, marks of direction, variation
 /// selectors and tags, which the characters around them choose the font of.
 fn invisible(c: u32) -> bool {
