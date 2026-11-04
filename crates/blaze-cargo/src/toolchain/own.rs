@@ -165,14 +165,6 @@ pub fn host() -> Option<&'static str> {
     })
 }
 
-/// blaze's own directory: `BLAZE_HOME`, else `.blaze` in the user's home.
-pub fn home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    Some(user_home()?.join(".blaze"))
-}
-
 /// Where this machine keeps blaze's toolchains: `.blaze/toolchains` in the user's home, for
 /// every `BLAZE_HOME`. A release is its pinned bytes, each file checked against its sha256 as
 /// it is downloaded, so every home of the machine reads the one copy: `BLAZE_HOME` moves a
@@ -180,14 +172,7 @@ pub fn home() -> Option<PathBuf> {
 /// CI job's, a second daemon's) neither downloads the release again nor fails for not having
 /// it. [`fetch`]'s lock keeps two processes from laying it out at once.
 pub fn toolchains() -> Option<PathBuf> {
-    Some(user_home()?.join(".blaze").join("toolchains"))
-}
-
-/// The user's home directory.
-fn user_home() -> Option<PathBuf> {
-    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    let home = std::env::var_os(var).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home))
+    Some(blaze_manifest::user_config::user_home()?.join(".blaze").join("toolchains"))
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one
@@ -782,7 +767,7 @@ mod tests {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(
             ours.version,
-            super::super::OURS.trim(),
+            blaze_units::lock::toolchain(),
             "toolchain_pins.py '{{\"write\": true}}'"
         );
         assert_eq!(ours.channel, "nightly");

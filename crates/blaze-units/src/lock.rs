@@ -50,9 +50,10 @@ pub fn is_version(version: &str) -> bool {
     date.len() == 8 && digits(date) && digits(n)
 }
 
-/// Whether the environment says this runs on CI, as blaze's live view tells it: `CI` set to
-/// anything but empty, `0` or `false` (any case), or `TF_BUILD` set (Azure Pipelines, which
-/// sets no `CI`).
+/// Whether the environment says this runs on CI, the one rule for it (`--locked` by default,
+/// `blaze test`'s live view off): `CI` set to anything but empty, `0` or `false` (any case;
+/// GitHub Actions, GitLab, Buildkite, CircleCI, Travis and most others set it), or `TF_BUILD`
+/// set (Azure Pipelines, which sets no `CI`).
 pub fn ci_says(ci: Option<&str>, tf_build: Option<&str>) -> bool {
     let ci = ci.map(str::trim).is_some_and(|it| !(it.is_empty() || it == "0" || it.eq_ignore_ascii_case("false")));
     ci || tf_build.is_some_and(|it| !it.is_empty())

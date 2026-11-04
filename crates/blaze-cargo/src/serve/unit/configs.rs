@@ -19,7 +19,7 @@
 //! with a cold front end infers its bodies again here: the plan keeps the observation with the
 //! record instead.
 
-use blaze_api::{ApiError, Diagnostic, Level};
+use blaze_api::{ApiError, Diagnostic};
 use blaze_diagnostics::reach::{self, Observation};
 use blaze_units::schema::{Mode, Unit};
 
@@ -43,7 +43,7 @@ pub(super) fn report(job: &Job, reader: Option<UnitReader>, ok: bool, built: &[u
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     }
     if !ok {
-        return Ok(vec![note(
+        return Ok(vec![Diagnostic::note(
             // alloc: once per job
             "`blaze::dead`, `blaze::test_only` and `blaze::cfg_only` are given only when every unit checks: what a unit \
              that failed uses is not known"
@@ -83,7 +83,7 @@ pub(super) fn report(job: &Job, reader: Option<UnitReader>, ok: bool, built: &[u
         }
         if let Some((label, why)) = observations.iter().find_map(|it| it.unported.as_ref().map(|why| (&it.label, why))) {
             // alloc: once per package not linted
-            notes.push(note(format!("the reachability lints are not given for `{}`: in {label}, {why}", package[0].0)));
+            notes.push(Diagnostic::note(format!("the reachability lints are not given for `{}`: in {label}, {why}", package[0].0)));
             continue;
         }
         said.extend(reach::merge(&observations).iter().map(|it| (it.unit, it.diag())));
@@ -128,19 +128,4 @@ fn label(u: &Unit) -> Option<String> {
         label.push_str(platform);
     }
     Some(label)
-}
-
-/// A note of the whole job, of no unit or span.
-fn note(message: String) -> Diagnostic {
-    Diagnostic {
-        level: Level::Note,
-        code: None,
-        rendered: format!("note: {message}\n"), // alloc: once per note
-        message,
-        spans: Vec::new(),    // alloc: none
-        children: Vec::new(), // alloc: none
-        facts: Vec::new(),    // alloc: none
-        unit: None,
-        explanation: None,
-    }
 }

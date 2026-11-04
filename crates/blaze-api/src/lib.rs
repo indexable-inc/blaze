@@ -897,6 +897,23 @@ pub struct Diagnostic {
     pub explanation: Option<String>,
 }
 
+impl Diagnostic {
+    /// A note of the whole request, of no unit, span or code: `note: {message}`.
+    pub fn note(message: String) -> Diagnostic {
+        Diagnostic {
+            code: None,
+            unit: None,
+            facts: Vec::new(), // alloc: none
+            level: Level::Note,
+            spans: Vec::new(), // alloc: none
+            rendered: format!("note: {message}\n"), // alloc: the report owns it, once per note
+            message,
+            children: Vec::new(), // alloc: none
+            explanation: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct UnitOf {
     /// The daemon's index of the unit in the request's unit graph: dense from 0 and the same

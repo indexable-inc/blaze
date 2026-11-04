@@ -26,10 +26,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import links, worked  # noqa: E402
+from storelib import linked  # noqa: E402
 
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-TIMEOUT = 900
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "show"]\nresolver = "2"\n',
     "show/Cargo.toml": '[package]\nname = "ushow"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -52,19 +51,6 @@ STEPS = [
 ]
 
 
-def build(ws, env, step):
-    """`blaze build`: how it linked the program (storelib.links), in order. A build with no
-    `blaze-work` line was not the daemon's, and stops the harness."""
-    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
-                         capture_output=True, text=True, timeout=TIMEOUT)
-    said = ran.stdout + ran.stderr
-    if ran.returncode != 0:
-        raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    if not worked(ran.stdout):
-        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
-    return [str(it) for it in links(ran.stdout, "uapp")]
-
-
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "blaze*")):
@@ -82,14 +68,14 @@ def main():
     program, source = os.path.join(ws, "target", "debug", "uapp"), os.path.join(ws, "app", "src", "main.rs")
     wrong = 0
     try:
-        build(ws, env, "first build")
+        linked(ws, env, "first build", "uapp")
         for n, (what, edits, expected) in enumerate(STEPS):
             text = open(source).read()
             for old, new in edits:
                 assert old in text, (what, old)
                 text = text.replace(old, new, 1)
             open(source, "w").write(text)
-            made = build(ws, env, what)
+            made = [str(it) for it in linked(ws, env, what, "uapp")]
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
             how = made[-1] if made else "no link"
             verdict = "ok"

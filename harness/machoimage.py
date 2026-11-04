@@ -36,10 +36,9 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import Link, links, worked  # noqa: E402
+from storelib import Link, linked  # noqa: E402
 
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-TIMEOUT = 900
 PROGRAM = "mimg"
 DEPLOYMENT = "14.0"
 FILES = {
@@ -154,19 +153,6 @@ def image_wrong(path: str, library: str | None) -> str | None:
     return None
 
 
-def build(ws: str, env: dict[str, str], step: str) -> list[Link]:
-    """`blaze build`: how it linked the program, in order. A build with no `blaze-work` line
-    was not the daemon's, and stops the harness."""
-    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
-                         capture_output=True, text=True, timeout=TIMEOUT)
-    said = ran.stdout + ran.stderr
-    if ran.returncode != 0:
-        raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    if not worked(ran.stdout):
-        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
-    return links(ran.stdout, PROGRAM)
-
-
 def verdict_of(made: list[Link], program: str, printed: str, want: str, hows: tuple[str, ...],
                library: str | None) -> str:
     """What is wrong with a build that linked `made` and whose program printed `printed`, or
@@ -205,7 +191,7 @@ def main() -> None:
     library: str | None = None
 
     def step(what: str, want: str, hows: tuple[str, ...]) -> None:
-        made = build(ws, env, what)
+        made = linked(ws, env, what, PROGRAM)
         printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
         verdict = verdict_of(made, program, printed, want, hows, library)
         rows.append((what, verdict, ", ".join(str(it) for it in made)))

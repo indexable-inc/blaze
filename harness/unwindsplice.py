@@ -25,10 +25,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import Link, links, worked  # noqa: E402
+from storelib import linked  # noqa: E402
 
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-TIMEOUT = 900
 PROGRAM = "usplice"
 FILES = {
     "Cargo.toml": f'[package]\nname = "{PROGRAM}"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -66,19 +65,6 @@ DEEP = """fn deep(n: u32) -> u32 {
 """
 
 
-def build(ws: str, env: dict[str, str], step: str) -> list[Link]:
-    """`blaze build`: how it linked the program, in order. A build with no `blaze-work` line
-    was not the daemon's, and stops the harness."""
-    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
-                         capture_output=True, text=True, timeout=TIMEOUT)
-    said = ran.stdout + ran.stderr
-    if ran.returncode != 0:
-        raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    if not worked(ran.stdout):
-        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
-    return links(ran.stdout, PROGRAM)
-
-
 def main() -> None:
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "blaze")):
@@ -101,7 +87,7 @@ def main() -> None:
         open(source, "w").write(text.replace(old, new, 1))
 
     def step(what: str, want: str, hows: tuple[str, ...]) -> None:
-        made = build(ws, env, what)
+        made = linked(ws, env, what, PROGRAM)
         ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
         printed = ran.stdout.strip()
         how = ", ".join(str(it) for it in made) or "no link"

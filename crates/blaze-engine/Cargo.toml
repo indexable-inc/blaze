@@ -62,7 +62,7 @@ toml_edit = { workspace = true, features = ["display", "parse"] }
 # The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
 # every list of sums the release publishes: `B3SUMS` (blaze-ids) and `SHA256SUMS`.
 blaze-registry.workspace = true
-# blaze's home and its `config.toml` (`user_config`), read in one place with blaze-registry's `[net]`.
+# blaze's home and its `config.toml` (`user_config`), read in one place.
 blaze-manifest.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
