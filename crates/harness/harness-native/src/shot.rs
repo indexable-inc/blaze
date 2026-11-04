@@ -38,23 +38,27 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK").unwrap_or_default().split(';').map(nums).filter(|v| v.len() == 2).enumerate().map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1])).collect();
     let mut drag = std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
     let mut up_next = false;
+    let mut at = (0.0f32, 0.0f32);
+    let (left, none) = (crate::term::Button::Left, crate::app::KeyMods::default());
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
         let t = start.elapsed().as_secs_f32();
         if up_next {
-            app.pointer_up();
+            app.pointer_up(at.0, at.1, left, none);
             up_next = false;
         } else if let Some(d) = drag.take_if(|_| t >= 0.8) {
-            app.pointer_down(d[0], d[1]);
+            app.pointer_down(d[0], d[1], left, 1, none);
             for k in 1..=8 {
                 let f = k as f32 / 8.0;
-                app.pointer_move(d[0] + (d[2] - d[0]) * f, d[1] + (d[3] - d[1]) * f);
+                at = (d[0] + (d[2] - d[0]) * f, d[1] + (d[3] - d[1]) * f);
+                app.pointer_move(at.0, at.1, none);
             }
             up_next = true;
         } else if clicks.first().is_some_and(|c| t >= c.0) {
             let (_, x, y) = clicks.remove(0);
-            app.pointer_down(x, y);
+            at = (x, y);
+            app.pointer_down(x, y, left, 1, none);
             up_next = true;
         }
         let r = &renderer;

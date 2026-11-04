@@ -8,11 +8,25 @@ prefab hn.Window : ui.Row {
   Padding: {l: 0, r: 8, t: 8, b: 8}
 }
 
-// The sidebar: the device, then its objects as a tree. Room at the top for the traffic lights.
+// The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar (the traffic lights are centred in it),
+// the selected object's title starting past the lights on their line. The host sets its height and left inset from
+// the window's buttons (src/window.rs, App::set_chrome); the window row below starts under it.
+prefab hn.TitleBar : ui.Row {
+  Clip
+  Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  Padding: {l: 0, r: 16, t: 0, b: 0}
+  title : ui.Words, Strong {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
+  }
+}
+
+// The sidebar: the device, then its objects as a tree. It starts under the title-bar strip (the window's top padding);
+// its first row is centred on the main card's header line.
 prefab hn.Sidebar : ui.Column {
   Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
-  Padding: {l: 8, r: 8, t: 38, b: 8}
+  Padding: {l: 8, r: 8, t: 6, b: 8}
 }
 
 // The sidebar's tree: one hn.ObjRow per object, kept by key (src/view.rs). It takes the sidebar's height left over by
