@@ -2975,7 +2975,7 @@ attributes #0 = { alwaysinline }
             let context = Context::create();
             let module = context.create_module("frame");
             let own = Defined { name: OWN, func: &func, pointees: &[], named: &[], weights: None, marked: false };
-            let function = Lowering::add(&context, &module, target, &own, forced).expect("added");
+            let function = Lowering::add(&context, &module, target, &own, forced, crate::Features::BASELINE).expect("added");
             function
                 .get_string_attribute(AttributeLoc::Function, "frame-pointer")
                 .map(|it| it.get_string_value().to_string_lossy().into_owned())
