@@ -100,7 +100,10 @@ pub(crate) fn claim(layout: Layout) -> NonNull<u8> {
 ///
 /// An implementor's every bit being zero is a valid, initialized value of it. Implemented here
 /// only, for the types [`zeroed`] tables are made of.
-#[cfg_attr(blaze_check, allow(dead_code, reason = "a model build's tables are boxes of the checker's atomics"))]
+#[cfg_attr(
+    blaze_check,
+    allow(dead_code, reason = "a model build's tables are boxes of the checker's atomics")
+)]
 pub(crate) unsafe trait Zeroed {}
 
 // SAFETY: An `AtomicU64` has `u64`'s representation; zero is the integer 0.
@@ -117,7 +120,10 @@ unsafe impl<T> Zeroed for AtomicPtr<T> {}
 unsafe impl Zeroed for Group {}
 
 /// `len` `T`s in fresh claimed space, every byte zero, never freed.
-#[cfg_attr(blaze_check, allow(dead_code, reason = "a model build's tables are boxes of the checker's atomics"))]
+#[cfg_attr(
+    blaze_check,
+    allow(dead_code, reason = "a model build's tables are boxes of the checker's atomics")
+)]
 pub(crate) fn zeroed<T: Zeroed>(len: usize) -> &'static [T] {
     let at = claim(Layout::array::<T>(len).expect("an interner table's layout")).cast::<T>();
     // SAFETY: `claim` gives `len * size_of::<T>()` committed bytes aligned for `T`, all zero
@@ -275,7 +281,9 @@ impl<T> Slots<T> {
     pub(crate) fn ensure(&self, index: usize) -> &AtomicPtr<T> {
         let (level, at) = Self::level(index);
         // alloc: the model checker's build only, once a doubling of the column
-        let slots = self.levels[level].get_or_init(|| (0..1usize << level).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect());
+        let slots = self.levels[level].get_or_init(|| {
+            (0..1usize << level).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect()
+        });
         &slots[at]
     }
 }
@@ -298,7 +306,8 @@ mod tests {
                                 let at = claim(Layout::from_size_align(size, align).unwrap());
                                 assert_eq!(at.as_ptr().addr() % align.max(LINE), 0);
                                 // SAFETY: `claim` gave `size.max(1)` committed bytes.
-                                let bytes = unsafe { std::slice::from_raw_parts(at.as_ptr(), size) };
+                                let bytes =
+                                    unsafe { std::slice::from_raw_parts(at.as_ptr(), size) };
                                 assert!(bytes.iter().all(|&byte| byte == 0), "fresh space is zero");
                                 // SAFETY: as above; the bytes are this claim's alone.
                                 unsafe { at.as_ptr().write_bytes(0xa5, size.max(1)) };
@@ -332,7 +341,12 @@ mod tests {
     fn zeroed_placed_and_published() {
         let groups: &[Group] = zeroed(16);
         assert!(groups.iter().all(|group| group.ctrl.load(Ordering::Relaxed) == 0));
-        assert!(groups.iter().flat_map(|group| &group.values).all(|value| value.load(Ordering::Relaxed).is_null()));
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| &group.values)
+                .all(|value| value.load(Ordering::Relaxed).is_null())
+        );
         let hashes: &[AtomicU64] = zeroed(100);
         assert!(hashes.iter().all(|hash| hash.load(Ordering::Relaxed) == 0));
         let placed = place([7u64, 8, 9]);
@@ -351,7 +365,10 @@ mod tests {
         let value = place(5u64);
         let far = 1 << 20;
         slots.ensure(far).store(std::ptr::from_ref(value).cast_mut(), Ordering::Release);
-        assert_eq!(slots.get(far).unwrap().load(Ordering::Acquire), std::ptr::from_ref(value).cast_mut());
+        assert_eq!(
+            slots.get(far).unwrap().load(Ordering::Acquire),
+            std::ptr::from_ref(value).cast_mut()
+        );
         assert!(slots.get(far - 1).unwrap().load(Ordering::Acquire).is_null());
         assert!(slots.get(far * 64).is_none());
     }

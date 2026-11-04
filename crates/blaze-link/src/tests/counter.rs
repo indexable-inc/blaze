@@ -6,7 +6,10 @@
 use blaze_codegen::{Arch, CompiledFunction, Data, InstanceKey, RelocKind, Relocation, Target};
 use blaze_inproc::{CodeMemory, CodeRange};
 
-use super::{Change, Disk, GROWTH, Image, Output, OutputKind, STAGE_BUDGET, TO, function, id, key, name, output};
+use super::{
+    Change, Disk, GROWTH, Image, Output, OutputKind, STAGE_BUDGET, TO, function, id, key, name,
+    output,
+};
 use crate::model::{Class, Reserve};
 use crate::output::Platform;
 use crate::{DevRun, Format, LinkError};
@@ -28,7 +31,8 @@ const X86_ADD: [u8; 8] = [0x48, 0x83, 0x05, 0, 0, 0, 0, 0x01];
 /// The calls word loaded, added to and stored, then the back edges word's address made:
 /// `adrp x16; ldr x17, [x16, lo12]; add x17, x17, #1; str x17, [x16, lo12]; adrp x16;
 /// add x16, x16, lo12; ret`.
-const A64_COUNT: [u32; 7] = [0x9000_0010, 0xf940_0211, 0x9100_0631, 0xf900_0211, 0x9000_0010, 0x9100_0210, 0xd65f_03c0];
+const A64_COUNT: [u32; 7] =
+    [0x9000_0010, 0xf940_0211, 0x9100_0631, 0xf900_0211, 0x9000_0010, 0x9100_0210, 0xd65f_03c0];
 
 #[derive(Clone, Copy, Debug)]
 enum Case {
@@ -122,7 +126,10 @@ fn counting(n: u8, arch: Arch) -> CompiledFunction {
             code.extend_from_slice(&X86_ADD);
             code.extend_from_slice(&X86_ADD);
             code.push(0xc3);
-            let relocs = vec![counter(3, RelocKind::PcRel32, n, -5), counter(11, RelocKind::PcRel32, n, 8 - 5)];
+            let relocs = vec![
+                counter(3, RelocKind::PcRel32, n, -5),
+                counter(11, RelocKind::PcRel32, n, 8 - 5),
+            ];
             function(n, &code, relocs)
         }
         _ => {
@@ -144,7 +151,10 @@ fn counting(n: u8, arch: Arch) -> CompiledFunction {
 fn reached(arch: Arch, addr: u64, code: &[u8]) -> Vec<u64> {
     let word = |at: u64| u32::from_le_bytes(code[at as usize..][..4].try_into().unwrap());
     match arch {
-        Arch::X86_64 => [3u64, 11].iter().map(|field| (addr + field + 5).wrapping_add_signed(i64::from(word(*field) as i32))).collect(),
+        Arch::X86_64 => [3u64, 11]
+            .iter()
+            .map(|field| (addr + field + 5).wrapping_add_signed(i64::from(word(*field) as i32)))
+            .collect(),
         _ => {
             let page = |at: u64| {
                 let insn = word(at);
@@ -187,7 +197,8 @@ fn reaches(image: &Image, file: &[u8], n: u8) -> Vec<u64> {
 
 /// The address of the image's cells reservation.
 fn cells_at(image: &Image) -> u64 {
-    let space = image.state.spaces.iter().find(|it| it.region.class == Class::Reserve(Reserve::Cells));
+    let space =
+        image.state.spaces.iter().find(|it| it.region.class == Class::Reserve(Reserve::Cells));
     space.expect("a cells reservation").region.addr
 }
 
@@ -205,19 +216,41 @@ fn file(disk: &Disk) -> Vec<u8> {
 fn two_counting_functions_reach_distinct_pairs_in_the_cells_reservation() {
     for case in CASES {
         let arch = case.arch();
-        let (entry, hook, f, g) = (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch));
+        let (entry, hook, f, g) =
+            (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch));
         let mut image = Image::new(name(TO), case.output(Some(dev(4)))).unwrap();
         let mut disk = Disk::default();
         disk.link(&mut image, case.change(&[&entry, &hook, &f, &g])).unwrap();
         let bytes = file(&disk);
         let cells = cells_at(&image);
-        assert_eq!((pair_of(&image, F), pair_of(&image, G)), (Some(0), Some(1)), "{case:?}: in the order first seen");
-        assert_eq!(pair_of(&image, ENTRY), None, "{case:?}: a function that doesn't count has none");
+        assert_eq!(
+            (pair_of(&image, F), pair_of(&image, G)),
+            (Some(0), Some(1)),
+            "{case:?}: in the order first seen"
+        );
+        assert_eq!(
+            pair_of(&image, ENTRY),
+            None,
+            "{case:?}: a function that doesn't count has none"
+        );
         assert_eq!(image.state.pairs.given(), 2);
         assert_eq!(reaches(&image, &bytes, F), expected(arch, cells), "{case:?}: the first pair");
-        assert_eq!(reaches(&image, &bytes, G), expected(arch, cells + 16), "{case:?}: the second pair");
-        let space = image.state.spaces.iter().find(|it| it.region.class == Class::Reserve(Reserve::Cells)).unwrap();
-        assert!(space.zero && space.offset.is_none() && space.region.size == 0, "{case:?}: {:?}", space.region);
+        assert_eq!(
+            reaches(&image, &bytes, G),
+            expected(arch, cells + 16),
+            "{case:?}: the second pair"
+        );
+        let space = image
+            .state
+            .spaces
+            .iter()
+            .find(|it| it.region.class == Class::Reserve(Reserve::Cells))
+            .unwrap();
+        assert!(
+            space.zero && space.offset.is_none() && space.region.size == 0,
+            "{case:?}: {:?}",
+            space.region
+        );
         assert_eq!(image.counter(&key(F)), None, "{case:?}: not committed into a code memory");
     }
 }
@@ -226,35 +259,69 @@ fn two_counting_functions_reach_distinct_pairs_in_the_cells_reservation() {
 fn a_relink_keeps_pairs_and_a_tier_up_gets_a_new_one_while_the_old_stays() {
     for case in CASES {
         let arch = case.arch();
-        let (entry, hook, f, g, g2) =
-            (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch), counting(G2, arch));
+        let (entry, hook, f, g, g2) = (
+            plain(ENTRY, arch),
+            plain(HOOK, arch),
+            counting(F, arch),
+            counting(G, arch),
+            counting(G2, arch),
+        );
         let mut image = Image::new(name(TO), case.output(Some(dev(4)))).unwrap();
         let mut disk = Disk::default();
         disk.link(&mut image, case.change(&[&entry, &hook, &f, &g])).unwrap();
         let cells = cells_at(&image);
 
-        let tier_up = || Change { added: vec![&g2], slots: vec![(key(G), key(G2))], ..Change::default() };
+        let tier_up =
+            || Change { added: vec![&g2], slots: vec![(key(G), key(G2))], ..Change::default() };
         disk.link(&mut image, tier_up()).unwrap();
         let bytes = file(&disk);
         assert_eq!(cells_at(&image), cells, "{case:?}: the reservation stays");
-        assert_eq!(reaches(&image, &bytes, F), expected(arch, cells), "{case:?}: a kept function keeps its pair");
-        assert_eq!(reaches(&image, &bytes, G), expected(arch, cells + 16), "{case:?}: the tier-0 code keeps its pair");
-        assert_eq!(reaches(&image, &bytes, G2), expected(arch, cells + 32), "{case:?}: the tier-up's new key, a new pair");
+        assert_eq!(
+            reaches(&image, &bytes, F),
+            expected(arch, cells),
+            "{case:?}: a kept function keeps its pair"
+        );
+        assert_eq!(
+            reaches(&image, &bytes, G),
+            expected(arch, cells + 16),
+            "{case:?}: the tier-0 code keeps its pair"
+        );
+        assert_eq!(
+            reaches(&image, &bytes, G2),
+            expected(arch, cells + 32),
+            "{case:?}: the tier-up's new key, a new pair"
+        );
 
         disk.link(&mut image, Change { removed: vec![key(G)], ..Change::default() }).unwrap();
-        assert_eq!(pair_of(&image, G), Some(1), "{case:?}: a removed function's pair stays its own");
+        assert_eq!(
+            pair_of(&image, G),
+            Some(1),
+            "{case:?}: a removed function's pair stays its own"
+        );
         assert_eq!(image.state.pairs.given(), 3);
 
         disk.roll_back(&mut image).unwrap();
         disk.roll_back(&mut image).unwrap();
         assert_eq!(image.state.pairs.given(), 3, "{case:?}: a rollback gives no pair back");
-        assert_eq!(pair_of(&image, G2), Some(2), "{case:?}: the rolled-back tier-up's key keeps its pair");
+        assert_eq!(
+            pair_of(&image, G2),
+            Some(2),
+            "{case:?}: the rolled-back tier-up's key keeps its pair"
+        );
         let h = counting(H, arch);
         disk.link(&mut image, Change { added: vec![&h], ..Change::default() }).unwrap();
-        assert_eq!(pair_of(&image, H), Some(3), "{case:?}: a new key never gets a rolled-back key's pair");
+        assert_eq!(
+            pair_of(&image, H),
+            Some(3),
+            "{case:?}: a new key never gets a rolled-back key's pair"
+        );
         disk.link(&mut image, tier_up()).unwrap();
         let bytes = file(&disk);
-        assert_eq!(reaches(&image, &bytes, G2), expected(arch, cells + 32), "{case:?}: tiered up again, the same pair");
+        assert_eq!(
+            reaches(&image, &bytes, G2),
+            expected(arch, cells + 32),
+            "{case:?}: tiered up again, the same pair"
+        );
         assert_eq!(reaches(&image, &bytes, H), expected(arch, cells + 48));
     }
 }
@@ -263,22 +330,34 @@ fn a_relink_keeps_pairs_and_a_tier_up_gets_a_new_one_while_the_old_stays() {
 fn running_out_of_pairs_is_an_error_naming_the_function_and_how_many_there_are() {
     for case in CASES {
         let arch = case.arch();
-        let (entry, hook, f, g, h) =
-            (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch), counting(H, arch));
+        let (entry, hook, f, g, h) = (
+            plain(ENTRY, arch),
+            plain(HOOK, arch),
+            counting(F, arch),
+            counting(G, arch),
+            counting(H, arch),
+        );
         let mut image = Image::new(name(TO), case.output(Some(dev(2)))).unwrap();
-        let error = image.stage(case.change(&[&entry, &hook, &f, &g, &h])).err().expect("three pairs of two");
+        let error = image
+            .stage(case.change(&[&entry, &hook, &f, &g, &h]))
+            .err()
+            .expect("three pairs of two");
         assert_eq!(error.function, Some(key(H)), "{case:?}: {error}");
         assert!(error.what.contains("hold 2 pairs"), "{case:?}: {error}");
 
         let mut disk = Disk::default();
         disk.link(&mut image, case.change(&[&entry, &hook, &f, &g])).unwrap();
-        let error = image.stage(Change { added: vec![&h], ..Change::default() }).err().expect("a third pair of two");
+        let error = image
+            .stage(Change { added: vec![&h], ..Change::default() })
+            .err()
+            .expect("a third pair of two");
         assert_eq!(error.function, Some(key(H)), "{case:?}: {error}");
         assert!(error.what.contains("hold 2 pairs"), "{case:?}: {error}");
         assert_eq!(image.state.pairs.given(), 2, "{case:?}: a failed stage gives out nothing");
 
         let mut none = Image::new(name(TO), case.output(Some(dev(0)))).unwrap();
-        let error = none.stage(case.change(&[&entry, &hook, &f])).err().expect("a dev run without cells");
+        let error =
+            none.stage(case.change(&[&entry, &hook, &f])).err().expect("a dev run without cells");
         assert_eq!(error.function, Some(key(F)), "{case:?}: {error}");
         assert!(error.what.contains("hold 0 pairs"), "{case:?}: {error}");
     }
@@ -317,7 +396,13 @@ fn counter_cells_named_by_another_function_by_data_or_by_another_kind_are_errors
     assert!(error.what.contains("Abs64"), "{error}");
 
     let mut in_data = plain(F, Arch::X86_64);
-    in_data.data.push(Data { id: id(70), align: 8, bytes: vec![0; 8], relocs: vec![counter(0, RelocKind::Abs64, F, 0)].into(), writable: false });
+    in_data.data.push(Data {
+        id: id(70),
+        align: 8,
+        bytes: vec![0; 8],
+        relocs: vec![counter(0, RelocKind::Abs64, F, 0)].into(),
+        writable: false,
+    });
     let error = stage(&in_data);
     assert_eq!(error.function, Some(key(F)), "{error}");
     assert!(error.what.contains("named in data"), "{error}");
@@ -345,17 +430,23 @@ fn code_memory(name: &str, len: u64, dev_run: DevRun) -> Option<CodeMemory> {
 fn counter_is_the_offset_in_the_code_memory_where_the_code_counts() {
     for case in CASES {
         let arch = case.arch();
-        let (entry, hook, f, g) = (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch));
+        let (entry, hook, f, g) =
+            (plain(ENTRY, arch), plain(HOOK, arch), counting(F, arch), counting(G, arch));
         let mut image = Image::new(name(TO), case.output(Some(dev(4)))).unwrap();
         let staged = image.stage(case.change(&[&entry, &hook, &f, &g])).unwrap();
         let len = staged.len();
-        let small = code_memory(&format!("blaze-link-counter-small-{case:?}"), len, DevRun { cells: 0, ..dev(4) });
+        let small = code_memory(
+            &format!("blaze-link-counter-small-{case:?}"),
+            len,
+            DevRun { cells: 0, ..dev(4) },
+        );
         let Some(mut small) = small else { return };
         let error = image.commit_into(staged, &mut small).err().expect("no cells part");
         assert!(error.what.contains("cells part"), "{case:?}: {error}");
 
         let staged = image.stage(case.change(&[&entry, &hook, &f, &g])).unwrap();
-        let mut memory = code_memory(&format!("blaze-link-counter-{case:?}"), len, dev(4)).expect("made above");
+        let mut memory =
+            code_memory(&format!("blaze-link-counter-{case:?}"), len, dev(4)).expect("made above");
         assert_eq!(image.commit_into(staged, &mut memory), Ok(None));
         let bytes = memory.bytes(CodeRange { offset: 0, len }).unwrap().to_vec();
         let cells = cells_at(&image);
@@ -369,7 +460,11 @@ fn counter_is_the_offset_in_the_code_memory_where_the_code_counts() {
             assert_eq!(at, memory.cells().offset + (calls - cells), "{case:?}: function {n}");
             assert!(at.is_multiple_of(16) && at + 16 <= memory.cells().end(), "{case:?}: {at:#x}");
             if laid_out {
-                assert_eq!(memory.offset_of(calls), Some(at), "{case:?}: the run's address of the calls word");
+                assert_eq!(
+                    memory.offset_of(calls),
+                    Some(at),
+                    "{case:?}: the run's address of the calls word"
+                );
                 assert_eq!(memory.linked(at), Some(calls));
             }
         }
@@ -383,7 +478,8 @@ fn counter_is_the_offset_in_the_code_memory_where_the_code_counts() {
 /// What staging a tier-up of a counting function allocates, its code adding `adds` times to
 /// its calls word, in an incremental dev run already holding one. One worker thread.
 fn staged_counting(adds: u32) -> blaze_alloc_count::Used {
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let case = Case::Elf;
         let many = |n: u8| {
@@ -396,7 +492,8 @@ fn staged_counting(adds: u32) -> blaze_alloc_count::Used {
             code.push(0xc3);
             function(n, &code, relocs)
         };
-        let (entry, hook, g, g2) = (plain(ENTRY, Arch::X86_64), plain(HOOK, Arch::X86_64), many(G), many(G2));
+        let (entry, hook, g, g2) =
+            (plain(ENTRY, Arch::X86_64), plain(HOOK, Arch::X86_64), many(G), many(G2));
         let mut image = Image::new(name(TO), case.output(Some(dev(4)))).unwrap();
         let mut disk = Disk::default();
         disk.link(&mut image, case.change(&[&entry, &hook, &g])).unwrap();
@@ -415,5 +512,8 @@ fn counter_relocations_allocate_nothing_per_relocation() {
     let many = staged_counting(2048);
     eprintln!("a counting tier-up stage: {few:?} with 64 counter relocations, {many:?} with 2048");
     assert!(many.allocations <= STAGE_BUDGET, "{many:?}, budget {STAGE_BUDGET}");
-    assert!(many.allocations <= few.allocations + GROWTH, "per counter relocation: {few:?} with 64, {many:?} with 2048");
+    assert!(
+        many.allocations <= few.allocations + GROWTH,
+        "per counter relocation: {few:?} with 64, {many:?} with 2048"
+    );
 }

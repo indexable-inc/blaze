@@ -19,7 +19,10 @@ impl Lower<'_> {
     /// `form` at `span`, which the formatter cannot format yet: refused, an error expression.
     fn comptime_unsupported(&self, span: Span, form: &str) -> Box<ast::Expr> {
         // alloc: the refusal's message, an error path
-        self.unsupported(span, format!("{form} is not supported by the formatter yet"));
+        self.unsupported(
+            span,
+            format!("{form} is not supported by the formatter yet"),
+        );
         self.mk_expr(
             span,
             ast::ExprKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed()),
@@ -129,7 +132,8 @@ impl Lower<'_> {
             // blaze's `#![feature(blaze_comptime)]` forms have no rustc AST: refused rather
             // than formatted as the plain `for` or index they would lose their mark to.
             ra::Expr::ForExpr(f) if f.const_token().is_some() => {
-                return self.comptime_unsupported(span, "`for const` (`#![feature(blaze_comptime)]`)");
+                return self
+                    .comptime_unsupported(span, "`for const` (`#![feature(blaze_comptime)]`)");
             }
             ra::Expr::IndexExpr(i) if i.dot_token().is_some() => {
                 return self.comptime_unsupported(
@@ -283,7 +287,11 @@ impl Lower<'_> {
                 } else {
                     ast::UnsafeBinderCastKind::Unwrap
                 };
-                ast::ExprKind::UnsafeBinderCast(kind, self.opt_expr(c.expr(), span), c.ty().map(|t| self.ty(t)))
+                ast::ExprKind::UnsafeBinderCast(
+                    kind,
+                    self.opt_expr(c.expr(), span),
+                    c.ty().map(|t| self.ty(t)),
+                )
             }
             ra::Expr::WhileExpr(w) => {
                 let label = self.label(w.label());
@@ -585,9 +593,7 @@ impl Lower<'_> {
             ast::Movability::Movable
         };
         let coroutine_marker = match (c.async_token(), c.gen_token()) {
-            (Some(a), Some(g)) => {
-                Some((ast::CoroutineKind::AsyncGen, self.tsp(a).to(self.tsp(g))))
-            }
+            (Some(a), Some(g)) => Some((ast::CoroutineKind::AsyncGen, self.tsp(a).to(self.tsp(g)))),
             (Some(a), None) => Some((ast::CoroutineKind::Async, self.tsp(a))),
             (None, Some(g)) => Some((ast::CoroutineKind::Gen, self.tsp(g))),
             (None, None) => None,

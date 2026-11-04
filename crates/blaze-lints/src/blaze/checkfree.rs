@@ -46,15 +46,14 @@ const BODIES: usize = 64;
 
 /// The options the release build's MIR is optimized with: what a checkfree function is held
 /// to.
-pub(crate) const RELEASE: MirOptions =
-    MirOptions {
-        level: MirOptLevel::Release,
-        ub_checks: false,
-        lifetime_markers: true,
-        inline: true,
-        heap_to_stack: false,
-        world: None,
-    };
+pub(crate) const RELEASE: MirOptions = MirOptions {
+    level: MirOptLevel::Release,
+    ub_checks: false,
+    lifetime_markers: true,
+    inline: true,
+    heap_to_stack: false,
+    world: None,
+};
 
 /// Whether `def` is a function marked `#[blaze::checkfree]`.
 pub(crate) fn is_checkfree(db: &base_db::Db, def: DefWithBodyId) -> bool {
@@ -124,7 +123,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let made = match checks::checks(db, mir) {
             Ok(it) => it,
             Err(error) => {
-                let message = format!("`{name}` is `#[blaze::checkfree]`, but its checks can't be read: {error}");
+                let message = format!(
+                    "`{name}` is `#[blaze::checkfree]`, but its checks can't be read: {error}"
+                );
                 facts::push(&mut found, LINT, whole, message, None);
                 continue;
             }
@@ -147,7 +148,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             if exempt::exempt(cx.text(), range, LINT) {
                 continue;
             }
-            let written = expr.and_then(|it| analysis.expr_range(it)).map(|it| cx.snippet(it).trim());
+            let written =
+                expr.and_then(|it| analysis.expr_range(it)).map(|it| cx.snippet(it).trim());
             let at = match written {
                 Some(it) if it.len() <= 60 && !it.contains('\n') => format!(" at `{it}`"),
                 _ => String::new(), // alloc: a message's part
@@ -173,7 +175,12 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 /// function of `core::panicking` or std's `rt` / `panicking` (its own call, or the call a
 /// callee inlined there makes). An `assert!(n <= v.len())` before a loop is how a checkfree
 /// function proves its indexes: the one check it keeps is the one it wrote.
-fn is_explicit<'db>(db: &'db base_db::Db, analysis: &hir::BodyAnalysis<'db>, expr: ExprId, kind: &CheckKind) -> bool {
+fn is_explicit<'db>(
+    db: &'db base_db::Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    expr: ExprId,
+    kind: &CheckKind,
+) -> bool {
     if !matches!(kind, CheckKind::Panics(_)) || loops::written(analysis, expr) {
         return false;
     }
@@ -186,10 +193,19 @@ fn is_explicit<'db>(db: &'db base_db::Db, analysis: &hir::BodyAnalysis<'db>, exp
 
 /// Whether the check of `kind` at `expr` is a bounds check of an index `bounds_check_in_loop`
 /// counts as proven before its loop (the `v[i]` itself, or the `Index::index` call it is).
-fn is_proven(body: &hir_def::expr_store::Body, proven: &[ExprId], expr: ExprId, kind: &CheckKind) -> bool {
+fn is_proven(
+    body: &hir_def::expr_store::Body,
+    proven: &[ExprId],
+    expr: ExprId,
+    kind: &CheckKind,
+) -> bool {
     let bounds = match kind {
         CheckKind::BoundsCheck => true,
-        CheckKind::Panics(it) => it.ends_with("::index") || it.ends_with("::index_mut") || it.ends_with("panic_bounds_check"),
+        CheckKind::Panics(it) => {
+            it.ends_with("::index")
+                || it.ends_with("::index_mut")
+                || it.ends_with("panic_bounds_check")
+        }
         _ => false,
     };
     bounds && matches!(body.expr(expr), Expr::Index { .. }) && proven.contains(&expr)

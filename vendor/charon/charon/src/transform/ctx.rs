@@ -113,9 +113,7 @@ impl TransformCtx {
 
     /// Span an error and register the error.
     pub(crate) fn span_err(&self, span: Span, msg: &str, level: Level) -> Error {
-        self.errors
-            .borrow_mut()
-            .span_err(&self.translated, span, msg, level)
+        self.errors.borrow_mut().span_err(&self.translated, span, msg, level)
     }
 
     pub(crate) fn opacity_for_name(&self, name: &Name) -> ItemOpacity {
@@ -136,11 +134,7 @@ impl TransformCtx {
         let current_def_id_is_local = mem::replace(&mut errors.def_id_is_local, def_id_is_local);
         drop(errors); // important: release the refcell "lock"
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))).is_err() {
-            register_error!(
-                self,
-                span,
-                "Thread panicked while transforming item `{def_id:?}`."
-            );
+            register_error!(self, span, "Thread panicked while transforming item `{def_id:?}`.");
         }
         let mut errors = self.errors.borrow_mut();
         errors.def_id = current_def_id;
@@ -358,9 +352,8 @@ pub trait BodyTransformCtx: Sized {
             match proj {
                 // The outermost deref we encountered gives us the metadata of the place.
                 ProjectionElem::Deref => {
-                    let metadata_place = subplace
-                        .clone()
-                        .project(ProjectionElem::PtrMetadata, metadata_ty.clone());
+                    let metadata_place =
+                        subplace.clone().project(ProjectionElem::PtrMetadata, metadata_ty.clone());
                     Some(Operand::Copy(metadata_place))
                 }
                 ProjectionElem::Field { .. } => {
@@ -388,10 +381,7 @@ pub trait BodyTransformCtx: Sized {
                 }
             }
         }
-        trace!(
-            "getting ptr metadata for place: {}",
-            place.with_ctx(&self.to_fmt())
-        );
+        trace!("getting ptr metadata for place: {}", place.with_ctx(&self.to_fmt()));
         let metadata_ty = place.ty().get_ptr_metadata(self.get_crate()).into_type();
         if metadata_ty.is_unit()
             || matches!(metadata_ty.kind(), TyKind::PtrMetadata(ty) if self.is_sized_type_var(ty))
@@ -399,10 +389,7 @@ pub trait BodyTransformCtx: Sized {
             // If the type var is known to be `Sized`, then no metadata is needed
             return Operand::mk_const_unit();
         }
-        trace!(
-            "computed metadata type: {}",
-            metadata_ty.with_ctx(&self.to_fmt())
-        );
+        trace!("computed metadata type: {}", metadata_ty.with_ctx(&self.to_fmt()));
         compute_place_metadata_inner(self, place, &metadata_ty)
             .unwrap_or_else(Operand::mk_const_unit)
     }
@@ -424,40 +411,23 @@ pub trait BodyTransformCtx: Sized {
                 let count_ty = count.ty().clone();
                 let size =
                     ConstantExpr::new(ConstantExprKind::SizeOf(ty.clone()), count_ty.clone());
-                let mode = if in_bounds {
-                    OverflowMode::UB
-                } else {
-                    OverflowMode::Wrap
-                };
+                let mode = if in_bounds { OverflowMode::UB } else { OverflowMode::Wrap };
                 let rval = Rvalue::BinaryOp(BinOp::Mul(mode), count, Operand::Const(size));
                 Operand::Copy(self.rval_to_place(rval, count_ty))
             }
         };
-        ProjectionElem::Offset {
-            bytes: Box::new(bytes),
-            in_bounds,
-            ty: output_ty,
-            ty_is_sized,
-        }
+        ProjectionElem::Offset { bytes: Box::new(bytes), in_bounds, ty: output_ty, ty_is_sized }
     }
 
     /// Create a `&` borrow of the place.
     fn borrow(&mut self, place: Place, kind: BorrowKind) -> Rvalue {
         let ptr_metadata = self.compute_place_metadata(&place);
-        Rvalue::Ref {
-            place,
-            kind,
-            ptr_metadata,
-        }
+        Rvalue::Ref { place, kind, ptr_metadata }
     }
     /// Create a `&raw` borrow of the place.
     fn raw_borrow(&mut self, place: Place, kind: RefKind) -> Rvalue {
         let ptr_metadata = self.compute_place_metadata(&place);
-        Rvalue::RawPtr {
-            place,
-            kind,
-            ptr_metadata,
-        }
+        Rvalue::RawPtr { place, kind, ptr_metadata }
     }
 
     /// Store a `&` borrow of the place into a new place.
@@ -555,10 +525,8 @@ impl BodyTransformCtx for LlbcStatementTransformCtx<'_> {
     }
 
     fn insert_storage_live_stmt(&mut self, local: LocalId) {
-        self.statements.push(llbc_ast::Statement::new(
-            self.span,
-            llbc_ast::StatementKind::StorageLive(local),
-        ));
+        self.statements
+            .push(llbc_ast::Statement::new(self.span, llbc_ast::StatementKind::StorageLive(local)));
     }
 
     fn insert_assn_stmt(&mut self, place: Place, rvalue: Rvalue) {
@@ -569,10 +537,8 @@ impl BodyTransformCtx for LlbcStatementTransformCtx<'_> {
     }
 
     fn insert_storage_dead_stmt(&mut self, local: LocalId) {
-        self.statements.push(llbc_ast::Statement::new(
-            self.span,
-            llbc_ast::StatementKind::StorageDead(local),
-        ));
+        self.statements
+            .push(llbc_ast::Statement::new(self.span, llbc_ast::StatementKind::StorageDead(local)));
     }
 }
 

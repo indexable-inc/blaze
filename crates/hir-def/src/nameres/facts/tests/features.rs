@@ -2,14 +2,10 @@
 //! macro the crate calls reads them while the map is being built.
 
 use base_db::Db;
-use intern::Symbol;
 use hir_expand::fixture;
+use intern::Symbol;
 
-use crate::{
-    nameres::crate_def_map,
-    test_db::TestDBExt,
-    unstable_features::UnstableFeatures,
-};
+use crate::{nameres::crate_def_map, test_db::TestDBExt, unstable_features::UnstableFeatures};
 
 const FIXTURE: &str = r#"
 //- /lib.rs crate:foo crate-attr:feature(never_patterns) crate-attr:no_std

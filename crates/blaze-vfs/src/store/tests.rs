@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
+use std::alloc::Global;
 
 use super::{Base, Building, Column, DIR, FILE, FIRST, Writer, chunk_of, chunk_start, run};
 
@@ -337,7 +337,8 @@ fn model_a_node_reads_whole_or_not_at_all() {
             })
         };
         // SAFETY: this thread is the table's one writer.
-        let child = unsafe { table.add_file(file, super::Blob::Heap(Arc::<[u8]>::from(&b"f"[..]).into())) };
+        let child =
+            unsafe { table.add_file(file, super::Blob::Heap(Arc::<[u8]>::from(&b"f"[..]).into())) };
         // SAFETY: as above.
         unsafe { table.add_dir(dir, &[(0, child, 0)]) };
         reader.join().unwrap();

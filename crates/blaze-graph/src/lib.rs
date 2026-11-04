@@ -26,7 +26,7 @@
 //! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues, [`par`]'s item
 //! sources and [`pump`]'s table of runs (structures whose safe versions would take a lock or
 //! an `Arc` per job, run or waiter, or a lock per key held across its run, each with model
-//! tests under `--cfg blaze_check`), and in `arena`'s allocator hook and
+//! tests under `--cfg blaze_check`), and in `arena`'s allocator hook, its account table's segments and
 //! the kernel calls of `arena` and [`topology`], each in a small module of its own.
 
 #![deny(unsafe_code)]
@@ -58,8 +58,7 @@ pub mod wait;
 
 pub use machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
 pub use plane::{
-    Budget, Key, Memo, NoMemo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId,
-    RequestStats,
+    Budget, Key, Memo, NoMemo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
 };
 
 /// A task stopped before its end because going on could not end: a wait that would close a

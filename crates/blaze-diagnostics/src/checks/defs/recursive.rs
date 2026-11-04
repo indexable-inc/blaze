@@ -10,10 +10,10 @@
 use std::rc::Rc;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir::{FieldSourceView, InFile, PathResolution};
+use std::alloc::Global;
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _},
@@ -139,7 +139,9 @@ impl<'db> Walk<'_, '_, 'db> {
     /// rustc's `check_representability_adt_ty`: the ADT itself, then the arguments it holds by
     /// value.
     fn adt_ty(&mut self, ty: hir::Type<'db>) -> Result<(), Infinite> {
-        if let Some(start) = self.stack.iter().position(|it| matches!(it, Frame::AdtTy(it) if *it == ty)) {
+        if let Some(start) =
+            self.stack.iter().position(|it| matches!(it, Frame::AdtTy(it) if *it == ty))
+        {
             self.report(start);
             return Err(Infinite);
         }
@@ -290,7 +292,8 @@ impl<'db> Walk<'_, '_, 'db> {
                 if segment.self_type_token().is_some() && path.qualifier().is_none() {
                     return;
                 }
-                let Some(PathResolution::Def(hir::ModuleDef::Adt(adt))) = cx.vsema.resolve_path(path)
+                let Some(PathResolution::Def(hir::ModuleDef::Adt(adt))) =
+                    cx.vsema.resolve_path(path)
                 else {
                     return;
                 };
@@ -346,7 +349,9 @@ fn fields(cx: &Cx<'_, '_>, adt: hir::Adt) -> impl Iterator<Item = hir::Field> {
     match adt {
         hir::Adt::Struct(it) => Either::Left(hir::Variant::from(it).fields_iter(cx.db)),
         hir::Adt::Union(it) => Either::Left(hir::Variant::from(it).fields_iter(cx.db)),
-        hir::Adt::Enum(it) => Either::Right(it.variants_iter(cx.db).flat_map(move |it| it.fields_iter(cx.db))),
+        hir::Adt::Enum(it) => {
+            Either::Right(it.variants_iter(cx.db).flat_map(move |it| it.fields_iter(cx.db)))
+        }
     }
 }
 

@@ -27,8 +27,8 @@ use std::{
 };
 
 use blaze_api::{
-    Applicability, Artifact, Blocks, DiagnosticRef, FetchVerb, Level, Report, ResponseRef, Severity, TargetKind, Unchecked,
-    UnitOfRef, Verb,
+    Applicability, Artifact, Blocks, DiagnosticRef, FetchVerb, Level, Report, ResponseRef,
+    Severity, TargetKind, Unchecked, UnitOfRef, Verb,
 };
 use blaze_hash::FixedState;
 use std::alloc::Global;
@@ -74,7 +74,9 @@ pub fn format(values: &[String]) -> Result<Format, String> {
         let json_with = |format: &mut Option<Format>, set: fn(&mut bool, &mut bool, &mut bool)| {
             let mut it = format.unwrap_or(json);
             match &mut it {
-                Format::Json { short, ansi, render_diagnostics } => set(short, ansi, render_diagnostics),
+                Format::Json { short, ansi, render_diagnostics } => {
+                    set(short, ansi, render_diagnostics)
+                }
                 // alloc: the error, once a request.
                 _ => return Err(TWO.to_owned()),
             }
@@ -289,7 +291,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     fn blocks(&mut self, unchecked: &Unchecked) {
         for behind in &unchecked.behind {
             let Some(id) = behind.id else { continue };
-            let Some((_, report)) = self.held.iter_mut().find(|(unit, _)| *unit == Some(id)) else { continue };
+            let Some((_, report)) = self.held.iter_mut().find(|(unit, _)| *unit == Some(id)) else {
+                continue;
+            };
             let mut all: Vec<String> = Vec::new(); // alloc: a failure's, once
             for unit in &behind.units {
                 let package = unit.split(' ').next().unwrap_or(unit);
@@ -298,7 +302,8 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 }
             }
             let notable = all.last().cloned().into_iter().collect(); // clone: as above
-            report.blocks = Some(Blocks { count: all.len() as u64, what: "packages".to_owned(), notable, all });
+            report.blocks =
+                Some(Blocks { count: all.len() as u64, what: "packages".to_owned(), notable, all });
         }
     }
 
@@ -314,7 +319,10 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         self.refused = true;
         say::leveled_with(&mut self.line, say::ERROR, "error", self.shown.color, |line| {
             // Writing to a String cannot fail.
-            let _ = write!(line, "the daemon numbered a {what} {index}, past the {IDS} a request's indexes stay under");
+            let _ = write!(
+                line,
+                "the daemon numbered a {what} {index}, past the {IDS} a request's indexes stay under"
+            );
         });
         Ok(())
     }
@@ -469,7 +477,13 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 }
                 self.counted[at].ended = true;
                 self.to(false)?;
-                summary(&mut self.line, &self.units[at], &self.names, &self.counted[at], self.shown);
+                summary(
+                    &mut self.line,
+                    &self.units[at],
+                    &self.names,
+                    &self.counted[at],
+                    self.shown,
+                );
             }
             // What a failed build left unchecked: the tree to stderr in every format, so a
             // person sees how much the errors above do not cover; under JSON one line an agent
@@ -526,7 +540,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         // has no span and no code, so the text is compared only then); and an empty text, the
         // note naming codes to explain, which rustc doesn't write under short.
         if diagnostic.rendered.is_empty()
-            || (diagnostic.spans.is_empty() && diagnostic.code.is_none() && summarizes(diagnostic.message))
+            || (diagnostic.spans.is_empty()
+                && diagnostic.code.is_none()
+                && summarizes(diagnostic.message))
         {
             return Ok(());
         }
@@ -604,7 +620,14 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         let package = name(&mut self.names, say::package_name(unit.package_id));
         let target = name(&mut self.names, unit.target.name);
         let local = unit.package_id.starts_with("path+");
-        self.units.push(Unit { package, target, kind: unit.target.kind, test: unit.test, doctest: unit.doctest, local });
+        self.units.push(Unit {
+            package,
+            target,
+            kind: unit.target.kind,
+            test: unit.test,
+            doctest: unit.doctest,
+            local,
+        });
         let warned = say::Warned { fixable: Some(0), ..say::Warned::default() };
         self.counted.push(Counted { warned, ..Counted::default() });
         Ok(Some(row))
@@ -631,15 +654,25 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         }
         // A slow build, done or not, points at what says why (`blaze slow`, docs/profiling.md).
         if took >= SLOW_BUILD && !self.shown.quiet && !self.shown.format.json() {
-            let what = format!("this build took {}: `blaze slow` says what made it slow and what to fix", say::elapsed(took));
+            let what = format!(
+                "this build took {}: `blaze slow` says what made it slow and what to fix",
+                say::elapsed(took)
+            );
             say::note_into(&mut self.line, &what, color);
         }
         // Kept for `blaze explain <package>`, which lists all a failure blocks.
         if let (Some(remember), false) = (&self.remember, self.failures.is_empty()) {
-            let kept = remember.as_ref().map_err(String::clone).and_then(|file| super::observe::remember(file, &self.failures));
+            let kept = remember
+                .as_ref()
+                .map_err(String::clone)
+                .and_then(|file| super::observe::remember(file, &self.failures));
             if let Err(why) = kept {
                 self.to(false)?;
-                say::warning_into(&mut self.line, &format!("`blaze explain` won't know this build's failures: {why}"), color);
+                say::warning_into(
+                    &mut self.line,
+                    &format!("`blaze explain` won't know this build's failures: {why}"),
+                    color,
+                );
             }
             self.failures.clear();
         }
@@ -659,7 +692,9 @@ const SLOW_BUILD: Duration = Duration::from_secs(30);
 
 /// rustc's closing lines, which cargo replaces with its own summary.
 fn summarizes(message: &str) -> bool {
-    message.starts_with("aborting due to") || message.ends_with(" warning emitted") || message.ends_with(" warnings emitted")
+    message.starts_with("aborting due to")
+        || message.ends_with(" warning emitted")
+        || message.ends_with(" warnings emitted")
 }
 
 /// A unit's "generated N warnings" (`JobQueue::report_warning_count` as the unit finishes, a
@@ -670,13 +705,32 @@ fn summary(line: &mut String, unit: &Unit, names: &str, counted: &Counted, shown
     let target = say::Named { kind: unit.kind, name: named(names, unit.target) };
     if !shown.quiet && counted.warned.total > 0 {
         say::leveled_with(line, say::WARN, "warning", shown.color, |line| {
-            say::generated_into(line, package, target, unit.test, unit.local && !shown.fixing, counted.warned);
+            say::generated_into(
+                line,
+                package,
+                target,
+                unit.test,
+                unit.local && !shown.fixing,
+                counted.warned,
+            );
         });
     }
     if counted.errors > 0 && !counted.reported {
         say::leveled_with(line, say::ERROR, "error", shown.color, |line| match unit.doctest {
-            true => say::doctests_could_not_compile_into(line, package, counted.errors, counted.warnings),
-            false => say::could_not_compile_into(line, package, target, unit.test, counted.errors, counted.warnings),
+            true => say::doctests_could_not_compile_into(
+                line,
+                package,
+                counted.errors,
+                counted.warnings,
+            ),
+            false => say::could_not_compile_into(
+                line,
+                package,
+                target,
+                unit.test,
+                counted.errors,
+                counted.warnings,
+            ),
         });
     }
 }
@@ -695,10 +749,9 @@ fn named(names: &str, Name(at, len): Name) -> &str {
 
 /// cargo's `machine_applicable`: a child of the diagnostic suggests a fix rustfix may apply.
 fn fixable(diagnostic: DiagnosticRef<'_>) -> bool {
-    diagnostic
-        .children
-        .iter()
-        .any(|child| child.spans.iter().any(|span| span.applicability == Some(Applicability::MachineApplicable)))
+    diagnostic.children.iter().any(|child| {
+        child.spans.iter().any(|span| span.applicability == Some(Applicability::MachineApplicable))
+    })
 }
 
 #[cfg(test)]

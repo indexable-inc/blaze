@@ -7,15 +7,13 @@
 use std::fmt::Write as _;
 
 use expect_test::expect_file;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, view};
 use hir_expand::fixture;
+use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, view};
 
 use crate::{
     DefWithBodyId, ModuleDefId,
     expr_store::Body,
-    nameres::{
-        DefMap, ModuleData, ModuleOrigin, ModuleSourceView, crate_def_map,
-    },
+    nameres::{DefMap, ModuleData, ModuleOrigin, ModuleSourceView, crate_def_map},
     test_db::{TestDB, TestDBExt},
 };
 

@@ -9,8 +9,7 @@ use std::{collections::BTreeMap, ops::Range};
 use smallvec::SmallVec;
 
 use super::machine::{
-    Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Shadow, Site,
-    TypedCx,
+    Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Shadow, Site, TypedCx,
 };
 use crate::next_solver::Ty;
 

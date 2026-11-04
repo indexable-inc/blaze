@@ -28,8 +28,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, PoisonError};
 
 use super::{
-    KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, kern,
-    mach_port_deallocate, mach_port_mod_refs, task,
+    KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    kern, mach_port_deallocate, mach_port_mod_refs, task,
 };
 use crate::channel::Channel;
 use crate::frame::kinds;
@@ -93,7 +93,15 @@ unsafe extern "C" {
     fn bootstrap_check_in(bp: Port, name: *const c_char, port: *mut Port) -> Kern;
     fn bootstrap_look_up(bp: Port, name: *const c_char, port: *mut Port) -> Kern;
     fn bootstrap_strerror(code: Kern) -> *const c_char;
-    fn mach_msg(message: *mut u8, option: c_int, send: u32, receive: u32, name: Port, timeout: u32, notify: Port) -> Kern;
+    fn mach_msg(
+        message: *mut u8,
+        option: c_int,
+        send: u32,
+        receive: u32,
+        name: Port,
+        timeout: u32,
+        notify: Port,
+    ) -> Kern;
     fn mach_msg_destroy(message: *mut u8);
     fn mach_port_allocate(task: Port, right: u32, name: *mut Port) -> Kern;
 }
@@ -227,13 +235,21 @@ pub(super) fn encode_reply(out: &mut Message, to: Port, objects: &[(Port, u64)])
 }
 
 /// The objects of a reply as the start hook received it, and its sender's audit token.
-pub(super) fn decode_reply(bytes: &[u8], count: usize) -> Result<(Vec<(Port, u64)>, Token), String> {
+pub(super) fn decode_reply(
+    bytes: &[u8],
+    count: usize,
+) -> Result<(Vec<(Port, u64)>, Token), String> {
     let size = reply_size(count);
     let header = get(bytes, 0).ok_or("a reply shorter than its header")?;
     if header & MACH_MSGH_BITS_COMPLEX == 0 || get(bytes, 20) != Some(REPLY_ID as u32) {
-        return Err(format!("a reply of bits {header:#x} and ID {:?}, not the service's", get(bytes, 20)));
+        return Err(format!(
+            "a reply of bits {header:#x} and ID {:?}, not the service's",
+            get(bytes, 20)
+        ));
     }
-    if get(bytes, 4).map(|it| it as usize) != Some(size) || get(bytes, HEADER).map(|it| it as usize) != Some(count) {
+    if get(bytes, 4).map(|it| it as usize) != Some(size)
+        || get(bytes, HEADER).map(|it| it as usize) != Some(count)
+    {
         return Err(format!(
             "a reply of {:?} bytes and {:?} descriptors, not {size} and {count}",
             get(bytes, 4),
@@ -248,7 +264,9 @@ pub(super) fn decode_reply(bytes: &[u8], count: usize) -> Result<(Vec<(Port, u64
         let word = get(bytes, at + 8).ok_or("a short reply")?;
         let (disposition, kind) = ((word >> 16) & 0xff, word >> 24);
         if kind != MACH_MSG_PORT_DESCRIPTOR || disposition != MACH_MSG_TYPE_PORT_SEND {
-            return Err(format!("descriptor {index} of the reply is of type {kind} and disposition {disposition}, not a send right"));
+            return Err(format!(
+                "descriptor {index} of the reply is of type {kind} and disposition {disposition}, not a send right"
+            ));
         }
         if port == MACH_PORT_NULL || port == MACH_PORT_DEAD {
             return Err(format!("descriptor {index} of the reply names no port"));
@@ -267,10 +285,20 @@ pub(super) fn peer_token(fd: i64) -> Result<Token, Error> {
     let mut token: Token = [0; 8];
     let mut len = size_of::<Token>() as libc::socklen_t;
     // SAFETY: `token` is 32 writable bytes and `len` says so; a bad `fd` fails with an error.
-    let got =
-        unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERTOKEN, (&raw mut token).cast(), &raw mut len) };
+    let got = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            (&raw mut token).cast(),
+            &raw mut len,
+        )
+    };
     if got != 0 || len as usize != size_of::<Token>() {
-        return Err(Error::new(format!("LOCAL_PEERTOKEN of the channel: {}", std::io::Error::last_os_error())));
+        return Err(Error::new(format!(
+            "LOCAL_PEERTOKEN of the channel: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(token)
 }
@@ -320,7 +348,10 @@ fn service() -> Result<(), Error> {
             // `main` and never changed; `name` is NUL-terminated; `port` is a live out-pointer.
             let code = unsafe { bootstrap_check_in(bootstrap_port, name.as_ptr(), &raw mut port) };
             if code != KERN_SUCCESS {
-                return Err(bootstrap_error(&format!("bootstrap_check_in of {}", name.to_string_lossy()), code));
+                return Err(bootstrap_error(
+                    &format!("bootstrap_check_in of {}", name.to_string_lossy()),
+                    code,
+                ));
             }
             std::thread::Builder::new()
                 .name("blaze-inproc-rendezvous".to_owned())
@@ -338,7 +369,15 @@ fn serve(port: Port) {
         // SAFETY: receives into `message`, `MESSAGE` writable bytes this thread owns, from the
         // receive right `port` this thread holds for the life of the process.
         let code = unsafe {
-            mach_msg(message.as_mut_ptr(), MACH_RCV_MSG | MACH_RCV_TRAILER_AUDIT, 0, MESSAGE as u32, port, 0, MACH_PORT_NULL)
+            mach_msg(
+                message.as_mut_ptr(),
+                MACH_RCV_MSG | MACH_RCV_TRAILER_AUDIT,
+                0,
+                MESSAGE as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
         };
         match code {
             KERN_SUCCESS => {}
@@ -365,7 +404,8 @@ fn serve(port: Port) {
             ))));
             continue;
         }
-        let objects: Vec<(Port, u64)> = pending.ports.0.iter().copied().zip(pending.lens.iter().copied()).collect();
+        let objects: Vec<(Port, u64)> =
+            pending.ports.0.iter().copied().zip(pending.lens.iter().copied()).collect();
         let mut reply = Message::new();
         let size = encode_reply(&mut reply, request.reply, &objects);
         // The rights go into the reply: sent, they are the start hook's; not sent, the kernel
@@ -418,27 +458,44 @@ impl Remote {
             return Err(Error::new(format!("process ID {} past pid_t", self.pid)));
         };
         // SAFETY: kill takes a process ID and a signal and touches no memory of ours.
-        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            return Err(Error::new(format!("kill of process {pid}: {}", std::io::Error::last_os_error())));
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(Error::new(format!(
+                "kill of process {pid}: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
     }
 
     pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
-        Err(Error::new(format!("a start hook asked the daemon to map object {object}: on macOS the hook maps it")))
+        Err(Error::new(format!(
+            "a start hook asked the daemon to map object {object}: on macOS the hook maps it"
+        )))
     }
 
     pub fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
-        Err(Error::new("a start hook asked the daemon to lay its overlays: on macOS the hook lays them"))
+        Err(Error::new(
+            "a start hook asked the daemon to lay its overlays: on macOS the hook lays them",
+        ))
     }
 }
 
 /// Files the objects for the run process on `channel`, sends the GRANT frame, and waits until
 /// the service gave them to its start hook. A hook that writes to the channel before it asked
 /// (its FAILED frame) is left for the host to read.
-pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+pub fn send_objects(
+    channel: &mut Channel,
+    pid: u32,
+    grant: &[u8],
+    objects: &[(&Object, Rights)],
+) -> Result<Remote, Error> {
     if objects.len() > MOST_OBJECTS {
-        return Err(Error::new(format!("{} objects to grant, past the {MOST_OBJECTS} one reply carries", objects.len())));
+        return Err(Error::new(format!(
+            "{} objects to grant, past the {MOST_OBJECTS} one reply carries",
+            objects.len()
+        )));
     }
     service()?;
     let token = peer_token(channel.raw())?;
@@ -468,7 +525,9 @@ pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&
     loop {
         match finished.recv_timeout(LOOK) {
             Ok(result) => return result.map(|()| Remote { pid }),
-            Err(RecvTimeoutError::Disconnected) => return Err(Error::new("the rendezvous service dropped a grant")),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::new("the rendezvous service dropped a grant"));
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         let late = Instant::now() >= deadline;
@@ -487,7 +546,9 @@ pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&
         }
         return match finished.recv_timeout(HANDOFF) {
             Ok(result) => result.map(|()| Remote { pid }),
-            Err(_) => Err(Error::new("the rendezvous service took a grant and never said how it went")),
+            Err(_) => {
+                Err(Error::new("the rendezvous service took a grant and never said how it went"))
+            }
         };
     }
 }
@@ -505,7 +566,9 @@ impl Drop for Receive {
 
 pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<super::Granted>, Error> {
     if count > MOST_OBJECTS {
-        return Err(Error::new(format!("a grant of {count} objects, past the {MOST_OBJECTS} one reply carries")));
+        return Err(Error::new(format!(
+            "a grant of {count} objects, past the {MOST_OBJECTS} one reply carries"
+        )));
     }
     let daemon = peer_token(channel.raw())?;
     let name = service_name(token_pid(&daemon));
@@ -537,7 +600,11 @@ pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<super::Gr
     let code = unsafe {
         mach_msg(
             message.as_mut_ptr(),
-            MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT | MACH_RCV_TRAILER_AUDIT,
+            MACH_SEND_MSG
+                | MACH_RCV_MSG
+                | MACH_SEND_TIMEOUT
+                | MACH_RCV_TIMEOUT
+                | MACH_RCV_TRAILER_AUDIT,
             size,
             MESSAGE as u32,
             reply.0,
@@ -546,7 +613,10 @@ pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<super::Gr
         )
     };
     if code != KERN_SUCCESS {
-        return Err(kern(&format!("asking {} for the run's objects: mach_msg", name.to_string_lossy()), code));
+        return Err(kern(
+            &format!("asking {} for the run's objects: mach_msg", name.to_string_lossy()),
+            code,
+        ));
     }
     match decode_reply(&message.0, count) {
         Ok((objects, token)) if token == daemon => {

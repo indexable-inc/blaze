@@ -23,7 +23,11 @@ pub struct Golden {
 
 impl Golden {
     pub fn new(name: &'static str) -> Golden {
-        Golden { name, ours: Vec::new(), theirs: std::env::var_os("BLAKE3_GOLDEN").map(|_| Vec::new()) }
+        Golden {
+            name,
+            ours: Vec::new(),
+            theirs: std::env::var_os("BLAKE3_GOLDEN").map(|_| Vec::new()),
+        }
     }
 
     /// One case: `ours`, and official BLAKE3's output for it, which only a
@@ -31,7 +35,12 @@ impl Golden {
     pub fn add(&mut self, ours: &[u8], official: impl FnOnce() -> Vec<u8>) {
         if let Some(theirs) = &mut self.theirs {
             let case = official();
-            assert!(ours == &case[..], "{}: the case at byte {} differs from official BLAKE3", self.name, theirs.len());
+            assert!(
+                ours == &case[..],
+                "{}: the case at byte {} differs from official BLAKE3",
+                self.name,
+                theirs.len()
+            );
             theirs.extend_from_slice(&case);
         }
         self.ours.extend_from_slice(ours);
@@ -39,10 +48,16 @@ impl Golden {
 
     /// The sweep's fold (64-bit FNV-1a, the startup self-test's) against `want`.
     pub fn check(self, want: u64) {
-        let got = self.ours.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+        let got = self.ours.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
         if self.theirs.is_some() {
             println!("golden {}: {got:#018x}", self.name);
         }
-        assert_eq!(got, want, "{}: the outputs' fold (BLAKE3_GOLDEN=1 regenerates it, a reviewed step)", self.name);
+        assert_eq!(
+            got, want,
+            "{}: the outputs' fold (BLAKE3_GOLDEN=1 regenerates it, a reviewed step)",
+            self.name
+        );
     }
 }

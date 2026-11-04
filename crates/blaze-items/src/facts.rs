@@ -44,8 +44,8 @@ use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId,
-    FunctionId, HasModule, ImplId, Lookup, ModuleId, StaticId, TraitId, VariantId,
+    AdtId, AssocItemId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
+    HasModule, ImplId, Lookup, ModuleId, StaticId, TraitId, VariantId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore},
     hir::{ClosureKind, ExprId},
@@ -60,12 +60,13 @@ use hir_expand::{
 };
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, all_super_traits,
-    check_orphan_rules, sealed_bounds,
+    check_orphan_rules,
     consteval::ConstEvalError,
     db::{AnonConstId, HirDatabase, InternedClosure, InternedClosureId},
     generics::generics,
     layout::{RustcEnumVariantIdx, Variants},
     next_solver::{Allocation, GenericArgs, SimplifiedType as HirSimplifiedType, Ty},
+    sealed_bounds,
     traits::is_inherent_impl_coherent,
 };
 use syntax::ast;
@@ -146,7 +147,11 @@ pub fn asker(seen_by: Crate, kind: blaze_query::QueryKind) -> Option<Crate> {
 }
 
 /// [`value`] with its asker as [`asker`] keeps it: `Some` exactly for a fact asked by a crate.
-pub(crate) fn value_as(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
+pub(crate) fn value_as(
+    db: &Db,
+    seen_by: Option<Crate>,
+    fact: &Fact,
+) -> Result<ContentId, Unhashable> {
     blaze_query::db::attach(db, || value_in(db, seen_by, fact))
 }
 
@@ -164,7 +169,8 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
         ),
         (_, false) => None,
     };
-    let seen = || seen_by.unwrap_or_else(|| unreachable!("checked above: {fact:?} is asked by a crate"));
+    let seen =
+        || seen_by.unwrap_or_else(|| unreachable!("checked above: {fact:?} is asked by a crate"));
     let domain = domain(fact);
     let absent = || Ok(Hasher::new(domain).part(b"absent").finish());
     let mut h = Hasher::new(domain);
@@ -186,8 +192,11 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                 Some(Resolved::Variant(it)) => VariantId::from(it),
                 Some(other) => unreachable!("{fact:?} names {other:?}, which has no fields"),
             };
-            let Some((local, _)) =
-                variant.fields(db).fields().iter().find(|(it, _)| u32::from(it.into_raw()) == field)
+            let Some((local, _)) = variant
+                .fields(db)
+                .fields()
+                .iter()
+                .find(|(it, _)| u32::from(it.into_raw()) == field)
             else {
                 return absent();
             };
@@ -307,8 +316,13 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             let supers = all_super_traits(db, trait_);
             h.update(&(supers.len() as u64).to_le_bytes());
             for &it in supers {
-                h.id(&hash::signature_hash(db, ItemId::Trait(it))?.0)
-                    .id(&implements_value(db, IMPLEMENTS, seen(), it, self_ty)?);
+                h.id(&hash::signature_hash(db, ItemId::Trait(it))?.0).id(&implements_value(
+                    db,
+                    IMPLEMENTS,
+                    seen(),
+                    it,
+                    self_ty,
+                )?);
                 // A vtable's slots are its methods in declaration order, which the trait's
                 // signature hash leaves out.
                 let items = &it.trait_items(db).items;
@@ -686,11 +700,7 @@ fn write_method(
 
 /// A const's value: evaluated for one without generics, else its code (each instance is
 /// evaluated where it is used, from that code).
-fn write_const_value(
-    db: &Db,
-    h: &mut Hasher,
-    konst: ConstId,
-) -> Result<(), Unhashable> {
+fn write_const_value(db: &Db, h: &mut Hasher, konst: ConstId) -> Result<(), Unhashable> {
     let owner = ItemId::Const(konst);
     if generics(db, konst.into()).iter(true).next().is_some() {
         h.part(b"generic");
@@ -772,11 +782,7 @@ fn write_evaluated<'db>(
     Ok(())
 }
 
-fn ty_hash<'db>(
-    db: &'db Db,
-    owner: ItemId,
-    ty: Ty<'db>,
-) -> Result<ContentId, Unhashable> {
+fn ty_hash<'db>(db: &'db Db, owner: ItemId, ty: Ty<'db>) -> Result<ContentId, Unhashable> {
     let sub = crate::form::Cx::new(db).ty(ty);
     hash::filled(db, CONST_TYPE, sub, owner)
 }

@@ -166,15 +166,8 @@ where
             let ok = if k > left {
                 false
             } else {
-                try_sort_around(
-                    &snapshot_l,
-                    left - k,
-                    right,
-                    i_fixed,
-                    &mut keys,
-                    &mut accept,
-                )
-                .await?
+                try_sort_around(&snapshot_l, left - k, right, i_fixed, &mut keys, &mut accept)
+                    .await?
             };
             search.record(ok);
         }

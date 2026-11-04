@@ -73,7 +73,13 @@ pub(crate) struct Link<T> {
 impl<T> Link<T> {
     fn new() -> Link<T> {
         Link {
-            board: Mutex::new(Board { question: None, reply: None, done: None, gone: false, wake: None }),
+            board: Mutex::new(Board {
+                question: None,
+                reply: None,
+                done: None,
+                gone: false,
+                wake: None,
+            }),
             replied: Condvar::new(),
         }
     }
@@ -106,7 +112,9 @@ impl<T> Answer for Link<T> {
     fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
         match self.ask(Question::Span(req))? {
             Reply::Span(it) => Ok(it),
-            Reply::Edition(_) => Err(Stop("was told an edition when it asked of a span".to_owned())), // alloc: error path
+            Reply::Edition(_) => {
+                Err(Stop("was told an edition when it asked of a span".to_owned()))
+            } // alloc: error path
         }
     }
 
@@ -140,18 +148,24 @@ pub(crate) fn run<T: Send + 'static>(
     // The expansion's span (`proc macro expansion`, naming the macro and its input) holds the
     // thread's time too, so a profile says which macro ran on it.
     let parent = tracing::Span::current();
-    submit(nested, Box::new(move || {
-        let _running = tracing::info_span!(target: "blaze", parent: &parent, "wasm expansion run").entered();
-        let done = panic::catch_unwind(AssertUnwindSafe(|| expansion(&theirs))).map_err(|payload| {
-            let said = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("a payload that is not a string");
-            Stop(format!("panicked on its wasm expansion thread: {said}")) // alloc: error path
-        });
-        theirs.post(|board| board.done = Some(done));
-    }))?;
+    submit(
+        nested,
+        Box::new(move || {
+            let _running =
+                tracing::info_span!(target: "blaze", parent: &parent, "wasm expansion run")
+                    .entered();
+            let done =
+                panic::catch_unwind(AssertUnwindSafe(|| expansion(&theirs))).map_err(|payload| {
+                    let said = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("a payload that is not a string");
+                    Stop(format!("panicked on its wasm expansion thread: {said}")) // alloc: error path
+                });
+            theirs.post(|board| board.done = Some(done));
+        }),
+    )?;
     let _gone = Gone(&link);
     loop {
         let mut board = wait::lock(&link.board, BOARD);
@@ -237,7 +251,9 @@ fn put_answering(taken: std::num::NonZeroUsize) {
 
 fn carry_answering() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
-    CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried::word(take_answering, put_answering)));
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried::word(take_answering, put_answering))
+    });
 }
 
 /// The job answers an expansion's question while it is held; ended on unwinding too.
@@ -388,7 +404,8 @@ mod tests {
         gate.reaches(Duration::from_secs(10), |it| it.running.load(Ordering::Acquire) >= cap);
         assert!(gate.most.load(Ordering::Acquire) <= cap, "at most {cap} expansions ran at once");
         gate.open();
-        let all = gate.reaches(Duration::from_secs(60), |it| it.done.load(Ordering::Acquire) == count);
+        let all =
+            gate.reaches(Duration::from_secs(60), |it| it.done.load(Ordering::Acquire) == count);
         assert!(all, "{} of {count} expansions ran", gate.done.load(Ordering::Acquire));
         assert!(gate.most.load(Ordering::Acquire) <= cap, "at most {cap} expansions ran at once");
     }
@@ -405,9 +422,13 @@ mod tests {
         }
         let nested = Arc::new(AtomicUsize::new(0));
         let ran = Arc::clone(&nested);
-        submit(true, Box::new(move || {
-            ran.fetch_add(1, Ordering::AcqRel);
-        })).expect("a nested expansion is handed in");
+        submit(
+            true,
+            Box::new(move || {
+                ran.fetch_add(1, Ordering::AcqRel);
+            }),
+        )
+        .expect("a nested expansion is handed in");
         let ran = gate.reaches(Duration::from_secs(10), |_| nested.load(Ordering::Acquire) == 1);
         gate.open();
         assert!(ran, "the nested expansion ran while the cap's threads were busy");

@@ -40,7 +40,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ImplTraitNotAllowed) -> Vec<Found>
         format!("`impl Trait` is not allowed in {position}"), // alloc: the error's text
         span,
     );
-    diag.note("`impl Trait` is only allowed in arguments and return types of functions and methods");
+    diag.note(
+        "`impl Trait` is only allowed in arguments and return types of functions and methods",
+    );
     // alloc: one error, for an error hir found
     vec![Found::new(diag, Phase::Lower)]
 }

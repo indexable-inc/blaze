@@ -28,8 +28,8 @@ pub use hir_ty_matchck::{BindingOrigin, SpecialTy};
 use crate::{
     Adt, Const, DefWithBody, Enum, EnumVariant, Impl, Module, Type, TypeOwnerId,
     diagnostics::{
-        AnyDiagnostic, ConstPatternRefused, EmptyRangePattern, MissingMatchArms, MixedDerefPatterns,
-        NonExhaustiveLet, PatternComplexityLimit,
+        AnyDiagnostic, ConstPatternRefused, EmptyRangePattern, MissingMatchArms,
+        MixedDerefPatterns, NonExhaustiveLet, PatternComplexityLimit,
     },
 };
 
@@ -228,8 +228,10 @@ pub(crate) fn match_check_diagnostics<'db, 'm>(
     }
     let syntax = Syntax { db, source_map: source_map() };
     let interner = DbInterner::new_no_crate(db);
-    let ty =
-        |ty: &'db StoredTy| Type { owner: type_owner, ty: EarlyBinder::bind(interner, ty.as_ref()) };
+    let ty = |ty: &'db StoredTy| Type {
+        owner: type_owner,
+        ty: EarlyBinder::bind(interner, ty.as_ref()),
+    };
     for error in &check.errors {
         match syntax.error(error, &ty) {
             Some(diagnostic) => acc.push(diagnostic),
@@ -249,7 +251,8 @@ fn uncovered<'db>(
     let witnesses = uncovered.witnesses.iter().map(|it| it.to_string()).collect();
     let variants = uncovered.variants.iter().map(|&id| EnumVariant { id }).collect(); // alloc: as above.
     // alloc: as above.
-    let special_tys = uncovered.special_tys.iter().map(|(it, special)| (ty(it), *special)).collect();
+    let special_tys =
+        uncovered.special_tys.iter().map(|(it, special)| (ty(it), *special)).collect();
     (witnesses, variants, special_tys)
 }
 
@@ -278,13 +281,17 @@ impl<'db> Syntax<'_, 'db> {
                     LetAt::Expr(expr) => {
                         self.source_map.expr_syntax(expr).ok()?.map(|it| it.syntax_node_ptr())
                     }
-                    LetAt::Stmt(pat) => self
-                        .parent::<ast::LetStmt>(self.pat(pat)?)?
-                        .map(|it| it.syntax_node_ptr()),
+                    LetAt::Stmt(pat) => {
+                        self.parent::<ast::LetStmt>(self.pat(pat)?)?.map(|it| it.syntax_node_ptr())
+                    }
                 };
                 let replacement =
                     it.replacement.and_then(|(pat, expr)| Some((self.pat(pat)?, self.expr(expr)?)));
-                MatchLint::IrrefutableLet(IrrefutableLet { source: it.source.into(), at, replacement })
+                MatchLint::IrrefutableLet(IrrefutableLet {
+                    source: it.source.into(),
+                    at,
+                    replacement,
+                })
             }
             matchck::MatchLint::BindingWithVariantName(it) => {
                 let ptr = self.source_map.pat_syntax(it.pat).ok()?;
@@ -381,12 +388,13 @@ impl<'db> Syntax<'_, 'db> {
                     matchck::ConstPatternError::Union => ConstPatternError::Union,
                     matchck::ConstPatternError::Pointer => ConstPatternError::Pointer,
                     matchck::ConstPatternError::Invalid(it) => ConstPatternError::Invalid(ty(it)),
-                    matchck::ConstPatternError::NotStructural { ty: it, inapplicable_structural } => {
-                        ConstPatternError::NotStructural {
-                            ty: ty(it),
-                            inapplicable_structural: *inapplicable_structural,
-                        }
-                    }
+                    matchck::ConstPatternError::NotStructural {
+                        ty: it,
+                        inapplicable_structural,
+                    } => ConstPatternError::NotStructural {
+                        ty: ty(it),
+                        inapplicable_structural: *inapplicable_structural,
+                    },
                     matchck::ConstPatternError::NotPartialEq {
                         ty: it,
                         local_manual,
@@ -398,8 +406,12 @@ impl<'db> Syntax<'_, 'db> {
                         local_manual: local_manual
                             .iter()
                             .map(|&it| match it {
-                                matchck::ManualPartialEq::Impl(id) => ManualPartialEq::Impl(id.into()),
-                                matchck::ManualPartialEq::Adt(id) => ManualPartialEq::Adt(id.into()),
+                                matchck::ManualPartialEq::Impl(id) => {
+                                    ManualPartialEq::Impl(id.into())
+                                }
+                                matchck::ManualPartialEq::Adt(id) => {
+                                    ManualPartialEq::Adt(id.into())
+                                }
                             })
                             // alloc: the notes of an error that fired, once each.
                             .collect(),

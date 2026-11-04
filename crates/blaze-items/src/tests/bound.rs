@@ -80,7 +80,8 @@ fn renaming_a_callee_keeps_the_code_and_changes_what_is_bound() {
 #[test]
 fn a_trait_method_binds_to_the_impl_it_resolves_to() {
     let common = "trait Tr { fn m(&self) -> u32; }\nstruct S;\nfn on_s(s: &S) -> u32 { s.m() }\n";
-    let (mut db, file) = single(&format!("{common}impl Tr for S {{ fn m(&self) -> u32 {{ 1 }} }}\n"));
+    let (mut db, file) =
+        single(&format!("{common}impl Tr for S {{ fn m(&self) -> u32 {{ 1 }} }}\n"));
     let (code_before, bound_before) = (code(&db, "on_s"), bound(&db, "on_s"));
     edit(&mut db, file, &format!("{common}impl<X> Tr for X {{ fn m(&self) -> u32 {{ 1 }} }}\n"));
     assert_eq!(code(&db, "on_s"), code_before);
@@ -104,7 +105,12 @@ fn a_new_impl_of_an_object_s_trait_changes_the_bound_hash() {
 fn function_of(db: &TestDB, krate: &str, name: &str) -> ItemId {
     let krate = *all_crates(db)
         .iter()
-        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == krate))
+        .find(|it| {
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == krate)
+        })
         .unwrap_or_else(|| panic!("no crate `{krate}`"));
     hir_def::test_items::declarations(db, krate)
         .into_iter()
@@ -184,7 +190,8 @@ fn a_derive_on_an_error_typed_struct_in_a_crate_the_item_does_not_load_leaves_it
 fn each_crates_impls_of_a_trait_are_hashed_once_for_all_its_loaders() {
     let mut text = String::from("//- minicore: sized, coerce_unsized, dispatch_from_dyn\n");
     for n in 0..4 {
-        let deps: Vec<String> = (0..n).map(|it| format!("c{it}")).chain(["core".to_owned()]).collect();
+        let deps: Vec<String> =
+            (0..n).map(|it| format!("c{it}")).chain(["core".to_owned()]).collect();
         let tr = if n == 0 { "pub trait Tr { fn m(&self); }\n" } else { "" };
         let path = if n == 0 { "Tr" } else { "c0::Tr" };
         text.push_str(&format!(
@@ -201,7 +208,9 @@ fn each_crates_impls_of_a_trait_are_hashed_once_for_all_its_loaders() {
                 .expect("`f` has a body");
         }
     });
-    let runs = |query: &str| executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count();
+    let runs = |query: &str| {
+        executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
+    };
     assert_eq!(runs("seen_impls_value"), 4, "{executed:#?}");
     assert_eq!(runs("own_impls_value"), 4, "{executed:#?}");
 }

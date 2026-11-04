@@ -78,7 +78,10 @@ pub(super) fn spans(walk: &Walk<'_>) -> Spans {
         found.clear();
         for node in tree.root.descendants() {
             let mut push = |pre: Pre, at: TextRange, key: TextSize| {
-                let gated = Gated { at: InFile::new(tree.file, at), node: InFile::new(tree.file, ast::ptr(node)) };
+                let gated = Gated {
+                    at: InFile::new(tree.file, at),
+                    node: InFile::new(tree.file, ast::ptr(node)),
+                };
                 found.push((u32::from(key), pre, gated));
             };
             gates_of(node, &mut push);
@@ -255,7 +258,9 @@ fn gates_of(node: ast::Node<'_>, push: &mut impl FnMut(Pre, TextRange, TextSize)
             let in_args = node.parent().is_some_and(|it| {
                 matches!(
                     it.kind(),
-                    SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::ASSOC_TYPE_ARG | SyntaxKind::CONST_PARAM
+                    SyntaxKind::GENERIC_ARG_LIST
+                        | SyntaxKind::ASSOC_TYPE_ARG
+                        | SyntaxKind::CONST_PARAM
                 )
             });
             if in_args && let Some(at) = const_block(node) {
@@ -324,15 +329,17 @@ fn gen_kind(node: ast::Node<'_>) -> Option<TextRange> {
 
 /// Whether the `try` of a block is `try bikeshed Ty`.
 fn bikeshed(modifier: ast::Node<'_>) -> bool {
-    modifier
-        .children_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .any(|it| it.kind() == T![bikeshed] || (it.kind() == SyntaxKind::IDENT && it.text() == "bikeshed"))
+    modifier.children_with_tokens().filter_map(NodeOrToken::into_token).any(|it| {
+        it.kind() == T![bikeshed] || (it.kind() == SyntaxKind::IDENT && it.text() == "bikeshed")
+    })
 }
 
 /// The span of a bound's constness: `~const`, `[const]` or `const`.
 fn bound_constness(bound: ast::Node<'_>) -> Option<TextRange> {
-    let mut tokens = bound.children_with_tokens().filter_map(NodeOrToken::into_token).filter(|it| !it.kind().is_trivia());
+    let mut tokens = bound
+        .children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .filter(|it| !it.kind().is_trivia());
     let mut before = None;
     let konst = loop {
         let it = tokens.next()?;
@@ -412,7 +419,11 @@ mod tests {
             };
             walk();
             blaze_alloc_count::assert_at_most(0, "the gates of a tree", &mut walk);
-            assert_eq!(gated, 2 * 3 * n, "each item's `default impl`, `try` and `yield`, walked twice");
+            assert_eq!(
+                gated,
+                2 * 3 * n,
+                "each item's `default impl`, `try` and `yield`, walked twice"
+            );
         }
     }
 
@@ -425,7 +436,10 @@ mod tests {
     #[test]
     fn a_default_fn_is_min_specialization_and_a_default_impl_specialization() {
         let text = "default impl<T> Tr for T { default fn f() {} }";
-        assert_eq!(gates(text), [(Pre::Specialization, "default"), (Pre::MinSpecialization, "default")]);
+        assert_eq!(
+            gates(text),
+            [(Pre::Specialization, "default"), (Pre::MinSpecialization, "default")]
+        );
     }
 
     #[test]

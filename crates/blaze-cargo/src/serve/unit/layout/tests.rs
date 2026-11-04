@@ -17,7 +17,12 @@ fn identity(n: u8) -> ContentId {
 }
 
 fn frame(build: &str, address: u64, inline_depth: u16) -> Frame {
-    Frame { build_id: Some(build.to_owned()), address: Some(address), inline_depth, ..Frame::named("f", FrameKind::Native) }
+    Frame {
+        build_id: Some(build.to_owned()),
+        address: Some(address),
+        inline_depth,
+        ..Frame::named("f", FrameKind::Native)
+    }
 }
 
 /// A profile read through the map of the build it ran: each sample's leaf is the function
@@ -46,9 +51,23 @@ fn a_sampled_address_names_the_function_its_build_put_there() {
     let deep = interner.stack([caller, leaf, inlined]).unwrap();
     let elsewhere = interner.stack([other]).unwrap();
     let outside = interner.stack([nowhere]).unwrap();
-    let sample = |stack, on_cpu, weight_ns| CpuSample { process: 1, thread: 1, t_ns: 0, stack, span_id: None, on_cpu, weight_ns };
+    let sample = |stack, on_cpu, weight_ns| CpuSample {
+        process: 1,
+        thread: 1,
+        t_ns: 0,
+        stack,
+        span_id: None,
+        on_cpu,
+        weight_ns,
+    };
     let profile = Profile {
-        threads: vec![Thread { process: 1, process_name: "app".into(), thread: 1, thread_name: None, cpu_ns: None }],
+        threads: vec![Thread {
+            process: 1,
+            process_name: "app".into(),
+            thread: 1,
+            thread_name: None,
+            cpu_ns: None,
+        }],
         frames: interner.frame_rows,
         stacks: interner.stack_rows,
         cpu_samples: vec![
@@ -62,11 +81,15 @@ fn a_sampled_address_names_the_function_its_build_put_there() {
         ],
         ..Profile::default()
     };
-    std::fs::write(target.path().join(DIR).join("app-1.ixprof"), profile.to_ixprof().unwrap()).unwrap();
+    std::fs::write(target.path().join(DIR).join("app-1.ixprof"), profile.to_ixprof().unwrap())
+        .unwrap();
 
     let profiles = Profiles::read(target.path()).unwrap().unwrap();
     let weights = profiles.weights(image).expect("the image's weights");
-    assert_eq!(*weights, Weights::new(vec![(identity(2), 6_000_000)], vec![(identity(1), identity(2), 6_000_000)]));
+    assert_eq!(
+        *weights,
+        Weights::new(vec![(identity(2), 6_000_000)], vec![(identity(1), identity(2), 6_000_000)])
+    );
     assert_eq!(profiles.counts, Counts { files: 1, samples: 5, unmapped: 1, outside: 1 });
     assert!(profiles.weights("/w/target/release/deps/other").is_none());
 

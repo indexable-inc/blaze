@@ -44,15 +44,23 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, stmt: ast::LetStmt<'t>) {
     let written = cx.source_of(init.syntax());
     let (message, reason) = match must_use_ty(cx, &ty, 0) {
         Some(reason) => (
-            format!("`let _ =` drops the `{}` of `{written}`, a `#[must_use]` type", ty.display(db, target)),
+            format!(
+                "`let _ =` drops the `{}` of `{written}`, a `#[must_use]` type",
+                ty.display(db, target)
+            ),
             reason,
         ),
         None => {
             let Some(function) = callee(cx, init.peel_parens()) else { return };
             let Ok(id) = hir_def::FunctionId::try_from(function) else { return };
-            let Some(reason) = AttrFlags::must_use_message(db, AttrDefId::FunctionId(id)) else { return };
+            let Some(reason) = AttrFlags::must_use_message(db, AttrDefId::FunctionId(id)) else {
+                return;
+            };
             (
-                format!("`let _ =` drops the result of `{}`, which is `#[must_use]`", function.name(db).as_str()),
+                format!(
+                    "`let _ =` drops the result of `{}`, which is `#[must_use]`",
+                    function.name(db).as_str()
+                ),
                 reason,
             )
         }
@@ -80,7 +88,8 @@ fn must_use_ty<'q>(cx: &Cx<'q, '_>, ty: &hir::Type<'q>, depth: u32) -> Option<Op
         return None;
     }
     let db = cx.db();
-    let trait_must_use = |it: hir::Trait| AttrFlags::must_use_message(db, AttrDefId::TraitId(TraitId::from(it)));
+    let trait_must_use =
+        |it: hir::Trait| AttrFlags::must_use_message(db, AttrDefId::TraitId(TraitId::from(it)));
     if let Some(adt) = ty.as_adt() {
         if let hir::Adt::Enum(it) = adt {
             let mut args = ty.type_arguments();
@@ -95,7 +104,9 @@ fn must_use_ty<'q>(cx: &Cx<'q, '_>, ty: &hir::Type<'q>, depth: u32) -> Option<Op
         }
         return AttrFlags::must_use_message(db, AttrDefId::AdtId(AdtId::from(adt)));
     }
-    if let Some(inner) = ty.as_reference_inner().or_else(|| ty.as_slice()).or_else(|| ty.remove_raw_ptr()) {
+    if let Some(inner) =
+        ty.as_reference_inner().or_else(|| ty.as_slice()).or_else(|| ty.remove_raw_ptr())
+    {
         return must_use_ty(cx, &inner, depth + 1);
     }
     if let Some(inner) = ty.as_array_element(db) {
@@ -169,7 +180,10 @@ pub fn f() {
         );
         assert_eq!(found.matches(TYPE).count(), 3, "{found}");
         assert!(found.contains("drops the `Token` of `token()`"), "{found}");
-        assert!(found.contains("a token is spent by `redeem`"), "the attribute's message is a note:\n{found}");
+        assert!(
+            found.contains("a token is spent by `redeem`"),
+            "the attribute's message is a note:\n{found}"
+        );
         assert_eq!(found.matches(FUNCTION).count(), 1, "{found}");
         assert!(found.contains("drops the result of `count`"), "{found}");
     }

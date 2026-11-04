@@ -59,7 +59,11 @@ fn a_pure_key_is_its_identity_and_never_a_sandboxed_runs() {
     other.identity = ContentId::of("blaze v2 test 1", b"another script");
     assert_ne!(one, run_key(&other, &roots().view()));
     assert_eq!(one.code, proof().identity);
-    assert_ne!(one.given, Given::new(RunKind::BuildScript).finish(), "a pure key is given that it is one");
+    assert_ne!(
+        one.given,
+        Given::new(RunKind::BuildScript).finish(),
+        "a pure key is given that it is one"
+    );
 }
 
 #[test]
@@ -84,12 +88,18 @@ fn an_effect_the_proof_said_absent_is_an_error_naming_the_script() {
     let places = places(&tools);
     let refused = |trace: Traced, proof: &Proof| {
         let error = check("p v0.1.0", proof, &places, &trace).unwrap_err();
-        assert!(error.0.contains("`p v0.1.0`") && error.0.contains("a bug in blaze's purity proof"), "{}", error.0);
+        assert!(
+            error.0.contains("`p v0.1.0`") && error.0.contains("a bug in blaze's purity proof"),
+            "{}",
+            error.0
+        );
         error.0
     };
     assert!(refused(traced(&["/etc/passwd"]), &proof()).contains("/etc/passwd"));
     assert!(refused(traced(&["/ws/other/Cargo.toml"]), &proof()).contains("/ws/other/Cargo.toml"));
-    assert!(refused(traced(&["/ws/p/target/debug/deps/x.rlib"]), &proof()).contains("target directory"));
+    assert!(
+        refused(traced(&["/ws/p/target/debug/deps/x.rlib"]), &proof()).contains("target directory")
+    );
     let mut reads_nothing = proof();
     reads_nothing.reads = false;
     assert!(refused(traced(&["/ws/p/data.txt"]), &reads_nothing).contains("in its package"));
@@ -103,8 +113,15 @@ fn an_effect_the_proof_said_absent_is_an_error_naming_the_script() {
 
 #[test]
 fn what_a_run_printed_and_wrote_is_checked_against_the_proof() {
-    let value = |stdout: &[u8], files: Vec<OutFile>| Value { code: Some(0), signal: None, stdout: stdout.to_vec(), stderr: Vec::new(), files };
-    let file = || OutFile { path: "x.rs".into(), executable: false, bytes: Some(b"fn x() {}".to_vec()) };
+    let value = |stdout: &[u8], files: Vec<OutFile>| Value {
+        code: Some(0),
+        signal: None,
+        stdout: stdout.to_vec(),
+        stderr: Vec::new(),
+        files,
+    };
+    let file =
+        || OutFile { path: "x.rs".into(), executable: false, bytes: Some(b"fn x() {}".to_vec()) };
     checked_value("p", &proof(), &value(b"cargo:rustc-cfg=x\n", vec![file()])).unwrap();
     let mut silent = proof();
     silent.prints = false;
@@ -171,39 +188,62 @@ fn a_kept_pure_result_is_found_until_a_variable_or_file_it_read_changes() {
             ("PATH".into(), "/bin".into()),
         ]
     };
-    let mut inputs = Fixed { files: [(PathBuf::from("/ws/p/data.txt"), [3; 32])].into(), env: env() };
+    let mut inputs =
+        Fixed { files: [(PathBuf::from("/ws/p/data.txt"), [3; 32])].into(), env: env() };
     let value = Value {
         code: Some(0),
         signal: None,
         stdout: b"cargo:rustc-cfg=x\n".to_vec(),
         stderr: Vec::new(),
-        files: vec![OutFile { path: "x.rs".into(), executable: false, bytes: Some(b"fn x() {}".to_vec()) }],
+        files: vec![OutFile {
+            path: "x.rs".into(),
+            executable: false,
+            bytes: Some(b"fn x() {}".to_vec()),
+        }],
     };
     let read = vec![(PathBuf::from("/ws/p/data.txt"), Some([3; 32]))];
     let map = roots();
     keep(&mut store, &proof(), roots().view(), read, &mut inputs, &value).unwrap();
     let reader = store.reader();
     let guard = blaze_cas::enter();
-    assert_eq!(find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(), Some(value.clone()));
+    assert_eq!(
+        find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(),
+        Some(value.clone())
+    );
 
     // A variable passed through that the code never reads changes nothing.
     inputs.env.retain(|it| it.0 != "PATH");
     inputs.env.push(("PATH".into(), "/usr/bin".into()));
-    assert_eq!(find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(), Some(value.clone()));
+    assert_eq!(
+        find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(),
+        Some(value.clone())
+    );
 
     inputs.env = env();
     inputs.env.retain(|it| it.0 != "TARGET");
     inputs.env.push(("TARGET".into(), "aarch64-unknown-linux-gnu".into()));
-    assert_eq!(find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(), None, "a variable the code reads changed");
+    assert_eq!(
+        find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(),
+        None,
+        "a variable the code reads changed"
+    );
 
     inputs.env = env();
     inputs.files.insert("/ws/p/data.txt".into(), [4; 32]);
-    assert_eq!(find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(), None, "a file it read changed");
+    assert_eq!(
+        find(&reader, &guard, &proof(), map.view(), &mut inputs).unwrap(),
+        None,
+        "a file it read changed"
+    );
 
     inputs.files.insert("/ws/p/data.txt".into(), [3; 32]);
     let mut other = proof();
     other.identity = ContentId::of("blaze v2 test 1", b"edited script");
-    assert_eq!(find(&reader, &guard, &other, map.view(), &mut inputs).unwrap(), None, "its code changed");
+    assert_eq!(
+        find(&reader, &guard, &other, map.view(), &mut inputs).unwrap(),
+        None,
+        "its code changed"
+    );
 }
 
 #[test]
@@ -215,7 +255,9 @@ fn a_miss_allocates_nothing_past_the_key() {
     let mut inputs = Fixed { files: BTreeMap::new(), env: Vec::new() };
     let proof = proof();
     let map = roots();
-    let found = blaze_alloc_count::assert_at_most(0, "a pure find that misses", || find(&reader, &guard, &proof, map.view(), &mut inputs).unwrap());
+    let found = blaze_alloc_count::assert_at_most(0, "a pure find that misses", || {
+        find(&reader, &guard, &proof, map.view(), &mut inputs).unwrap()
+    });
     assert_eq!(found, None);
 }
 
@@ -227,7 +269,10 @@ fn a_pure_result_kept_in_one_checkout_is_found_in_another() {
     let at = |home: &str| {
         let roots = crate::roots::RootMap::default()
             .with(crate::roots::Role::Package, Path::new(&format!("{home}/p")))
-            .with(crate::roots::Role::OutDir, Path::new(&format!("{home}/p/target/debug/build/p-0123/out")))
+            .with(
+                crate::roots::Role::OutDir,
+                Path::new(&format!("{home}/p/target/debug/build/p-0123/out")),
+            )
             .with(crate::roots::Role::Target, Path::new(&format!("{home}/p/target")));
         let inputs = Fixed {
             files: [(PathBuf::from(format!("{home}/p/data.txt")), [3; 32])].into(),
@@ -241,20 +286,29 @@ fn a_pure_result_kept_in_one_checkout_is_found_in_another() {
     let value = |home: &str| Value {
         code: Some(0),
         signal: None,
-        stdout: format!("cargo:rustc-link-search={home}/p/target/debug/build/p-0123/out\n").into_bytes(),
+        stdout: format!("cargo:rustc-link-search={home}/p/target/debug/build/p-0123/out\n")
+            .into_bytes(),
         stderr: Vec::new(),
         files: Vec::new(),
     };
     let (a, mut a_inputs) = at("/home/a");
     let read = |home: &str| vec![(PathBuf::from(format!("{home}/p/data.txt")), Some([3; 32]))];
-    keep(&mut store, &proof(), a.view(), read("/home/a"), &mut a_inputs, &value("/home/a")).unwrap();
+    keep(&mut store, &proof(), a.view(), read("/home/a"), &mut a_inputs, &value("/home/a"))
+        .unwrap();
     let (b, mut b_inputs) = at("/srv/b");
     {
         let reader = store.reader();
         let guard = blaze_cas::enter();
         // Found where it ran; never in another checkout on that one's word alone.
-        assert_eq!(find(&reader, &guard, &proof(), a.view(), &mut a_inputs).unwrap(), Some(value("/home/a")));
-        assert_eq!(find(&reader, &guard, &proof(), b.view(), &mut b_inputs).unwrap(), None, "unverified");
+        assert_eq!(
+            find(&reader, &guard, &proof(), a.view(), &mut a_inputs).unwrap(),
+            Some(value("/home/a"))
+        );
+        assert_eq!(
+            find(&reader, &guard, &proof(), b.view(), &mut b_inputs).unwrap(),
+            None,
+            "unverified"
+        );
     }
     // B runs it and gets the same, its output ported: verified.
     keep(&mut store, &proof(), b.view(), read("/srv/b"), &mut b_inputs, &value("/srv/b")).unwrap();
@@ -262,7 +316,14 @@ fn a_pure_result_kept_in_one_checkout_is_found_in_another() {
     let guard = blaze_cas::enter();
     let (c, mut c_inputs) = at("/opt/c");
     // Found, and what it printed is this checkout's.
-    assert_eq!(find(&reader, &guard, &proof(), c.view(), &mut c_inputs).unwrap(), Some(value("/opt/c")));
+    assert_eq!(
+        find(&reader, &guard, &proof(), c.view(), &mut c_inputs).unwrap(),
+        Some(value("/opt/c"))
+    );
     c_inputs.files.insert("/opt/c/p/data.txt".into(), [4; 32]);
-    assert_eq!(find(&reader, &guard, &proof(), c.view(), &mut c_inputs).unwrap(), None, "a file it read changed");
+    assert_eq!(
+        find(&reader, &guard, &proof(), c.view(), &mut c_inputs).unwrap(),
+        None,
+        "a file it read changed"
+    );
 }

@@ -25,9 +25,9 @@ use crate::resolver::{
 use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Summary};
 
 use crate::resolver::{HashMap, HashSet};
-use std::alloc::Global;
 use anyhow::Context as _;
 use blaze_ids::radix;
+use std::alloc::Global;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -205,7 +205,9 @@ pub(super) struct RegistryQueryer<'a, T: Registry, Q> {
     /// execution.
     summary_cache: HashMap<
         (Option<PackageId>, Summary, ResolveOpts),
-        (Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>, bool), Global>,
+        (Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>, bool),
+        Global,
+    >,
 }
 
 /// The [`RegistryQueryer`] over `registry`.

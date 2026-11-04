@@ -166,8 +166,7 @@ fn remove_dynamic_checks(
 ) {
     // Whether this local was used in another block
     let used_outside_block = |local: LocalId| {
-        uses.iter_enumerated()
-            .any(|(bid, used)| bid != block_id && used.contains(&local))
+        uses.iter_enumerated().any(|(bid, used)| bid != block_id && used.contains(&local))
     };
 
     // We return the statements we want to keep, which must be a prefix of `block.statements`.
@@ -192,12 +191,7 @@ fn remove_dynamic_checks(
             Statement {
                 kind:
                     StatementKind::Assert {
-                        assert:
-                            Assert {
-                                cond: Operand::Move(cond),
-                                expected: true,
-                                ..
-                            },
+                        assert: Assert { cond: Operand::Move(cond), expected: true, .. },
                         ..
                     },
                 ..
@@ -216,14 +210,7 @@ fn remove_dynamic_checks(
         //   assert(move b == true)
         [
             Statement {
-                kind:
-                    StatementKind::Assign(
-                        reborrow,
-                        Rvalue::RawPtr {
-                            kind: RefKind::Shared,
-                            ..
-                        },
-                    ),
+                kind: StatementKind::Assign(reborrow, Rvalue::RawPtr { kind: RefKind::Shared, .. }),
                 ..
             },
             Statement {
@@ -524,12 +511,7 @@ fn remove_dynamic_checks(
 /// and the overflow check already performs both at that point. Storing the result in a fresh local
 /// lets us keep the write to the (not-yet-computed) destination place at the original shift site.
 fn resolve_pending_shift_check(body: &mut ExprBody, check: PendingShiftCheck) {
-    let PendingShiftCheck {
-        block,
-        amount,
-        cond_local,
-        cast_local,
-    } = check;
+    let PendingShiftCheck { block, amount, cond_local, cast_local } = check;
 
     // Locate the assert we will repurpose to hold the early, promoted shift. Pairing it with the
     // shift below (via `zip`) means we bail before mutating anything if either is unexpectedly
@@ -553,31 +535,26 @@ fn resolve_pending_shift_check(body: &mut ExprBody, check: PendingShiftCheck) {
         .body
         .iter_enumerated()
         .find_map(|(sb, block_data)| {
-            block_data
-                .statements
-                .iter()
-                .enumerate()
-                .find_map(|(i, stmt)| {
-                    if let StatementKind::Assign(dest, Rvalue::BinaryOp(binop, lhs, rhs)) =
-                        &stmt.kind
-                        && matches!(
-                            binop,
-                            BinOp::Shl(OverflowMode::Wrap) | BinOp::Shr(OverflowMode::Wrap)
-                        )
-                        && equiv_op(rhs, &amount)
-                    {
-                        Some((
-                            StmtLoc::new(sb, i),
-                            dest.clone(),
-                            lhs.clone(),
-                            rhs.clone(),
-                            binop.with_overflow(OverflowMode::Panic),
-                            dest.ty.clone(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
+            block_data.statements.iter().enumerate().find_map(|(i, stmt)| {
+                if let StatementKind::Assign(dest, Rvalue::BinaryOp(binop, lhs, rhs)) = &stmt.kind
+                    && matches!(
+                        binop,
+                        BinOp::Shl(OverflowMode::Wrap) | BinOp::Shr(OverflowMode::Wrap)
+                    )
+                    && equiv_op(rhs, &amount)
+                {
+                    Some((
+                        StmtLoc::new(sb, i),
+                        dest.clone(),
+                        lhs.clone(),
+                        rhs.clone(),
+                        binop.with_overflow(OverflowMode::Panic),
+                        dest.ty.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
         })
         .zip(assert_pos)
     else {
@@ -651,10 +628,7 @@ fn reconstruct_overflow_calls(ctx: &TransformCtx, body: &mut ExprBody) {
     let mut rewritten_locals = HashSet::default();
     for id in body.body.indices() {
         let block = &body.body[id];
-        let TerminatorKind::Call {
-            call, dest, target, ..
-        } = &block.terminator.kind
-        else {
+        let TerminatorKind::Call { call, dest, target, .. } = &block.terminator.kind else {
             continue;
         };
 
@@ -712,11 +686,8 @@ fn reconstruct_overflow_calls(ctx: &TransformCtx, body: &mut ExprBody) {
         if tuple_mentions[local] != integer_uses[local] + 1 + usize::from(followed_by_assert) {
             continue;
         }
-        let binop = if followed_by_assert {
-            binop.with_overflow(OverflowMode::Panic)
-        } else {
-            binop
-        };
+        let binop =
+            if followed_by_assert { binop.with_overflow(OverflowMode::Panic) } else { binop };
         let rvalue = Rvalue::BinaryOp(binop, left.clone(), right.clone());
 
         // All uses of the tuple are accounted for, so we can give its local the scalar type.
@@ -764,8 +735,6 @@ impl UllbcPass for Transform {
             Vec::new()
         });
         // Resolve the checks whose shift lives in a later block (see [PendingShiftCheck]).
-        pending_shift_checks
-            .into_iter()
-            .for_each(|check| resolve_pending_shift_check(b, check));
+        pending_shift_checks.into_iter().for_each(|check| resolve_pending_shift_check(b, check));
     }
 }

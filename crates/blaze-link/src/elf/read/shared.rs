@@ -52,7 +52,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         let symbol_name = || {
             dynsym.symbol_name(ENDIAN, symbol).map_or_else(
                 |_| format!("at string offset {}", symbol.st_name(ENDIAN)), // alloc: error path
-                |it| String::from_utf8_lossy(it).into_owned(), // alloc: error path
+                |it| String::from_utf8_lossy(it).into_owned(),              // alloc: error path
             )
         };
         let weak = match symbol.st_bind() {
@@ -62,7 +62,11 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
             elf::STB_LOCAL => continue,
             other => {
                 // alloc: error path
-                return Err(format!("{name}: symbol {} has binding {}, which blaze-link does not read", symbol_name(), other.0));
+                return Err(format!(
+                    "{name}: symbol {} has binding {}, which blaze-link does not read",
+                    symbol_name(),
+                    other.0
+                ));
             }
         };
         let version = match &table {
@@ -97,7 +101,9 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                                             format!("{name}: more than 65,536 versions")
                                         })?;
                                         // alloc: error path
-                                        let at = names.push(found).map_err(|it| format!("{name}: {it}"))?;
+                                        let at = names
+                                            .push(found)
+                                            .map_err(|it| format!("{name}: {it}"))?;
                                         versions.push(at);
                                         slot
                                     }

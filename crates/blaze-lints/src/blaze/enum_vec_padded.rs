@@ -36,7 +36,11 @@ const MIN_SIZE: u64 = 16;
 
 /// The sizes of `enum_`'s variants (the sum of each one's fields), largest first, each with its
 /// name; `None` when a field has no layout.
-fn variant_sizes(db: &base_db::Db, ty: &hir::Type<'_>, enum_: hir::Enum) -> Option<Vec<(u64, hir::Name)>> {
+fn variant_sizes(
+    db: &base_db::Db,
+    ty: &hir::Type<'_>,
+    enum_: hir::Enum,
+) -> Option<Vec<(u64, hir::Name)>> {
     // alloc: the sizes of one enum's variants
     let mut sizes = Vec::new();
     for variant in enum_.variants(db) {
@@ -102,7 +106,10 @@ pub(super) fn covers(cx: &Cx<'_, '_>, def: hir::Struct) -> bool {
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -113,7 +120,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     for (index, field) in def.fields(db).into_iter().enumerate() {
         let Some(Padded { ty, enum_, element_size, sizes }) = padded(cx, field) else { continue };
         let (largest, smallest) = (&sizes[0], &sizes[sizes.len() - 1]);
-        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else { continue };
+        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else {
+            continue;
+        };
         let Some(range) = cx.range(node) else { continue };
         let message = format!(
             "the field `{}` of `{}` is a `{}` only pushed and iterated, whose every element takes {element_size} bytes \

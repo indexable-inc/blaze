@@ -2,10 +2,7 @@ use super::*;
 use crate::runner::{Backend, Database, Settings, Verbosity};
 
 fn s(strs: &[&str]) -> Vec<String> {
-    std::iter::once("prog")
-        .chain(strs.iter().copied())
-        .map(String::from)
-        .collect()
+    std::iter::once("prog").chain(strs.iter().copied()).map(String::from).collect()
 }
 
 fn apply(args: &[&str]) -> Settings {
@@ -74,10 +71,7 @@ fn test_database_disabled() {
 #[test]
 fn test_suppress_health_check_single() {
     let parsed = apply(&["--suppress-health-check", "too_slow"]);
-    assert_eq!(
-        parsed.suppress_health_check,
-        vec![crate::runner::HealthCheck::TooSlow]
-    );
+    assert_eq!(parsed.suppress_health_check, vec![crate::runner::HealthCheck::TooSlow]);
 }
 
 #[test]
@@ -85,10 +79,7 @@ fn test_suppress_health_check_multiple() {
     let parsed = apply(&["--suppress-health-check", "too_slow,filter_too_much"]);
     assert_eq!(
         parsed.suppress_health_check,
-        vec![
-            crate::runner::HealthCheck::TooSlow,
-            crate::runner::HealthCheck::FilterTooMuch
-        ]
+        vec![crate::runner::HealthCheck::TooSlow, crate::runner::HealthCheck::FilterTooMuch]
     );
 }
 
@@ -100,14 +91,7 @@ fn test_suppress_health_check_all() {
 
 #[test]
 fn test_multiple_flags() {
-    let parsed = apply(&[
-        "--derandomize",
-        "true",
-        "--seed",
-        "9",
-        "--verbosity",
-        "quiet",
-    ]);
+    let parsed = apply(&["--derandomize", "true", "--seed", "9", "--verbosity", "quiet"]);
     assert!(parsed.derandomize);
     assert_eq!(parsed.seed, Some(9));
     assert_eq!(parsed.verbosity, Verbosity::Quiet);
@@ -284,11 +268,9 @@ fn test_apply_cli_args_parse_error() {
 
 #[test]
 fn test_database_default() {
-    let parsed = try_apply_cli_args(
-        || Settings::new().database(None),
-        s(&["--database", "default"]),
-    )
-    .unwrap();
+    let parsed =
+        try_apply_cli_args(|| Settings::new().database(None), s(&["--database", "default"]))
+            .unwrap();
     assert_eq!(parsed.database, Database::Unset);
 }
 
@@ -307,11 +289,9 @@ fn test_profile_flag_missing_value_error() {
 
 #[test]
 fn test_profile_flag_repeated_error() {
-    let err = try_apply_cli_args(
-        Settings::new,
-        s(&["--profile", "ci", "--profile", "development"]),
-    )
-    .unwrap_err();
+    let err =
+        try_apply_cli_args(Settings::new, s(&["--profile", "ci", "--profile", "development"]))
+            .unwrap_err();
     match err {
         CliError::Parse(msg) => assert_eq!(msg, "--profile may be given at most once"),
         other => panic!("expected parse error, got {other:?}"),

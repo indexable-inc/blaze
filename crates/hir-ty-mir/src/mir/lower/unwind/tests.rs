@@ -7,10 +7,10 @@
 //! blocks in the same order and ask whether a local is `Copy` in the same order.
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
 use blaze_rng::SplitMix64;
 use la_arena::{Idx, RawIdx};
+use std::alloc::Global;
 
 use super::*;
 use crate::mir::framed::block_id;
@@ -168,9 +168,15 @@ impl Old<'_> {
         old_unwind_through(&mut self.tree, self.storage, &in_scope, Some(local))
     }
 
-    fn before(&mut self, index: usize, locals: &[LocalId], position: usize) -> Option<BasicBlockId> {
-        let mut before: Vec<LocalId> =
-            (0..index).flat_map(|outer| old_leaving_order(&self.scopes[outer], &self.operands)).collect();
+    fn before(
+        &mut self,
+        index: usize,
+        locals: &[LocalId],
+        position: usize,
+    ) -> Option<BasicBlockId> {
+        let mut before: Vec<LocalId> = (0..index)
+            .flat_map(|outer| old_leaving_order(&self.scopes[outer], &self.operands))
+            .collect();
         before.extend_from_slice(&locals[..position]);
         old_unwind_through(&mut self.tree, self.storage, &before, Some(locals[position]))
     }
@@ -202,7 +208,12 @@ impl<'f> New<'f> {
         self.unwinds.from_drop(&mut self.tree, locals, at)
     }
 
-    fn before(&mut self, index: usize, locals: &[LocalId], position: usize) -> Option<BasicBlockId> {
+    fn before(
+        &mut self,
+        index: usize,
+        locals: &[LocalId],
+        position: usize,
+    ) -> Option<BasicBlockId> {
         self.listed();
         self.unwinds.before(&mut self.tree, index, locals, position)
     }
@@ -388,7 +399,11 @@ impl<'f> Both<'f> {
             7 if self.locals > 0 => {
                 let local = local(rng.index(self.locals));
                 self.old.operands.insert(local);
-                self.new.unwinds.mark_operand(&mut self.new.scopes[..], &mut self.new.operands, local);
+                self.new.unwinds.mark_operand(
+                    &mut self.new.scopes[..],
+                    &mut self.new.operands,
+                    local,
+                );
             }
             8 if self.locals > 0 => {
                 let local = local(rng.index(self.locals));

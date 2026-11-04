@@ -244,7 +244,10 @@ struct AssocOwner<'db> {
 
 /// The traits `scope` declares, then its impls: one list for the assoc items [`scope_items`]
 /// images and the calls [`scope_calls`] walks.
-fn assoc_owners<'db>(db: &'db Db, scope: &'db ItemScope) -> impl Iterator<Item = AssocOwner<'db>> + 'db {
+fn assoc_owners<'db>(
+    db: &'db Db,
+    scope: &'db ItemScope,
+) -> impl Iterator<Item = AssocOwner<'db>> + 'db {
     let traits = scope.declarations().filter_map(move |def| {
         let ModuleDefId::TraitId(it) = def else { return None };
         let assoc = TraitItems::query(db, it);
@@ -376,7 +379,10 @@ fn record_naming<S: Sig>(
 }
 
 /// Why bytes do not read, for the panic of a corrupt image.
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read here: `Result::map_err` hands the error over by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of every read here: `Result::map_err` hands the error over by value"
+)]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason of a panic.
     error.to_string()

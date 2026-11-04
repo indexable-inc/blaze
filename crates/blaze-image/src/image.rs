@@ -152,7 +152,8 @@ impl<S: Stable> Image<S> {
 
     /// Section `id`, if the image has it and it is of `schema`.
     pub fn section(&self, id: SectionId, schema: SchemaHash) -> Result<Section, Refused> {
-        let section = self.spine.sections.iter().find(|it| it.id == id).ok_or(Refused::Missing { id })?;
+        let section =
+            self.spine.sections.iter().find(|it| it.id == id).ok_or(Refused::Missing { id })?;
         match section.schema == schema {
             true => Ok(*section),
             false => Err(Refused::Schema { id, found: section.schema, wanted: schema }),
@@ -170,7 +171,11 @@ impl<S: Stable> Image<S> {
     pub fn group(&self, section: &Section, group: u32) -> Result<&[u8], Corrupt> {
         if group >= section.groups {
             let at = u64::from(group) * self.group_len();
-            return Err(Corrupt { section: section.id, group, cause: Cause::Bounds { at, len: 1 } });
+            return Err(Corrupt {
+                section: section.id,
+                group,
+                cause: Cause::Bounds { at, len: 1 },
+            });
         }
         self.ensure(section, group)?;
         let at = u64::from(group) * self.group_len();
@@ -199,7 +204,12 @@ impl<S: Stable> Image<S> {
 
     /// `count` `T`s at `at` of `section`, read in place: `T` a plain record, `at` aligned for it.
     #[inline]
-    pub fn slice<T: Record>(&self, section: &Section, at: u64, count: u64) -> Result<&[T], Corrupt> {
+    pub fn slice<T: Record>(
+        &self,
+        section: &Section,
+        at: u64,
+        count: u64,
+    ) -> Result<&[T], Corrupt> {
         let bytes = count.checked_mul(size_of::<T>() as u64).unwrap_or(u64::MAX);
         let bytes = self.range(section, at, bytes)?;
         raw::cast::<T>(bytes).ok_or(Corrupt {
@@ -220,7 +230,9 @@ impl<S: Stable> Image<S> {
     /// gives each worker, since one core's CRC32C (about 8 bytes a cycle) is a tenth of what the
     /// machine's memory can stream.
     pub fn check(&self, section: &Section, groups: Range<u32>) -> Result<(), Corrupt> {
-        groups.take_while(|&group| group < section.groups).try_for_each(|group| self.ensure(section, group))
+        groups
+            .take_while(|&group| group < section.groups)
+            .try_for_each(|group| self.ensure(section, group))
     }
 
     /// All of `section`, every group checked: for a section its owner reads whole at start.
@@ -248,7 +260,11 @@ impl<S: Stable> Image<S> {
             return Ok(Bytes::default());
         }
         if !whole.as_ptr().addr().is_multiple_of(8) {
-            return Err(Corrupt { section: section.id, group: 0, cause: Cause::Misaligned { at: 0, align: 8 } });
+            return Err(Corrupt {
+                section: section.id,
+                group: 0,
+                cause: Cause::Misaligned { at: 0, align: 8 },
+            });
         }
         let bytes: *const [u8] = whole;
         // SAFETY: the bytes are `self.owner`'s, which `Stable` keeps at one address and
@@ -315,7 +331,8 @@ impl<S: Stable> Image<S> {
         let bit = bit_of(index);
         if !self.checked.contains(bit, Relaxed) {
             let wanted = self.spine.tops[table_group as usize];
-            let found = crc32c(self.span(self.spine.crc_at + u64::from(table_group) * group, group));
+            let found =
+                crc32c(self.span(self.spine.crc_at + u64::from(table_group) * group, group));
             if found != wanted {
                 self.bad.insert(bit, Relaxed);
                 return Err(Cause::CrcTable { table_group, found, wanted });

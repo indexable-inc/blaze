@@ -52,10 +52,10 @@ impl Key {
     pub fn from_pem(pem: &str) -> Result<Key, GitHubError> {
         let mut lines = pem.lines().map(str::trim).skip_while(|line| line.is_empty());
         let begin = lines.next().unwrap_or_default();
-        let label = begin
-            .strip_prefix("-----BEGIN ")
-            .and_then(|it| it.strip_suffix("-----"))
-            .ok_or_else(|| GitHubError::new("the App's key is not PEM: no -----BEGIN line first"))?;
+        let label =
+            begin.strip_prefix("-----BEGIN ").and_then(|it| it.strip_suffix("-----")).ok_or_else(
+                || GitHubError::new("the App's key is not PEM: no -----BEGIN line first"),
+            )?;
         let end = format!("-----END {label}-----"); // alloc: once, at start, the App's key
         let mut base64 = String::new(); // alloc: once, at start, the App's key
         let mut ended = false;
@@ -86,7 +86,8 @@ impl Key {
             "RSA PRIVATE KEY" => RsaKeyPair::from_der(&der),
             "PRIVATE KEY" => RsaKeyPair::from_pkcs8(&der),
             _ => {
-                return Err(GitHubError::new(format!( // alloc: error path
+                return Err(GitHubError::new(format!(
+                    // alloc: error path
                     "the App's key PEM is a {label}, not an RSA PRIVATE KEY or a PRIVATE KEY"
                 )));
             }
@@ -101,7 +102,8 @@ impl Key {
     fn jwt(&self, app: u64, now: u64) -> Result<String, GitHubError> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
         // alloc: once per token minted, about once an hour
-        let claims = format!(r#"{{"iat":{},"exp":{},"iss":{app}}}"#, now.saturating_sub(60), now + 540);
+        let claims =
+            format!(r#"{{"iat":{},"exp":{},"iss":{app}}}"#, now.saturating_sub(60), now + 540);
         // alloc: once per token minted, about once an hour
         let mut jwt = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims));
         // alloc: once per token minted, about once an hour
@@ -302,7 +304,10 @@ impl GitHub {
             || !app.api.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-.".contains(&byte))
         {
             // alloc: error path
-            return Err(GitHubError::new(format!("{:?} is not a host name for GitHub's API", app.api)));
+            return Err(GitHubError::new(format!(
+                "{:?} is not a host name for GitHub's API",
+                app.api
+            )));
         }
         // alloc: none until the first call, then reused
         let (body, request) = (Vec::new(), Vec::new());
@@ -335,7 +340,8 @@ impl GitHub {
     /// lock is taken only then, so once an hour.
     fn fresh(&mut self) -> Result<&Token, GitHubError> {
         let now = now()?;
-        let valid = |held: &Minted| matches!(held, Some((_, expires)) if now + RENEW_BEFORE < *expires);
+        let valid =
+            |held: &Minted| matches!(held, Some((_, expires)) if now + RENEW_BEFORE < *expires);
         if !valid(&self.token) {
             self.token = None;
             let minted = Arc::clone(&self.minted);
@@ -345,9 +351,12 @@ impl GitHub {
                 let jwt = self.app.key.jwt(self.app.id, now)?;
                 self.body.clear();
                 let answer = self.call("POST", Route::Mint, Auth::Bearer(&jwt), true)?;
-                let token: MintedToken<'_> = serde_json::from_slice(&answer.body).map_err(|_| {
-                    GitHubError::new("GitHub's answer to minting a token is not a token and its expires_at")
-                })?;
+                let token: MintedToken<'_> =
+                    serde_json::from_slice(&answer.body).map_err(|_| {
+                        GitHubError::new(
+                            "GitHub's answer to minting a token is not a token and its expires_at",
+                        )
+                    })?;
                 let expires = unix_seconds(&token.expires_at)?;
                 *shared = Some((Token(token.token), expires));
             }
@@ -384,7 +393,8 @@ impl GitHub {
         };
         write_request(request, method, api, &path, authorization, body);
         // alloc: error path
-        let dial = || connect(api, tls).map_err(|error| GitHubError::new(format!("{}: {error}", what())));
+        let dial =
+            || connect(api, tls).map_err(|error| GitHubError::new(format!("{}: {error}", what())));
         let held = kept.take().filter(|it| it.idle_since.elapsed() < KEEP_IDLE);
         let reused = held.is_some();
         let mut stream = match held {
@@ -397,10 +407,11 @@ impl GitHub {
             exchanged = exchange(&mut stream, request);
         }
         // alloc: error path
-        let answer = exchanged.map_err(|failed| GitHubError::new(format!("{}: {}", what(), failed.what)))?;
-        let closes = answer
-            .header("Connection")
-            .is_some_and(|it| it.split(',').any(|token| token.trim().eq_ignore_ascii_case("close")));
+        let answer =
+            exchanged.map_err(|failed| GitHubError::new(format!("{}: {}", what(), failed.what)))?;
+        let closes = answer.header("Connection").is_some_and(|it| {
+            it.split(',').any(|token| token.trim().eq_ignore_ascii_case("close"))
+        });
         if !closes {
             *kept = Some(Kept { stream, idle_since: Instant::now() });
         }
@@ -415,9 +426,13 @@ impl GitHub {
 }
 
 /// A TLS connection to `api`'s port 443, with the timeouts set.
-fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+fn connect(
+    api: &str,
+    tls: &Arc<ClientConfig>,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
     // alloc: error path
-    let addresses = (api, 443).to_socket_addrs().map_err(|error| format!("resolving {api}: {error}"))?;
+    let addresses =
+        (api, 443).to_socket_addrs().map_err(|error| format!("resolving {api}: {error}"))?;
     let mut last = None;
     let mut connected = None;
     for address in addresses {
@@ -431,7 +446,8 @@ fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConne
         }
     }
     // alloc: error path
-    let tcp = connected.ok_or_else(|| last.unwrap_or_else(|| format!("{api} resolved to no address")))?;
+    let tcp =
+        connected.ok_or_else(|| last.unwrap_or_else(|| format!("{api} resolved to no address")))?;
     tcp.set_read_timeout(Some(TIMEOUT))
         .and_then(|()| tcp.set_write_timeout(Some(TIMEOUT)))
         .map_err(|error| format!("setting timeouts: {error}"))?; // alloc: error path
@@ -439,7 +455,8 @@ fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConne
         // alloc: once per connection, the TLS name rustls keeps
         ServerName::try_from(api.to_owned()).map_err(|error| format!("{api:?} as a TLS server name: {error}"))?;
     // alloc: error path
-    let tls = ClientConnection::new(Arc::clone(tls), name).map_err(|error| format!("starting TLS: {error}"))?;
+    let tls = ClientConnection::new(Arc::clone(tls), name)
+        .map_err(|error| format!("starting TLS: {error}"))?;
     Ok(StreamOwned::new(tls, tcp))
 }
 
@@ -456,8 +473,11 @@ fn write_request(
 ) {
     out.clear();
     let (scheme, credential) = authorization;
-    write!(out, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {scheme}{credential}\r\n")
-        .expect("a Vec takes every byte");
+    write!(
+        out,
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {scheme}{credential}\r\n"
+    )
+    .expect("a Vec takes every byte");
     out.extend_from_slice(
         b"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nUser-Agent: blaze-ci\r\n",
     );
@@ -608,18 +628,20 @@ fn tls() -> Result<Arc<ClientConfig>, GitHubError> {
     if added == 0 {
         // alloc: error path
         let errors: Vec<String> = found.errors.iter().map(ToString::to_string).collect();
-        return Err(GitHubError::new(format!( // alloc: error path
+        return Err(GitHubError::new(format!(
+            // alloc: error path
             "no root certificate to verify GitHub with was found on this machine ({})",
             // alloc: error path
             if errors.is_empty() { "no errors loading them".to_owned() } else { errors.join("; ") },
         )));
     }
     // alloc: once, at start, the TLS config
-    let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| GitHubError::new(format!("TLS versions: {error}")))? // alloc: error path
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| GitHubError::new(format!("TLS versions: {error}")))? // alloc: error path
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     Ok(Arc::new(config)) // alloc: once, at start, the TLS config
 }
 

@@ -20,10 +20,10 @@ mod compare;
 mod refine;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
+use std::alloc::Global;
 use syntax::view::{AstNode as _, HasName as _};
 
 use crate::{
@@ -50,9 +50,12 @@ impl<'db> Origin<'db> {
                 let mut span = cx.span(source.with_value(name.syntax().text_range()));
                 let loc = id.loc(cx.db);
                 let derive = loc.trait_.derive_macro(lang_items(cx.db, cx.krate.base()));
-                let def_site = derive
-                    .and_then(|it| cx.vsema.source(hir::Macro::from(it)))
-                    .map(|it| cx.span(it.map(|it| item_range_view(it.either(|it| it.syntax(), |it| it.syntax())))));
+                let def_site =
+                    derive.and_then(|it| cx.vsema.source(hir::Macro::from(it))).map(|it| {
+                        cx.span(it.map(|it| {
+                            item_range_view(it.either(|it| it.syntax(), |it| it.syntax()))
+                        }))
+                    });
                 // alloc: the error's span; called only on an error path (`builtin`'s E0204, E0206, E0184)
                 span.expansion = Some(Box::new(Expansion {
                     call_site: cx.span(loc.source(cx.db)),
@@ -119,7 +122,8 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     members.resize(starts[traits.len()] as usize, 0);
     for (index, slot) in of_impl.iter().enumerate() {
         let Some(slot) = *slot else { continue };
-        members[next[slot as usize] as usize] = u32::try_from(index).expect("a crate has fewer than 2^32 impls");
+        members[next[slot as usize] as usize] =
+            u32::try_from(index).expect("a crate has fewer than 2^32 impls");
         next[slot as usize] += 1;
     }
     let mut builtin = builtin::Builtin::new(cx);
@@ -156,10 +160,13 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
 pub(crate) fn coherent(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     let denied = denies_explicit_impls(cx, trait_);
     let mut builtin = builtin::Builtin::new(cx);
-    impls(cx, &super::defs::scopes(cx)).iter().filter(|(impl_, _)| impl_.trait_(cx.db) == Some(trait_)).all(|(impl_, origin)| {
-        let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, trait_, denied);
-        !hir_error && !errors.iter().any(is_error)
-    })
+    impls(cx, &super::defs::scopes(cx))
+        .iter()
+        .filter(|(impl_, _)| impl_.trait_(cx.db) == Some(trait_))
+        .all(|(impl_, origin)| {
+            let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, trait_, denied);
+            !hir_error && !errors.iter().any(is_error)
+        })
 }
 
 /// The coherence checks of one impl of `trait_` (`coherent_trait`'s loop): what is given here,
@@ -199,7 +206,8 @@ fn incorrect_safety(cx: &Cx<'_, '_>, at: &ImplAt<'_>, trait_: hir::Trait) -> boo
     let trait_unsafe = trait_.is_unsafe(db);
     let is_drop = lang_items(db, cx.krate.base()).Drop == Some(trait_.into());
     let may_dangle = is_drop && {
-        let (lifetimes, types) = AttrFlags::query_generic_params(db, hir_def::GenericDefId::from(at.id));
+        let (lifetimes, types) =
+            AttrFlags::query_generic_params(db, hir_def::GenericDefId::from(at.id));
         lifetimes.values().chain(types.values()).any(|it| it.contains(AttrFlags::MAY_DANGLE))
     };
     match (impl_unsafe, trait_unsafe, negative, may_dangle) {
@@ -242,7 +250,8 @@ fn impls<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origi
 
 /// Whether the trait is marked `#[rustc_deny_explicit_impl]`.
 fn denies_explicit_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
-    AttrFlags::query(cx.db, hir_def::TraitId::from(trait_).into()).contains(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL)
+    AttrFlags::query(cx.db, hir_def::TraitId::from(trait_).into())
+        .contains(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL)
 }
 
 /// `enforce_trait_manually_implementable`: E0322 (E0328 for `Unsize`) for an impl of a trait
@@ -260,7 +269,10 @@ fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt<'_>, trait_: hir::Trait) -> Vec<Fo
     // alloc: the error's label
     diag.span_label(span, format!("impl of `{name}` not allowed"));
     // alloc: the error's fact
-    diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("the attributes of `{name}`"));
+    diag.fact(
+        Fact::Signature(cx.key(ItemId::Trait(trait_.into()))),
+        format!("the attributes of `{name}`"),
+    );
     diag.fact(at.coherence(cx), "the header of the impl");
     // alloc: the error
     vec![Found::new(diag, Phase::Items)]
@@ -288,7 +300,8 @@ impl Allowed for S {}
 fn main() {}
 "#,
         );
-        let errors: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("E0322: ")).collect();
+        let errors: Vec<String> =
+            checked.messages().into_iter().filter(|it| it.starts_with("E0322: ")).collect();
         assert_eq!(
             errors,
             [

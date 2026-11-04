@@ -217,8 +217,7 @@ fn has_run(lines: &[String], run: &[&str]) -> bool {
     lines.windows(run.len()).any(|window| window.iter().zip(run).all(|(a, b)| a == b))
 }
 
-const LABELED_LOOP_IN_BREAK: &str =
-    "parentheses are required around this expression to avoid confusion with a labeled break expression";
+const LABELED_LOOP_IN_BREAK: &str = "parentheses are required around this expression to avoid confusion with a labeled break expression";
 
 /// rustc's `parse_expr_break`: the labeled loop is the value of an unlabeled `break`, with
 /// `LabeledLoopInBreak` where the loop ends.
@@ -265,8 +264,7 @@ fn every_labeled_value_of_a_break_is_parenthesized() {
         let (_, errors) = parse_lines("fn f() { loop { break 'a: 1; } }", edition);
         assert!(errors.iter().any(|it| it.ends_with("expected a loop or block")), "{errors:?}");
         assert!(!errors.iter().any(|it| it.ends_with(LABELED_LOOP_IN_BREAK)), "{errors:?}");
-        let (_, errors) =
-            parse_lines("fn f() { 'b: loop { break 'b 'a: loop {}; } }", edition);
+        let (_, errors) = parse_lines("fn f() { 'b: loop { break 'b 'a: loop {}; } }", edition);
         assert_eq!(errors, Vec::<String>::new());
     }
 }
@@ -280,7 +278,10 @@ fn a_raw_lifetime_and_a_c_string_are_split_before_2021() {
         let (tree, errors) = parse_lines(text, edition);
         assert_eq!(errors, Vec::<String>::new(), "{edition:?}");
         assert!(
-            has_run(&tree, &["L_PAREN \"(\"", "LIFETIME_IDENT \"'r\"", "POUND \"#\"", "IDENT \"lt\""]),
+            has_run(
+                &tree,
+                &["L_PAREN \"(\"", "LIFETIME_IDENT \"'r\"", "POUND \"#\"", "IDENT \"lt\""]
+            ),
             "{edition:?}: {tree:#?}"
         );
         assert!(
@@ -601,12 +602,16 @@ mod warm_parse {
             let input = lexed.to_input(Edition::CURRENT);
             drop(TopEntryPoint::SourceFile.parse(&input));
             drop(TopEntryPoint::SourceFile.parse_outline(&input));
-            blaze_alloc_count::assert_at_most(0, "a warm parse of one of the parser's sources", || {
-                TopEntryPoint::SourceFile.parse(&input)
-            });
-            blaze_alloc_count::assert_at_most(0, "a warm outline of one of the parser's sources", || {
-                TopEntryPoint::SourceFile.parse_outline(&input)
-            });
+            blaze_alloc_count::assert_at_most(
+                0,
+                "a warm parse of one of the parser's sources",
+                || TopEntryPoint::SourceFile.parse(&input),
+            );
+            blaze_alloc_count::assert_at_most(
+                0,
+                "a warm outline of one of the parser's sources",
+                || TopEntryPoint::SourceFile.parse_outline(&input),
+            );
         }
     }
 

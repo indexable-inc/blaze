@@ -38,11 +38,7 @@ pub fn stdtr(df: i32, t: f64) -> Result<f64, InternalError> {
         }
         f * abs_t / libm::sqrt(z * df as f64)
     };
-    Ok(if t < 0.0 {
-        0.5 - 0.5 * p
-    } else {
-        0.5 + 0.5 * p
-    })
+    Ok(if t < 0.0 { 0.5 - 0.5 * p } else { 0.5 + 0.5 * p })
 }
 
 /// Inverse Student's t CDF (quantile) for integer `df >= 1`.
@@ -92,11 +88,7 @@ pub fn stdtrit(df: i32, p: f64) -> Result<f64, InternalError> {
         let log_f = log_norm - 0.5 * (df as f64 + 1.0) * libm::log1p(t * t / df as f64);
         let f = libm::exp(log_f);
         let t_newton = t - (f_val - q) / f;
-        t = if lo <= t_newton && t_newton <= hi {
-            t_newton
-        } else {
-            0.5 * (lo + hi)
-        };
+        t = if lo <= t_newton && t_newton <= hi { t_newton } else { 0.5 * (lo + hi) };
         if hi - lo < eps * (1.0 + t.abs()) {
             break;
         }
@@ -202,11 +194,7 @@ impl LogStudentTDistribution {
     pub fn new(scale_bits: f64, df: i32) -> Self {
         let t_coef =
             gamma((df as f64 + 1.0) / 2.0) / (libm::sqrt(df as f64 * PI) * gamma(df as f64 / 2.0));
-        Self {
-            scale_bits,
-            df,
-            t_coef,
-        }
+        Self { scale_bits, df, t_coef }
     }
 }
 
@@ -226,11 +214,8 @@ impl Distribution for LogStudentTDistribution {
 
     fn pdf(&self, x: f64) -> f64 {
         let y = libm::copysign(libm::log2(1.0 + x.abs()), x) / self.scale_bits;
-        let f_t = self.t_coef
-            * libm::pow(
-                1.0 + y * y / self.df as f64,
-                -((self.df as f64 + 1.0) / 2.0),
-            );
+        let f_t =
+            self.t_coef * libm::pow(1.0 + y * y / self.df as f64, -((self.df as f64 + 1.0) / 2.0));
         f_t / (self.scale_bits * (1.0 + x.abs()) * LN_2)
     }
 }

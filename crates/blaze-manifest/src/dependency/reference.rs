@@ -8,8 +8,8 @@ use std::fmt;
 
 use anyhow::bail;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cargo_util_schemas::manifest::FeatureName;
+use std::alloc::Global;
 
 use super::Dependency;
 use crate::edit_distance::closest_msg;

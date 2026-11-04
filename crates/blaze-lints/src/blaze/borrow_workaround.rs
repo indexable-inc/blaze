@@ -212,7 +212,8 @@ fn find(cx: &Cx<'_, '_>, general: bool, nll: bool) -> Vec<Found> {
         if !*checked.get_or_insert_with(|| passes(hir_ty_borrowck::borrowck(db, def))) {
             return found;
         }
-        let mir = match mir.get_or_insert_with(|| db.mir_body(InferBodyId::DefWithBodyId(def)).ok()) {
+        let mir = match mir.get_or_insert_with(|| db.mir_body(InferBodyId::DefWithBodyId(def)).ok())
+        {
             Some(it) => *it,
             None => return found,
         };
@@ -220,7 +221,8 @@ fn find(cx: &Cx<'_, '_>, general: bool, nll: bool) -> Vec<Found> {
         if !passes(&hir_ty_borrowck::borrowck_rewritten(db, def, &rewritten, mode)) {
             continue;
         }
-        let stable = mode == Mode::Nll || passes(&hir_ty_borrowck::borrowck_rewritten(db, def, &rewritten, Mode::Nll));
+        let stable = mode == Mode::Nll
+            || passes(&hir_ty_borrowck::borrowck_rewritten(db, def, &rewritten, Mode::Nll));
         let lint = match stable {
             true if general => Lint::BorrowWorkaround,
             false if nll => Lint::NllWorkaround,
@@ -235,7 +237,9 @@ fn find(cx: &Cx<'_, '_>, general: bool, nll: bool) -> Vec<Found> {
 
 /// Whether a borrow check found no error and checked the whole body.
 fn passes(result: &BorrowckResult) -> bool {
-    result.skipped.is_none() && result.not_checked.is_none() && !result.diagnostics.iter().any(|it| it.is_error())
+    result.skipped.is_none()
+        && result.not_checked.is_none()
+        && !result.diagnostics.iter().any(|it| it.is_error())
 }
 
 impl<'db> Walk<'_, 'db, '_> {
@@ -288,21 +292,33 @@ impl<'db> Walk<'_, 'db, '_> {
 
     /// What `condition` tests, when it is a probe this lint knows.
     fn probe(&self, condition: ExprId) -> Option<Probe> {
-        let Expr::MethodCall { receiver, args, .. } = self.body.expr(condition) else { return None };
+        let Expr::MethodCall { receiver, args, .. } = self.body.expr(condition) else {
+            return None;
+        };
         let db = self.db();
         let (f, _) = written_callee(self.analysis.infer(), self.body, condition)?;
         let adt = facts::impl_adt(db, f)?;
         match (self.name(f), args) {
-            ("contains_key", [key]) if self.map(adt) && self.receiver_adt(receiver).is_some_and(|it| self.map(it)) => {
-                Some(Probe::Map { place: self.place_of(receiver, PLACE_DEPTH)?, key: self.plain_key(*key)? })
+            ("contains_key", [key])
+                if self.map(adt) && self.receiver_adt(receiver).is_some_and(|it| self.map(it)) =>
+            {
+                Some(Probe::Map {
+                    place: self.place_of(receiver, PLACE_DEPTH)?,
+                    key: self.plain_key(*key)?,
+                })
             }
-            ("is_some", []) if facts::adt_is(db, adt, "core", "Option") => match self.map_get(receiver, &["get"]) {
-                Some((place, key)) => Some(Probe::Map { place, key }),
-                None if self.receiver_adt(receiver).is_some_and(|it| facts::adt_is(db, it, "core", "Option")) => {
-                Some(Probe::Option { place: self.place_of(receiver, PLACE_DEPTH)? })
+            ("is_some", []) if facts::adt_is(db, adt, "core", "Option") => {
+                match self.map_get(receiver, &["get"]) {
+                    Some((place, key)) => Some(Probe::Map { place, key }),
+                    None if self
+                        .receiver_adt(receiver)
+                        .is_some_and(|it| facts::adt_is(db, it, "core", "Option")) =>
+                    {
+                        Some(Probe::Option { place: self.place_of(receiver, PLACE_DEPTH)? })
+                    }
+                    None => None,
+                }
             }
-            None => None,
-            },
             _ => None,
         }
     }
@@ -321,7 +337,9 @@ impl<'db> Walk<'_, 'db, '_> {
 
     /// `map.<one of names>(key)` on a map place: the place and the key.
     fn map_get(&self, id: ExprId, names: &[&str]) -> Option<(Place, ExprId)> {
-        let Expr::MethodCall { receiver, args: [key], .. } = self.body.expr(id) else { return None };
+        let Expr::MethodCall { receiver, args: [key], .. } = self.body.expr(id) else {
+            return None;
+        };
         let (f, _) = written_callee(self.analysis.infer(), self.body, id)?;
         if !names.contains(&self.name(f)) || !self.map(facts::impl_adt(self.db(), f)?) {
             return None;
@@ -341,7 +359,10 @@ impl<'db> Walk<'_, 'db, '_> {
                 (there == *place && self.same_key(*key, again)).then_some(())?;
                 self.method_lookup(at)
             }
-            (Probe::Map { place, key }, Expr::Ref { expr: index, rawness: Rawness::Ref, mutability: Mutability::Shared }) => {
+            (
+                Probe::Map { place, key },
+                Expr::Ref { expr: index, rawness: Rawness::Ref, mutability: Mutability::Shared },
+            ) => {
                 let Expr::Index { base, index: again } = self.body.expr(index) else { return None };
                 self.index_of(place, *key, base, again)?;
                 Some(Lookup {
@@ -375,8 +396,13 @@ impl<'db> Walk<'_, 'db, '_> {
                 let (f, _) = written_callee(self.analysis.infer(), self.body, at)?;
                 let db = self.db();
                 let option = facts::adt_is(db, facts::impl_adt(db, f)?, "core", "Option")
-                    && self.receiver_adt(receiver).is_some_and(|it| facts::adt_is(db, it, "core", "Option"));
-                if !option || !OPTION_LOOKUPS.contains(&self.name(f)) || self.place_of(receiver, PLACE_DEPTH)? != *place {
+                    && self
+                        .receiver_adt(receiver)
+                        .is_some_and(|it| facts::adt_is(db, it, "core", "Option"));
+                if !option
+                    || !OPTION_LOOKUPS.contains(&self.name(f))
+                    || self.place_of(receiver, PLACE_DEPTH)? != *place
+                {
                     return None;
                 }
                 self.method_lookup(at)
@@ -397,9 +423,9 @@ impl<'db> Walk<'_, 'db, '_> {
     fn runs_deref(&self, expr: ExprId) -> bool {
         let Some(adjustments) = self.analysis.infer().expr_adjustment(expr) else { return false };
         let db = self.db();
-        let known = self
-            .receiver_adt(expr)
-            .is_some_and(|adt| PURE_DEREF.iter().any(|it| facts::crate_is(db, adt.module(db).krate(db), it)));
+        let known = self.receiver_adt(expr).is_some_and(|adt| {
+            PURE_DEREF.iter().any(|it| facts::crate_is(db, adt.module(db).krate(db), it))
+        });
         !known && adjustments.iter().any(|it| matches!(it.kind, Adjust::Deref(Some(_))))
     }
 
@@ -412,7 +438,8 @@ impl<'db> Walk<'_, 'db, '_> {
     fn index_of(&self, place: &Place, key: ExprId, base: ExprId, index: ExprId) -> Option<()> {
         let ty = self.analysis.ty(self.analysis.infer().expr_ty(base));
         let map = ty.strip_references().as_adt().is_some_and(|adt| self.map(adt));
-        (map && self.place_of(base, PLACE_DEPTH)? == *place && self.same_key(key, index)).then_some(())
+        (map && self.place_of(base, PLACE_DEPTH)? == *place && self.same_key(key, index))
+            .then_some(())
     }
 
     /// `base.get(index)`, `base` in parentheses unless it is a path or a field.
@@ -430,16 +457,21 @@ impl<'db> Walk<'_, 'db, '_> {
         let scrutinee = self.text(at)?.to_owned(); // alloc: a finding's text
         let unwrapped = self.parents.of_expr(at).filter(|&parent| match self.body.expr(parent) {
             Expr::MethodCall { receiver, args, .. } if receiver == at => {
-                let unwraps = written_callee(self.analysis.infer(), self.body, parent).is_some_and(|(f, _)| {
-                    let db = self.db();
-                    let option = facts::impl_adt(db, f).is_some_and(|adt| facts::adt_is(db, adt, "core", "Option"));
-                    option
-                        && match (self.name(f), args) {
-                            ("unwrap", []) => true,
-                            ("expect", [message]) => matches!(self.body.expr(*message), Expr::Literal(_)),
-                            _ => false,
-                        }
-                });
+                let unwraps = written_callee(self.analysis.infer(), self.body, parent).is_some_and(
+                    |(f, _)| {
+                        let db = self.db();
+                        let option = facts::impl_adt(db, f)
+                            .is_some_and(|adt| facts::adt_is(db, adt, "core", "Option"));
+                        option
+                            && match (self.name(f), args) {
+                                ("unwrap", []) => true,
+                                ("expect", [message]) => {
+                                    matches!(self.body.expr(*message), Expr::Literal(_))
+                                }
+                                _ => false,
+                            }
+                    },
+                );
                 unwraps && super::loops::written(self.analysis, parent)
             }
             _ => false,
@@ -471,7 +503,9 @@ impl<'db> Walk<'_, 'db, '_> {
                 place.fields.push(*name);
                 Some(place)
             }
-            Expr::UnaryOp { expr: inner, op: UnaryOp::Deref } if self.builtin_deref(inner) => self.place_of(inner, depth),
+            Expr::UnaryOp { expr: inner, op: UnaryOp::Deref } if self.builtin_deref(inner) => {
+                self.place_of(inner, depth)
+            }
             Expr::Ref { expr: inner, rawness: Rawness::Ref, .. } => self.place_of(inner, depth),
             _ => None,
         }
@@ -495,7 +529,9 @@ impl<'db> Walk<'_, 'db, '_> {
         let Some(depth) = depth.checked_sub(1) else { return key };
         match self.body.expr(key) {
             Expr::Ref { expr, rawness: Rawness::Ref, .. } => self.key_core(expr, depth),
-            Expr::UnaryOp { expr, op: UnaryOp::Deref } if self.builtin_deref(expr) => self.key_core(expr, depth),
+            Expr::UnaryOp { expr, op: UnaryOp::Deref } if self.builtin_deref(expr) => {
+                self.key_core(expr, depth)
+            }
             _ => key,
         }
     }
@@ -510,10 +546,16 @@ impl<'db> Walk<'_, 'db, '_> {
         match (self.body.expr(a), self.body.expr(b)) {
             (Expr::Literal(x), Expr::Literal(y)) => x == y,
             (Expr::Path(_), Expr::Path(_)) => {
-                let (x, y) = (value_of(self.db(), self.def, self.body, a), value_of(self.db(), self.def, self.body, b));
+                let (x, y) = (
+                    value_of(self.db(), self.def, self.body, a),
+                    value_of(self.db(), self.def, self.body, b),
+                );
                 x.is_some()
                     && x == y
-                    && matches!(x, Some(ValueNs::LocalBinding(_) | ValueNs::ConstId(_) | ValueNs::StaticId(_)))
+                    && matches!(
+                        x,
+                        Some(ValueNs::LocalBinding(_) | ValueNs::ConstId(_) | ValueNs::StaticId(_))
+                    )
             }
             (Expr::Field { .. }, Expr::Field { .. }) => {
                 matches!((self.place_of(a, PLACE_DEPTH), self.place_of(b, PLACE_DEPTH)), (Some(x), Some(y)) if x == y)
@@ -544,7 +586,14 @@ impl<'db> Walk<'_, 'db, '_> {
     }
 
     /// The finding of the `if` `id`, its fix written.
-    fn found(&self, lint: Lint, id: ExprId, condition: ExprId, probe: &Probe, lookup: &Lookup) -> Option<Found> {
+    fn found(
+        &self,
+        lint: Lint,
+        id: ExprId,
+        condition: ExprId,
+        probe: &Probe,
+        lookup: &Lookup,
+    ) -> Option<Found> {
         let (if_range, condition_range) = (self.range(id)?, self.range(condition)?);
         let name = fresh(self.cx.snippet(if_range))?;
         let with = match lookup.with {
@@ -568,14 +617,20 @@ impl<'db> Walk<'_, 'db, '_> {
                  blaze's borrow checker accepts one lookup, `if let Some({name}) = {}`",
                 lookup.scrutinee
             ),
-            _ => format!("{what} is looked up twice; one lookup, `if let Some({name}) = {}`, does the same", lookup.scrutinee),
+            _ => format!(
+                "{what} is looked up twice; one lookup, `if let Some({name}) = {}`, does the same",
+                lookup.scrutinee
+            ),
         };
         Some(Found {
             lint,
             range: condition_range,
             again: lookup.replaced,
             message,
-            parts: [(condition_range, format!("let Some({name}) = {}", lookup.scrutinee)), (lookup.replaced, with)],
+            parts: [
+                (condition_range, format!("let Some({name}) = {}", lookup.scrutinee)),
+                (lookup.replaced, with),
+            ],
             applicability,
         })
     }
@@ -584,7 +639,9 @@ impl<'db> Walk<'_, 'db, '_> {
 /// A name for the binding that no identifier in `text` (the `if`, where it would be in scope)
 /// is: `found`, else `found1`, `found2`, ..
 fn fresh(text: &str) -> Option<String> {
-    let taken = |name: &str| text.split(|it: char| !(it.is_alphanumeric() || it == '_')).any(|it| it == name);
+    let taken = |name: &str| {
+        text.split(|it: char| !(it.is_alphanumeric() || it == '_')).any(|it| it == name)
+    };
     (0..NAMES)
         .map(|n| match n {
             0 => "found".to_owned(), // alloc: a finding's text
@@ -599,7 +656,12 @@ fn fresh(text: &str) -> Option<String> {
 /// from the switch to the call is not one the move keeps the meaning of: a block with another
 /// way in, a cleanup block, a statement that writes a variable, may panic or drops, or a
 /// terminator other than a `Goto`.
-fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: ExprId) -> Option<MirBody<'db>> {
+fn hoisted<'db>(
+    mir: &MirBody<'db>,
+    if_: ExprId,
+    condition: ExprId,
+    lookup: ExprId,
+) -> Option<MirBody<'db>> {
     let blocks = &mir.basic_blocks;
     // The `if`'s switch on its condition's value: the only one.
     // alloc: the switches of one `if`, one
@@ -607,7 +669,9 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
         .iter()
         .filter_map(|(id, block)| {
             let terminator = block.terminator.as_ref()?;
-            let TerminatorKind::SwitchInt { discr, targets } = &terminator.kind else { return None };
+            let TerminatorKind::SwitchInt { discr, targets } = &terminator.kind else {
+                return None;
+            };
             let OperandKind::Copy(flag) = &discr.kind else { return None };
             let ours = terminator.span == MirSpan::ExprId(if_)
                 && discr.span == Some(MirSpan::ExprId(condition))
@@ -649,7 +713,11 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
     let mut at = then;
     let call = loop {
         let block = &blocks[at];
-        if path.len() >= PATH || preds[at.into_raw().into_u32() as usize] != 1 || block.is_cleanup || path.contains(&at) {
+        if path.len() >= PATH
+            || preds[at.into_raw().into_u32() as usize] != 1
+            || block.is_cleanup
+            || path.contains(&at)
+        {
             return None;
         }
         path.push(at);
@@ -665,7 +733,9 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
     }
     // The statements before the call only borrow, copy or name a value, into temporaries.
     let temporary = |local: LocalId| {
-        local != return_slot() && !mir.param_locals.contains(&local) && !mir.binding_locals.values().any(|&it| it == local)
+        local != return_slot()
+            && !mir.param_locals.contains(&local)
+            && !mir.binding_locals.values().any(|&it| it == local)
     };
     // alloc: the temporaries one path writes, a few
     let mut written: Vec<LocalId> = Vec::new();
@@ -682,8 +752,11 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
     for &block in &path {
         for statement in &blocks[block].statements {
             match &statement.kind {
-                StatementKind::StorageLive(_) | StatementKind::Nop | StatementKind::FakeRead(_) => {}
-                StatementKind::Assign(place, value) if place.projection.is_empty() && temporary(place.local) => {
+                StatementKind::StorageLive(_) | StatementKind::Nop | StatementKind::FakeRead(_) => {
+                }
+                StatementKind::Assign(place, value)
+                    if place.projection.is_empty() && temporary(place.local) =>
+                {
                     let fine = match value {
                         Rvalue::Use(operand) => readable(operand, &written),
                         Rvalue::Ref(..) | Rvalue::CopyForDeref(_) => true,
@@ -699,7 +772,9 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
         }
     }
     let terminator = blocks[call].terminator.as_ref()?;
-    let TerminatorKind::Call { func, args, destination, target: Some(target), .. } = &terminator.kind else {
+    let TerminatorKind::Call { func, args, destination, target: Some(target), .. } =
+        &terminator.kind
+    else {
         return None;
     };
     if !destination.projection.is_empty() || !temporary(destination.local) {
@@ -725,7 +800,9 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
         terminator: Some(switch_terminator),
         is_cleanup: false,
     });
-    if let TerminatorKind::Call { destination: to, target: next, cleanup: unwind, .. } = &mut call_kind {
+    if let TerminatorKind::Call { destination: to, target: next, cleanup: unwind, .. } =
+        &mut call_kind
+    {
         *to = kept_place.clone(); // clone: one place
         *next = Some(rest);
         *unwind = cleanup;

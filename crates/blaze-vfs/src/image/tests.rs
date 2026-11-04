@@ -12,7 +12,9 @@ use blaze_core::{
 use blaze_ids::ContentId;
 use blaze_image::{Builder, Image, MIN_GROUP_SHIFT, SectionId};
 
-use super::{BLOBS_SCHEMA, DISKS_SCHEMA, DisksUnused, ImageError, ImageMark, ImageUse, TREE_SCHEMA};
+use super::{
+    BLOBS_SCHEMA, DISKS_SCHEMA, DisksUnused, ImageError, ImageMark, ImageUse, TREE_SCHEMA,
+};
 use crate::{Change, Mode, Op, OpError, Vfs, journal::base_of, store::Source, tree::NodeId};
 
 fn file() -> FileName {
@@ -567,14 +569,25 @@ fn names_with_one_old_hash_take_bounded_probes_in_the_tree_and_its_image() {
     let began = std::time::Instant::now();
     vfs.commit("main", vfs.empty(), &ops).unwrap();
     let named = crate::probes::take();
-    eprintln!("flood: a commit of {} names with one old hash: {:?}, {named} names compared", names.len(), began.elapsed());
-    assert!(named <= bound, "a commit of {} names with one old hash compared {named} names, over {bound}", names.len());
+    eprintln!(
+        "flood: a commit of {} names with one old hash: {:?}, {named} names compared",
+        names.len(),
+        began.elapsed()
+    );
+    assert!(
+        named <= bound,
+        "a commit of {} names with one old hash compared {named} names, over {bound}",
+        names.len()
+    );
     settle(&mut sim, &mut vfs);
     let (mark, image) = image_of(&mut vfs).unwrap();
     let (mut twin, mut twin_sim) = start(4);
     twin.commit("main", twin.empty(), &ops).unwrap();
     settle(&mut twin_sim, &mut twin);
-    assert!(image_of(&mut twin).unwrap().1 == image, "the same names give the same image, its key and index");
+    assert!(
+        image_of(&mut twin).unwrap().1 == image,
+        "the same names give the same image, its key and index"
+    );
     assert!(vfs.image_durable(mark.name));
     settle(&mut sim, &mut vfs);
 
@@ -589,8 +602,16 @@ fn names_with_one_old_hash_take_bounded_probes_in_the_tree_and_its_image() {
         assert_eq!(back.tree.table().names().len(), kept, "{name} is found in the image");
     }
     let looked = crate::probes::take();
-    eprintln!("flood: finding {} names with one old hash in the image: {:?}, {looked} places", names.len(), began.elapsed());
-    assert!(looked <= bound, "finding {} names with one old hash in the image looked at {looked} places, over {bound}", names.len());
+    eprintln!(
+        "flood: finding {} names with one old hash in the image: {:?}, {looked} places",
+        names.len(),
+        began.elapsed()
+    );
+    assert!(
+        looked <= bound,
+        "finding {} names with one old hash in the image looked at {looked} places, over {bound}",
+        names.len()
+    );
     let root = back.root(back.head("main").unwrap()).unwrap();
     assert_eq!(back.tree.read(root, &names[17]).unwrap(), Some(&b"x"[..]));
 }

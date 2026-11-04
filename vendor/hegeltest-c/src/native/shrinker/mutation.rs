@@ -83,10 +83,7 @@ impl<'a> Shrinker<'a> {
                     .collect();
                 let max_size = crate::native::core::flattened_len(&snapshot);
 
-                if !self
-                    .replay_observing_divergence(&snapshot, new_val, i)
-                    .await?
-                {
+                if !self.replay_observing_divergence(&snapshot, new_val, i).await? {
                     continue;
                 }
 
@@ -164,11 +161,7 @@ impl<'a> Shrinker<'a> {
             self.run_test_fn(ShrinkRun::Full(&attempt)).await?;
         self.calls += 1;
         let diverged = actual_nodes.len() == expected.len()
-            && actual_nodes
-                .iter()
-                .zip(&expected)
-                .skip(i + 1)
-                .any(|(a, e)| a.data.kind() != *e);
+            && actual_nodes.iter().zip(&expected).skip(i + 1).any(|(a, e)| a.data.kind() != *e);
         if is_interesting && sort_key(&actual_nodes) < sort_key(&self.current_nodes) {
             self.accept_improvement(actual_nodes, actual_spans)?;
         }

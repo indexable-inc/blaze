@@ -8,16 +8,14 @@ pub struct Transform;
 impl UllbcPass for Transform {
     fn transform_body(&self, _ctx: &mut TransformCtx, body: &mut ullbc_ast::ExprBody) {
         for blk in &mut body.body {
-            blk.statements
-                .retain(|st| !(st.kind.is_nop() && st.comments_before.is_empty()))
+            blk.statements.retain(|st| !(st.kind.is_nop() && st.comments_before.is_empty()))
         }
     }
 }
 impl LlbcPass for Transform {
     fn transform_body(&self, _ctx: &mut TransformCtx, body: &mut llbc_ast::ExprBody) {
         body.body.visit_blocks_bwd(|blk: &mut llbc_ast::Block| {
-            blk.statements
-                .retain(|st| !(st.kind.is_nop() && st.comments_before.is_empty()))
+            blk.statements.retain(|st| !(st.kind.is_nop() && st.comments_before.is_empty()))
         });
     }
 }

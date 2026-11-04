@@ -3,7 +3,6 @@ use std::{cell::RefCell, fmt, iter, mem, ops::ControlFlow};
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_mem::scratch::Scratch;
 use hir_expand::{
     MacroDefId,
@@ -13,6 +12,7 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use smallvec::SmallVec;
 use span::SyntaxContext;
+use std::alloc::Global;
 use syntax::view::HasName;
 
 use crate::{
@@ -197,11 +197,7 @@ impl<'db> Resolver<'db> {
     }
 
     /// Resolve known struct from std, like `std::boxed::Box`
-    pub fn resolve_known_struct(
-        &self,
-        db: &Db,
-        path: &ModPath,
-    ) -> Option<StructId> {
+    pub fn resolve_known_struct(&self, db: &Db, path: &ModPath) -> Option<StructId> {
         let res = self.resolve_module_path(db, path, BuiltinShadowMode::Other).take_types()?;
         match res {
             ModuleDefId::AdtId(AdtId::StructId(it)) => Some(it),
@@ -295,8 +291,9 @@ impl<'db> Resolver<'db> {
         // Generic parameters have macros 2.0 hygiene ([`crate::nameres::param_name`]): the
         // name they are looked up by, taken at the first generic parameters met.
         let mut keyed = None;
-        let mut param_name =
-            || *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, hygiene));
+        let mut param_name = || {
+            *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, hygiene))
+        };
         if skip_to_mod {
             return match hygienic {
                 Some(items) => {
@@ -387,11 +384,7 @@ impl<'db> Resolver<'db> {
         }
     }
 
-    pub fn resolve_path_in_type_ns_fully(
-        &self,
-        db: &Db,
-        path: Path<'_>,
-    ) -> Option<TypeNs> {
+    pub fn resolve_path_in_type_ns_fully(&self, db: &Db, path: Path<'_>) -> Option<TypeNs> {
         let (res, unresolved, _) = self.resolve_path_in_type_ns(db, path)?;
         if unresolved.is_some() {
             return None;
@@ -504,7 +497,9 @@ impl<'db> Resolver<'db> {
         let path_hygiene = hygiene_id;
         let mut keyed = None;
         let mut param_name = || {
-            *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, path_hygiene))
+            *keyed.get_or_insert_with(|| {
+                crate::nameres::path_param_name(db, *first_name, path_hygiene)
+            })
         };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
         // Where the item scopes are for a path a `macro` wrote: its locals are told apart by
@@ -528,9 +523,10 @@ impl<'db> Resolver<'db> {
                 match scope {
                     Scope::ExprScope { store, scope_id } => {
                         // A name a pattern binds twice means its last binding.
-                        let entry = self.expr_scopes(store).entries(scope_id).iter().rev().find(
-                            |entry| entry.name() == first_name && entry.hygiene() == hygiene_id,
-                        );
+                        let entry =
+                            self.expr_scopes(store).entries(scope_id).iter().rev().find(|entry| {
+                                entry.name() == first_name && entry.hygiene() == hygiene_id
+                            });
 
                         if let Some(e) = entry {
                             return Some((
@@ -541,7 +537,8 @@ impl<'db> Resolver<'db> {
                         }
                     }
                     Scope::MacroDefScope { store, scope_id } => {
-                        let info = macro_hygiene.get_or_insert_with(|| hygiene_info(db, hygiene_id));
+                        let info =
+                            macro_hygiene.get_or_insert_with(|| hygiene_info(db, hygiene_id));
                         handle_macro_def_scope(
                             db,
                             &mut hygiene_id,
@@ -626,7 +623,8 @@ impl<'db> Resolver<'db> {
             Some(items) => items,
             None => Some((self.module_scope, *path)),
         };
-        if let Some(res) = items.and_then(|(items, path)| items.resolve_path_in_value_ns(db, &path)) {
+        if let Some(res) = items.and_then(|(items, path)| items.resolve_path_in_value_ns(db, &path))
+        {
             return Some(res);
         }
 
@@ -754,9 +752,9 @@ impl<'db> Resolver<'db> {
             }
             _ => None,
         });
-        if let Some(items) = block.or_else(|| {
-            self.module_scope.answers(db, mod_path, ns).then_some(self.module_scope)
-        }) {
+        if let Some(items) = block
+            .or_else(|| self.module_scope.answers(db, mod_path, ns).then_some(self.module_scope))
+        {
             items.record_uses(db, mod_path, ns, out);
         }
     }
@@ -1001,8 +999,10 @@ impl<'db> Resolver<'db> {
                 Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                     let impl_data = ImplSignature::of(db, impl_);
                     if let Some(target_trait) = impl_data.target_trait
-                        && let Some(TypeNs::TraitId(trait_)) = self
-                            .resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))
+                        && let Some(TypeNs::TraitId(trait_)) = self.resolve_path_in_type_ns_fully(
+                            db,
+                            impl_data.store.path(target_trait.path),
+                        )
                     {
                         f(trait_)?;
                     }
@@ -1080,7 +1080,12 @@ impl<'db> Resolver<'db> {
     ) -> Option<ModuleId> {
         match hygiene.is_root() {
             true => None,
-            false => crate::nameres::def_site::privacy_scope(db, hygiene.syntax_context(), expn, self.module()),
+            false => crate::nameres::def_site::privacy_scope(
+                db,
+                hygiene.syntax_context(),
+                expn,
+                self.module(),
+            ),
         }
     }
 
@@ -1334,10 +1339,7 @@ fn handle_macro_def_scope(
 }
 
 #[inline]
-fn hygiene_info(
-    db: &Db,
-    hygiene_id: HygieneId,
-) -> Option<(SyntaxContext, MacroDefId)> {
+fn hygiene_info(db: &Db, hygiene_id: HygieneId) -> Option<(SyntaxContext, MacroDefId)> {
     if !hygiene_id.is_root() {
         let ctx = hygiene_id.syntax_context();
         ctx.outer_expn(db).map(|expansion| {
@@ -1380,7 +1382,12 @@ impl<'db> Resolver<'db> {
 
     /// The items of a module of a block's def map, which share the crate's local def map.
     fn block_items(&self, def_map: &'db DefMap, module_id: ModuleId) -> ModuleItemMap<'db> {
-        ModuleItemMap { def_map, local_def_map: self.module_scope.local_def_map, module_id, around: false }
+        ModuleItemMap {
+            def_map,
+            local_def_map: self.module_scope.local_def_map,
+            module_id,
+            around: false,
+        }
     }
 
     /// The item scope a path whose first segment has `hygiene` is looked up in, by a `macro`'s
@@ -1421,12 +1428,7 @@ impl<'db> Resolver<'db> {
         }
     }
 
-    fn resolve_module_path(
-        &self,
-        db: &Db,
-        path: &ModPath,
-        shadow: BuiltinShadowMode,
-    ) -> PerNs {
+    fn resolve_module_path(&self, db: &Db, path: &ModPath, shadow: BuiltinShadowMode) -> PerNs {
         let (item_map, item_local_map, module) = self.item_scope_();
         // This method resolves `path` just like import paths, so no expected macro subns is given.
         let (module_res, segment_index) =
@@ -1569,11 +1571,7 @@ impl<'db> Resolver<'db> {
         self
     }
 
-    fn push_generic_params_scope(
-        self,
-        db: &'db Db,
-        def: GenericDefId,
-    ) -> Resolver<'db> {
+    fn push_generic_params_scope(self, db: &'db Db, def: GenericDefId) -> Resolver<'db> {
         let params = GenericParams::of(db, def);
         self.push_scope(Scope::GenericParams { def, params })
     }
@@ -1581,7 +1579,11 @@ impl<'db> Resolver<'db> {
 
 impl<'db> ModuleItemMap<'db> {
     /// `path` in this scope and, when [`Self::around`], the scopes around its block.
-    fn resolve_locally(&self, db: &Db, path: &ModPath) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
+    fn resolve_locally(
+        &self,
+        db: &Db,
+        path: &ModPath,
+    ) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
         match self.around {
             true => self.def_map.resolve_path_around(
                 self.local_def_map,
@@ -1651,7 +1653,9 @@ impl<'db> ModuleItemMap<'db> {
     fn answers(&self, db: &Db, path: &ModPath, ns: Namespace) -> bool {
         match ns {
             Namespace::Values => self.resolve_path_in_value_ns(db, path).is_some(),
-            Namespace::Types | Namespace::Macros => self.resolve_path_in_type_ns(db, path).is_some(),
+            Namespace::Types | Namespace::Macros => {
+                self.resolve_path_in_type_ns(db, path).is_some()
+            }
         }
     }
 
@@ -1775,7 +1779,8 @@ impl HasResolver for ModuleId {
             while let Some(parent) = def_map.parent() {
                 let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
                 let block_module_id = mem::replace(&mut module_id, parent);
-                scopes.push(Scope::BlockScope { def_map: block_def_map, module_id: block_module_id });
+                scopes
+                    .push(Scope::BlockScope { def_map: block_def_map, module_id: block_module_id });
                 if parent.block(db).is_none() {
                     break;
                 }

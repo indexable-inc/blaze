@@ -68,7 +68,11 @@ fn the_slots_take_what_the_free_lists_took() {
             }
             assert_eq!(slots.made(), model.generation.len(), "seed {seed}: slots made");
             for &handle in live.iter().chain(&stale) {
-                assert_eq!(slots.live(handle), model.live(parts(handle)), "seed {seed}: {handle:?}");
+                assert_eq!(
+                    slots.live(handle),
+                    model.live(parts(handle)),
+                    "seed {seed}: {handle:?}"
+                );
             }
             assert!(stale.iter().all(|&it| !slots.live(it)), "seed {seed}: a stale handle is live");
         }
@@ -104,12 +108,23 @@ fn a_done_for_a_task_whose_slot_was_reused_is_refused() {
 
 /// A request's nodes: a diamond, one of them keyed, and one alone.
 fn diamond() -> Vec<Spec> {
-    vec![work(1, &[], 3), work(2, &[1], 2), keyed(3, &[1], 2, 7), work(4, &[2, 3], 1), work(5, &[], 1)]
+    vec![
+        work(1, &[], 3),
+        work(2, &[1], 2),
+        keyed(3, &[1], 2, 7),
+        work(4, &[2, 3], 1),
+        work(5, &[], 1),
+    ]
 }
 
 /// One request through the plane: opened, its nodes added, closed and released at once, then
 /// each node run reported built until it finishes. `out` and `running` keep their room.
-fn one_round(plane: &mut Plane, nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>, running: &mut Vec<NodeId>) {
+fn one_round(
+    plane: &mut Plane,
+    nodes: Vec<Spec>,
+    out: &mut Vec<PlaneOutput>,
+    running: &mut Vec<NodeId>,
+) {
     let request = RequestId(9);
     out.clear();
     let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false };
@@ -139,8 +154,14 @@ fn one_round(plane: &mut Plane, nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>, ru
         }
         assert!(!running.is_empty(), "a request that neither runs nor finishes");
         for &id in running.iter() {
-            let done =
-                PlaneInput::Done { at_ns, id, outcome: Outcome::Built, added: Vec::new(), group: None, peak: 0 };
+            let done = PlaneInput::Done {
+                at_ns,
+                id,
+                outcome: Outcome::Built,
+                added: Vec::new(),
+                group: None,
+                peak: 0,
+            };
             plane.step_into(done, out).unwrap();
             at_ns += 1;
         }

@@ -23,9 +23,8 @@ fn raise_internal_error_unwinds_as_a_typed_payload_inside_a_test_context() {
     let payload = with_test_context(|| {
         catch_unwind(|| raise_internal_error(format_args!("inner"))).unwrap_err()
     });
-    let internal = payload
-        .downcast_ref::<InternalError>()
-        .expect("expected an InternalError control payload");
+    let internal =
+        payload.downcast_ref::<InternalError>().expect("expected an InternalError control payload");
     assert!(internal.0.contains("inner"), "{}", internal.0);
 }
 
@@ -34,10 +33,7 @@ fn internal_assert_includes_the_condition_when_it_fails() {
     let value = 3;
     let payload = catch_unwind(|| hegel_internal_assert!(value == 4)).unwrap_err();
     let msg = panic_message(payload);
-    assert!(
-        msg.contains("internal assertion failed: value == 4"),
-        "{msg}"
-    );
+    assert!(msg.contains("internal assertion failed: value == 4"), "{msg}");
 }
 
 #[test]

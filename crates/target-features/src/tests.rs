@@ -31,7 +31,10 @@ fn rustc_map(arch: TargetArch) -> HashMap<&'static str, &'static [&'static str]>
 }
 
 /// rustc's `implied_target_features` of each feature of `enabled`, added to it.
-fn rustc_expand(map: &HashMap<&'static str, &'static [&'static str]>, enabled: &mut HashSet<&'static str>) {
+fn rustc_expand(
+    map: &HashMap<&'static str, &'static [&'static str]>,
+    enabled: &mut HashSet<&'static str>,
+) {
     let mut queue = enabled.iter().copied().collect::<Vec<_>>();
     while let Some(feature) = queue.pop() {
         if let Some(implications) = map.get(feature) {

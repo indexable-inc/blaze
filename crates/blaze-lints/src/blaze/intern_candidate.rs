@@ -47,7 +47,17 @@ const DEPTH: u32 = 4;
 /// The owned pointers and collections of std, by name: what makes a type deep, and what a
 /// recursive type holds itself through.
 const HEAP: &[&str] = &[
-    "Box", "Vec", "String", "Rc", "Arc", "VecDeque", "BTreeMap", "BTreeSet", "HashMap", "HashSet", "LinkedList",
+    "Box",
+    "Vec",
+    "String",
+    "Rc",
+    "Arc",
+    "VecDeque",
+    "BTreeMap",
+    "BTreeSet",
+    "HashMap",
+    "HashSet",
+    "LinkedList",
     "BinaryHeap",
 ];
 
@@ -150,7 +160,10 @@ fn key_of(db: &Db, ty: &hir::Type<'_>) -> Option<AdtId> {
     let adt = ty.as_adt()?;
     let name = adt.name(db);
     let krate = adt.module(db).krate(db);
-    if !KEYED.iter().any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it)) {
+    if !KEYED
+        .iter()
+        .any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it))
+    {
         return None;
     }
     ty.type_arguments().next()?.strip_references().as_adt().map(AdtId::from)
@@ -164,7 +177,14 @@ fn heap(db: &Db, adt: hir::Adt) -> bool {
 }
 
 /// The most owned heap types `ty` nests, one in another; and whether it holds `me` behind one.
-fn depth(db: &Db, ty: &hir::Type<'_>, me: hir::Adt, under_heap: bool, budget: u32, recursive: &mut bool) -> u32 {
+fn depth(
+    db: &Db,
+    ty: &hir::Type<'_>,
+    me: hir::Adt,
+    under_heap: bool,
+    budget: u32,
+    recursive: &mut bool,
+) -> u32 {
     let ty = ty.strip_references();
     if let Some(inner) = ty.as_slice() {
         return depth(db, &inner, me, under_heap, budget, recursive);
@@ -174,7 +194,11 @@ fn depth(db: &Db, ty: &hir::Type<'_>, me: hir::Adt, under_heap: bool, budget: u3
     }
     if ty.is_tuple() {
         let fields = ty.tuple_fields(db);
-        return fields.iter().map(|it| depth(db, it, me, under_heap, budget, recursive)).max().unwrap_or(0);
+        return fields
+            .iter()
+            .map(|it| depth(db, it, me, under_heap, budget, recursive))
+            .max()
+            .unwrap_or(0);
     }
     let Some(adt) = ty.as_adt() else { return 0 };
     if adt == me {
@@ -185,7 +209,8 @@ fn depth(db: &Db, ty: &hir::Type<'_>, me: hir::Adt, under_heap: bool, budget: u3
         return 0;
     }
     if heap(db, adt) {
-        let inner = ty.type_arguments().map(|it| depth(db, &it, me, true, budget - 1, recursive)).max();
+        let inner =
+            ty.type_arguments().map(|it| depth(db, &it, me, true, budget - 1, recursive)).max();
         return 1 + inner.unwrap_or(0);
     }
     match adt {
@@ -195,9 +220,11 @@ fn depth(db: &Db, ty: &hir::Type<'_>, me: hir::Adt, under_heap: bool, budget: u3
             .map(|(_, it)| depth(db, it, me, under_heap, budget - 1, recursive))
             .max()
             .unwrap_or(0),
-        hir::Adt::Enum(_) => {
-            ty.type_arguments().map(|it| depth(db, &it, me, under_heap, budget - 1, recursive)).max().unwrap_or(0)
-        }
+        hir::Adt::Enum(_) => ty
+            .type_arguments()
+            .map(|it| depth(db, &it, me, under_heap, budget - 1, recursive))
+            .max()
+            .unwrap_or(0),
     }
 }
 
@@ -240,7 +267,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Adt<'t>) {
         return;
     }
     let mut recursive = false;
-    let deepest = field_types(db, adt).iter().map(|it| depth(db, it, adt, false, DEPTH, &mut recursive)).max();
+    let deepest = field_types(db, adt)
+        .iter()
+        .map(|it| depth(db, it, adt, false, DEPTH, &mut recursive))
+        .max();
     let deep = deepest.unwrap_or(0) >= 2;
     if !recursive && !deep {
         return;

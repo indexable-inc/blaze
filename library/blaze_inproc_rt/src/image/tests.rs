@@ -22,13 +22,16 @@ fn a_good_elf() -> Vec<u8> {
 #[test]
 fn an_elf_gives_its_code_reservations_and_header() {
     let got = layout(Format::Elf, &a_good_elf(), PAGE).unwrap();
-    assert_eq!(got, Layout {
-        format: Format::Elf,
-        header: 0,
-        span: 0..0x10_c000,
-        code: vec![Segment { offset: 0x1000, linked: 0x1000, len: 0x3000 }],
-        reserved: vec![0x8000..0x10_8000, 0x10_8000..0x10_c000],
-    });
+    assert_eq!(
+        got,
+        Layout {
+            format: Format::Elf,
+            header: 0,
+            span: 0..0x10_c000,
+            code: vec![Segment { offset: 0x1000, linked: 0x1000, len: 0x3000 }],
+            reserved: vec![0x8000..0x10_8000, 0x10_8000..0x10_c000],
+        }
+    );
     assert_eq!(headers_len(Format::Elf, &a_good_elf()), Some(64 + 56 * 6));
 }
 
@@ -38,10 +41,19 @@ fn an_elf_is_refused_for_what_a_run_cannot_overlay() {
         let error = layout(Format::Elf, &elf(loads), PAGE).unwrap_err();
         assert!(error.what.contains(says), "{error} does not say {says:?}");
     };
-    refused(&[(R, 0, 0, 0x800, 0x800), (RX | RW, 0x1000, 0x1000, 0x10, 0x10)], "writable and executable");
+    refused(
+        &[(R, 0, 0, 0x800, 0x800), (RX | RW, 0x1000, 0x1000, 0x10, 0x10)],
+        "writable and executable",
+    );
     refused(&[(R, 0, 0, 0x800, 0x800), (RX, 0x1000, 0x1000, 0x10, 0x20)], "all file bytes");
-    refused(&[(R, 0, 0, 0x800, 0x800), (RX, 0x1010, 0x1010, 0x10, 0x10)], "does not start on a page");
-    refused(&[(R, 0, 0, 0x800, 0x800), (RX, 0x1000, 0x1000, 0x10, 0x10), (RW, 0x1800, 0x1800, 8, 8)], "shares a page");
+    refused(
+        &[(R, 0, 0, 0x800, 0x800), (RX, 0x1010, 0x1010, 0x10, 0x10)],
+        "does not start on a page",
+    );
+    refused(
+        &[(R, 0, 0, 0x800, 0x800), (RX, 0x1000, 0x1000, 0x10, 0x10), (RW, 0x1800, 0x1800, 8, 8)],
+        "shares a page",
+    );
     refused(&[(R, 0, 0, 0x800, 0x800), (0, 0x1000, 0x1000, 0x10, 0x1000)], "has file bytes");
     refused(&[(R, 0, 0, 0x800, 0x800), (0, 0, 0x1800, 0, 0x1000)], "not whole pages");
     refused(&[(RX, 0x1000, 0x1000, 0x10, 0x10)], "file offset 0");
@@ -62,7 +74,8 @@ fn macho(segments: &[(&str, u64, u64, u64, u64, u32)]) -> Vec<u8> {
     put32(&mut out, 12, 2);
     put32(&mut out, 16, segments.len() as u32);
     put32(&mut out, 20, commands as u32);
-    for (index, &(name, vmaddr, vmsize, fileoff, filesize, initprot)) in segments.iter().enumerate() {
+    for (index, &(name, vmaddr, vmsize, fileoff, filesize, initprot)) in segments.iter().enumerate()
+    {
         let at = 32 + 72 * index;
         put32(&mut out, at, 0x19);
         put32(&mut out, at + 4, 72);
@@ -92,13 +105,16 @@ fn a_good_macho() -> Vec<u8> {
 #[test]
 fn a_macho_gives_its_code_reservations_and_header() {
     let got = layout(Format::MachO, &a_good_macho(), MPAGE).unwrap();
-    assert_eq!(got, Layout {
-        format: Format::MachO,
-        header: 0x1_0000_0000,
-        span: 0x1_0000_0000..0x1_0041_4000,
-        code: vec![Segment { offset: 0, linked: 0x1_0000_0000, len: 0x8000 }],
-        reserved: vec![0x1_0001_0000..0x1_0041_0000],
-    });
+    assert_eq!(
+        got,
+        Layout {
+            format: Format::MachO,
+            header: 0x1_0000_0000,
+            span: 0x1_0000_0000..0x1_0041_4000,
+            code: vec![Segment { offset: 0, linked: 0x1_0000_0000, len: 0x8000 }],
+            reserved: vec![0x1_0001_0000..0x1_0041_0000],
+        }
+    );
     assert_eq!(headers_len(Format::MachO, &a_good_macho()), Some(32 + 72 * 5));
 }
 
@@ -174,13 +190,16 @@ fn a_good_pe() -> Vec<u8> {
 #[test]
 fn a_pe_gives_its_code_as_one_segment_on_granules() {
     let got = layout(Format::Pe, &a_good_pe(), GRANULE).unwrap();
-    assert_eq!(got, Layout {
-        format: Format::Pe,
-        header: BASE,
-        span: BASE..BASE + 0x23_0000,
-        code: vec![Segment { offset: 0x1_0000, linked: BASE + 0x1_0000, len: 0x1_0000 }],
-        reserved: vec![BASE + 0x3_0000..BASE + 0x23_0000],
-    });
+    assert_eq!(
+        got,
+        Layout {
+            format: Format::Pe,
+            header: BASE,
+            span: BASE..BASE + 0x23_0000,
+            code: vec![Segment { offset: 0x1_0000, linked: BASE + 0x1_0000, len: 0x1_0000 }],
+            reserved: vec![BASE + 0x3_0000..BASE + 0x23_0000],
+        }
+    );
     assert_eq!(headers_len(Format::Pe, &a_good_pe()), Some(0x400));
 }
 
@@ -194,8 +213,14 @@ fn a_pe_is_refused_for_what_a_run_cannot_overlay() {
     refused(&[(0x100, 0x1_0000, 0x200, 0x1_0000, CODE | 0x8000_0000)], "writable and executable");
     refused(&[(0x100, 0x1_0000, 0x200, 0x400, CODE)], "raw data at");
     refused(&[(0x300, 0x1_0000, 0x200, 0x1_0000, CODE)], "all raw data");
-    refused(&[(0x100, 0x1_0000, 0x200, 0x1_0000, CODE), (0x100, 0x1_1000, 0x200, 0x1_1000, DATA)], "shares a page");
-    refused(&[(0x100, 0x1_0000, 0x200, 0x1_0000, CODE), (0x1000, 0x2_1000, 0, 0, 0)], "not whole pages");
+    refused(
+        &[(0x100, 0x1_0000, 0x200, 0x1_0000, CODE), (0x100, 0x1_1000, 0x200, 0x1_1000, DATA)],
+        "shares a page",
+    );
+    refused(
+        &[(0x100, 0x1_0000, 0x200, 0x1_0000, CODE), (0x1000, 0x2_1000, 0, 0, 0)],
+        "not whole pages",
+    );
     let mut dll = a_good_pe();
     put16(&mut dll, 0x80 + 22, 0x2022);
     assert!(layout(Format::Pe, &dll, GRANULE).unwrap_err().what.contains("not an executable"));
@@ -203,7 +228,11 @@ fn a_pe_is_refused_for_what_a_run_cannot_overlay() {
 
 #[test]
 fn headers_mutated_or_cut_are_an_error_or_a_layout_never_a_panic() {
-    let cases = [(Format::Elf, a_good_elf(), PAGE), (Format::MachO, a_good_macho(), MPAGE), (Format::Pe, a_good_pe(), GRANULE)];
+    let cases = [
+        (Format::Elf, a_good_elf(), PAGE),
+        (Format::MachO, a_good_macho(), MPAGE),
+        (Format::Pe, a_good_pe(), GRANULE),
+    ];
     let mut rng = SplitMix64::new(0x1a40_77ee_0000_0003);
     for (format, bytes, page) in cases {
         for cut in 0..bytes.len() {
@@ -218,12 +247,27 @@ fn headers_mutated_or_cut_are_an_error_or_a_layout_never_a_panic() {
             }
             if let Ok(got) = layout(format, &mutated, page) {
                 for segment in &got.code {
-                    assert!(segment.linked.is_multiple_of(page) && segment.len.is_multiple_of(page) && segment.len != 0);
-                    assert!(segment.linked >= got.span.start && segment.linked + segment.len <= got.span.end);
+                    assert!(
+                        segment.linked.is_multiple_of(page)
+                            && segment.len.is_multiple_of(page)
+                            && segment.len != 0
+                    );
+                    assert!(
+                        segment.linked >= got.span.start
+                            && segment.linked + segment.len <= got.span.end
+                    );
                 }
                 for range in &got.reserved {
-                    assert!(range.start.is_multiple_of(page) && range.end.is_multiple_of(page) && range.start < range.end);
-                    assert!(got.code.iter().all(|it| it.linked + it.len <= range.start || range.end <= it.linked));
+                    assert!(
+                        range.start.is_multiple_of(page)
+                            && range.end.is_multiple_of(page)
+                            && range.start < range.end
+                    );
+                    assert!(
+                        got.code
+                            .iter()
+                            .all(|it| it.linked + it.len <= range.start || range.end <= it.linked)
+                    );
                 }
             }
         }

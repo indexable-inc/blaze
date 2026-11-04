@@ -9,7 +9,6 @@ use std::{cell::RefCell, mem, ops};
 
 use base_db::{Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use either::Either;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, TraitId, VariantId,
@@ -25,6 +24,7 @@ use hir_ty::{
 };
 use hir_ty_unsafeck::unsafe_operations;
 use span::FileId;
+use std::alloc::Global;
 
 use crate::{
     BuiltinAttr, ConstParam, Crate, DeriveHelper, ExpressionStoreOwner, Function, Impl, ItemInNs,

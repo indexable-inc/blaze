@@ -49,10 +49,13 @@ unsafe impl MemoryCreator for Lazy {
         maximum: Option<usize>,
         reserved: Option<usize>,
         guard: usize,
-    ) -> Result<Box<dyn LinearMemory>, String> { // dyn: Wasmtime's
+    ) -> Result<Box<dyn LinearMemory>, String> {
+        // dyn: Wasmtime's
         if guard != 0 {
             // alloc: error path
-            return Err(format!("Wasmtime asked the seed runner for a {guard}-byte guard region, which its engine sets to none"));
+            return Err(format!(
+                "Wasmtime asked the seed runner for a {guard}-byte guard region, which its engine sets to none"
+            ));
         }
         let Some(reserved) = reserved else {
             // alloc: error path
@@ -60,17 +63,26 @@ unsafe impl MemoryCreator for Lazy {
         };
         if !ty.is_64() {
             // alloc: error path
-            return Err("the module's memory is 32-bit: the seed runner runs memory64 seeds (wasm64)".to_owned());
+            return Err(
+                "the module's memory is 32-bit: the seed runner runs memory64 seeds (wasm64)"
+                    .to_owned(),
+            );
         }
         // The whole reservation, never less for a smaller maximum: Wasmtime compiles its bounds
         // checks against the engine's `memory_reservation`, which is this.
         let _ = maximum;
         if minimum > reserved {
             // alloc: error path
-            return Err(format!("the module's memory starts at {minimum} bytes, more than the {reserved} bytes the seed runner reserves (its maximum)"));
+            return Err(format!(
+                "the module's memory starts at {minimum} bytes, more than the {reserved} bytes the seed runner reserves (its maximum)"
+            ));
         }
         // alloc: one per memory
-        Ok(Box::new(Reservation::new(reserved, minimum).map_err(|why| format!("reserving {reserved} bytes for the seed's memory: {why}"))?))
+        Ok(Box::new(
+            Reservation::new(reserved, minimum).map_err(|why| {
+                format!("reserving {reserved} bytes for the seed's memory: {why}")
+            })?,
+        ))
     }
 }
 
@@ -92,7 +104,8 @@ unsafe impl Sync for Reservation {}
 impl Reservation {
     fn new(reserved: usize, minimum: usize) -> io::Result<Reservation> {
         let page = page();
-        let reserved = round_up(reserved.max(page), page).ok_or_else(|| io::Error::other("the reservation overflows"))?;
+        let reserved = round_up(reserved.max(page), page)
+            .ok_or_else(|| io::Error::other("the reservation overflows"))?;
         // SAFETY: a fresh anonymous mapping at an address the kernel picks; it overlaps
         // nothing the process holds.
         let base = unsafe {
@@ -108,7 +121,8 @@ impl Reservation {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let base = NonNull::new(base.cast::<u8>()).ok_or_else(|| io::Error::other("mmap returned null"))?;
+        let base = NonNull::new(base.cast::<u8>())
+            .ok_or_else(|| io::Error::other("mmap returned null"))?;
         // Owned from here: an error below unmaps it.
         let mut memory = Reservation { base, reserved, size: 0, page };
         #[cfg(target_os = "linux")]
@@ -132,11 +146,20 @@ impl Reservation {
         if to > from {
             // SAFETY: `[base + from, base + to)` is inside the reservation (`to` is at most
             // `reserved`, a multiple of the page), which this value alone maps.
-            let rc = unsafe { libc::mprotect(self.base.as_ptr().add(from).cast(), to - from, libc::PROT_READ | libc::PROT_WRITE) };
+            let rc = unsafe {
+                libc::mprotect(
+                    self.base.as_ptr().add(from).cast(),
+                    to - from,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
             if rc != 0 {
                 let why = io::Error::last_os_error();
                 // alloc: error path
-                return Err(io::Error::new(why.kind(), format!("making {} bytes writable (mprotect): {why}", to - from)));
+                return Err(io::Error::new(
+                    why.kind(),
+                    format!("making {} bytes writable (mprotect): {why}", to - from),
+                ));
             }
         }
         self.size = new;
@@ -155,11 +178,18 @@ fn no_huge_pages(base: NonNull<u8>, len: usize) -> io::Result<()> {
         return Ok(());
     }
     let why = io::Error::last_os_error();
-    if why.raw_os_error() == Some(libc::EINVAL) && !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+    if why.raw_os_error() == Some(libc::EINVAL)
+        && !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists()
+    {
         return Ok(());
     }
     // alloc: error path
-    Err(io::Error::new(why.kind(), format!("turning transparent huge pages off for the seed's {len}-byte memory (madvise MADV_NOHUGEPAGE): {why}")))
+    Err(io::Error::new(
+        why.kind(),
+        format!(
+            "turning transparent huge pages off for the seed's {len}-byte memory (madvise MADV_NOHUGEPAGE): {why}"
+        ),
+    ))
 }
 
 // SAFETY: `as_ptr` is the base of a mapping that never moves and stays mapped until drop;

@@ -12,8 +12,8 @@ use rustc_abi::{ExternAbi, Float, Integer, Size};
 use rustc_ast_ir::{Mutability, try_visit, visit::VisitorResult};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ClosureKind, DebruijnIndex, FlagComputation, Flags, FloatTy,
-    FloatVid, GenericTypeVisitable, InferTy, IntTy, IntVid, Interner, PredicateProxy,
-    TyVid, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+    FloatVid, GenericTypeVisitable, InferTy, IntTy, IntVid, Interner, PredicateProxy, TyVid,
+    TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
     TypeVisitor, UintTy, Upcast,
     inherent::{
         AdtDef as _, BoundExistentialPredicates, GenericArgs as _, IntoKind, ParamLike,
@@ -1332,12 +1332,11 @@ impl<'db> rustc_type_ir::inherent::Ty<DbInterner<'db>> for Ty<'db> {
         // cycle detection in fulfillment will not kick in, which leads
         // to unnecessary overflows in async code. See the issue:
         // <https://github.com/rust-lang/rust/issues/145151>.
-        let coroutine_args = interner.mk_args_from_iter(coroutine_args.iter().map(|arg| {
-            match arg.kind() {
+        let coroutine_args =
+            interner.mk_args_from_iter(coroutine_args.iter().map(|arg| match arg.kind() {
                 GenericArgKind::Type(_) | GenericArgKind::Const(_) => arg,
                 GenericArgKind::Lifetime(_) => Region::new_erased(interner).into(),
-            }
-        }));
+            }));
         Ty::new_coroutine_witness(interner, def_id, coroutine_args)
     }
 
@@ -1354,11 +1353,7 @@ impl<'db> rustc_type_ir::inherent::Ty<DbInterner<'db>> for Ty<'db> {
         Ty::new(interner, TyKind::Ref(region, ty, mutbl))
     }
 
-    fn new_array_with_const_len(
-        interner: DbInterner<'db>,
-        ty: Self,
-        len: Const<'db>,
-    ) -> Self {
+    fn new_array_with_const_len(interner: DbInterner<'db>, ty: Self, len: Const<'db>) -> Self {
         Ty::new(interner, TyKind::Array(ty, len))
     }
 

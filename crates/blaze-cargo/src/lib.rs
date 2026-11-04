@@ -48,7 +48,12 @@ pub const REFUSED_SAYS: &str = "blaze could not compile";
 /// could not compile, `reached` of them, each `name: why`, the first `shown` named (every one
 /// with `None`). Nothing else compiles them (AGENTS.md, no fallback), and a link without them
 /// would fail on what they leave undefined or keep a stand-in that aborts.
-pub fn refused_error(program: &str, reached: usize, said: impl Iterator<Item = String>, shown: Option<u32>) -> String {
+pub fn refused_error(
+    program: &str,
+    reached: usize,
+    said: impl Iterator<Item = String>,
+    shown: Option<u32>,
+) -> String {
     let shown = shown.map_or(usize::MAX, |it| usize::try_from(it).unwrap_or(usize::MAX));
     let mut text = format!(
         "`{program}` reaches {reached} function{} {REFUSED_SAYS}, and a build with nothing of \
@@ -71,12 +76,18 @@ mod refused_tests {
     fn a_refused_error_names_as_many_as_asked() {
         let said = || (0..20).map(|it| format!("f{it}: why"));
         let first = super::refused_error("app", 20, said(), Some(super::REFUSED_SHOWN));
-        assert!(first.contains("\n  f15: why\n  and 4 more (`--refused all` names every one)"), "{first}");
+        assert!(
+            first.contains("\n  f15: why\n  and 4 more (`--refused all` names every one)"),
+            "{first}"
+        );
         assert!(!first.contains("f16"), "{first}");
         let every = super::refused_error("app", 20, said(), None);
         assert!(every.ends_with("\n  f19: why") && !every.contains("more"), "{every}");
         let none = super::refused_error("app", 20, said(), Some(0));
-        assert!(none.ends_with("so it is not built:\n  and 20 more (`--refused all` names every one)"), "{none}");
+        assert!(
+            none.ends_with("so it is not built:\n  and 20 more (`--refused all` names every one)"),
+            "{none}"
+        );
     }
 }
 

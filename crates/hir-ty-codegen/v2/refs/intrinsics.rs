@@ -16,7 +16,6 @@ use std::{
 };
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use cranelift_codegen::ir::{self, types};
 use hir_def::{
     AdtId, FunctionId, HasModule, VariantId,
@@ -36,6 +35,7 @@ use hir_ty_mir::mir::{
 use rustc_abi::Size;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{Tys, Walk, told};
 use crate::{
@@ -211,9 +211,9 @@ fn neon_pairwise(name: &str, arity: usize) -> bool {
         ("umaxp" | "smaxp" | "uminp" | "sminp" | "addp", 2) => true,
         ("sqdmulh", 2) => ty.bits() <= 32,
         ("uaddlp" | "saddlp", 1) => ty.bits() <= 32,
-        ("uaddlv" | "saddlv" | "uaddv" | "saddv", 1) => first
-            .and_then(|it| ir::Type::int(it.strip_prefix('i')?.parse().ok()?))
-            .is_some(),
+        ("uaddlv" | "saddlv" | "uaddv" | "saddv", 1) => {
+            first.and_then(|it| ir::Type::int(it.strip_prefix('i')?.parse().ok()?)).is_some()
+        }
         ("sqdmull", 2) => ty.bits() >= 32,
         ("tbl1", 2) | ("tbx1", 3) => ty == types::I8,
         _ => false,
@@ -804,10 +804,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let scalar = self.ty_scalar(arg_tys[0])?;
                 if !scalar.ty.is_float() {
                     // alloc: the error's message
-                    return Err(unsupported(format!(
-                        "intrinsic `{intrinsic}` on {:?}",
-                        scalar.ty
-                    )));
+                    return Err(unsupported(format!("intrinsic `{intrinsic}` on {:?}", scalar.ty)));
                 }
                 if soft(scalar.ty) {
                     self.soft_unary(intrinsic, scalar.ty)?;
@@ -850,10 +847,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 self.ty_scalar(arg_tys[1])?;
                 if !scalar.ty.is_float() {
                     // alloc: the error's message
-                    return Err(unsupported(format!(
-                        "intrinsic `{intrinsic}` on {:?}",
-                        scalar.ty
-                    )));
+                    return Err(unsupported(format!("intrinsic `{intrinsic}` on {:?}", scalar.ty)));
                 }
                 if soft(scalar.ty) {
                     let op = match intrinsic {
@@ -1038,11 +1032,19 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     "x86.sha256msg1" => "sha256msg1 xmm0, xmm1",
                     _ => "sha256msg2 xmm0, xmm1",
                 };
-                self.assembly(asm::vector_instruction(self.fx.cg.target.call_conv, instruction, "xmm0"))?;
+                self.assembly(asm::vector_instruction(
+                    self.fx.cg.target.call_conv,
+                    instruction,
+                    "xmm0",
+                ))?;
             }
             ("x86.sha256rnds2", [_, _, _]) => {
                 let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
-                self.assembly(asm::vector_instruction(self.fx.cg.target.call_conv, rounds, "xmm3"))?;
+                self.assembly(asm::vector_instruction(
+                    self.fx.cg.target.call_conv,
+                    rounds,
+                    "xmm3",
+                ))?;
             }
             (
                 "aarch64.crypto.sha256su0"
@@ -1063,7 +1065,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 | "aarch64.crypto.sha1su0",
                 [_, _, _],
             ) => self.assembly(crate::neon_crypto(name))?,
-            ("x86.sha1rnds4", [_, _, _]) => self.assembly(asm::sha1rnds4(self.fx.cg.target.call_conv))?,
+            ("x86.sha1rnds4", [_, _, _]) => {
+                self.assembly(asm::sha1rnds4(self.fx.cg.target.call_conv))?
+            }
             ("x86.xgetbv", [_]) => self.assembly(asm::xgetbv(self.fx.cg.target.call_conv))?,
             (
                 "aarch64.crc32b" | "aarch64.crc32h" | "aarch64.crc32w" | "aarch64.crc32x"
@@ -1160,6 +1164,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     "x86.avx512fp16.",
                     "x86.avx512bf16.",
                     "x86.avx2.vpdp",
+                    "x86.avx2.gather.",
                     "x86.vcvtne",
                     "x86.vbcstne",
                 ]
@@ -1218,11 +1223,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     }
 
     /// What `lower_fma` refuses of an fma giving `dst_ty`, and else its bytes and suffix.
-    fn fma_shape(
-        &self,
-        name: Intrinsic,
-        dst_ty: Ty<'db>,
-    ) -> Result<(u32, &'static str), String> {
+    fn fma_shape(&self, name: Intrinsic, dst_ty: Ty<'db>) -> Result<(u32, &'static str), String> {
         if self.enables_feature(TargetFeature::FMA4) {
             // alloc: the error's message
             return Err(unsupported(format!("`{name}` in an x86-64 function with FMA4")));
@@ -1276,7 +1277,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn fused_forms(&mut self, bytes: u32, suffix: &str) -> Result<(), String> {
         let loads = [avx512::Load::Vector(bytes); 3];
         for text in fma_texts(bytes, suffix) {
-            self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &loads, &text, avx512::Out::Vector(bytes)))?;
+            self.assembly(asm::avx512_function(
+                self.fx.cg.target.call_conv,
+                &loads,
+                &text,
+                avx512::Out::Vector(bytes),
+            ))?;
         }
         Ok(())
     }
@@ -1329,20 +1335,25 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 }
                 return Ok(());
             }
-            let lowered = avx512::half_vector(op, a.count * a.bits / 8, r.count * r.bits / 8, |it| {
-                self.fx.function_enables(it)
-            });
+            let lowered =
+                avx512::half_vector(op, a.count * a.bits / 8, r.count * r.bits / 8, |it| {
+                    self.fx.function_enables(it)
+                });
             let Some(lowered) = lowered.filter(|it| it.loads.len() == args.len()) else {
                 // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` of lanes of f16 on x86-64 without an instruction for it here"
                 )));
             };
-            return self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out));
+            return self.assembly(asm::avx512_function(
+                self.fx.cg.target.call_conv,
+                &lowered.loads,
+                &lowered.text,
+                lowered.out,
+            ));
         }
         let single_and_half = op == SimdOp::Cast && matches!(widths, Some((16, 32) | (32, 16)));
-        if self.fx.cg.target.arch != Arch::Aarch64
-            || !(single_and_half || self.fx.half_precision())
+        if self.fx.cg.target.arch != Arch::Aarch64 || !(single_and_half || self.fx.half_precision())
         {
             return Err(unsupported(
                 "vector operation on lanes of f16 without the half-precision instructions",
@@ -1516,7 +1527,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             OperandKind::Copy(_) | OperandKind::Move(_) => {
                 return match self.fx.assigned_once(operand) {
                     Some(Rvalue::Use(from)) => self.splat_immediate(from, lane),
-                    Some(Rvalue::Aggregate(AggregateKind::Adt(..), fields)) if fields.len() == 1 => {
+                    Some(Rvalue::Aggregate(AggregateKind::Adt(..), fields))
+                        if fields.len() == 1 =>
+                    {
                         self.splat_immediate(&fields[0], lane)
                     }
                     Some(Rvalue::Repeat(from, _)) => {
@@ -1575,7 +1588,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             // alloc: the error's message
             return Err(unsupported(format!("`llvm.{name}` returning {dst_ty:?}")));
         }
-        self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out))?;
+        self.assembly(asm::avx512_function(
+            self.fx.cg.target.call_conv,
+            &lowered.loads,
+            &lowered.text,
+            lowered.out,
+        ))?;
         Ok(true)
     }
 
@@ -1656,8 +1674,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 writes
             }
         };
-        let text =
-            asm::x86_function(self.fx.cg.target.call_conv, &text, &reads, &writes, &lowered.clobbers).map_err(unsupported)?;
+        let text = asm::x86_function(
+            self.fx.cg.target.call_conv,
+            &text,
+            &reads,
+            &writes,
+            &lowered.clobbers,
+        )
+        .map_err(unsupported)?;
         self.assembly(text)
     }
 
@@ -1800,7 +1824,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// `branch_unless_equal` of two values of `ty`: `memcmp` of bytes, a soft float's `==`.
     /// `seen` are the types already looked at, which ask for the same wherever they are.
-    fn equal_parts(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>) -> Result<(), String> {
+    fn equal_parts(
+        &mut self,
+        ty: Ty<'db>,
+        seen: &mut HashSet<Ty<'db>, Global>,
+    ) -> Result<(), String> {
         let db = self.db();
         let ty = self.fx.normalize(ty);
         if !seen.insert(ty) {

@@ -119,7 +119,9 @@ fn leaf<'db>(
     let span = cx.span(tree.map(|it| it.syntax().text_range()));
     let message = match crate_private {
         // alloc: the error's message
-        true => format!("`{ident}` is only public within the crate, and cannot be re-exported outside"),
+        true => {
+            format!("`{ident}` is only public within the crate, and cannot be re-exported outside")
+        }
         // alloc: the error's message
         false => format!("`{ident}` is private, and cannot be re-exported"),
     };
@@ -141,7 +143,10 @@ fn leaf<'db>(
         diag = Diag::error(Some("E0364"), message, span.clone());
         match macro_rules(cx, def) {
             Some(range) => {
-                diag.span_help(cx.span(range), "consider adding a `#[macro_export]` to the macro in the imported module");
+                diag.span_help(
+                    cx.span(range),
+                    "consider adding a `#[macro_export]` to the macro in the imported module",
+                );
                 diag.suggestion(
                     cx.span(tree.with_value(vis.syntax().text_range())),
                     "in case you want to use the macro within this crate only, reduce the visibility to `pub(crate)`",
@@ -151,12 +156,18 @@ fn leaf<'db>(
             }
             None => {
                 // alloc: the error's note
-                diag.span_note(span, format!("consider marking `{ident}` as `pub` in the imported module"));
+                diag.span_note(
+                    span,
+                    format!("consider marking `{ident}` as `pub` in the imported module"),
+                );
             }
         }
     }
     if let Some(item) = item_id(cx.db, def) {
-        diag.fact(blaze_items::Fact::Signature(cx.key(item)), "the visibility of the re-exported item");
+        diag.fact(
+            blaze_items::Fact::Signature(cx.key(item)),
+            "the visibility of the re-exported item",
+        );
     }
     let module = cx.vsema.scope(path.syntax()).map(|it| it.module());
     if let Some(module) = module {

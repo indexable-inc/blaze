@@ -99,7 +99,9 @@ fn late_bound_span(cx: &Cx<'_, '_>, def: GenericDef) -> Option<Span> {
         found = match (it.ty(), it.amp_token(), it.lifetime()) {
             (Some(ty), _, _) => first_free(cx, ty.syntax()),
             (None, Some(amp), None) => Some(amp.text_range()),
-            (None, _, Some(lifetime)) if lifetime.text() == "'_" => Some(lifetime.syntax().text_range()),
+            (None, _, Some(lifetime)) if lifetime.text() == "'_" => {
+                Some(lifetime.syntax().text_range())
+            }
             _ => None,
         };
     }

@@ -122,10 +122,16 @@ mod tests {
     fn every_exit_code_round_trips_and_stays_below_signal_deaths() {
         for &exit in Exit::ALL {
             assert_eq!(Exit::from_code(exit.code()), Some(exit), "{exit}");
-            assert!((1..128).contains(&exit.code()), "{exit} is not a code below a signal death's 128");
+            assert!(
+                (1..128).contains(&exit.code()),
+                "{exit} is not a code below a signal death's 128"
+            );
         }
         assert_eq!(Exit::from_code(0), None);
-        assert_eq!(said(76).to_string(), "76 (LOOP_STALLED: its loop made no progress for the stall bound)");
+        assert_eq!(
+            said(76).to_string(),
+            "76 (LOOP_STALLED: its loop made no progress for the stall bound)"
+        );
         assert_eq!(said(3).to_string(), "3");
     }
 }

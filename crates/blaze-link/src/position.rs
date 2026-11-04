@@ -143,8 +143,10 @@ impl Spans {
     /// The name of file `file` (below [`Spans::files`]).
     pub fn file(&self, file: u32) -> &str {
         let at = file as usize * 4;
-        let start = u32::from_le_bytes(self.buf[at..at + 4].try_into().expect("four bytes")) as usize;
-        let len = u32::from_le_bytes(self.buf[start - 4..start].try_into().expect("four bytes")) as usize;
+        let start =
+            u32::from_le_bytes(self.buf[at..at + 4].try_into().expect("four bytes")) as usize;
+        let len =
+            u32::from_le_bytes(self.buf[start - 4..start].try_into().expect("four bytes")) as usize;
         std::str::from_utf8(&self.buf[start..start + len]).expect("checked UTF-8 when made")
     }
 
@@ -153,7 +155,9 @@ impl Spans {
             return None;
         }
         let at = self.spans_at as usize + index as usize * SPAN;
-        let word = |n: usize| u32::from_le_bytes(self.buf[at + n * 4..at + n * 4 + 4].try_into().expect("four bytes"));
+        let word = |n: usize| {
+            u32::from_le_bytes(self.buf[at + n * 4..at + n * 4 + 4].try_into().expect("four bytes"))
+        };
         Some(Position { file: word(0), line: word(1), column: word(2) })
     }
 
@@ -280,7 +284,9 @@ mod tests {
                 spans: (0..n).map(|it| Position { file: it, line: it + 1, column: 1 }).collect(),
             };
             let bytes = owned.encode();
-            let spans = blaze_alloc_count::assert_at_most(1, "a table checked and kept", || Spans::new(&bytes).unwrap());
+            let spans = blaze_alloc_count::assert_at_most(1, "a table checked and kept", || {
+                Spans::new(&bytes).unwrap()
+            });
             blaze_alloc_count::assert_at_most(0, "a span, a file name, a comparison", || {
                 assert_eq!(spans.span(n - 1), Some(Position { file: n - 1, line: n, column: 1 }));
                 assert_eq!(spans.file(n - 1), owned.files[n as usize - 1]);

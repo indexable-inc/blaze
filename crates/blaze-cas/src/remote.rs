@@ -51,14 +51,14 @@
 //! No fallback: a fetch that can't be answered (no connection, the server hung up, a malformed
 //! or too-long frame) completes [`Done::Failed`] naming what went wrong, for the store to see.
 
-use std::collections::VecDeque;
 use blaze_hash::hash_map;
+use std::collections::VecDeque;
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::{ByHashSet, HashMap};
-use std::alloc::Global;
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
+use std::alloc::Global;
 
 use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
 
@@ -202,7 +202,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
         VALUE => {
             let code = reader.u8().map_err(truncated)?;
             // alloc: an error path.
-            let kind = Kind::from_code(code).ok_or_else(|| format!("an unknown kind code {code}"))?;
+            let kind =
+                Kind::from_code(code).ok_or_else(|| format!("an unknown kind code {code}"))?;
             let content = ContentId(*reader.array().map_err(truncated)?);
             let len = reader.u64().map_err(truncated)?;
             if len > LONGEST_VALUE {
@@ -229,7 +230,10 @@ fn read_header(reader: &mut Reader<'_>) -> Result<(), String> {
     let header = reader.array::<8>().map_err(truncated)?;
     if header[..6] != ANSWER_MAGIC[..] {
         // alloc: an error path.
-        return Err(format!("not an answer: its magic is {:?}", header[..6].escape_ascii().to_string()));
+        return Err(format!(
+            "not an answer: its magic is {:?}",
+            header[..6].escape_ascii().to_string()
+        ));
     }
     let version = u16::from_le_bytes([header[6], header[7]]);
     if version != VERSION {
@@ -253,7 +257,11 @@ fn parse_filter(bytes: &[u8]) -> Result<(bool, u64, Fuse8), String> {
         0 => false,
         1 => true,
         // alloc: an error path.
-        other => return Err(format!("a filter that neither adds (0) nor replaces (1) but says {other}")),
+        other => {
+            return Err(format!(
+                "a filter that neither adds (0) nor replaces (1) but says {other}"
+            ));
+        }
     };
     let epoch = reader.u64().map_err(truncated)?;
     // alloc: an error path.
@@ -317,7 +325,13 @@ pub const VALUE_FRAME_HEADER: usize = 8 + VALUE_HEADER;
 /// Writes into the first [`VALUE_FRAME_HEADER`] bytes of `head` what
 /// [`Answer::encode_framed`] writes before a value of `len` bytes. A buffer holding the value
 /// after that many reserved bytes is then the frame as it is, for `Done::Read`, with no copy.
-pub fn write_value_frame_header(head: &mut [u8], key: &Key, kind: Kind, content: &ContentId, len: usize) {
+pub fn write_value_frame_header(
+    head: &mut [u8],
+    key: &Key,
+    kind: Kind,
+    content: &ContentId,
+    len: usize,
+) {
     let head = &mut head[..VALUE_FRAME_HEADER];
     head[..8].copy_from_slice(&((VALUE_HEADER + len) as u64).to_le_bytes());
     head[8..16].copy_from_slice(&header(ANSWER_MAGIC));
@@ -820,7 +834,7 @@ impl Server {
             closing: Vec::new(),
             failed: None,
             peers: HashMap::new_in(Global), // alloc: a connection's or server's state, for its life
-            ops: HashMap::new_in(Global), // alloc: a connection's or server's state, for its life
+            ops: HashMap::new_in(Global),   // alloc: a connection's or server's state, for its life
             // alloc: empty, allocates nothing; once per server, setup.
             filters: Vec::new(),
             full_keys: 0,
@@ -1003,7 +1017,10 @@ impl Server {
                     }
                     // The buffer sent gathers the next short answers, its room kept, unless it
                     // was a long answer's.
-                    if peer.short.capacity() == 0 && spare.is_empty() && spare.capacity() <= SHORT_ROOM {
+                    if peer.short.capacity() == 0
+                        && spare.is_empty()
+                        && spare.capacity() <= SHORT_ROOM
+                    {
                         peer.short = spare;
                     }
                     self.serve(conn, store, &mut corrupt, effects);
@@ -1191,8 +1208,7 @@ mod tests {
     /// [`stored`] in `sim`, kept for the test to commit puts in.
     fn opened(mut sim: Sim, values: &[(&str, Kind, &[u8])]) -> (Sim, Store) {
         let mut effects = Vec::new();
-        let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
         let mut store = Store::open(config, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
         assert!(store.ready());
@@ -1218,7 +1234,11 @@ mod tests {
     }
 
     /// What `client.complete` appends.
-    fn completed(client: &mut Client, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Completion> {
+    fn completed(
+        client: &mut Client,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<Completion> {
         let mut answers = Vec::new();
         client.complete(completion, effects, &mut answers);
         answers
@@ -1356,7 +1376,12 @@ mod tests {
                         return;
                     };
                     let n = self.links.len() as u64;
-                    let end = |conn| End { conn: Conn(conn), open: true, recv: None, incoming: Vec::new() };
+                    let end = |conn| End {
+                        conn: Conn(conn),
+                        open: true,
+                        recv: None,
+                        incoming: Vec::new(),
+                    };
                     self.links.push([end(2 * n), end(2 * n + 1)]);
                     self.inbox[C].push_back(done(tag, Done::Connected { conn: Conn(2 * n) }));
                     self.inbox[S].push_back(done(listen, Done::Accepted { conn: Conn(2 * n + 1) }));
@@ -1370,7 +1395,10 @@ mod tests {
                     bytes.clear();
                     let sent = match open {
                         true => Done::Sent(bytes),
-                        false => Done::Broken { buffer: bytes, error: IoError("the peer hung up".into()) },
+                        false => Done::Broken {
+                            buffer: bytes,
+                            error: IoError("the peer hung up".into()),
+                        },
                     };
                     self.inbox[side].push_back(done(tag, sent));
                 }
@@ -1434,7 +1462,9 @@ mod tests {
     }
 
     fn hung_up(effects: &[Effect], conn: Conn) -> bool {
-        effects.iter().any(|effect| matches!(effect, Effect::Hangup { conn: on, .. } if *on == conn))
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Hangup { conn: on, .. } if *on == conn))
     }
 
     fn samples() -> Vec<Answer> {
@@ -1479,7 +1509,9 @@ mod tests {
             assert_eq!(whole, framed(|out| answer.write(out)));
             assert_eq!(unframe(&whole), answer);
             match (parse(&whole[8..]).unwrap(), &answer) {
-                (Parsed::Missing { key }, Answer::Missing { key: asked }) => assert_eq!(key, *asked),
+                (Parsed::Missing { key }, Answer::Missing { key: asked }) => {
+                    assert_eq!(key, *asked)
+                }
                 (
                     Parsed::Value { key, kind, content, bytes },
                     Answer::Value { key: asked, kind: sent, content: hashed, bytes: value },
@@ -1556,7 +1588,12 @@ mod tests {
         let content = store.get(&key("a")).unwrap().unwrap().content;
         assert_eq!(
             answer(&net.answers[0]),
-            Answer::Value { key: key("a"), kind: Kind::Code, content, bytes: b"the code of a".to_vec() }
+            Answer::Value {
+                key: key("a"),
+                kind: Kind::Code,
+                content,
+                bytes: b"the code of a".to_vec()
+            }
         );
         assert_eq!(answer(&net.answers[0]), Answer::of(&store, &key("a")).unwrap());
         assert_eq!(net.answers[1].tag, Tag(2));
@@ -1690,14 +1727,25 @@ mod tests {
             panic!("expected one connect, got {effects:?}")
         };
         effects.clear();
-        let none = completed(&mut client, Completion { tag: connect, done: Done::Connected { conn } }, &mut effects);
+        let none = completed(
+            &mut client,
+            Completion { tag: connect, done: Done::Connected { conn } },
+            &mut effects,
+        );
         assert!(none.is_empty());
         let send = effect_on(&effects, conn, false).unwrap();
         let recv = effect_on(&effects, conn, true).unwrap();
         let asked: Vec<u8> = names.iter().flat_map(|name| ask(name)).collect();
         assert_eq!(sent_on(&effects, conn), Some(&asked[..]));
         effects.clear();
-        assert!(completed(&mut client, Completion { tag: send, done: Done::Sent(Vec::new()) }, &mut effects).is_empty());
+        assert!(
+            completed(
+                &mut client,
+                Completion { tag: send, done: Done::Sent(Vec::new()) },
+                &mut effects
+            )
+            .is_empty()
+        );
         (client, effects, recv)
     }
 
@@ -1706,7 +1754,11 @@ mod tests {
         let conn = Conn(5);
         let (mut client, mut effects, recv) = connected(&["a", "b"], conn);
         let prefix = (LONGEST_FRAME + 1).to_le_bytes().to_vec();
-        let answers = completed(&mut client, Completion { tag: recv, done: Done::Read(prefix) }, &mut effects);
+        let answers = completed(
+            &mut client,
+            Completion { tag: recv, done: Done::Read(prefix) },
+            &mut effects,
+        );
         assert_eq!(answers.len(), 2);
         for answer in &answers {
             assert!(failure(answer).contains("more than"), "{answer:?}");
@@ -1738,8 +1790,15 @@ mod tests {
             let [Effect::Recv { tag, .. }] = effects[..] else { panic!("{effects:?}") };
             rest = tag;
             let Link::Up(up) = &client.link else { panic!("the connection is up") };
-            assert!(up.buffer.capacity() >= up.buffer.len() + RECV_MOST.min(frame.len() - up.buffer.len()));
-            assert!(up.buffer.capacity() <= 2 * (up.buffer.len() + RECV_MOST), "{}", up.buffer.capacity());
+            assert!(
+                up.buffer.capacity()
+                    >= up.buffer.len() + RECV_MOST.min(frame.len() - up.buffer.len())
+            );
+            assert!(
+                up.buffer.capacity() <= 2 * (up.buffer.len() + RECV_MOST),
+                "{}",
+                up.buffer.capacity()
+            );
         }
         let Link::Up(up) = &client.link else { panic!("the connection is up") };
         let buffer = up.buffer.as_ptr();
@@ -1750,14 +1809,17 @@ mod tests {
         assert_eq!(answers, vec![Completion { tag: Tag(0), done: Done::Read(frame.clone()) }]);
         let Done::Read(handed) = &answers[0].done else { panic!("{answers:?}") };
         assert_eq!(handed.as_ptr(), buffer, "the frame is handed on without a copy");
-        let [Effect::Recv { most, .. }] = effects[..] else { panic!("it receives on for filters: {effects:?}") };
+        let [Effect::Recv { most, .. }] = effects[..] else {
+            panic!("it receives on for filters: {effects:?}")
+        };
         assert_eq!(most, CLIENT_RECV, "nothing is owed, so the least is asked");
 
         assert_eq!(owed(&(LONGEST_FRAME + 1).to_le_bytes()), 0);
 
         // A prefix that says a gigabyte reserves what one receive brings, not the gigabyte.
         let (mut client, mut effects, recv) = connected(&["a"], Conn(5));
-        let prefix = Completion { tag: recv, done: Done::Read((1u64 << 30).to_le_bytes().to_vec()) };
+        let prefix =
+            Completion { tag: recv, done: Done::Read((1u64 << 30).to_le_bytes().to_vec()) };
         assert!(completed(&mut client, prefix, &mut effects).is_empty());
         let Link::Up(up) = &client.link else { panic!("the connection is up") };
         assert!(up.buffer.capacity() <= 8 + RECV_MOST, "{}", up.buffer.capacity());
@@ -1771,14 +1833,16 @@ mod tests {
         let garbage = framed(|out| out.extend_from_slice(b"not an answer"));
         let other_key = framed(|out| write_missing(out, &key("b")));
         let unasked = [framed(|out| write_missing(out, &key("a"))), other_key.clone()].concat();
-        for (stream, why, failed) in [
-            (garbage, "malformed", 1),
-            (other_key, "not asked", 1),
-            (unasked, "not asked", 0),
-        ] {
+        for (stream, why, failed) in
+            [(garbage, "malformed", 1), (other_key, "not asked", 1), (unasked, "not asked", 0)]
+        {
             let conn = Conn(6);
             let (mut client, mut effects, recv) = connected(&["a"], conn);
-            let answers = completed(&mut client, Completion { tag: recv, done: Done::Read(stream) }, &mut effects);
+            let answers = completed(
+                &mut client,
+                Completion { tag: recv, done: Done::Read(stream) },
+                &mut effects,
+            );
             let failures: Vec<&Completion> =
                 answers.iter().filter(|it| matches!(it.done, Done::Failed(_))).collect();
             assert_eq!(failures.len(), failed, "{answers:?}");
@@ -1898,13 +1962,20 @@ mod tests {
         assert!(client.out.is_empty());
 
         let frame = Answer::Missing { key: key("a") }.encode_framed();
-        let mut answers = completed(&mut client, Completion { tag: recv, done: Done::Read(frame.clone()) }, &mut effects);
+        let mut answers = completed(
+            &mut client,
+            Completion { tag: recv, done: Done::Read(frame.clone()) },
+            &mut effects,
+        );
         answers.sort_by_key(|it| it.tag);
         assert_eq!(
             answers,
             [Tag(0), Tag(5)].map(|tag| Completion { tag, done: Done::Read(frame.clone()) })
         );
-        assert!(matches!(effects[..], [Effect::Recv { .. }]), "it receives on for filters: {effects:?}");
+        assert!(
+            matches!(effects[..], [Effect::Recv { .. }]),
+            "it receives on for filters: {effects:?}"
+        );
     }
 
     /// A started server that has accepted `conns` and sent each its filter, and the tag of
@@ -1921,7 +1992,8 @@ mod tests {
             let accepted = Completion { tag: listen, done: Done::Accepted { conn: *conn } };
             assert!(server.complete(accepted, &store, &mut effects).is_empty());
             recvs.push(effect_on(&effects, *conn, true).unwrap());
-            let (replaces, epoch, _) = parse_filter(&sent_on(&effects, *conn).unwrap()[8..]).unwrap();
+            let (replaces, epoch, _) =
+                parse_filter(&sent_on(&effects, *conn).unwrap()[8..]).unwrap();
             assert!(replaces && epoch == store.epoch(), "a full filter first");
             let send = effect_on(&effects, *conn, false).unwrap();
             effects.clear();
@@ -1970,7 +2042,11 @@ mod tests {
         assert!(!hung_up(&effects, partial));
         let recv = effect_on(&effects, partial, true).unwrap();
         effects.clear();
-        server.complete(Completion { tag: recv, done: Done::Read(Vec::new()) }, &store, &mut effects);
+        server.complete(
+            Completion { tag: recv, done: Done::Read(Vec::new()) },
+            &store,
+            &mut effects,
+        );
         assert!(hung_up(&effects, partial));
         assert!(sent_on(&effects, partial).is_none());
     }
@@ -1978,7 +2054,8 @@ mod tests {
     #[test]
     fn a_batch_of_short_answers_is_one_send() {
         let names: Vec<String> = (0..100).map(|n| format!("short {n}")).collect();
-        let bodies: Vec<Vec<u8>> = (0..100).map(|n| (0..1024).map(|it| (it + n) as u8).collect()).collect();
+        let bodies: Vec<Vec<u8>> =
+            (0..100).map(|n| (0..1024).map(|it| (it + n) as u8).collect()).collect();
         let kept: Vec<(&str, Kind, &[u8])> = names
             .iter()
             .zip(&bodies)
@@ -2000,7 +2077,8 @@ mod tests {
             })
             .collect();
         assert_eq!(sends.len(), 1, "one send for the batch");
-        let expected: Vec<Answer> = names.iter().map(|name| Answer::of(&store, &key(name)).unwrap()).collect();
+        let expected: Vec<Answer> =
+            names.iter().map(|name| Answer::of(&store, &key(name)).unwrap()).collect();
         assert_eq!(frames(sends[0]), expected);
         assert_eq!(expected.iter().filter(|it| matches!(it, Answer::Missing { .. })).count(), 50);
     }
@@ -2010,8 +2088,11 @@ mod tests {
         const LONG: usize = 40 << 20;
         let names = ["w", "x", "y", "z"];
         let bodies: Vec<Vec<u8>> = (0..4).map(|n| vec![n; LONG]).collect();
-        let kept: Vec<(&str, Kind, &[u8])> =
-            names.iter().zip(&bodies).map(|(name, bytes)| (*name, Kind::Code, &bytes[..])).collect();
+        let kept: Vec<(&str, Kind, &[u8])> = names
+            .iter()
+            .zip(&bodies)
+            .map(|(name, bytes)| (*name, Kind::Code, &bytes[..]))
+            .collect();
         let store = stored(&kept);
         let conn = Conn(13);
         let (mut server, mut effects, recvs) = serving(&[conn]);
@@ -2024,7 +2105,10 @@ mod tests {
         let queued = peer.out.len() + usize::from(peer.sending.is_some());
         assert!(queued <= 2, "{queued} frames queued from one batch");
         assert_eq!(peer.queued, queued * frame);
-        assert!(effect_on(&effects, conn, true).is_none(), "no more asks are read while over the bound");
+        assert!(
+            effect_on(&effects, conn, true).is_none(),
+            "no more asks are read while over the bound"
+        );
 
         let mut sent = Vec::new();
         while sent.len() < names.len() {
@@ -2035,7 +2119,8 @@ mod tests {
             assert!(server.complete(done, &store, &mut effects).is_empty());
             assert!(server.peers[&conn].queued <= QUEUED_MOST + frame);
         }
-        let expected: Vec<Answer> = names.iter().map(|name| Answer::of(&store, &key(name)).unwrap()).collect();
+        let expected: Vec<Answer> =
+            names.iter().map(|name| Answer::of(&store, &key(name)).unwrap()).collect();
         assert_eq!(sent, expected);
         let peer = &server.peers[&conn];
         assert_eq!(peer.queued, 0);
@@ -2091,7 +2176,8 @@ mod tests {
 
     #[test]
     fn a_delta_brings_what_a_batch_put_and_a_full_filter_replaces_the_deltas() {
-        let (mut sim, mut store) = opened(Sim::new(8, Faults::default()), &[("a", Kind::Code, b"a".as_slice())]);
+        let (mut sim, mut store) =
+            opened(Sim::new(8, Faults::default()), &[("a", Kind::Code, b"a".as_slice())]);
         commit(&mut sim, &mut store);
         let mut net = Net::new(usize::MAX);
         net.server.refresh(&mut store, &mut net.effects[S]);
@@ -2130,7 +2216,8 @@ mod tests {
     fn a_filter_never_hides_a_key_it_covers(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let first: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(60));
-        let batches: Vec<Vec<u16>> = tc.draw(gs::vecs(gs::vecs(gs::integers()).max_size(30)).max_size(24));
+        let batches: Vec<Vec<u16>> =
+            tc.draw(gs::vecs(gs::vecs(gs::integers()).max_size(30)).max_size(24));
         let name = |n: u16| format!("model {n}");
         let put = |store: &mut Store, n: u16| {
             store.put(key(&name(n)), Kind::Code, &n.to_le_bytes()).unwrap();
@@ -2188,13 +2275,17 @@ mod tests {
         let (mut client, mut effects, recv) = connected(&["b"], conn);
         let mut bad = frame.clone();
         bad[17] = 9;
-        let answers = completed(&mut client, Completion { tag: recv, done: Done::Read(bad) }, &mut effects);
+        let answers =
+            completed(&mut client, Completion { tag: recv, done: Done::Read(bad) }, &mut effects);
         assert_eq!(answers.len(), 1);
         assert!(failure(&answers[0]).contains("malformed filter"), "{answers:?}");
         assert!(hung_up(&effects, conn));
 
         let (mut client, mut effects, recv) = connected(&["b"], Conn(15));
-        assert!(completed(&mut client, Completion { tag: recv, done: Done::Read(frame) }, &mut effects).is_empty());
+        assert!(
+            completed(&mut client, Completion { tag: recv, done: Done::Read(frame) }, &mut effects)
+                .is_empty()
+        );
         assert_eq!(client.epoch(), Some(3));
         assert!(client.may_hold(&key("a")));
         assert!(client.waiting.contains_key(&key("b")), "a fetch asked before is still answered");
@@ -2211,8 +2302,12 @@ mod tests {
     fn a_put_not_yet_packed_is_in_the_next_delta() {
         // Four keys first: a full filter of none is rebuilt whole on the first new key
         // (`Server::refresh`'s `4 * delta_keys > full_keys`), which sends no delta.
-        let held: &[(&str, Kind, &[u8])] =
-            &[("s1", Kind::Code, b"1"), ("s2", Kind::Code, b"2"), ("s3", Kind::Code, b"3"), ("s4", Kind::Code, b"4")];
+        let held: &[(&str, Kind, &[u8])] = &[
+            ("s1", Kind::Code, b"1"),
+            ("s2", Kind::Code, b"2"),
+            ("s3", Kind::Code, b"3"),
+            ("s4", Kind::Code, b"4"),
+        ];
         let (mut sim, mut store) = opened(Sim::new(11, Faults::default()), held);
         let mut net = Net::new(usize::MAX);
         net.server.refresh(&mut store, &mut net.effects[S]);
@@ -2271,7 +2366,10 @@ mod tests {
                     net.run(&store);
                     covered.clone_from(&put);
                     for &it in &covered {
-                        assert!(net.client.may_hold(&key(&name(it))), "{it}, put before a refresh, hidden");
+                        assert!(
+                            net.client.may_hold(&key(&name(it))),
+                            "{it}, put before a refresh, hidden"
+                        );
                     }
                 }
                 _ => {
@@ -2283,7 +2381,10 @@ mod tests {
                     let got = answer(last);
                     if covered.contains(&n) {
                         assert_eq!(got, Answer::of(&store, &key(&name(n))).unwrap(), "{n} covered");
-                        assert!(matches!(got, Answer::Value { .. }), "{n} covered and answered {got:?}");
+                        assert!(
+                            matches!(got, Answer::Value { .. }),
+                            "{n} covered and answered {got:?}"
+                        );
                     } else if !put.contains(&n) {
                         assert_eq!(got, Answer::Missing { key: key(&name(n)) });
                     }
@@ -2331,7 +2432,8 @@ mod tests {
         let (_, _, filter) = parse_filter(&frame[8..]).unwrap();
         assert!(keys.iter().all(|it| filter.contains(word(it))));
         const PROBES: usize = 4096;
-        let wrong = (0..PROBES).filter(|n| filter.contains(word(&key(&format!("out {salt} {n}"))))).count();
+        let wrong =
+            (0..PROBES).filter(|n| filter.contains(word(&key(&format!("out {salt} {n}"))))).count();
         // 16 expected; 64 is past any run of these probes but a broken filter's.
         assert!(wrong <= 64, "{wrong} of {PROBES} absent keys ruled in by a filter of {built}");
     }

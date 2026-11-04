@@ -7,7 +7,7 @@ use crate::ast::{
 };
 use crate::context::{Context, SmtEncoding};
 use crate::messages::MessageInterface;
-use crate::printer::{Printer, node_to_string};
+use crate::printer::{node_to_string, Printer};
 use crate::scope_map::ScopeMap;
 use crate::util::vec_map;
 use std::collections::HashSet;
@@ -73,7 +73,11 @@ pub fn typ_eq(typ1: &Typ, typ2: &Typ) -> bool {
 }
 
 fn expect_typ(typ1: &Typ, typ2: &Typ, msg: &str) -> Result<(), TypeError> {
-    if typ_eq(typ1, typ2) { Ok(()) } else { Err(msg.to_string()) }
+    if typ_eq(typ1, typ2) {
+        Ok(())
+    } else {
+        Err(msg.to_string())
+    }
 }
 
 fn check_typ(typing: &Typing, typ: &Typ) -> Result<(), TypeError> {

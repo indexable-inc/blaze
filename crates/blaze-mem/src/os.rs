@@ -89,9 +89,12 @@ pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
 
 #[cfg(windows)]
 pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
     // SAFETY: a fresh reservation at an address the kernel picks, committed whole.
-    let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    let base =
+        unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
@@ -232,14 +235,17 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     if let Some(at) = freed::take(pages) {
         // As below: an address in the module's own memory, from the free list's answer.
         let base = std::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
-        return NonNull::new(base).ok_or_else(|| io::Error::other("the free list gave pages at address 0"));
+        return NonNull::new(base)
+            .ok_or_else(|| io::Error::other("the free list gave pages at address 0"));
     }
     let old = memory_grow::<0>(pages);
     if old == usize::MAX {
         return Err(io::Error::new(
             io::ErrorKind::OutOfMemory,
             // alloc: the error of a reservation refused, once
-            format!("growing linear memory by {pages} pages of 64 KiB for a {bytes}-byte reservation (memory.grow) failed"),
+            format!(
+                "growing linear memory by {pages} pages of 64 KiB for a {bytes}-byte reservation (memory.grow) failed"
+            ),
         ));
     }
     // The pages are the module's own memory at `old` pages in: an address, with nothing to
@@ -280,7 +286,10 @@ mod freed {
     /// again, or `None` when no range is big enough.
     pub(super) fn take(pages: usize) -> Option<usize> {
         let mut free = FREE.lock();
-        let (&at, &have) = free.iter().filter(|&(_, &have)| have >= pages).min_by_key(|&(&at, &have)| (have, at))?;
+        let (&at, &have) = free
+            .iter()
+            .filter(|&(_, &have)| have >= pages)
+            .min_by_key(|&(&at, &have)| (have, at))?;
         free.remove(&at);
         if have > pages {
             free.insert(at + pages, have - pages); // alloc: the free list's node, global as the list is
@@ -362,12 +371,22 @@ pub(crate) fn reserve_on(bytes: usize, _huge: bool, node: u32) -> io::Result<Non
     // SAFETY: a fresh reservation in this process at an address the kernel picks; the node is a
     // number the kernel checks.
     let base = unsafe {
-        VirtualAllocExNuma(GetCurrentProcess(), std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS, node)
+        VirtualAllocExNuma(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            bytes,
+            MEM_RESERVE,
+            PAGE_NOACCESS,
+            node,
+        )
     };
     NonNull::new(base.cast::<u8>()).ok_or_else(|| {
         let why = io::Error::last_os_error();
         // alloc: the error of a reservation refused, once
-        io::Error::new(why.kind(), format!("reserving {bytes} bytes on NUMA node {node} (VirtualAllocExNuma): {why}"))
+        io::Error::new(
+            why.kind(),
+            format!("reserving {bytes} bytes on NUMA node {node} (VirtualAllocExNuma): {why}"),
+        )
     })
 }
 
@@ -406,7 +425,15 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     // SAFETY: `mbind` reads `MASK_WORDS` words of `mask`, a live array, and changes only the
     // policy of the range, which the caller says is a reservation of ours.
     let status = unsafe {
-        libc::syscall(libc::SYS_mbind, ptr.as_ptr(), bytes, MPOL_PREFERRED, mask.as_ptr(), maxnode, 0)
+        libc::syscall(
+            libc::SYS_mbind,
+            ptr.as_ptr(),
+            bytes,
+            MPOL_PREFERRED,
+            mask.as_ptr(),
+            maxnode,
+            0,
+        )
     };
     if status == 0 {
         return Ok(());
@@ -415,7 +442,10 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     match why.raw_os_error() {
         Some(libc::ENOSYS) if node == 0 => Ok(()),
         // alloc: the error of a placement refused, once
-        _ => Err(io::Error::new(why.kind(), format!("binding {bytes} bytes to NUMA node {node} (mbind): {why}"))),
+        _ => Err(io::Error::new(
+            why.kind(),
+            format!("binding {bytes} bytes to NUMA node {node} (mbind): {why}"),
+        )),
     }
 }
 
@@ -475,9 +505,8 @@ fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours, which nothing
     // else maps; changing its protection touches no other memory.
-    let rc = unsafe {
-        libc::mprotect(ptr.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE)
-    };
+    let rc =
+        unsafe { libc::mprotect(ptr.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE) };
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
@@ -566,7 +595,11 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
 /// committed, and reached by nothing until this returns; the caller makes no other commit of it
 /// at once.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn commit_reserved(ptr: NonNull<u8>, bytes: usize, node: Option<u32>) -> io::Result<()> {
+pub(crate) unsafe fn commit_reserved(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    node: Option<u32>,
+) -> io::Result<()> {
     /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
     const MADV_POPULATE_WRITE: libc::c_int = 23;
     debug_assert!(ptr.as_ptr().addr() % crate::HUGE_PAGE == 0 && bytes % crate::HUGE_PAGE == 0);
@@ -631,11 +664,18 @@ fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
         _ => "unset BLAZE_HUGE_PAGES for transparent huge pages",
     };
     // alloc: the error of a commit refused, once
-    io::Error::new(why.kind(), format!("{step} {bytes} bytes on reserved 2 MiB pages (MAP_HUGETLB): {why}; {hint}"))
+    io::Error::new(
+        why.kind(),
+        format!("{step} {bytes} bytes on reserved 2 MiB pages (MAP_HUGETLB): {why}; {hint}"),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) unsafe fn commit_reserved(_ptr: NonNull<u8>, _bytes: usize, _node: Option<u32>) -> io::Result<()> {
+pub(crate) unsafe fn commit_reserved(
+    _ptr: NonNull<u8>,
+    _bytes: usize,
+    _node: Option<u32>,
+) -> io::Result<()> {
     reserved_pool()
 }
 

@@ -44,15 +44,36 @@ pub(in crate::nameres) enum UseTail {
 pub(in crate::nameres) enum Gen {
     /// A child module, by its index in [`Model::modules`].
     Mod(usize),
-    Struct { name: &'static str, vis: Vis },
-    Fn { name: &'static str, vis: Vis },
-    Use { vis: Vis, path: String, tail: UseTail },
+    Struct {
+        name: &'static str,
+        vis: Vis,
+    },
+    Fn {
+        name: &'static str,
+        vis: Vis,
+    },
+    Use {
+        vis: Vis,
+        path: String,
+        tail: UseTail,
+    },
     /// The definition of macro `m<id>` ([`Model::macros`]).
-    MacroRules { id: usize, export: bool },
+    MacroRules {
+        id: usize,
+        export: bool,
+    },
     /// A call of `m<id>`, by name (textual scope) or through `crate::` (exported).
-    Call { id: usize, qualified: bool },
-    ExternCrateSelf { alias: &'static str },
-    Cfg { on: bool, item: Box<Gen> },
+    Call {
+        id: usize,
+        qualified: bool,
+    },
+    ExternCrateSelf {
+        alias: &'static str,
+    },
+    Cfg {
+        on: bool,
+        item: Box<Gen>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +155,13 @@ impl Model {
             };
             let inline = rng.one_in(2);
             let macro_use = rng.one_in(3);
-            model.modules.push(Module { parent: Some(parent), name, inline, macro_use, items: Vec::new() });
+            model.modules.push(Module {
+                parent: Some(parent),
+                name,
+                inline,
+                macro_use,
+                items: Vec::new(),
+            });
             let child = model.modules.len() - 1;
             model.modules[parent].items.push(Gen::Mod(child));
         }
@@ -179,7 +206,9 @@ impl Model {
             0 | 1 => Vis::Pub,
             2 => Vis::Crate,
             3 if !path.is_empty() => Vis::Super,
-            4 if !path.is_empty() => Vis::In(path[..rng.below(path.len() as u64) as usize].to_vec()),
+            4 if !path.is_empty() => {
+                Vis::In(path[..rng.below(path.len() as u64) as usize].to_vec())
+            }
             _ => Vis::Private,
         }
     }
@@ -193,7 +222,11 @@ impl Model {
         match rng.below(4) {
             0 if target_path.starts_with(&here) && target != module => {
                 let rest = &target_path[here.len()..];
-                if self.edition == "2015" { format!("self::{}", rest.join("::")) } else { rest.join("::") }
+                if self.edition == "2015" {
+                    format!("self::{}", rest.join("::"))
+                } else {
+                    rest.join("::")
+                }
             }
             1 if !here.is_empty() => {
                 let parent = &here[..here.len() - 1];
@@ -227,9 +260,10 @@ impl Model {
                 };
                 Gen::Use { vis: self.vis(rng, module), path, tail }
             }
-            7 if !self.macros.is_empty() => {
-                Gen::Call { id: rng.below(self.macros.len() as u64) as usize, qualified: rng.one_in(2) }
-            }
+            7 if !self.macros.is_empty() => Gen::Call {
+                id: rng.below(self.macros.len() as u64) as usize,
+                qualified: rng.one_in(2),
+            },
             8 if module == 0 && self.edition != "2015" => {
                 Gen::ExternCrateSelf { alias: pick(rng, &["this", "me"]) }
             }
@@ -348,13 +382,16 @@ impl Model {
         }
         for (id, _) in self.macros.iter().enumerate() {
             if self.modules.iter().all(|it| {
-                it.items.iter().all(|item| !matches!(item, Gen::Call { id: called, .. } if *called == id))
+                it.items
+                    .iter()
+                    .all(|item| !matches!(item, Gen::Call { id: called, .. } if *called == id))
             }) {
                 continue;
             }
             let mut smaller = self.clone();
             for data in &mut smaller.modules {
-                data.items.retain(|item| !matches!(item, Gen::Call { id: called, .. } if *called == id));
+                data.items
+                    .retain(|item| !matches!(item, Gen::Call { id: called, .. } if *called == id));
             }
             out.push(smaller);
         }

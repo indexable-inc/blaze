@@ -11,7 +11,6 @@
 //! (`DanglingPointersFromTemporaries`, `DanglingPointersFromLocals`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::InFile;
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -24,6 +23,7 @@ use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use intern::sym;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode};
 
 use super::{Inits, has_attr, layout, peel_casts, span, ty_text};
@@ -36,7 +36,8 @@ use crate::{
     model::{Diag, Span},
 };
 
-const DESTRUCTORS: &str = "for more information, see <https://doc.rust-lang.org/reference/destructors.html>";
+const DESTRUCTORS: &str =
+    "for more information, see <https://doc.rust-lang.org/reference/destructors.html>";
 const SAFE: &str = "a dangling pointer is safe, but dereferencing one is undefined behavior";
 
 const TEMPORARIES: &str = "dangling_pointers_from_temporaries";
@@ -55,7 +56,10 @@ pub(crate) struct DanglingPointers {
 impl DanglingPointers {
     fn runs(&mut self, b: &BodyCx<'_, '_, '_>) -> (bool, bool) {
         *self.runs.get_or_insert_with(|| {
-            (b.cx.lint_may_fire(LintId::named(TEMPORARIES)), b.cx.lint_may_fire(LintId::named(LOCALS)))
+            (
+                b.cx.lint_may_fire(LintId::named(TEMPORARIES)),
+                b.cx.lint_may_fire(LintId::named(LOCALS)),
+            )
         })
     }
 }
@@ -124,7 +128,10 @@ impl Searcher<'_, '_, '_> {
                     for statement in statements {
                         match statement {
                             Statement::Let { initializer, else_branch, .. } => {
-                                initializer.into_iter().chain(else_branch).for_each(|it| this.expr(it));
+                                initializer
+                                    .into_iter()
+                                    .chain(else_branch)
+                                    .for_each(|it| this.expr(it));
                             }
                             Statement::Expr { expr, .. } => this.expr(expr),
                             Statement::Item(_) => {}
@@ -144,7 +151,9 @@ impl Searcher<'_, '_, '_> {
                 self.expr(rhs);
                 self.expr(lhs);
             }
-            _ => store.walk_child_exprs_without_pats(expr, |it| stdx::ensure_sufficient_stack(|| self.expr(it))),
+            _ => store.walk_child_exprs_without_pats(expr, |it| {
+                stdx::ensure_sufficient_stack(|| self.expr(it))
+            }),
         }
     }
 
@@ -168,9 +177,12 @@ fn temporary(b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     }
     let Some(call) = util::syntax(b, expr) else { return };
     // clone: a node handle, a reference count, once the call is of a `#[rustc_as_ptr]` method on a temporary
-    let Some(name) = ast::MethodCallExpr::cast(call.value).and_then(|it| it.name_ref()) else { return };
+    let Some(name) = ast::MethodCallExpr::cast(call.value).and_then(|it| it.name_ref()) else {
+        return;
+    };
     let ptr_span = b.cx.span(call.with_value(name.syntax().text_range()));
-    let (Some(at), Some(temporary_span), Some(ty)) = (b.expr_node(expr), span(b, receiver), ty_text(b, receiver))
+    let (Some(at), Some(temporary_span), Some(ty)) =
+        (b.expr_node(expr), span(b, receiver), ty_text(b, receiver))
     else {
         return;
     };
@@ -179,7 +191,9 @@ fn temporary(b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     let mut diag = Diag::lint(
         TEMPORARIES,
         // alloc: the lint's text, for a lint found
-        format!("this creates a dangling pointer because temporary `{ty}` is dropped at end of statement"),
+        format!(
+            "this creates a dangling pointer because temporary `{ty}` is dropped at end of statement"
+        ),
         // clone: a lint's span, for a lint found
         ptr_span.clone(),
     );
@@ -187,7 +201,9 @@ fn temporary(b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     // alloc: the lint's text, for a lint found
     diag.span_label(temporary_span, format!("this `{ty}` is dropped at end of statement"));
     // alloc: the lint's text, for a lint found
-    diag.help(format!("bind the `{ty}` to a variable such that it outlives the pointer returned by `{callee}`"));
+    diag.help(format!(
+        "bind the `{ty}` to a variable such that it outlives the pointer returned by `{callee}`"
+    ));
     diag.note(SAFE);
     diag.note("returning a pointer to a local variable will always result in a dangling pointer");
     diag.note(DESTRUCTORS);
@@ -201,7 +217,11 @@ fn is_temporary_rvalue(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     match b.store().expr(expr) {
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::RecordLit { .. } => true,
         Expr::BinaryOp { op, .. } => !matches!(op, None | Some(BinaryOp::Assignment { .. })),
-        Expr::If { .. } | Expr::Loop { .. } | Expr::Match { .. } | Expr::Block { .. } | Expr::Await { .. } => true,
+        Expr::If { .. }
+        | Expr::Loop { .. }
+        | Expr::Match { .. }
+        | Expr::Block { .. }
+        | Expr::Await { .. } => true,
         Expr::Missing
         | Expr::Path(_)
         | Expr::Let { .. }
@@ -240,16 +260,24 @@ fn owns_allocation<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> bool {
     }
     let lang = DbInterner::new_with(b.db(), b.owner.krate(b.db())).lang_items();
     if let Some(inner) = ty.boxed_ty() {
-        let is_cstr = inner.as_adt().is_some_and(|(adt, _)| lang.CStr.is_some_and(|it| adt == AdtId::StructId(it)));
+        let is_cstr = inner
+            .as_adt()
+            .is_some_and(|(adt, _)| lang.CStr.is_some_and(|it| adt == AdtId::StructId(it)));
         return inner.is_slice() || inner.is_str() || is_cstr || owns_allocation(b, inner);
     }
     let Some((adt, _)) = ty.as_adt() else { return false };
-    let lang_owned = [lang.String.map(AdtId::StructId), lang.MaybeUninit.map(AdtId::UnionId), lang.UnsafeCell.map(AdtId::StructId)];
+    let lang_owned = [
+        lang.String.map(AdtId::StructId),
+        lang.MaybeUninit.map(AdtId::UnionId),
+        lang.UnsafeCell.map(AdtId::StructId),
+    ];
     if lang_owned.contains(&Some(adt)) {
         return true;
     }
     let name = util::diagnostic_item(b.db(), AttrDefId::AdtId(adt));
-    name.is_some_and(|it| [sym::cstring_type, sym::Vec, sym::Cell, sym::SyncUnsafeCell].contains(&it))
+    name.is_some_and(|it| {
+        [sym::cstring_type, sym::Vec, sym::Cell, sym::SyncUnsafeCell].contains(&it)
+    })
 }
 
 /// What a function or closure returning a raw pointer is linted with: rustc's
@@ -269,7 +297,10 @@ fn function_return(b: &BodyCx<'_, '_, '_>, function: FunctionId) -> Option<FnRet
         return None;
     }
     let interner = DbInterner::new_with(db, function.krate(db));
-    let poly = db.callable_item_signature(CallableDefId::FunctionId(function)).instantiate_identity().skip_norm_wip();
+    let poly = db
+        .callable_item_signature(CallableDefId::FunctionId(function))
+        .instantiate_identity()
+        .skip_norm_wip();
     let output = interner.instantiate_bound_regions_with_erased(poly).output();
     pointee_not_1zst(b, output)?;
     let source = function.lookup(db).source_view(db);
@@ -350,7 +381,9 @@ impl Locals<'_, '_, '_> {
                 self.returns(rhs, out);
                 self.returns(lhs, out);
             }
-            _ => store.walk_child_exprs_without_pats(expr, |it| stdx::ensure_sufficient_stack(|| self.returns(it, out))),
+            _ => store.walk_child_exprs_without_pats(expr, |it| {
+                stdx::ensure_sufficient_stack(|| self.returns(it, out))
+            }),
         }
     }
 
@@ -367,7 +400,9 @@ impl Locals<'_, '_, '_> {
         if store.binding_owner(from) != self.owner {
             return;
         }
-        let (Some(at), Some(expr_span), Some(local_var)) = (b.expr_node(expr), span(b, expr), b.binding_node(from)) else {
+        let (Some(at), Some(expr_span), Some(local_var)) =
+            (b.expr_node(expr), span(b, expr), b.binding_node(from))
+        else {
             return;
         };
         // alloc: the lint's text, for a lint found

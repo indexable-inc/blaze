@@ -94,18 +94,16 @@ fn check_rerun(edited: &str) {
 
 #[test]
 fn signatures_keep_the_def_map() {
-    check_backdated(&LIB.replace(
-        "pub fn f(x: u8) -> u8 { x }",
-        "pub fn f(x: u16, y: &str) -> u64 { 0 }",
-    ));
+    check_backdated(
+        &LIB.replace("pub fn f(x: u8) -> u8 { x }", "pub fn f(x: u16, y: &str) -> u64 { 0 }"),
+    );
 }
 
 #[test]
 fn fields_keep_the_def_map() {
-    check_backdated(&LIB.replace(
-        "pub struct Fields { pub a: u8 }",
-        "pub struct Fields { pub a: u8, b: u16 }",
-    ));
+    check_backdated(
+        &LIB.replace("pub struct Fields { pub a: u8 }", "pub struct Fields { pub a: u8, b: u16 }"),
+    );
     check_backdated(&LIB.replace("B { x: u8 }", "B { x: u8, y: u64 }"));
 }
 
@@ -118,10 +116,12 @@ fn types_of_consts_statics_and_aliases_keep_the_def_map() {
 
 #[test]
 fn trait_and_impl_items_keep_the_def_map() {
-    check_backdated(&LIB.replace(
-        "pub trait Tr { fn m(&self); }",
-        "pub trait Tr { fn m(&self) -> u8; fn n() {} }",
-    ));
+    check_backdated(
+        &LIB.replace(
+            "pub trait Tr { fn m(&self); }",
+            "pub trait Tr { fn m(&self) -> u8; fn n() {} }",
+        ),
+    );
     check_backdated(&LIB.replace(
         "impl Tr for Fields { fn m(&self) {} }",
         "impl Tr for Fields { fn m(&self) { let _ = 1; } }",

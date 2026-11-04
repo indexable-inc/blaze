@@ -72,7 +72,10 @@ fn has_reason(meta: ast::TokenTreeMeta<'_>) -> bool {
     }
     let (last, len) = if current.1 == 0 { previous } else { current };
     let [Some(name), Some(eq), Some(value)] = last else { return false };
-    len == 3 && name.text() == "reason" && eq.kind() == SyntaxKind::EQ && value.kind() == SyntaxKind::STRING
+    len == 3
+        && name.text() == "reason"
+        && eq.kind() == SyntaxKind::EQ
+        && value.kind() == SyntaxKind::STRING
 }
 
 #[cfg(test)]

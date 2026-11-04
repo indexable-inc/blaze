@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::manifest::{
     ProfileName, ProfilePackageSpec, StringOrBool, TomlDebugInfo, TomlProfile, TomlProfiles,
     TomlTrimPaths,
 };
 use serde::Serialize;
+use std::alloc::Global;
 
 use crate::config::{CliUnstable, CompileKind, Config};
 use crate::features::{Feature, Features};
@@ -307,12 +307,16 @@ pub struct ContractChecks {
 /// The `contract-checks` keys of the root manifest at `path`. A value that is not a boolean,
 /// or the key under a profile's `package` or `build-override` table (it is a profile-wide
 /// setting: the crate cfg of every unit of the build), is an error naming the key.
-pub fn read_contract_checks<F: Files>(files: &F, path: &std::path::Path) -> anyhow::Result<ContractChecks> {
+pub fn read_contract_checks<F: Files>(
+    files: &F,
+    path: &std::path::Path,
+) -> anyhow::Result<ContractChecks> {
     // alloc: an error's context, made only when the read fails.
     let bytes = files.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| anyhow::anyhow!("path at `{}` was not valid utf-8", path.display()))?;
-    contract_checks_of(text).with_context(|| format!("failed to parse manifest at `{}`", path.display()))
+    contract_checks_of(text)
+        .with_context(|| format!("failed to parse manifest at `{}`", path.display()))
 }
 
 /// [`read_contract_checks`] of a manifest's text.
@@ -331,9 +335,12 @@ pub fn contract_checks_of(manifest: &str) -> anyhow::Result<ContractChecks> {
             };
             by_profile.insert(name.clone(), on);
         }
-        let nested = profile.get("build-override").into_iter().map(|it| ("build-override".to_owned(), it));
+        let nested =
+            profile.get("build-override").into_iter().map(|it| ("build-override".to_owned(), it));
         let packages = profile.get("package").and_then(toml::Value::as_table).into_iter().flatten();
-        for (place, table) in nested.chain(packages.map(|(spec, it)| (format!("package.{spec}"), it))) {
+        for (place, table) in
+            nested.chain(packages.map(|(spec, it)| (format!("package.{spec}"), it)))
+        {
             if table.get(KEY).is_some() {
                 bail!(
                     "`profile.{name}.{place}.{KEY}`: `{KEY}` is a setting of the whole profile, \
@@ -393,12 +400,7 @@ struct ProfileMaker {
 }
 
 impl ProfileMaker {
-    fn get_profile(
-        &self,
-        pkg: Option<&PackageId>,
-        is_member: bool,
-        is_for_host: bool,
-    ) -> Profile {
+    fn get_profile(&self, pkg: Option<&PackageId>, is_member: bool, is_for_host: bool) -> Profile {
         let mut profile = self.default.clone();
         if let Some(toml) = &self.toml {
             merge_profile(&mut profile, toml);
@@ -851,9 +853,9 @@ fn get_config_profile<F: Files>(
 ) -> anyhow::Result<Option<TomlProfile>> {
     let Some(profile) = config.config_profile(name)? else { return Ok(None) };
     let mut warnings = Vec::new();
-    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).with_context(|| {
-        format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition)
-    })?;
+    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).with_context(
+        || format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition),
+    )?;
     for warning in warnings {
         config.warn(warning);
     }

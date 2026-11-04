@@ -72,7 +72,11 @@ impl Inputs for World {
         &self.env
     }
 
-    fn names(&mut self, _: &Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {
+    fn names(
+        &mut self,
+        _: &Path,
+        _: &mut blaze_usercode::trace::Names<'_>,
+    ) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -84,8 +88,17 @@ impl Inputs for World {
 /// A binary of `versions.len()` functions, function `n` at version `versions[n]`; the first
 /// `slots` are called through slots, slot `s` holding function `s`.
 pub(crate) fn image(versions: &[u32], slots: u32, beside: u32) -> Image {
-    let fns = versions.iter().enumerate().map(|(n, &v)| Version { id: id(n as u32), bound: bound(n as u32, v) }).collect();
-    Image::new(fns, (0..slots).collect(), ContentId::of("blaze v2 testsel beside 1", &beside.to_le_bytes())).unwrap()
+    let fns = versions
+        .iter()
+        .enumerate()
+        .map(|(n, &v)| Version { id: id(n as u32), bound: bound(n as u32, v) })
+        .collect();
+    Image::new(
+        fns,
+        (0..slots).collect(),
+        ContentId::of("blaze v2 testsel beside 1", &beside.to_le_bytes()),
+    )
+    .unwrap()
 }
 
 fn given() -> ContentId {
@@ -95,7 +108,10 @@ fn given() -> ContentId {
 const DATA: &str = "/ws/data";
 
 fn world(data: u8) -> World {
-    World { files: [(PathBuf::from(DATA), [data; 32])].into(), env: vec![("FOO".into(), "1".into())] }
+    World {
+        files: [(PathBuf::from(DATA), [data; 32])].into(),
+        env: vec![("FOO".into(), "1".into())],
+    }
 }
 
 fn read(world: &World) -> Traced {
@@ -115,11 +131,21 @@ struct Case {
 
 impl Case {
     fn new() -> Case {
-        Case { store: Mem::default(), attrs: Attrs::default(), reached: vec![0, 1, 2, 3], outside: false }
+        Case {
+            store: Mem::default(),
+            attrs: Attrs::default(),
+            reached: vec![0, 1, 2, 3],
+            outside: false,
+        }
     }
 
     fn subject(&self) -> Subject<'_> {
-        Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: Reached::Known(&self.reached) }
+        Subject {
+            name: "parse::nested",
+            attrs: &self.attrs,
+            outside: self.outside,
+            reached: Reached::Known(&self.reached),
+        }
     }
 
     fn choose(&self, image: &Image, world: &World) -> Choice {
@@ -127,13 +153,22 @@ impl Case {
     }
 
     fn keep(&mut self, image: &Image, ran: &Ran<'_>) -> Result<Kept, RecordError> {
-        let subject = Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: Reached::Known(&self.reached) };
+        let subject = Subject {
+            name: "parse::nested",
+            attrs: &self.attrs,
+            outside: self.outside,
+            reached: Reached::Known(&self.reached),
+        };
         keep(&mut self.store, given(), image, &subject, ran)
     }
 
     fn ran(&mut self, image: &Image, world: &World, passed: bool, record: &Record) -> Kept {
         let traced = read(world);
-        self.keep(image, &Ran { passed, took: Duration::from_millis(40), traced: Some(&traced), record }).unwrap()
+        self.keep(
+            image,
+            &Ran { passed, took: Duration::from_millis(40), traced: Some(&traced), record },
+        )
+        .unwrap()
     }
 }
 
@@ -164,7 +199,10 @@ fn a_pass_stands_until_a_function_it_executed_changes() {
     assert!(kept.pass);
     assert_eq!(kept.basis, Basis::Executed);
     let choice = case.choose(&at, &world(1));
-    assert_eq!(choice, Choice::Cached(Cached { took: Duration::from_millis(40), basis: Basis::Executed }));
+    assert_eq!(
+        choice,
+        Choice::Cached(Cached { took: Duration::from_millis(40), basis: Basis::Executed })
+    );
 
     // Function 1 is reached and not executed: the reached set would run the test again.
     let edited = image(&[0, 1, 0, 0, 0], 4, 0);
@@ -239,7 +277,12 @@ fn a_function_gone_from_the_binary_runs_it() {
     let at = image(&[0, 0, 0, 0, 0], 4, 0);
     case.ran(&at, &world(1), true, &executed(&[3]));
     let fns = [0u32, 1, 2, 4].iter().map(|&n| Version { id: id(n), bound: bound(n, 0) }).collect();
-    let fewer = Image::new(fns, vec![0, 1, 2], ContentId::of("blaze v2 testsel beside 1", &0u32.to_le_bytes())).unwrap();
+    let fewer = Image::new(
+        fns,
+        vec![0, 1, 2],
+        ContentId::of("blaze v2 testsel beside 1", &0u32.to_le_bytes()),
+    )
+    .unwrap();
     assert_eq!(why(case.choose(&fewer, &world(1))), Why::Gone(id(3)));
 }
 
@@ -267,7 +310,12 @@ fn a_pass_that_cant_be_kept_is_not() {
     assert_eq!(why(case.choose(&at, &world(1))), Why::NoPass);
 
     let network = Traced { untraceable: vec![Untraceable::Network], ..read(&world(1)) };
-    let ran = Ran { passed: true, took: Duration::from_millis(3), traced: Some(&network), record: &record };
+    let ran = Ran {
+        passed: true,
+        took: Duration::from_millis(3),
+        traced: Some(&network),
+        record: &record,
+    };
     assert!(!case.keep(&at, &ran).unwrap().pass);
     assert_eq!(why(case.choose(&at, &world(1))), Why::NoPass);
 }

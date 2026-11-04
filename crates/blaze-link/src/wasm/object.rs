@@ -73,7 +73,12 @@ const COMDAT_SECTION: u8 = 5;
 
 /// Reads a file of a link whose module is memory64 (wasm64) or not: an object whose memory is
 /// the other width is refused.
-pub(super) fn read(name: &str, bytes: &[u8], kind: &NativeKind, memory64: bool) -> Result<NativeFile, String> {
+pub(super) fn read(
+    name: &str,
+    bytes: &[u8],
+    kind: &NativeKind,
+    memory64: bool,
+) -> Result<NativeFile, String> {
     match kind {
         NativeKind::Object => {
             // alloc: error path
@@ -283,7 +288,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                                 ));
                             }
                             // alloc: error path
-                            kind => return Err(format!("the import {module}.{field} of kind {kind}")),
+                            kind => {
+                                return Err(format!("the import {module}.{field} of kind {kind}"));
+                            }
                         }
                     }
                 }
@@ -355,7 +362,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                                 r.sleb()?;
                             }
                             // alloc: error path
-                            (other, _) => return Err(format!("a data segment's offset of opcode {other:#04x} for its memory")),
+                            (other, _) => {
+                                return Err(format!(
+                                    "a data segment's offset of opcode {other:#04x} for its memory"
+                                ));
+                            }
                         }
                         if r.u8()? != 0x0b {
                             // alloc: error path
@@ -651,9 +662,10 @@ fn width(r_type: u32) -> usize {
         | reloc::FUNCTION_OFFSET_I32
         | reloc::SECTION_OFFSET_I32 => 4,
         reloc::TABLE_INDEX_I64 | reloc::MEMORY_ADDR_I64 => 8,
-        reloc::MEMORY_ADDR_LEB64 | reloc::MEMORY_ADDR_SLEB64 | reloc::MEMORY_ADDR_REL_SLEB64 | reloc::TABLE_INDEX_SLEB64 => {
-            super::leb::PADDED64
-        }
+        reloc::MEMORY_ADDR_LEB64
+        | reloc::MEMORY_ADDR_SLEB64
+        | reloc::MEMORY_ADDR_REL_SLEB64
+        | reloc::TABLE_INDEX_SLEB64 => super::leb::PADDED64,
         _ => super::leb::PADDED,
     }
 }
@@ -661,8 +673,14 @@ fn width(r_type: u32) -> usize {
 fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     let parsed = parse(bytes)?;
     match parsed.memory64 {
-        Some(true) if !memory64 => return Err("a memory64 (wasm64) object in a wasm32 link".to_owned()), // alloc: error path
-        Some(false) if memory64 => return Err("a wasm32 object, its memory 32-bit, in a memory64 (wasm64) link".to_owned()), // alloc: error path
+        Some(true) if !memory64 => {
+            return Err("a memory64 (wasm64) object in a wasm32 link".to_owned());
+        } // alloc: error path
+        Some(false) if memory64 => {
+            return Err(
+                "a wasm32 object, its memory 32-bit, in a memory64 (wasm64) link".to_owned()
+            );
+        } // alloc: error path
         _ => {}
     }
     let linking = linking(parsed.linking.ok_or(
@@ -683,7 +701,8 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     let mut total = 0;
     for &(name, contents) in &parsed.relocs {
         // alloc: error path
-        let (_, count) = relocs_header(&mut Reader::new(contents)).map_err(|e| format!("{name}: {e}"))?;
+        let (_, count) =
+            relocs_header(&mut Reader::new(contents)).map_err(|e| format!("{name}: {e}"))?;
         total += count;
     }
     let mut all_relocs: Vec<Reloc> = Vec::with_capacity(total);
@@ -703,13 +722,15 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
         }
         *run = start..all_relocs.len() as u32;
     }
-    let relocs_of = |section: usize| &all_relocs[runs[section].start as usize..runs[section].end as usize];
+    let relocs_of =
+        |section: usize| &all_relocs[runs[section].start as usize..runs[section].end as usize];
     let start_of = |section: usize| parsed.sections[section].at;
     let named = |r: &Reloc| reloc::name(r.r_type).unwrap_or("an unknown relocation");
 
     let bodies = parsed.bodies.len();
-    let mut sections =
-        Vec::with_capacity(bodies + parsed.segments.len() + parsed.customs.len() + linking.inits.len());
+    let mut sections = Vec::with_capacity(
+        bodies + parsed.segments.len() + parsed.customs.len() + linking.inits.len(),
+    );
     // Every section's relocations, each section's a run: the core's one column.
     let mut fixups: Vec<NativeFixup> = Vec::with_capacity(all_relocs.len() + linking.inits.len());
     // Every name once, borrowed from the input and pushed: the functions' and init arrays'
@@ -722,8 +743,14 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     let comdat_names: usize = linking.comdats.iter().map(|it| it.0.len()).sum();
     // An imported function's module and field once for its `WasmImport`, the field again as
     // its symbol's name when the symbol has none.
-    let fields: usize = parsed.imported.iter().map(|it| it.module.len() + 2 * it.field.len()).sum::<usize>()
-        + parsed.imported_globals.iter().chain(&parsed.imported_tables).map(|it| it.len()).sum::<usize>();
+    let fields: usize =
+        parsed.imported.iter().map(|it| it.module.len() + 2 * it.field.len()).sum::<usize>()
+            + parsed
+                .imported_globals
+                .iter()
+                .chain(&parsed.imported_tables)
+                .map(|it| it.len())
+                .sum::<usize>();
     // A symbol's name once for it and once more in its function's section name, `.text.` and
     // an index (at most 16 bytes) or `.init_array.` and a priority (at most 17).
     let mut names = Names::with_capacity(
@@ -735,8 +762,11 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
             + 24 * (bodies + linking.inits.len()),
     );
     let mut scratch = String::with_capacity(longest + 24);
-    let undefined_functions =
-        linking.symbols.iter().filter(|it| it.kind == SYM_FUNCTION && it.flags & UNDEFINED != 0).count();
+    let undefined_functions = linking
+        .symbols
+        .iter()
+        .filter(|it| it.kind == SYM_FUNCTION && it.flags & UNDEFINED != 0)
+        .count();
     let mut imports = Vec::with_capacity(undefined_functions);
 
     // alloc: once per object, an entry per function
@@ -773,7 +803,9 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     }
     // The last export of each body wins, as the export section's order says.
     for &(function, name) in &parsed.exports {
-        if let Some(slot) = function.checked_sub(imported).and_then(|it| function_names.get_mut(it as usize)) {
+        if let Some(slot) =
+            function.checked_sub(imported).and_then(|it| function_names.get_mut(it as usize))
+        {
             slot.export = Some(name);
         }
     }
@@ -874,10 +906,11 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     if let Some(data) = parsed.data {
         for r in data_relocs {
             let at = start_of(data) + r.offset;
-            let (segment, offset) = within(&parsed.segments, at, width(r.r_type)).ok_or_else(|| {
-                // alloc: error path
-                format!("{} at {:#x} of the data section, in no segment", named(r), r.offset)
-            })?;
+            let (segment, offset) =
+                within(&parsed.segments, at, width(r.r_type)).ok_or_else(|| {
+                    // alloc: error path
+                    format!("{} at {:#x} of the data section, in no segment", named(r), r.offset)
+                })?;
             match reloc::kind(r.r_type)? {
                 Kind::Applied => segment_fixups.push((
                     segment as u32,
@@ -1145,7 +1178,8 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
         }
         let run = fixups.len() as u32;
         // A function pointer: four bytes, or eight in a memory64 module.
-        let (apply, slot) = if memory64 { (reloc::TABLE_INDEX_I64, 8) } else { (reloc::TABLE_INDEX_I32, 4) };
+        let (apply, slot) =
+            if memory64 { (reloc::TABLE_INDEX_I64, 8) } else { (reloc::TABLE_INDEX_I32, 4) };
         fixups.push(NativeFixup {
             at: 0,
             apply: Apply::Native(apply),
@@ -1169,7 +1203,8 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     let mut grouped = Vec::with_capacity(linking.comdat_entries.len());
     for (name, entries) in &linking.comdats {
         let start = grouped.len() as u32;
-        for &(kind, index) in &linking.comdat_entries[entries.start as usize..entries.end as usize] {
+        for &(kind, index) in &linking.comdat_entries[entries.start as usize..entries.end as usize]
+        {
             grouped.push(match kind {
                 COMDAT_DATA => *segment_sections
                     .get(index as usize)
@@ -1189,13 +1224,20 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
                 other => return Err(format!("the COMDAT `{name}` holds a thing of kind {other}")),
             });
         }
-        groups.push(Group { name: names.push(name)?, sections: start..grouped.len() as u32, largest: false });
+        groups.push(Group {
+            name: names.push(name)?,
+            sections: start..grouped.len() as u32,
+            largest: false,
+        });
     }
 
     for fixup in &fixups {
         if fixup.symbol as usize >= symbols.len() {
             // alloc: error path
-            return Err(format!("a relocation against symbol {}, which there is not", fixup.symbol));
+            return Err(format!(
+                "a relocation against symbol {}, which there is not",
+                fixup.symbol
+            ));
         }
     }
     Ok(Object {
@@ -1255,7 +1297,12 @@ mod tests {
     ];
 
     /// Relocations: type, offset in the section, symbol or type, addend.
-    fn reloc_section(out: &mut Vec<u8>, name_: &str, section_index: u32, relocs: &[(u8, u32, u32, i64)]) {
+    fn reloc_section(
+        out: &mut Vec<u8>,
+        name_: &str,
+        section_index: u32,
+        relocs: &[(u8, u32, u32, i64)],
+    ) {
         let mut contents = Vec::new();
         uleb(&mut contents, section_index.into());
         uleb(&mut contents, relocs.len() as u64);
@@ -1274,7 +1321,11 @@ mod tests {
     fn object_bytes(code_relocs: &[(u8, u32, u32, i64)], extra_symbol: Option<&[u8]>) -> Vec<u8> {
         let mut out = reader::MAGIC.to_vec();
         // Types: 0 is (i32 i32 i32 i32) -> i32, 1 is () -> (), 2 is (i32) -> ().
-        section(&mut out, 1, &vec_of(3, &[0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 0, 0x60, 1, 0x7f, 0]));
+        section(
+            &mut out,
+            1,
+            &vec_of(3, &[0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 0, 0x60, 1, 0x7f, 0]),
+        );
         let mut imports = Vec::new();
         name(&mut imports, "env");
         name(&mut imports, "__linear_memory");
@@ -1361,7 +1412,9 @@ mod tests {
             sym(extra);
         }
         let mut segments = Vec::new();
-        for (segment, align) in [(".rodata.msg", 0), (".bss.buf", 3), (".data.ptr", 2), ("my_items", 2)] {
+        for (segment, align) in
+            [(".rodata.msg", 0), (".bss.buf", 3), (".data.ptr", 2), ("my_items", 2)]
+        {
             name(&mut segments, segment);
             segments.extend([align, 0]);
         }
@@ -1383,7 +1436,14 @@ mod tests {
     }
 
     fn code_relocs() -> Vec<(u8, u32, u32, i64)> {
-        vec![(7, 4, SP, 0), (4, 11, 4, 2), (1, 17, 1, 0), (6, 23, 2, 0), (20, 28, 8, 0), (0, 34, 2, 0)]
+        vec![
+            (7, 4, SP, 0),
+            (4, 11, 4, 2),
+            (1, 17, 1, 0),
+            (6, 23, 2, 0),
+            (20, 28, 8, 0),
+            (0, 34, 2, 0),
+        ]
     }
 
     fn read_object(bytes: &[u8]) -> Result<Object, String> {
@@ -1426,7 +1486,10 @@ mod tests {
         assert_eq!(object.sections[3].align, 8);
         // Segments and custom sections are ranges of the input, not copies.
         assert!(matches!(object.sections[2].data, Data::Input(_)));
-        assert_eq!(object.section_bytes(&object.sections[2].data, &input).unwrap(), Some(&b"hi!\0"[..]));
+        assert_eq!(
+            object.section_bytes(&object.sections[2].data, &input).unwrap(),
+            Some(&b"hi!\0"[..])
+        );
         assert!(matches!(object.sections[6].data, Data::Input(_)));
         assert_eq!(object.section_bytes(&object.sections[3].data, &input).unwrap(), None);
         let retained: Vec<bool> = object.sections.iter().map(|it| it.retain).collect();
@@ -1483,7 +1546,8 @@ mod tests {
         }
         assert_eq!(end as usize, object.fixups.len());
 
-        let symbol = |name: &str| object.symbols.iter().find(|it| object.name(it.name) == name).unwrap();
+        let symbol =
+            |name: &str| object.symbols.iter().find(|it| object.name(it.name) == name).unwrap();
         assert_eq!(object.symbols.len(), 11);
         assert_eq!(
             symbol("_start").def,
@@ -1495,7 +1559,10 @@ mod tests {
         assert_eq!(object.imports.len(), 1);
         let (at, import) = &object.imports[0];
         assert_eq!(object.symbols[*at as usize], *fd_write);
-        assert_eq!((object.name(import.module), object.name(import.field)), ("wasi_snapshot_preview1", "fd_write"));
+        assert_eq!(
+            (object.name(import.module), object.name(import.field)),
+            ("wasi_snapshot_preview1", "fd_write")
+        );
         // The type is borrowed from the type section, in place.
         let ty = import.type_bytes(&input).unwrap();
         assert_eq!(ty, [0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f]);
@@ -1609,12 +1676,15 @@ mod tests {
         assert!(read("libc.so", &linked, &NativeKind::Shared { as_needed: true }, false).is_err());
 
         // An object's memory is the link's width: a wasm32 object in a wasm64 link is refused.
-        let error = read("crt1.o", &object_bytes(&code_relocs(), None), &NativeKind::Object, true).err().unwrap();
+        let error = read("crt1.o", &object_bytes(&code_relocs(), None), &NativeKind::Object, true)
+            .err()
+            .unwrap();
         assert!(error.contains("memory64"), "{error}");
     }
 
     fn header(name: &str, size: usize) -> Vec<u8> {
-        let mut out = format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}", 0, 0, 0, 644).into_bytes();
+        let mut out =
+            format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}", 0, 0, 0, 644).into_bytes();
         out.extend(b"`\n");
         assert_eq!(out.len(), 60);
         out
@@ -1652,14 +1722,16 @@ mod tests {
         let names: Vec<&str> = archive.members.iter().map(|it| archive.name(it.name)).collect();
         assert_eq!(names, ["a.o", "b.o"]);
         assert_eq!(&bytes[archive.members[1].bytes.clone()], reader::MAGIC);
-        let index: Vec<(&str, u32)> = archive.index.iter().map(|&(name, at)| (archive.name(name), at)).collect();
+        let index: Vec<(&str, u32)> =
+            archive.index.iter().map(|&(name, at)| (archive.name(name), at)).collect();
         assert_eq!(index, [("_start", 0), ("helper", 1)]);
     }
 
     #[test]
     fn an_archive_without_an_index() {
         let bytes = archive_bytes(false);
-        let error = read("libx.a", &bytes, &NativeKind::Archive { whole: false }, false).err().unwrap();
+        let error =
+            read("libx.a", &bytes, &NativeKind::Archive { whole: false }, false).err().unwrap();
         assert!(error.contains("libx.a") && error.contains("index"), "{error}");
         assert!(read("libx.a", &bytes, &NativeKind::Archive { whole: true }, false).is_ok());
     }
@@ -1669,7 +1741,8 @@ mod tests {
         // One header of a 100-byte member, and no bytes after it.
         let mut bytes = b"!<arch>\n".to_vec();
         bytes.extend(header("a.o/", 100));
-        let error = read("liba.a", &bytes, &NativeKind::Archive { whole: true }, false).err().unwrap();
+        let error =
+            read("liba.a", &bytes, &NativeKind::Archive { whole: true }, false).err().unwrap();
         assert!(error.contains("`a.o`") && error.contains("past the archive"), "{error}");
     }
 

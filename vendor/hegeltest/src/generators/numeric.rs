@@ -127,11 +127,7 @@ impl Float for f64 {
 pub(crate) fn sign_aware_lte<T: Float>(a: T, b: T) -> bool {
     let a = a.to_f64();
     let b = b.to_f64();
-    if a == 0.0 && b == 0.0 {
-        a.is_sign_negative() || b.is_sign_positive()
-    } else {
-        a <= b
-    }
+    if a == 0.0 && b == 0.0 { a.is_sign_negative() || b.is_sign_positive() } else { a <= b }
 }
 
 /// Generator for integer values. Created by [`integers()`].
@@ -353,11 +349,8 @@ impl<T: Float> FloatGenerator<T> {
             invalid_argument!("Cannot have allow_infinity=true with both min_value and max_value");
         }
 
-        let smallest_normal = if width == 32 {
-            f32::MIN_POSITIVE as f64
-        } else {
-            f64::MIN_POSITIVE
-        };
+        let smallest_normal =
+            if width == 32 { f32::MIN_POSITIVE as f64 } else { f64::MIN_POSITIVE };
         let min_f = self.min.map(|v| v.to_f64());
         let max_f = self.max.map(|v| v.to_f64());
         let allow_subnormal = self.allow_subnormal.unwrap_or(match (min_f, max_f) {
@@ -403,11 +396,7 @@ impl<T: Float> FloatGenerator<T> {
         };
 
         let smallest_nonzero_magnitude = if allow_subnormal {
-            if width == 32 {
-                f64::from(f32::from_bits(1))
-            } else {
-                f64::from_bits(1)
-            }
+            if width == 32 { f64::from(f32::from_bits(1)) } else { f64::from_bits(1) }
         } else {
             smallest_normal
         };

@@ -30,9 +30,7 @@ fn mk_fn_ptr(ctx: &TransformCtx, id: ItemId, mut generics: GenericArgs) -> FnPtr
             types: Default::default(),
             vtable: None,
         };
-        generics
-            .trait_refs
-            .push(PolyTraitRef::new(kind, trait_decl_ref));
+        generics.trait_refs.push(PolyTraitRef::new(kind, trait_decl_ref));
     }
     let fun_id = *id.as_fun().unwrap();
     FnPtr::new(FnPtrKind::Fun(fun_id), generics)
@@ -52,10 +50,7 @@ fn method_impl_trait_ref(
     let impl_ref = impl_ref.clone().substitute(fun_generics);
     let trait_impl = ctx.translated.trait_impls.get(impl_ref.id)?;
     let trait_decl_ref = trait_impl.impl_trait.clone().substitute(&impl_ref.generics);
-    Some(TraitRef::new(
-        TraitRefKind::TraitImpl(impl_ref),
-        trait_decl_ref,
-    ))
+    Some(TraitRef::new(TraitRefKind::TraitImpl(impl_ref), trait_decl_ref))
 }
 
 fn index_method_types(
@@ -110,11 +105,7 @@ fn transform_operation(std_items: &Transform, ctx: &TransformCtx, statement: &mu
                     [Region::Erased].into(),
                     [elem_ty.clone()].into(),
                     [len.clone()].into(),
-                    elem_ty_is_sized
-                        .iter()
-                        .cloned()
-                        .map(PolyTraitRef::empty)
-                        .collect(),
+                    elem_ty_is_sized.iter().cloned().map(PolyTraitRef::empty).collect(),
                 );
                 statement.kind = StatementKind::Call {
                     call: Call {
@@ -130,12 +121,7 @@ fn transform_operation(std_items: &Transform, ctx: &TransformCtx, statement: &mu
         // Transform the array aggregates to function calls.
         StatementKind::Assign(
             place,
-            Rvalue::Repeat {
-                operand,
-                count,
-                elem_is_sized,
-                elem_is_copy,
-            },
+            Rvalue::Repeat { operand, count, elem_is_sized, elem_is_copy },
         ) => {
             // We could avoid the clone operations below if we take the content of
             // the statement. In practice, this shouldn't have much impact.
@@ -145,9 +131,8 @@ fn transform_operation(std_items: &Transform, ctx: &TransformCtx, statement: &mu
             // `Copy`'s explicit `Clone` supertrait follows its optional implicit marker clause.
             // `array::repeat` has the corresponding `Clone` bound at the same position.
             let clone_clause_id = TraitClauseId::new(usize::from(elem_is_sized.is_some()));
-            let Some(ty_is_clone) = elem_is_copy
-                .clone()
-                .project_parent_clause(&ctx.translated, clone_clause_id)
+            let Some(ty_is_clone) =
+                elem_is_copy.clone().project_parent_clause(&ctx.translated, clone_clause_id)
             else {
                 return;
             };
@@ -218,9 +203,8 @@ impl<'a, 'b> IndexVisitor<'a, 'b> {
         let Some(&index_fun_id) = self.std_items.item_map.get(&item) else {
             return;
         };
-        let Some(index_fun) = index_fun_id
-            .as_fun()
-            .and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
+        let Some(index_fun) =
+            index_fun_id.as_fun().and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
         else {
             return;
         };
@@ -228,16 +212,10 @@ impl<'a, 'b> IndexVisitor<'a, 'b> {
             [Region::Erased].into(),
             [ty.clone()].into(),
             [].into(),
-            ty_is_sized
-                .iter()
-                .cloned()
-                .map(PolyTraitRef::empty)
-                .collect(),
+            ty_is_sized.iter().cloned().map(PolyTraitRef::empty).collect(),
         );
         let index_fn_ptr = mk_fn_ptr(self.ctx.ctx, index_fun_id, index_generics);
-        let index_ty = index_fun.signature.inputs[0]
-            .clone()
-            .substitute(&index_fn_ptr.generics);
+        let index_ty = index_fun.signature.inputs[0].clone().substitute(&index_fn_ptr.generics);
 
         let output_inner_ty = if matches!(pe, Index { .. }) {
             ty.clone()
@@ -245,36 +223,24 @@ impl<'a, 'b> IndexVisitor<'a, 'b> {
             TyKind::Slice(ty.clone(), ty_is_sized.clone()).into_ty()
         };
         let output_ty = {
-            TyKind::Ref(
-                Region::Erased,
-                output_inner_ty.clone(),
-                RefKind::mutable(mut_access),
-            )
-            .into_ty()
+            TyKind::Ref(Region::Erased, output_inner_ty.clone(), RefKind::mutable(mut_access))
+                .into_ty()
         };
 
         // Push the statements:
         // `storage_live(tmp0)`
         // `tmp0 = &{mut}p`
         let input_var =
-            self.ctx
-                .borrow_to_new_var(subplace.clone(), BorrowKind::mutable(mut_access), None);
+            self.ctx.borrow_to_new_var(subplace.clone(), BorrowKind::mutable(mut_access), None);
 
         // Construct the arguments to pass to the indexing function.
         let (last_arg, from_end) = match &pe {
-            Index {
-                offset: x,
-                from_end,
-                ..
+            Index { offset: x, from_end, .. } | Subslice { to: x, from_end, .. } => {
+                (x.as_ref().clone(), *from_end)
             }
-            | Subslice {
-                to: x, from_end, ..
-            } => (x.as_ref().clone(), *from_end),
             _ => unreachable!(),
         };
-        let to_idx = self
-            .ctx
-            .compute_subslice_end_idx(subplace, last_arg, from_end);
+        let to_idx = self.ctx.compute_subslice_end_idx(subplace, last_arg, from_end);
         let index = match &pe {
             Index { .. } => to_idx,
             Subslice { from, .. } => {
@@ -303,18 +269,16 @@ impl<'a, 'b> IndexVisitor<'a, 'b> {
             let Some(&array_fun_id) = self.std_items.item_map.get(&array_item) else {
                 return;
             };
-            let Some(array_fun) = array_fun_id
-                .as_fun()
-                .and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
+            let Some(array_fun) =
+                array_fun_id.as_fun().and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
             else {
                 return;
             };
             let Some(&slice_fun_id) = self.std_items.item_map.get(&slice_item) else {
                 return;
             };
-            let Some(slice_fun) = slice_fun_id
-                .as_fun()
-                .and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
+            let Some(slice_fun) =
+                slice_fun_id.as_fun().and_then(|id| self.ctx.ctx.translated.fun_decls.get(*id))
             else {
                 return;
             };
@@ -399,19 +363,14 @@ impl<'a, 'b> IndexVisitor<'a, 'b> {
         // `tmp1 = {Array,Slice}{Mut,Shared}{Index,SubSlice}(move tmp0, <other args>)`
         let output_var = {
             let output_var = self.ctx.fresh_var(None, output_ty);
-            let index_call = Call {
-                func: FnOperand::Regular(index_fn_ptr),
-                args,
-                safety: CallSafety::Inherit,
-            };
+            let index_call =
+                Call { func: FnOperand::Regular(index_fn_ptr), args, safety: CallSafety::Inherit };
             let kind = StatementKind::Call {
                 call: index_call,
                 dest: output_var.clone(),
                 on_unwind: Block::new_unreachable(self.ctx.span),
             };
-            self.ctx
-                .statements
-                .push(Statement::new(self.ctx.span, kind));
+            self.ctx.statements.push(Statement::new(self.ctx.span, kind));
             output_var
         };
 
@@ -491,21 +450,13 @@ impl VisitBodyMut for IndexVisitor<'_, '_> {
         match x {
             // `UniqueImmutable` de facto gives mutable access and only shows up if there is nested
             // mutable access.
-            RawPtr {
-                kind: RefKind::Mut, ..
-            }
+            RawPtr { kind: RefKind::Mut, .. }
             | Ref {
                 kind: BorrowKind::Mut | BorrowKind::TwoPhaseMut | BorrowKind::UniqueImmutable,
                 ..
             } => self.visit_inner_with_mutability(x, true),
-            RawPtr {
-                kind: RefKind::Shared,
-                ..
-            }
-            | Ref {
-                kind: BorrowKind::Shared | BorrowKind::Shallow,
-                ..
-            }
+            RawPtr { kind: RefKind::Shared, .. }
+            | Ref { kind: BorrowKind::Shared | BorrowKind::Shallow, .. }
             | Discriminant(..) => self.visit_inner_with_mutability(x, false),
 
             Use(..)
@@ -660,10 +611,7 @@ impl Transform {
                 }
                 _ => continue,
             };
-            index_impl_methods
-                .entry(item)
-                .or_default()
-                .push(ItemId::Fun(fun.def_id));
+            index_impl_methods.entry(item).or_default().push(ItemId::Fun(fun.def_id));
         }
         let item_map = matches
             .into_iter()
@@ -689,18 +637,14 @@ impl LlbcPass for Transform {
             return;
         };
         if ctx.options.ops_to_function_calls {
-            body.body
-                .visit_statements(&mut |statement: &mut Statement| {
-                    transform_operation(self, ctx, statement)
-                });
+            body.body.visit_statements(&mut |statement: &mut Statement| {
+                transform_operation(self, ctx, statement)
+            });
         }
         if ctx.options.index_to_function_calls {
             decl.transform_llbc_statements(ctx, |ctx, st: &mut Statement| {
-                let mut visitor = IndexVisitor {
-                    ctx,
-                    std_items: self,
-                    place_mutability_stack: Vec::new(),
-                };
+                let mut visitor =
+                    IndexVisitor { ctx, std_items: self, place_mutability_stack: Vec::new() };
                 use StatementKind::*;
                 match &mut st.kind {
                     Assign(..)

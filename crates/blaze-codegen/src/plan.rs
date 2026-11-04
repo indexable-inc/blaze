@@ -113,7 +113,10 @@ impl Origin {
             Origin::BuildTime(it) => (2, it.as_str()),
             Origin::Std => (3, ""),
         };
-        hasher.update(&[tag]).update(&(package.len() as u64).to_le_bytes()).update(package.as_bytes());
+        hasher
+            .update(&[tag])
+            .update(&(package.len() as u64).to_le_bytes())
+            .update(package.as_bytes());
     }
 }
 
@@ -140,8 +143,12 @@ impl Consed for PackageName {
 
 /// Every package name the process has made an [`Origin`] of: the packages of the workspaces
 /// it builds, a few thousand at most.
-#[expect(clippy::disallowed_types, reason = "the process's one interner of package names, which every `Origin` points into")]
-static PACKAGES: std::sync::LazyLock<HashCons<PackageName>> = std::sync::LazyLock::new(HashCons::new);
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one interner of package names, which every `Origin` points into"
+)]
+static PACKAGES: std::sync::LazyLock<HashCons<PackageName>> =
+    std::sync::LazyLock::new(HashCons::new);
 
 impl Package {
     /// The package named `name`. A name made before is found with no lock and no allocation.
@@ -265,7 +272,13 @@ pub enum PlanError {
     /// The code must be stencils (the first tier of a live build's or a tiered run's, or every
     /// level of `codegen-backend = "stencil"`), and the toolchain's CPU lacks `off`, a feature
     /// of the target's baseline CPU, whose code the stencils are ([`Toolchain::lacks_baseline`]).
-    StencilsNeedBaseline { origin: Origin, level: OptLevel, target: String, cpu: String, off: String },
+    StencilsNeedBaseline {
+        origin: Origin,
+        level: OptLevel,
+        target: String,
+        cpu: String,
+        off: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -332,7 +345,11 @@ impl Policy {
     /// end's when the instance says (`#[rustc_inherit_overflow_checks]` or std's MIR, built
     /// without them), else the profile's for the origin. A tail call (`become`) changes
     /// nothing here: stencils make one as LLVM does (`return_call`, `musttail`).
-    pub fn choose(&self, origin: &Origin, overflow_checks: Option<bool>) -> Result<Choice, PlanError> {
+    pub fn choose(
+        &self,
+        origin: &Origin,
+        overflow_checks: Option<bool>,
+    ) -> Result<Choice, PlanError> {
         let profile = &self.profile;
         let mut level = profile.opt_level;
         let mut checks = profile.overflow_checks;
@@ -401,17 +418,26 @@ impl Policy {
             heap_to_stack: self.heap_to_stack && !matches!(origin, Origin::Std),
             // Only code of the tests' processes has the fuel runtime to call; wasm32's one
             // producer has no lowering of it.
-            fuel: self.fuel && native && !self.proc_macro_bridge && !matches!(origin, Origin::BuildTime(_)),
+            fuel: self.fuel
+                && native
+                && !self.proc_macro_bridge
+                && !matches!(origin, Origin::BuildTime(_)),
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
-        let counted = self.mode == Mode::Tiered && level == OptLevel::O0 && !matches!(origin, Origin::BuildTime(_));
+        let counted = self.mode == Mode::Tiered
+            && level == OptLevel::O0
+            && !matches!(origin, Origin::BuildTime(_));
         // A live build's LLVM code starts as stencils until LLVM's is in the slot.
         let tiered = live && backend.is_release();
         let stencils = counted || tiered || backend == Backend::Stencil;
         if stencils && self.toolchain.stencils.is_none() {
             // clone: an error names the target
-            return Err(PlanError::NoStencils { origin: *origin, level: asked, target: self.toolchain.target.clone() });
+            return Err(PlanError::NoStencils {
+                origin: *origin,
+                level: asked,
+                target: self.toolchain.target.clone(),
+            });
         }
         if let (true, Some(off)) = (stencils, lacks) {
             return Err(PlanError::StencilsNeedBaseline {
@@ -527,7 +553,8 @@ mod tests {
     /// the first tier of a live build's included.
     #[test]
     fn native_code_is_never_cranelifts() {
-        let levels = [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::S, OptLevel::Z];
+        let levels =
+            [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::S, OptLevel::Z];
         for level in levels {
             for mode in [Mode::Output, Mode::Live, Mode::Tiered] {
                 let mut policy = policy(level, mode);
@@ -535,7 +562,11 @@ mod tests {
                 for origin in origins() {
                     let choice = policy.choose(&origin, None).unwrap();
                     for spec in std::iter::once(&choice.first).chain(&choice.then) {
-                        assert!(!spec.backend.is_cranelift(), "{level:?} {mode:?} {origin:?}: {:?}", spec.backend);
+                        assert!(
+                            !spec.backend.is_cranelift(),
+                            "{level:?} {mode:?} {origin:?}: {:?}",
+                            spec.backend
+                        );
                         assert!(!spec.fold, "{level:?} {mode:?} {origin:?}: folds are Cranelift's");
                     }
                 }
@@ -545,16 +576,26 @@ mod tests {
 
     #[test]
     fn a_target_with_no_stencil_library_stops_below_llvms_levels() {
-        for (level, mode) in [(OptLevel::O0, Mode::Output), (OptLevel::O1, Mode::Output), (OptLevel::O3, Mode::Live)] {
+        for (level, mode) in
+            [(OptLevel::O0, Mode::Output), (OptLevel::O1, Mode::Output), (OptLevel::O3, Mode::Live)]
+        {
             let mut policy = policy(level, mode);
             policy.toolchain.stencils = None;
             let why = policy.choose(&member(), None).unwrap_err();
             assert_eq!(
                 why,
-                PlanError::NoStencils { origin: member(), level, target: "aarch64-unknown-linux-gnu".to_owned() }
+                PlanError::NoStencils {
+                    origin: member(),
+                    level,
+                    target: "aarch64-unknown-linux-gnu".to_owned()
+                }
             );
             let message = why.to_string();
-            assert!(message.contains("Member(\"app\")") && message.contains("aarch64-unknown-linux-gnu"), "{message}");
+            assert!(
+                message.contains("Member(\"app\")")
+                    && message.contains("aarch64-unknown-linux-gnu"),
+                "{message}"
+            );
         }
         let mut output = policy(OptLevel::O3, Mode::Output);
         output.toolchain.stencils = None;
@@ -567,8 +608,14 @@ mod tests {
             let policy = wasm(level);
             let backend = |origin: Origin| policy.choose(&origin, None).unwrap().first.backend;
             assert_eq!(backend(member()), Backend::Cranelift { speed: false });
-            assert_eq!(backend(Origin::Dependency(Package::new("regex"))), Backend::Cranelift { speed: true });
-            assert_eq!(backend(Origin::BuildTime(Package::new("serde_derive"))), Backend::Cranelift { speed: true });
+            assert_eq!(
+                backend(Origin::Dependency(Package::new("regex"))),
+                Backend::Cranelift { speed: true }
+            );
+            assert_eq!(
+                backend(Origin::BuildTime(Package::new("serde_derive"))),
+                Backend::Cranelift { speed: true }
+            );
         }
         let mut folding = wasm(OptLevel::O0);
         folding.fold = true;
@@ -590,7 +637,8 @@ mod tests {
         assert_eq!(o0.first.backend, Backend::Llvm { opt: 0 });
         let o1 = lacking(OptLevel::O1, Mode::Output).choose(&member(), None).unwrap();
         assert_eq!(o1.first.backend, Backend::Llvm { opt: 1 });
-        let live = lacking(OptLevel::O0, Mode::Live).choose(&member(), None).unwrap_err().to_string();
+        let live = lacking(OptLevel::O0, Mode::Live).choose(&member(), None);
+        let live = live.unwrap_err().to_string();
         assert!(live.contains("cortex-a35") && live.contains("`lse`"), "{live}");
         let plus = policy(OptLevel::O0, Mode::Output);
         assert_eq!(plus.choose(&member(), None).unwrap().first.backend, Backend::Stencil);
@@ -618,7 +666,8 @@ mod tests {
         );
         let own = policy.choose(&member(), None).unwrap();
         assert_eq!(own.first.backend, Backend::Stencil);
-        let dependency = policy.choose(&Origin::Dependency(Package::new("nalgebra")), None).unwrap();
+        let dependency =
+            policy.choose(&Origin::Dependency(Package::new("nalgebra")), None).unwrap();
         assert_eq!(dependency.first.backend, Backend::Llvm { opt: 3 });
         let named = policy.choose(&Origin::Dependency(Package::new("slow")), None).unwrap();
         assert_eq!(named.first.backend, Backend::Stencil);
@@ -690,10 +739,14 @@ mod tests {
         let mut output = tiered.clone();
         output.mode = Mode::Output;
         let higher = Origin::Dependency(Package::new("nalgebra"));
-        let (at_three, as_output) = (tiered.choose(&higher, None).unwrap(), output.choose(&higher, None).unwrap());
+        let (at_three, as_output) =
+            (tiered.choose(&higher, None).unwrap(), output.choose(&higher, None).unwrap());
         assert_eq!(at_three.first, as_output.first);
         assert_eq!((at_three.then, at_three.patchable), (as_output.then, as_output.patchable));
-        assert_eq!(tiered.choose(&Origin::Std, None).unwrap().first.backend, Backend::Llvm { opt: 3 });
+        assert_eq!(
+            tiered.choose(&Origin::Std, None).unwrap().first.backend,
+            Backend::Llvm { opt: 3 }
+        );
         let build = tiered.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
         assert_eq!(build.first.backend, Backend::Stencil);
         assert!(!build.first.counted);
@@ -725,7 +778,10 @@ mod tests {
             let mut policy = policy(OptLevel::O3, Mode::Output);
             policy.toolchain.llvm = llvm;
             policy.profile.stencils = true;
-            policy.profile.packages.insert("*".to_owned(), Override { opt_level: Some(OptLevel::Z), ..Override::default() });
+            policy.profile.packages.insert(
+                "*".to_owned(),
+                Override { opt_level: Some(OptLevel::Z), ..Override::default() },
+            );
             for origin in origins() {
                 let choice = policy.choose(&origin, None).unwrap();
                 assert_eq!(choice.first.backend, Backend::Stencil, "{origin:?}");
@@ -769,7 +825,9 @@ mod tests {
             Override { opt_level: Some(OptLevel::O3), ..Override::default() },
         );
         let syn = Origin::Dependency(Package::new("syn"));
-        let settings = |policy: &Policy, origin: &Origin| policy.choose(origin, None).unwrap().first.settings();
+        let settings = |policy: &Policy, origin: &Origin| {
+            policy.choose(origin, None).unwrap().first.settings()
+        };
         assert_eq!(settings(&a, &member()), settings(&b, &member()));
         assert_eq!(settings(&a, &syn), settings(&b, &syn));
         let mut c = a.clone();
@@ -787,7 +845,9 @@ mod tests {
     fn heap_to_stack_keys_every_function_but_stds() {
         let off = policy(OptLevel::O2, Mode::Output);
         let on = Policy { heap_to_stack: true, ..off.clone() };
-        let settings = |policy: &Policy, origin: &Origin| policy.choose(origin, None).unwrap().first.settings();
+        let settings = |policy: &Policy, origin: &Origin| {
+            policy.choose(origin, None).unwrap().first.settings()
+        };
         assert_eq!(settings(&off, &Origin::Std), settings(&on, &Origin::Std));
         assert!(!on.choose(&Origin::Std, None).unwrap().first.heap_to_stack);
         for origin in [member(), Origin::Dependency(Package::new("regex"))] {

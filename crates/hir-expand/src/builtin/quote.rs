@@ -315,7 +315,8 @@ pub(crate) fn str_literal(s: &str, span: Span) -> crate::tt::Literal {
             while let Some(c) = rest.chars().next() {
                 escaped.extend(c.escape_default());
                 rest = &rest[c.len_utf8()..];
-                let run = rest.bytes().position(|b| !kept_by_escape_default(b)).unwrap_or(rest.len());
+                let run =
+                    rest.bytes().position(|b| !kept_by_escape_default(b)).unwrap_or(rest.len());
                 let (kept, tail) = rest.split_at(run);
                 escaped.push_str(kept);
                 rest = tail;
@@ -468,17 +469,20 @@ mod tests {
             let mut b = top(DUMMY);
             let items = Emit(|b: &mut tt::TopSubtreeBuilder| {
                 for it in &fields {
-                    let item = Group(OTHER, |b: &mut tt::TopSubtreeBuilder| {
-                        quote_into!(b, OTHER => #it : self . #it , )
-                    });
+                    let item = Group(
+                        OTHER,
+                        |b: &mut tt::TopSubtreeBuilder| quote_into!(b, OTHER => #it : self . #it , ),
+                    );
                     quote_into!(b, OTHER => #item);
                 }
             });
             let body = Emit(|b: &mut tt::TopSubtreeBuilder| quote_into!(b, DUMMY => { #items }));
-            let path = Group(OTHER, |b: &mut tt::TopSubtreeBuilder| {
-                quote_into!(b, OTHER => #name :: #name)
-            });
-            let single = Group(OTHER, |b: &mut tt::TopSubtreeBuilder| quote_into!(b, OTHER => #name));
+            let path = Group(
+                OTHER,
+                |b: &mut tt::TopSubtreeBuilder| quote_into!(b, OTHER => #name :: #name),
+            );
+            let single =
+                Group(OTHER, |b: &mut tt::TopSubtreeBuilder| quote_into!(b, OTHER => #name));
             let nothing = Group(DUMMY, |_: &mut tt::TopSubtreeBuilder| {});
             quote_into!(&mut b, DUMMY => impl #path for #single #nothing #empty #body);
             b.build_skip_top_subtree()
@@ -542,14 +546,28 @@ mod tests {
     #[test]
     fn str_literal_escapes_as_escape_default() {
         let mut cases: Vec<String> = [
-            "", "plain text 123", "a\"b", "it's", "back\\slash", "tab\t", "nl\n", "café", "\u{0}",
-            "~ !", "\"", "\n\n\nend", "start\u{7f}", "日本語", "mixed é \u{1F600} \\ \" ' \r\t x",
+            "",
+            "plain text 123",
+            "a\"b",
+            "it's",
+            "back\\slash",
+            "tab\t",
+            "nl\n",
+            "café",
+            "\u{0}",
+            "~ !",
+            "\"",
+            "\n\n\nend",
+            "start\u{7f}",
+            "日本語",
+            "mixed é \u{1F600} \\ \" ' \r\t x",
         ]
         .into_iter()
         .map(String::from)
         .collect();
         // Every character up to U+00FF, and a few beyond, alone and between kept runs.
-        let chars: String = (0u32..0x100).chain([0x2028, 0xFEFF, 0x1F600]).filter_map(char::from_u32).collect();
+        let chars: String =
+            (0u32..0x100).chain([0x2028, 0xFEFF, 0x1F600]).filter_map(char::from_u32).collect();
         cases.push(chars.clone());
         cases.push(chars.chars().flat_map(|c| [c, 'k', 'e', 'p', 't']).collect());
         for s in &cases {
@@ -569,7 +587,8 @@ mod tests {
         for text in ["foo", "type", "r#type", "Self", "_x"] {
             let sym = Symbol::intern(text);
             let quoted = quote!(DUMMY => #sym);
-            let Some(tt::TtElement::Leaf(tt::Leaf::Ident(ident))) = quoted.token_trees().iter().next()
+            let Some(tt::TtElement::Leaf(tt::Leaf::Ident(ident))) =
+                quoted.token_trees().iter().next()
             else {
                 panic!("not an ident");
             };

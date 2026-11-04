@@ -265,8 +265,11 @@ fn expand_one<'db>(
 ) -> Result<(), MirLowerError<'db>> {
     let interner = filler.infcx.interner;
     let owner = body.owner;
-    let Some(Terminator { span, kind: TerminatorKind::ComptimeFor { binder, domain, body: first, after } }) =
-        body.basic_blocks[head].terminator.clone() // clone: the head's parts, before it is rewritten
+    let Some(Terminator {
+        span,
+        kind: TerminatorKind::ComptimeFor { binder, domain, body: first, after },
+    }) = body.basic_blocks[head].terminator.clone()
+    // clone: the head's parts, before it is rewritten
     else {
         return Err(unexpanded(MirComptimeForm::ForHead, owner));
     };
@@ -299,7 +302,11 @@ fn expand_one<'db>(
     // alloc: one list per loop expanded, kept across the copies
     let region: Vec<BasicBlockId> = frame::task(Tag::Mir, |frame| {
         let dominators = Dominators::new(body, frame);
-        body.basic_blocks.iter().map(|(id, _)| id).filter(|&b| dominators.dominates(first, b)).collect()
+        body.basic_blocks
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|&b| dominators.dominates(first, b))
+            .collect()
     });
     let mut in_region: SmallVec<[Option<usize>; 64]> =
         SmallVec::from_elem(None, body.basic_blocks.len());
@@ -315,7 +322,9 @@ fn expand_one<'db>(
         .filter(|(_, local)| mentions(interner, binder, local.ty.as_ref()))
         .map(|(id, _)| id)
         .collect();
-    if let Some(&local) = own.iter().find(|&&it| closure_names(interner, binder, body.locals[it].ty.as_ref())) {
+    if let Some(&local) =
+        own.iter().find(|&&it| closure_names(interner, binder, body.locals[it].ty.as_ref()))
+    {
         // alloc: error path
         return Err(MirLowerError::NotSupported(format!(
             "a closure or `async` block of type {:?} in {owner:?} names the binder of a \
@@ -338,7 +347,8 @@ fn expand_one<'db>(
             decl.ty = ReplaceBinder { interner, binder, member }.fold_ty(decl.ty.as_ref()).store();
             map_local.push((local, body.locals.alloc(decl)));
         }
-        let local = |it: LocalId| map_local.iter().find(|(from, _)| *from == it).map_or(it, |&(_, to)| to);
+        let local =
+            |it: LocalId| map_local.iter().find(|(from, _)| *from == it).map_or(it, |&(_, to)| to);
         let projection = member_projection(interner, member);
         let mut no_field = false;
         let mut fix_place = |place: &mut StoredPlace| {
@@ -465,7 +475,8 @@ fn retire_binder_locals<'db>(
     });
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
-            if let StatementKind::StorageLive(it) | StatementKind::StorageDead(it) = statement.kind {
+            if let StatementKind::StorageLive(it) | StatementKind::StorageDead(it) = statement.kind
+            {
                 mark(it);
             }
         }
@@ -517,9 +528,8 @@ pub(super) fn fold_if_const<'db>(
                 body.owner, alias.args
             )));
         }
-        let value = db
-            .anon_const_eval(id, alias.args, Some(filler.trait_env))
-            .map_err(|error| {
+        let value =
+            db.anon_const_eval(id, alias.args, Some(filler.trait_env)).map_err(|error| {
                 // alloc: error path
                 let name = format!("the `if const` condition {id:?} in {:?}", body.owner);
                 MirLowerError::ConstEvalError(name.into(), Box::new(error))
@@ -573,7 +583,9 @@ fn switched_constant<'db>(
     };
     let local = match &discr.kind {
         OperandKind::Constant { .. } => return constant(discr),
-        OperandKind::Copy(place) | OperandKind::Move(place) if place.projection.as_slice().is_empty() => {
+        OperandKind::Copy(place) | OperandKind::Move(place)
+            if place.projection.as_slice().is_empty() =>
+        {
             place.local
         }
         _ => return None,

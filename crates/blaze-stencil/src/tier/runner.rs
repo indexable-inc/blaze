@@ -99,7 +99,9 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
     ) -> Result<Runner<M, R>, String> {
         if config.period.is_zero() {
             // alloc: the error, at the run's start.
-            return Err("a tiering period of zero: the cells would be read without pause".to_owned());
+            return Err(
+                "a tiering period of zero: the cells would be read without pause".to_owned()
+            );
         }
         let workers = config.workers.max(1);
         // alloc: once per run, shared by its threads.
@@ -190,7 +192,8 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
                 let mut state = lock(&self.shared.state);
                 if state.stopped.is_none() {
                     // alloc: the error, once per run whose thread panicked.
-                    state.stopped = Some(format!("a tiering thread panicked: {}", panic_text(&*payload)));
+                    state.stopped =
+                        Some(format!("a tiering thread panicked: {}", panic_text(&*payload)));
                 }
             }
         }
@@ -239,7 +242,8 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Shared<M, R> {
                 }
                 Err(payload) => {
                     // alloc: the error, which stops the run's tiering.
-                    *stopped = Some(format!("reading the cells panicked: {}", panic_text(&*payload)));
+                    *stopped =
+                        Some(format!("reading the cells panicked: {}", panic_text(&*payload)));
                     self.work.notify_all();
                     return;
                 }

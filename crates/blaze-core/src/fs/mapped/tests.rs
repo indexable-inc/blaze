@@ -29,7 +29,9 @@ const ADVICE: [Advice; 4] = [Advice::Normal, Advice::Sequential, Advice::Random,
 fn every_option() -> impl Iterator<Item = MapOptions> {
     [false, true].into_iter().flat_map(|populate| {
         [false, true].into_iter().flat_map(move |huge| {
-            ADVICE.into_iter().map(move |advice| MapOptions::new().populate(populate).huge_pages(huge).advise(advice))
+            ADVICE.into_iter().map(move |advice| {
+                MapOptions::new().populate(populate).huge_pages(huge).advise(advice)
+            })
         })
     })
 }
@@ -113,7 +115,12 @@ fn a_mapping_keeps_its_length_when_the_file_grows() {
     // SAFETY: the file is only appended to below, past the mapped length, so no byte under the
     // slice changes; it is never written in place or cut.
     let mapped = unsafe { Mapped::open(&path) }.unwrap();
-    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&pattern(9000, 12)).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&pattern(9000, 12))
+        .unwrap();
     assert_eq!(mapped.len(), 5000);
     assert_eq!(mapped.bytes(), &pattern(5000, 11)[..]);
     assert!(mapped.get(5000).is_none());
@@ -181,5 +188,7 @@ fn a_mapping_is_the_file_read(tc: TestCase) {
 
 /// FNV-1a: a name for a case's file.
 fn name_of(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }

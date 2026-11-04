@@ -7,17 +7,17 @@
 //! the shape's order) and its answer (the step's result); its body is at the same index in the
 //! shard's `defs`, for the errors that name it.
 
+use blaze_hash::hash_map::Entry as Slot;
 use std::{
     mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use blaze_hash::hash_map::Entry as Slot;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_def::DefWithBodyId;
 use parking_lot::{Mutex, MutexGuard};
+use std::alloc::Global;
 
 use super::{Refusal, Step, StepCounts};
 
@@ -203,7 +203,10 @@ impl Pending {
         let mut taken = Vec::with_capacity(SHARDS);
         for shard in &self.shards {
             let mut shard = shard.0.lock();
-            taken.push(Taken { bytes: mem::take(&mut shard.bytes), defs: mem::take(&mut shard.defs) });
+            taken.push(Taken {
+                bytes: mem::take(&mut shard.bytes),
+                defs: mem::take(&mut shard.defs),
+            });
             for (name, count) in shard.refused.drain() {
                 *refused.entry(name).or_default() += count;
             }
@@ -241,7 +244,8 @@ pub(super) fn entries(taken: &Taken) -> impl Iterator<Item = Entry<'_>> {
         if rest.is_empty() {
             return None;
         }
-        let word = |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().expect("4 bytes")) as usize;
+        let word =
+            |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().expect("4 bytes")) as usize;
         let (entry_len, shape_len, answer_len) = (word(0), word(8), word(12));
         let step = Step::ALL[usize::from(rest[4])];
         let (entry, next) = rest.split_at(entry_len);

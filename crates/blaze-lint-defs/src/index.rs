@@ -308,7 +308,9 @@ pub(super) static FIRST_GROUP: [u16; BUILTIN_END] = {
         let kind = FCW_ORDER.0[i] as usize;
         let mut at = 0;
         while at < BUILTIN_END {
-            if matches!(fcw_group(&lints::BUILTIN[at]), Some(it) if it == kind) && first[at] == NO_GROUP {
+            if matches!(fcw_group(&lints::BUILTIN[at]), Some(it) if it == kind)
+                && first[at] == NO_GROUP
+            {
                 first[at] = i as u16;
             }
             at += 1;
@@ -384,7 +386,8 @@ static TOOL_LIST: [(u16, u8); MOST_TOOLS] = TOOLS.0;
 pub(super) fn has_lints_of(tool: &str, internal: bool) -> bool {
     TOOL_LIST[..TOOLS.1].iter().any(|&(first, len)| {
         let first = usize::from(first);
-        (first < BLAZE_END || internal) && ALL[first].name.as_bytes()[..usize::from(len)] == *tool.as_bytes()
+        (first < BLAZE_END || internal)
+            && ALL[first].name.as_bytes()[..usize::from(len)] == *tool.as_bytes()
     })
 }
 

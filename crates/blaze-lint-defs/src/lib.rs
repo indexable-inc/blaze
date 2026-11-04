@@ -35,13 +35,13 @@ use std::sync::OnceLock;
 use edition::Edition;
 use serde::{Deserialize, Serialize};
 
-pub use self::{
-    options::{Args, LintOptions},
-    set::LintSet,
-};
 use self::index::{
     ALL, BLAZE_END, BUILTIN_END, Entry, FIRST_GROUP, GROUP_COUNT, INTERNAL_END, INTERNAL_GROUP,
     Joined, KNOWN_TOOLS, LINTS_BY_NAME, NO_GROUP, OTHER_KEYS, REFS, other,
+};
+pub use self::{
+    options::{Args, LintOptions},
+    set::LintSet,
 };
 
 /// A lint level, in rustc's order: where one is capped, the lower wins.
@@ -104,7 +104,8 @@ impl Level {
 
 /// The attributes that set a level, at the indices of their levels in [`ATTR_LEVELS`].
 const LEVEL_ATTR_NAMES: &[&str] = &["allow", "expect", "warn", "deny", "forbid"];
-const ATTR_LEVELS: [Level; 5] = [Level::Allow, Level::Expect, Level::Warn, Level::Deny, Level::Forbid];
+const ATTR_LEVELS: [Level; 5] =
+    [Level::Allow, Level::Expect, Level::Warn, Level::Deny, Level::Forbid];
 
 blaze_phf::phf_table!(static LEVEL_ATTRS = LEVEL_ATTR_NAMES;);
 
@@ -409,7 +410,8 @@ impl LintId {
     const UNNUMBERED: LintId = LintId(u16::MAX);
 
     pub const WARNINGS: LintId = LintId::named("warnings");
-    pub const UNFULFILLED_LINT_EXPECTATIONS: LintId = LintId::named("unfulfilled_lint_expectations");
+    pub const UNFULFILLED_LINT_EXPECTATIONS: LintId =
+        LintId::named("unfulfilled_lint_expectations");
     pub const RENAMED_AND_REMOVED_LINTS: LintId = LintId::named("renamed_and_removed_lints");
     pub const UNKNOWN_LINTS: LintId = LintId::named("unknown_lints");
     pub const UNUSED_ATTRIBUTES: LintId = LintId::named("unused_attributes");
@@ -578,7 +580,9 @@ fn build_groups() -> Vec<Group> {
     for &(alias, of) in names::ALIASES {
         let lints = match other(of.as_bytes()) {
             // clone: setup, as above
-            Some(Entry::Group(at)) if usize::from(at) < groups.len() => groups[usize::from(at)].lints.clone(),
+            Some(Entry::Group(at)) if usize::from(at) < groups.len() => {
+                groups[usize::from(at)].lints.clone()
+            }
             _ => panic!("alias `{alias}` of no group `{of}`"),
         };
         groups.push(Group::new(alias, lints, Some(of)));
@@ -624,7 +628,9 @@ pub enum Checked {
     Ok(&'static [&'static Lint]),
     /// Unknown. rustc suggests a similar name when `suggest`: of `tool::name` when a tool was
     /// written, else of `name` among clippy's (blaze-diagnostics' `no_lint_suggestion`).
-    NoLint { suggest: bool },
+    NoLint {
+        suggest: bool,
+    },
     /// Of a tool rustc does not know.
     NoTool,
     Renamed(&'static str),

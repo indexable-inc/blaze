@@ -19,10 +19,7 @@ impl InternalError {
     /// Capture `message` together with the caller's source location.
     #[track_caller]
     pub fn new(message: core::fmt::Arguments<'_>) -> Self {
-        InternalError {
-            message: message.to_string(),
-            location: core::panic::Location::caller(),
-        }
+        InternalError { message: message.to_string(), location: core::panic::Location::caller() }
     }
 }
 

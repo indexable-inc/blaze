@@ -24,8 +24,7 @@ impl<'a> Shrinker<'a> {
 
             let simplest = vec![0u8; min_size];
             if simplest != current {
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(simplest))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(simplest))])).await?;
             }
 
             let captured = self.current_byte_value(i).ok_or(PassExit::NodeGone)?;
@@ -35,9 +34,8 @@ impl<'a> Shrinker<'a> {
                 while let Some(sz) = search.probe() {
                     let sz = sz as usize;
                     let cand = captured[..sz].to_vec();
-                    let ok = self
-                        .replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))]))
-                        .await?;
+                    let ok =
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))])).await?;
                     search.record(ok);
                 }
             }
@@ -50,8 +48,7 @@ impl<'a> Shrinker<'a> {
                     break;
                 }
                 let cand = cur[..sz].to_vec();
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))])).await?;
             }
 
             let cur = self.current_byte_value(i).ok_or(PassExit::NodeGone)?;
@@ -64,8 +61,7 @@ impl<'a> Shrinker<'a> {
                 }
                 let mut cand = cur.clone();
                 cand.remove(j);
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))])).await?;
             }
 
             let cur = self.current_byte_value(i).ok_or(PassExit::NodeGone)?;
@@ -81,9 +77,8 @@ impl<'a> Shrinker<'a> {
                 while let Some(e) = search.probe() {
                     let mut cand = self.current_byte_value(i).ok_or(PassExit::NodeGone)?;
                     cand[j] = e as u8;
-                    let ok = self
-                        .replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))]))
-                        .await?;
+                    let ok =
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(cand))])).await?;
                     search.record(ok);
                 }
             }
@@ -102,9 +97,7 @@ impl<'a> Shrinker<'a> {
                     }
                     let mut swapped = cur.clone();
                     swapped.swap(j - 1, j);
-                    if self
-                        .replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(swapped))]))
-                        .await?
+                    if self.replace(&HashMap::from_iter([(i, ChoiceValue::Bytes(swapped))])).await?
                     {
                         j -= 1;
                     } else {
@@ -172,10 +165,7 @@ impl<'a> Shrinker<'a> {
         }
 
         let combined: Vec<u8> = s.iter().copied().chain(t.iter().copied()).collect();
-        if self
-            .try_redistribute_bytes(i, j, Vec::new(), combined, &kind_j)
-            .await?
-        {
+        if self.try_redistribute_bytes(i, j, Vec::new(), combined, &kind_j).await? {
             return Ok(());
         }
 
@@ -183,10 +173,7 @@ impl<'a> Shrinker<'a> {
         let mut t_prepended = Vec::with_capacity(t.len() + 1);
         t_prepended.push(*last);
         t_prepended.extend_from_slice(&t);
-        if !self
-            .try_redistribute_bytes(i, j, s_init.to_vec(), t_prepended, &kind_j)
-            .await?
-        {
+        if !self.try_redistribute_bytes(i, j, s_init.to_vec(), t_prepended, &kind_j).await? {
             return Ok(());
         }
 
@@ -200,8 +187,7 @@ impl<'a> Shrinker<'a> {
                 let new_s = s[..s_len - n].to_vec();
                 let mut new_t = s[s_len - n..].to_vec();
                 new_t.extend_from_slice(&t);
-                self.try_redistribute_bytes(i, j, new_s, new_t, &kind_j)
-                    .await?
+                self.try_redistribute_bytes(i, j, new_s, new_t, &kind_j).await?
             };
             search.record(ok);
         }

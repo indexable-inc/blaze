@@ -46,7 +46,7 @@ use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
 use blaze_image::{Builder, Cause, Image, MIN_GROUP_SHIFT, Section, SectionId};
 use blaze_vfs::{
-    ImageMark, ImageUse, Mode, Op, OpError, View, Vfs,
+    ImageMark, ImageUse, Mode, Op, OpError, Vfs, View,
     tree_layout::{
         C_NAME_BYTES, C_SHAPES, COLUMNS, LAYOUT, MAGIC, MAGIC_BYTES, W_COLUMNS, W_ENTRIES, W_MAGIC,
         W_NODES, WORDS,
@@ -132,12 +132,19 @@ fn check(data: &[u8]) {
 
     let used = match &found.image {
         ImageUse::Used { name, nodes, disks } => {
-            assert_eq!((*name, *nodes), (mark.name, mark.nodes), "the image used is the one written");
+            assert_eq!(
+                (*name, *nodes),
+                (mark.name, mark.nodes),
+                "the image used is the one written"
+            );
             assert!(disks_damaged || disks.is_none(), "undamaged disks are used: {disks:?}");
             true
         }
         ImageUse::Resumed { .. } => {
-            assert!(header_damaged, "an image whose header names no base is not resumed: {found:?}");
+            assert!(
+                header_damaged,
+                "an image whose header names no base is not resumed: {found:?}"
+            );
             true
         }
         ImageUse::Malformed(why) => {
@@ -147,7 +154,11 @@ fn check(data: &[u8]) {
         }
         ImageUse::Corrupt(corrupt) => {
             assert!(header_damaged, "only a header places a column outside its section: {corrupt}");
-            assert_eq!(corrupt.section, SectionId::VFS_TREE, "a column is of the tree section: {corrupt}");
+            assert_eq!(
+                corrupt.section,
+                SectionId::VFS_TREE,
+                "a column is of the tree section: {corrupt}"
+            );
             assert!(
                 matches!(corrupt.cause, Cause::Bounds { .. } | Cause::Misaligned { .. }),
                 "an image of good CRCs is corrupt only by a column's place: {corrupt}"
@@ -193,7 +204,11 @@ fn check(data: &[u8]) {
             ImageUse::Used { name: mark.name, nodes: mark.nodes, disks: None },
             "an undamaged image is used as written"
         );
-        assert_eq!((found.skipped, found.heads_dropped), (0, 0), "an undamaged image drops nothing");
+        assert_eq!(
+            (found.skipped, found.heads_dropped),
+            (0, 0),
+            "an undamaged image drops nothing"
+        );
         assert_eq!(heads(&back), heads(&vfs), "an undamaged image restores the heads written");
         for (head, root, _) in heads(&vfs) {
             assert_eq!(
@@ -403,7 +418,9 @@ fn settle(vfs: &mut Vfs, file: &mut Vec<u8>) {
                 *file = bytes;
                 Done::Written
             }
-            other => panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}"),
+            other => {
+                panic!("the journal asks only for appends, syncs, cuts and rewrites: {other:?}")
+            }
         };
         vfs.complete(Completion { tag, done }, &mut effects);
     }
@@ -440,7 +457,9 @@ fn walk(vfs: &mut Vfs, root: ContentId, mapped: Option<&[u8]>) -> Vec<(String, S
         match vfs.follow(view, &path) {
             Ok(Some(file)) => within(file.bytes, mapped, &path),
             Err(OpError::Corrupt { section, group }) => {
-                panic!("{path:?}: following it reads group {group} of section {section:#x}, corrupt")
+                panic!(
+                    "{path:?}: following it reads group {group} of section {section:#x}, corrupt"
+                )
             }
             Ok(None) | Err(_) => {}
         }

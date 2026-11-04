@@ -222,33 +222,47 @@ pub struct Disallowed {
     pub lint: Option<String>,
 }
 
-const ENTRY_KEYS: [&str; 6] = ["path", "reason", "replacement", "allow-invalid", "allow-in", "lint"];
+const ENTRY_KEYS: [&str; 6] =
+    ["path", "reason", "replacement", "allow-invalid", "allow-in", "lint"];
 
 /// The entries of `table`'s list `kind`; an entry that does not read is the error, naming it.
 pub fn disallowed(table: &toml::Table, kind: Kind) -> Result<Vec<Disallowed>, String> {
     let key = kind.key();
     let Some(list) = table.get(key) else { return Ok(Vec::new()) };
-    let error = |what: String| format!("error reading Clippy's configuration file: {what} in `{key}`");
-    let list = list.as_array().ok_or_else(|| error(format!("invalid type: {}, expected a list", list.type_str())))?;
+    let error =
+        |what: String| format!("error reading Clippy's configuration file: {what} in `{key}`");
+    let list = list
+        .as_array()
+        .ok_or_else(|| error(format!("invalid type: {}, expected a list", list.type_str())))?;
     let mut entries = Vec::with_capacity(list.len());
     for item in list {
         let entry = match item {
             toml::Value::String(path) => Disallowed { path: path.clone(), ..Disallowed::default() },
             toml::Value::Table(fields) => {
                 if let Some(unknown) = fields.keys().find(|it| !ENTRY_KEYS.contains(&it.as_str())) {
-                    return Err(error(format!("unknown field `{unknown}`, expected one of {}", ENTRY_KEYS.join(", "))));
+                    return Err(error(format!(
+                        "unknown field `{unknown}`, expected one of {}",
+                        ENTRY_KEYS.join(", ")
+                    )));
                 }
                 let string = |name: &str| match fields.get(name) {
                     None => Ok(None),
                     Some(toml::Value::String(it)) => Ok(Some(it.clone())),
-                    Some(other) => Err(error(format!("invalid type: {}, expected a string for `{name}`", other.type_str()))),
+                    Some(other) => Err(error(format!(
+                        "invalid type: {}, expected a string for `{name}`",
+                        other.type_str()
+                    ))),
                 };
-                let path = string("path")?.ok_or_else(|| error("an entry with no `path`".to_owned()))?;
+                let path =
+                    string("path")?.ok_or_else(|| error("an entry with no `path`".to_owned()))?;
                 let allow_invalid = match fields.get("allow-invalid") {
                     None => false,
                     Some(toml::Value::Boolean(it)) => *it,
                     Some(other) => {
-                        return Err(error(format!("invalid type: {}, expected a boolean for `allow-invalid` of `{path}`", other.type_str())));
+                        return Err(error(format!(
+                            "invalid type: {}, expected a boolean for `allow-invalid` of `{path}`",
+                            other.type_str()
+                        )));
                     }
                 };
                 let allow_in = match fields.get("allow-in") {
@@ -270,11 +284,25 @@ pub fn disallowed(table: &toml::Table, kind: Kind) -> Result<Vec<Disallowed>, St
                 if let Some(lint) = &lint
                     && !lint.starts_with("blaze::")
                 {
-                    return Err(error(format!("`lint` of `{path}` is `{lint}`, not a lint of blaze's")));
+                    return Err(error(format!(
+                        "`lint` of `{path}` is `{lint}`, not a lint of blaze's"
+                    )));
                 }
-                Disallowed { reason: string("reason")?, replacement: string("replacement")?, allow_invalid, allow_in, lint, path }
+                Disallowed {
+                    reason: string("reason")?,
+                    replacement: string("replacement")?,
+                    allow_invalid,
+                    allow_in,
+                    lint,
+                    path,
+                }
             }
-            other => return Err(error(format!("invalid type: {}, expected a path or a table", other.type_str()))),
+            other => {
+                return Err(error(format!(
+                    "invalid type: {}, expected a path or a table",
+                    other.type_str()
+                )));
+            }
         };
         entries.push(entry);
     }
@@ -314,7 +342,10 @@ impl Conf {
     }
 
     /// [`Conf::load`] of a file already read: its path and its text.
-    pub fn of_text(file: Option<(PathBuf, String)>, rust_version: Option<&str>) -> Result<Conf, String> {
+    pub fn of_text(
+        file: Option<(PathBuf, String)>,
+        rust_version: Option<&str>,
+    ) -> Result<Conf, String> {
         let (path, table) = match file {
             Some((path, text)) => {
                 let table = text
@@ -327,7 +358,9 @@ impl Conf {
         checked(&table)?;
         let msrv = match table.get("msrv").or_else(|| table.get("min-rust-version")) {
             Some(toml::Value::String(it)) => Some(Version::parse(it).ok_or_else(|| {
-                format!("error reading Clippy's configuration file: `{it}` is not a valid Rust version")
+                format!(
+                    "error reading Clippy's configuration file: `{it}` is not a valid Rust version"
+                )
             })?),
             Some(other) => {
                 return Err(format!(
@@ -344,29 +377,49 @@ impl Conf {
     /// it does not set from the workspace's `[workspace.metadata.blaze.lints]`. `None` when
     /// neither names a profile, and the profile lints are silent. A path in `clippy.toml` is
     /// from the file's directory.
-    pub fn profile_settings(&self, workspace: Option<&crate::profile::Workspace<'_>>) -> Result<Option<crate::profile::Settings>, String> {
+    pub fn profile_settings(
+        &self,
+        workspace: Option<&crate::profile::Workspace<'_>>,
+    ) -> Result<Option<crate::profile::Settings>, String> {
         use crate::profile::{COLD_DEFAULT_PPB, HOT_DEFAULT_PPB, Settings, percent_ppb};
         let file = self.path.as_ref().map(|it| format!("`{}`", it.display()));
-        let workspace_named = workspace.map(|it| format!("`[workspace.metadata.blaze.lints]` of `{}`", it.manifest));
-        let (path, named_in) = match (self.table.get("profile").and_then(toml::Value::as_str), workspace.and_then(|it| it.path)) {
+        let workspace_named =
+            workspace.map(|it| format!("`[workspace.metadata.blaze.lints]` of `{}`", it.manifest));
+        let (path, named_in) = match (
+            self.table.get("profile").and_then(toml::Value::as_str),
+            workspace.and_then(|it| it.path),
+        ) {
             (Some(path), _) => {
                 let dir = self.path.as_deref().and_then(Path::parent).unwrap_or(Path::new(""));
                 (dir.join(path), file.clone().unwrap_or_else(|| "`clippy.toml`".to_owned()))
             }
-            (None, Some(path)) => (PathBuf::from(path), workspace_named.clone().unwrap_or_default()),
+            (None, Some(path)) => {
+                (PathBuf::from(path), workspace_named.clone().unwrap_or_default())
+            }
             (None, None) => return Ok(None),
         };
-        let percent = |key: &str, of_workspace: Option<&str>, default: u64| -> Result<u64, String> {
-            if let Some(text) = percent_text(&self.table, key)? {
-                return percent_ppb(&text, key, file.as_deref().unwrap_or("`clippy.toml`"));
-            }
-            match of_workspace {
-                Some(text) => percent_ppb(text, key, workspace_named.as_deref().unwrap_or_default()),
-                None => Ok(default),
-            }
-        };
-        let hot_ppb = percent("profile-hot-percent", workspace.and_then(|it| it.hot_percent), HOT_DEFAULT_PPB)?;
-        let cold_ppb = percent("profile-cold-percent", workspace.and_then(|it| it.cold_percent), COLD_DEFAULT_PPB)?;
+        let percent =
+            |key: &str, of_workspace: Option<&str>, default: u64| -> Result<u64, String> {
+                if let Some(text) = percent_text(&self.table, key)? {
+                    return percent_ppb(&text, key, file.as_deref().unwrap_or("`clippy.toml`"));
+                }
+                match of_workspace {
+                    Some(text) => {
+                        percent_ppb(text, key, workspace_named.as_deref().unwrap_or_default())
+                    }
+                    None => Ok(default),
+                }
+            };
+        let hot_ppb = percent(
+            "profile-hot-percent",
+            workspace.and_then(|it| it.hot_percent),
+            HOT_DEFAULT_PPB,
+        )?;
+        let cold_ppb = percent(
+            "profile-cold-percent",
+            workspace.and_then(|it| it.cold_percent),
+            COLD_DEFAULT_PPB,
+        )?;
         if cold_ppb > hot_ppb {
             return Err(format!(
                 "`profile-cold-percent` is above `profile-hot-percent` for the profile named in {named_in}: a function can't be both"
@@ -377,7 +430,10 @@ impl Conf {
 
     /// This configuration with the profile of [`Conf::profile_settings`] read in; an error
     /// naming the profile's path when it doesn't read.
-    pub fn with_profile(mut self, workspace: Option<&crate::profile::Workspace<'_>>) -> Result<Conf, String> {
+    pub fn with_profile(
+        mut self,
+        workspace: Option<&crate::profile::Workspace<'_>>,
+    ) -> Result<Conf, String> {
         if let Some(settings) = self.profile_settings(workspace)? {
             self.profile = Some(crate::profile::load(settings)?);
         }
@@ -444,7 +500,8 @@ mod tests {
     /// load's error, never the default.
     #[test]
     fn a_value_of_the_wrong_type_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-conf-types-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-lints-conf-types-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("clippy.toml");
         for (text, says) in [
@@ -478,7 +535,10 @@ disallowed-methods = [
         .unwrap();
         checked(&table).unwrap();
         let types = disallowed(&table, Kind::Types).unwrap();
-        assert_eq!(types[0], Disallowed { path: "std::collections::LinkedList".to_owned(), ..Disallowed::default() });
+        assert_eq!(
+            types[0],
+            Disallowed { path: "std::collections::LinkedList".to_owned(), ..Disallowed::default() }
+        );
         assert_eq!(types[1].replacement.as_deref(), Some("parking_lot::Mutex"));
         assert_eq!(types[1].reason.as_deref(), Some("no poisoning"));
         assert!(types[2].allow_invalid);
@@ -487,10 +547,19 @@ disallowed-methods = [
         assert_eq!(methods[0].lint.as_deref(), Some("blaze::wall_clock"));
         assert!(disallowed(&table, Kind::Macros).unwrap().is_empty());
         for (text, says) in [
-            ("disallowed-types = [{ path = \"a::B\", replace = \"c::D\" }]\n", "unknown field `replace`"),
+            (
+                "disallowed-types = [{ path = \"a::B\", replace = \"c::D\" }]\n",
+                "unknown field `replace`",
+            ),
             ("disallowed-types = [{ reason = \"x\" }]\n", "an entry with no `path`"),
-            ("disallowed-methods = [{ path = \"a::b\", allow-in = [\"driver\"] }]\n", "not a module path from `crate`"),
-            ("disallowed-macros = [{ path = \"a::b\", lint = \"clippy::x\" }]\n", "not a lint of blaze's"),
+            (
+                "disallowed-methods = [{ path = \"a::b\", allow-in = [\"driver\"] }]\n",
+                "not a module path from `crate`",
+            ),
+            (
+                "disallowed-macros = [{ path = \"a::b\", lint = \"clippy::x\" }]\n",
+                "not a lint of blaze's",
+            ),
             ("disallowed-types = \"a::B\"\n", "expected a list"),
         ] {
             let error = checked(&text.parse().unwrap()).expect_err(text);

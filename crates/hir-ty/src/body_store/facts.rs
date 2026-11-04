@@ -70,5 +70,10 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// The definition [`BodyFacts::def_key`] gave `key` for `body` in `db`; `None` when there is
     /// none: the record names an item this database does not have, which for a record found
     /// under a matching identity is a bug in the identity.
-    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>>;
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>>;
 }

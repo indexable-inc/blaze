@@ -38,7 +38,12 @@ mod macro_eval {
         Fatal
     }
 
-    pub(super) fn cook(src: &str, end: u32, kind: LiteralKind, errors: &mut Vec<String>) -> Result<(LitKind, String), Fatal> {
+    pub(super) fn cook(
+        src: &str,
+        end: u32,
+        kind: LiteralKind,
+        errors: &mut Vec<String>,
+    ) -> Result<(LitKind, String), Fatal> {
         let str_from_to = |s: u32, e: u32| &src[s as usize..e as usize];
         let unterminated = |errors: &mut Vec<String>, terminated: bool, m: &str| match terminated {
             true => Ok(()),
@@ -69,15 +74,39 @@ mod macro_eval {
                 quoted(src, LitKind::CStr, Mode::CStr, end, 2, 1, errors)
             }
             LiteralKind::RawStr { n_hashes } => match n_hashes {
-                Some(n) => quoted(src, LitKind::StrRaw(n), Mode::RawStr, end, 2 + u32::from(n), 1 + u32::from(n), errors),
+                Some(n) => quoted(
+                    src,
+                    LitKind::StrRaw(n),
+                    Mode::RawStr,
+                    end,
+                    2 + u32::from(n),
+                    1 + u32::from(n),
+                    errors,
+                ),
                 None => return Err(fatal(errors, raw_message(src, 1))),
             },
             LiteralKind::RawByteStr { n_hashes } => match n_hashes {
-                Some(n) => quoted(src, LitKind::ByteStrRaw(n), Mode::RawByteStr, end, 3 + u32::from(n), 1 + u32::from(n), errors),
+                Some(n) => quoted(
+                    src,
+                    LitKind::ByteStrRaw(n),
+                    Mode::RawByteStr,
+                    end,
+                    3 + u32::from(n),
+                    1 + u32::from(n),
+                    errors,
+                ),
                 None => return Err(fatal(errors, raw_message(src, 2))),
             },
             LiteralKind::RawCStr { n_hashes } => match n_hashes {
-                Some(n) => quoted(src, LitKind::CStrRaw(n), Mode::RawCStr, end, 3 + u32::from(n), 1 + u32::from(n), errors),
+                Some(n) => quoted(
+                    src,
+                    LitKind::CStrRaw(n),
+                    Mode::RawCStr,
+                    end,
+                    3 + u32::from(n),
+                    1 + u32::from(n),
+                    errors,
+                ),
                 None => return Err(fatal(errors, raw_message(src, 2))),
             },
             LiteralKind::Int { base, empty_int } => {
@@ -120,8 +149,9 @@ mod macro_eval {
     fn raw_message(src: &str, prefix_len: u32) -> String {
         match rustc_lexer::validate_raw_str(src, prefix_len) {
             Err(RawStrError::InvalidStarter { bad_char }) => {
-                let mut message =
-                    String::from("found invalid character; only `#` is allowed in raw string delimitation: ");
+                let mut message = String::from(
+                    "found invalid character; only `#` is allowed in raw string delimitation: ",
+                );
                 escaped_char(bad_char, &mut message);
                 message
             }
@@ -266,7 +296,10 @@ fn agrees(src: &str) {
     let (cooked, errors) = cook(src).expect("a literal");
     let messages: Vec<String> = errors.iter().map(|e| e.message.to_string()).collect();
     for e in &errors {
-        assert!(e.range.start <= e.range.end && e.range.end <= len, "{src:?}: {e:?} outside the token");
+        assert!(
+            e.range.start <= e.range.end && e.range.end <= len,
+            "{src:?}: {e:?} outside the token"
+        );
     }
 
     let mut old_errors = Vec::new();
@@ -280,10 +313,13 @@ fn agrees(src: &str) {
             assert_eq!(*last, fatal.message, "{src:?}");
             assert_eq!(before, &messages[..], "{src:?}");
         }
-        (old, new) => panic!("{src:?}: macro-eval's copy {} where the shared one {new:?}", match old {
-            Ok(_) => "cooked",
-            Err(_) => "stopped",
-        }),
+        (old, new) => panic!(
+            "{src:?}: macro-eval's copy {} where the shared one {new:?}",
+            match old {
+                Ok(_) => "cooked",
+                Err(_) => "stopped",
+            }
+        ),
     }
 
     let unterminated = matches!(
@@ -301,14 +337,70 @@ fn agrees(src: &str) {
 }
 
 const CASES: &[&str] = &[
-    "'a'", "''", "'\\n'", "'\\x7f'", "'\\x80'", "'\\u{10ffff}'", "'\\u{110000}'", "'\\u{d800}'",
-    "'\\u{}'", "'\\u{_1}'", "'\\u{1234567}'", "'\\u1'", "'\\u{1'", "'\\q'", "'\t'", "'\r'", "'\n'",
-    "b'a'", "b'é'", "b'\\u{1}'", "b'\\q'", "b'\\xff'", "\"abc\"", "\"a\\\nb\"", "\"a\\\n\n b\"",
-    "\"\\\r\"", "\"\r\"", "\"\\z\"", "\"abc", "b\"\\xff\"", "b\"é\"", "b\"abc", "c\"\\0\"",
-    "c\"a\\u{0}\"", "c\"ok\"", "c\"x", "r\"a\rb\"", "r#\"x\"#", "r##\"x\"#", "r#~\"x\"#", "br\"é\"",
-    "br#\"ok\"#suffix", "cr\"\0\"", "cr##\"y\"##", "\"x\"_", "\"x\"suf", "0b102", "0o78_9", "0b",
-    "0x", "0xff", "1e", "1e+", "1.0e", "0b1.0", "0x1.0", "1.5f32", "0o7e1", "0b1e1", "12_u8",
-    "'\\'", "\"\\\"", "b'\\'", "'\\u{d7ff}'",
+    "'a'",
+    "''",
+    "'\\n'",
+    "'\\x7f'",
+    "'\\x80'",
+    "'\\u{10ffff}'",
+    "'\\u{110000}'",
+    "'\\u{d800}'",
+    "'\\u{}'",
+    "'\\u{_1}'",
+    "'\\u{1234567}'",
+    "'\\u1'",
+    "'\\u{1'",
+    "'\\q'",
+    "'\t'",
+    "'\r'",
+    "'\n'",
+    "b'a'",
+    "b'é'",
+    "b'\\u{1}'",
+    "b'\\q'",
+    "b'\\xff'",
+    "\"abc\"",
+    "\"a\\\nb\"",
+    "\"a\\\n\n b\"",
+    "\"\\\r\"",
+    "\"\r\"",
+    "\"\\z\"",
+    "\"abc",
+    "b\"\\xff\"",
+    "b\"é\"",
+    "b\"abc",
+    "c\"\\0\"",
+    "c\"a\\u{0}\"",
+    "c\"ok\"",
+    "c\"x",
+    "r\"a\rb\"",
+    "r#\"x\"#",
+    "r##\"x\"#",
+    "r#~\"x\"#",
+    "br\"é\"",
+    "br#\"ok\"#suffix",
+    "cr\"\0\"",
+    "cr##\"y\"##",
+    "\"x\"_",
+    "\"x\"suf",
+    "0b102",
+    "0o78_9",
+    "0b",
+    "0x",
+    "0xff",
+    "1e",
+    "1e+",
+    "1.0e",
+    "0b1.0",
+    "0x1.0",
+    "1.5f32",
+    "0o7e1",
+    "0b1e1",
+    "12_u8",
+    "'\\'",
+    "\"\\\"",
+    "b'\\'",
+    "'\\u{d7ff}'",
 ];
 
 #[test]
@@ -337,10 +429,13 @@ fn ranges_are_rustcs() {
 fn bare_crs_in_doc_comments() {
     let mut errors = Vec::new();
     doc_comment_errors(" a\rb\r", false, |e| errors.push(e));
-    assert_eq!(errors, [
-        CookError::new(2..3, "bare CR not allowed in doc-comment"),
-        CookError::new(4..5, "bare CR not allowed in doc-comment"),
-    ]);
+    assert_eq!(
+        errors,
+        [
+            CookError::new(2..3, "bare CR not allowed in doc-comment"),
+            CookError::new(4..5, "bare CR not allowed in doc-comment"),
+        ]
+    );
     errors.clear();
     doc_comment_errors(" ok ", true, |e| errors.push(e));
     assert!(errors.is_empty());

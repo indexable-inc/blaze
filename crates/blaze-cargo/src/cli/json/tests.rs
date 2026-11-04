@@ -1,5 +1,6 @@
 use blaze_api::{
-    Artifact, ArtifactKind, BuildScriptRan, Diagnostic, Level, Span, TargetKind, UnitOf, UnitProfile, UnitTarget,
+    Artifact, ArtifactKind, BuildScriptRan, Diagnostic, Level, Span, TargetKind, UnitOf,
+    UnitProfile, UnitTarget,
 };
 use blaze_ids::ContentId;
 
@@ -32,8 +33,14 @@ const TARGET: &str = r#"{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_
 
 #[test]
 fn build_finished() {
-    assert_eq!(line(|out| super::build_finished(out, true)), r#"{"reason":"build-finished","success":true}"#);
-    assert_eq!(line(|out| super::build_finished(out, false)), r#"{"reason":"build-finished","success":false}"#);
+    assert_eq!(
+        line(|out| super::build_finished(out, true)),
+        r#"{"reason":"build-finished","success":true}"#
+    );
+    assert_eq!(
+        line(|out| super::build_finished(out, false)),
+        r#"{"reason":"build-finished","success":false}"#
+    );
 }
 
 #[test]
@@ -91,7 +98,12 @@ fn strings_as_serde_json_writes_them() {
     assert_eq!(line(|out| quote(out, text)), serde_json::to_string(text).unwrap());
 }
 
-fn span(file: &str, (line, column): (u32, u32), (end_line, end_column): (u32, u32), bytes: (u32, u32)) -> Span {
+fn span(
+    file: &str,
+    (line, column): (u32, u32),
+    (end_line, end_column): (u32, u32),
+    bytes: (u32, u32),
+) -> Span {
     Span {
         file: file.to_owned(),
         line,
@@ -140,7 +152,8 @@ fn unused(rendered: &str) -> Diagnostic {
 fn checkout() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("src/main.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n").unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n")
+        .unwrap();
     std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
     let root = dir.path().display().to_string();
     (dir, root)
@@ -192,7 +205,9 @@ fn a_compiler_message_as_cargo_writes_it_again() {
     // A coded error carries rustc's markdown for its code as the code's `explanation`.
     let coded = Diagnostic {
         code: Some("E0384".to_owned()),
-        explanation: Some("A variable was assigned twice.\n\n```compile_fail,E0384\n```\n".to_owned()),
+        explanation: Some(
+            "A variable was assigned twice.\n\n```compile_fail,E0384\n```\n".to_owned(),
+        ),
         ..unused(rendered)
     };
     assert!(

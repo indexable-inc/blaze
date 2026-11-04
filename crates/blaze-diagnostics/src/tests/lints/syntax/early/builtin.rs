@@ -302,11 +302,7 @@ fn main() {
 "#;
     assert_reports(
         &ui_core("lint-double-negations.rs", "2015", "copy, unary_ops, builtin_impls", source),
-        &[
-            warning(6, &[]),
-            warning(7, &[]),
-            warning(8, &[]),
-        ],
+        &[warning(6, &[]), warning(7, &[]), warning(8, &[])],
     );
 }
 
@@ -373,7 +369,10 @@ static ALLOC: Bump = Bump;
 
 fn main() {}
 "#;
-    assert_reports(&ui_core("global-allocator-unsafe-code.rs", "2024", "global_allocator", source), &[]);
+    assert_reports(
+        &ui_core("global-allocator-unsafe-code.rs", "2024", "global_allocator", source),
+        &[],
+    );
 }
 
 #[test]
@@ -407,5 +406,10 @@ pub fn f() {
         "//- minicore: global_allocator\n//- /global-allocator-cfg.rs crate:other:main edition:2024 cfg:test\n{source}"
     ));
     assert!(found.contains("error: aborting due to 1 previous error"), "{found}");
-    assert!(found.contains("error: usage of an `unsafe` block\n  --> $DIR/global-allocator-cfg.rs:20:5\n"), "{found}");
+    assert!(
+        found.contains(
+            "error: usage of an `unsafe` block\n  --> $DIR/global-allocator-cfg.rs:20:5\n"
+        ),
+        "{found}"
+    );
 }

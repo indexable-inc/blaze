@@ -152,7 +152,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     ClosureKind::OldCoroutine(_)
                     | ClosureKind::Coroutine { kind: CoroutineKind::Gen, .. } => {
                         let yield_ty = self.table.next_ty_var(closure_expr.into());
-                        self.require_type_is_sized(yield_ty, closure_expr.into(), ObligationCauseCode::Misc);
+                        self.require_type_is_sized(
+                            yield_ty,
+                            closure_expr.into(),
+                            ObligationCauseCode::Misc,
+                        );
                         yield_ty
                     }
                     ClosureKind::Coroutine { kind: CoroutineKind::Async, .. } => {
@@ -160,7 +164,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     }
                     ClosureKind::Coroutine { kind: CoroutineKind::AsyncGen, .. } => {
                         let yield_ty = self.table.next_ty_var(closure_expr.into());
-                        self.require_type_is_sized(yield_ty, closure_expr.into(), ObligationCauseCode::Misc);
+                        self.require_type_is_sized(
+                            yield_ty,
+                            closure_expr.into(),
+                            ObligationCauseCode::Misc,
+                        );
                         self.poll_option_ty(yield_ty)
                     }
                     _ => unreachable!(),
@@ -335,9 +343,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let prev_resume_yield_tys = mem::replace(&mut self.resume_yield_tys, resume_yield_tys);
         let desugaring = match closure_kind {
             ClosureKind::Coroutine { kind, .. } => Some(kind),
-            ClosureKind::Closure | ClosureKind::OldCoroutine(_) | ClosureKind::CoroutineClosure(_) => {
-                None
-            }
+            ClosureKind::Closure
+            | ClosureKind::OldCoroutine(_)
+            | ClosureKind::CoroutineClosure(_) => None,
         };
         let prev_desugaring = mem::replace(&mut self.coroutine_desugaring, desugaring);
 
@@ -1074,7 +1082,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ) -> PolyFnSig<'db> {
         let mut supplied = Vec::with_capacity_in(decl_inputs.len(), self.frame);
         let (output, bound_vars) = self.with_ty_lowering(|ctx| {
-            ctx.lower_closure_signature_under_binder(binder, decl_inputs, decl_output, &mut supplied)
+            ctx.lower_closure_signature_under_binder(
+                binder,
+                decl_inputs,
+                decl_output,
+                &mut supplied,
+            )
         });
         let interner = self.interner();
         let supplied_return = self.supplied_ty(closure_expr, output);

@@ -4,9 +4,12 @@
 //! bytes are written only of text a macro asks to be tokens of.
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext};
-use tt::{DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder, WirePart};
+use std::alloc::Global;
+use tt::{
+    DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder,
+    WirePart,
+};
 
 /// A packed span's `len_part` that makes its `start` an index of the wide spans.
 pub const WIDE: u32 = u32::MAX;
@@ -90,7 +93,10 @@ impl Parts {
                 Ok(self.all()[file_id as usize])
             }
             // alloc: the message of a tree refused.
-            _ => Err(format!("the expansion has {} span parts, each named by its index alone", self.len())),
+            _ => Err(format!(
+                "the expansion has {} span parts, each named by its index alone",
+                self.len()
+            )),
         }
     }
 

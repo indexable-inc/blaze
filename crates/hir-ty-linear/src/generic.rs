@@ -11,10 +11,8 @@
 //! associated type is not marked: code generic over the trait drops values of it.
 
 use hir_def::{
-    CallableDefId, DefWithBodyId, GenericDefId, GenericParamId, ItemContainerId, Lookup,
-    AssocItemId,
-    attrs::AttrFlags,
-    hir::generics::GenericParams,
+    AssocItemId, CallableDefId, DefWithBodyId, GenericDefId, GenericParamId, ItemContainerId,
+    Lookup, attrs::AttrFlags, hir::generics::GenericParams,
 };
 use hir_ty::{
     ParamEnvAndCrate, TyDefId,
@@ -139,18 +137,15 @@ fn resolve<'db>(
         return Some((func.into(), args));
     };
     let lang = types.interner.lang_items();
-    let callable_traits = [
-        lang.Fn,
-        lang.FnMut,
-        lang.FnOnce,
-        lang.AsyncFn,
-        lang.AsyncFnMut,
-        lang.AsyncFnOnce,
-    ];
+    let callable_traits =
+        [lang.Fn, lang.FnMut, lang.FnOnce, lang.AsyncFn, lang.AsyncFnMut, lang.AsyncFnOnce];
     if callable_traits.contains(&Some(trait_))
         && matches!(
             args.type_at(0).kind(),
-            TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)
+            TyKind::Closure(..)
+                | TyKind::CoroutineClosure(..)
+                | TyKind::FnDef(..)
+                | TyKind::FnPtr(..)
         )
     {
         return None;
@@ -188,13 +183,15 @@ pub(crate) fn check_impl_bindings<'db>(
         if !types.holds(ty) {
             continue;
         }
-        let admits = trait_.trait_items(db).associated_type_by_name(name).is_some_and(|it| {
-            AttrFlags::query(db, it.into()).contains(AttrFlags::LINEAR)
-        });
+        let admits = trait_
+            .trait_items(db)
+            .associated_type_by_name(name)
+            .is_some_and(|it| AttrFlags::query(db, it.into()).contains(AttrFlags::LINEAR));
         if admits {
             continue;
         }
-        let trait_name = hir_def::signatures::TraitSignature::of(db, trait_).name.as_str().to_owned(); // alloc: error path
+        let trait_name =
+            hir_def::signatures::TraitSignature::of(db, trait_).name.as_str().to_owned(); // alloc: error path
         let name = name.as_str();
         let shown = names::ty_in(db, types.krate, ty);
         out.push(LinearDiagnostic {

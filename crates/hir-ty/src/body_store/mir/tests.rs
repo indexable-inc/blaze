@@ -13,8 +13,7 @@ use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
-use blaze_query::db::Setter;
+use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
     deps::ImageStore,
@@ -26,6 +25,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_type_ir::inherent::Ty as _;
+use std::alloc::Global;
 
 use super::{RAN, built, decode, encode, lookup_mir, place};
 use crate::{
@@ -85,7 +85,9 @@ fn unreadable_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerEr
         let mut body = mir_of(db, owner);
         let past = idx(body.basic_blocks.len() as u32);
         match &mut body.basic_blocks[body.start_block].terminator {
-            Some(Terminator { kind: TerminatorKind::Call { target, .. }, .. }) => *target = Some(past),
+            Some(Terminator { kind: TerminatorKind::Call { target, .. }, .. }) => {
+                *target = Some(past)
+            }
             _ => unreachable!("the test's first block ends in a call"),
         }
         Ok(body)
@@ -141,7 +143,11 @@ fn closure_of(db: &Db, def: DefWithBodyId) -> InternedClosureId<'_> {
         .expect("`closures` has a closure");
     InternedClosureId::new(
         db,
-        InternedClosure { owner: InferBodyId::DefWithBodyId(def), expr, kind: ClosureKind::Closure },
+        InternedClosure {
+            owner: InferBodyId::DefWithBodyId(def),
+            expr,
+            kind: ClosureKind::Closure,
+        },
     )
 }
 
@@ -169,18 +175,27 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
     let n = locals.alloc(Local { ty: types.u32.store() });
     let w = locals.alloc(Local { ty: wrap_ty.store() });
     let place = |local| Place::<'db> { local, projection: Projection::new_from_slice(&[]) }.store();
-    let copy = |local| Operand { kind: OperandKind::Copy(place(local)), span: Some(MirSpan::ExprId(idx(0))) };
+    let copy = |local| Operand {
+        kind: OperandKind::Copy(place(local)),
+        span: Some(MirSpan::ExprId(idx(0))),
+    };
 
     let mut statements = vec![
         Statement { kind: StatementKind::StorageLive(w), span: MirSpan::Unknown },
         Statement {
-            kind: StatementKind::Assign(place(n), Rvalue::Use(Operand::from_bytes(Box::new([7, 0, 0, 0]), types.u32))),
+            kind: StatementKind::Assign(
+                place(n),
+                Rvalue::Use(Operand::from_bytes(Box::new([7, 0, 0, 0]), types.u32)),
+            ),
             span: MirSpan::ExprId(idx(1)),
         },
         Statement {
             kind: StatementKind::Assign(
                 place(w),
-                Rvalue::Aggregate(AggregateKind::Adt(VariantId::StructId(wrap), empty.store()), Box::new([copy(n)])),
+                Rvalue::Aggregate(
+                    AggregateKind::Adt(VariantId::StructId(wrap), empty.store()),
+                    Box::new([copy(n)]),
+                ),
             ),
             span: MirSpan::PatId(idx(0)),
         },
@@ -191,7 +206,9 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
                     kind: OperandKind::Move(
                         Place::<'db> {
                             local: w,
-                            projection: Projection::new_from_slice(&[ProjectionElem::Field(crate::mir::FieldIndex(0))]),
+                            projection: Projection::new_from_slice(&[ProjectionElem::Field(
+                                crate::mir::FieldIndex(0),
+                            )]),
                         }
                         .store(),
                     ),
@@ -267,7 +284,7 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
 }
 
 fn ask(s: &Session, closure: bool) -> Ask {
-    Ask::new(&s.db, function(&s.db, "closures"), closure, false)
+    Ask::new(&s.db, Durability::LOW, function(&s.db, "closures"), closure, false)
 }
 
 /// `owner`'s MIR in stable form: its answer's bytes, every id by its key.
@@ -299,12 +316,17 @@ fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
 
 /// Where `owner`'s MIR answer is in `memory`, from its shape in slot 0: its store key and its
 /// answer key.
-fn answer_of<'db>(memory: &Memory, s: &'db Session, owner: MirOwner<'db>) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
+fn answer_of<'db>(
+    memory: &Memory,
+    s: &'db Session,
+    owner: MirOwner<'db>,
+) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
     let (def, schema) = place(&s.db, owner).unwrap();
     let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
     let base = record::base_key(&identity, Step::Mir, &schema, &solver_version(&BUILD));
     let shape_key = record::shape_key(&base, 0);
-    let shape = memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
+    let shape =
+        memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
     let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
     let mut key = AnswerKey::new(&shape_key);
     for fact in shape.facts() {
@@ -330,7 +352,11 @@ fn a_body_and_its_closure_are_two_records_under_the_body() {
 fn stored_mir_is_read_in_a_fresh_database_without_building_it() {
     let (memory, defs, forms) = stored();
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
-    assert_ne!(function(&db_of(FIXTURE), "closures"), function(&fresh.db, "closures"), "the two databases' ids differ");
+    assert_ne!(
+        function(&db_of(FIXTURE), "closures"),
+        function(&fresh.db, "closures"),
+        "the two databases' ids differ"
+    );
     reset_ran();
     for closure in [false, true] {
         let ask = ask(&fresh, closure);
@@ -338,10 +364,18 @@ fn stored_mir_is_read_in_a_fresh_database_without_building_it() {
         let read = built_mir(&fresh.db, ask).as_ref().expect("a stored MIR is `Ok`");
         assert_eq!(ran(), 0, "{owner:?} is read, not built");
         assert_eq!(*read, mir_of(&fresh.db, owner), "{owner:?} reads back as the MIR built here");
-        assert_eq!(stable(&fresh, owner), forms[usize::from(closure)], "{owner:?}: both databases write the same bytes");
+        assert_eq!(
+            stable(&fresh, owner),
+            forms[usize::from(closure)],
+            "{owner:?}: both databases write the same bytes"
+        );
     }
     let flushed = fresh.installed.flush().unwrap();
-    assert_eq!(flushed.steps[Step::Mir as usize], StepCounts { hits: 2, ..StepCounts::default() }, "the body and its closure hit");
+    assert_eq!(
+        flushed.steps[Step::Mir as usize],
+        StepCounts { hits: 2, ..StepCounts::default() },
+        "the body and its closure hit"
+    );
     assert_eq!(without_steps(flushed), Flushed::default(), "a hit offers nothing");
 }
 
@@ -350,9 +384,14 @@ fn a_lowering_error_is_never_stored() {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
     let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
-    let failing = Ask::new(&first.db, function(&first.db, "closures"), false, true);
+    let failing =
+        Ask::new(&first.db, Durability::LOW, function(&first.db, "closures"), false, true);
     assert!(built_mir(&first.db, failing).is_err());
-    assert_eq!(without_steps(first.installed.flush().unwrap()), Flushed::default(), "an error is never offered");
+    assert_eq!(
+        without_steps(first.installed.flush().unwrap()),
+        Flushed::default(),
+        "an error is never offered"
+    );
     assert_eq!(memory.len(), 0);
 
     failing.set_fails(&mut first.db).to(false);
@@ -395,7 +434,9 @@ fn a_body_that_does_not_read_back_is_an_error_naming_it() {
     assert!(unreadable_mir(&s.db, ask).is_ok(), "the body is still the query's answer");
     let error = s.installed.flush().expect_err("a body offered that does not read back");
     assert!(
-        error.contains(&format!("{def:?}")) && error.contains("MIR") && error.contains("does not read back"),
+        error.contains(&format!("{def:?}"))
+            && error.contains("MIR")
+            && error.contains("does not read back"),
         "{error}"
     );
     assert_eq!(memory.len(), 0, "nothing of it is stored");
@@ -410,7 +451,11 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
         let _ = built_mir(&same.db, ask(&same, closure));
     }
     assert_eq!(ran(), 2, "every hit is built as well");
-    assert_eq!(without_steps(same.installed.flush().unwrap()), Flushed::default(), "each stored MIR is the one built");
+    assert_eq!(
+        without_steps(same.installed.flush().unwrap()),
+        Flushed::default(),
+        "each stored MIR is the one built"
+    );
     drop(same);
 
     // The body's answer swapped for its closure's: it decodes, and differs.
@@ -515,7 +560,11 @@ fn located_mir<'db>(db: &'db Db, def: DefWithBodyId, fixture: &str) -> MirBody<'
         (column_at, Operand::from_bytes(Box::from(column.to_le_bytes()), types.u32), types.u32),
         (
             said_at,
-            Operand::from_concrete_const(fat.into(), MemoryMap::simple(said.as_bytes().into()), types.static_str_ref),
+            Operand::from_concrete_const(
+                fat.into(),
+                MemoryMap::simple(said.as_bytes().into()),
+                types.static_str_ref,
+            ),
             types.static_str_ref,
         ),
     ];
@@ -528,11 +577,17 @@ fn located_mir<'db>(db: &'db Db, def: DefWithBodyId, fixture: &str) -> MirBody<'
         let local = locals.alloc(Local { ty: ty.store() });
         binding_locals.insert(idx(binding as u32), local);
         operand.span = Some(MirSpan::ExprId(expr));
-        statements.push(Statement { kind: StatementKind::Assign(place(local), Rvalue::Use(operand)), span: MirSpan::ExprId(expr) });
+        statements.push(Statement {
+            kind: StatementKind::Assign(place(local), Rvalue::Use(operand)),
+            span: MirSpan::ExprId(expr),
+        });
     }
     let here = binding_locals[idx(0)];
     statements.push(Statement {
-        kind: StatementKind::Assign(place(ret), Rvalue::Use(Operand { kind: OperandKind::Copy(place(here)), span: None })),
+        kind: StatementKind::Assign(
+            place(ret),
+            Rvalue::Use(Operand { kind: OperandKind::Copy(place(here)), span: None }),
+        ),
         span: MirSpan::Unknown,
     });
     let mut basic_blocks = Arena::new();
@@ -577,13 +632,15 @@ fn a_moved_body_with_renamed_locals_reads_its_locations_from_where_it_is_now() {
     let first = session(db_of(&before), &memory, &defs, None, Mode::Serve);
     let def = function(&first.db, "located");
     let mut record = Vec::new();
-    encode(&first.db, &*first.facts, def, &located_mir(&first.db, def, &before), &mut record).expect("a location literal is a slot");
+    encode(&first.db, &*first.facts, def, &located_mir(&first.db, def, &before), &mut record)
+        .expect("a location literal is a slot");
 
     let moved = session(second(&after), &memory, &defs, None, Mode::Serve);
     let def = function(&moved.db, "located");
     let fresh = located_mir(&moved.db, def, &after);
     reset_ran();
-    let read = decode(&moved.db, &*moved.facts, def, &Aligned::copy_from(&record)).expect("the record reads in the moved body");
+    let read = decode(&moved.db, &*moved.facts, def, &Aligned::copy_from(&record))
+        .expect("the record reads in the moved body");
     assert_eq!(ran(), 0, "no MIR is built");
     assert_eq!(read, fresh, "each location is where the call is now");
     let mut again = Vec::new();
@@ -594,7 +651,8 @@ fn a_moved_body_with_renamed_locals_reads_its_locations_from_where_it_is_now() {
 #[test]
 fn a_location_constant_that_is_not_its_literals_is_refused() {
     let fixture = located(0, ["here", "at", "said"]);
-    let s = session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    let s =
+        session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
     let def = function(&s.db, "located");
     let mut body = located_mir(&s.db, def, &fixture);
     let Rvalue::Use(operand) = (match &mut body.basic_blocks[body.start_block].statements[0].kind {
@@ -603,20 +661,26 @@ fn a_location_constant_that_is_not_its_literals_is_refused() {
     }) else {
         unreachable!("of a constant")
     };
-    *operand = Operand { span: operand.span, ..Operand::from_bytes(Box::new([0; 4]), default_types().types.u32) };
-    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a line that is not the literal's");
+    *operand = Operand {
+        span: operand.span,
+        ..Operand::from_bytes(Box::new([0; 4]), default_types().types.u32)
+    };
+    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new())
+        .expect_err("a line that is not the literal's");
     assert!(error.to_string().contains("location"), "{error}");
 }
 
 #[test]
 fn a_location_macro_in_a_pattern_is_refused() {
     let fixture = located(0, ["here", "at", "said"]);
-    let s = session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    let s =
+        session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
     let def = function(&s.db, "matched");
     let mut body = located_mir(&s.db, function(&s.db, "located"), &fixture);
     body.owner = InferBodyId::DefWithBodyId(def);
     body.basic_blocks[body.start_block].statements.clear();
-    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a pattern's line has no slot");
+    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new())
+        .expect_err("a pattern's line has no slot");
     assert!(error.to_string().contains("pattern"), "{error}");
 }
 
@@ -627,6 +691,6 @@ fn no_store_builds_as_without_one() {
     let owner = MirOwner::Body(InferBodyId::DefWithBodyId(def));
     let (_, schema) = place(&db, owner).unwrap();
     assert!(matches!(lookup_mir(&db, def, owner, schema), Lookup::Off));
-    let ask = Ask::new(&db, def, false, false);
+    let ask = Ask::new(&db, Durability::LOW, def, false, false);
     assert_eq!(*built_mir(&db, ask).as_ref().unwrap(), mir_of(&db, owner_of(&db, ask)));
 }

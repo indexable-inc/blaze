@@ -200,8 +200,7 @@ struct Committed {
 }
 
 /// Bytes committed in every region, whatever holds them.
-static COMMITTED: Committed =
-    Committed { now: AtomicU64::new(0), high_water: AtomicU64::new(0) };
+static COMMITTED: Committed = Committed { now: AtomicU64::new(0), high_water: AtomicU64::new(0) };
 
 /// Address space every live region reserves, and the most it reserved: [`Committed`]'s shape,
 /// on a line of its own, since reserving is rarer than committing.
@@ -400,7 +399,9 @@ pub(crate) struct Gathered {
 
 impl Gathered {
     fn fold_tags(&self) {
-        for (tag, (allocated, freed)) in Tag::ALL.into_iter().zip(self.allocated.iter().zip(&self.freed)) {
+        for (tag, (allocated, freed)) in
+            Tag::ALL.into_iter().zip(self.allocated.iter().zip(&self.freed))
+        {
             let bytes = allocated.replace(0);
             if bytes != 0 {
                 line(tag).allocated.fetch_add(bytes, Ordering::Relaxed);

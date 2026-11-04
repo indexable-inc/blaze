@@ -119,10 +119,12 @@ pub fn owner(node: ast::Node<'_>, generics: bool) -> Option<ast::AnyHasAttrs<'_>
         return None;
     }
     let owner = ast::AnyHasAttrs::cast(node)?;
-    let inner_of_outer = matches!(kind, STMT_LIST | ITEM_LIST | ASSOC_ITEM_LIST | MATCH_ARM_LIST | EXTERN_ITEM_LIST)
-        && node.ancestors().skip(1).take(2).any(|it| {
-            ast::AnyHasAttrs::cast(it).is_some_and(|it| it.inner_attributes_node().is_some_and(|inner| inner == node))
-        });
+    let inner_of_outer =
+        matches!(kind, STMT_LIST | ITEM_LIST | ASSOC_ITEM_LIST | MATCH_ARM_LIST | EXTERN_ITEM_LIST)
+            && node.ancestors().skip(1).take(2).any(|it| {
+                ast::AnyHasAttrs::cast(it)
+                    .is_some_and(|it| it.inner_attributes_node().is_some_and(|inner| inner == node))
+            });
     (!inner_of_outer).then_some(owner)
 }
 
@@ -170,15 +172,23 @@ pub fn read_crate_attr<'t>(root: ast::Node<'t>, cfg: &CfgOptions, edition: Editi
     reads
 }
 
-fn read_attrs<'t>(attrs: impl Iterator<Item = ast::Attr<'t>>, cfg: &CfgOptions, edition: Edition) -> Reads<'t> {
+fn read_attrs<'t>(
+    attrs: impl Iterator<Item = ast::Attr<'t>>,
+    cfg: &CfgOptions,
+    edition: Edition,
+) -> Reads<'t> {
     let mut found = Reads::new();
-    hir_expand::attrs::expand_cfg_attr_view(attrs, || cfg, |meta, top| {
-        let direct = top.meta().is_some_and(|it| it.syntax() == meta.syntax());
-        if let Some(read) = read_meta(meta, edition, direct) {
-            found.push(read);
-        }
-        ControlFlow::<()>::Continue(())
-    });
+    hir_expand::attrs::expand_cfg_attr_view(
+        attrs,
+        || cfg,
+        |meta, top| {
+            let direct = top.meta().is_some_and(|it| it.syntax() == meta.syntax());
+            if let Some(read) = read_meta(meta, edition, direct) {
+                found.push(read);
+            }
+            ControlFlow::<()>::Continue(())
+        },
+    );
     found
 }
 
@@ -186,30 +196,41 @@ fn read_attrs<'t>(attrs: impl Iterator<Item = ast::Attr<'t>>, cfg: &CfgOptions, 
 /// than `allow`: what blaze-diagnostics' `may_fire` scans the crate for. A name that sets
 /// nothing (an unknown one, a removed one, a tool's not in the tables) adds nothing; nothing is
 /// checked of where the attribute is, which can only add a lint the levels leave allowed.
-pub fn not_allowed(attr: ast::Attr<'_>, store: &Store, cfg: &CfgOptions, edition: Edition, set: &mut LintSet) {
-    hir_expand::attrs::expand_cfg_attr_view::<()>(std::iter::once(attr), || cfg, |meta, _| {
-        if let Some(Read::Level(level, items, _)) = read_meta(meta, edition, false)
-            && level != Level::Allow
-        {
-            for item in &items {
-                let ItemKind::Word(path) = &item.kind else { continue };
-                let lints: &[&Lint] = match &path[..] {
-                    [only] => store.lints_named(None, only.name()),
-                    [tool, name] => store.lints_named(Some(tool.name()), name.name()),
-                    _ => &[],
-                };
-                for lint in lints {
-                    set.insert(lint.id());
+pub fn not_allowed(
+    attr: ast::Attr<'_>,
+    store: &Store,
+    cfg: &CfgOptions,
+    edition: Edition,
+    set: &mut LintSet,
+) {
+    hir_expand::attrs::expand_cfg_attr_view::<()>(
+        std::iter::once(attr),
+        || cfg,
+        |meta, _| {
+            if let Some(Read::Level(level, items, _)) = read_meta(meta, edition, false)
+                && level != Level::Allow
+            {
+                for item in &items {
+                    let ItemKind::Word(path) = &item.kind else { continue };
+                    let lints: &[&Lint] = match &path[..] {
+                        [only] => store.lints_named(None, only.name()),
+                        [tool, name] => store.lints_named(Some(tool.name()), name.name()),
+                        _ => &[],
+                    };
+                    for lint in lints {
+                        set.insert(lint.id());
+                    }
                 }
             }
-        }
-        ControlFlow::Continue(())
-    });
+            ControlFlow::Continue(())
+        },
+    );
 }
 
 /// The attributes the lint levels read: the five that set a level, at the indices of their
 /// levels in [`LEVELS`], then `doc` and `automatically_derived`.
-const ATTR_NAMES: &[&str] = &["allow", "expect", "warn", "deny", "forbid", "doc", "automatically_derived"];
+const ATTR_NAMES: &[&str] =
+    &["allow", "expect", "warn", "deny", "forbid", "doc", "automatically_derived"];
 const LEVELS: [Level; 5] = [Level::Allow, Level::Expect, Level::Warn, Level::Deny, Level::Forbid];
 const DOC: usize = 5;
 const AUTOMATICALLY_DERIVED: usize = 6;
@@ -221,7 +242,8 @@ fn read_meta<'t>(meta: ast::Meta<'t>, edition: Edition, direct: bool) -> Option<
     match meta {
         ast::Meta::PathMeta(it) => {
             let name = name(it.path())?;
-            (ATTRS.get(name.text()) == Some(AUTOMATICALLY_DERIVED)).then_some(Read::Allows(LintId::SINGLE_USE_LIFETIMES))
+            (ATTRS.get(name.text()) == Some(AUTOMATICALLY_DERIVED))
+                .then_some(Read::Allows(LintId::SINGLE_USE_LIFETIMES))
         }
         ast::Meta::TokenTreeMeta(it) => {
             let name = name(it.path())?;
@@ -234,7 +256,9 @@ fn read_meta<'t>(meta: ast::Meta<'t>, edition: Edition, direct: bool) -> Option<
             match level {
                 Some(level) => Some(Read::Level(level, items, direct)),
                 None => {
-                    let hidden = items.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
+                    let hidden = items.iter().any(
+                        |it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")),
+                    );
                     hidden.then_some(Read::Allows(LintId::MISSING_DOCS))
                 }
             }
@@ -250,7 +274,10 @@ pub fn list(tt: ast::TokenTree<'_>, edition: Edition) -> Option<Items<'_>> {
         // alloc: none up to 16 tokens, a `SmallVec`
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
     let (first, last) = (children.first()?, children.last()?);
-    if first.kind() != SyntaxKind::L_PAREN || last.kind() != SyntaxKind::R_PAREN || children.len() < 2 {
+    if first.kind() != SyntaxKind::L_PAREN
+        || last.kind() != SyntaxKind::R_PAREN
+        || children.len() < 2
+    {
         return None;
     }
     let inner = &children[1..children.len() - 1];
@@ -268,7 +295,8 @@ pub fn list(tt: ast::TokenTree<'_>, edition: Edition) -> Option<Items<'_>> {
 }
 
 fn item<'t>(elements: &[ast::Element<'t>], edition: Edition) -> Option<Item<'t>> {
-    let range = TextRange::new(elements.first()?.text_range().start(), elements.last()?.text_range().end());
+    let range =
+        TextRange::new(elements.first()?.text_range().start(), elements.last()?.text_range().end());
     if let [NodeOrToken::Token(token)] = elements
         && is_literal(token.kind())
     {
@@ -280,7 +308,8 @@ fn item<'t>(elements: &[ast::Element<'t>], edition: Edition) -> Option<Item<'t>>
         [NodeOrToken::Token(eq), NodeOrToken::Token(value)]
             if eq.kind() == SyntaxKind::EQ && is_literal(value.kind()) =>
         {
-            let string = ast::String::cast(*value).and_then(|it| it.value().ok().map(|it| Symbol::intern(&it)));
+            let string = ast::String::cast(*value)
+                .and_then(|it| it.value().ok().map(|it| Symbol::intern(&it)));
             ItemKind::NameValue { path, string, value: value.text_range() }
         }
         [NodeOrToken::Node(tt)] if tt.kind() == SyntaxKind::TOKEN_TREE => {
@@ -297,7 +326,10 @@ fn item<'t>(elements: &[ast::Element<'t>], edition: Edition) -> Option<Item<'t>>
 
 /// The path `elements` start with and what follows it. A path that starts with `::` has
 /// rustc's `{{root}}` for its first segment, at the `::`.
-fn path<'e, 't>(elements: &'e [ast::Element<'t>], edition: Edition) -> Option<(Path<'t>, &'e [ast::Element<'t>])> {
+fn path<'e, 't>(
+    elements: &'e [ast::Element<'t>],
+    edition: Edition,
+) -> Option<(Path<'t>, &'e [ast::Element<'t>])> {
     let mut segments = Path::new();
     let mut rest = elements;
     if let Some((range, after)) = colons(rest) {
@@ -321,7 +353,9 @@ fn path<'e, 't>(elements: &'e [ast::Element<'t>], edition: Edition) -> Option<(P
 /// `::` at the start of `elements`, as one token or two `:` together.
 fn colons<'e, 't>(elements: &'e [ast::Element<'t>]) -> Option<(TextRange, &'e [ast::Element<'t>])> {
     match elements {
-        [NodeOrToken::Token(it), rest @ ..] if it.kind() == SyntaxKind::COLON2 => Some((it.text_range(), rest)),
+        [NodeOrToken::Token(it), rest @ ..] if it.kind() == SyntaxKind::COLON2 => {
+            Some((it.text_range(), rest))
+        }
         [NodeOrToken::Token(a), NodeOrToken::Token(b), rest @ ..]
             if a.kind() == SyntaxKind::COLON
                 && b.kind() == SyntaxKind::COLON
@@ -346,25 +380,36 @@ fn is_literal(kind: SyntaxKind) -> bool {
 
 /// The tools of the crate's `#![register_tool(..)]`s among `attrs`: the root file's inner
 /// attributes, then those of `-Z crate-attr`.
-pub fn registered_tools<'t>(attrs: impl Iterator<Item = ast::Attr<'t>>, cfg: &CfgOptions, edition: Edition) -> Vec<String> {
+pub fn registered_tools<'t>(
+    attrs: impl Iterator<Item = ast::Attr<'t>>,
+    cfg: &CfgOptions,
+    edition: Edition,
+) -> Vec<String> {
     // alloc: setup, once per crate's levels, the crate root's tools
     let mut tools = Vec::new();
-    hir_expand::attrs::expand_cfg_attr_view::<()>(attrs, || cfg, |meta, _| {
-        if let ast::Meta::TokenTreeMeta(meta) = meta
-            && meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "register_tool")
-            && let Some(items) = meta.token_tree().and_then(|it| list(it, edition))
-        {
-            for item in items {
-                if let ItemKind::Word(path) = item.kind
-                    && let [tool] = &path[..]
-                {
-                    // alloc: as above
-                    tools.push(tool.name().to_owned());
+    hir_expand::attrs::expand_cfg_attr_view::<()>(
+        attrs,
+        || cfg,
+        |meta, _| {
+            if let ast::Meta::TokenTreeMeta(meta) = meta
+                && meta
+                    .path()
+                    .and_then(|it| it.as_single_name_ref())
+                    .is_some_and(|it| it.text() == "register_tool")
+                && let Some(items) = meta.token_tree().and_then(|it| list(it, edition))
+            {
+                for item in items {
+                    if let ItemKind::Word(path) = item.kind
+                        && let [tool] = &path[..]
+                    {
+                        // alloc: as above
+                        tools.push(tool.name().to_owned());
+                    }
                 }
             }
-        }
-        ControlFlow::Continue(())
-    });
+            ControlFlow::Continue(())
+        },
+    );
     tools
 }
 
@@ -372,7 +417,11 @@ pub fn registered_tools<'t>(attrs: impl Iterator<Item = ast::Attr<'t>>, cfg: &Cf
 /// for the root of a macro's expansion, what is around the call (around the item, for a derive
 /// or an attribute macro); for the root of a module's file, its `mod` item; none for the
 /// crate's root file, or a file that is no module of `krate`.
-pub fn parent<'db>(db: &'db Db, krate: Crate, node: InFile<ast::Node<'db>>) -> Option<InFile<ast::Node<'db>>> {
+pub fn parent<'db>(
+    db: &'db Db,
+    krate: Crate,
+    node: InFile<ast::Node<'db>>,
+) -> Option<InFile<ast::Node<'db>>> {
     if let Some(parent) = node.value.parent() {
         return Some(node.with_value(parent));
     }
@@ -382,9 +431,12 @@ pub fn parent<'db>(db: &'db Db, krate: Crate, node: InFile<ast::Node<'db>>) -> O
     let loc = call.loc(db);
     let at = loc.to_node_view(db);
     let around = match loc.kind {
-        MacroCallKind::FnLike { .. } => {
-            at.value.ancestors().skip(1).find(|it| !matches!(it.kind(), SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE))
-        }
+        MacroCallKind::FnLike { .. } => at.value.ancestors().skip(1).find(|it| {
+            !matches!(
+                it.kind(),
+                SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE
+            )
+        }),
         MacroCallKind::Derive { .. } => {
             at.value.ancestors().find(|it| ast::Adt::can_cast(it.kind())).and_then(|it| it.parent())
         }
@@ -433,7 +485,9 @@ mod tests {
     fn by_match<'t>(meta: ast::Meta<'t>, edition: Edition, direct: bool) -> Option<Read<'t>> {
         let name = |path: Option<ast::Path<'t>>| path.and_then(|it| it.as_single_name_ref());
         match meta {
-            ast::Meta::PathMeta(it) if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") => {
+            ast::Meta::PathMeta(it)
+                if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") =>
+            {
                 Some(Read::Allows(LintId::SINGLE_USE_LIFETIMES))
             }
             ast::Meta::TokenTreeMeta(it) => {
@@ -464,12 +518,30 @@ mod tests {
     #[test]
     fn attribute_names_are_read_as_matched() {
         let names = [
-            "allow", "expect", "warn", "deny", "forbid", "doc", "automatically_derived", "Allow", "allows", "allo",
-            "force_warn", "cfg", "derive", "automatically_derive", "docs", "deny_", "x", "inline", "rustfmt",
+            "allow",
+            "expect",
+            "warn",
+            "deny",
+            "forbid",
+            "doc",
+            "automatically_derived",
+            "Allow",
+            "allows",
+            "allo",
+            "force_warn",
+            "cfg",
+            "derive",
+            "automatically_derive",
+            "docs",
+            "deny_",
+            "x",
+            "inline",
+            "rustfmt",
         ];
         let mut text = String::new();
         for name in names {
-            for args in ["", "(dead_code)", "(hidden)", "(a, b, reason = \"r\")", " = \"v\"", "()"] {
+            for args in ["", "(dead_code)", "(hidden)", "(a, b, reason = \"r\")", " = \"v\"", "()"]
+            {
                 text.push_str(&format!("#[{name}{args}]\n#[rustc::{name}{args}]\n"));
             }
         }
@@ -480,7 +552,11 @@ mod tests {
         for meta in parse.root().descendants().filter_map(ast::Meta::cast) {
             for direct in [false, true] {
                 let written = meta.syntax();
-                assert_eq!(plain(read_meta(meta, edition, direct)), plain(by_match(meta, edition, direct)), "{written}");
+                assert_eq!(
+                    plain(read_meta(meta, edition, direct)),
+                    plain(by_match(meta, edition, direct)),
+                    "{written}"
+                );
             }
             seen += 1;
         }

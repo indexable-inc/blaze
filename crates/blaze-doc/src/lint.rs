@@ -4,19 +4,15 @@
 //! the crate's cfg says. Levels given on the command line (`RUSTDOCFLAGS`) are not read. A link
 //! in docs a macro of another crate wrote is not reported at all, as rustc reports no lint there.
 
-use hir::{CfgExpr, CfgOptions, HirFileId, InFile, view::Semantics};
 use base_db::Db;
+use hir::{CfgExpr, CfgOptions, HirFileId, InFile, view::Semantics};
 use syntax::{
     NodeOrToken, TextRange,
     view::{self as ast, AstNode, HasAttrs},
 };
 
 /// Whether a broken link at `at`, in `krate`, is reported.
-pub(crate) fn broken_links_reported(
-    db: &Db,
-    krate: hir::Crate,
-    at: InFile<TextRange>,
-) -> bool {
+pub(crate) fn broken_links_reported(db: &Db, krate: hir::Crate, at: InFile<TextRange>) -> bool {
     !in_external_macro(db, krate, at) && level(db, krate, at).unwrap_or(true)
 }
 

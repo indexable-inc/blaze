@@ -40,11 +40,7 @@ impl<G, T> VecGenerator<G, T> {
 impl<G, T: PartialEq> VecGenerator<G, T> {
     /// Require all elements to be unique.
     pub fn unique(mut self, unique: bool) -> Self {
-        self.unique_by = if unique {
-            Some(<T as PartialEq>::eq)
-        } else {
-            None
-        };
+        self.unique_by = if unique { Some(<T as PartialEq>::eq) } else { None };
         self
     }
 }
@@ -99,9 +95,7 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> Vec<T> {
-        self.draw_vec(tc, &mut PrettyPrinter::noop(), |elements, tc, _| {
-            tc.draw_silent(elements)
-        })
+        self.draw_vec(tc, &mut PrettyPrinter::noop(), |elements, tc, _| tc.draw_silent(elements))
     }
 }
 
@@ -110,9 +104,7 @@ where
     G: PrintableGenerator<T>,
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> Vec<T> {
-        self.draw_vec(tc, printer, |elements, tc, printer| {
-            tc.draw_and_print(elements, printer)
-        })
+        self.draw_vec(tc, printer, |elements, tc, printer| tc.draw_and_print(elements, printer))
     }
 }
 
@@ -220,9 +212,7 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> HashSet<T> {
-        self.draw_set(tc, &mut PrettyPrinter::noop(), |elements, tc, _| {
-            tc.draw_silent(elements)
-        })
+        self.draw_set(tc, &mut PrettyPrinter::noop(), |elements, tc, _| tc.draw_silent(elements))
     }
 }
 
@@ -232,9 +222,7 @@ where
     T: Eq + Hash,
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> HashSet<T> {
-        self.draw_set(tc, printer, |elements, tc, printer| {
-            tc.draw_and_print(elements, printer)
-        })
+        self.draw_set(tc, printer, |elements, tc, printer| tc.draw_and_print(elements, printer))
     }
 }
 
@@ -462,9 +450,7 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> BTreeSet<T> {
-        self.draw_set(tc, &mut PrettyPrinter::noop(), |elements, tc, _| {
-            tc.draw_silent(elements)
-        })
+        self.draw_set(tc, &mut PrettyPrinter::noop(), |elements, tc, _| tc.draw_silent(elements))
     }
 }
 
@@ -474,9 +460,7 @@ where
     T: Ord,
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> BTreeSet<T> {
-        self.draw_set(tc, printer, |elements, tc, printer| {
-            tc.draw_and_print(elements, printer)
-        })
+        self.draw_set(tc, printer, |elements, tc, printer| tc.draw_and_print(elements, printer))
     }
 }
 
@@ -695,9 +679,7 @@ impl<G: Generator<T> + Send + Sync, T, const N: usize> Generator<[T; N]>
     }
 
     fn do_draw(&self, tc: &TestCase) -> [T; N] {
-        self.draw_array(tc, &mut PrettyPrinter::noop(), |element, tc, _| {
-            tc.draw_silent(element)
-        })
+        self.draw_array(tc, &mut PrettyPrinter::noop(), |element, tc, _| tc.draw_silent(element))
     }
 }
 
@@ -705,8 +687,6 @@ impl<G: PrintableGenerator<T> + Send + Sync, T, const N: usize> PrintableGenerat
     for ArrayGenerator<G, T, N>
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> [T; N] {
-        self.draw_array(tc, printer, |element, tc, printer| {
-            tc.draw_and_print(element, printer)
-        })
+        self.draw_array(tc, printer, |element, tc, printer| tc.draw_and_print(element, printer))
     }
 }

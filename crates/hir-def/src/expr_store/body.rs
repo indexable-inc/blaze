@@ -4,9 +4,9 @@ use std::ops;
 
 use base_db::{Db, EditionedFileId};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
 use span::{AstIdMap, Edition, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
+use std::alloc::Global;
 use syntax::{
     FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self, AstNode as _},
@@ -281,11 +281,7 @@ fn lower_relative(
 
 /// Lowers the body of `def` from the whole file it is in, as `lowering` says. What a body
 /// written by a macro is lowered with, and what [`check_relative`] checks the others against.
-fn lower_in_file(
-    db: &Db,
-    def: DefWithBodyId,
-    lowering: BodyLowering<'_>,
-) -> (Body, BodySourceMap) {
+fn lower_in_file(db: &Db, def: DefWithBodyId, lowering: BodyLowering<'_>) -> (Body, BodySourceMap) {
     let mut params = None;
     let mut function = None;
     let mut is_async_fn = false;
@@ -621,7 +617,9 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
         return placed_body_syntax(db, def);
     }
     let Some(&id) = file_body_syntax(db, file).get(&ast_id) else {
-        panic!("{def:?}: {ast_id:?} is outside fn bodies but no item of {file:?} with a body has it")
+        panic!(
+            "{def:?}: {ast_id:?} is outside fn bodies but no item of {file:?} with a body has it"
+        )
     };
     <ItemBodySyntax<'_> as blaze_query::db::FromId>::from_id(id).syntax(db)
 }
@@ -639,7 +637,10 @@ struct ItemBodySyntax<'db> {
 /// The [`ItemBodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by
 /// its ast id: changed only when such an item comes or goes, not by where an item is.
 #[blaze_query::tracked(returns(ref))]
-fn file_body_syntax(db: &Db, file: EditionedFileId) -> HashMap<ErasedFileAstId, blaze_query::db::Id, Global> {
+fn file_body_syntax(
+    db: &Db,
+    file: EditionedFileId,
+) -> HashMap<ErasedFileAstId, blaze_query::db::Id, Global> {
     let file_id = HirFileId::from(file);
     let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else {
         unreachable!("{file:?} is a real file")
@@ -649,12 +650,16 @@ fn file_body_syntax(db: &Db, file: EditionedFileId) -> HashMap<ErasedFileAstId, 
     let mut items = HashMap::new_in(Global);
     for &[start, end, kind, id] in ast_id_map.entries() {
         let kind = SyntaxKind::from(kind as u16);
-        if !matches!(kind, SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::VARIANT) {
+        if !matches!(
+            kind,
+            SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::VARIANT
+        ) {
             continue;
         }
         let ast_id = ErasedFileAstId::from_raw(id);
         let ptr = SyntaxNodePtr::from_parts(kind, TextRange::new(start.into(), end.into()));
-        let syntax = anchored_body_syntax(db, file_id, span_map, ast_id_map, view::to_node(ptr, root));
+        let syntax =
+            anchored_body_syntax(db, file_id, span_map, ast_id_map, view::to_node(ptr, root));
         let item = ItemBodySyntax::new(db, ast_id, syntax);
         items.insert(ast_id, blaze_query::db::AsId::as_id(&item));
     }
@@ -778,12 +783,7 @@ impl Body {
         })
     }
 
-    pub fn pretty_print(
-        &self,
-        db: &Db,
-        owner: DefWithBodyId,
-        edition: Edition,
-    ) -> String {
+    pub fn pretty_print(&self, db: &Db, owner: DefWithBodyId, edition: Edition) -> String {
         pretty::print_body_hir(db, self, owner, edition)
     }
 

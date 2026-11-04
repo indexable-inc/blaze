@@ -32,7 +32,8 @@ const MAX_STEPS: u32 = 8;
 /// tests; keeping a check is always correct.
 pub fn use_proved_contracts<'db>(db: &'db Db, body: &mut MirBody<'db>) -> Vec<Fact> {
     let owner = owner_path(db, body.owner);
-    let _span = tracing::info_span!(target: "blaze", "contracts.use_proved", owner = %owner).entered();
+    let _span =
+        tracing::info_span!(target: "blaze", "contracts.use_proved", owner = %owner).entered();
     let mut facts = Vec::new(); // alloc: the facts outlive the pass's frame, kept with the body
     frame::task(Tag::Mir, |frame| {
         let defs = Defs::of(body, frame);
@@ -50,7 +51,9 @@ pub fn use_proved_contracts<'db>(db: &'db Db, body: &mut MirBody<'db>) -> Vec<Fa
             else {
                 continue;
             };
-            let (Some(cond), Some(index)) = (whole_local(cond), whole_local(index)) else { continue };
+            let (Some(cond), Some(index)) = (whole_local(cond), whole_local(index)) else {
+                continue;
+            };
             // An array's length is a constant; a slice's is read from the place.
             let OperandKind::Constant { konst, .. } = &len.kind else { continue };
             let Some(length) = try_const_usize(db, konst.as_ref()) else { continue };
@@ -82,7 +85,8 @@ pub fn use_proved_contracts<'db>(db: &'db Db, body: &mut MirBody<'db>) -> Vec<Fa
         }
         for removal in removed.iter() {
             let Removal { block, target, callee, fact } = *removal;
-            let usable = callees.iter().find(|(it, _)| *it == callee).and_then(|(_, it)| it.as_ref());
+            let usable =
+                callees.iter().find(|(it, _)| *it == callee).and_then(|(_, it)| it.as_ref());
             let text = usable.map_or("", |it| it.bound.text.as_str());
             let _span = tracing::info_span!(
                 target: "blaze",
@@ -148,8 +152,12 @@ fn usable(db: &Db, callee: FunctionId, args: GenericArgs<'_>) -> Option<Usable> 
 
 /// The function a call at the end of `block` calls directly, with its (empty) generic
 /// arguments, if it is a non-generic function.
-fn direct_callee<'db>(body: &MirBody<'db>, block: BasicBlockId) -> Option<(FunctionId, GenericArgs<'db>)> {
-    let TerminatorKind::Call { func, .. } = &body.basic_blocks[block].terminator.as_ref()?.kind else {
+fn direct_callee<'db>(
+    body: &MirBody<'db>,
+    block: BasicBlockId,
+) -> Option<(FunctionId, GenericArgs<'db>)> {
+    let TerminatorKind::Call { func, .. } = &body.basic_blocks[block].terminator.as_ref()?.kind
+    else {
         return None;
     };
     let ty = match &func.kind {
@@ -166,7 +174,12 @@ fn direct_callee<'db>(body: &MirBody<'db>, block: BasicBlockId) -> Option<(Funct
 }
 
 /// Whether `statements` assign `cond` the comparison `index < len`.
-fn compares(statements: &[hir_ty::mir::Statement], cond: LocalId, index: LocalId, len: &Operand) -> bool {
+fn compares(
+    statements: &[hir_ty::mir::Statement],
+    cond: LocalId,
+    index: LocalId,
+    len: &Operand,
+) -> bool {
     statements.iter().any(|statement| match &statement.kind {
         StatementKind::Assign(place, Rvalue::BinaryOp(BinOp::Lt, a, b)) => {
             place.local == cond

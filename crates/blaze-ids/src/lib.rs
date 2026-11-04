@@ -18,7 +18,10 @@ use std::{fmt, hash, marker::PhantomData};
 
 use blaze_mem::swiss::Index;
 
-#[allow(clippy::disallowed_types, reason = "`Mutex` is named only by `Shard::lock`, which allows it")]
+#[allow(
+    clippy::disallowed_types,
+    reason = "`Mutex` is named only by `Shard::lock`, which allows it"
+)]
 use crate::{
     b3::ContextKey,
     sync::{
@@ -121,13 +124,18 @@ pub struct Hasher(b3::Hasher);
 /// 22); and unknown until they are all chosen, so none can be chosen to collide under it. Every
 /// persisted index of keys an attacker may pick (the interner's, the VFS's names) takes its
 /// key here, each in a domain of its own.
-pub fn index_key<'a>(domain: &'static str, values: impl IntoIterator<Item = &'a [u8]>) -> blaze_hash::SipKey {
+pub fn index_key<'a>(
+    domain: &'static str,
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> blaze_hash::SipKey {
     let mut hasher = Hasher::new(domain);
     for value in values {
         hasher.update(&(value.len() as u64).to_le_bytes()).update(value);
     }
     let id = hasher.finish();
-    let word = |at: usize| u64::from_le_bytes(id.0[at..at + 8].try_into().expect("8 bytes of a content ID"));
+    let word = |at: usize| {
+        u64::from_le_bytes(id.0[at..at + 8].try_into().expect("8 bytes of a content ID"))
+    };
     blaze_hash::SipKey::new(word(0), word(8))
 }
 
@@ -173,7 +181,9 @@ fn home(name: &str) -> usize {
 }
 
 /// [`b3::context_key`]`(domain)`, derived once per name.
-#[blaze::pure(trusted = "DOMAIN_KEYS memoizes b3::context_key of the domain's text: a slot once set never changes, and a lookup compares the text, so the key is the text's whatever the table holds")]
+#[blaze::pure(
+    trusted = "DOMAIN_KEYS memoizes b3::context_key of the domain's text: a slot once set never changes, and a lookup compares the text, so the key is the text's whatever the table holds"
+)]
 fn context_key(domain: &'static str) -> &'static ContextKey {
     context_key_in(&DOMAIN_KEYS, domain)
 }
@@ -477,7 +487,8 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         if slots[at].set((id, value)).is_err() {
             unreachable!("index {raw} handed out twice");
         }
-        let hash_of = |raw: u32| probe_hash(&self.slot(raw).expect("an index entry before its value").0);
+        let hash_of =
+            |raw: u32| probe_hash(&self.slot(raw).expect("an index entry before its value").0);
         shard.index.insert(len as usize, probe_hash(&id), raw, hash_of);
         shard.len.store(len + 1, Ordering::Relaxed);
         Idx::from_raw(raw)
@@ -534,8 +545,13 @@ mod tests {
         assert_eq!(ContentId::of("blaze v2 a 1", b"x"), ContentId::of("blaze v2 a 1", b"x"));
     }
 
-    const DOMAINS: [&str; 5] =
-        ["blaze v2 a 1", "blaze v2 b 1", "", "blaze v2 key 1", "blaze v2 a domain of some length 7"];
+    const DOMAINS: [&str; 5] = [
+        "blaze v2 a 1",
+        "blaze v2 b 1",
+        "",
+        "blaze v2 key 1",
+        "blaze v2 a domain of some length 7",
+    ];
 
     #[test]
     fn a_hasher_derives_its_domain_key() {
@@ -556,11 +572,15 @@ mod tests {
     #[test]
     fn of_many_is_of_for_each() {
         let lengths = [0, 1, 63, 64, 65, 1024, 1025, 3000, 2, 64];
-        let inputs: Vec<Vec<u8>> =
-            lengths.iter().enumerate().map(|(i, &len)| (0..len).map(|b| (b * 7 + i) as u8).collect()).collect();
+        let inputs: Vec<Vec<u8>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| (0..len).map(|b| (b * 7 + i) as u8).collect())
+            .collect();
         let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
         for domain in DOMAINS {
-            let expected: Vec<ContentId> = inputs.iter().map(|it| ContentId::of(domain, it)).collect();
+            let expected: Vec<ContentId> =
+                inputs.iter().map(|it| ContentId::of(domain, it)).collect();
             assert_eq!(ContentId::of_many(domain, &inputs), expected, "{domain:?}");
         }
         assert_eq!(ContentId::of_many("blaze v2 a 1", &[]), Vec::new());
@@ -600,7 +620,8 @@ mod tests {
 
     #[test]
     fn of_many_is_the_hasher_at_every_length_and_group_size() {
-        let bytes: Vec<u8> = (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let bytes: Vec<u8> =
+            (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         for copies in [1, 2, 3, 4, 5, 8, 16, 17, 33] {
             let inputs: Vec<&[u8]> = (0..=1100)
                 .flat_map(|len| (0..copies).map(move |copy| (len, copy)))
@@ -610,7 +631,12 @@ mod tests {
             for (input, id) in inputs.iter().zip(&many) {
                 let mut expected = blake3::Hasher::new_derive_key("blaze v2 a 1");
                 expected.update(input);
-                assert_eq!(*id, ContentId(*expected.finalize().as_bytes()), "{} bytes", input.len());
+                assert_eq!(
+                    *id,
+                    ContentId(*expected.finalize().as_bytes()),
+                    "{} bytes",
+                    input.len()
+                );
             }
         }
     }
@@ -626,7 +652,8 @@ mod tests {
             bytes[16..20].copy_from_slice(&n.to_le_bytes());
             ids.push(ContentId(bytes));
         }
-        let indices: Vec<_> = ids.iter().zip(0..).map(|(&id, n)| interner.intern(id, || n)).collect();
+        let indices: Vec<_> =
+            ids.iter().zip(0..).map(|(&id, n)| interner.intern(id, || n)).collect();
         for (n, (id, &idx)) in ids.iter().zip(&indices).enumerate() {
             assert_eq!(interner.find(id), Some(idx));
             assert_eq!(*interner.get(idx), n as u32);
@@ -644,8 +671,9 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn many_domains_keep_their_own_keys() {
-        let names: Vec<&'static str> =
-            (0..600).map(|n| &*Box::leak(format!("blaze v2 test domain {n}").into_boxed_str())).collect();
+        let names: Vec<&'static str> = (0..600)
+            .map(|n| &*Box::leak(format!("blaze v2 test domain {n}").into_boxed_str()))
+            .collect();
         let first: Vec<ContentId> = names.iter().map(|&name| ContentId::of(name, b"x")).collect();
         let threads: Vec<Vec<ContentId>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..4)
@@ -773,7 +801,8 @@ mod tests {
             workers.into_iter().map(|it| it.join().unwrap()).collect()
         });
         assert_eq!(interner.len(), 10_000);
-        let mut raws: Vec<u32> = (0..10_000).map(|n| interner.find(&id(n)).unwrap().raw()).collect();
+        let mut raws: Vec<u32> =
+            (0..10_000).map(|n| interner.find(&id(n)).unwrap().raw()).collect();
         raws.sort_unstable();
         raws.dedup();
         assert_eq!(raws.len(), 10_000);
@@ -869,7 +898,8 @@ mod model {
     impl Model {
         /// Key `k` is `id(shard, tag, k)` for the `k`th of `keys`.
         fn new(keys: impl IntoIterator<Item = (u32, u32)>) -> Arc<Model> {
-            let ids = keys.into_iter().zip(0..).map(|((shard, tag), key)| id(shard, tag, key)).collect();
+            let ids =
+                keys.into_iter().zip(0..).map(|((shard, tag), key)| id(shard, tag, key)).collect();
             Arc::new(Model {
                 interner: Sharded::new(),
                 ids,
@@ -909,14 +939,20 @@ mod model {
 
         fn reads_back(&self, key: u8, idx: Idx<Counted>) {
             assert_eq!(self.interner.get(idx).key, key, "an index reads back its value");
-            assert_eq!(self.interner.content(idx), self.ids[key as usize], "an index reads back its ID");
+            assert_eq!(
+                self.interner.content(idx),
+                self.ids[key as usize],
+                "an index reads back its ID"
+            );
             assert!((idx.raw() as usize) < self.interner.end(), "an index is below `end`");
         }
 
         /// Checks the history, then drops the interner: every value made is dropped once.
         fn finish(model: Arc<Model>) {
             model.history.check(Set::default());
-            let Ok(model) = Arc::try_unwrap(model) else { panic!("a model thread outlived its join") };
+            let Ok(model) = Arc::try_unwrap(model) else {
+                panic!("a model thread outlived its join")
+            };
             let made = model.made.into_inner();
             drop(model.interner);
             assert!(made.iter().all(|it| it.load(Relaxed)), "every value made is dropped once");
@@ -981,7 +1017,8 @@ mod model {
     fn model_growth_keeps_every_index() {
         blaze_check::model(|| {
             let model = Model::new((0..8).map(|tag| (0, tag)));
-            let before: Vec<Option<Idx<Counted>>> = (0..6).map(|key| model.run(Op::Intern(key))).collect();
+            let before: Vec<Option<Idx<Counted>>> =
+                (0..6).map(|key| model.run(Op::Intern(key))).collect();
             let other = {
                 let model = model.clone();
                 thread::spawn(move || [Op::Intern(6), Op::Intern(7)].map(|op| model.run(op)))
@@ -995,9 +1032,14 @@ mod model {
             if six.is_some() {
                 assert_eq!(six, six_at, "key 6 found at its index");
             }
-            let all: Vec<Option<Idx<Counted>>> = before.iter().copied().chain([six_at, seven_at]).collect();
+            let all: Vec<Option<Idx<Counted>>> =
+                before.iter().copied().chain([six_at, seven_at]).collect();
             for (key, &idx) in all.iter().enumerate() {
-                assert_eq!(model.interner.find(&model.ids[key]), idx, "key {key} kept across the growth");
+                assert_eq!(
+                    model.interner.find(&model.ids[key]),
+                    idx,
+                    "key {key} kept across the growth"
+                );
             }
             assert_eq!(model.interner.len(), 8);
             Model::finish(model);

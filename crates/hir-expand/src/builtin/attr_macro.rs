@@ -335,7 +335,9 @@ fn contract_clause_expand<'f>(
     let unchanged = || tt::TopSubtree::from_subtree_in(tt.view(), frame);
     let fail = |msg: &str| ExpandResult::new(unchanged(), ExpandError::other(span, msg));
     let args = match &id.loc(db).kind {
-        MacroCallKind::Attr { attr_args: Some(args), .. } if !args.token_trees().is_empty() => &**args,
+        MacroCallKind::Attr { attr_args: Some(args), .. } if !args.token_trees().is_empty() => {
+            &**args
+        }
         _ => {
             let (name, example) = match clause {
                 ContractClause::Requires => ("requires", "condition"),
@@ -347,9 +349,7 @@ fn contract_clause_expand<'f>(
             ));
         }
     };
-    let is_kw = |it: &tt::TtElement<'_>, kw: &str| {
-        matches!(it, tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.is_raw == tt::IdentIsRaw::No && ident.sym.as_str() == kw)
-    };
+    let is_kw = |it: &tt::TtElement<'_>, kw: &str| matches!(it, tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.is_raw == tt::IdentIsRaw::No && ident.sym.as_str() == kw);
     let elements = tt.iter();
     let mut before_fn = elements.clone();
     let Some(fn_at) = before_fn.position(|it| is_kw(&it, "fn")) else {
@@ -371,9 +371,7 @@ fn contract_clause_expand<'f>(
     let (body_subtree, body) = body;
 
     let punct = |char| tt::Leaf::Punct(tt::Punct { char, spacing: tt::Spacing::Alone, span });
-    let is_punct = |it: &Option<tt::TtElement<'_>>, ch: char| {
-        matches!(it, Some(tt::TtElement::Leaf(tt::Leaf::Punct(p))) if p.char == ch)
-    };
+    let is_punct = |it: &Option<tt::TtElement<'_>>, ch: char| matches!(it, Some(tt::TtElement::Leaf(tt::Leaf::Punct(p))) if p.char == ch);
     let mut rest = body.clone();
     // The body's inner attributes (`#![..]`, inner doc comments) stay first.
     let mut kept = 0;
@@ -563,7 +561,12 @@ mod tests {
             symbols.push(Symbol::intern(&text.to_uppercase()));
             symbols.push(Symbol::intern(&text[..text.len() - 1]));
         }
-        symbols.extend([sym::self_, sym::cfg, Symbol::intern("inline"), Symbol::intern("tokio_test")]);
+        symbols.extend([
+            sym::self_,
+            sym::cfg,
+            Symbol::intern("inline"),
+            Symbol::intern("tokio_test"),
+        ]);
         for symbol in symbols {
             let name = Name::new_symbol_root(symbol);
             assert_eq!(
@@ -574,7 +577,10 @@ mod tests {
         }
         for (at, symbol) in BuiltinAttrExpander::NAMES.iter().enumerate() {
             let name = Name::new_symbol_root(symbol.clone());
-            assert_eq!(BuiltinAttrExpander::find_by_name(&name), Some(BuiltinAttrExpander::ALL[at]));
+            assert_eq!(
+                BuiltinAttrExpander::find_by_name(&name),
+                Some(BuiltinAttrExpander::ALL[at])
+            );
         }
     }
 }

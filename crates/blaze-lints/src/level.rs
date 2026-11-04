@@ -470,9 +470,17 @@ mod tests {
         assert_eq!(general.of(Lint::Blaze(blaze::Lint::SmallMap), &[]).level, Level::Allow);
         let hot = Levels::new(&CommandLine::parse(&args("--deny=blaze::hot")).unwrap());
         assert_eq!(hot.of(hot_alloc, &[]).level, Level::Deny);
-        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level, Level::Deny, "`blaze::hot` has it");
+        assert_eq!(
+            hot.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level,
+            Level::Deny,
+            "`blaze::hot` has it"
+        );
         let renamed = Levels::new(&CommandLine::parse(&args("--deny=blaze::std_hashmap")).unwrap());
-        assert_eq!(renamed.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level, Level::Deny, "the old name stands for the new");
+        assert_eq!(
+            renamed.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level,
+            Level::Deny,
+            "the old name stands for the new"
+        );
         assert_eq!(hot.of(Lint::Clippy(info("needless_bool")), &[]).level, Level::Warn);
         let span = Span { file: "src/lib.rs".to_owned(), lo: 0, hi: 1, expansion: None };
         let cold = Set {
@@ -514,7 +522,8 @@ mod tests {
     #[test]
     fn the_notes_rustc_adds() {
         let notes = |spec: Spec| {
-            let mut diagnostic = Diag::new(blaze_diagnostics::model::Level::Warning, None, String::new());
+            let mut diagnostic =
+                Diag::new(blaze_diagnostics::model::Level::Warning, None, String::new());
             explain(&mut diagnostic, Lint::Clippy(info("needless_bool")), &spec);
             diagnostic.children.into_iter().map(|it| it.message).collect::<Vec<_>>()
         };
@@ -574,7 +583,9 @@ mod tests {
         assert_eq!(Level::of_cap("force-warn"), None);
         assert_eq!(Level::of_cap("expect"), None);
         assert!(CommandLine::parse(&args("--cap-lints force-warn")).is_err());
-        for level in [Level::Allow, Level::Expect, Level::Warn, Level::ForceWarn, Level::Deny, Level::Forbid] {
+        for level in
+            [Level::Allow, Level::Expect, Level::Warn, Level::ForceWarn, Level::Deny, Level::Forbid]
+        {
             let flag = match level {
                 Level::Allow => "-A",
                 Level::Expect | Level::Warn => "-W",
@@ -583,7 +594,10 @@ mod tests {
                 Level::Forbid => "-F",
             };
             assert_eq!(level.to_cmd_flag(), flag);
-            assert_eq!(Level::of_attr(level.as_str()), (level != Level::ForceWarn).then_some(level));
+            assert_eq!(
+                Level::of_attr(level.as_str()),
+                (level != Level::ForceWarn).then_some(level)
+            );
         }
     }
 }

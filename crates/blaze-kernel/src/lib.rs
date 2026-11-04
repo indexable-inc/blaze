@@ -34,7 +34,7 @@ use std::fmt;
 
 use blaze_cas::{Key, Kind};
 use blaze_ids::{ContentId, Hasher};
-use blaze_store_check::{Hit, RecordedRead, Recompute, Setting, VerifyError};
+use blaze_store_check::{Hit, Recompute, RecordedRead, Setting, VerifyError};
 
 mod entry;
 mod reads;
@@ -43,7 +43,9 @@ mod store;
 mod tests;
 pub mod why;
 
-pub use crate::entry::{Entry, EntryKey, EntryReads, Shape, ShapeReads, entry_key, shape_slot, whole};
+pub use crate::entry::{
+    Entry, EntryKey, EntryReads, Shape, ShapeReads, entry_key, shape_slot, whole,
+};
 pub use crate::reads::{Reads, Trace};
 pub use crate::store::{Get, Put, Reading, Writing};
 pub use crate::why::{Miss, Missed, Part};
@@ -230,7 +232,8 @@ pub trait Compute: Step {
     type World: World + ?Sized;
 
     /// The value of `input`, from what `ctx` reads and nothing else.
-    fn compute(ctx: &mut Reads<'_, Self::World>, input: &Self::Input) -> Result<Vec<u8>, StepError>;
+    fn compute(ctx: &mut Reads<'_, Self::World>, input: &Self::Input)
+    -> Result<Vec<u8>, StepError>;
 }
 
 /// Why a step's run made no value.
@@ -329,8 +332,12 @@ impl fmt::Display for KernelError {
                 "two kernel steps share a number or a name: `{}` (step {}) and `{}` (step {})",
                 first.1, first.0.0, second.1, second.0.0
             ),
-            KernelError::Store { of, key, why } => write!(f, "{of}: the store at {:x}: {why}", key.0),
-            KernelError::World { of, read, why } => write!(f, "{of}: the read {read} failed, so nothing was kept: {why}"),
+            KernelError::Store { of, key, why } => {
+                write!(f, "{of}: the store at {:x}: {why}", key.0)
+            }
+            KernelError::World { of, read, why } => {
+                write!(f, "{of}: the read {read} failed, so nothing was kept: {why}")
+            }
             KernelError::Unsteady { of, read, first, then } => write!(
                 f,
                 "{of}: the read {read} saw {:x} and then {:x} in one run: the world changed under the step, so nothing was kept",
@@ -397,7 +404,9 @@ impl Kernel {
     pub fn code<S: Step>(&self) -> Result<CodeId, KernelError> {
         match self.steps.get(&S::ID) {
             Some(it) if it.type_id == TypeId::of::<S>() => Ok(it.code),
-            Some(it) => Err(KernelError::Unregistered { step: S::ID, name: S::NAME, holder: Some(it.name) }),
+            Some(it) => {
+                Err(KernelError::Unregistered { step: S::ID, name: S::NAME, holder: Some(it.name) })
+            }
             None => Err(KernelError::Unregistered { step: S::ID, name: S::NAME, holder: None }),
         }
     }
@@ -482,7 +491,9 @@ impl Kernel {
         let identity = self.identity::<S>(input)?;
         let key = whole::key(&identity);
         // alloc: the value, kept in the store
-        store.put(key, S::KIND, value.to_vec()).map_err(|it| conflict::<S>(input, &identity, key, &[], &it))?;
+        store
+            .put(key, S::KIND, value.to_vec())
+            .map_err(|it| conflict::<S>(input, &identity, key, &[], &it))?;
         Ok(key)
     }
 }
@@ -500,7 +511,13 @@ fn conflict<S: Step>(
 ) -> KernelError {
     // alloc: an error
     let reads = reads.to_vec();
-    KernelError::Conflict { of: of::<S>(input, identity), key, reads, kept: mismatch.kept, given: mismatch.given }
+    KernelError::Conflict {
+        of: of::<S>(input, identity),
+        key,
+        reads,
+        kept: mismatch.kept,
+        given: mismatch.given,
+    }
 }
 
 /// The key of the entry of `identity` whose reads all hash the same now: the entry with no
@@ -512,14 +529,17 @@ fn find_key<S: Compute, G: Get + ?Sized>(
     identity: &Identity,
 ) -> Result<Option<Key>, KernelError> {
     let id = identity.id();
-    let failed = |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
+    let failed =
+        |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
     let whole = whole::key(identity);
     if store.has(&whole).map_err(|why| failed(whole, why))? {
         return Ok(Some(whole));
     }
     for n in 0..MOST_SHAPES {
         let slot = shape_slot(&id, n);
-        let Some(bytes) = store.get(&slot).map_err(|why| failed(slot, why))? else { return Ok(None) };
+        let Some(bytes) = store.get(&slot).map_err(|why| failed(slot, why))? else {
+            return Ok(None);
+        };
         let shape = Shape::read(bytes, &id).map_err(|why| failed(slot, why))?;
         let mut key = EntryKey::new(&id, shape.len());
         for read in shape.reads() {
@@ -546,12 +566,19 @@ fn read_entry<'s, S: Step, G: Get + ?Sized>(
 ) -> Result<Entry<'s>, KernelError> {
     let failed = |why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
     // alloc: an error
-    let bytes = store.get(&key).map_err(failed)?.ok_or_else(|| failed("its entry went missing after it was probed".to_owned()))?;
+    let bytes = store
+        .get(&key)
+        .map_err(failed)?
+        .ok_or_else(|| failed("its entry went missing after it was probed".to_owned()))?;
     Entry::read(bytes, key, identity).map_err(failed)
 }
 
 /// `S` of `input` with fresh reads: its value and its reads, sorted, each once.
-fn run<S: Compute>(world: &S::World, input: &S::Input, identity: &Identity) -> Result<(Vec<u8>, Trace), KernelError> {
+fn run<S: Compute>(
+    world: &S::World,
+    input: &S::Input,
+    identity: &Identity,
+) -> Result<(Vec<u8>, Trace), KernelError> {
     let mut ctx = Reads::new(world);
     let computed = S::compute(&mut ctx, input);
     let trace = ctx.finish().map_err(|it| ended::<S>(world, input, identity, it))?;
@@ -562,11 +589,18 @@ fn run<S: Compute>(world: &S::World, input: &S::Input, identity: &Identity) -> R
             read: world.describe(error.read()),
             why: error.why,
         }),
-        Err(StepError::Refused(why)) => Err(KernelError::Compute { of: of::<S>(input, identity), why }),
+        Err(StepError::Refused(why)) => {
+            Err(KernelError::Compute { of: of::<S>(input, identity), why })
+        }
     }
 }
 
-fn ended<S: Compute>(world: &S::World, input: &S::Input, identity: &Identity, ended: reads::Unfinished) -> KernelError {
+fn ended<S: Compute>(
+    world: &S::World,
+    input: &S::Input,
+    identity: &Identity,
+    ended: reads::Unfinished,
+) -> KernelError {
     match ended {
         reads::Unfinished::Failed(error) => KernelError::World {
             of: of::<S>(input, identity),
@@ -598,12 +632,14 @@ fn keep<S: Compute, P: Put + ?Sized>(
     value: &[u8],
 ) -> Result<Key, KernelError> {
     let id = identity.id();
-    let failed = |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
+    let failed =
+        |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
     let key = entry_key(&id, trace.iter());
     let bytes = entry::encode(identity, trace, value);
     if let Err(mismatch) = store.put(key, S::KIND, bytes) {
         // alloc: an error
-        let reads: Vec<String> = trace.iter().map(|(read, seen)| described(world, read, seen)).collect();
+        let reads: Vec<String> =
+            trace.iter().map(|(read, seen)| described(world, read, seen)).collect();
         return Err(conflict::<S>(input, identity, key, &reads, &mismatch));
     }
     if trace.is_empty() {
@@ -629,25 +665,35 @@ fn keep<S: Compute, P: Put + ?Sized>(
 fn described<W: World + ?Sized>(world: &W, read: Read<'_>, seen: Seen) -> String {
     match seen {
         Seen::Is(hash) => format!("{} = {hash:x}", world.describe(read)), // alloc: an error's or a check's text
-        Seen::Gone => format!("{} (gone)", world.describe(read)),         // alloc: an error's or a check's text
+        Seen::Gone => format!("{} (gone)", world.describe(read)), // alloc: an error's or a check's text
     }
 }
 
 /// Checks a hit when `verify` samples it: `S` is run again with fresh reads, and it must make
 /// the entry's reads and bytes.
-fn check<S: Compute>(verify: &Setting, world: &S::World, input: &S::Input, entry: &Entry<'_>) -> Result<(), KernelError> {
+fn check<S: Compute>(
+    verify: &Setting,
+    world: &S::World,
+    input: &S::Input,
+    entry: &Entry<'_>,
+) -> Result<(), KernelError> {
     let identity = entry.identity.id();
     if !verify.sampled(&identity) {
         return Ok(());
     }
     let label = S::label(input);
     // alloc: a sampled check's text
-    let names: Vec<String> = entry.reads().map(|(read, seen)| described(world, read, seen)).collect();
+    let names: Vec<String> =
+        entry.reads().map(|(read, seen)| described(world, read, seen)).collect();
     // alloc: a sampled check's reads
-    let reads: Vec<RecordedRead<'_>> =
-        names.iter().zip(entry.reads()).map(|(what, (_, seen))| RecordedRead { what, hash: seen.hash() }).collect();
+    let reads: Vec<RecordedRead<'_>> = names
+        .iter()
+        .zip(entry.reads())
+        .map(|(what, (_, seen))| RecordedRead { what, hash: seen.hash() })
+        .collect();
     let hit = Hit { function: &label, identity, reads: &reads, stored: entry.value };
-    blaze_store_check::check(verify, &hit, &Again::<S> { world, input, entry }).map_err(KernelError::Verify)?;
+    blaze_store_check::check(verify, &hit, &Again::<S> { world, input, entry })
+        .map_err(KernelError::Verify)?;
     Ok(())
 }
 

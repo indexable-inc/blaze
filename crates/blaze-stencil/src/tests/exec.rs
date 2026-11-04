@@ -40,8 +40,8 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-pub use super::interp::Outcome;
 use super::host::{self, Compiled};
+pub use super::interp::Outcome;
 use crate::code::{self, Code, Name};
 
 /// Namespace of user names that are the linked units, by index.
@@ -286,7 +286,9 @@ impl Exec {
                         }
                         Name::User { namespace: HOST, index } => link.host[index as usize],
                         Name::User { namespace, index } => {
-                            panic!("unit {i}: a relocation against u{namespace}:{index}, which no test makes")
+                            panic!(
+                                "unit {i}: a relocation against u{namespace}:{index}, which no test makes"
+                            )
                         }
                         Name::LibCall(call) => symbols.libcall(call),
                         Name::Known(symbol) => panic!("unit {i}: a relocation against {symbol:?}"),
@@ -343,7 +345,9 @@ impl Exec {
         let mut out = vec![0; len];
         // SAFETY: the object is `len` bytes at `at` in the live data mapping, and no call is
         // running (calls borrow `self` and have returned), so nothing writes it meanwhile.
-        unsafe { ptr::copy_nonoverlapping((self.data_at() + at) as *const u8, out.as_mut_ptr(), len) };
+        unsafe {
+            ptr::copy_nonoverlapping((self.data_at() + at) as *const u8, out.as_mut_ptr(), len)
+        };
         out
     }
 
@@ -353,7 +357,9 @@ impl Exec {
         let cell = self.data_at() + self.counters + unit * 16;
         // SAFETY: the cells are 16 bytes, 16-aligned, in the live data mapping; the code
         // writes them only during a call, and none is running.
-        unsafe { [ptr::read_volatile(cell as *const u64), ptr::read_volatile((cell + 8) as *const u64)] }
+        unsafe {
+            [ptr::read_volatile(cell as *const u64), ptr::read_volatile((cell + 8) as *const u64)]
+        }
     }
 
     /// Calls unit `unit` with `args`, in this process: for calls that must not trap. Panics
@@ -464,7 +470,11 @@ impl Drop for Exec {
 
 /// Whether `value` is passed as a `ty`: its type, or any 128-bit vector for a 128-bit vector.
 fn fits(value: &DataValue, ty: ir::Type) -> bool {
-    if ty.is_vector() { value.ty().is_vector() && value.ty().bytes() == ty.bytes() } else { value.ty() == ty }
+    if ty.is_vector() {
+        value.ty().is_vector() && value.ty().bytes() == ty.bytes()
+    } else {
+        value.ty() == ty
+    }
 }
 
 /// The address of a host function `(tag: i64, value: i64)` that raises an exception of this
@@ -694,7 +704,8 @@ impl Writer {
 }
 
 fn rel32(unit: usize, kind: Kind, delta: i64) -> i32 {
-    i32::try_from(delta).unwrap_or_else(|_| panic!("unit {unit}: {kind:?} of {delta:#x} out of range"))
+    i32::try_from(delta)
+        .unwrap_or_else(|_| panic!("unit {unit}: {kind:?} of {delta:#x} out of range"))
 }
 
 /// Runs `f` in a forked child with `len` bytes of memory shared with this process, and gives
@@ -819,7 +830,9 @@ type Xmm = std::arch::x86_64::__m128i;
 #[cfg(target_arch = "x86_64")]
 extern "C" fn pshufb(a: Xmm, b: Xmm) -> Xmm {
     // SAFETY: `__m128i` is 16 plain bytes, and every bit pattern of each is valid.
-    let (a, b) = unsafe { (std::mem::transmute::<Xmm, [u8; 16]>(a), std::mem::transmute::<Xmm, [u8; 16]>(b)) };
+    let (a, b) = unsafe {
+        (std::mem::transmute::<Xmm, [u8; 16]>(a), std::mem::transmute::<Xmm, [u8; 16]>(b))
+    };
     let mut out = [0u8; 16];
     for (out, index) in out.iter_mut().zip(b) {
         *out = if index & 0x80 != 0 { 0 } else { a[usize::from(index & 0xf)] };
@@ -856,8 +869,12 @@ impl<'a> View<'a> {
                 handlers: &code.handlers,
                 unwind: match &code.unwind {
                     Some(code::Unwind::Dwarf { len, rows }) => Frame::Rows(*len, rows),
-                    Some(code::Unwind::Windows { .. }) => panic!("Windows unwind info on a Unix host"),
-                    Some(code::Unwind::WindowsArm64 { .. }) => panic!("Windows unwind info on a Unix host"),
+                    Some(code::Unwind::Windows { .. }) => {
+                        panic!("Windows unwind info on a Unix host")
+                    }
+                    Some(code::Unwind::WindowsArm64 { .. }) => {
+                        panic!("Windows unwind info on a Unix host")
+                    }
                     None => Frame::None,
                 },
                 sig,
@@ -926,8 +943,10 @@ impl Frames {
         let mut cie = isa.create_systemv_cie().expect("a CIE for the host's ISA");
         cie.fde_address_encoding = gimli::DW_EH_PE_absptr;
         cie.lsda_encoding = Some(gimli::DW_EH_PE_absptr);
-        let personality = personality as unsafe extern "C" fn(c_int, c_int, u64, *mut Exception, *mut c_void) -> c_int;
-        cie.personality = Some((gimli::DW_EH_PE_absptr, Address::Constant(personality as usize as u64)));
+        let personality = personality
+            as unsafe extern "C" fn(c_int, c_int, u64, *mut Exception, *mut c_void) -> c_int;
+        cie.personality =
+            Some((gimli::DW_EH_PE_absptr, Address::Constant(personality as usize as u64)));
         let mut table = FrameTable::default();
         let cie = table.add_cie(cie);
         let mut any = false;
@@ -979,7 +998,8 @@ impl Frames {
             // libunwind registers one FDE at a time: every entry whose CIE pointer is not 0.
             let mut at = 0;
             while at + 8 <= eh_frame.len() {
-                let len = u32::from_le_bytes(eh_frame[at..at + 4].try_into().expect("4 bytes")) as usize;
+                let len =
+                    u32::from_le_bytes(eh_frame[at..at + 4].try_into().expect("4 bytes")) as usize;
                 if len == 0 {
                     break;
                 }
@@ -1126,7 +1146,10 @@ fn a_cranelift_function_runs() {
     let exec = Exec::cranelift(&compiled, &sig);
     assert_eq!(exec.call::<(i64, i64), i64>(0, (40, 2)), 42);
     assert_eq!(exec.values(0, &[DataValue::I64(-1), DataValue::I64(1)]), [DataValue::I64(0)]);
-    assert_eq!(exec.values_forked(0, &[DataValue::I64(7), DataValue::I64(8)]), Outcome::Returned(vec![DataValue::I64(15)]));
+    assert_eq!(
+        exec.values_forked(0, &[DataValue::I64(7), DataValue::I64(8)]),
+        Outcome::Returned(vec![DataValue::I64(15)])
+    );
 }
 
 #[test]
@@ -1184,10 +1207,8 @@ fn an_exception_lands_in_cranelift_code() {
     });
     let tag = b.ins().iconst(types::I64, 7);
     let normal_call = b.func.dfg.block_call(normal, &[]);
-    let caught_call = b.func.dfg.block_call(
-        caught,
-        &[ir::BlockArg::TryCallExn(0), ir::BlockArg::TryCallExn(1)],
-    );
+    let caught_call =
+        b.func.dfg.block_call(caught, &[ir::BlockArg::TryCallExn(0), ir::BlockArg::TryCallExn(1)]);
     let table = b.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
         throw_sig,
         normal_call,

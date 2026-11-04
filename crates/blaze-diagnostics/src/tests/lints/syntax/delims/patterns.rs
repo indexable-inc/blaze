@@ -28,12 +28,7 @@ fn main() {
 "#;
     assert_reports(
         &ui("issue-103435-extra-parentheses.rs", "2015", source),
-        &[
-            error(15, &[]),
-            error(5, &[]),
-            error(8, &[]),
-            error(11, &["`if`"]),
-        ],
+        &[error(15, &[]), error(5, &[]), error(8, &[]), error(11, &["`if`"])],
     );
 }
 
@@ -82,10 +77,6 @@ fn main() {}
 "#;
     assert_reports(
         &ui_run_pass("unused-parens-in-macro-issue-120642.rs", "2015", source, &Options::default()),
-        &[
-            warning(26, &[]),
-            warning(23, &[]),
-            warning(26, &[]),
-        ],
+        &[warning(26, &[]), warning(23, &[]), warning(26, &[])],
     );
 }

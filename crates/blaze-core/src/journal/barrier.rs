@@ -139,7 +139,9 @@ impl Barrier {
     pub(crate) fn end(&mut self, why: &str) {
         for Waiting { tag, .. } in self.waiting.drain(..) {
             // alloc: an error path.
-            let why = format!("the watch ended before every change made before the flush was told: {why}");
+            let why = format!(
+                "the watch ended before every change made before the flush was told: {why}"
+            );
             self.decisions.push(Decision::Failed { tag, why });
         }
     }
@@ -245,7 +247,11 @@ mod tests {
         barrier.end("the watched directory was moved");
         let decisions = take(&mut barrier);
         assert_eq!(decisions.len(), 2);
-        assert!(decisions.iter().all(|it| matches!(it, Decision::Failed { why, .. } if why.contains("moved"))));
+        assert!(
+            decisions
+                .iter()
+                .all(|it| matches!(it, Decision::Failed { why, .. } if why.contains("moved")))
+        );
         assert!(!barrier.hurried());
     }
 }

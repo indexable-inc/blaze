@@ -53,7 +53,9 @@ impl<'h, 't> Printer<'h, 't> {
             ConstKind::Param(param) => {
                 let params = GenericParams::of(self.db, param.id.parent());
                 match &params[param.id.local_id()] {
-                    TypeOrConstParamData::ConstParamData(data) => self.write_str(data.name.symbol().as_str()),
+                    TypeOrConstParamData::ConstParamData(data) => {
+                        self.write_str(data.name.symbol().as_str())
+                    }
                     TypeOrConstParamData::TypeParamData(_) => {
                         unreachable!("a const parameter's data is a const parameter's")
                     }
@@ -79,7 +81,10 @@ impl<'h, 't> Printer<'h, 't> {
         if self.spelling() == Spelling::TypeName
             && let ConstKind::Value(value) = c.kind()
             && let ValTreeKind::Leaf(leaf) = value.value.inner()
-            && matches!(value.ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_))
+            && matches!(
+                value.ty.kind(),
+                TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)
+            )
         {
             return self.print_scalar_int(*leaf, value.ty);
         }
@@ -94,7 +99,9 @@ impl<'h, 't> Printer<'h, 't> {
         let ty = value.ty;
         match (value.value.inner(), ty.kind()) {
             (ValTreeKind::Branch(consts), TyKind::Ref(_, inner, _)) => match inner.kind() {
-                TyKind::Slice(elem) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => self.print_byte_str(*consts),
+                TyKind::Slice(elem) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => {
+                    self.print_byte_str(*consts)
+                }
                 TyKind::Str => {
                     // alloc: a string constant printed, the edge
                     let bytes: Vec<u8> = bytes(*consts).collect();
@@ -106,7 +113,9 @@ impl<'h, 't> Printer<'h, 't> {
                     self.print_valtree(ValueConst { ty: inner, value: value.value });
                 }
             },
-            (ValTreeKind::Branch(consts), TyKind::Array(elem, _)) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => {
+            (ValTreeKind::Branch(consts), TyKind::Array(elem, _))
+                if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) =>
+            {
                 self.write_str("*");
                 self.print_byte_str(*consts);
             }
@@ -123,7 +132,9 @@ impl<'h, 't> Printer<'h, 't> {
                 }
                 self.write_str(")");
             }
-            (ValTreeKind::Branch(consts), TyKind::Adt(def, args)) => self.print_adt_value(def.def_id(), args, *consts, ty),
+            (ValTreeKind::Branch(consts), TyKind::Adt(def, args)) => {
+                self.print_adt_value(def.def_id(), args, *consts, ty)
+            }
             (ValTreeKind::Leaf(leaf), TyKind::Ref(_, inner, _)) => {
                 self.write_str("&");
                 self.print_scalar_int(*leaf, inner);
@@ -137,14 +148,22 @@ impl<'h, 't> Printer<'h, 't> {
                 };
                 self.print_value_path(def, args.skip_binder().as_slice());
             }
-            (ValTreeKind::Branch(consts), _) if consts.as_slice().is_empty() => self.write_str("<ZST>"),
+            (ValTreeKind::Branch(consts), _) if consts.as_slice().is_empty() => {
+                self.write_str("<ZST>")
+            }
             (kind, _) => self.write_fmt(format_args!("{kind:?}")),
         }
     }
 
     /// An ADT value from rustc's `destructure_const`: an enum's first field is its variant's
     /// index, the variant's fields follow.
-    fn print_adt_value(&mut self, adt: AdtId, args: GenericArgs<'t>, consts: Consts<'t>, ty: Ty<'t>) {
+    fn print_adt_value(
+        &mut self,
+        adt: AdtId,
+        args: GenericArgs<'t>,
+        consts: Consts<'t>,
+        ty: Ty<'t>,
+    ) {
         let consts = consts.as_slice();
         let (variant, def, fields): (VariantId, Def, &[Const<'t>]) = match adt {
             AdtId::StructId(it) => (it.into(), Def::Adt(adt), consts),
@@ -161,7 +180,9 @@ impl<'h, 't> Printer<'h, 't> {
                 let index = match consts.first().map(|it| it.kind()) {
                     Some(ConstKind::Value(v)) => match v.value.inner() {
                         ValTreeKind::Leaf(leaf) => leaf.to_u32() as usize,
-                        ValTreeKind::Branch(_) => unreachable!("an enum value starts with its variant's index"),
+                        ValTreeKind::Branch(_) => {
+                            unreachable!("an enum value starts with its variant's index")
+                        }
                     },
                     _ => unreachable!("an enum value starts with its variant's index"),
                 };
@@ -216,7 +237,9 @@ impl<'h, 't> Printer<'h, 't> {
     /// rustc's `pretty_print_const_scalar_int`, without the type.
     fn print_scalar_int(&mut self, int: ScalarInt, ty: Ty<'t>) {
         match ty.kind() {
-            TyKind::Bool if let Ok(b) = int.try_to_bool() => self.write_str(if b { "true" } else { "false" }),
+            TyKind::Bool if let Ok(b) = int.try_to_bool() => {
+                self.write_str(if b { "true" } else { "false" })
+            }
             TyKind::Float(fty) => {
                 let bits = int.to_bits_unchecked();
                 match fty {
@@ -228,7 +251,9 @@ impl<'h, 't> Printer<'h, 't> {
             }
             TyKind::Int(it) => self.write_int(int, Int::Signed(it)),
             TyKind::Uint(it) => self.write_int(int, Int::Unsigned(it)),
-            TyKind::Char if let Ok(c) = char::try_from(int) => self.write_fmt(format_args!("{c:?}")),
+            TyKind::Char if let Ok(c) = char::try_from(int) => {
+                self.write_fmt(format_args!("{c:?}"))
+            }
             TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) => {
                 self.write_fmt(format_args!("{{0x{:x} as ", int.to_bits_unchecked()));
                 let was = std::mem::replace(&mut self.in_value, false);
@@ -261,7 +286,11 @@ impl<'h, 't> Printer<'h, 't> {
 }
 
 /// `{value}{suffix}`, `_` between for one that is not finite: rustc's float printing.
-fn float<F: rustc_apfloat::Float + std::fmt::Display>(p: &mut Printer<'_, '_>, value: F, suffix: &str) {
+fn float<F: rustc_apfloat::Float + std::fmt::Display>(
+    p: &mut Printer<'_, '_>,
+    value: F,
+    suffix: &str,
+) {
     let sep = if value.is_finite() { "" } else { "_" };
     p.write_fmt(format_args!("{value}{sep}{suffix}"));
 }
@@ -327,8 +356,12 @@ mod tests {
     #[test]
     fn integers_print_as_const_int_does() {
         let size = |n: u64| Size::from_bytes(n);
-        let u = |v: u128, n: u64, ty: UintTy| const_int(ScalarInt::try_from_uint(v, size(n)).unwrap(), Int::Unsigned(ty));
-        let i = |v: i128, n: u64, ty: IntTy| const_int(ScalarInt::try_from_int(v, size(n)).unwrap(), Int::Signed(ty));
+        let u = |v: u128, n: u64, ty: UintTy| {
+            const_int(ScalarInt::try_from_uint(v, size(n)).unwrap(), Int::Unsigned(ty))
+        };
+        let i = |v: i128, n: u64, ty: IntTy| {
+            const_int(ScalarInt::try_from_int(v, size(n)).unwrap(), Int::Signed(ty))
+        };
         assert_eq!(u(255, 1, UintTy::U8), ConstInt::Max("u8"));
         assert_eq!(u(7, 1, UintTy::U8), ConstInt::Unsigned(7));
         assert_eq!(i(-128, 1, IntTy::I8), ConstInt::Min("i8"));

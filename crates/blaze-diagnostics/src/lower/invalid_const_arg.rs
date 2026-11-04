@@ -25,11 +25,19 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidConstArg) -> Vec<Found> {
     let (code, message, phase) = match &d.reason {
         CreateConstError::LocalBinding => {
             // alloc: the error's text, for an error hir found
-            (Some("E0435"), "attempt to use a non-constant value in a constant".to_owned(), Phase::Resolve)
+            (
+                Some("E0435"),
+                "attempt to use a non-constant value in a constant".to_owned(),
+                Phase::Resolve,
+            )
         }
         CreateConstError::UsedForbiddenParam => {
             // alloc: the error's text, for an error hir found
-            (None, "generic parameters may not be used in const operations".to_owned(), Phase::Resolve)
+            (
+                None,
+                "generic parameters may not be used in const operations".to_owned(),
+                Phase::Resolve,
+            )
         }
         CreateConstError::DoesNotResolve => {
             // alloc: the error's text, for an error hir found
@@ -37,7 +45,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidConstArg) -> Vec<Found> {
         }
         CreateConstError::ImplSelf => {
             // alloc: the error's text, for an error hir found
-            (None, "generic `Self` types are currently not permitted in anonymous constants".to_owned(), Phase::Resolve)
+            (
+                None,
+                "generic `Self` types are currently not permitted in anonymous constants"
+                    .to_owned(),
+                Phase::Resolve,
+            )
         }
         CreateConstError::NeedsAnonConst
         | CreateConstError::ConstHasGenerics
@@ -46,7 +59,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidConstArg) -> Vec<Found> {
         | CreateConstError::TypeMismatch { .. }
         | CreateConstError::TargetLayoutNotAvailable => {
             // alloc: the error's text, for an error hir found
-            (None, format!("blaze cannot lower the const argument `{text}` yet: {:?}", d.reason), Phase::Bodies)
+            (
+                None,
+                format!("blaze cannot lower the const argument `{text}` yet: {:?}", d.reason),
+                Phase::Bodies,
+            )
         }
     };
     // clone: a handle, on the error path, for an error hir found
@@ -57,7 +74,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidConstArg) -> Vec<Found> {
         // alloc: the error's text, for an error hir found
         CreateConstError::DoesNotResolve => Some("not found in this scope".to_owned()),
         // alloc: the error's text, for an error hir found
-        CreateConstError::UsedForbiddenParam => Some(format!("cannot perform const operation using `{text}`")),
+        CreateConstError::UsedForbiddenParam => {
+            Some(format!("cannot perform const operation using `{text}`"))
+        }
         _ => None,
     };
     if let Some(label) = label {

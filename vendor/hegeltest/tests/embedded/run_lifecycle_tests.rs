@@ -39,10 +39,7 @@ fn unknown_panic_info_returns_unknown_placeholders() {
     assert_eq!(thread_name, "<unknown>");
     assert_eq!(thread_id, "?");
     assert_eq!(location, "<unknown>");
-    assert_eq!(
-        backtrace.status(),
-        std::backtrace::BacktraceStatus::Disabled
-    );
+    assert_eq!(backtrace.status(), std::backtrace::BacktraceStatus::Disabled);
 }
 
 #[test]
@@ -61,16 +58,8 @@ fn filter_short_backtrace_trims_at_end_marker() {
                  1: real_frame at /tmp/b.rs:5\n  \
                  2: another_frame at /tmp/c.rs:7";
     let out = filter_short_backtrace(input);
-    assert!(
-        !out.contains("noisy_frame"),
-        "expected noisy_frame to be trimmed, got {:?}",
-        out
-    );
-    assert!(
-        out.contains("   0: real_frame"),
-        "expected renumbered real_frame, got {:?}",
-        out
-    );
+    assert!(!out.contains("noisy_frame"), "expected noisy_frame to be trimmed, got {:?}", out);
+    assert!(out.contains("   0: real_frame"), "expected renumbered real_frame, got {:?}", out);
     assert!(
         out.contains("   1: another_frame"),
         "expected renumbered another_frame, got {:?}",
@@ -85,11 +74,7 @@ fn filter_short_backtrace_trims_at_begin_marker() {
                  stuff: __rust_begin_short_backtrace\n  \
                  2: noisy_frame at /tmp/c.rs:7";
     let out = filter_short_backtrace(input);
-    assert!(
-        out.contains("   0: real_frame"),
-        "expected renumbered real_frame, got {:?}",
-        out
-    );
+    assert!(out.contains("   0: real_frame"), "expected renumbered real_frame, got {:?}", out);
     assert!(
         !out.contains("noisy_frame"),
         "expected noisy_frame after begin marker to be trimmed, got {:?}",
@@ -181,11 +166,7 @@ fn a_bare_capture_never_replaces_a_ranked_one() {
     assert_eq!(kept.lines, ["let x = 1;"]);
     assert_eq!(kept.payload.downcast_ref::<&str>(), Some(&"ranked"));
 
-    store_capture(
-        &mut captured,
-        origin.clone(),
-        report(Some("newer diagnostic"), &[], "newer"),
-    );
+    store_capture(&mut captured, origin.clone(), report(Some("newer diagnostic"), &[], "newer"));
     let kept = &captured[&origin];
     assert_eq!(kept.diagnostic.as_deref(), Some("newer diagnostic"));
     assert_eq!(kept.payload.downcast_ref::<&str>(), Some(&"newer"));
@@ -193,10 +174,7 @@ fn a_bare_capture_never_replaces_a_ranked_one() {
 
 /// Settings for the single-case runs below.
 fn test_settings() -> Settings {
-    Settings::new()
-        .database(None)
-        .derandomize(true)
-        .seed(Some(1))
+    Settings::new().database(None).derandomize(true).seed(Some(1))
 }
 
 /// Run one real test case from a fresh engine run through `run_test_case`,
@@ -207,17 +185,11 @@ fn run_one_case(
     is_final: bool,
     verbosity: Verbosity,
     body: &mut dyn FnMut(TestCase),
-) -> (
-    TestCaseResult,
-    Option<Box<dyn std::any::Any + Send>>,
-    Option<String>,
-) {
+) -> (TestCaseResult, Option<Box<dyn std::any::Any + Send>>, Option<String>) {
     init_panic_hook();
     let c_settings = SettingsHandle::build(&test_settings(), None, None);
     let run = RunHandle::start(&c_settings, None).expect("the engine starts");
-    let c_tc = run
-        .next_test_case()
-        .expect("the engine schedules at least one case");
+    let c_tc = run.next_test_case().expect("the engine schedules at least one case");
     run_test_case(c_tc, body, is_final, verbosity, &RunOutput::resolve(), None)
 }
 
@@ -252,10 +224,7 @@ fn drive_single_failure_reraises_the_tests_own_panic() {
         },
         &test_settings(),
     );
-    assert!(
-        msg.contains("boom x="),
-        "expected the test's own panic, got: {msg}"
-    );
+    assert!(msg.contains("boom x="), "expected the test's own panic, got: {msg}");
 }
 
 #[test]
@@ -270,10 +239,7 @@ fn drive_multiple_failures_panics_with_the_count() {
         },
         &test_settings().report_multiple_failures(true),
     );
-    assert!(
-        msg.contains("2 distinct failures"),
-        "expected the multi-failure count, got: {msg}"
-    );
+    assert!(msg.contains("2 distinct failures"), "expected the multi-failure count, got: {msg}");
 }
 
 #[test]
@@ -285,10 +251,7 @@ fn drive_run_error_panics_with_the_engines_message() {
         },
         &test_settings(),
     );
-    assert!(
-        msg.to_lowercase().contains("filter"),
-        "expected a health-check run error, got: {msg}"
-    );
+    assert!(msg.to_lowercase().contains("filter"), "expected a health-check run error, got: {msg}");
     assert!(
         !msg.contains("Property test failed"),
         "a run error must not use the test-failure framing, got: {msg}"
@@ -371,10 +334,7 @@ fn stale_panic_info_is_not_attributed_to_a_later_hook_skipping_panic() {
 #[test]
 fn discarded_failures_skip_backtrace_capture() {
     run_case_capturing(false, Verbosity::Normal, &mut |_tc| panic!("{}", "boom"));
-    assert!(
-        !capture_flag(),
-        "a discarded (non-final) failure must not pay for a backtrace"
-    );
+    assert!(!capture_flag(), "a discarded (non-final) failure must not pay for a backtrace");
 }
 
 #[test]

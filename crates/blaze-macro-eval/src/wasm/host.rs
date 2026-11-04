@@ -13,7 +13,9 @@
 
 use std::ptr::NonNull;
 
-use wasmtime::{Caller, Engine, InstancePre, Linker, Memory, ResourceLimiter, Store, Trap, TypedFunc};
+use wasmtime::{
+    Caller, Engine, InstancePre, Linker, Memory, ResourceLimiter, Store, Trap, TypedFunc,
+};
 
 use super::{
     abi::{self, BRIDGE},
@@ -53,7 +55,8 @@ pub(crate) struct Cx<'a> {
 }
 
 impl<'a> Cx<'a> {
-    pub(crate) fn new(answer: &'a dyn Answer, server: Server, os: Os<'a>) -> Cx<'a> { // dyn: as above
+    pub(crate) fn new(answer: &'a dyn Answer, server: Server, os: Os<'a>) -> Cx<'a> {
+        // dyn: as above
         // alloc: none until the first request, then reused
         Cx { answer, server, os, reply: Vec::new(), output: None, stop: None, scratch: Vec::new() }
     }
@@ -67,7 +70,12 @@ pub(crate) struct Limits {
 }
 
 impl ResourceLimiter for Limits {
-    fn memory_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
         if desired as u64 > MEMORY {
             self.over = true;
             return Ok(false);
@@ -76,7 +84,12 @@ impl ResourceLimiter for Limits {
         Ok(true)
     }
 
-    fn table_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
         Ok(desired <= TABLE_MAX)
     }
 }
@@ -98,7 +111,10 @@ fn stopped() -> wasmtime::Error {
 /// Runs `f` on the module's memory and the call's [`Cx`]; a [`Stop`] it returns is kept and
 /// ends the instance.
 #[allow(unsafe_code)]
-fn with<R>(caller: &mut Caller<'_, Host>, f: impl FnOnce(&mut [u8], &mut Cx<'_>) -> Result<R, Stop>) -> wasmtime::Result<R> {
+fn with<R>(
+    caller: &mut Caller<'_, Host>,
+    f: impl FnOnce(&mut [u8], &mut Cx<'_>) -> Result<R, Stop>,
+) -> wasmtime::Result<R> {
     let Some(memory) = caller.data().memory else {
         return Err(wasmtime::Error::msg("the module called the host before its memory was found"));
     };
@@ -159,9 +175,13 @@ fn bridge(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             wasi::put(mem, into.wrapping_add(8), &k1.to_le_bytes())
         })
     })?;
-    l.func_wrap(BRIDGE, "env_var", |mut c: Caller<'_, Host>, name: u32, len: u32, into: u32, capacity: u32| {
-        with(&mut c, |mem, cx| env_var(mem, cx, name, len, into, capacity))
-    })?;
+    l.func_wrap(
+        BRIDGE,
+        "env_var",
+        |mut c: Caller<'_, Host>, name: u32, len: u32, into: u32, capacity: u32| {
+            with(&mut c, |mem, cx| env_var(mem, cx, name, len, into, capacity))
+        },
+    )?;
     l.func_wrap(BRIDGE, "current_dir", |mut c: Caller<'_, Host>, into: u32, capacity: u32| {
         with(&mut c, |mem, cx| current_dir(mem, cx, into, capacity))
     })?;
@@ -176,7 +196,10 @@ fn current_dir(mem: &mut [u8], cx: &mut Cx<'_>, into: u32, capacity: u32) -> Res
     let Some(dir) = cx.os.current_dir() else { return Ok(-1) };
     let Ok(n) = i32::try_from(dir.len()) else {
         // alloc: error path
-        return Err(Stop(format!("was given a working directory of {} bytes, more than a 32-bit memory holds", dir.len())));
+        return Err(Stop(format!(
+            "was given a working directory of {} bytes, more than a 32-bit memory holds",
+            dir.len()
+        )));
     };
     if dir.len() <= capacity as usize {
         wasi::put(mem, into, dir.as_bytes())?;
@@ -188,16 +211,29 @@ fn current_dir(mem: &mut [u8], cx: &mut Cx<'_>, into: u32, capacity: u32) -> Res
 /// name at `name`, noted read by name ([`Os::var`]), written at `into` when it fits in
 /// `capacity`: its length, or -1 when it is unset. The module's `getenv` asks this one name at a
 /// time, so its expansion is keyed by the variables it read alone.
-fn env_var(mem: &mut [u8], cx: &mut Cx<'_>, name: u32, len: u32, into: u32, capacity: u32) -> Result<i32, Stop> {
+fn env_var(
+    mem: &mut [u8],
+    cx: &mut Cx<'_>,
+    name: u32,
+    len: u32,
+    into: u32,
+    capacity: u32,
+) -> Result<i32, Stop> {
     let name = wasi::bytes(mem, name, len)?;
     let Ok(name) = std::str::from_utf8(name) else {
         // alloc: error path
-        return Err(Stop(format!("read the variable {:?}, whose name is not UTF-8", String::from_utf8_lossy(name))));
+        return Err(Stop(format!(
+            "read the variable {:?}, whose name is not UTF-8",
+            String::from_utf8_lossy(name)
+        )));
     };
     let Some(value) = cx.os.var(name) else { return Ok(-1) };
     let Ok(n) = i32::try_from(value.len()) else {
         // alloc: error path
-        return Err(Stop(format!("read a variable of {} bytes, more than a 32-bit memory holds", value.len())));
+        return Err(Stop(format!(
+            "read a variable of {} bytes, more than a 32-bit memory holds",
+            value.len()
+        )));
     };
     if value.len() <= capacity as usize {
         wasi::put(mem, into, value.as_bytes())?;
@@ -271,7 +307,9 @@ pub(crate) fn expand(
     let left = match left {
         Ok(left) => left,
         // alloc: error path
-        Err(e) => return (Err(Stop(format!("ran on an engine that counts no fuel: {e:#}"))), spent),
+        Err(e) => {
+            return (Err(Stop(format!("ran on an engine that counts no fuel: {e:#}"))), spent);
+        }
     };
     spent.fuel = FUEL.saturating_sub(left);
     if let Err(error) = watched {
@@ -309,11 +347,12 @@ fn stopped_by(
     }
     if let Some(&Unentered { errno }) = error.downcast_ref::<Unentered>() {
         let dir = cx.os.current_dir().unwrap_or("<none>");
-        let why = match (errno, u16::try_from(errno).ok().and_then(|it| blaze_wasi::Errno(it).name())) {
-            (0, _) => "no errno".to_owned(), // alloc: error path
-            (_, Some(name)) => format!("{name} (WASI errno {errno})"), // alloc: error path
-            (_, None) => format!("WASI errno {errno}"), // alloc: error path
-        };
+        let why =
+            match (errno, u16::try_from(errno).ok().and_then(|it| blaze_wasi::Errno(it).name())) {
+                (0, _) => "no errno".to_owned(), // alloc: error path
+                (_, Some(name)) => format!("{name} (WASI errno {errno})"), // alloc: error path
+                (_, None) => format!("WASI errno {errno}"), // alloc: error path
+            };
         // alloc: error path
         return Err(Stop(format!(
             "could not enter `{dir}`, the directory cargo runs rustc in for the calling crate, in its \
@@ -329,9 +368,13 @@ fn stopped_by(
     }
     Err(match (over, trap) {
         // alloc: error path
-        (Some(Over::Steps), _) => Stop(format!("ran out of its {FUEL} units of fuel in its wasm module: it may loop forever")),
+        (Some(Over::Steps), _) => Stop(format!(
+            "ran out of its {FUEL} units of fuel in its wasm module: it may loop forever"
+        )),
         // alloc: error path
-        (Some(Over::Memory), _) => Stop(format!("asked for more than its {MEMORY} bytes of wasm memory: {error:#}")),
+        (Some(Over::Memory), _) => {
+            Stop(format!("asked for more than its {MEMORY} bytes of wasm memory: {error:#}"))
+        }
         // alloc: error path
         (None, Some(_)) => Stop(format!("trapped in its wasm module: {error:#}")),
         // alloc: error path
@@ -355,13 +398,26 @@ impl std::fmt::Display for Unentered {
 impl std::error::Error for Unentered {}
 
 /// The watched statics' bytes in `memory` of the instance `store` holds, into `into`.
-fn read(store: &Store<Host>, memory: Memory, statics: &Statics, into: &mut Vec<u8>) -> wasmtime::Result<()> {
+fn read(
+    store: &Store<Host>,
+    memory: Memory,
+    statics: &Statics,
+    into: &mut Vec<u8>,
+) -> wasmtime::Result<()> {
     into.clear();
-    statics.read(memory.data(store), into).map_err(|why| wasmtime::Error::msg(format!("its `{}` section {why}", super::statics::SECTION)))
+    statics.read(memory.data(store), into).map_err(|why| {
+        wasmtime::Error::msg(format!("its `{}` section {why}", super::statics::SECTION))
+    })
 }
 
 /// The instance's part of [`expand`].
-fn run(store: &mut Store<Host>, pre: &InstancePre<Host>, index: u32, input: &[u8], watch: &mut Watch) -> wasmtime::Result<()> {
+fn run(
+    store: &mut Store<Host>,
+    pre: &InstancePre<Host>,
+    index: u32,
+    input: &[u8],
+    watch: &mut Watch,
+) -> wasmtime::Result<()> {
     store.set_fuel(FUEL)?;
     let instantiating = tracing::info_span!(target: "blaze", "macro instantiate").entered();
     let instance = pre.instantiate(&mut *store)?;
@@ -382,7 +438,8 @@ fn run(store: &mut Store<Host>, pre: &InstancePre<Host>, index: u32, input: &[u8
     read(store, memory, &watch.statics, &mut watch.before)?;
     watch.started = true;
     let alloc: TypedFunc<u32, u32> = instance.get_typed_func(&mut *store, abi::ALLOC)?;
-    let expand: TypedFunc<(u32, u32, u32), u32> = instance.get_typed_func(&mut *store, abi::EXPAND)?;
+    let expand: TypedFunc<(u32, u32, u32), u32> =
+        instance.get_typed_func(&mut *store, abi::EXPAND)?;
     let Ok(len) = u32::try_from(input.len()) else {
         return Err(wasmtime::Error::msg("its input is more than a 32-bit memory holds"));
     };
@@ -399,7 +456,11 @@ fn run(store: &mut Store<Host>, pre: &InstancePre<Host>, index: u32, input: &[u8
     match called? {
         0 => Ok(()),
         1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),
-        status if status & abi::STATUS == abi::UNENTERED => Err(wasmtime::Error::new(Unentered { errno: status >> 8 })),
-        status => Err(wasmtime::Error::msg(format!("the module returned status {status}, which the ABI has not"))),
+        status if status & abi::STATUS == abi::UNENTERED => {
+            Err(wasmtime::Error::new(Unentered { errno: status >> 8 }))
+        }
+        status => Err(wasmtime::Error::msg(format!(
+            "the module returned status {status}, which the ABI has not"
+        ))),
     }
 }

@@ -10,7 +10,6 @@
 
 use base_db::{Db, LangCrateOrigin};
 use blaze_hash::{HashMap, HashSet, SharedMap};
-use std::alloc::Global;
 use hir::{
     AsAssocItem, AssocItem, AssocItemContainer, Crate, HasAttrs, HasVisibility, Macro, MacroKind,
     Module, ModuleDef, Visibility,
@@ -19,6 +18,7 @@ use hir_def::{
     item_scope::{ImportOrExternCrate, ImportOrGlob},
     per_ns::PerNs,
 };
+use std::alloc::Global;
 
 use crate::{
     TestOnly,
@@ -446,7 +446,8 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
     let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
         blaze_query::db::attach(db, || Walker::new(db, &crates[at]).walk())
     });
-    let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize)), Global> = HashMap::new_in(Global);
+    let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize)), Global> =
+        HashMap::new_in(Global);
     let mut own: Vec<HashMap<ModuleDef, usize, Global>> = vec![];
     for (krate, list) in placed.iter().enumerate() {
         let mut here: HashMap<ModuleDef, ((u8, usize), usize), Global> = HashMap::new_in(Global);

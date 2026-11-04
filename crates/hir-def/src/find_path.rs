@@ -13,7 +13,6 @@ use std::{
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use hir_expand::{
     Lookup,
@@ -22,6 +21,7 @@ use hir_expand::{
 };
 use intern::sym;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     ModuleDefId, ModuleIdLt,
@@ -262,8 +262,7 @@ fn find_path_inner<'db>(
     if let Some(ModuleDefId::EnumVariantId(variant)) = item.as_module_def_id() {
         // - if the item is an enum variant, refer to it via the enum
         let loc = variant.lookup(ctx.db);
-        if let Some(path) = find_path_inner(ctx, st, ItemInNs::Types(loc.parent.into()), max_len)
-        {
+        if let Some(path) = find_path_inner(ctx, st, ItemInNs::Types(loc.parent.into()), max_len) {
             return Some(path.push(st, loc.name));
         }
         // If this doesn't work, it seems we have no way of referring to the
@@ -372,9 +371,10 @@ fn find_in_scope<'db>(
 ) -> Option<Name> {
     // FIXME: We could have multiple applicable names here, but we currently only return the first
     def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
-        def_map.module(db, local_id).scope(db).names_of(item, |name, _, declared| {
-            (declared || !ignore_local_imports).then(|| *name)
-        })
+        def_map
+            .module(db, local_id)
+            .scope(db)
+            .names_of(item, |name, _, declared| (declared || !ignore_local_imports).then(|| *name))
     })
 }
 
@@ -857,8 +857,12 @@ pub(crate) mod tests {
             syntax::SourceFile::parse(&format!("use {path};"), span::Edition::CURRENT);
         let ast_path =
             parsed_path_file.root().descendants().find_map(syntax::view::Path::cast).unwrap();
-        #[expect(clippy::disallowed_types, reason = "the fixture's span map, set once per path test: not global")]
-        let span_map = std::cell::LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the fixture's span map, set once per path test: not global"
+        )]
+        let span_map =
+            std::cell::LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
         let mod_path =
             ModPath::from_src_view(&db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
                 .unwrap();
@@ -2457,13 +2461,13 @@ pub mod future {
 
         use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
         use blaze_hash::HashSet;
-        use std::alloc::Global;
         use hir_expand::{
             Lookup,
             mod_path::{ModPath, PathKind},
             name::{AsName, Name},
         };
         use intern::sym;
+        use std::alloc::Global;
 
         use super::super::{
             FIND_PATH_FUEL, FindPathConfig, MAX_PATH_LEN, PrefixKind, Stability, Stability::*,
@@ -3283,8 +3287,14 @@ pub mod future {
                             ignore_local_imports,
                             cfg,
                         );
-                        let old =
-                            reference::find_path(&db, item, from, prefix, ignore_local_imports, cfg);
+                        let old = reference::find_path(
+                            &db,
+                            item,
+                            from,
+                            prefix,
+                            ignore_local_imports,
+                            cfg,
+                        );
                         assert_eq!(
                             new, old,
                             "seed {seed}, {item:?} from {from:?}, {prefix:?}, \

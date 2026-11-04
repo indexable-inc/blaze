@@ -23,7 +23,12 @@ pub(crate) struct Mounted {
 }
 
 impl Mounted {
-    pub(crate) fn new(reader: blaze_vfs::Reader, view: ContentId, mounts: &[Mount], root: &str) -> Mounted {
+    pub(crate) fn new(
+        reader: blaze_vfs::Reader,
+        view: ContentId,
+        mounts: &[Mount],
+        root: &str,
+    ) -> Mounted {
         let mut mounts = mounts.to_vec();
         mounts.sort_by(|a, b| b.at.len().cmp(&a.at.len()).then_with(|| a.at.cmp(&b.at)));
         Mounted { reader, view, mounts, root: root.trim_end_matches('/').to_owned() }
@@ -54,7 +59,10 @@ impl Mounted {
 
     /// The bytes of the file at absolute `path`, with its content ID; `Err` for bytes of the
     /// mapped image that fail their check.
-    pub(crate) fn read(&self, path: &str) -> Result<Option<(ContentId, blaze_vfs::Mode, Bytes)>, Corrupt> {
+    pub(crate) fn read(
+        &self,
+        path: &str,
+    ) -> Result<Option<(ContentId, blaze_vfs::Mode, Bytes)>, Corrupt> {
         let Some((root, inner)) = self.locate(path) else { return Ok(None) };
         self.reader.file(root, &inner)
     }
@@ -73,7 +81,9 @@ impl Mounted {
                 match is_dir {
                     true => pending.push(rel),
                     false => {
-                        let Some((_, _, bytes)) = pinned.held(root, &join(&inner, &rel))? else { return Ok(None) };
+                        let Some((_, _, bytes)) = pinned.held(root, &join(&inner, &rel))? else {
+                            return Ok(None);
+                        };
                         out.push((rel, bytes));
                     }
                 }
@@ -108,7 +118,11 @@ impl Mounted {
     /// ([`blaze_diagnostics::emit::names_text`]: a root with an appended module) is never read
     /// from a mount, whose file is not the text its spans are of: the caller gives it from the
     /// database first, and one it did not is added as unread.
-    pub(crate) fn add_sources(&self, sources: &mut blaze_diagnostics::emit::Sources, diags: &[blaze_diagnostics::Diag]) {
+    pub(crate) fn add_sources(
+        &self,
+        sources: &mut blaze_diagnostics::emit::Sources,
+        diags: &[blaze_diagnostics::Diag],
+    ) {
         for name in sources.unread(diags) {
             if blaze_diagnostics::emit::names_text(name) {
                 sources.add(name, None);

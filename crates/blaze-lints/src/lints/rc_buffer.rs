@@ -57,6 +57,11 @@ fn report<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, name: &str, code: St
     }
     let Some(range) = cx.range(path.syntax()) else { return };
     let span = cx.span(range);
-    cx.lint(LINT, path.syntax(), span.clone(), format!("usage of `{name}<T>` when T is a buffer type"))
-        .suggestion(span, "try", code, Applicability::Unspecified);
+    cx.lint(
+        LINT,
+        path.syntax(),
+        span.clone(),
+        format!("usage of `{name}<T>` when T is a buffer type"),
+    )
+    .suggestion(span, "try", code, Applicability::Unspecified);
 }

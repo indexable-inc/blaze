@@ -1,6 +1,6 @@
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use intern::Symbol;
+use std::alloc::Global;
 
 use super::*;
 
@@ -37,7 +37,10 @@ fn features(declared: &Declared, implied: Option<TargetArch>) -> TargetFeatures<
 fn call_safety_follows_the_targets_table() {
     // `is_target_feature_call_safe`: an `aes` caller may call a `neon` callee on AArch64 only.
     let (caller, callee) = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
-        (Declared::of(frame, &[Symbol::intern("aes")]), Declared::of(frame, &[Symbol::intern("neon")]))
+        (
+            Declared::of(frame, &[Symbol::intern("aes")]),
+            Declared::of(frame, &[Symbol::intern("neon")]),
+        )
     });
     let callee = features(&callee, None);
     assert!(!features(&caller, Some(TargetArch::X86)).is_superset(&callee));

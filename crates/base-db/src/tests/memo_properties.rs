@@ -1,10 +1,10 @@
 //! The query engine's memos against recomputation: over any run of edits, reads, LRU evictions and
 //! synthetic writes, a query and one that reads it give what the text they read gives now.
 
-use hegel::{Hegel, Settings, TestCase};
-use hegel::generators as gs;
-use blaze_query::db::{Database as _, Durability};
 use crate::FileId;
+use blaze_query::db::{Database as _, Durability};
+use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
 
 use crate::{Db, FileText};
 
@@ -28,7 +28,10 @@ fn len_read_through(db: &Db, text: FileText) -> u32 {
 #[derive(Debug)]
 enum Op {
     Set(u32, String),
-    Read { file: u32, through: bool },
+    Read {
+        file: u32,
+        through: bool,
+    },
     /// The budget applies when a view opens: a write that changed nothing, of every kind.
     Evict,
     SyntheticWrite,
@@ -81,7 +84,8 @@ fn gives_what_recomputing_gives(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 

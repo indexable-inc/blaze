@@ -64,7 +64,9 @@ struct LoadInfo {
 impl LoadInfo {
     #[inline]
     fn any_before(&self, clock: &VClock) -> bool {
-        self.timestamps.iter().any(|&(load_index, load_timestamp)| load_timestamp <= clock[load_index])
+        self.timestamps
+            .iter()
+            .any(|&(load_index, load_timestamp)| load_timestamp <= clock[load_index])
     }
 }
 
@@ -95,7 +97,12 @@ impl StoreBuffer {
 
     /// An RMW or failed compare-exchange reads the latest store (Miri:
     /// `read_from_last_store`).
-    pub(super) fn read_from_last_store(&mut self, index: VectorIdx, clocks: &ThreadClockSet, is_seqcst: bool) {
+    pub(super) fn read_from_last_store(
+        &mut self,
+        index: VectorIdx,
+        clocks: &ThreadClockSet,
+        is_seqcst: bool,
+    ) {
         if let Some(store_elem) = self.buffer.back_mut() {
             store_elem.load_impl(index, clocks, is_seqcst);
         }
@@ -103,35 +110,43 @@ impl StoreBuffer {
 
     /// Visits, newest first, each store a load with `clocks` may read, until `visit` says stop
     /// (Miri: the candidate iterator of `fetch_store`).
-    fn candidates(&self, is_seqcst: bool, clocks: &ThreadClockSet, mut visit: impl FnMut(usize) -> bool) {
+    fn candidates(
+        &self,
+        is_seqcst: bool,
+        clocks: &ThreadClockSet,
+        mut visit: impl FnMut(usize) -> bool,
+    ) {
         let mut found_sc = false;
         for pos in (0..self.buffer.len()).rev() {
             let store_elem = &self.buffer[pos];
-            let keep_searching = if store_elem.store_timestamp <= clocks.clock[store_elem.store_thread] {
-                // CoWR: a store that happens before the load hides everything earlier in
-                // modification order (C++20 §6.9.2.2 [intro.races] paragraph 18).
-                false
-            } else if store_elem.load_info.any_before(&clocks.clock) {
-                // CoRR: so does a store read by a load that happens before this one
-                // (paragraph 16).
-                false
-            } else if store_elem.store_timestamp <= clocks.write_seqcst[store_elem.store_thread]
-                && store_elem.is_seqcst
-            {
-                // A load after an SC fence can't read before the last SC store before that fence
-                // (C++17 §32.4 [atomics.order] paragraph 4).
-                false
-            } else if is_seqcst && store_elem.store_timestamp <= clocks.read_seqcst[store_elem.store_thread] {
-                // An SC load can read only the last store before the last SC fence
-                // (paragraph 5).
-                false
-            } else if is_seqcst && store_elem.load_info.sc_loaded {
-                // An SC load can't read before a store an earlier SC load read
-                // (coherence-ordered-before, C++20 §31.4 paragraphs 3.1, 3.3 and 4.1).
-                false
-            } else {
-                true
-            };
+            let keep_searching =
+                if store_elem.store_timestamp <= clocks.clock[store_elem.store_thread] {
+                    // CoWR: a store that happens before the load hides everything earlier in
+                    // modification order (C++20 §6.9.2.2 [intro.races] paragraph 18).
+                    false
+                } else if store_elem.load_info.any_before(&clocks.clock) {
+                    // CoRR: so does a store read by a load that happens before this one
+                    // (paragraph 16).
+                    false
+                } else if store_elem.store_timestamp <= clocks.write_seqcst[store_elem.store_thread]
+                    && store_elem.is_seqcst
+                {
+                    // A load after an SC fence can't read before the last SC store before that fence
+                    // (C++17 §32.4 [atomics.order] paragraph 4).
+                    false
+                } else if is_seqcst
+                    && store_elem.store_timestamp <= clocks.read_seqcst[store_elem.store_thread]
+                {
+                    // An SC load can read only the last store before the last SC fence
+                    // (paragraph 5).
+                    false
+                } else if is_seqcst && store_elem.load_info.sc_loaded {
+                    // An SC load can't read before a store an earlier SC load read
+                    // (coherence-ordered-before, C++20 §31.4 paragraphs 3.1, 3.3 and 4.1).
+                    false
+                } else {
+                    true
+                };
 
             // An SC load ignores all but the last store marked SC.
             let include = if is_seqcst && store_elem.is_seqcst {
@@ -179,7 +194,13 @@ impl StoreBuffer {
     }
 
     /// Records a load of the store at `pos` and returns its bytes (Miri: `load_impl`).
-    pub(super) fn load(&mut self, pos: usize, index: VectorIdx, clocks: &ThreadClockSet, is_seqcst: bool) -> &StoreElement {
+    pub(super) fn load(
+        &mut self,
+        pos: usize,
+        index: VectorIdx,
+        clocks: &ThreadClockSet,
+        is_seqcst: bool,
+    ) -> &StoreElement {
         let store_elem = &mut self.buffer[pos];
         store_elem.load_impl(index, clocks, is_seqcst);
         store_elem

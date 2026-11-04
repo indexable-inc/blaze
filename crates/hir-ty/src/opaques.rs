@@ -1,6 +1,6 @@
 //! Handling of opaque types, detection of defining scope and hidden type.
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use hir_def::{
     AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId,
@@ -264,10 +264,7 @@ fn for_each_defining_body(
     }
 
     // Associated Type Position Impl Trait.
-    fn from_assoc_items(
-        assoc_items: &[(Name, AssocItemId)],
-        f: &mut impl FnMut(DefWithBodyId),
-    ) {
+    fn from_assoc_items(assoc_items: &[(Name, AssocItemId)], f: &mut impl FnMut(DefWithBodyId)) {
         for &(_, assoc_id) in assoc_items {
             match assoc_id {
                 AssocItemId::FunctionId(it) => f(it.into()),
@@ -297,10 +294,7 @@ fn defining_functions(db: &Db, type_alias: TypeAliasId) -> Box<[FunctionId]> {
 }
 
 /// The type aliases `func` names in its `#[define_opaque(..)]`.
-fn defined_type_aliases(
-    db: &Db,
-    func: FunctionId,
-) -> impl Iterator<Item = TypeAliasId> {
+fn defined_type_aliases(db: &Db, func: FunctionId) -> impl Iterator<Item = TypeAliasId> {
     let paths = AttrFlags::define_opaque(db, func);
     let resolver = (!paths.is_empty()).then(|| func.resolver(db));
     paths.iter().filter_map(move |path| {

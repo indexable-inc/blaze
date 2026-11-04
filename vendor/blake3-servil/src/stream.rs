@@ -149,7 +149,11 @@ struct Out<const N: usize>(UnsafeCell<[u8; N]>);
 /// assert_eq!(handed_back, 1000);
 /// assert_eq!(digests[7], blake3_servil::convenience::hash(&messages[7].0));
 /// ```
-pub fn stream<'env, D: FnMut(&'env mut [Hash]), T>(mode: Mode, done: D, body: impl for<'s> FnOnce(&'s mut Stream<'env, D>) -> T) -> T {
+pub fn stream<'env, D: FnMut(&'env mut [Hash]), T>(
+    mode: Mode,
+    done: D,
+    body: impl for<'s> FnOnce(&'s mut Stream<'env, D>) -> T,
+) -> T {
     let mut stream = Stream::open(mode, done);
     let result = body(&mut stream);
     assert_eq!(stream.delivered, stream.next, "a stream's body calls finish last");
@@ -214,7 +218,8 @@ struct Storage {
 
 /// Streams' storage not in use: recycled, never freed (a worker may read a
 /// source's counters after its stream ended).
-static FREE: std::sync::Mutex<std::vec::Vec<FreeStorage>> = std::sync::Mutex::new(std::vec::Vec::new());
+static FREE: std::sync::Mutex<std::vec::Vec<FreeStorage>> =
+    std::sync::Mutex::new(std::vec::Vec::new());
 
 struct FreeStorage(&'static mut Storage);
 
@@ -234,7 +239,9 @@ impl Storage {
     fn new() -> Storage {
         Storage {
             source: Box::leak(Box::new(crate::lanes::sources::Source::new(ENTRIES))),
-            entries: std::vec![Entry { len: 0, kind: Kind::Abandoned, first: 0, ring_end: 0 }; ENTRIES].into_boxed_slice(),
+            entries:
+                std::vec![Entry { len: 0, kind: Kind::Abandoned, first: 0, ring_end: 0 }; ENTRIES]
+                    .into_boxed_slice(),
             ring: {
                 // Zeroed, untouched pages (only the bytes used are faulted
                 // in: calloc maps them lazily, where an aligned allocation
@@ -282,7 +289,11 @@ fn fill_all(fill: &mut impl FnMut(usize, &mut [u8]) -> usize, at: usize, room: &
     while done < room.len() {
         let left = room.len() - done;
         let n = fill(at + done, &mut room[done..]);
-        assert!(n != 0, "fill wrote nothing with {left} of its {} bytes left: its source ended before the message's length", room.len());
+        assert!(
+            n != 0,
+            "fill wrote nothing with {left} of its {} bytes left: its source ended before the message's length",
+            room.len()
+        );
         assert!(n <= left, "fill says it wrote {n} bytes into a room of {left}");
         done += n;
     }
@@ -291,7 +302,11 @@ fn fill_all(fill: &mut impl FnMut(usize, &mut [u8]) -> usize, at: usize, room: &
 /// Part `i` of a message in `pieces` parts, its digest at `out`: the
 /// message whole, or a piece.
 fn part_kind(i: usize, pieces: usize, out: *mut Hash) -> Kind {
-    if pieces == 1 { Kind::Message { out } } else { Kind::Piece { counter: (i * PIECE / CHUNK_LEN) as u64, last: i + 1 == pieces, out } }
+    if pieces == 1 {
+        Kind::Message { out }
+    } else {
+        Kind::Piece { counter: (i * PIECE / CHUNK_LEN) as u64, last: i + 1 == pieces, out }
+    }
 }
 
 /// The messages of one [`stream`] call, and the places for their digests,
@@ -338,7 +353,12 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// its digest into `out`: a [`Block`](crate::performance::Block)-aligned
     /// message, as [`hash`](crate::performance::hash) takes one (the bytes
     /// past its end ignored).
-    pub fn submit(&mut self, message: &'env [crate::performance::Block], len: usize, out: &'env mut Hash) {
+    pub fn submit(
+        &mut self,
+        message: &'env [crate::performance::Block],
+        len: usize,
+        out: &'env mut Hash,
+    ) {
         let message: &'env [u8] = &crate::performance::Block::bytes(message)[..len];
         let out: *mut Hash = out;
         let pieces = message.len().div_ceil(PIECE).max(1);
@@ -364,7 +384,12 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// `room` before writing it). The stream reuses the bytes once `out`
     /// is handed back; a stream keeps 2 MiB of them, and `submit_with`
     /// waits for room as `submit` does.
-    pub fn submit_with(&mut self, len: usize, mut fill: impl FnMut(usize, &mut [u8]) -> usize, out: &'env mut Hash) {
+    pub fn submit_with(
+        &mut self,
+        len: usize,
+        mut fill: impl FnMut(usize, &mut [u8]) -> usize,
+        out: &'env mut Hash,
+    ) {
         let out: *mut Hash = out;
         let pieces = len.div_ceil(PIECE).max(1);
         for i in 0..pieces {
@@ -393,7 +418,12 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// part of the hash, so a wrong one costs nothing but speed. Today the
     /// stream does not use it; it is here so that a stream that schedules
     /// by it later changes no caller.
-    pub fn submit_reader(&mut self, mut reader: impl std::io::Read, size_hint: Option<u64>, out: &'env mut Hash) -> std::io::Result<u64> {
+    pub fn submit_reader(
+        &mut self,
+        mut reader: impl std::io::Read,
+        size_hint: Option<u64>,
+        out: &'env mut Hash,
+    ) -> std::io::Result<u64> {
         let _ = size_hint;
         let out: *mut Hash = out;
         let start = self.head;
@@ -426,7 +456,11 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
                 }
                 Some(_) => false,
             };
-            let kind = if i == 0 && last { Kind::Message { out } } else { Kind::Piece { counter: (i * PIECE / CHUNK_LEN) as u64, last, out } };
+            let kind = if i == 0 && last {
+                Kind::Message { out }
+            } else {
+                Kind::Piece { counter: (i * PIECE / CHUNK_LEN) as u64, last, out }
+            };
             // [at, at + n): this piece's reserved room, written.
             let input = self.s.ring_at(at);
             self.add_part(input, n, kind, end, out as *mut u8);
@@ -441,7 +475,10 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// A piece's room (PIECE bytes, reserved), read into from `reader` until
     /// it is full, the reader ends, or a read fails: its offset, the ring's
     /// head after its reservation, the bytes read, and the read's result.
-    fn read_piece(&mut self, reader: &mut impl std::io::Read) -> (usize, usize, usize, std::io::Result<()>) {
+    fn read_piece(
+        &mut self,
+        reader: &mut impl std::io::Read,
+    ) -> (usize, usize, usize, std::io::Result<()>) {
         let at = self.reserve(PIECE);
         let end = self.head;
         // Sound: [at, at + PIECE) is reserved and free, and `&mut self`
@@ -464,11 +501,19 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// message into `out`, in the messages' order: `out` holds one per
     /// message. The batch goes in parts of up to 64 KiB, each one entry;
     /// `out` comes back whole.
-    pub fn submit_batch(&mut self, batch: &'env crate::performance::Batch<'_>, out: &'env mut [Hash]) {
+    pub fn submit_batch(
+        &mut self,
+        batch: &'env crate::performance::Batch<'_>,
+        out: &'env mut [Hash],
+    ) {
         let message_len = batch.message_len();
         let batch = crate::performance::Block::bytes(batch.blocks());
         let slot = crate::many::slot_len(message_len);
-        assert_eq!(Some(batch.len()), slot.checked_mul(out.len()), "a batch's digest space holds one digest per message");
+        assert_eq!(
+            Some(batch.len()),
+            slot.checked_mul(out.len()),
+            "a batch's digest space holds one digest per message"
+        );
         crate::many::assert_slots(batch, message_len, out.len());
         let whole = (out.as_mut_ptr(), out.len());
         let per_part = (TASK_LEN / slot).max(1);
@@ -494,7 +539,12 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// stream's: whatever `fill` leaves there, the stream zeroes them before
     /// hashing, so a room reused for shorter messages hashes right. As
     /// [`submit_with`](Stream::submit_with) and [`submit_batch`](Stream::submit_batch).
-    pub fn submit_batch_with(&mut self, message_len: usize, mut fill: impl FnMut(usize, &mut [u8]) -> usize, out: &'env mut [Hash]) {
+    pub fn submit_batch_with(
+        &mut self,
+        message_len: usize,
+        mut fill: impl FnMut(usize, &mut [u8]) -> usize,
+        out: &'env mut [Hash],
+    ) {
         let slot = crate::many::slot_len(message_len);
         let whole = (out.as_mut_ptr(), out.len());
         let per_part = (TASK_LEN / slot).max(1);
@@ -527,7 +577,14 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
     /// is handed over first); a piece of a long message is a task of its
     /// own, a whole subtree at its offset; an empty batch's one part is no
     /// task (done as it is added).
-    fn add_part(&mut self, input: *const u8, len: usize, kind: Kind, ring_end: usize, out: *mut u8) {
+    fn add_part(
+        &mut self,
+        input: *const u8,
+        len: usize,
+        kind: Kind,
+        ring_end: usize,
+        out: *mut u8,
+    ) {
         let entry = self.add_entry(len, kind, ring_end);
         let batch = match kind {
             Kind::Message { .. } => None,
@@ -567,7 +624,9 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
         // Messages longer than a block hash one at a time: a task of them
         // stops at a quarter of a task's bytes, to spread over more threads
         // (spread over more threads); batches fill a task's bytes.
-        if open.members == MEMBERS || open.len >= if batch.is_some() { TASK_LEN } else { TASK_LEN / 4 } {
+        if open.members == MEMBERS
+            || open.len >= if batch.is_some() { TASK_LEN } else { TASK_LEN / 4 }
+        {
             self.publish();
         }
     }
@@ -685,7 +744,9 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
             // hands it back once, after its task wrote it (the Acquire above).
             match kind {
                 Kind::Message { out } => (self.done)(core::slice::from_mut(unsafe { &mut *out })),
-                Kind::Batch { whole: Some((out, n)), .. } => (self.done)(unsafe { core::slice::from_raw_parts_mut(out, n) }),
+                Kind::Batch { whole: Some((out, n)), .. } => {
+                    (self.done)(unsafe { core::slice::from_raw_parts_mut(out, n) })
+                }
                 Kind::Batch { whole: None, .. } => {}
                 Kind::Abandoned => {
                     self.stack.clear();
@@ -695,9 +756,15 @@ impl<'env, D: FnMut(&'env mut [Hash])> Stream<'env, D> {
                     // Sound: the task wrote its out before counting `left` down.
                     let piece = unsafe { *self.s.pieces_out[index].0.0.get() };
                     let (key, flags, platform) = (self.key, self.flags, Platform::detect());
-                    let parent = |left: &CVBytes, right: &CVBytes| crate::hasher::parent_output(left, right, &key, flags, platform);
+                    let parent = |left: &CVBytes, right: &CVBytes| {
+                        crate::hasher::parent_output(left, right, &key, flags, platform)
+                    };
                     let cv: CVBytes = if counter == 0 && len > CHUNK_LEN {
-                        parent(piece[..OUT_LEN].try_into().unwrap(), piece[OUT_LEN..].try_into().unwrap()).chaining_value()
+                        parent(
+                            piece[..OUT_LEN].try_into().unwrap(),
+                            piece[OUT_LEN..].try_into().unwrap(),
+                        )
+                        .chaining_value()
                     } else {
                         piece[..OUT_LEN].try_into().unwrap()
                     };
@@ -791,20 +858,46 @@ mod test {
         let mut input = std::vec![0u8; (1 << 20) + 200];
         crate::test::paint_test_input(&mut input);
         let key = [5u8; 32];
-        let lens: std::vec::Vec<usize> =
-            (0..12000).map(|i| [0, 1, 63, 64, 64, 64, 100, 1024, 1024, 1500, 4096, PIECE, PIECE + 1, 200_000, (1 << 20) + 7, 64][i % 16]).collect();
+        let lens: std::vec::Vec<usize> = (0..12000)
+            .map(|i| {
+                [
+                    0,
+                    1,
+                    63,
+                    64,
+                    64,
+                    64,
+                    100,
+                    1024,
+                    1024,
+                    1500,
+                    4096,
+                    PIECE,
+                    PIECE + 1,
+                    200_000,
+                    (1 << 20) + 7,
+                    64,
+                ][i % 16]
+            })
+            .collect();
         // Borrowed messages start their blocks: 0, 1 or 2 blocks in.
         let blocks = crate::test::message(&input);
         let message = |i: usize| &input[64 * (i % 3)..][..lens[i]];
-        for (mode, ways) in [(Mode::Plain, 0), (Mode::Keyed(&key), 1), (Mode::DeriveKey("stream test"), 2)] {
+        for (mode, ways) in
+            [(Mode::Plain, 0), (Mode::Keyed(&key), 1), (Mode::DeriveKey("stream test"), 2)]
+        {
             let mut got = places(lens.len());
-            let want_handed: std::vec::Vec<(usize, usize)> = got.iter().map(|h| (h as *const Hash as usize, 1)).collect();
+            let want_handed: std::vec::Vec<(usize, usize)> =
+                got.iter().map(|h| (h as *const Hash as usize, 1)).collect();
             let mut handed = std::vec::Vec::new();
             stream(mode, record(&mut handed), |s| {
                 // With workers to hand tasks to, the stream has its slot
                 // among the pool's sources (a stream without one hashes
                 // every task on the caller: right, and slower).
-                assert_eq!(s.slot.is_some(), std::thread::available_parallelism().map_or(1, |n| n.get()) > 1);
+                assert_eq!(
+                    s.slot.is_some(),
+                    std::thread::available_parallelism().map_or(1, |n| n.get()) > 1
+                );
                 for (i, out) in got.iter_mut().enumerate() {
                     // Borrowed, written in place (in reads of up to 1000
                     // bytes), or each in turn.
@@ -829,7 +922,12 @@ mod test {
             });
             assert!(handed == want_handed, "every place handed back once, in order");
             for i in 0..lens.len() {
-                assert_eq!(got[i], crate::convenience::hash_with(mode, message(i)), "message {i}, {} bytes", lens[i]);
+                assert_eq!(
+                    got[i],
+                    crate::convenience::hash_with(mode, message(i)),
+                    "message {i}, {} bytes",
+                    lens[i]
+                );
             }
         }
     }
@@ -857,7 +955,11 @@ mod test {
                     s.finish();
                 },
             );
-            assert_eq!(got, std::vec![crate::convenience::hash(&std::vec![0xABu8; len]); count], "{len}-byte messages");
+            assert_eq!(
+                got,
+                std::vec![crate::convenience::hash(&std::vec![0xABu8; len]); count],
+                "{len}-byte messages"
+            );
         }
     }
 
@@ -878,7 +980,11 @@ mod test {
                 let mut reader = Uneven { data: &input, at: 0, calls: 0, fail_at: None };
                 s.submit_with(input.len(), |_, room| retry(|| reader.read(room)), &mut got[0]);
                 // 40 messages of 100 bytes, each in its 128-byte slot.
-                let slots: std::vec::Vec<u8> = (0..40).flat_map(|m| (0..128).map(move |b| if b < 100 { (m * 7 + b) as u8 } else { 0 })).collect();
+                let slots: std::vec::Vec<u8> = (0..40)
+                    .flat_map(|m| {
+                        (0..128).map(move |b| if b < 100 { (m * 7 + b) as u8 } else { 0 })
+                    })
+                    .collect();
                 let mut reader = Uneven { data: &slots, at: 0, calls: 0, fail_at: None };
                 s.submit_batch_with(100, |_, room| retry(|| reader.read(room)), &mut batch);
                 s.finish();
@@ -1010,8 +1116,18 @@ mod test {
                     &mut take(&mut rest, 1)[0],
                 );
             }
-            assert_eq!(s.submit_reader(&input[..2 * PIECE + 1], None, &mut take(&mut rest, 1)[0]).unwrap(), 2 * PIECE as u64 + 1);
-            assert!(s.submit_reader(Uneven { data: &input, at: 0, calls: 0, fail_at: Some(PIECE + 1) }, None, &mut take(&mut rest, 1)[0]).is_err());
+            assert_eq!(
+                s.submit_reader(&input[..2 * PIECE + 1], None, &mut take(&mut rest, 1)[0]).unwrap(),
+                2 * PIECE as u64 + 1
+            );
+            assert!(
+                s.submit_reader(
+                    Uneven { data: &input, at: 0, calls: 0, fail_at: Some(PIECE + 1) },
+                    None,
+                    &mut take(&mut rest, 1)[0]
+                )
+                .is_err()
+            );
             s.submit_batch(&batch, take(&mut rest, 4));
             s.submit_batch_with(
                 64,
@@ -1024,11 +1140,16 @@ mod test {
             );
             s.finish();
         });
-        let mut want: std::vec::Vec<Hash> = lens.iter().flat_map(|&l| [crate::convenience::hash(&input[..l]); 2]).collect();
+        let mut want: std::vec::Vec<Hash> =
+            lens.iter().flat_map(|&l| [crate::convenience::hash(&input[..l]); 2]).collect();
         want.push(crate::convenience::hash(&input[..2 * PIECE + 1]));
         want.push(Hash::from_bytes([0; 32]));
         want.extend([crate::convenience::hash(&input[..64]); 7]);
         assert_eq!(got, want);
-        assert_eq!(handed.len(), 2 * lens.len() + 1 + 2, "a place back per submission, none for the failed reader");
+        assert_eq!(
+            handed.len(),
+            2 * lens.len() + 1 + 2,
+            "a place back per submission, none for the failed reader"
+        );
     }
 }

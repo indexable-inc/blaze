@@ -20,7 +20,7 @@ use super::{
     dense::{Dense, Heap, Zeroed},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
-    provenance::{Cause, restamp_run},
+    provenance::{self, Cause, restamp_run},
     row::{Owners, Pages, VALUE, VIEW_MASK, span},
 };
 
@@ -47,6 +47,7 @@ impl View {
 /// An input's kind, by how often it changes: workspace files (`LOW`), workspace structure
 /// (`MEDIUM`), libraries and frozen tables (`HIGH`). A row's durability is the lowest kind it
 /// read; a row whose kind did not change since it was verified verifies with one compare.
+/// No default: each input states its kind, and a row's comes from what it read.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Durability(pub(crate) u8);
 
@@ -62,12 +63,6 @@ impl Durability {
 
     pub fn as_u8(self) -> u8 {
         self.0
-    }
-}
-
-impl Default for Durability {
-    fn default() -> Durability {
-        Durability::LOW
     }
 }
 
@@ -243,6 +238,9 @@ pub struct Storage {
     pub(crate) nodes: Dense<NodeRow>,
     /// Each memo's last run: its view and [`Cause`], written by the run's flight holder.
     pub(crate) runs: Dense<AtomicU64>,
+    /// What its runs logged for the profile while the run log is on ([`provenance::log_runs`]),
+    /// taken by its holder with the database in hand ([`provenance::take_log_in`]).
+    pub(crate) run_log: provenance::RunLog,
     next_node: AtomicU32,
     /// The rows' edge spans, one per row (in its header's `edges`): a rerun replaces its row's
     /// span, leaving the old one dead until [`Storage::settle`] moves the
@@ -318,6 +316,7 @@ impl Storage {
             next_page: AtomicU32::new(1),
             nodes: Dense::growing(NODES, Tag::Query, "nodes"),
             runs: Dense::growing(NODES, Tag::Query, "node runs"),
+            run_log: provenance::RunLog::new(),
             next_node: AtomicU32::new(1),
             edges: Dense::growing(EDGES, Tag::Query, "dependency edges"),
             edges_top: AtomicU64::new(0),
@@ -515,14 +514,19 @@ impl Storage {
     pub fn held_bytes(&self) -> u64 {
         let tables: u64 = self
             .live()
-            .filter_map(|index| ingredient::vtable(index).map(|vtable| (vtable.memory)(self, index).held()))
+            .filter_map(|index| {
+                ingredient::vtable(index).map(|vtable| (vtable.memory)(self, index).held())
+            })
             .sum();
         tables + self.graph_usage().iter().map(MemoryUsage::held).sum::<u64>()
     }
 
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
     fn graph_usage(&self) -> [MemoryUsage; 3] {
-        let live = self.edges_top.load(Ordering::Relaxed).saturating_sub(self.edges_dead.load(Ordering::Relaxed));
+        let live = self
+            .edges_top
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.edges_dead.load(Ordering::Relaxed));
         let nodes = u64::from(self.nodes_made());
         let captured = self.captured_top.load(Ordering::Relaxed);
         [
@@ -544,7 +548,8 @@ impl Storage {
                 name: "captured reads",
                 rows: captured,
                 used: captured,
-                row_bytes: (self.captured.committed_bytes() + self.captures.committed_bytes()) as u64,
+                row_bytes: (self.captured.committed_bytes() + self.captures.committed_bytes())
+                    as u64,
                 value_bytes: 0,
             },
         ]
@@ -594,8 +599,12 @@ impl Storage {
         // Named, so a build's time moving edges is its own, never its writer's self time
         // (rule 14).
         let _settle =
-            tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead).entered();
-        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query, "dependency edges"));
+            tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead)
+                .entered();
+        let old = std::mem::replace(
+            &mut self.edges,
+            Dense::growing(EDGES, Tag::Query, "dependency edges"),
+        );
         let mut moved = Relocate { old, top: 0 };
         for index in 1..=ingredient::registered() {
             if self.tables[index as usize].load(Ordering::Relaxed).is_null() {
@@ -712,7 +721,9 @@ impl Storage {
         let mut has = [false; Tag::COUNT];
         for at in 0..count {
             let index = self.weighed.get_mut()[at];
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             weight[weighed.tag.index()] += (weighed.weight)(self, index);
             has[weighed.tag.index()] = true;
         }
@@ -734,6 +745,38 @@ impl Storage {
                 self.passed_at[at] = tag::snapshot().get(tag).live;
             }
         }
+    }
+
+    /// Lets go of every value of every function of `tag` whose values go only when asked
+    /// (`lru = 0`), keeping each row's stamp, edges and hash, so a dependent still verifies
+    /// against it and a read makes it again and backdates (`evict`'s contract); returns how many
+    /// values went. A tag, not a list of functions: a build lets go of every MIR as it ends
+    /// (`hir::evict::drop_mir`), and a MIR query added later goes with the rest by its
+    /// `mem_tag`, never kept because a list was not told of it (coroutine witnesses and
+    /// location literals were, before: tagged MIR, never let go).
+    pub fn evict_tag(&mut self, tag: Tag) -> usize {
+        // alloc: once a release, the live ingredients
+        let indices: Vec<u32> = self.live().collect();
+        let mut evicted = 0;
+        for index in indices {
+            if let Some(explicit) = ingredient::vtable(index).and_then(|it| it.explicit)
+                && explicit.tag == tag
+            {
+                evicted += (explicit.evict)(self, index);
+            }
+        }
+        evicted
+    }
+
+    /// How many values the functions of `tag` whose values go only when asked (`lru = 0`)
+    /// hold, from their counters: 0 once [`Storage::evict_tag`] let go of them and nothing read
+    /// one again.
+    pub fn values_of(&self, tag: Tag) -> usize {
+        self.live()
+            .filter_map(|index| Some((ingredient::vtable(index)?.explicit?, index)))
+            .filter(|(explicit, _)| explicit.tag == tag)
+            .map(|(explicit, index)| (explicit.values)(self, index))
+            .sum()
     }
 
     /// Weighs every value of `tag`'s `lru` functions and, past `budget`, lets the least
@@ -759,7 +802,9 @@ impl Storage {
         let mut weight = 0;
         for at in 0..count {
             let index = self.weighed.get_mut()[at];
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             if weighed.tag == tag {
                 weight += (weighed.held)(self, index, &mut values);
             }
@@ -770,7 +815,9 @@ impl Storage {
         let (mut evicted, mut freed) = (0, 0);
         for one in victims.chunk_by(|a, b| a.ingredient == b.ingredient) {
             let index = one[0].ingredient;
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             let (n, bytes) = (weighed.evict)(self, index, one);
             evicted += n;
             freed += bytes;
@@ -897,24 +944,35 @@ impl Storage {
     }
 
     /// Records that memo `node` runs in this view because of `cause`: its flight holder's one
-    /// store before the run, read back by [`Storage::provenance`]. A run in the view it last
-    /// ran in counts as [`counts::RERAN`], and a run for an evicted value as
-    /// [`counts::EVICTED_ASKED`].
+    /// store before the run, read back by [`Storage::provenance`]. Each run counts under its
+    /// cause ([`counts::RAN_NEW`], [`counts::RAN_CHANGED`], [`counts::RAN_UNTRACKED`],
+    /// [`counts::RAN_CYCLE`], and [`counts::EVICTED_ASKED`] for an evicted value); a run in the
+    /// view it last ran in counts as [`counts::RERAN`] too. While the run log is on, every run
+    /// but a first is logged with its cause ([`provenance::RunLog::log`]).
     #[inline]
     pub(crate) fn record_run(&self, node: u32, cause: Cause) {
         let run = self.runs.get(node as usize);
         let was = run.load(Ordering::Relaxed);
         run.store(cause.word(self.view), Ordering::Relaxed);
         let reran = ((was >> 32) as u32) & VIEW_MASK == self.view;
-        let evicted = matches!(cause, Cause::Evicted);
-        if reran || evicted {
-            let (index, _, _) = key_parts(self.key_of(node));
-            if reran {
-                counts::count(index, counts::RERAN);
-            }
-            if evicted {
-                counts::count(index, counts::EVICTED_ASKED);
-            }
+        let key = self.key_of(node);
+        let (index, _, _) = key_parts(key);
+        if reran {
+            counts::count(index, counts::RERAN);
+        }
+        let (what, read) = match cause {
+            Cause::New => (counts::RAN_NEW, None),
+            Cause::Changed(read) => (counts::RAN_CHANGED, Some(read)),
+            Cause::Evicted => (counts::EVICTED_ASKED, None),
+            Cause::Untracked => (counts::RAN_UNTRACKED, None),
+            Cause::Cycle => (counts::RAN_CYCLE, None),
+        };
+        counts::count(index, what);
+        if cause != Cause::New && provenance::logging() {
+            let read = read
+                .filter(|&it| it != 0 && it < self.nodes_made())
+                .map_or(0, |it| self.key_of(it));
+            self.run_log.log(key, read, self.view, provenance::Logged::Ran(cause));
         }
     }
 
@@ -992,7 +1050,9 @@ impl Storage {
             self.captures_full(start, len, number, owner);
         }
         self.captured.ensure(end as usize);
-        for (place, &entry) in self.captured.slice(start as usize, entries.len()).iter().zip(entries) {
+        for (place, &entry) in
+            self.captured.slice(start as usize, entries.len()).iter().zip(entries)
+        {
             // Relaxed: the capture is published with its `Reads`, by whatever hands that over.
             place.store(entry, Ordering::Relaxed);
         }

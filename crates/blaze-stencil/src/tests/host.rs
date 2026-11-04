@@ -171,7 +171,10 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
         for handler in site.exception_handlers {
             match *handler {
                 cranelift_codegen::MachExceptionHandler::Tag(tag, landing) => {
-                    handlers.push(code::Handler::Tag { tag: tag.as_u32(), landing: landing.as_offset() });
+                    handlers.push(code::Handler::Tag {
+                        tag: tag.as_u32(),
+                        landing: landing.as_offset(),
+                    });
                 }
                 cranelift_codegen::MachExceptionHandler::Default(landing) => {
                     handlers.push(code::Handler::Default { landing: landing.as_offset() });
@@ -185,7 +188,15 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
         calls.push(code::CallSite { ret: site.ret_addr, handlers: first..handlers.len() as u32 });
     }
     let unwind = compiled.create_unwind_info(isa).map_err(|e| format!("{e:?}"))?;
-    Ok(Compiled { bytes, align: compiled.buffer.min_alignment, relocs, traps, calls, handlers, unwind })
+    Ok(Compiled {
+        bytes,
+        align: compiled.buffer.min_alignment,
+        relocs,
+        traps,
+        calls,
+        handlers,
+        unwind,
+    })
 }
 
 /// The relocation name of `name` in `func`, as the stencil backend's glue names it

@@ -38,11 +38,20 @@ const REASON: usize = 16 + 1 + 8;
 
 fn check(data: &[u8]) {
     let (most, got) = blaze_fuzz::largest_allocation(|| trace::decode(data));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "decoding {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "decoding {} bytes asked for {most} at once",
+        data.len()
+    );
     let Ok(report) = got else { return };
     let again = trace::encode(&report);
-    assert_eq!(trace::decode(&again).as_ref(), Ok(&report), "a report encoded again decodes to itself");
-    let lossy = matches!(report, Report::NotMade(_)) && std::str::from_utf8(&data[REASON..]).is_err();
+    assert_eq!(
+        trace::decode(&again).as_ref(),
+        Ok(&report),
+        "a report encoded again decodes to itself"
+    );
+    let lossy =
+        matches!(report, Report::NotMade(_)) && std::str::from_utf8(&data[REASON..]).is_err();
     if !lossy {
         assert_eq!(again, data, "a report decoded is the bytes it encodes to: {report:?}");
     }
@@ -51,10 +60,21 @@ fn check(data: &[u8]) {
 /// Reports as a launcher writes them.
 fn seeds() -> Vec<Vec<u8>> {
     let traced = Traced {
-        files: vec![(PathBuf::from("/p/foo/build.rs"), Some([7; 32])), (PathBuf::from("/p/foo/missing"), None)],
+        files: vec![
+            (PathBuf::from("/p/foo/build.rs"), Some([7; 32])),
+            (PathBuf::from("/p/foo/missing"), None),
+        ],
         dirs: vec![(PathBuf::from("/p/foo/src"), [9; 32])],
-        env: vec![(OsString::from("CC"), Some(OsString::from("cc"))), (OsString::from("NOT_SET"), None)],
-        untraceable: vec![Untraceable::Clock, Untraceable::Random, Untraceable::Network, Untraceable::Descriptor],
+        env: vec![
+            (OsString::from("CC"), Some(OsString::from("cc"))),
+            (OsString::from("NOT_SET"), None),
+        ],
+        untraceable: vec![
+            Untraceable::Clock,
+            Untraceable::Random,
+            Untraceable::Network,
+            Untraceable::Descriptor,
+        ],
     };
     [
         Report::NotMade("spawn: no such file or directory".into()),

@@ -8,13 +8,14 @@
 //! for a timer's flush of rows of no build), so a daemon numbers its builds past every build the
 //! directory holds rows of ([`History::next_build`]), and
 //! `seq` the flush's number, which only grows in a directory. A Parquet file holds one schema,
-//! so a table a file keeps each file self-describing, and the views glob `*.<table>.parquet`.
-//! Beside them, `schema.<table>.parquet` holds no rows and every column of each table, so each
-//! glob matches a file even before a table has rows, with today's columns.
+//! so a table a file keeps each file self-describing, and the views read `*.<table>.parquet`
+//! (named one by one, as a reader's [`Pin`] resolves them). Beside them,
+//! `schema.<table>.parquet` holds no rows and every column of each table, so each view reads a
+//! file even before a table has rows, with today's columns.
 //!
 //! Each file is made in memory, in a buffer kept across flushes, and written with one `write`
 //! to a hidden name, then renamed, so DuckDB never reads half a file. Past [`CAP_BYTES`] (or the
-//! cap the history is opened with), the oldest files are deleted first.
+//! cap the history is opened with), the oldest files are retired first.
 //!
 //! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
 //! left 3,250), and every reader's glob reads each one's footer. So after each flush the
@@ -26,12 +27,17 @@
 //! become one a level up, so a table holds at most `FAN_IN - 1` files a level and its levels
 //! grow as log16 of its flushes; as the build ends (the flush of `Some(build)`), each of its
 //! tables becomes one file. Only files this history wrote since it opened are merged: those
-//! there before may be of another blaze's schema. The views' globs read both name forms.
+//! there before may be of another blaze's schema. The views read both name forms.
 //!
-//! A merge is written to a hidden name and renamed into place, then its inputs are deleted.
-//! Between the two (milliseconds) a reader's glob can see the merged file and its inputs both,
-//! and count those rows twice; that race is not solved. A crash between the two leaves both,
-//! and the next open deletes the inputs a merged file holds.
+//! A merge is written to a hidden name and renamed into place, then its inputs are *retired*:
+//! out of the history at once, off the disk only once no reader can still read them. A reader
+//! pins the directory ([`Pin`]) and reads an explicit list of files ([`Snapshot`]), never a
+//! glob; the writer publishes each retirement (the file [`RETIRED`]) before it looks at the
+//! pins, and deletes a retired file only once every pin has read that retirement
+//! ([`retire`] says why each row is then read exactly once). Until 2026-11-04 a merge deleted
+//! its inputs at once, and a `blaze slow` racing it failed on DuckDB's "Cannot open file". A
+//! crash between a merge's rename and the retirement of its inputs leaves both, and the next
+//! open retires the inputs a merged file holds.
 //!
 //! What a daemon that dies leaves readable: a build's `builds` row as it starts (outcome
 //! `running`, [`History::build_started`]), and with each flush that wrote rows the spans every
@@ -52,8 +58,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    types::UInt32Type,
+    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array,
+    UInt64Array, types::UInt32Type,
 };
 use arrow_schema::ArrowError;
 use parquet::{
@@ -73,7 +79,7 @@ use crate::{
     batches::{self, Process},
     clock,
     errors::{self, ErrorRow},
-    facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
+    facts::{self, CrateDepRow, KeyPartRow, LinkRow, MissRow, ProvenanceRow, QueryCountRow},
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity,
     sampler::{self, Sample},
@@ -82,8 +88,13 @@ use crate::{
 };
 
 mod compact;
+mod pin;
+pub(crate) mod retire;
 
 use compact::Name;
+pub use pin::Pin;
+use retire::Retired;
+pub use retire::{PINS, RETIRED, Snapshot};
 
 /// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
 /// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
@@ -137,7 +148,9 @@ pub fn writes(dir: &Path, pid: u32) -> bool {
     // than "held" says nothing of the owner, and the live pid the file names is taken as it.
     match fs::File::open(&path).map(|file| file.try_lock_shared()) {
         Ok(Ok(())) => false,
-        Ok(Err(fs::TryLockError::WouldBlock)) | Ok(Err(fs::TryLockError::Error(_))) | Err(_) => true,
+        Ok(Err(fs::TryLockError::WouldBlock)) | Ok(Err(fs::TryLockError::Error(_))) | Err(_) => {
+            true
+        }
     }
 }
 
@@ -181,7 +194,8 @@ pub enum Outcome {
 
 impl Outcome {
     /// In the order of their numbers, which are their keys in the column's dictionary.
-    pub const ALL: [Outcome; 5] = [Outcome::Ok, Outcome::Failed, Outcome::Cancelled, Outcome::Stalled, Outcome::Running];
+    pub const ALL: [Outcome; 5] =
+        [Outcome::Ok, Outcome::Failed, Outcome::Cancelled, Outcome::Stalled, Outcome::Running];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -236,6 +250,8 @@ pub struct Flushed {
     pub crate_deps: usize,
     pub query_counts: usize,
     pub misses: usize,
+    pub key_parts: usize,
+    pub provenance: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -243,9 +259,10 @@ pub struct Flushed {
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
-    /// Old files deleted to stay under the cap.
+    /// Old files retired to stay under the cap (deleted once no reader pins them).
     pub deleted: u32,
-    /// Files merged into others, and deleted, after the flush.
+    /// Files merged into others, and retired, after the flush (deleted once no reader pins
+    /// them).
     pub merged: u32,
     /// Files those merges made.
     pub compacted: u32,
@@ -253,17 +270,47 @@ pub struct Flushed {
 
 #[derive(Debug)]
 pub enum HistoryError {
-    Io { path: PathBuf, doing: &'static str, error: io::Error },
-    Parquet { path: PathBuf, table: &'static str, error: ParquetError },
-    Arrow { table: &'static str, error: ArrowError },
+    Io {
+        path: PathBuf,
+        doing: &'static str,
+        error: io::Error,
+    },
+    Parquet {
+        path: PathBuf,
+        table: &'static str,
+        error: ParquetError,
+    },
+    Arrow {
+        table: &'static str,
+        error: ArrowError,
+    },
     /// What a build was of could not be told: its tree's digest, or blaze's own hash.
-    Identity { what: &'static str, path: PathBuf, error: io::Error },
+    Identity {
+        what: &'static str,
+        path: PathBuf,
+        error: io::Error,
+    },
     /// The history `dir` has no schema file of `tables` (it was written before they existed),
     /// and writing them there failed: no view over it can be opened.
-    SchemasMissing { dir: PathBuf, tables: Vec<&'static str>, error: Box<HistoryError> },
+    SchemasMissing {
+        dir: PathBuf,
+        tables: Vec<&'static str>,
+        error: Box<HistoryError>,
+    },
     /// Merging files into `output` failed at the step `doing`, on `file`: an input, or the
     /// hidden file the output is written to. Every input stays in place.
-    Compact { output: PathBuf, file: PathBuf, doing: &'static str, error: CompactError },
+    Compact {
+        output: PathBuf,
+        file: PathBuf,
+        doing: &'static str,
+        error: CompactError,
+    },
+    /// The history's [`RETIRED`] at `path` is not a file a blaze wrote: `why`. Which files are
+    /// out of the history can't be told, so neither the writer nor a reader goes on.
+    Retired {
+        path: PathBuf,
+        why: &'static str,
+    },
 }
 
 /// Why a merge of history files failed.
@@ -293,7 +340,11 @@ impl fmt::Display for HistoryError {
                 write!(f, "the profile history: {doing} {}: {error}", path.display())
             }
             HistoryError::Parquet { path, table, error } => {
-                write!(f, "the profile history: writing the {table} table to {}: {error}", path.display())
+                write!(
+                    f,
+                    "the profile history: writing the {table} table to {}: {error}",
+                    path.display()
+                )
             }
             HistoryError::Arrow { table, error } => {
                 write!(f, "the profile history: making the {table} table's rows: {error}")
@@ -314,6 +365,11 @@ impl fmt::Display for HistoryError {
                 output.display(),
                 file.display()
             ),
+            HistoryError::Retired { path, why } => write!(
+                f,
+                "the profile history: {}, which names the files retired from it, does not read back: {why}",
+                path.display()
+            ),
         }
     }
 }
@@ -329,11 +385,15 @@ impl std::error::Error for HistoryError {
             HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::Parquet(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::SchemaDiffers, .. } => None,
+            HistoryError::Retired { .. } => None,
         }
     }
 }
 
-fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -> HistoryError + 'a {
+fn io_error<'a>(
+    path: &'a Path,
+    doing: &'static str,
+) -> impl FnOnce(io::Error) -> HistoryError + 'a {
     // alloc: an error
     move |error| HistoryError::Io { path: path.to_owned(), doing, error }
 }
@@ -373,7 +433,7 @@ fn properties(table: &Table) -> WriterProperties {
     it.build()
 }
 
-fn table_at(table: &Table) -> usize {
+pub(crate) fn table_at(table: &Table) -> usize {
     match schema::TABLES.iter().position(|it| it.name == table.name) {
         Some(at) => at,
         None => unreachable!("{} is a table of the history", table.name),
@@ -389,7 +449,10 @@ pub(crate) struct Writer {
 impl Writer {
     pub(crate) fn new() -> Writer {
         // alloc: once a history
-        Writer { properties: schema::TABLES.iter().map(|it| properties(it)).collect(), buf: Vec::with_capacity(1 << 20) }
+        Writer {
+            properties: schema::TABLES.iter().map(|it| properties(it)).collect(),
+            buf: Vec::with_capacity(1 << 20),
+        }
     }
 
     /// Writes `parts`, rows of `table`, as the Parquet file `path`; its size.
@@ -409,7 +472,8 @@ impl Writer {
         buf.clear();
         // clone: a table's writer properties, once a file
         let properties = self.properties[table_at(table)].clone();
-        let mut writer = ArrowWriter::try_new(buf, batches::schema_of(table), Some(properties)).map_err(parquet)?;
+        let mut writer = ArrowWriter::try_new(buf, batches::schema_of(table), Some(properties))
+            .map_err(parquet)?;
         for part in parts {
             writer.write(part).map_err(parquet)?;
         }
@@ -430,7 +494,7 @@ impl Writer {
     }
 }
 
-/// The empty file of `table` in the history `dir`, which every view's glob matches, so a view
+/// The empty file of `table` in the history `dir`, which every view reads, so a view
 /// of a table no file has rows for reads as empty instead of failing.
 fn schema_file(dir: &Path, table: &Table) -> PathBuf {
     // alloc: a file's name, once a table
@@ -508,7 +572,7 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
 
-/// A file of the history the cap counts: written by a flush or a merge, deleted oldest first
+/// A file of the history the cap counts: written by a flush or a merge, retired oldest first
 /// (by the last flush it holds rows of, `name.last`).
 struct Kept {
     name: Name,
@@ -517,6 +581,12 @@ struct Kept {
     /// Written by this history since it opened, so it may be merged: a file there before may be
     /// of another blaze's schema.
     ours: bool,
+}
+
+/// The name of a history file at `path`, as its directory lists it (its name parsed, so UTF-8).
+fn file_name(path: &Path) -> String {
+    // alloc: a file's name, once a file retired
+    path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// A merge as its driver runs it: the paths of the files merged, in seq order, and the name of
@@ -530,7 +600,11 @@ struct Job {
 /// copying their column chunks as they are, with `properties` (the table's); its size. It is
 /// streamed to a hidden name and renamed into place, so a reader never sees half of it; on a
 /// failure the hidden file is deleted and `output` is not made.
-fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
+fn concat(
+    output: &Path,
+    inputs: &[PathBuf],
+    properties: &WriterProperties,
+) -> Result<u64, HistoryError> {
     let name = output.file_name().and_then(|it| it.to_str()).unwrap_or("history");
     // alloc: a file's name, once a merge
     let hidden = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
@@ -576,17 +650,21 @@ fn concat_into(
         error,
     };
     let footer = |path: &Path| -> Result<(fs::File, ParquetMetaData), HistoryError> {
-        let file = fs::File::open(path).map_err(|error| fail(path, "opening the input", CompactError::Io(error)))?;
+        let file = fs::File::open(path)
+            .map_err(|error| fail(path, "opening the input", CompactError::Io(error)))?;
         let metadata = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Optional)
             .parse_and_finish(&file)
-            .map_err(|error| fail(path, "reading the footer of the input", CompactError::Parquet(error)))?;
+            .map_err(|error| {
+                fail(path, "reading the footer of the input", CompactError::Parquet(error))
+            })?;
         Ok((file, metadata))
     };
     let Some(first) = inputs.first() else { return Ok(()) };
     let (first_file, first_metadata) = footer(first)?;
     let schema = first_metadata.file_metadata().schema_descr().root_schema_ptr();
-    let out = fs::File::create(hidden).map_err(|error| fail(hidden, "making", CompactError::Io(error)))?;
+    let out = fs::File::create(hidden)
+        .map_err(|error| fail(hidden, "making", CompactError::Io(error)))?;
     // alloc: writer properties, once a merge
     let properties = Arc::new(properties.clone());
     let mut writer = SerializedFileWriter::new(out, Arc::clone(&schema), properties)
@@ -603,13 +681,17 @@ fn concat_into(
             None => footer(path)?,
         };
         if metadata.file_metadata().schema() != &*schema {
-            return Err(fail(path, "checking the schema of the input", CompactError::SchemaDiffers));
+            return Err(fail(
+                path,
+                "checking the schema of the input",
+                CompactError::SchemaDiffers,
+            ));
         }
         for (rg_at, row_group) in metadata.row_groups().iter().enumerate() {
             let index = metadata.page_index_for_row_group(rg_at);
-            let mut group = writer
-                .next_row_group()
-                .map_err(|error| fail(hidden, "starting a row group of", CompactError::Parquet(error)))?;
+            let mut group = writer.next_row_group().map_err(|error| {
+                fail(hidden, "starting a row group of", CompactError::Parquet(error))
+            })?;
             for (column_at, column) in row_group.columns().iter().enumerate() {
                 let close = ColumnCloseResult {
                     bytes_written: column.compressed_size().cast_unsigned(),
@@ -620,10 +702,13 @@ fn concat_into(
                     column_index: index.column_index(column_at).cloned(),
                     offset_index: index.offset_index(column_at).cloned(),
                 };
-                group.append_column(&file, close)
-                    .map_err(|error| fail(path, "copying a column chunk of the input", CompactError::Parquet(error)))?;
+                group.append_column(&file, close).map_err(|error| {
+                    fail(path, "copying a column chunk of the input", CompactError::Parquet(error))
+                })?;
             }
-            group.close().map_err(|error| fail(hidden, "ending a row group of", CompactError::Parquet(error)))?;
+            group.close().map_err(|error| {
+                fail(hidden, "ending a row group of", CompactError::Parquet(error))
+            })?;
         }
     }
     writer.close().map_err(|error| fail(hidden, "ending", CompactError::Parquet(error)))?;
@@ -664,11 +749,18 @@ pub struct History {
     query_counts: Vec<QueryCountRow>,
     /// What builds computed again, and why, since the last flush.
     misses: Vec<MissRow>,
+    /// The parts of the keys of what builds computed again, since the last flush.
+    key_parts: Vec<KeyPartRow>,
+    /// The query engine's run log at each build's end, since the last flush.
+    provenance: Vec<ProvenanceRow>,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
     /// The highest build any file of the directory is named for, or a flush was for.
     last_build: u64,
+    /// The history's generation and the files retired from it still on disk, as [`RETIRED`]
+    /// says them.
+    retired: Retired,
     /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
     /// far, and a flush's new ones.
     sampler: &'static sampler::Ring,
@@ -686,51 +778,64 @@ pub struct History {
 impl History {
     /// The history in `dir`, made if it isn't there, holding at most `cap` bytes of files. Its
     /// first flush takes everything the rings still hold. A flush's number continues from the
-    /// files already there; the hidden files a write left half done are deleted. Its flushes
+    /// files already there; the hidden files a write left half done are deleted, and the files
+    /// a merged file holds the rows of (a crash left them) are retired. Its flushes
     /// read CPU samples from `sampler`: the process's ring ([`sampler::process`]) in a daemon,
     /// a ring of a test's own in a test, so what a test's flush writes never depends on a
     /// sampler that something else in its process started.
-    pub fn open(dir: &Path, cap: u64, sampler: &'static sampler::Ring) -> Result<History, HistoryError> {
+    pub fn open(
+        dir: &Path,
+        cap: u64,
+        sampler: &'static sampler::Ring,
+    ) -> Result<History, HistoryError> {
         fs::create_dir_all(dir).map_err(io_error(dir, "making the directory"))?;
+        let retired = pin::read_retired(dir)?;
+        // alloc: a file's name, once a history
+        let retired_hidden = format!(".{RETIRED}.");
         // alloc: once a history
         let mut kept = Vec::new();
         let mut last_build = 0;
+        // The last flush any file names, retired or not: the next flush numbers past it.
+        let mut last_seq = 0;
         for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
             let entry = entry.map_err(io_error(dir, "listing"))?;
             let path = entry.path();
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             // `.<file>.parquet.<pid>.tmp`, and `.<file>.parquet.tmp` of a blaze before the pid.
-            if name.starts_with('.') && name.ends_with(".tmp") && name.contains(".parquet.") {
+            if name.starts_with('.')
+                && name.ends_with(".tmp")
+                && (name.contains(".parquet.") || name.starts_with(&retired_hidden))
+            {
                 fs::remove_file(&path).map_err(io_error(&path, "deleting a half-written file"))?;
                 continue;
             }
             let Some(named) = Name::parse(name) else { continue };
             last_build = last_build.max(named.build);
+            last_seq = last_seq.max(named.last);
+            if retired.holds(name) {
+                continue;
+            }
             let bytes = entry.metadata().map_err(io_error(&path, "reading the size of"))?.len();
             kept.push(Kept { name: named, bytes, path, ours: false });
         }
-        // A crash between a merge's rename and its deletes left files whose rows a merged file
-        // holds: deleted, so no reader counts them twice.
+        // A crash between a merge's rename and the retirement of its inputs left files whose
+        // rows a merged file holds: retired, so no reader counts them twice (a reader leaves
+        // them out meanwhile: [`Snapshot::resolve`]).
         // alloc: once a history
         let names: Vec<Name> = kept.iter().map(|it| it.name).collect();
-        let gone = compact::superseded(&names);
-        for &at in &gone {
-            let path = &kept[at].path;
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(path, "deleting a file a merged file holds the rows of")(error)),
-            }
-        }
+        let superseded = compact::superseded(&names);
+        // alloc: once a history
+        let mut gone: Vec<String> =
+            superseded.iter().map(|&at| file_name(&kept[at].path)).collect();
         let mut at = 0;
         kept.retain(|_| {
-            let keep = gone.binary_search(&at).is_err();
+            let keep = superseded.binary_search(&at).is_err();
             at += 1;
             keep
         });
         kept.sort_unstable_by_key(|it| it.name.last);
-        let seq = kept.last().map_or(1, |it| it.name.last + 1);
+        let seq = last_seq + 1;
         let total = kept.iter().map(|it| it.bytes).sum();
         let mut writer = Writer::new();
         writer.schemas(dir)?;
@@ -746,7 +851,10 @@ impl History {
         let drainer = std::thread::Builder::new()
             .name("blaze-drain".to_owned()) // alloc: once a history
             .spawn(move || drain(&draining, &stopped, &full_to))
-            .map_err(io_error(dir, "starting the drain thread (`blaze-drain`) of the history in"))?;
+            .map_err(io_error(
+                dir,
+                "starting the drain thread (`blaze-drain`) of the history in",
+            ))?;
         let mut history = History {
             // alloc: once a history
             dir: dir.to_owned(),
@@ -775,9 +883,14 @@ impl History {
             query_counts: Vec::new(),
             // alloc: once a history
             misses: Vec::new(),
+            // alloc: once a history
+            key_parts: Vec::new(),
+            // alloc: once a history
+            provenance: Vec::new(),
             kept: kept.into(),
             total,
             last_build,
+            retired,
             sampler,
             sampled: 0,
             // alloc: once a history
@@ -787,7 +900,9 @@ impl History {
             // alloc: once a history
             open_written: Vec::new(),
         };
-        history.trim()?;
+        history.trim(&mut gone);
+        history.retire(gone)?;
+        history.reap()?;
         Ok(history)
     }
 
@@ -867,11 +982,24 @@ impl History {
         self.misses.extend(rows);
     }
 
+    /// Notes the parts of the key of each thing a build computed again, for the next flush to
+    /// write.
+    pub fn keyed(&mut self, rows: impl IntoIterator<Item = KeyPartRow>) {
+        self.key_parts.extend(rows);
+    }
+
+    /// Notes the query engine's run log as a build ended (why each run ran), for the next
+    /// flush to write.
+    pub fn ran(&mut self, rows: impl IntoIterator<Item = ProvenanceRow>) {
+        self.provenance.extend(rows);
+    }
+
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for the highest build any of its rows is of and
     /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
     /// Then merges files this history wrote ([`Flushed::merged`]; each table of `build` into one
-    /// file when `build` is given, as its build ends) and deletes the oldest files past the cap.
+    /// file when `build` is given, as its build ends) and retires the oldest files past the cap,
+    /// then deletes the retired files no reader pins.
     /// A failed write is an error naming the file; the rows it held are not written again. A
     /// failed merge is an error after the flush's own files are written.
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
@@ -888,8 +1016,18 @@ impl History {
             self.told = now;
             let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
             self.read.counters.extend(
-                [(Plot::ProfileSpansLost, now.0), (Plot::ProfileRowsSkipped, now.1), (Plot::ProfileRowsBehind, now.2)]
-                    .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
+                [
+                    (Plot::ProfileSpansLost, now.0),
+                    (Plot::ProfileRowsSkipped, now.1),
+                    (Plot::ProfileRowsBehind, now.2),
+                ]
+                .map(|(plot, value)| CounterRow {
+                    build,
+                    plot,
+                    t_ns,
+                    value,
+                    fiber: None,
+                }),
             );
         }
         self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
@@ -915,7 +1053,13 @@ impl History {
         let grew = total != self.bugs_told.0;
         let build32 = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
         if build.is_some() || grew {
-            self.read.counters.push(CounterRow { build: build32, plot: Plot::BlazeBugs, t_ns, value: total, fiber: None });
+            self.read.counters.push(CounterRow {
+                build: build32,
+                plot: Plot::BlazeBugs,
+                t_ns,
+                value: total,
+                fiber: None,
+            });
         }
         if !grew {
             return;
@@ -932,9 +1076,14 @@ impl History {
             self.bugs_told.1[at] = site.count;
             let detail = match (&site.thread, &site.backtrace) {
                 // alloc: a row a site of a bug, once a flush it grew in
-                (thread, Some(stack)) => format!("first on thread `{}`:\n{stack}", thread.as_deref().unwrap_or("unnamed")),
+                (thread, Some(stack)) => format!(
+                    "first on thread `{}`:\n{stack}",
+                    thread.as_deref().unwrap_or("unnamed")
+                ),
                 // alloc: as above
-                (thread, None) => format!("first on thread `{}`", thread.as_deref().unwrap_or("unnamed")),
+                (thread, None) => {
+                    format!("first on thread `{}`", thread.as_deref().unwrap_or("unnamed"))
+                }
             };
             self.errors.push(ErrorRow {
                 build_id: build.unwrap_or(0),
@@ -946,7 +1095,12 @@ impl History {
                 // alloc: as above
                 function: Some(site.kind.to_owned()),
                 // alloc: as above
-                message: format!("a blaze bug: `{}` {}, {more} more time{}", site.kind, site.what, if more == 1 { "" } else { "s" }),
+                message: format!(
+                    "a blaze bug: `{}` {}, {more} more time{}",
+                    site.kind,
+                    site.what,
+                    if more == 1 { "" } else { "s" }
+                ),
                 detail: Some(detail),
                 // alloc: as above
                 file: Some(site.at.file().to_owned()),
@@ -988,19 +1142,27 @@ impl History {
             batches::spans(&self.read.spans, of_build).map_err(arrow_error(&schema::SPANS))?,
             batches::spans(&self.others, self.process).map_err(arrow_error(&schema::SPANS))?,
         ];
-        let counters =
-            [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
+        let counters = [batches::counters(&self.read.counters, self.process)
+            .map_err(arrow_error(&schema::COUNTERS))?];
         let builds = [builds(&self.ended, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
         let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
         let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
-        let crate_deps = [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
+        let crate_deps =
+            [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
         let query_counts =
-            [facts::query_counts(&self.query_counts).map_err(arrow_error(&schema::QUERY_COUNTS))?];
+            [facts::query_counts(&self.query_counts)
+                .map_err(arrow_error(&schema::QUERY_COUNTS))?];
         let misses = [facts::misses(&self.misses).map_err(arrow_error(&schema::MISSES))?];
-        let switches =
-            [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
-        let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
-        let folded = [batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?];
+        let key_parts =
+            [facts::key_parts(&self.key_parts).map_err(arrow_error(&schema::KEY_PARTS))?];
+        let provenance =
+            [facts::provenance(&self.provenance).map_err(arrow_error(&schema::PROVENANCE))?];
+        let switches = [batches::switches(&self.read.switches, self.process)
+            .map_err(arrow_error(&schema::SWITCHES))?];
+        let events = [batches::events(&self.read.events, self.process)
+            .map_err(arrow_error(&schema::EVENTS))?];
+        let folded = [batches::folded(&self.read.folds, self.process)
+            .map_err(arrow_error(&schema::FOLDED))?];
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
@@ -1011,7 +1173,8 @@ impl History {
         let now = flight::threads_now();
         let open = match same_open(&now, &self.open_written) {
             false => {
-                let batch = batches::open(&now, clock::mono_ns(), self.process).map_err(arrow_error(&schema::OPEN))?;
+                let batch = batches::open(&now, clock::mono_ns(), self.process)
+                    .map_err(arrow_error(&schema::OPEN))?;
                 self.open_written = now;
                 batch
             }
@@ -1031,6 +1194,8 @@ impl History {
             crate_deps: rows(&crate_deps),
             query_counts: rows(&query_counts),
             misses: rows(&misses),
+            key_parts: rows(&key_parts),
+            provenance: rows(&provenance),
             open: rows(&open),
             folded: rows(&folded),
             skipped: self.read.skipped + samples_skipped,
@@ -1039,7 +1204,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 13] = [
+        let tables: [(&'static Table, &[RecordBatch]); 15] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1051,6 +1216,8 @@ impl History {
             (&schema::CRATE_DEPS, &crate_deps),
             (&schema::QUERY_COUNTS, &query_counts),
             (&schema::MISSES, &misses),
+            (&schema::KEY_PARTS, &key_parts),
+            (&schema::PROVENANCE, &provenance),
             (&schema::OPEN, &open),
             (&schema::FOLDED, &folded),
         ];
@@ -1072,9 +1239,17 @@ impl History {
         self.crate_deps.clear();
         self.query_counts.clear();
         self.misses.clear();
-        let compacted = self.compact(ended, &mut flushed);
-        flushed.deleted = self.trim()?;
+        self.key_parts.clear();
+        self.provenance.clear();
+        // alloc: once a flush
+        let mut gone = Vec::new();
+        let compacted = self.compact(ended, &mut flushed, &mut gone);
+        flushed.deleted = self.trim(&mut gone);
+        // Published before the pins are looked at, so a reader either read the retirement or
+        // pins every file it may list.
+        let reaped = self.retire(gone).and_then(|()| self.reap());
         compacted?;
+        reaped?;
         match self.unidentified.take() {
             Some(error) => Err(error),
             None => Ok(flushed),
@@ -1083,9 +1258,15 @@ impl History {
 
     /// Merges the files this history wrote since it opened as [`compact::plan`] says, `ended`
     /// the build whose end this flush is for, counting the files merged and made in `flushed`.
-    /// Each merge's output is renamed into place before its inputs are deleted; a merge that
-    /// fails leaves every input in place and ends the compaction.
-    fn compact(&mut self, ended: Option<u64>, flushed: &mut Flushed) -> Result<(), HistoryError> {
+    /// Each merge's output is renamed into place before its inputs are retired (their names
+    /// pushed onto `gone`, for [`History::retire`]); a merge that fails leaves every input in
+    /// place and ends the compaction.
+    fn compact(
+        &mut self,
+        ended: Option<u64>,
+        flushed: &mut Flushed,
+        gone: &mut Vec<String>,
+    ) -> Result<(), HistoryError> {
         // alloc: once a flush
         let ours: Vec<usize> = (0..self.kept.len()).filter(|&at| self.kept[at].ours).collect();
         // alloc: once a flush
@@ -1109,39 +1290,63 @@ impl History {
             let path = self.dir.join(job.output.file_name());
             let properties = &self.writer.properties[job.output.table];
             let bytes = concat(&path, &job.inputs, properties)?;
-            let mut gone = 0;
+            let mut bytes_gone = 0;
             self.kept.retain(|it| {
                 let merged = job.inputs.contains(&it.path);
                 if merged {
-                    gone += it.bytes;
+                    bytes_gone += it.bytes;
                 }
                 !merged
             });
-            self.total -= gone;
+            self.total -= bytes_gone;
             let at = self.kept.partition_point(|it| it.name.last <= job.output.last);
-            // clone: a file's path, once a merge
-            self.kept.insert(at, Kept { name: job.output, bytes, path: path.clone(), ours: true });
+            self.kept.insert(at, Kept { name: job.output, bytes, path, ours: true });
             self.total += bytes;
             flushed.compacted += 1;
             for input in &job.inputs {
-                match fs::remove_file(input) {
-                    Ok(()) => {}
-                    // Gone already, as the merge wants it.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(HistoryError::Compact {
-                            output: path,
-                            // clone: an error
-                            file: input.clone(),
-                            doing: "deleting a merged input",
-                            error: CompactError::Io(error),
-                        });
-                    }
-                }
+                gone.push(file_name(input));
                 flushed.merged += 1;
             }
         }
         Ok(())
+    }
+
+    /// Retires the files `gone` (names in the directory, already out of `kept`) and publishes
+    /// that in [`RETIRED`], before [`History::reap`] looks at the pins.
+    fn retire(&mut self, gone: Vec<String>) -> Result<(), HistoryError> {
+        if self.retired.retire(gone) {
+            put(&self.dir.join(RETIRED), self.retired.encode().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the retired files no reader's pin holds, then publishes that they are gone: how
+    /// many. A file is deleted before [`RETIRED`] stops naming it, so a reader never lists a
+    /// file it would read as in the history while it is deleted.
+    fn reap(&mut self) -> Result<u32, HistoryError> {
+        if self.retired.files.is_empty() {
+            return Ok(0);
+        }
+        let _span = tracing::info_span!(target: "blaze", "profile reap").entered();
+        let pins = pin::pinned(&self.dir)?;
+        let reapable = self.retired.reapable(&pins);
+        if reapable.is_empty() {
+            return Ok(0);
+        }
+        for &at in &reapable {
+            let path = self.dir.join(&self.retired.files[at].0);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                // Gone already (a crash after the delete, before the publish), as it should be.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error(&path, "deleting a retired file no reader pins")(error));
+                }
+            }
+        }
+        self.retired.reaped(&reapable);
+        put(&self.dir.join(RETIRED), self.retired.encode().as_bytes())?;
+        Ok(u32::try_from(reapable.len()).unwrap_or(u32::MAX))
     }
 
     /// The build a flush's files are named for: the highest build any of its rows is of, and
@@ -1158,8 +1363,13 @@ impl History {
             self.crate_deps.iter().map(|it| it.build_id).max(),
             self.query_counts.iter().map(|it| it.build_id).max(),
             self.misses.iter().map(|it| it.build_id).max(),
+            self.key_parts.iter().map(|it| it.build_id).max(),
+            self.provenance.iter().map(|it| it.build_id).max(),
         ];
-        facts.into_iter().flatten().fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
+        facts
+            .into_iter()
+            .flatten()
+            .fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
     }
 
     /// The flush's CPU samples as a `samples` batch, their frames named. A flush with no new
@@ -1176,31 +1386,19 @@ impl History {
         batches::samples(&self.samples, &names, (Instant::now(), clock::mono_ns()), self.process)
     }
 
-    /// Deletes the oldest files until the rest fit under the cap, keeping at least the newest
-    /// flush's files, every table of it.
-    fn trim(&mut self) -> Result<u32, HistoryError> {
-        let mut deleted = 0;
+    /// Takes the oldest files out of `kept` until the rest fit under the cap, keeping at least
+    /// the newest flush's files, every table of it: their names pushed onto `gone`, for
+    /// [`History::retire`]. How many.
+    fn trim(&mut self, gone: &mut Vec<String>) -> u32 {
+        let mut retired = 0;
         let newest = self.kept.back().map_or(0, |it| it.name.last);
         while self.total > self.cap && self.kept.front().is_some_and(|it| it.name.last != newest) {
-            let oldest = &self.kept[0];
-            match fs::remove_file(&oldest.path) {
-                Ok(()) => {}
-                // Gone already, as the cap wants it.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(HistoryError::Io {
-                        // clone: an error
-                        path: oldest.path.clone(),
-                        doing: "deleting the oldest file past the history's cap",
-                        error,
-                    });
-                }
-            }
+            let Some(oldest) = self.kept.pop_front() else { break };
             self.total -= oldest.bytes;
-            self.kept.pop_front();
-            deleted += 1;
+            gone.push(file_name(&oldest.path));
+            retired += 1;
         }
-        Ok(deleted)
+        retired
     }
 }
 
@@ -1299,8 +1497,10 @@ pub fn write_live(window: Duration, dir: &Path) -> Result<Flushed, HistoryError>
     flight::window(window, &mut read);
     let process = Process::this();
     let spans = batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?;
-    let counters = batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?;
-    let switches = batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?;
+    let counters =
+        batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?;
+    let switches =
+        batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?;
     let events = batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?;
     let mut writer = Writer::new();
     writer.schemas(dir)?;
@@ -1343,16 +1543,29 @@ mod tests {
 
     fn read_back(path: &Path) -> Vec<RecordBatch> {
         let file = fs::File::open(path).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap().map(Result::unwrap).collect()
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     fn same(written: &RecordBatch, read: &[RecordBatch]) {
         assert_eq!(read.len(), 1, "a small table reads back as one batch");
         let read = &read[0];
         assert_eq!(read.num_rows(), written.num_rows());
-        assert_eq!(read.schema().fields(), written.schema().fields(), "the Arrow types come back, dictionaries too");
+        assert_eq!(
+            read.schema().fields(),
+            written.schema().fields(),
+            "the Arrow types come back, dictionaries too"
+        );
         for (i, field) in written.schema().fields().iter().enumerate() {
-            assert!(read.column(i).as_ref() == written.column(i).as_ref(), "{} reads back the same", field.name());
+            assert!(
+                read.column(i).as_ref() == written.column(i).as_ref(),
+                "{} reads back the same",
+                field.name()
+            );
         }
     }
 
@@ -1420,21 +1633,31 @@ mod tests {
         let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], 7).unwrap();
 
         let mut writer = Writer::new();
-        for (table, batch) in [(&schema::SPANS, &spans), (&schema::COUNTERS, &counters), (&schema::BUILDS, &builds)] {
+        for (table, batch) in
+            [(&schema::SPANS, &spans), (&schema::COUNTERS, &counters), (&schema::BUILDS, &builds)]
+        {
             let path = dir.join(format!("1-00000001.{}.parquet", table.name));
             let bytes = writer.write(&path, table, std::slice::from_ref(batch)).unwrap();
             assert_eq!(bytes, fs::metadata(&path).unwrap().len());
             let read = read_back(&path);
             same(batch, &read);
             // arrow-rs gives the batches it reads no schema metadata; the file's schema has it.
-            let file = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path).unwrap()).unwrap();
+            let file =
+                ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path).unwrap()).unwrap();
             assert_eq!(file.schema().metadata()["blaze.table"], table.name);
         }
         let read = read_back(&dir.join("1-00000001.builds.parquet"));
-        let outcome = read[0].column(schema::BUILDS.column("outcome").unwrap()).as_dictionary::<UInt32Type>();
+        let outcome =
+            read[0].column(schema::BUILDS.column("outcome").unwrap()).as_dictionary::<UInt32Type>();
         let names = outcome.values().as_string::<i32>();
         assert_eq!(names.value(outcome.keys().value(1) as usize), "stalled");
-        assert!(fs::read_dir(&dir).unwrap().all(|it| !it.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(
+            fs::read_dir(&dir).unwrap().all(|it| !it
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
     }
 
     /// Each flush says the process's reported bugs: the counter with each build's flush and
@@ -1472,7 +1695,12 @@ mod tests {
         assert_eq!(counters, [(0, 2)]);
         let [row] = &errors[..] else { panic!("one row: {errors:?}") };
         assert_eq!(
-            (row.kind.as_str(), row.function.as_deref(), row.message.as_str(), row.detail.as_deref()),
+            (
+                row.kind.as_str(),
+                row.function.as_deref(),
+                row.message.as_str(),
+                row.detail.as_deref()
+            ),
             (
                 "blaze-bug",
                 Some("AdtDef"),
@@ -1480,15 +1708,23 @@ mod tests {
                 Some("first on thread `driver`")
             )
         );
-        assert_eq!((row.file.as_deref(), row.line, row.t_ns), (Some(at.file()), Some(at.line()), Some(20)));
+        assert_eq!(
+            (row.file.as_deref(), row.line, row.t_ns),
+            (Some(at.file()), Some(at.line()), Some(20))
+        );
         history.told_bugs(None, 30, 2, || panic!("the sites are read only when the total grew"));
-        assert_eq!(said(&mut history), (Vec::new(), Vec::new()), "a timer's flush with nothing new says nothing");
+        assert_eq!(
+            said(&mut history),
+            (Vec::new(), Vec::new()),
+            "a timer's flush with nothing new says nothing"
+        );
         history.told_bugs(None, 40, 3, || vec![site(3)]);
         let (counters, errors) = said(&mut history);
         assert_eq!(counters, [(0, 3)]);
-        assert_eq!(errors.iter().map(|it| it.message.as_str()).collect::<Vec<_>>(), [
-            "a blaze bug: `AdtDef` formatted with no database attached, 1 more time"
-        ]);
+        assert_eq!(
+            errors.iter().map(|it| it.message.as_str()).collect::<Vec<_>>(),
+            ["a blaze bug: `AdtDef` formatted with no database attached, 1 more time"]
+        );
     }
 
     #[test]
@@ -1497,7 +1733,8 @@ mod tests {
         let workspace = dir.join("work");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let mut history = History::open(&dir.join("profile"), CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history =
+            History::open(&dir.join("profile"), CAP_BYTES, sampler::unsampled()).unwrap();
         let built = |history: &mut History, build_id| {
             let row = BuildRow {
                 workspace: workspace.to_str().unwrap().into(),
@@ -1507,9 +1744,15 @@ mod tests {
             };
             history.build_ended(row);
             let flushed = history.flush(Some(build_id)).unwrap();
-            let read = read_back(&dir.join(format!("profile/{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
+            let read = read_back(
+                &dir.join(format!("profile/{}-{:08}.builds.parquet", flushed.build, flushed.seq)),
+            );
             let string = |name: &str| {
-                read[0].column(schema::BUILDS.column(name).unwrap()).as_string::<i32>().value(0).to_owned()
+                read[0]
+                    .column(schema::BUILDS.column(name).unwrap())
+                    .as_string::<i32>()
+                    .value(0)
+                    .to_owned()
             };
             (string("tree"), string("blaze"))
         };
@@ -1537,15 +1780,29 @@ mod tests {
             dur_ns: Some(7),
         }]);
         history.crate_graph([
-            CrateDepRow { build_id: 61, krate: "app".into(), dep: "serde".into(), kind: DepKind::Normal },
-            CrateDepRow { build_id: 61, krate: "app".into(), dep: "cc".into(), kind: DepKind::Build },
+            CrateDepRow {
+                build_id: 61,
+                krate: "app".into(),
+                dep: "serde".into(),
+                kind: DepKind::Normal,
+            },
+            CrateDepRow {
+                build_id: 61,
+                krate: "app".into(),
+                dep: "cc".into(),
+                kind: DepKind::Build,
+            },
         ]);
         let flushed = history.flush(Some(61)).unwrap();
         assert_eq!((flushed.links, flushed.crate_deps), (1, 2));
-        let links = read_back(&dir.join(format!("{}-{:08}.links.parquet", flushed.build, flushed.seq)));
-        let image = links[0].column(schema::LINKS.column("image").unwrap()).as_string::<i32>().value(0);
+        let links =
+            read_back(&dir.join(format!("{}-{:08}.links.parquet", flushed.build, flushed.seq)));
+        let image =
+            links[0].column(schema::LINKS.column("image").unwrap()).as_string::<i32>().value(0);
         assert_eq!(image, "app (bin)");
-        let deps = read_back(&dir.join(format!("{}-{:08}.crate_deps.parquet", flushed.build, flushed.seq)));
+        let deps = read_back(
+            &dir.join(format!("{}-{:08}.crate_deps.parquet", flushed.build, flushed.seq)),
+        );
         assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
         let again = history.flush(Some(62)).unwrap();
@@ -1572,16 +1829,31 @@ mod tests {
             reads_recorded: 6,
             reads_kept: 7,
             reads_most: 8,
+            written: 9,
+            ran_new: 10,
+            ran_changed: 11,
+            ran_untracked: 12,
+            ran_cycle: 13,
         };
-        history.query_counted([mir, QueryCountRow { query: "infer_body_query", executed: 7566, ..mir }]);
+        history.query_counted([
+            mir,
+            QueryCountRow { query: "infer_body_query", executed: 7566, ..mir },
+        ]);
         let flushed = history.flush(Some(63)).unwrap();
         assert_eq!(flushed.query_counts, 2);
-        let read = read_back(&dir.join(format!("{}-{:08}.query_counts.parquet", flushed.build, flushed.seq)));
+        let read = read_back(
+            &dir.join(format!("{}-{:08}.query_counts.parquet", flushed.build, flushed.seq)),
+        );
         let batch = &read[0];
         let count = |name: &str, row: usize| {
-            batch.column(schema::QUERY_COUNTS.column(name).unwrap()).as_primitive::<UInt64Type>().value(row)
+            batch
+                .column(schema::QUERY_COUNTS.column(name).unwrap())
+                .as_primitive::<UInt64Type>()
+                .value(row)
         };
-        let query = batch.column(schema::QUERY_COUNTS.column("query").unwrap()).as_dictionary::<UInt32Type>();
+        let query = batch
+            .column(schema::QUERY_COUNTS.column("query").unwrap())
+            .as_dictionary::<UInt32Type>();
         let names = query.values().as_string::<i32>();
         assert_eq!(names.value(query.keys().value(1) as usize), "infer_body_query");
         assert_eq!(
@@ -1595,10 +1867,15 @@ mod tests {
                 "dropped",
                 "reads_recorded",
                 "reads_kept",
-                "reads_most"
+                "reads_most",
+                "written",
+                "ran_new",
+                "ran_changed",
+                "ran_untracked",
+                "ran_cycle"
             ]
             .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8],
+            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);
@@ -1630,16 +1907,22 @@ mod tests {
         let path = dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq));
         let spans = read_back(&path);
         let found = spans.iter().any(|batch| {
-            let names = batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
-            let commits = batch.column(schema::SPANS.column("commit").unwrap()).as_dictionary::<UInt32Type>();
+            let names =
+                batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
+            let commits =
+                batch.column(schema::SPANS.column("commit").unwrap()).as_dictionary::<UInt32Type>();
             (0..batch.num_rows()).any(|row| {
-                let name = names.values().as_string::<i32>().value(names.keys().value(row) as usize);
-                let commit = commits.keys().is_valid(row).then(|| commits.values().as_string::<i32>().value(commits.keys().value(row) as usize));
+                let name =
+                    names.values().as_string::<i32>().value(names.keys().value(row) as usize);
+                let commit = commits.keys().is_valid(row).then(|| {
+                    commits.values().as_string::<i32>().value(commits.keys().value(row) as usize)
+                });
                 name == "history flushed" && commit == Some("0123abc")
             })
         });
         assert!(found, "the span is in the build's file, with the build's commit");
-        let builds = read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
+        let builds =
+            read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
         assert_eq!(builds[0].num_rows(), 1);
 
         let again = history.flush(None).unwrap();
@@ -1672,20 +1955,36 @@ mod tests {
         .unwrap();
         history.build_ended(row(43, Outcome::Ok));
         let flushed = history.flush(Some(43)).unwrap();
-        let spans = read_back(&dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq)));
+        let spans =
+            read_back(&dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq)));
         let ours: usize = spans
             .iter()
             .map(|batch| {
-                let names = batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
-                let threads = batch.column(schema::SPANS.column("thread").unwrap()).as_primitive::<UInt32Type>();
+                let names = batch
+                    .column(schema::SPANS.column("name").unwrap())
+                    .as_dictionary::<UInt32Type>();
+                let threads = batch
+                    .column(schema::SPANS.column("thread").unwrap())
+                    .as_primitive::<UInt32Type>();
                 (0..batch.num_rows())
                     .filter(|&row| {
-                        threads.value(row) == tid && names.values().as_string::<i32>().value(names.keys().value(row) as usize) == "history drained"
+                        threads.value(row) == tid
+                            && names
+                                .values()
+                                .as_string::<i32>()
+                                .value(names.keys().value(row) as usize)
+                                == "history drained"
                     })
                     .count()
             })
             .sum();
-        assert_eq!(ours, bursts * burst, "{} rows written, {} rows a ring", bursts * burst, flight::CAP);
+        assert_eq!(
+            ours,
+            bursts * burst,
+            "{} rows written, {} rows a ring",
+            bursts * burst,
+            flight::CAP
+        );
     }
 
     #[test]
@@ -1697,10 +1996,17 @@ mod tests {
         drop(history);
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
         let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
-        assert!(!dir.join(".1-00000099.spans.parquet.tmp").exists(), "a half-written file is deleted");
+        assert!(
+            !dir.join(".1-00000099.spans.parquet.tmp").exists(),
+            "a half-written file is deleted"
+        );
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         assert!(first.build >= 1, "{first:?}");
-        assert_eq!(u64::from(history.next_build()), first.build + 1, "a restarted daemon numbers its builds past the history's");
+        assert_eq!(
+            u64::from(history.next_build()),
+            first.build + 1,
+            "a restarted daemon numbers its builds past the history's"
+        );
         let next = u64::from(history.next_build());
         history.build_ended(row(next, Outcome::Ok));
         let second = history.flush(Some(next)).unwrap();
@@ -1729,7 +2035,10 @@ mod tests {
         .unwrap();
         let timer = first.flush(None).unwrap();
         assert!(timer.spans >= 1, "{timer:?}");
-        assert!(timer.build >= u64::from(KILLED), "the timer's flush is named for the build its rows are of: {timer:?}");
+        assert!(
+            timer.build >= u64::from(KILLED),
+            "the timer's flush is named for the build its rows are of: {timer:?}"
+        );
         drop(first);
         let second = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         assert!(
@@ -1753,7 +2062,11 @@ mod tests {
         let first = history.flush(None).unwrap();
         let idle = history.flush(None).unwrap();
         assert_eq!((first.samples, idle.samples), (0, 0), "the test's ring holds no samples");
-        assert_eq!(symbols::ASKED.with(std::cell::Cell::get), asked, "a flush with no samples asked for names");
+        assert_eq!(
+            symbols::ASKED.with(std::cell::Cell::get),
+            asked,
+            "a flush with no samples asked for names"
+        );
         let sample = Sample {
             at: Instant::now(),
             tid: 1,
@@ -1764,7 +2077,11 @@ mod tests {
             on_cpu: true,
         };
         OWN.keep(&[sample]);
-        assert_eq!(history.flush(None).unwrap().samples, 1, "the sample kept into the history's ring");
+        assert_eq!(
+            history.flush(None).unwrap().samples,
+            1,
+            "the sample kept into the history's ring"
+        );
         _ = fs::remove_dir_all(&dir);
     }
 
@@ -1778,17 +2095,27 @@ mod tests {
             flushes.push(history.flush(Some(build)).unwrap());
         }
         let name = |it: &Flushed| dir.join(format!("{}-{:08}.builds.parquet", it.build, it.seq));
-        assert!(!name(&flushes[0]).exists() && !name(&flushes[1]).exists(), "the older builds' files are deleted");
-        assert!(name(&flushes[2]).exists(), "the newest flush's files stay, though they are past the cap alone");
+        assert!(
+            !name(&flushes[0]).exists() && !name(&flushes[1]).exists(),
+            "the older builds' files are deleted"
+        );
+        assert!(
+            name(&flushes[2]).exists(),
+            "the newest flush's files stay, though they are past the cap alone"
+        );
         assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert!(history.kept.iter().all(|it| it.name.last == flushes[2].seq), "only the newest flush is kept");
+        assert!(
+            history.kept.iter().all(|it| it.name.last == flushes[2].seq),
+            "only the newest flush is kept"
+        );
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
     #[test]
     #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
     fn what_a_flush_costs() {
-        let functions: Vec<flight::Sym> = (0..1000).map(|i| flight::intern(&format!("app::f{i}"))).collect();
+        let functions: Vec<flight::Sym> =
+            (0..1000).map(|i| flight::intern(&format!("app::f{i}"))).collect();
         let rows: Vec<SpanRow> = (0..1_000_000u64)
             .map(|i| SpanRow {
                 build: 1,
@@ -1831,11 +2158,20 @@ mod tests {
 
     #[test]
     fn a_file_name_gives_its_seq() {
-        let named = |name: &str| Name::parse(name).map(|it| (it.build, it.first, it.last, it.level));
+        let named =
+            |name: &str| Name::parse(name).map(|it| (it.build, it.first, it.last, it.level));
         assert_eq!(named("41-00000007.spans.parquet"), Some((41, 7, 7, 0)));
         assert_eq!(named("0-00000012.counters.parquet"), Some((0, 12, 12, 0)));
-        assert_eq!(named("3-00000001-00000016-1.spans.parquet"), Some((3, 1, 16, 1)), "a merged file");
-        assert_eq!(named("3-00000001-00000016-0.spans.parquet"), None, "a merged file is of level 1 or more");
+        assert_eq!(
+            named("3-00000001-00000016-1.spans.parquet"),
+            Some((3, 1, 16, 1)),
+            "a merged file"
+        );
+        assert_eq!(
+            named("3-00000001-00000016-0.spans.parquet"),
+            None,
+            "a merged file is of level 1 or more"
+        );
         assert_eq!(named("3-00000009-00000002-1.spans.parquet"), None);
         assert_eq!(named("schema.spans.parquet"), None);
         assert_eq!(named("live.spans.parquet"), None);

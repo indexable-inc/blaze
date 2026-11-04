@@ -31,11 +31,10 @@
 //! `sanitize` and `emitted` forbid unsafe code. The values are of one context, the thread's
 //! ([`Machine`]): no handle crosses threads.
 
-use std::{cell::RefCell, fmt, sync::Once};
 use blaze_hash::hash_map::Entry;
+use std::{cell::RefCell, fmt, sync::Once};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     AddressSpace, GlobalVisibility, OptimizationLevel,
@@ -58,6 +57,7 @@ use inkwell::{
     values::{BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     Arch,
@@ -267,7 +267,13 @@ fn compiled(
                 .collect::<SmallVec<[_; 1]>>();
             let mut functions = Vec::with_capacity(defined.len());
             for (at, defined) in defined.iter().enumerate() {
-                match Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE) {
+                match Lowering::add(
+                    context,
+                    &module,
+                    target,
+                    defined,
+                    super::backend::V1_FRAME_POINTERS,
+                    crate::Features::BASELINE,                ) {
                     Ok(function) => functions.push(Some(function)),
                     Err(e) if alone.is_some() => return Err(e),
                     Err(e) => {
@@ -305,7 +311,13 @@ fn compiled(
             // Every body shown is declared before any is defined, as one may call another.
             let mut by_id = HashMap::new_in(Global);
             for (it, defined) in std::iter::zip(&seen, &shown) {
-                if let Ok(function) = Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE) {
+                if let Ok(function) = Lowering::add(
+                    context,
+                    &module,
+                    target,
+                    defined,
+                    super::backend::V1_FRAME_POINTERS,
+                    crate::Features::BASELINE,                ) {
                     mark_hint(context, function, it.hint);
                     by_id.insert(it.id.as_u32(), function);
                 }
@@ -537,7 +549,9 @@ fn wrap<'ctx>(
     if lower::has_musttail(inner) {
         Lowering::same_abi_attributes(outer, call)
             // alloc: the error's message
-            .map_err(|why| Unhandled::TailCall(format!("the call of the wrapped function: {why}")))?;
+            .map_err(|why| {
+                Unhandled::TailCall(format!("the call of the wrapped function: {why}"))
+            })?;
         call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindMustTail);
     }
     match call.try_as_basic_value().basic() {
@@ -664,9 +678,10 @@ fn mark_hint<'ctx>(context: &'ctx Context, function: FunctionValue<'ctx>, hint: 
 }
 
 /// Gives `function` the `target-features` of `features` ([`lower::Lowering::add`], which tells
-/// it its `target-cpu` too), as rustc gives each function its own: the whole set, since LLVM compiles a function that has one with it in place of its
-/// target machine's. The attribute goes with the function's export, so LLVM's inliner builds
-/// it only into a caller that has its features. Nothing for the target's baseline.
+/// it its `target-cpu` too), as rustc gives each function its own: the whole set, since LLVM
+/// compiles a function that has one with it in place of its target machine's. The attribute
+/// goes with the function's export, so LLVM's inliner builds it only into a caller that has
+/// its features. Nothing for the target's baseline.
 fn mark_features<'ctx>(
     context: &'ctx Context,
     function: FunctionValue<'ctx>,
@@ -675,7 +690,10 @@ fn mark_features<'ctx>(
 ) -> Result<(), Unhandled> {
     let told = told(target, features)?;
     if !told.is_empty() {
-        function.add_attribute(AttributeLoc::Function, context.create_string_attribute("target-features", &told));
+        function.add_attribute(
+            AttributeLoc::Function,
+            context.create_string_attribute("target-features", &told),
+        );
     }
     Ok(())
 }
@@ -719,7 +737,13 @@ pub(super) fn export(
         // alloc: once per export, as `constants`
         let statics: HashSet<u32, Global> = recorder.statics().collect();
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
-        let function = Lowering::add(context, &module, recorder.target, &own, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE)?;
+        let function = Lowering::add(
+            context,
+            &module,
+            recorder.target,
+            &own,
+            super::backend::V1_FRAME_POINTERS,
+            crate::Features::BASELINE,        )?;
         mark_hint(context, function, hint);
         let shown = HashMap::new_in(Global);
         let (resume, memcmp) = (recorder.resume(), recorder.memcmp());
@@ -828,16 +852,24 @@ fn imported<'ctx>(
         }
     }
     let function_name = |it: FunctionValue<'ctx>| it.get_name().to_string_lossy().into_owned();
-    one_per_request(&mut functions, import, function_name, |it| it.count_basic_blocks() > 0, |_, _| false, |kept, gone| {
-        gone.replace_all_uses_with(kept);
-        // SAFETY: `gone` is a function of `imported` that `functions` no longer holds
-        // (`one_per_request` drops it), and `replace_all_uses_with` just above left no use of
-        // it, so freeing it leaves nothing dangling.
-        unsafe { gone.delete() };
-    })?;
+    one_per_request(
+        &mut functions,
+        import,
+        function_name,
+        |it| it.count_basic_blocks() > 0,
+        |_, _| false,
+        |kept, gone| {
+            gone.replace_all_uses_with(kept);
+            // SAFETY: `gone` is a function of `imported` that `functions` no longer holds
+            // (`one_per_request` drops it), and `replace_all_uses_with` just above left no use of
+            // it, so freeing it leaves nothing dangling.
+            unsafe { gone.delete() };
+        },
+    )?;
     let data_name = |it: GlobalValue<'ctx>| it.get_name().to_string_lossy().into_owned();
     let defined = |it: GlobalValue<'ctx>| it.get_initializer().is_some();
-    let same = |a: GlobalValue<'ctx>, b: GlobalValue<'ctx>| a.get_initializer() == b.get_initializer();
+    let same =
+        |a: GlobalValue<'ctx>, b: GlobalValue<'ctx>| a.get_initializer() == b.get_initializer();
     one_per_request(&mut datas, import, data_name, defined, same, |kept, gone| {
         gone.as_pointer_value().replace_all_uses_with(kept.as_pointer_value());
         // SAFETY: `gone` is a global variable of `imported` (from `get_globals`) that `datas`
@@ -985,8 +1017,7 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 }
                 // SAFETY: `instruction` is a live call or invoke of `module`; the type it is
                 // called through is owned by `context` and lives for `'ctx`.
-                let called =
-                    unsafe { core::LLVMGetCalledFunctionType(instruction.as_value_ref()) };
+                let called = unsafe { core::LLVMGetCalledFunctionType(instruction.as_value_ref()) };
                 // SAFETY: `called` is a function type of `context`, which outlives `'ctx`; a
                 // non-function type would make `FunctionType` lie about its kind.
                 let through = unsafe { FunctionType::new(called) };
@@ -996,7 +1027,9 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 }
                 // A `musttail` call is of the caller's type, which its callee's must then be:
                 // turned into a call of the callee's type it would not verify.
-                if call.get_tail_call_kind() == inkwell::values::LLVMTailCallKind::LLVMTailCallKindMustTail {
+                if call.get_tail_call_kind()
+                    == inkwell::values::LLVMTailCallKind::LLVMTailCallKindMustTail
+                {
                     // alloc: the error's message
                     return Err(Unhandled::TailCall(format!(
                         "`{}` tail-calls `{}`, whose body has parameters that are pointers where \
@@ -1328,7 +1361,11 @@ impl Kept {
 
     /// Passes whose pipelines instrument for PGO or use `profile` (the bytes of the profile
     /// `wanted` names, with a NUL after them, as [`pgo::profile`] keeps them).
-    fn of_pgo(machine: &TargetMachine, wanted: pgo::Wanted, profile: Option<&[u8]>) -> Result<Kept, Unhandled> {
+    fn of_pgo(
+        machine: &TargetMachine,
+        wanted: pgo::Wanted,
+        profile: Option<&[u8]>,
+    ) -> Result<Kept, Unhandled> {
         use inkwell::llvm_sys::transforms::pass_builder::{
             LLVMBlazeCreatePgoPasses, LLVMBlazePgo, LLVMBlazePgoGenerate, LLVMBlazePgoUse,
         };
@@ -1337,7 +1374,9 @@ impl Kept {
             (pgo::Wanted::Use(_), Some(bytes @ [.., 0])) => (LLVMBlazePgoUse, bytes),
             (pgo::Wanted::Use(id), _) => {
                 // alloc: the error's message
-                return Err(Unhandled::Llvm(format!("the profile {id:x} without its bytes and their NUL")));
+                return Err(Unhandled::Llvm(format!(
+                    "the profile {id:x} without its bytes and their NUL"
+                )));
             }
         };
         let pgo = LLVMBlazePgo {
@@ -1420,7 +1459,9 @@ impl Kept {
     /// optimized code keeps in its loops, each with its loop's heat, in the order LLVM made
     /// them ([`report::Raw`]).
     fn report_of(&self, function: FunctionValue<'_>) -> Result<Vec<report::Raw>, Unhandled> {
-        use inkwell::llvm_sys::transforms::pass_builder::{LLVMBlazeReportKept, LLVMBlazeReportRow, LLVMBlazeReportRows};
+        use inkwell::llvm_sys::transforms::pass_builder::{
+            LLVMBlazeReportKept, LLVMBlazeReportRow, LLVMBlazeReportRows,
+        };
         use inkwell::values::AsValueRef as _;
         // SAFETY: `self.0` is live and this thread's (as in `run`); `function` is a live function
         // of a module of the context the passes ran, which the wrapper only reads.
@@ -1448,8 +1489,17 @@ impl Kept {
         // alloc: the function's findings, kept in its report
         rows.iter()
             .map(|row| {
-                let (name, message) = (text(row.Name, row.NameLength), text(row.Message, row.MessageLength));
-                report::Raw::of(row.Kind, row.Heat, row.Line, row.LoopLine, row.Count, name, message)
+                let (name, message) =
+                    (text(row.Name, row.NameLength), text(row.Message, row.MessageLength));
+                report::Raw::of(
+                    row.Kind,
+                    row.Heat,
+                    row.Line,
+                    row.LoopLine,
+                    row.Count,
+                    name,
+                    message,
+                )
             })
             .collect()
     }
@@ -1566,7 +1616,8 @@ impl Machinery {
         work: impl FnOnce() -> Result<(T, FunctionValue<'ctx>), Unhandled>,
     ) -> Result<(T, Vec<report::Raw>), Unhandled> {
         self.passes.report_start();
-        let done = work().and_then(|(value, function)| Ok((value, self.passes.report_of(function)?)));
+        let done =
+            work().and_then(|(value, function)| Ok((value, self.passes.report_of(function)?)));
         self.passes.report_stop();
         done
     }
@@ -1591,7 +1642,8 @@ struct Machine {
     // `Target::index`), level, what they build with for PGO and the target features they are
     // told: a daemon builds a dev job
     // with the host's and a release job with the baseline's.
-    machines: HashMap<(usize, Optimization, Option<pgo::Wanted>, super::Features), Machinery, Global>,
+    machines:
+        HashMap<(usize, Optimization, Option<pgo::Wanted>, super::Features), Machinery, Global>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -1652,7 +1704,10 @@ impl Machine {
         })
     }
 
-    fn create(target: &super::Target, optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+    fn create(
+        target: &super::Target,
+        optimization: Optimization,
+    ) -> Result<TargetMachine, Unhandled> {
         Self::create_for(target, optimization, super::Features::BASELINE)
     }
 
@@ -1670,7 +1725,9 @@ impl Machine {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
             #[cfg(feature = "llvm-wasm")]
-            Arch::Wasm32 | Arch::Wasm64 => Target::initialize_webassembly(&InitializationConfig::default()),
+            Arch::Wasm32 | Arch::Wasm64 => {
+                Target::initialize_webassembly(&InitializationConfig::default())
+            }
             // The pinned LLVM (`llvm.json`) is built without the WebAssembly target, so its
             // initializer is not in the library this links.
             #[cfg(not(feature = "llvm-wasm"))]
@@ -1707,19 +1764,25 @@ impl Machine {
             )
             // alloc: an error
             .ok_or_else(|| {
-                Unhandled::Llvm(format!("no target machine for {name}'s CPU {cpu} with the features {told:?}"))
+                Unhandled::Llvm(format!(
+                    "no target machine for {name}'s CPU {cpu} with the features {told:?}"
+                ))
             })?;
         // SAFETY: `machine` is a live target machine, and `cpu` is read for its length during
         // the call only.
         if unsafe { LLVMBlazeHasCpu(machine.as_mut_ptr(), cpu.as_ptr().cast(), cpu.len()) } == 0 {
             // alloc: an error
-            return Err(Unhandled::Llvm(format!("LLVM's {name} has no CPU {cpu:?} (-C target-cpu)")));
+            return Err(Unhandled::Llvm(format!(
+                "LLVM's {name} has no CPU {cpu:?} (-C target-cpu)"
+            )));
         }
         for feature in told.split(',').filter(|it| !it.is_empty()) {
             let bare = &feature[1..];
             // SAFETY: `machine` is a live target machine, and `bare` is read for its length
             // during the call only.
-            let known = unsafe { LLVMBlazeHasFeature(machine.as_mut_ptr(), bare.as_ptr().cast(), bare.len()) };
+            let known = unsafe {
+                LLVMBlazeHasFeature(machine.as_mut_ptr(), bare.as_ptr().cast(), bare.len())
+            };
             if known == 0 {
                 // alloc: an error
                 return Err(Unhandled::Llvm(format!(
@@ -1987,8 +2050,12 @@ impl fmt::Display for Unhandled {
             Unhandled::Llvm(message) => {
                 write!(f, "llvm: {}", message.lines().next().unwrap_or_default())
             }
-            Unhandled::TailCall(why) => write!(f, "a tail call (`become`) LLVM can't guarantee: {why}"),
-            Unhandled::Duplicate(what) => write!(f, "two objects under one name of the module's own: {what}"),
+            Unhandled::TailCall(why) => {
+                write!(f, "a tail call (`become`) LLVM can't guarantee: {why}")
+            }
+            Unhandled::Duplicate(what) => {
+                write!(f, "two objects under one name of the module's own: {what}")
+            }
         }
     }
 }
@@ -2004,7 +2071,9 @@ mod tests {
     fn wasm32_is_refused_by_name_while_blazes_llvm_has_no_webassembly() {
         let wasm32 = crate::Target::of("wasm32-wasip1").unwrap();
         match Machine::create(wasm32, Optimization::NONE) {
-            Err(Unhandled::Llvm(what)) => assert!(what.contains("wasm32") && what.contains("llvm-wasm"), "{what}"),
+            Err(Unhandled::Llvm(what)) => {
+                assert!(what.contains("wasm32") && what.contains("llvm-wasm"), "{what}")
+            }
             Err(other) => panic!("{other:?}"),
             Ok(_) => panic!("a target machine from an LLVM without WebAssembly"),
         }
@@ -2242,10 +2311,17 @@ define i32 @"blaze.own"() {
             module.set_data_layout(&machine.get_target_data().get_data_layout());
             link(&context, &module, std::slice::from_ref(&import), Linkage::External).unwrap();
             module.verify().unwrap();
-            let globals: Vec<String> =
-                module.get_globals().map(|it| it.get_name().to_string_lossy().into_owned()).collect();
+            let globals: Vec<String> = module
+                .get_globals()
+                .map(|it| it.get_name().to_string_lossy().into_owned())
+                .collect();
             assert_eq!(globals, ["blaze.d.3"], "{}", module.print_to_string().to_string_lossy());
-            let body = module.get_function("blaze.f.5").unwrap().print_to_string().to_string_lossy().into_owned();
+            let body = module
+                .get_function("blaze.f.5")
+                .unwrap()
+                .print_to_string()
+                .to_string_lossy()
+                .into_owned();
             assert_eq!(body.matches("ptr @blaze.d.3").count(), 2, "{body}");
             machine.write_to_memory_buffer(&module, FileType::Object).unwrap().as_slice().to_vec()
         };
@@ -2272,10 +2348,13 @@ define i32 @"blaze.own"() {
         let mut import = exported(&context, DEFINES_TWO, vec![5], 5);
         import.datas = vec![3, 3];
         let module = context.create_module("blaze");
-        let refused = link(&context, &module, std::slice::from_ref(&import), Linkage::External).unwrap_err();
+        let refused =
+            link(&context, &module, std::slice::from_ref(&import), Linkage::External).unwrap_err();
         let Unhandled::Duplicate(what) = &refused else { panic!("{refused:?}") };
         assert!(
-            ["`blaze.f.5`", "`blaze.d.0`", "`blaze.d.1`", "`blaze.d.3`"].iter().all(|it| what.contains(it)),
+            ["`blaze.f.5`", "`blaze.d.0`", "`blaze.d.1`", "`blaze.d.3`"]
+                .iter()
+                .all(|it| what.contains(it)),
             "{what}"
         );
     }
@@ -2320,7 +2399,9 @@ define i32 @"blaze.own"() {
     /// which has no COMDATs (LLVM ends the process on one), in `__text` by its symbol.
     #[test]
     fn a_unit_reads_back_from_mach_o_and_elf_alike() {
-        for triple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
+        for triple in
+            ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+        {
             reads_back_a_unit_of_two(crate::Target::of(triple).unwrap());
         }
     }
@@ -2331,10 +2412,14 @@ define i32 @"blaze.own"() {
     fn a_comdat_on_mach_o_is_refused_by_name() {
         let context = Context::create();
         let module = context.create_module("blaze");
-        let function = module.add_function("blaze.f.3", context.void_type().fn_type(&[], false), None);
+        let function =
+            module.add_function("blaze.f.3", context.void_type().fn_type(&[], false), None);
         let apple = crate::Target::of("aarch64-apple-darwin").unwrap();
         let refused = own_comdat(&module, apple, function).unwrap_err().to_string();
-        assert!(refused.contains("blaze.f.3") && refused.contains("aarch64-apple-darwin"), "{refused}");
+        assert!(
+            refused.contains("blaze.f.3") && refused.contains("aarch64-apple-darwin"),
+            "{refused}"
+        );
         assert!(function.as_global_value().get_comdat().is_none());
         own_comdat(&module, crate::Target::x86_64_linux(), function).unwrap();
         assert!(function.as_global_value().get_comdat().is_some());
@@ -2547,39 +2632,132 @@ attributes #0 = { alwaysinline }
             b.ins().load(ty, crate::MEM, p, offset)
         }
         let cases: &[(&str, Make)] = &[
-            ("swizzle", |b, p| { let (x, i) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16)); b.ins().swizzle(x, i) }),
-            ("uwiden_low", |b, p| { let x = at(b, I8X16, p, 0); b.ins().uwiden_low(x) }),
-            ("uwiden_high", |b, p| { let x = at(b, I16X8, p, 0); b.ins().uwiden_high(x) }),
-            ("swiden_low", |b, p| { let x = at(b, I32X4, p, 0); b.ins().swiden_low(x) }),
-            ("swiden_high", |b, p| { let x = at(b, I8X16, p, 0); b.ins().swiden_high(x) }),
-            ("scalar_to_vector", |b, p| { let x = at(b, I64, p, 0); b.ins().scalar_to_vector(I64X2, x) }),
-            ("scalar_to_vector f32", |b, p| { let x = at(b, F32, p, 0); b.ins().scalar_to_vector(F32X4, x) }),
-            ("avg_round", |b, p| { let (x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16)); b.ins().avg_round(x, y) }),
-            ("sqmul_round_sat", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().sqmul_round_sat(x, y) }),
-            ("snarrow", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().snarrow(x, y) }),
-            ("unarrow", |b, p| { let (x, y) = (at(b, I32X4, p, 0), at(b, I32X4, p, 16)); b.ins().unarrow(x, y) }),
-            ("uunarrow", |b, p| { let (x, y) = (at(b, I64X2, p, 0), at(b, I64X2, p, 16)); b.ins().uunarrow(x, y) }),
-            ("iabs", |b, p| { let x = at(b, I8X16, p, 0); b.ins().iabs(x) }),
-            ("iabs scalar", |b, p| { let x = at(b, I32, p, 0); b.ins().iabs(x) }),
-            ("popcnt", |b, p| { let x = at(b, I8X16, p, 0); b.ins().popcnt(x) }),
-            ("fadd", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fadd(x, y) }),
-            ("fdiv", |b, p| { let (x, y) = (at(b, F64X2, p, 0), at(b, F64X2, p, 16)); b.ins().fdiv(x, y) }),
-            ("fmin", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fmin(x, y) }),
-            ("fneg", |b, p| { let x = at(b, F64X2, p, 0); b.ins().fneg(x) }),
-            ("sqrt", |b, p| { let x = at(b, F32X4, p, 0); b.ins().sqrt(x) }),
-            ("nearest", |b, p| { let x = at(b, F32X4, p, 0); b.ins().nearest(x) }),
-            ("fcmp", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fcmp(FloatCC::LessThan, x, y) }),
-            ("bitselect", |b, p| { let (c, x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16), at(b, I8X16, p, 32)); b.ins().bitselect(c, x, y) }),
-            ("bitselect f32", |b, p| { let (c, x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16), at(b, F32X4, p, 32)); b.ins().bitselect(c, x, y) }),
-            ("fcvt_from_sint", |b, p| { let x = at(b, I32X4, p, 0); b.ins().fcvt_from_sint(F32X4, x) }),
-            ("fcvt_from_uint", |b, p| { let x = at(b, I32X4, p, 0); b.ins().fcvt_from_uint(F32X4, x) }),
-            ("fcvt_to_sint_sat", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fcvt_to_sint_sat(I32X4, x) }),
-            ("fcvt_to_uint_sat", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fcvt_to_uint_sat(I32X4, x) }),
-            ("fvpromote_low", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fvpromote_low(x) }),
-            ("fvdemote", |b, p| { let x = at(b, F64X2, p, 0); b.ins().fvdemote(x) }),
+            ("swizzle", |b, p| {
+                let (x, i) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16));
+                b.ins().swizzle(x, i)
+            }),
+            ("uwiden_low", |b, p| {
+                let x = at(b, I8X16, p, 0);
+                b.ins().uwiden_low(x)
+            }),
+            ("uwiden_high", |b, p| {
+                let x = at(b, I16X8, p, 0);
+                b.ins().uwiden_high(x)
+            }),
+            ("swiden_low", |b, p| {
+                let x = at(b, I32X4, p, 0);
+                b.ins().swiden_low(x)
+            }),
+            ("swiden_high", |b, p| {
+                let x = at(b, I8X16, p, 0);
+                b.ins().swiden_high(x)
+            }),
+            ("scalar_to_vector", |b, p| {
+                let x = at(b, I64, p, 0);
+                b.ins().scalar_to_vector(I64X2, x)
+            }),
+            ("scalar_to_vector f32", |b, p| {
+                let x = at(b, F32, p, 0);
+                b.ins().scalar_to_vector(F32X4, x)
+            }),
+            ("avg_round", |b, p| {
+                let (x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16));
+                b.ins().avg_round(x, y)
+            }),
+            ("sqmul_round_sat", |b, p| {
+                let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16));
+                b.ins().sqmul_round_sat(x, y)
+            }),
+            ("snarrow", |b, p| {
+                let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16));
+                b.ins().snarrow(x, y)
+            }),
+            ("unarrow", |b, p| {
+                let (x, y) = (at(b, I32X4, p, 0), at(b, I32X4, p, 16));
+                b.ins().unarrow(x, y)
+            }),
+            ("uunarrow", |b, p| {
+                let (x, y) = (at(b, I64X2, p, 0), at(b, I64X2, p, 16));
+                b.ins().uunarrow(x, y)
+            }),
+            ("iabs", |b, p| {
+                let x = at(b, I8X16, p, 0);
+                b.ins().iabs(x)
+            }),
+            ("iabs scalar", |b, p| {
+                let x = at(b, I32, p, 0);
+                b.ins().iabs(x)
+            }),
+            ("popcnt", |b, p| {
+                let x = at(b, I8X16, p, 0);
+                b.ins().popcnt(x)
+            }),
+            ("fadd", |b, p| {
+                let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16));
+                b.ins().fadd(x, y)
+            }),
+            ("fdiv", |b, p| {
+                let (x, y) = (at(b, F64X2, p, 0), at(b, F64X2, p, 16));
+                b.ins().fdiv(x, y)
+            }),
+            ("fmin", |b, p| {
+                let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16));
+                b.ins().fmin(x, y)
+            }),
+            ("fneg", |b, p| {
+                let x = at(b, F64X2, p, 0);
+                b.ins().fneg(x)
+            }),
+            ("sqrt", |b, p| {
+                let x = at(b, F32X4, p, 0);
+                b.ins().sqrt(x)
+            }),
+            ("nearest", |b, p| {
+                let x = at(b, F32X4, p, 0);
+                b.ins().nearest(x)
+            }),
+            ("fcmp", |b, p| {
+                let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16));
+                b.ins().fcmp(FloatCC::LessThan, x, y)
+            }),
+            ("bitselect", |b, p| {
+                let (c, x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16), at(b, I8X16, p, 32));
+                b.ins().bitselect(c, x, y)
+            }),
+            ("bitselect f32", |b, p| {
+                let (c, x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16), at(b, F32X4, p, 32));
+                b.ins().bitselect(c, x, y)
+            }),
+            ("fcvt_from_sint", |b, p| {
+                let x = at(b, I32X4, p, 0);
+                b.ins().fcvt_from_sint(F32X4, x)
+            }),
+            ("fcvt_from_uint", |b, p| {
+                let x = at(b, I32X4, p, 0);
+                b.ins().fcvt_from_uint(F32X4, x)
+            }),
+            ("fcvt_to_sint_sat", |b, p| {
+                let x = at(b, F32X4, p, 0);
+                b.ins().fcvt_to_sint_sat(I32X4, x)
+            }),
+            ("fcvt_to_uint_sat", |b, p| {
+                let x = at(b, F32X4, p, 0);
+                b.ins().fcvt_to_uint_sat(I32X4, x)
+            }),
+            ("fvpromote_low", |b, p| {
+                let x = at(b, F32X4, p, 0);
+                b.ins().fvpromote_low(x)
+            }),
+            ("fvdemote", |b, p| {
+                let x = at(b, F64X2, p, 0);
+                b.ins().fvdemote(x)
+            }),
             ("uload8x8", |b, p| b.ins().uload8x8(crate::MEM, p, 0)),
             ("sload32x2", |b, p| b.ins().sload32x2(crate::MEM, p, 8)),
-            ("umulhi", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().umulhi(x, y) }),
+            ("umulhi", |b, p| {
+                let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16));
+                b.ins().umulhi(x, y)
+            }),
             ("vconst", |b, _| {
                 let constant = b.func.dfg.constants.insert((0..16).collect::<Vec<u8>>().into());
                 b.ins().vconst(I32X4, constant)
@@ -2603,7 +2781,10 @@ attributes #0 = { alwaysinline }
             builder.ins().store(crate::MEM, value, p, 64);
             builder.ins().return_(&[]);
             builder.finalize(isa.frontend_config());
-            for optimization in [Optimization::NONE, Optimization { passes: Passes::Aggressive, selection: Selection::Optimized }] {
+            for optimization in [
+                Optimization::NONE,
+                Optimization { passes: Passes::Aggressive, selection: Selection::Optimized },
+            ] {
                 if let Err(why) = emit(&mut wants, &[], &func, optimization, None, &[]) {
                     refused.push(format!("{name}: {why}"));
                 }
@@ -2623,18 +2804,27 @@ attributes #0 = { alwaysinline }
             Arch::Wasm32 | Arch::Wasm64 => return,
         };
         let set = target.features_of(target.cpu(), &[wanted.to_owned()]).unwrap();
-        let machine = Machine::create_for(crate::Target::for_host(), Optimization::NONE, set).unwrap();
+        let machine =
+            Machine::create_for(crate::Target::for_host(), Optimization::NONE, set).unwrap();
         let told = |it: &TargetMachine| it.get_feature_string().to_string_lossy().into_owned();
         assert!(told(&machine).contains(wanted), "{}", told(&machine));
         let baseline = Machine::create(crate::Target::for_host(), Optimization::NONE).unwrap();
         assert!(!told(&baseline).contains(wanted), "{}", told(&baseline));
         let unknown = target.features_of(target.cpu(), &["+no-such-feature".to_owned()]).unwrap();
-        let Err(Unhandled::Llvm(refused)) = Machine::create_for(crate::Target::for_host(), Optimization::NONE, unknown) else {
+        let Err(Unhandled::Llvm(refused)) =
+            Machine::create_for(crate::Target::for_host(), Optimization::NONE, unknown)
+        else {
             panic!("a machine told a feature LLVM lacks");
         };
         assert!(refused.contains("no-such-feature"), "{refused}");
-        let with_set = Machine::with_pgo(crate::Target::for_host(), Optimization::NONE, None, set, |_, it| Ok(told(it))).unwrap();
-        let without = Machine::with(crate::Target::for_host(), Optimization::NONE, |_, it| Ok(told(it))).unwrap();
+        let with_set =
+            Machine::with_pgo(crate::Target::for_host(), Optimization::NONE, None, set, |_, it| {
+                Ok(told(it))
+            })
+            .unwrap();
+        let without =
+            Machine::with(crate::Target::for_host(), Optimization::NONE, |_, it| Ok(told(it)))
+                .unwrap();
         assert!(with_set.contains(wanted) && !without.contains(wanted), "{with_set} {without}");
     }
 
@@ -2659,7 +2849,14 @@ attributes #0 = { alwaysinline }
         for (features, told) in [(crate::Features::BASELINE, target.cpu()), (named, cpu)] {
             let context = Context::create();
             let module = context.create_module("cpu");
-            let own = Defined { name: OWN, func: &func, pointees: &[], named: &[], weights: None, marked: false };
+            let own = Defined {
+                name: OWN,
+                func: &func,
+                pointees: &[],
+                named: &[],
+                weights: None,
+                marked: false,
+            };
             Lowering::add(&context, &module, target, &own, false, features).unwrap();
             let text = module.print_to_string().to_string();
             assert!(text.contains(&format!("\"target-cpu\"=\"{told}\"")), "{told}: {text}");
@@ -2675,7 +2872,8 @@ attributes #0 = { alwaysinline }
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
         let context = Context::create();
-        let machinery = Machinery::new(Machine::create(crate::Target::for_host(), optimization).unwrap());
+        let machinery =
+            Machinery::new(Machine::create(crate::Target::for_host(), optimization).unwrap());
         let fresh = Machine::create(crate::Target::for_host(), optimization).unwrap();
         let pipelines = [
             optimization.pipeline().unwrap(),
@@ -2773,14 +2971,25 @@ attributes #0 = { alwaysinline }
         let context = Context::create();
         let module = context.create_module("tail");
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
-        let function = Lowering::add(&context, &module, target, &own, false, crate::Features::BASELINE)?;
+        let baseline = crate::Features::BASELINE;
+        let function = Lowering::add(&context, &module, target, &own, false, baseline)?;
         let constants: HashMap<u32, &[u8], Global> = HashMap::new_in(Global);
         let statics: HashSet<u32, Global> = HashSet::new_in(Global);
         let blocks_asm: HashMap<u32, &'static crate::asm::Inline, Global> = HashMap::new_in(Global);
         let shown: HashMap<u32, FunctionValue<'_>, Global> = HashMap::new_in(Global);
         Lowering::define(
-            &context, &module, target, function, &own, &constants, &statics, None, None,
-            &blocks_asm, &shown, None,
+            &context,
+            &module,
+            target,
+            function,
+            &own,
+            &constants,
+            &statics,
+            None,
+            None,
+            &blocks_asm,
+            &shown,
+            None,
         )?;
         let verified = |module: &Module<'_>| {
             module.verify().map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))
@@ -2879,7 +3088,8 @@ attributes #0 = { alwaysinline }
             }
             for optimization in [Optimization::NONE, optimized_level()] {
                 let code = emit(&mut wants, &[], &func, optimization, None, &[]).unwrap();
-                let calls = code.relocs.iter().filter(|it| it.name == RelocName::Func(own.as_u32()));
+                let calls =
+                    code.relocs.iter().filter(|it| it.name == RelocName::Func(own.as_u32()));
                 assert!(calls.count() > 0, "{count}: {:?}", code.relocs);
             }
         }
@@ -2900,7 +3110,9 @@ attributes #0 = { alwaysinline }
     /// memory) keeps the call.
     #[test]
     fn a_tail_call_passes_on_sret_and_converts_pointers_to_the_callers_types() {
-        use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, InstBuilder, MemFlagsData, types::I64};
+        use cranelift_codegen::ir::{
+            AbiParam, ArgumentPurpose, InstBuilder, MemFlagsData, types::I64,
+        };
 
         use super::super::fragment::{FuncTarget, Pointee};
 

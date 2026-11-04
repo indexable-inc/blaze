@@ -4,15 +4,15 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use hir_def::{
-    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId,
-    TypeAliasId, TypeOrConstParamId, TypeParamId,
+    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId, TypeAliasId,
+    TypeOrConstParamId, TypeParamId,
     hir::generics::{GenericParams, LocalTypeOrConstParamId},
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
     unstable_features::UnstableFeatures,
 };
 use rustc_type_ir::{
-    AliasTyKind, ClausePolarity, ClauseKind, TypeSuperVisitable as _, TypeVisitable as _,
-    Upcast, elaborate, inherent::IntoKind,
+    AliasTyKind, ClauseKind, ClausePolarity, TypeSuperVisitable as _, TypeVisitable as _, Upcast,
+    elaborate, inherent::IntoKind,
 };
 
 use crate::{
@@ -20,9 +20,9 @@ use crate::{
     db::HirDatabase,
     lower::{GenericPredicates, ImplTraitIdx},
     next_solver::{
-        AliasTy, AssocTyId, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
-        ParamTy, TraitAssocTyId,
-        SolverDefId, TraitClause, TraitRef, Ty, TypingMode, Unnormalized,
+        AliasTy, AssocTyId, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs,
+        ParamEnv, ParamTy, SolverDefId, TraitAssocTyId, TraitClause, TraitRef, Ty, TypingMode,
+        Unnormalized,
         infer::{
             DbInternerInferExt,
             traits::{Obligation, ObligationCause},
@@ -54,10 +54,7 @@ pub enum MethodViolationCode {
     UndispatchableReceiver,
 }
 
-pub fn dyn_compatibility(
-    db: &Db,
-    trait_: TraitId,
-) -> Option<DynCompatibilityViolation> {
+pub fn dyn_compatibility(db: &Db, trait_: TraitId) -> Option<DynCompatibilityViolation> {
     for &super_trait in crate::utils::all_super_traits(db, trait_) {
         if let Some(v) = db.dyn_compatibility_of_trait(super_trait) {
             return if super_trait == trait_ {
@@ -71,11 +68,7 @@ pub fn dyn_compatibility(
     None
 }
 
-pub fn dyn_compatibility_with_callback<F>(
-    db: &Db,
-    trait_: TraitId,
-    cb: &mut F,
-) -> ControlFlow<()>
+pub fn dyn_compatibility_with_callback<F>(db: &Db, trait_: TraitId, cb: &mut F) -> ControlFlow<()>
 where
     F: FnMut(DynCompatibilityViolation) -> ControlFlow<()>,
 {
@@ -275,11 +268,11 @@ fn method_site(
                 index: arg as u32 + 1,
             }),
         MethodViolationCode::ReferencesSelfOutput => ViolationSite::Output(function),
-        MethodViolationCode::ReferencesImplTraitInTrait => return_impl_trait(&sig)
-            .map_or(ViolationSite::Name(function.into()), |index| ViolationSite::Opaque {
-                function,
-                index,
-            }),
+        MethodViolationCode::ReferencesImplTraitInTrait => {
+            return_impl_trait(&sig).map_or(ViolationSite::Name(function.into()), |index| {
+                ViolationSite::Opaque { function, index }
+            })
+        }
         MethodViolationCode::UndispatchableReceiver => ViolationSite::Param { function, index: 0 },
         MethodViolationCode::StaticMethod
         | MethodViolationCode::AsyncFn
@@ -412,9 +405,7 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
                     _,
                     AliasTy {
                         kind:
-                            AliasTyKind::Projection {
-                                def_id: TraitAssocTyId(AssocTyId::RpititId(_)),
-                            },
+                            AliasTyKind::Projection { def_id: TraitAssocTyId(AssocTyId::RpititId(_)) },
                         ..
                     },
                 ) => ControlFlow::Continue(()),

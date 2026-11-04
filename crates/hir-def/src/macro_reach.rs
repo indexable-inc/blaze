@@ -33,7 +33,9 @@ mod tests;
 pub fn macro_reach_module(db: &Db, id: MacroId) -> Option<ModuleId> {
     let def = id.definition(db);
     let transparency = match def.kind {
-        MacroDefKind::Declarative(ast_id, _) => ast_id.decl_macro_expander(db, def.krate).transparency,
+        MacroDefKind::Declarative(ast_id, _) => {
+            ast_id.decl_macro_expander(db, def.krate).transparency
+        }
         MacroDefKind::ProcMacro(..) => return None,
         _ => {
             let written = symbol_attr(db, AttrDefId::MacroId(id), "rustc_macro_transparency");
@@ -148,7 +150,8 @@ impl<'f> MacroReachable<'f> {
                 match def {
                     ModuleDefId::ModuleId(child) => {
                         let own = child.def_map(db).module(db, child).visibility;
-                        if own.is_visible_from(db, defining) && self.walked.insert((child, defining))
+                        if own.is_visible_from(db, defining)
+                            && self.walked.insert((child, defining))
                         {
                             self.stack.push(child);
                         }
@@ -168,12 +171,7 @@ impl<'f> MacroReachable<'f> {
 }
 
 /// The fields of a struct or union accessible from `defining`, whose types rustc reaches.
-fn fields(
-    db: &Db,
-    variant: VariantId,
-    defining: ModuleId,
-    each: &mut impl FnMut(Reached),
-) {
+fn fields(db: &Db, variant: VariantId, defining: ModuleId, each: &mut impl FnMut(Reached)) {
     for (local_id, vis) in VariantFields::field_visibilities(db, variant).iter() {
         if vis.is_visible_from(db, defining) {
             each(Reached::FieldType(FieldId { parent: variant, local_id }));

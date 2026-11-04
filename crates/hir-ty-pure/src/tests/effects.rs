@@ -71,7 +71,11 @@ pub fn jump(at: usize) -> fn() {
                 panic!("`jump` makes a function pointer of a number, so it is not {}", effect.name);
             };
             let said = refusal.said();
-            assert!(said.contains("transmutes `usize`") && said.contains("a function pointer or vtable made of bytes"), "{said}");
+            assert!(
+                said.contains("transmutes `usize`")
+                    && said.contains("a function pointer or vtable made of bytes"),
+                "{said}"
+            );
         }
     });
 }
@@ -112,7 +116,10 @@ pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
     let (keys, raw) = (fn_named(&db, krate, "keys"), fn_named(&db, krate, "raw"));
     blaze_query::db::attach(&db, || {
         if let Err(refusal) = check_generic(&db, keys, &PURE) {
-            panic!("`keys` takes a `NonNull` of the toolchain, so it should be pure, but {}", refusal.said());
+            panic!(
+                "`keys` takes a `NonNull` of the toolchain, so it should be pure, but {}",
+                refusal.said()
+            );
         }
         let Err(refusal) = check_generic(&db, raw, &PURE) else {
             panic!("`raw` takes a raw pointer of its own, so it is not pure");

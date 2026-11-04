@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cargo_util_schemas::manifest::TomlProfiles;
+use std::alloc::Global;
 
 use crate::features::{Edition, Features, ResolveBehavior};
 use crate::files::Files;

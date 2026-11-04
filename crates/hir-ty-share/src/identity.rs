@@ -16,7 +16,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
 use hir_def::{AdtId, CallableDefId, HasModule};
@@ -36,6 +35,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{Unshared, code};
 
@@ -341,17 +341,20 @@ impl<'db> Spell<'db> {
             TyKind::Coroutine(id, args) => {
                 self.u8(19);
                 self.key(key::coroutine_key(db, id.0));
-                let code = match is_by_move_coroutine(db, id.0, args.as_coroutine()) {
+                let by_move = is_by_move_coroutine(db, id.0, args.as_coroutine());
+                let code = match by_move {
                     true => code::of_coroutine_by_move(db, id.0),
                     false => code::of_coroutine(db, id.0),
                 };
                 self.id(code.as_ref().map_err(Clone::clone)?);
+                self.id(&code::coroutine_names(db, id.0, by_move)?);
                 self.args(args)?;
             }
             TyKind::CoroutineWitness(id, args) => {
                 self.u8(20);
                 self.key(key::coroutine_key(db, id.0));
                 self.id(code::of_coroutine(db, id.0).as_ref().map_err(Clone::clone)?);
+                self.id(&code::coroutine_names(db, id.0, false)?);
                 self.args(args)?;
             }
             TyKind::Never => self.u8(21),
@@ -512,11 +515,14 @@ impl<'db> Spell<'db> {
             }
         };
         // alloc: error path
-        let allocation = allocation.map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
+        let allocation =
+            allocation.map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
         Const::new_from_allocation(DbInterner::new_with(db, krate), &allocation, env)
             // alloc: error path
-            .map_err(|error| no_content(format!("the constant `{konst:?}` has no value tree: {error:?}")))
+            .map_err(|error| {
+                no_content(format!("the constant `{konst:?}` has no value tree: {error:?}"))
+            })
     }
 
     fn valtree(&mut self, value: ValTree<'db>) -> Result<(), Unshared> {

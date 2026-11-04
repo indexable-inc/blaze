@@ -35,10 +35,13 @@
 #![cfg_attr(target_os = "wasi", feature(wasi_ext, random))]
 
 pub mod busy;
-#[allow(unsafe_code, reason = "getpriority and setpriority on the calling process, each one call behind a safe function")]
-pub mod cores;
 #[cfg(target_os = "linux")]
 mod cgroup;
+#[allow(
+    unsafe_code,
+    reason = "getpriority and setpriority on the calling process, each one call behind a safe function"
+)]
+pub mod cores;
 pub mod create_process;
 pub mod decimal;
 pub mod exit;
@@ -70,7 +73,10 @@ mod process;
 pub mod children {
     pub use crate::process::{State, Unreaped, Waiter, unreaped};
 }
-#[allow(unsafe_code, reason = "single system calls and the aligned-copy view, each behind a safe function")]
+#[allow(
+    unsafe_code,
+    reason = "single system calls and the aligned-copy view, each behind a safe function"
+)]
 mod raw;
 pub mod signal;
 pub mod sim;
@@ -80,15 +86,17 @@ pub mod threads;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the io_uring driver: its mapped rings, buffers and system calls")]
 pub mod uring;
+pub mod utf8;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the inotify driver: its system calls and the events it reads")]
 mod watch;
-pub mod utf8;
 pub mod wheel;
 
 use std::{fmt, time::Duration};
 
-pub use crate::journal::{Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp};
+pub use crate::journal::{
+    Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
+};
 pub use crate::tags::Tags;
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
@@ -217,8 +225,7 @@ impl FileName {
 
     /// Whether `self` is `dir` or under it.
     pub fn is_under(&self, dir: &FileName) -> bool {
-        self.0 == dir.0
-            || self.0.strip_prefix(&*dir.0).is_some_and(|rest| rest.starts_with('/'))
+        self.0 == dir.0 || self.0.strip_prefix(&*dir.0).is_some_and(|rest| rest.starts_with('/'))
     }
 }
 
@@ -232,7 +239,8 @@ impl fmt::Display for FileName {
 /// name: a clone is made of a file, never through a link. Every driver says it the same, so an
 /// asker can tell this refusal (the name is something other than the file it made) from a file
 /// system that cannot share blocks.
-pub const CLONE_THROUGH_A_LINK: &str = "is a symbolic link: blaze clones a file, never through a link";
+pub const CLONE_THROUGH_A_LINK: &str =
+    "is a symbolic link: blaze clones a file, never through a link";
 
 /// What a failed [`Effect::Clone`] says after its source's name (and what it is, where known)
 /// when the source is no regular file: a FIFO, a socket or a device, or on Windows a reparse
@@ -260,45 +268,91 @@ pub const RECV_MOST: usize = 64 << 10;
 pub enum Effect {
     /// The whole file. A file that is not there reads as empty: a journal not yet written is
     /// one with no records.
-    ReadAll { file: FileName, tag: Tag },
+    ReadAll {
+        file: FileName,
+        tag: Tag,
+    },
     /// `len` bytes at `at`, or fewer at the end of the file.
-    Read { file: FileName, at: u64, len: usize, tag: Tag },
+    Read {
+        file: FileName,
+        at: u64,
+        len: usize,
+        tag: Tag,
+    },
     /// The target of the symbolic link `file`, never followed: completes with [`Done::Read`]
     /// of the target's bytes as the link holds them (on Windows UTF-8, `\` written `/`). A
     /// `file` that is not a symbolic link, or is not there, fails naming it.
-    ReadLink { file: FileName, tag: Tag },
+    ReadLink {
+        file: FileName,
+        tag: Tag,
+    },
     /// Bytes added at the end of the file, creating it. Not durable until a [`Effect::Sync`] of
     /// the file asked for after this one has completed.
-    Append { file: FileName, bytes: Vec<u8>, tag: Tag },
+    Append {
+        file: FileName,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
     /// Everything appended to the file before this was asked for is durable once it completes.
-    Sync { file: FileName, tag: Tag },
+    Sync {
+        file: FileName,
+        tag: Tag,
+    },
     /// The file cut to its first `len` bytes (made if missing); durable once a later sync
     /// completes.
-    Truncate { file: FileName, len: u64, tag: Tag },
+    Truncate {
+        file: FileName,
+        len: u64,
+        tag: Tag,
+    },
     /// The file's whole contents replaced by `bytes`, durably and all at once: a reader or a
     /// crash sees the old contents or the new, never a part. Its directories are made.
-    Write { file: FileName, bytes: Vec<u8>, tag: Tag },
+    Write {
+        file: FileName,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
     /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
-    List { dir: FileName, tag: Tag },
+    List {
+        dir: FileName,
+        tag: Tag,
+    },
     /// `bytes` written at `at` of `file`, which exists, past its end making it longer; durable
     /// once a later [`Effect::Sync`] of the file completes. Completes with [`Done::Written`].
     /// For a link writing the pages that changed into a clone of the last executable.
-    WriteAt { file: FileName, at: u64, bytes: Vec<u8>, tag: Tag },
+    WriteAt {
+        file: FileName,
+        at: u64,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
     /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the
     /// new name survives a crash once it completes. Completes with [`Done::Renamed`].
-    Rename { from: FileName, to: FileName, tag: Tag },
+    Rename {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
     /// The file's permission bits set to `mode` (0o755 for an executable), through a symbolic
     /// link at `file` to the file it points to on Unix (`chmod`); Windows sets the link's own.
     /// Completes with [`Done::Moded`].
-    Mode { file: FileName, mode: u32, tag: Tag },
+    Mode {
+        file: FileName,
+        mode: u32,
+        tag: Tag,
+    },
     /// As [`Effect::Mode`], of the file itself, for a store sealing what it placed: a symbolic
     /// link (on Windows any reparse point) or anything else that is no regular file at `file`
     /// is refused, naming it, never followed or changed. Set on the file opened `O_NOFOLLOW`
     /// (`fchmod`), never by `fchmodat(AT_SYMLINK_NOFOLLOW)`, which glibc makes `fchmodat2`, a
     /// call some seccomp filters refuse. Completes with [`Done::Moded`].
-    Seal { file: FileName, mode: u32, tag: Tag },
+    Seal {
+        file: FileName,
+        mode: u32,
+        tag: Tag,
+    },
     /// `dir` made the user's alone, and checked to be with everything under it, for what keeps
     /// code it runs (the store: a value is checked against its own hash, never against what its
     /// key says made it, so whoever may write there can plant code under any key). A missing
@@ -307,7 +361,10 @@ pub enum Effect {
     /// to write it ([`Access`]); once `dir` is, on Unix the group's and others' bits are taken
     /// off it, so that no one else reads what was built either. What is refused is never
     /// mended. Completes with [`Done::Private`].
-    Private { dir: FileName, tag: Tag },
+    Private {
+        dir: FileName,
+        tag: Tag,
+    },
     /// The file's access and modification times both set to `modified_ns`, nanoseconds since
     /// the Unix epoch, as cargo gives a build script's `output` the time its run began. Of the
     /// file as it is when this runs, so asked once the write that made it has completed; a
@@ -315,31 +372,55 @@ pub enum Effect {
     /// Completes with [`Done::Timed`]. A file that is not there fails, and so does a time the
     /// system's call cannot say (past a 32-bit `time_t`), naming the file; what is kept is the
     /// file system's resolution of it (100 ns on NTFS, 1 s on HFS+).
-    Times { file: FileName, modified_ns: u64, tag: Tag },
+    Times {
+        file: FileName,
+        modified_ns: u64,
+        tag: Tag,
+    },
     /// `to` made a file with `from`'s contents that shares its blocks (`FICLONE`,
     /// `fclonefileat`): a new file's mode (0o666 less the umask) and modified now, whatever
     /// `from`'s are (a store's copies are read-only). A symbolic link `from` is refused, never
     /// followed or cloned, with [`CLONE_THROUGH_A_LINK`]. Fails where the file system cannot
     /// share blocks, naming both files' volumes: nothing copies instead.
-    Clone { from: FileName, to: FileName, tag: Tag },
+    Clone {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
     /// `to` made another name of `from`, for outputs nothing writes in place.
-    Link { from: FileName, to: FileName, tag: Tag },
+    Link {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
     /// What the file is, or that it is not there; a symbolic link is followed to what it
     /// points to.
-    Stat { file: FileName, tag: Tag },
+    Stat {
+        file: FileName,
+        tag: Tag,
+    },
     /// As [`Effect::Stat`], a symbolic link at `file` not followed: it is a file of its own
     /// length (as [`Effect::List`] lists it; on Windows a reparse point's own), so a store's
     /// first look at a file it placed sees a link put there as the wrong length.
-    Lstat { file: FileName, tag: Tag },
+    Lstat {
+        file: FileName,
+        tag: Tag,
+    },
     /// The file, or an empty directory, gone. Gone already is done.
-    Remove { file: FileName, tag: Tag },
+    Remove {
+        file: FileName,
+        tag: Tag,
+    },
     /// Completes with [`Done::Changed`] each time files under `dir` change, until an
     /// [`Effect::Unwatch`] of the same tag, which ends it with [`Done::Unwatched`], or a
     /// [`Done::Failed`], which ends it too. It is in flight until it ends; an unwatch has no
     /// completion of its own but the watch's end. A change that names `dir` itself says the
     /// directory may have been replaced or moved (inotify, which watches an inode, says so of
     /// an overflow too): a watcher that must hear of every later change watches again.
-    Watch { dir: FileName, tag: Tag },
+    Watch {
+        dir: FileName,
+        tag: Tag,
+    },
     /// A watch of `dir` that starts where `since` left the system's journal of changes
     /// (docs/v2/plan/design/restore.md): it completes with [`Done::Journaled`] for the changes
     /// made since then, one with `caught_up` once they are all told, then for each change
@@ -348,26 +429,44 @@ pub enum Effect {
     /// batch naming where the journal is. Changes it cannot name are a
     /// [`Lost`] subtree, never left out: the cursor saved from a batch is never past a change
     /// not in it or an earlier one.
-    Journal { dir: FileName, since: Cursor, tag: Tag },
-    Unwatch { tag: Tag },
+    Journal {
+        dir: FileName,
+        since: Cursor,
+        tag: Tag,
+    },
+    Unwatch {
+        tag: Tag,
+    },
     /// Each file's [`Stamp`], in order, as one batch the driver runs as many at once as it
     /// can (io_uring: `IORING_OP_STATX`, thousands in flight). A symlink is stamped itself, not
     /// followed; a name that is not there is [`Stamp::GONE`]. Completes with
     /// [`Done::Stamped`]; it fails only as a whole, never for one name. `files` is shared, so
     /// an asker that compares the stamps against the names keeps them without a copy.
-    Stamp { files: std::sync::Arc<Names>, tag: Tag },
+    Stamp {
+        files: std::sync::Arc<Names>,
+        tag: Tag,
+    },
     /// What is directly in `dir`, each name with its [`Stamp`], sorted by name; completes with
     /// [`Done::Entries`]. A `dir` that is not there, or not a directory, fails.
-    Entries { dir: FileName, tag: Tag },
+    Entries {
+        dir: FileName,
+        tag: Tag,
+    },
     /// Completes with [`Done::Flushed`] once every change the system had queued for the watch
     /// `watch` when this was asked has been told as that watch's [`Done::Changed`], before
     /// this completion: what a watcher reads after it has seen every change made before the
     /// flush. A change the system made after may be told before it or after. Fails for a
     /// watch not in flight, and where watches have no barrier (naming why); a watch that ends
     /// first fails it.
-    Flush { watch: Tag, tag: Tag },
+    Flush {
+        watch: Tag,
+        tag: Tag,
+    },
     /// Completes once `after` has passed.
-    Timer { after: Duration, tag: Tag },
+    Timer {
+        after: Duration,
+        tag: Tag,
+    },
     /// The whole file mapped read-only into memory, shared with every other mapping of it
     /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
     ///
@@ -375,21 +474,37 @@ pub enum Effect {
     /// appends to or truncates that file in place; it is replaced only by renaming another
     /// file over it, as the store and the image do. An in-place write would change bytes under
     /// a live `&[u8]`, and a truncate would fault on the next read of the pages cut.
-    Map { file: FileName, tag: Tag },
+    Map {
+        file: FileName,
+        tag: Tag,
+    },
     /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
     /// once it has exited and its output is read, or with [`Done::Failed`] when it could not
     /// start (no sandbox can be made here is a failure, never a run outside one).
-    Spawn { command: Box<Command>, tag: Tag },
+    Spawn {
+        command: Box<Command>,
+        tag: Tag,
+    },
     /// The process of the spawn `tag` killed: its spawn completes, with the signal. No
     /// completion of its own; a spawn that ended already is left as it is.
-    Kill { tag: Tag },
+    Kill {
+        tag: Tag,
+    },
     /// Completes with [`Done::Accepted`] for each connection made to `at`, until an
     /// [`Effect::Unlisten`] of the same tag, which ends it with [`Done::Unlistened`]. In
     /// flight until it ends, as a watch is.
-    Listen { at: Address, tag: Tag },
-    Unlisten { tag: Tag },
+    Listen {
+        at: Address,
+        tag: Tag,
+    },
+    Unlisten {
+        tag: Tag,
+    },
     /// A connection made to `at`; completes with [`Done::Connected`].
-    Connect { at: Address, tag: Tag },
+    Connect {
+        at: Address,
+        tag: Tag,
+    },
     /// The bytes the peer of `conn` sent since the last receive, at most `most` and at most
     /// [`RECV_MOST`], appended to `into` after what it holds: `into` may be empty or hold bytes
     /// its asker keeps (the start of a frame), which stay as they are. Its capacity never
@@ -397,12 +512,24 @@ pub enum Effect {
     /// each [`Done::Read`]'s buffer to its next receive allocates nothing once it has grown.
     /// Completes with [`Done::Read`] of `into`, nothing appended once the peer has hung up, or
     /// with [`Done::Broken`] of it as given.
-    Recv { conn: Conn, most: usize, into: Vec<u8>, tag: Tag },
+    Recv {
+        conn: Conn,
+        most: usize,
+        into: Vec<u8>,
+        tag: Tag,
+    },
     /// All of `bytes` sent on `conn`. Completes with [`Done::Sent`] of `bytes` cleared, its
     /// capacity kept for the next send, or with [`Done::Broken`] of it cleared.
-    Send { conn: Conn, bytes: Vec<u8>, tag: Tag },
+    Send {
+        conn: Conn,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
     /// `conn` closed; a receive in flight on it completes with nothing appended.
-    Hangup { conn: Conn, tag: Tag },
+    Hangup {
+        conn: Conn,
+        tag: Tag,
+    },
 }
 
 impl Effect {
@@ -460,7 +587,10 @@ pub enum Address {
     /// fails naming what it is. `fd` stays its passer's, and the socket's file the manager's:
     /// it is never removed. Listened on only: a connect to it fails (connect to
     /// [`Address::Unix`] of `at`).
-    Inherited { fd: i32, at: FileName },
+    Inherited {
+        fd: i32,
+        at: FileName,
+    },
     Tcp(std::net::SocketAddr),
 }
 
@@ -675,7 +805,10 @@ pub enum Done {
     /// Files under a watched directory changed: each is named once, in no order. `lost` says
     /// the system dropped changes (its queue overflowed), so whoever watches must look at the
     /// whole directory again: the names are not all of them.
-    Changed { files: Vec<FileName>, lost: bool },
+    Changed {
+        files: Vec<FileName>,
+        lost: bool,
+    },
     /// What an [`Effect::Journal`] heard.
     Journaled(Box<Journaled>),
     /// Of an [`Effect::Stamp`]: one per name, in its order.
@@ -688,8 +821,12 @@ pub enum Done {
     Fired,
     Mapped(Mapping),
     Exited(Box<Exit>),
-    Accepted { conn: Conn },
-    Connected { conn: Conn },
+    Accepted {
+        conn: Conn,
+    },
+    Connected {
+        conn: Conn,
+    },
     Unlistened,
     /// Of an [`Effect::Send`]: its bytes, cleared, their capacity kept.
     Sent(Vec<u8>),
@@ -698,7 +835,10 @@ pub enum Done {
     /// cleared, a receive's as it was given. The one buffer not handed back is a send's that
     /// io_uring's ring still held when the ring itself failed: the kernel may yet read it, so
     /// it stays where it is, abandoned, and `buffer` is empty and new.
-    Broken { buffer: Vec<u8>, error: IoError },
+    Broken {
+        buffer: Vec<u8>,
+        error: IoError,
+    },
     /// It did not happen. For an append, none of its bytes are durable unless a later sync
     /// says so; for a sync, nothing appended since the last successful one is known durable;
     /// for a write, the file is as it was.

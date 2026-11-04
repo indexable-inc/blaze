@@ -65,9 +65,11 @@ pub(super) fn check_fn<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
     if let Some(list) = f.param_list() {
         let params = func.assoc_fn_params(db);
         // The written parameters in the order `assoc_fn_params` has them: `self` first.
-        let written = list.self_param().map(|it| it.syntax()).into_iter().chain(
-            list.params().map(|it| it.ty().map_or(it.syntax(), |ty| ty.syntax())),
-        );
+        let written = list
+            .self_param()
+            .map(|it| it.syntax())
+            .into_iter()
+            .chain(list.params().map(|it| it.ty().map_or(it.syntax(), |ty| ty.syntax())));
         for (node, param) in written.zip(params.iter()) {
             let ty = param.ty();
             let Some(size) = large(db, ty) else { continue };
@@ -129,9 +131,9 @@ pub(super) fn check_enum<'t>(cx: &mut Cx<'_, 't>, item: ast::Enum<'t>) {
     }
     let enum_name = def.name(db);
     let big_name = big.name(db);
-    let written = item
-        .variant_list()
-        .and_then(|list| list.variants().find(|it| it.name().is_some_and(|it| it.text() == big_name.as_str())));
+    let written = item.variant_list().and_then(|list| {
+        list.variants().find(|it| it.name().is_some_and(|it| it.text() == big_name.as_str()))
+    });
     let node = written.map_or(item.syntax(), |it| it.syntax());
     let Some(range) = cx.range(node) else { return };
     let message = format!(
@@ -185,7 +187,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 }
 
 /// A finding into `found` when `arg`, moved to `dest`, is a place of a large type.
-fn moved_into(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, arg: ExprId, dest: Dest, found: &mut Vec<Finding>) {
+fn moved_into(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    arg: ExprId,
+    dest: Dest,
+    found: &mut Vec<Finding>,
+) {
     let db = cx.db();
     let body = analysis.body();
     let infer = analysis.infer();
@@ -206,7 +214,8 @@ fn moved_into(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, arg: ExprId, de
         Dest::Literal => "this struct literal".to_owned(), // alloc: a message's part
     };
     let target = cx.krate().to_display_target(db);
-    let message = format!("this moves a `{}` of {size} bytes into {to}: {FIX}", ty.display(db, target));
+    let message =
+        format!("this moves a `{}` of {size} bytes into {to}: {FIX}", ty.display(db, target));
     let note = format!("a move of more than {LIMIT} bytes is a `memcpy` of all of it");
     facts::push(found, LINT, range, message, Some(note));
 }
@@ -222,7 +231,10 @@ enum Dest {
 fn is_place(body: &hir_def::expr_store::Body, expr: ExprId) -> bool {
     matches!(
         body.expr(expr),
-        Expr::Path(_) | Expr::Field { .. } | Expr::Index { .. } | Expr::UnaryOp { op: UnaryOp::Deref, .. }
+        Expr::Path(_)
+            | Expr::Field { .. }
+            | Expr::Index { .. }
+            | Expr::UnaryOp { op: UnaryOp::Deref, .. }
     )
 }
 
@@ -262,12 +274,18 @@ pub enum Even {
         assert!(found.contains("`fn take` takes a `Big` of 1024 bytes by value"), "{found}");
         assert!(found.contains("`fn make` returns a `Big` of 1024 bytes by value"), "{found}");
         assert!(found.contains("`fn mover` takes a `Big` of 1024 bytes by value"), "{found}");
-        assert!(found.contains("this moves a `Big` of 1024 bytes into this struct literal"), "{found}");
+        assert!(
+            found.contains("this moves a `Big` of 1024 bytes into this struct literal"),
+            "{found}"
+        );
         assert!(
             !found.contains("into the call to `take`"),
             "a call's result is built in the argument's slot, not moved:\n{found}"
         );
-        assert!(found.contains("`Message::Payload` holds 2048 bytes, over 4× `Ping`'s 0"), "{found}");
+        assert!(
+            found.contains("`Message::Payload` holds 2048 bytes, over 4× `Ping`'s 0"),
+            "{found}"
+        );
         assert!(!found.contains("`Even::"), "variants of like size are not found:\n{found}");
         assert!(!found.contains("`fn take_ref`"), "{found}");
         assert!(!found.contains("`fn shared`"), "an `Arc` is a pointer:\n{found}");

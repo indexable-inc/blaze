@@ -5,16 +5,16 @@
 //! An entry is its length, its answer, its shape's length, its shape (`record`'s bytes, as
 //! stored) and its facts' values, each 32 bytes, in the shape's order.
 
+use blaze_hash::hash_map::Entry as Slot;
 use std::{
     mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use blaze_hash::hash_map::Entry as Slot;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::{Answer, FactRef, Refusal, record};
 
@@ -169,7 +169,8 @@ pub(super) fn entries(bytes: &[u8]) -> impl Iterator<Item = Entry<'_>> {
         if rest.is_empty() {
             return None;
         }
-        let word = |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().expect("4 bytes")) as usize;
+        let word =
+            |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().expect("4 bytes")) as usize;
         let entry_len = word(0);
         let answer = match rest[4] {
             0 => Answer::Fails,
@@ -180,7 +181,9 @@ pub(super) fn entries(bytes: &[u8]) -> impl Iterator<Item = Entry<'_>> {
         let (shape, values) = entry[ENTRY_HEAD..].split_at(shape_len);
         rest = next;
         Some(Entry {
-            goal_key: ContentId(shape[8..40].try_into().expect("a shape starts with its magic and goal key")),
+            goal_key: ContentId(
+                shape[8..40].try_into().expect("a shape starts with its magic and goal key"),
+            ),
             answer,
             shape,
             values,

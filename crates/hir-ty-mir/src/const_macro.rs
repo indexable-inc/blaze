@@ -12,13 +12,13 @@ use std::{any::Any, sync::Arc};
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
     parse_to_token_tree_static_span,
     proc_macro::{
-        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+        Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacroKind,
     },
     tt,
 };
@@ -26,6 +26,7 @@ use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
 use span::{FileId, Span};
+use std::alloc::Global;
 use syntax::{
     AstNode, Edition, SyntaxKind,
     ast::{self, HasAttrs, HasModuleItem, HasName},
@@ -114,12 +115,7 @@ impl ConstMacroExpander {
     }
 
     /// What each parameter of `func`, of the macro crate `krate`, takes.
-    fn params(
-        &self,
-        db: &Db,
-        krate: Crate,
-        func: FunctionId,
-    ) -> Result<Vec<Param>, String> {
+    fn params(&self, db: &Db, krate: Crate, func: FunctionId) -> Result<Vec<Param>, String> {
         let item = const_ast_item(db, krate)?;
         let sig = db.callable_item_signature(func.into()).skip_binder().skip_binder();
         let target = DisplayTarget::from_crate(db, krate);
@@ -228,12 +224,18 @@ fn flat_input(
     Ok(input)
 }
 
+/// What a const macro's call states of its reads ([`ExpansionReads::Unknown`]).
+///
+/// [`ExpansionReads::Unknown`]: hir_expand::proc_macro::ExpansionReads::Unknown
+const CONST_MACRO_READS: &str =
+    "a const macro, run on the database's evaluator: no server traced what it read";
+
 impl ProcMacroExpander for ConstMacroExpander {
     fn expand(
         &self,
         db: &Db,
         ProcMacroCall { subtree, attrs, def_site, call_site, mixed_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let (krate, func) = self.function(db).map_err(ProcMacroExpansionError::System)?;
         let hir = db;
         let edition = krate.data(db).edition;
@@ -290,12 +292,16 @@ impl ProcMacroExpander for ConstMacroExpander {
                 Err(_) => ProcMacroExpansionError::Panic(format!("{text}{error:?}")),
             }
         })?;
-        parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
-            ProcMacroExpansionError::Panic(format!(
-                "the const macro `{}` returned text that is not tokens: {output:?}",
-                self.name
-            ))
-        })
+        let tree =
+            parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
+                ProcMacroExpansionError::Panic(format!(
+                    "the const macro `{}` returned text that is not tokens: {output:?}",
+                    self.name
+                ))
+            })?;
+        // It runs on the database's evaluator, whose reads are the database's own, tracked;
+        // none is traced as a server traces what it read, so its calling crate gets no image.
+        Ok(Expanded::untraced(tree, CONST_MACRO_READS))
     }
 
     // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set

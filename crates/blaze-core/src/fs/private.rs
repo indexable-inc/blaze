@@ -32,7 +32,9 @@ pub(crate) fn private(dir: &Path, name: &FileName) -> io::Result<Option<(FileNam
             // Removed since it was listed: there is nothing of it to trust.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             // alloc: an error path
-            Err(error) => return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display()))),
+            Err(error) => {
+                return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())));
+            }
         }
     }
     Ok(None)
@@ -245,7 +247,9 @@ mod os {
         let mut buffer = vec![0u64; (len as usize).div_ceil(8).max(1)];
         let room = (buffer.len() * 8) as u32;
         // SAFETY: `buffer` is `room` bytes that are this function's to write.
-        let got = unsafe { GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), room, &mut len) };
+        let got = unsafe {
+            GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), room, &mut len)
+        };
         if got == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -310,7 +314,8 @@ mod os {
             }
             // SAFETY: every entry starts with its kind, flags and size, then a mask and an
             // identifier for the kinds read here; `read_unaligned` asks for no alignment.
-            let Entry { kind, flags, size, mask, .. } = unsafe { entry.cast::<Entry>().read_unaligned() };
+            let Entry { kind, flags, size, mask, .. } =
+                unsafe { entry.cast::<Entry>().read_unaligned() };
             if kind == DENIED || flags & INHERIT_ONLY != 0 || mask & WRITES == 0 {
                 continue;
             }
@@ -322,7 +327,8 @@ mod os {
             let sid: PSID = unsafe { entry.byte_add(std::mem::offset_of!(Entry, sid_start)) };
             // SAFETY: `sid` is in the list, which the descriptor keeps alive, and `user` in the
             // gate's buffer; the owner's own rights are the owner's, who was found trusted.
-            let known = unsafe { trusted(sid, user) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };
+            let known =
+                unsafe { trusted(sid, user) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };
             if !known {
                 return Ok(Access::OthersWrite);
             }

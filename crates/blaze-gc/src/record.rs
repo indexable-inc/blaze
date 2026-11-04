@@ -47,9 +47,13 @@ pub fn encode(record: &Record) -> Vec<u8> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Record, String> {
-    let record: Record = serde_json::from_slice(bytes).map_err(|error| format!("it does not read as a record: {error}"))?;
+    let record: Record = serde_json::from_slice(bytes)
+        .map_err(|error| format!("it does not read as a record: {error}"))?;
     if record.format != FORMAT {
-        return Err(format!("it is of format {}, and this blaze reads format {FORMAT}", record.format));
+        return Err(format!(
+            "it is of format {}, and this blaze reads format {FORMAT}",
+            record.format
+        ));
     }
     Ok(record)
 }
@@ -84,7 +88,8 @@ pub fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), String> {
     for _ in 0..2 {
         let temporary = dir.join(temporary_name(&base));
         let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            let mut file =
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)
@@ -134,14 +139,20 @@ pub fn is_marked(dir: &Path) -> bool {
     if crate::lease::has_lease(dir) || path_of(dir).is_file() {
         return true;
     }
-    std::fs::read(dir.join(CACHEDIR_TAG)).is_ok_and(|it| it.starts_with(CACHEDIR_SIGNATURE.as_bytes()))
+    std::fs::read(dir.join(CACHEDIR_TAG))
+        .is_ok_and(|it| it.starts_with(CACHEDIR_SIGNATURE.as_bytes()))
 }
 
 /// `dir` was used at `now_ns` for `checkout`, and so were its directories `profiles`: its record
 /// rewritten when the checkout differs or a time is [`TOUCH_EVERY_NS`] old. A record that does
 /// not read is written afresh, and the error it had is returned with the write's outcome so the
 /// caller can say it.
-pub fn touch(dir: &Path, checkout: Option<&str>, profiles: &[&str], now_ns: u64) -> Result<Option<String>, String> {
+pub fn touch(
+    dir: &Path,
+    checkout: Option<&str>,
+    profiles: &[&str],
+    now_ns: u64,
+) -> Result<Option<String>, String> {
     let (had, unread) = match read(dir) {
         Ok(had) => (had, None),
         Err(why) => (None, Some(why)),
@@ -150,7 +161,9 @@ pub fn touch(dir: &Path, checkout: Option<&str>, profiles: &[&str], now_ns: u64)
     let fresh = had.as_ref().is_some_and(|it| {
         it.checkout.as_deref() == checkout
             && recent(it.used_ns)
-            && profiles.iter().all(|name| it.profiles.iter().any(|(it, at)| it == name && recent(*at)))
+            && profiles
+                .iter()
+                .all(|name| it.profiles.iter().any(|(it, at)| it == name && recent(*at)))
     });
     if fresh {
         return Ok(unread);
@@ -159,7 +172,15 @@ pub fn touch(dir: &Path, checkout: Option<&str>, profiles: &[&str], now_ns: u64)
     kept.retain(|(it, _)| !profiles.contains(&it.as_str()));
     kept.extend(profiles.iter().map(|name| ((*name).to_owned(), now_ns)));
     kept.sort();
-    write(dir, &Record { format: FORMAT, checkout: checkout.map(str::to_owned), used_ns: now_ns, profiles: kept })?;
+    write(
+        dir,
+        &Record {
+            format: FORMAT,
+            checkout: checkout.map(str::to_owned),
+            used_ns: now_ns,
+            profiles: kept,
+        },
+    )?;
     Ok(unread)
 }
 
@@ -192,7 +213,11 @@ pub fn boot_ns() -> Option<u64> {
     if unsafe { libc::clock_gettime(clock, &mut at) } != 0 {
         return None;
     }
-    #[allow(clippy::unnecessary_cast, clippy::useless_conversion, reason = "the field widths differ by target")]
+    #[allow(
+        clippy::unnecessary_cast,
+        clippy::useless_conversion,
+        reason = "the field widths differ by target"
+    )]
     let (secs, nanos) = (at.tv_sec as u64, at.tv_nsec as u64);
     Some(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
 }

@@ -2,7 +2,7 @@ use crate::context::SmtSolver;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 // blaze: the solver is the executable its caller names (blaze's pinned Z3), never one looked up
 // on PATH or in `VERUS_Z3_PATH`, and a failure to start it is an error naming the solver and
@@ -18,7 +18,13 @@ pub struct LaunchError {
 
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "could not start {} at {}: {}", self.solver, self.executable.display(), self.error)
+        write!(
+            f,
+            "could not start {} at {}: {}",
+            self.solver,
+            self.executable.display(),
+            self.error
+        )
     }
 }
 

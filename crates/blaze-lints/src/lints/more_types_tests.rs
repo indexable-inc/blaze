@@ -126,7 +126,11 @@ fn dbg_macro_forms() {
 }",
     );
     let found = lint(&fixture, &only("dbg_macro"));
-    assert_eq!(found.matches("the `dbg!` macro is intended as a debugging tool").count(), 2, "{found}");
+    assert_eq!(
+        found.matches("the `dbg!` macro is intended as a debugging tool").count(),
+        2,
+        "{found}"
+    );
     // `dbg!();` as a statement goes with its `;`; several arguments become a tuple.
     assert!(found.contains("2 -     dbg!();\n"), "{found}");
     assert!(found.contains("3 +     let _ = (a, b);"), "{found}");
@@ -238,11 +242,16 @@ impl S {
 }
 const FREE: &'static str = \"f\";",
     );
-    let found = lint(&fixture, &(only("box_collection") + " -W clippy::redundant_static_lifetimes"));
+    let found =
+        lint(&fixture, &(only("box_collection") + " -W clippy::redundant_static_lifetimes"));
     let boxed = "you seem to be trying to use `Box<Vec<..>>`";
     assert_eq!(found.matches(boxed).count(), 1, "the trait's method only: {found}");
     assert!(found.contains(" --> src/lib.rs:2:23\n"), "{found}");
-    assert_eq!(found.matches("constants have by default a `'static` lifetime").count(), 1, "{found}");
+    assert_eq!(
+        found.matches("constants have by default a `'static` lifetime").count(),
+        1,
+        "{found}"
+    );
     assert!(found.contains(" --> src/lib.rs:11:"), "the free constant only: {found}");
 }
 
@@ -269,7 +278,9 @@ fn in_body() {
     assert!(found.contains(" --> src/lib.rs:2:8\n"), "{found}");
     assert!(found.contains(" --> src/lib.rs:5:9\n"), "{found}");
     assert!(
-        found.contains("= help: `Vec<..>` is already on the heap, `Box<Vec<..>>` makes an extra allocation"),
+        found.contains(
+            "= help: `Vec<..>` is already on the heap, `Box<Vec<..>>` makes an extra allocation"
+        ),
         "{found}"
     );
     assert!(
@@ -374,7 +385,10 @@ impl Clone for E {
 impl Copy for E {}",
     );
     let found = lint(&fixture, &only("large_enum_variant"));
-    assert!(found.contains("boxing a variant would require the type no longer be `Copy`"), "{found}");
+    assert!(
+        found.contains("boxing a variant would require the type no longer be `Copy`"),
+        "{found}"
+    );
     assert!(!found.contains("consider boxing"), "{found}");
 }
 
@@ -395,7 +409,11 @@ extern \"C\" fn j(a: Large) {}
 pub fn exported(a: Large) {}",
     );
     let found = lint(&fixture, &only("large_types_passed_by_value"));
-    assert_eq!(found.matches("is passed by value, but might be more efficient").count(), 2, "{found}");
+    assert_eq!(
+        found.matches("is passed by value, but might be more efficient").count(),
+        2,
+        "{found}"
+    );
     assert!(found.contains(
         "warning: this argument (2048 byte) is passed by value, but might be more efficient if passed by reference (limit: 256 byte)\n --> src/lib.rs:6:9\n"
     ), "{found}");
@@ -466,7 +484,10 @@ impl L {
     );
     let found = lint(&fixture, &only("needless_pass_by_value"));
     assert_eq!(found.matches("this argument is passed by value").count(), 1, "{found}");
-    assert!(found.contains(" --> src/lib.rs:14:28\n"), "the inherent method is still linted: {found}");
+    assert!(
+        found.contains(" --> src/lib.rs:14:28\n"),
+        "the inherent method is still linted: {found}"
+    );
 }
 
 #[test]
@@ -659,7 +680,9 @@ fn h(p: *const u32) -> u32 {
     );
     let found = lint(&fixture, &only("multiple_unsafe_ops_per_block"));
     assert_eq!(
-        found.matches("this `unsafe` block contains 2 unsafe operations, expected only one").count(),
+        found
+            .matches("this `unsafe` block contains 2 unsafe operations, expected only one")
+            .count(),
         2,
         "{found}"
     );

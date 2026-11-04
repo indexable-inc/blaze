@@ -34,25 +34,61 @@ pub(super) fn is_glob_of_non_module(kind: ImportKind, res: PerNs) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefDiagnosticKind {
-    UnresolvedModule { ast: AstId<ast::Module>, candidates: Box<[String]> },
-    UnresolvedExternCrate { ast: AstId<ast::ExternCrate> },
-    UnresolvedImport { id: AstId<ast::Use>, index: Idx<ast::UseTree> },
+    UnresolvedModule {
+        ast: AstId<ast::Module>,
+        candidates: Box<[String]>,
+    },
+    UnresolvedExternCrate {
+        ast: AstId<ast::ExternCrate>,
+    },
+    UnresolvedImport {
+        id: AstId<ast::Use>,
+        index: Idx<ast::UseTree>,
+    },
     /// Code `cfg` leaves out under its crate's cfg options (`Crate::cfg_options`), which are not
     /// copied into each diagnostic: a crate like `std` has thousands of these.
-    UnconfiguredCode { ast_id: ErasedAstId, cfg: CfgExpr },
-    UnresolvedMacroCall { ast: MacroCallKind, path: ModPath },
-    UnimplementedBuiltinMacro { ast: AstId<ast::Macro> },
-    InvalidDeriveTarget { ast: AstId<ast::Item>, id: AttrId },
-    MalformedDerive { ast: AstId<ast::Adt>, id: AttrId },
-    MacroDefError { ast: AstId<ast::Macro>, message: String },
-    MacroError { ast: AstId<ast::Item>, path: ModPath, err: ExpandErrorKind },
+    UnconfiguredCode {
+        ast_id: ErasedAstId,
+        cfg: CfgExpr,
+    },
+    UnresolvedMacroCall {
+        ast: MacroCallKind,
+        path: ModPath,
+    },
+    UnimplementedBuiltinMacro {
+        ast: AstId<ast::Macro>,
+    },
+    InvalidDeriveTarget {
+        ast: AstId<ast::Item>,
+        id: AttrId,
+    },
+    MalformedDerive {
+        ast: AstId<ast::Adt>,
+        id: AttrId,
+    },
+    MacroDefError {
+        ast: AstId<ast::Macro>,
+        message: String,
+    },
+    MacroError {
+        ast: AstId<ast::Item>,
+        path: ModPath,
+        err: ExpandErrorKind,
+    },
     /// A `use` of a trait's associated items (`use Trait::item`, `use Trait::*`) that rustc's
     /// `finalize_imports` reports, or that blaze cannot list.
-    TraitItemImport { id: AstId<ast::Use>, index: Idx<ast::UseTree>, why: TraitItemImport },
+    TraitItemImport {
+        id: AstId<ast::Use>,
+        index: Idx<ast::UseTree>,
+        why: TraitItemImport,
+    },
     /// What the crate's injected `extern crate std;` (`core` under `#![no_std]`) and `use
     /// std::prelude::rust_20xx::*;` need and the crate graph does not give: the crate has no
     /// prelude then.
-    Prelude { krate: Name, error: PreludeError },
+    Prelude {
+        krate: Name,
+        error: PreludeError,
+    },
 }
 
 /// Why a [`DefDiagnosticKind::Prelude`] is reported, as rustc reports the items

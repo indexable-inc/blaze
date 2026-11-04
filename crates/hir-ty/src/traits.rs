@@ -2,7 +2,7 @@
 
 use std::{fmt, hash::Hash};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
     TypeParamId,
@@ -355,7 +355,8 @@ pub fn is_impossible_associated_item(
         .skip_binder()
         .filter(|clause| clause.visit_with(&mut OwnParam(parent)).is_continue())
     {
-        let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
+        let clause =
+            EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
         let obligation =
             Obligation::new(interner, ObligationCause::dummy(), ParamEnv::empty(), clause);
         ocx.register_obligation(obligation);

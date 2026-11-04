@@ -268,7 +268,9 @@ pub(crate) fn give_obligations(mut list: PredicateObligations<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEEP_AT_MOST, PENDING_DEPTH, give_obligations, give_pending, obligations, pending};
+    use super::{
+        KEEP_AT_MOST, PENDING_DEPTH, give_obligations, give_pending, obligations, pending,
+    };
     use crate::next_solver::{fulfill::Pending, infer::traits::PredicateObligations};
 
     fn reserved(rows: usize) -> Pending<'static> {

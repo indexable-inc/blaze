@@ -59,12 +59,15 @@ impl fmt::Display for UnknownCpu {
         if *known_target {
             write!(
                 f,
-                "`-C target-cpu={cpu}` is no CPU blaze knows of target `{triple}`: blaze knows those \
-                 `rustc --print target-cpus` lists and the pinned LLVM's aliases of them \
+                "`-C target-cpu={cpu}` is no CPU blaze knows of target `{triple}`: blaze knows \
+                 those `rustc --print target-cpus` lists and the pinned LLVM's aliases of them \
                  (target_features::cpus, written by tools/cpus.py)"
             )
         } else {
-            write!(f, "`-C target-cpu={cpu}`: blaze has no CPUs of target `{triple}` (tools/cpus.py)")
+            write!(
+                f,
+                "`-C target-cpu={cpu}`: blaze has no CPUs of target `{triple}` (tools/cpus.py)"
+            )
         }
     }
 }
@@ -74,7 +77,8 @@ impl fmt::Display for UnknownCpu {
 /// not know.
 pub fn features(triple: &str, cpu: &str) -> Result<&'static [&'static str], UnknownCpu> {
     // alloc: an error, naming the target and the CPU
-    let unknown = |known_target| UnknownCpu { triple: triple.to_owned(), cpu: cpu.to_owned(), known_target };
+    let unknown =
+        |known_target| UnknownCpu { triple: triple.to_owned(), cpu: cpu.to_owned(), known_target };
     let cpus = of(triple).ok_or_else(|| unknown(false))?;
     cpus.features(cpu).ok_or_else(|| unknown(true))
 }
@@ -86,7 +90,9 @@ mod tests {
     #[test]
     fn an_llvm_alias_is_the_cpu_it_names() {
         let darwin = "aarch64-apple-darwin";
-        for (alias, cpu) in [("apple-m1", "apple-a14"), ("apple-m2", "apple-a15"), ("apple-m3", "apple-a16")] {
+        let aliases =
+            [("apple-m1", "apple-a14"), ("apple-m2", "apple-a15"), ("apple-m3", "apple-a16")];
+        for (alias, cpu) in aliases {
             assert_eq!(super::features(darwin, alias), super::features(darwin, cpu), "{alias}");
         }
         assert!(super::features(darwin, "apple-m4").unwrap().contains(&"sme"));

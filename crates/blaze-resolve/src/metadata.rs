@@ -3,9 +3,9 @@
 //! dependencies (`-Zbindeps`) and the fields they add are not ported.
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cargo_platform::Platform;
 use serde::Serialize;
+use std::alloc::Global;
 
 use crate::dependency::DepKind;
 use crate::interning::InternedString;

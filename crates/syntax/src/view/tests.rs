@@ -4,11 +4,11 @@
 use crate::{
     AstNode as _, AstToken as _, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken,
     Text, TextRange, TextSize,
-    unescape::EscapeError,
     ast::{
         self, HasArgList as _, HasAttrs as _, HasLoopBody as _, HasModuleItem as _, HasName as _,
         IsString as _, RangeItem as _,
     },
+    unescape::EscapeError,
     view::{
         self, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _, HasLoopBody as _,
         HasModuleItem as _, HasName as _, IsString as _, RangeItem as _,
@@ -390,10 +390,7 @@ fn names_and_lifetimes() {
         assert_eq!(h.text(), v.text());
         assert_eq!(h.as_tuple_field(), v.as_tuple_field());
         assert_eq!(h.token_kind(), v.token_kind());
-        assert_eq!(
-            ho(ast::Impl::for_trait_name_ref(&h)),
-            vo(view::Impl::for_trait_name_ref(v))
-        );
+        assert_eq!(ho(ast::Impl::for_trait_name_ref(&h)), vo(view::Impl::for_trait_name_ref(v)));
         assert_eq!(
             ho(ast::RecordExprField::for_field_name(&h)),
             vo(view::RecordExprField::for_field_name(v))
@@ -876,10 +873,7 @@ fn expressions() {
         assert_eq!(ho(h.else_branch()), vo(v.else_branch()));
     }
     for (h, v) in some(f.nodes::<ast::ElseBranch, view::ElseBranch<'_>>()) {
-        assert_eq!(
-            matches!(h, ast::ElseBranch::Block(_)),
-            matches!(v, view::ElseBranch::Block(_))
-        );
+        assert_eq!(matches!(h, ast::ElseBranch::Block(_)), matches!(v, view::ElseBranch::Block(_)));
     }
     for (h, v) in some(f.nodes::<ast::PrefixExpr, view::PrefixExpr<'_>>()) {
         assert_eq!(h.op_kind(), v.op_kind());

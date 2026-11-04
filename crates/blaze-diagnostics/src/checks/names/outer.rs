@@ -22,13 +22,20 @@ use crate::{
 
 /// The E0401 or E0411 of `name` written at `path`, when that is what it is; `last` whether it
 /// is the whole path (a qualifier `Self::` with nothing to give it is E0433 instead).
-pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path<'_>, name: &str, last: bool) -> Option<Diag> {
+pub(super) fn check(
+    cx: &Cx<'_, '_>,
+    signature: &Signature<'_>,
+    path: ast::Path<'_>,
+    name: &str,
+    last: bool,
+) -> Option<Diag> {
     let file = signature.node.file_id;
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     let span = at(path.segment()?.syntax().text_range());
     let inner = inner_item(signature.node.value);
     if name == "Self" {
-        let outer = inner.ancestors().skip(1).take_while(|it| !is_module(*it)).find_map(SelfGiver::of);
+        let outer =
+            inner.ancestors().skip(1).take_while(|it| !is_module(*it)).find_map(SelfGiver::of);
         return match outer {
             Some(giver) => Some(self_from_outer(cx, file, inner, giver, span)),
             None if last => Some(self_not_allowed(cx, file, inner, span)),
@@ -40,9 +47,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path<
         .skip(1)
         .take_while(|it| !is_module(*it))
         .filter_map(|it| ast::AnyHasGenericParams::cast(it)?.generic_param_list())
-        .find_map(|list| list.type_or_const_params().find(|it| it.name().is_some_and(|it| it.text() == name)))?;
+        .find_map(|list| {
+            list.type_or_const_params().find(|it| it.name().is_some_and(|it| it.text() == name))
+        })?;
     // clone: the error's span
-    let mut diag = Diag::error(Some("E0401"), "can't use generic parameters from outer item", span.clone());
+    let mut diag =
+        Diag::error(Some("E0401"), "can't use generic parameters from outer item", span.clone());
     diag.span_label(span, "use of generic parameter from outer item");
     let (kind, name_range) = match &param {
         ast::TypeOrConstParam::Type(it) => ("type", it.name()?.syntax().text_range()),
@@ -70,7 +80,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path<
             );
         }
     } else if let Some((insert, snippet)) = introduce(inner, name) {
-        diag.suggestion_verbose(at(insert), "try introducing a local generic parameter here", snippet, Applicability::MaybeIncorrect);
+        diag.suggestion_verbose(
+            at(insert),
+            "try introducing a local generic parameter here",
+            snippet,
+            Applicability::MaybeIncorrect,
+        );
     }
     Some(diag)
 }
@@ -105,7 +120,13 @@ impl<'t> SelfGiver<'t> {
     }
 }
 
-fn self_from_outer(cx: &Cx<'_, '_>, file: hir::HirFileId, inner: ast::Node<'_>, giver: SelfGiver<'_>, span: Span) -> Diag {
+fn self_from_outer(
+    cx: &Cx<'_, '_>,
+    file: hir::HirFileId,
+    inner: ast::Node<'_>,
+    giver: SelfGiver<'_>,
+    span: Span,
+) -> Diag {
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     // clone: the error's span
     let mut diag = Diag::error(Some("E0401"), "can't use `Self` from outer item", span.clone());
@@ -115,7 +136,10 @@ fn self_from_outer(cx: &Cx<'_, '_>, file: hir::HirFileId, inner: ast::Node<'_>, 
     match giver {
         SelfGiver::Impl(imp) => {
             if let Some(token) = imp.impl_token() {
-                diag.span_label(at(token.text_range()), "`Self` type implicitly declared here, by this `impl`");
+                diag.span_label(
+                    at(token.text_range()),
+                    "`Self` type implicitly declared here, by this `impl`",
+                );
             }
             // alloc: the error's suggestion
             direct = imp.self_ty().map(|it| it.syntax().to_string());
@@ -135,21 +159,35 @@ fn self_from_outer(cx: &Cx<'_, '_>, file: hir::HirFileId, inner: ast::Node<'_>, 
         diag.note(format!("a `{keyword}` is a separate item from the item that contains it"));
     }
     if let Some(snippet) = direct {
-        diag.suggestion_verbose(span, "refer to the type directly here instead", snippet, Applicability::MaybeIncorrect);
+        diag.suggestion_verbose(
+            span,
+            "refer to the type directly here instead",
+            snippet,
+            Applicability::MaybeIncorrect,
+        );
     }
     diag
 }
 
 /// E0411 (`suggest_self_ty`): `Self` where no item gives it.
-fn self_not_allowed(cx: &Cx<'_, '_>, file: hir::HirFileId, inner: ast::Node<'_>, span: Span) -> Diag {
+fn self_not_allowed(
+    cx: &Cx<'_, '_>,
+    file: hir::HirFileId,
+    inner: ast::Node<'_>,
+    span: Span,
+) -> Diag {
     // clone: the error's span
-    let mut diag = Diag::error(Some("E0411"), "cannot find type `Self` in this scope", span.clone());
+    let mut diag =
+        Diag::error(Some("E0411"), "cannot find type `Self` in this scope", span.clone());
     diag.span_label(span, "`Self` is only available in impls, traits, and type definitions");
     if let Some((label, _)) = item_label(inner)
         && let Some((article, descr)) = ast_item_descr(inner)
     {
         // alloc: the error's label
-        diag.span_label(cx.span(InFile::new(file, label)), format!("`Self` not allowed in {article} {descr}"));
+        diag.span_label(
+            cx.span(InFile::new(file, label)),
+            format!("`Self` not allowed in {article} {descr}"),
+        );
     }
     diag
 }

@@ -69,7 +69,8 @@ fn assert_same(
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
             let new = expander::expand_rules(db, &mac.rules, input, marker, style, call_site)
                 .map(|(tree, arm, _)| (tree, arm));
-            let old = expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
+            let old =
+                expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
             assert_eq!(new, old, "{}\nstyle: {style:?}, marked", what());
         }
     }
@@ -149,11 +150,7 @@ fn entry_point(idx: usize) -> parser::PrefixEntryPoint {
 
 /// Takes fragments of every kind from every position of `input` by both
 /// [`crate::expect_fragment`] and the model's, and asserts they agree.
-fn assert_same_fragments(
-    db: &Db,
-    input: &tt::TopSubtree,
-    what: &impl Fn() -> String,
-) {
+fn assert_same_fragments(db: &Db, input: &tt::TopSubtree, what: &impl Fn() -> String) {
     let delim_span = input.top_subtree().delimiter.delim_span();
     for idx in 0..ENTRY_POINTS {
         let mut new_iter = input.iter();
@@ -477,11 +474,7 @@ impl Gen {
             let pat = if roll < 35 {
                 Pat::Token(self.pick(&TOKENS))
             } else if roll < 75 {
-                let kind = if repeated {
-                    self.pick(&REPEATED_KINDS)
-                } else {
-                    self.pick(&KINDS)
-                };
+                let kind = if repeated { self.pick(&REPEATED_KINDS) } else { self.pick(&KINDS) };
                 self.vars += 1;
                 Pat::Var(self.vars - 1, kind)
             } else if roll < 87 && depth < 3 {

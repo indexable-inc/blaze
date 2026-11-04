@@ -176,7 +176,9 @@ pub fn survey(func: &ir::Function, target: &Target) -> Result<Vec<Error>, Error>
     let library = table::Library::get(table::Variant::of(target)?)?;
     match target.arch {
         blaze_codegen::Arch::X86_64 => Ok(patch::survey::<arch::x64::X64>(func, target, library)),
-        blaze_codegen::Arch::Aarch64 => Ok(patch::survey::<arch::aarch64::Aarch64>(func, target, library)),
+        blaze_codegen::Arch::Aarch64 => {
+            Ok(patch::survey::<arch::aarch64::Aarch64>(func, target, library))
+        }
         blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => {
             Err(Error::new("wasm has no stencils: its code is written from the IR as a module"))
         }

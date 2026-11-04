@@ -1,4 +1,5 @@
 mod backdate;
+mod batch_order;
 mod globs;
 mod imports;
 mod incremental;
@@ -10,7 +11,6 @@ mod primitive_shadow;
 mod stale_ids;
 mod trait_imports;
 mod uses;
-mod batch_order;
 mod views;
 
 use expect_test::{Expect, expect};

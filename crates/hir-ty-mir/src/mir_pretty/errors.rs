@@ -246,11 +246,7 @@ impl MirEvalError<'_> {
 }
 
 /// The file and range of `span` in the body of `def`.
-fn source_range(
-    db: &Db,
-    def: InferBodyId<'_>,
-    span: MirSpan,
-) -> Option<(FileId, TextRange)> {
+fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {
             let body = Body::source_map(db, def);

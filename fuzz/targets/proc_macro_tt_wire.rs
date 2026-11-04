@@ -110,7 +110,8 @@ fn part(wire: WirePart) -> Result<(SpanAnchor, SyntaxContext), String> {
         // alloc: the error path; `read_wire`'s callback reports why as a `String`.
         return Err(format!("no file is {:#x}", wire.file_id));
     }
-    let Some(ctx) = EDITIONS.map(SyntaxContext::root).into_iter().find(|it| it.into_u32() == wire.ctx)
+    let Some(ctx) =
+        EDITIONS.map(SyntaxContext::root).into_iter().find(|it| it.into_u32() == wire.ctx)
     else {
         // alloc: the error path; `read_wire`'s callback reports why as a `String`.
         return Err(format!("context {} was not sent", wire.ctx));
@@ -130,7 +131,11 @@ fn read(bytes: &[u8]) -> Result<(TopSubtree, usize), WireError> {
 fn check(data: &[u8]) {
     let (most, read_whole) = blaze_fuzz::largest_allocation(|| read(data));
     let bound = blaze_fuzz::allowed(data.len());
-    assert!(most <= bound, "reading a tree of {} bytes asked for {most} at once, past {bound}", data.len());
+    assert!(
+        most <= bound,
+        "reading a tree of {} bytes asked for {most} at once, past {bound}",
+        data.len()
+    );
     let Ok((tree, used)) = read_whole else { return };
 
     assert!(used <= data.len() && used % 4 == 0, "a tree took {used} of {} bytes", data.len());

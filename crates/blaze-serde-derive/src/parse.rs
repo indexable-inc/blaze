@@ -182,7 +182,10 @@ impl RenameRule {
             RenameRule::Lowercase => name.to_ascii_lowercase(),
             RenameRule::CamelCase => {
                 let mut chars = name.chars();
-                chars.next().map(|first| first.to_ascii_lowercase().to_string() + chars.as_str()).unwrap_or_default()
+                chars
+                    .next()
+                    .map(|first| first.to_ascii_lowercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
             }
             RenameRule::SnakeCase | RenameRule::KebabCase => {
                 let mut snake = String::new();
@@ -259,22 +262,43 @@ pub(crate) fn item(input: TokenStream) -> Result<Item, Error> {
                     generics.predicates.extend(c.where_clause());
                     fields
                 }
-                Some(TokenTree::Punct(punct)) if punct.as_char() == ';' => Fields { style: Style::Unit, list: Vec::new() },
-                _ => return Err(Error::new(ident.span(), format!("struct `{name}` ({}): its body does not read as a struct's", at(ident.span())))),
+                Some(TokenTree::Punct(punct)) if punct.as_char() == ';' => {
+                    Fields { style: Style::Unit, list: Vec::new() }
+                }
+                _ => {
+                    return Err(Error::new(
+                        ident.span(),
+                        format!(
+                            "struct `{name}` ({}): its body does not read as a struct's",
+                            at(ident.span())
+                        ),
+                    ));
+                }
             };
             Data::Struct(fields)
         }
         "enum" => {
             generics.predicates.extend(c.where_clause());
-            let Some(TokenTree::Group(body)) = c.next().filter(|it| matches!(it, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)) else {
-                return Err(Error::new(ident.span(), format!("enum `{name}` ({}): its body does not read as an enum's", at(ident.span()))));
+            let Some(TokenTree::Group(body)) = c.next().filter(
+                |it| matches!(it, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace),
+            ) else {
+                return Err(Error::new(
+                    ident.span(),
+                    format!(
+                        "enum `{name}` ({}): its body does not read as an enum's",
+                        at(ident.span())
+                    ),
+                ));
             };
             Data::Enum(variants(&name, &body, container.rename_all)?)
         }
         other => {
             return Err(Error::new(
                 keyword.span(),
-                format!("`{other} {name}` ({}): blaze-serde-derive derives for structs and enums only", at(keyword.span())),
+                format!(
+                    "`{other} {name}` ({}): blaze-serde-derive derives for structs and enums only",
+                    at(keyword.span())
+                ),
             ));
         }
     };
@@ -300,23 +324,31 @@ impl std::fmt::Display for Owner<'_> {
 /// The combinations serde refuses, refused here too.
 fn check_container(ident: &Ident, attrs: &Container, data: &Data) -> Result<(), Error> {
     let name = unraw(ident);
-    let refuse = |what: &str| Err(Error::new(ident.span(), format!("`{name}` ({}): {what}", at(ident.span()))));
+    let refuse = |what: &str| {
+        Err(Error::new(ident.span(), format!("`{name}` ({}): {what}", at(ident.span()))))
+    };
     match data {
         Data::Struct(fields) => {
             if attrs.tag.is_some() || attrs.untagged {
                 return refuse("`#[serde(tag)]` and `#[serde(untagged)]` are for enums");
             }
             if attrs.transparent && fields.list.iter().filter(|it| !it.attrs.skip).count() != 1 {
-                return refuse("`#[serde(transparent)]` needs exactly one field that is not skipped");
+                return refuse(
+                    "`#[serde(transparent)]` needs exactly one field that is not skipped",
+                );
             }
             if attrs.default.is_some() && fields.style != Style::Named {
-                return refuse("`#[serde(default)]` on a container is for structs with named fields");
+                return refuse(
+                    "`#[serde(default)]` on a container is for structs with named fields",
+                );
             }
             if fields.style != Style::Named && fields.list.iter().any(|it| it.attrs.flatten) {
                 return refuse("`#[serde(flatten)]` is for named fields");
             }
             if attrs.deny_unknown_fields && fields.list.iter().any(|it| it.attrs.flatten) {
-                return refuse("`#[serde(flatten)]` can't be used with `#[serde(deny_unknown_fields)]`");
+                return refuse(
+                    "`#[serde(flatten)]` can't be used with `#[serde(deny_unknown_fields)]`",
+                );
             }
         }
         Data::Enum(variants) => {
@@ -329,7 +361,11 @@ fn check_container(ident: &Ident, attrs: &Container, data: &Data) -> Result<(), 
             if attrs.tag.is_some() && attrs.untagged {
                 return refuse("`#[serde(tag)]` and `#[serde(untagged)]` together");
             }
-            if attrs.tag.is_some() && variants.iter().any(|it| it.fields.style == Style::Tuple && it.fields.list.len() != 1) {
+            if attrs.tag.is_some()
+                && variants
+                    .iter()
+                    .any(|it| it.fields.style == Style::Tuple && it.fields.list.len() != 1)
+            {
                 return refuse("`#[serde(tag)]` can't be used with tuple variants");
             }
             let others: Vec<&Variant> = variants.iter().filter(|it| it.attrs.other).collect();
@@ -343,7 +379,9 @@ fn check_container(ident: &Ident, attrs: &Container, data: &Data) -> Result<(), 
                 return refuse("`#[serde(other)]` in an untagged enum");
             }
             for variant in variants {
-                if variant.fields.list.iter().any(|it| it.attrs.flatten) && variant.fields.style != Style::Named {
+                if variant.fields.list.iter().any(|it| it.attrs.flatten)
+                    && variant.fields.style != Style::Named
+                {
                     return refuse("`#[serde(flatten)]` is for named fields");
                 }
             }
@@ -394,7 +432,10 @@ fn serde_metas(attrs: &[Group], owner: &Owner<'_>) -> Result<Vec<Meta>, Error> {
             _ => {
                 return Err(Error::new(
                     head.span(),
-                    format!("`#[serde ..]` on {owner} ({}): blaze-serde-derive reads `#[serde(..)]` lists only", at(head.span())),
+                    format!(
+                        "`#[serde ..]` on {owner} ({}): blaze-serde-derive reads `#[serde(..)]` lists only",
+                        at(head.span())
+                    ),
                 ));
             }
         };
@@ -408,7 +449,9 @@ fn meta_list(stream: TokenStream, owner: &Owner<'_>) -> Result<Vec<Meta>, Error>
     for chunk in split_commas(stream.into_iter().collect()) {
         let meta = match chunk.as_slice() {
             [TokenTree::Ident(key)] => Meta { key: key.clone(), value: Value::Flag },
-            [TokenTree::Ident(key), TokenTree::Punct(eq), TokenTree::Literal(lit)] if eq.as_char() == '=' => {
+            [TokenTree::Ident(key), TokenTree::Punct(eq), TokenTree::Literal(lit)]
+                if eq.as_char() == '=' =>
+            {
                 let value = string_of(lit).ok_or_else(|| {
                     Error::new(
                         lit.span(),
@@ -420,7 +463,9 @@ fn meta_list(stream: TokenStream, owner: &Owner<'_>) -> Result<Vec<Meta>, Error>
                 })?;
                 Meta { key: key.clone(), value: Value::Str(value, lit.span()) }
             }
-            [TokenTree::Ident(key), TokenTree::Group(list)] if list.delimiter() == Delimiter::Parenthesis => {
+            [TokenTree::Ident(key), TokenTree::Group(list)]
+                if list.delimiter() == Delimiter::Parenthesis =>
+            {
                 Meta { key: key.clone(), value: Value::List(meta_list(list.stream(), owner)?) }
             }
             _ => {
@@ -428,7 +473,10 @@ fn meta_list(stream: TokenStream, owner: &Owner<'_>) -> Result<Vec<Meta>, Error>
                 let text: TokenStream = chunk.iter().cloned().collect();
                 return Err(Error::new(
                     span,
-                    format!("`#[serde({text})]` on {owner} ({}): a form blaze-serde-derive does not read", at(span)),
+                    format!(
+                        "`#[serde({text})]` on {owner} ({}): a form blaze-serde-derive does not read",
+                        at(span)
+                    ),
                 ));
             }
         };
@@ -461,7 +509,10 @@ fn unsupported(meta: &Meta, owner: &Owner<'_>, place: &str) -> Error {
 }
 
 fn duplicate(meta: &Meta, owner: &Owner<'_>) -> Error {
-    Error::new(meta.span(), format!("`#[serde({})]` twice on {owner} ({})", meta.name(), at(meta.span())))
+    Error::new(
+        meta.span(),
+        format!("`#[serde({})]` twice on {owner} ({})", meta.name(), at(meta.span())),
+    )
 }
 
 /// `value` of `meta`, which must be `key = "value"`.
@@ -473,10 +524,22 @@ fn str_value<'m>(meta: &'m Meta, owner: &Owner<'_>, place: &str) -> Result<(&'m 
 }
 
 /// `value` read as Rust tokens (a path or a type), at the literal's span.
-fn tokens_of(value: &str, span: Span, meta: &Meta, owner: &Owner<'_>) -> Result<TokenStream, Error> {
+fn tokens_of(
+    value: &str,
+    span: Span,
+    meta: &Meta,
+    owner: &Owner<'_>,
+) -> Result<TokenStream, Error> {
     match TokenStream::from_str(value) {
         Ok(tokens) => Ok(respan(tokens, span)),
-        Err(_) => Err(Error::new(span, format!("`#[serde({} = \"{value}\")]` on {owner} ({}): `{value}` does not lex", meta.name(), at(span)))),
+        Err(_) => Err(Error::new(
+            span,
+            format!(
+                "`#[serde({} = \"{value}\")]` on {owner} ({}): `{value}` does not lex",
+                meta.name(),
+                at(span)
+            ),
+        )),
     }
 }
 
@@ -538,7 +601,9 @@ fn container_attrs(attrs: &[Group], owner: &Owner<'_>) -> Result<Container, Erro
             "default" => {
                 let default = match &meta.value {
                     Value::Flag => DefaultOf::Trait,
-                    Value::Str(value, span) => DefaultOf::Path(tokens_of(value, *span, &meta, owner)?),
+                    Value::Str(value, span) => {
+                        DefaultOf::Path(tokens_of(value, *span, &meta, owner)?)
+                    }
                     Value::List(_) => return Err(unsupported(&meta, owner, PLACE)),
                 };
                 if out.default.replace(default).is_some() {
@@ -557,13 +622,16 @@ fn container_attrs(attrs: &[Group], owner: &Owner<'_>) -> Result<Container, Erro
                 }
             }
             "bound" => {
-                let Value::List(list) = &meta.value else { return Err(unsupported(&meta, owner, PLACE)) };
+                let Value::List(list) = &meta.value else {
+                    return Err(unsupported(&meta, owner, PLACE));
+                };
                 for side in list {
                     let (value, span) = str_value(side, owner, PLACE)?;
-                    let predicates = split_commas(tokens_of(value, span, side, owner)?.into_iter().collect())
-                        .into_iter()
-                        .map(|it| it.into_iter().collect())
-                        .collect();
+                    let predicates =
+                        split_commas(tokens_of(value, span, side, owner)?.into_iter().collect())
+                            .into_iter()
+                            .map(|it| it.into_iter().collect())
+                            .collect();
                     let slot = match side.name().as_str() {
                         "serialize" => &mut out.bound_serialize,
                         "deserialize" => &mut out.bound_deserialize,
@@ -644,7 +712,9 @@ fn field_attrs(attrs: &[Group], owner: &Owner<'_>, ty: &TokenStream) -> Result<F
         if out.serialize_with.is_some() || out.deserialize_with.is_some() {
             return Err(Error::new(
                 Span::call_site(),
-                format!("{owner}: `#[serde(with)]` together with `serialize_with` or `deserialize_with`"),
+                format!(
+                    "{owner}: `#[serde(with)]` together with `serialize_with` or `deserialize_with`"
+                ),
             ));
         }
         out.serialize_with = Some(join(&module, "serialize"));
@@ -654,7 +724,13 @@ fn field_attrs(attrs: &[Group], owner: &Owner<'_>, ty: &TokenStream) -> Result<F
         Some(span) => {
             let lifetimes = generics::lifetimes_in(ty);
             if lifetimes.is_empty() {
-                return Err(Error::new(span, format!("`#[serde(borrow)]` on {owner} ({}): its type has no lifetime to borrow", at(span))));
+                return Err(Error::new(
+                    span,
+                    format!(
+                        "`#[serde(borrow)]` on {owner} ({}): its type has no lifetime to borrow",
+                        at(span)
+                    ),
+                ));
             }
             out.borrow_cow = cow_of(ty);
             lifetimes
@@ -664,8 +740,18 @@ fn field_attrs(attrs: &[Group], owner: &Owner<'_>, ty: &TokenStream) -> Result<F
             None => Vec::new(),
         },
     };
-    if out.flatten && (out.skip || out.rename.is_some() || out.default.is_some() || out.skip_serializing_if.is_some()) {
-        return Err(Error::new(Span::call_site(), format!("{owner}: `#[serde(flatten)]` with another attribute blaze-serde-derive does not combine it with")));
+    if out.flatten
+        && (out.skip
+            || out.rename.is_some()
+            || out.default.is_some()
+            || out.skip_serializing_if.is_some())
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            format!(
+                "{owner}: `#[serde(flatten)]` with another attribute blaze-serde-derive does not combine it with"
+            ),
+        ));
     }
     Ok(out)
 }
@@ -688,17 +774,27 @@ fn join(module: &TokenStream, function: &str) -> TokenStream {
 /// reads it).
 fn cow_of(ty: &TokenStream) -> Option<CowOf> {
     let tokens: Vec<TokenTree> = ty.clone().into_iter().collect();
-    let at = tokens.iter().rposition(|it| matches!(it, TokenTree::Ident(it) if it.to_string() == "Cow"))?;
+    let at = tokens
+        .iter()
+        .rposition(|it| matches!(it, TokenTree::Ident(it) if it.to_string() == "Cow"))?;
     let rest = &tokens[at + 1..];
-    let is = |tree: &TokenTree, ch: char| matches!(tree, TokenTree::Punct(it) if it.as_char() == ch);
+    let is =
+        |tree: &TokenTree, ch: char| matches!(tree, TokenTree::Punct(it) if it.as_char() == ch);
     match rest {
         [open, quote, TokenTree::Ident(_), comma, TokenTree::Ident(inner), close]
-            if is(open, '<') && is(quote, '\'') && is(comma, ',') && is(close, '>') && inner.to_string() == "str" =>
+            if is(open, '<')
+                && is(quote, '\'')
+                && is(comma, ',')
+                && is(close, '>')
+                && inner.to_string() == "str" =>
         {
             Some(CowOf::Str)
         }
         [open, quote, TokenTree::Ident(_), comma, TokenTree::Group(inner), close]
-            if is(open, '<') && is(quote, '\'') && is(comma, ',') && is(close, '>')
+            if is(open, '<')
+                && is(quote, '\'')
+                && is(comma, ',')
+                && is(close, '>')
                 && inner.delimiter() == Delimiter::Bracket
                 && inner.stream().to_string().replace(' ', "") == "u8" =>
         {
@@ -723,15 +819,27 @@ fn variant_attrs(attrs: &[Group], owner: &Owner<'_>) -> Result<VariantAttrs, Err
     Ok(out)
 }
 
-fn named_fields(item: &str, variant: Option<&str>, body: &Group, rename_all: Option<RenameRule>) -> Result<Fields, Error> {
+fn named_fields(
+    item: &str,
+    variant: Option<&str>,
+    body: &Group,
+    rename_all: Option<RenameRule>,
+) -> Result<Fields, Error> {
     let mut list = Vec::new();
-    for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate() {
+    for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate()
+    {
         let mut c = Cursor::new(chunk);
         let attrs = c.outer_attrs();
         c.visibility();
         let ident = c.ident("a field's name")?;
         if !c.peek_punct(':') {
-            return Err(Error::new(ident.span(), format!("field `{ident}` of `{item}` ({}): no `:` after its name", at(ident.span()))));
+            return Err(Error::new(
+                ident.span(),
+                format!(
+                    "field `{ident}` of `{item}` ({}): no `:` after its name",
+                    at(ident.span())
+                ),
+            ));
         }
         c.next();
         let ty = c.rest();
@@ -754,7 +862,8 @@ fn named_fields(item: &str, variant: Option<&str>, body: &Group, rename_all: Opt
 
 fn tuple_fields(item: &str, variant: Option<&str>, body: &Group) -> Result<Fields, Error> {
     let mut list = Vec::new();
-    for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate() {
+    for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate()
+    {
         let mut c = Cursor::new(chunk);
         let attrs = c.outer_attrs();
         c.visibility();
@@ -766,14 +875,21 @@ fn tuple_fields(item: &str, variant: Option<&str>, body: &Group) -> Result<Field
         let owner = Owner { item, field: Some(&path) };
         let attrs = field_attrs(&attrs, &owner, &ty)?;
         if attrs.rename.is_some() {
-            return Err(Error::new(body.span(), format!("{owner}: `#[serde(rename)]` on a tuple field")));
+            return Err(Error::new(
+                body.span(),
+                format!("{owner}: `#[serde(rename)]` on a tuple field"),
+            ));
         }
         list.push(Field { ident: None, index, key: index.to_string(), ty, attrs });
     }
     Ok(Fields { style: Style::Tuple, list })
 }
 
-fn variants(item: &str, body: &Group, rename_all: Option<RenameRule>) -> Result<Vec<Variant>, Error> {
+fn variants(
+    item: &str,
+    body: &Group,
+    rename_all: Option<RenameRule>,
+) -> Result<Vec<Variant>, Error> {
     let mut out = Vec::new();
     for chunk in split_commas(body.stream().into_iter().collect()) {
         let mut c = Cursor::new(chunk);
@@ -892,7 +1008,8 @@ impl Cursor {
     fn visibility(&mut self) {
         if self.peek_ident("pub") {
             self.at += 1;
-            if matches!(self.peek(), Some(TokenTree::Group(it)) if it.delimiter() == Delimiter::Parenthesis) {
+            if matches!(self.peek(), Some(TokenTree::Group(it)) if it.delimiter() == Delimiter::Parenthesis)
+            {
                 self.at += 1;
             }
         }
@@ -922,7 +1039,10 @@ impl Cursor {
             arrow = is_arrow_head;
             out.push(tree);
         }
-        Err(Error::new(open, format!("blaze-serde-derive found no `>` closing the generics at {}", at(open))))
+        Err(Error::new(
+            open,
+            format!("blaze-serde-derive found no `>` closing the generics at {}", at(open)),
+        ))
     }
 
     /// The predicates of a `where` here, up to a `{` or `;` outside `<..>`; none when there is
@@ -936,10 +1056,14 @@ impl Cursor {
         let mut depth = 0u32;
         while let Some(tree) = self.peek() {
             match tree {
-                TokenTree::Group(group) if depth == 0 && group.delimiter() == Delimiter::Brace => break,
+                TokenTree::Group(group) if depth == 0 && group.delimiter() == Delimiter::Brace => {
+                    break;
+                }
                 TokenTree::Punct(punct) if depth == 0 && punct.as_char() == ';' => break,
                 TokenTree::Punct(punct) if punct.as_char() == '<' => depth += 1,
-                TokenTree::Punct(punct) if punct.as_char() == '>' => depth = depth.saturating_sub(1),
+                TokenTree::Punct(punct) if punct.as_char() == '>' => {
+                    depth = depth.saturating_sub(1)
+                }
                 _ => {}
             }
             tokens.push(tree.clone());

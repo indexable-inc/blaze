@@ -23,16 +23,8 @@ pub fn pretty_display_list<T>(
     t_to_string: impl Fn(T) -> String,
     it: impl IntoIterator<Item = T>,
 ) -> String {
-    let mut elems = it
-        .into_iter()
-        .map(t_to_string)
-        .map(|x| format!("  {},\n", x))
-        .peekable();
-    if elems.peek().is_none() {
-        "[]".to_owned()
-    } else {
-        format!("[\n{}]", elems.format(""))
-    }
+    let mut elems = it.into_iter().map(t_to_string).map(|x| format!("  {},\n", x)).peekable();
+    if elems.peek().is_none() { "[]".to_owned() } else { format!("[\n{}]", elems.format("")) }
 }
 
 /// Implement `From` and `TryFrom` to wrap/unwrap enum variants with a single payload.
@@ -227,10 +219,7 @@ pub mod type_map {
 
     impl<M> Default for TypeMap<M> {
         fn default() -> Self {
-            Self {
-                data: Default::default(),
-                phantom: Default::default(),
-            }
+            Self { data: Default::default(), phantom: Default::default() }
         }
     }
 }
@@ -468,10 +457,7 @@ pub fn arg_values<'a, T: AsRef<str>>(
             None
         }
     }
-    ArgFilter {
-        args: args.iter(),
-        needle,
-    }
+    ArgFilter { args: args.iter(), needle }
 }
 
 pub fn arg_value<'a, T: AsRef<str>>(args: &'a [T], needle: &'a str) -> Option<&'a str> {
@@ -481,13 +467,7 @@ pub fn arg_value<'a, T: AsRef<str>>(args: &'a [T], needle: &'a str) -> Option<&'
 #[test]
 fn catch_stack_overflow() {
     fn recurse(depth: usize) -> Result<(), StackDepthLimitExceeded> {
-        try_ensure_sufficient_stack(|| {
-            if depth > 0 {
-                recurse(depth - 1)
-            } else {
-                Ok(())
-            }
-        })?
+        try_ensure_sufficient_stack(|| if depth > 0 { recurse(depth - 1) } else { Ok(()) })?
     }
 
     assert!(recurse(1024).is_err());

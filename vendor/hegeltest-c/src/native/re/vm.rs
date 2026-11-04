@@ -210,11 +210,7 @@ impl Classes {
                 unreachable!("units are character tests")
             };
             if !unit.bounds(*flags, &mut bounds) {
-                return if units.len() > 63 {
-                    Classes::ByChar
-                } else {
-                    Classes::Tests(units)
-                };
+                return if units.len() > 63 { Classes::ByChar } else { Classes::Tests(units) };
             }
         }
         bounds.retain(|&bound| bound >= 128);
@@ -284,10 +280,8 @@ impl Dfa {
     /// The state whose threads are `pcs`, made when new; the caller
     /// keeps the number of states within [`DFA_STATES`].
     fn intern(&mut self, insts: &[Inst], pcs: &[usize]) -> u32 {
-        let waiting = pcs
-            .iter()
-            .position(|&pc| matches!(insts[pc], Inst::Match))
-            .unwrap_or(pcs.len());
+        let waiting =
+            pcs.iter().position(|&pc| matches!(insts[pc], Inst::Match)).unwrap_or(pcs.len());
         let pcs = &pcs[..(waiting + 1).min(pcs.len())];
         if let Some(&id) = self.ids.get(pcs) {
             return id;
@@ -408,14 +402,9 @@ impl<'p> Compiler<'p> {
     /// non-capturing group around one, with the flags in force inside it.
     fn single_unit(&mut self, p: &SubPattern, flags: u32) -> Option<(Unit, u32)> {
         match p.data.as_slice() {
-            [
-                OpCode::Subpattern {
-                    group: None,
-                    add_flags,
-                    del_flags,
-                    p,
-                },
-            ] => self.single_unit(p, combine_flags(flags, *add_flags, *del_flags)),
+            [OpCode::Subpattern { group: None, add_flags, del_flags, p }] => {
+                self.single_unit(p, combine_flags(flags, *add_flags, *del_flags))
+            }
             [op] => self.unit_of(op, flags).map(|unit| (unit, flags)),
             _ => None,
         }
@@ -438,12 +427,7 @@ impl<'p> Compiler<'p> {
                     self.branch(alternatives, flags)?;
                     continue;
                 }
-                OpCode::Subpattern {
-                    add_flags,
-                    del_flags,
-                    p,
-                    ..
-                } => {
+                OpCode::Subpattern { add_flags, del_flags, p, .. } => {
                     self.seq(p, combine_flags(flags, *add_flags, *del_flags))?;
                     continue;
                 }
@@ -496,11 +480,7 @@ impl<'p> Compiler<'p> {
         flags: u32,
     ) -> Result<usize, Unsupported> {
         let behind = (direction < 0).then(|| usize::try_from(get_width(p).0).unwrap_or(usize::MAX));
-        let index = self.emit(Inst::Look {
-            negate,
-            behind,
-            entry: 0,
-        })?;
+        let index = self.emit(Inst::Look { negate, behind, entry: 0 })?;
         self.pending.push((index, p, flags));
         Ok(index)
     }
@@ -544,11 +524,7 @@ impl<'p> Compiler<'p> {
 }
 
 fn split_inst(body: usize, exit: usize, greedy: bool) -> Inst {
-    if greedy {
-        Inst::Split(body, exit)
-    } else {
-        Inst::Split(exit, body)
-    }
+    if greedy { Inst::Split(body, exit) } else { Inst::Split(exit, body) }
 }
 
 /// The threads still waiting for input at the end of a text, in order of
@@ -590,10 +566,7 @@ struct Scratch {
 
 impl Scratch {
     fn new(size: usize) -> Scratch {
-        let threads = || Threads {
-            pcs: Vec::with_capacity(size),
-            marks: alloc::vec![0; size],
-        };
+        let threads = || Threads { pcs: Vec::with_capacity(size), marks: alloc::vec![0; size] };
         Scratch {
             current: threads(),
             next: threads(),
@@ -641,10 +614,8 @@ impl Program {
                 *target = entry;
             }
         }
-        let positional = compiler
-            .insts
-            .iter()
-            .any(|inst| matches!(inst, Inst::At(..) | Inst::Look { .. }));
+        let positional =
+            compiler.insts.iter().any(|inst| matches!(inst, Inst::At(..) | Inst::Look { .. }));
         let classes = Classes::of(&compiler.insts);
         Ok(Program {
             insts: compiler.insts,
@@ -700,10 +671,7 @@ impl Program {
     }
 
     fn take_scratch(&self) -> Scratch {
-        self.scratch
-            .lock()
-            .pop()
-            .unwrap_or_else(|| Scratch::new(self.insts.len()))
+        self.scratch.lock().pop().unwrap_or_else(|| Scratch::new(self.insts.len()))
     }
 
     fn return_scratch(&self, scratch: Scratch) {
@@ -790,15 +758,8 @@ impl Program {
         let mut scratch = self.take_scratch();
         scratch.current.pcs.clear();
         scratch.current.pcs.extend_from_slice(&resume.pcs);
-        let (end, touch, _) = self.steps(
-            text,
-            start,
-            start + consumed,
-            None,
-            found,
-            Touch::Never,
-            &mut scratch,
-        );
+        let (end, touch, _) =
+            self.steps(text, start, start + consumed, None, found, Touch::Never, &mut scratch);
         self.return_scratch(scratch);
         (end, touch)
     }
@@ -948,12 +909,7 @@ impl Program {
         mut touch: Touch,
         scratch: &mut Scratch,
     ) -> (Option<usize>, Touch, Option<Resume>) {
-        let Scratch {
-            current,
-            next,
-            stack,
-            generation,
-        } = scratch;
+        let Scratch { current, next, stack, generation } = scratch;
         while !current.pcs.is_empty() {
             *generation += 1;
             next.pcs.clear();
@@ -1045,11 +1001,7 @@ impl Program {
                         stack.push(pc + 1);
                     }
                 }
-                Inst::Look {
-                    negate,
-                    behind,
-                    entry,
-                } => {
+                Inst::Look { negate, behind, entry } => {
                     let (matched, inner) = self.look(*behind, *entry, text, pos);
                     if behind.is_some_and(|w| w > pos) || inner != Touch::Never {
                         *touch = Touch::End;

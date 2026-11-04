@@ -227,7 +227,10 @@ const _: () = assert!(size_of::<Group>() == 32 && align_of::<Group>() == 32);
 
 fn new_table(len: usize) -> Box<[Group]> {
     (0..len)
-        .map(|_| Group { ctrl: AtomicU64::new(0), values: std::array::from_fn(|_| AtomicU32::new(0)) })
+        .map(|_| Group {
+            ctrl: AtomicU64::new(0),
+            values: std::array::from_fn(|_| AtomicU32::new(0)),
+        })
         // alloc: growth, one table per doubling of the values, over the inserts that filled the last
         .collect()
 }
@@ -321,7 +324,8 @@ impl Index {
 
     /// How many values the table in use holds at most before it grows: 0 before the first insert.
     pub fn capacity(&self) -> usize {
-        self.at_level(self.level.load(Ordering::Acquire)).map_or(0, |groups| groups.len() * INDEX_SLOTS * 3 / 4)
+        self.at_level(self.level.load(Ordering::Acquire))
+            .map_or(0, |groups| groups.len() * INDEX_SLOTS * 3 / 4)
     }
 
     /// Frees the tables the index outgrew. With `&mut`, no reader is probing one.
@@ -335,7 +339,9 @@ impl Index {
 
 /// Fills the first empty slot from `hash`'s home group of `groups`, for the one writer.
 fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
-    let at = vacant(hash, groups.len(), |at: usize| Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Relaxed)));
+    let at = vacant(hash, groups.len(), |at: usize| {
+        Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Relaxed))
+    });
     let group = &groups[at.group];
     group.values[at.slot].store(value, Ordering::Relaxed);
     group.ctrl.store(at.tagged(tag(hash)).0, publish);
@@ -377,7 +383,14 @@ mod tests {
         }
 
         /// The probe loop as each copy wrote it, over plain words.
-        pub fn find(words: &[u64], slots: usize, hash: u64, tag: u64, low: u64, hit: impl Fn(usize) -> bool) -> Option<usize> {
+        pub fn find(
+            words: &[u64],
+            slots: usize,
+            hash: u64,
+            tag: u64,
+            low: u64,
+            hit: impl Fn(usize) -> bool,
+        ) -> Option<usize> {
             let mask = words.len() - 1;
             let mut at = hash as usize & mask;
             loop {
@@ -419,7 +432,11 @@ mod tests {
     fn agrees<const SLOTS: usize>(bytes: [u8; 8], tag: u8) {
         let word = word::<SLOTS>(bytes);
         let low = Ctrl::<SLOTS>::LOW;
-        assert_eq!(bits(word.matching(tag)), reference::matching(word.0, u64::from(tag), low), "{word:x?} {tag:x}");
+        assert_eq!(
+            bits(word.matching(tag)),
+            reference::matching(word.0, u64::from(tag), low),
+            "{word:x?} {tag:x}"
+        );
         assert_eq!(bits(word.empty()), reference::empty(word.0, low));
         assert_eq!(bits(word.live()), reference::live(word.0, low));
         let naive: Vec<usize> = (0..SLOTS).filter(|&slot| word.tag_at(slot) == tag).collect();
@@ -461,8 +478,15 @@ mod tests {
         let key = hash >> 60;
         let hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
         let low = Ctrl::<SLOTS>::LOW;
-        let want = reference::find(&words, SLOTS, hash, u64::from(tag(hash)), low, |i| keys[i] == key);
-        let got = find::<SLOTS, usize>(hash, tag(hash), groups, |g| Ctrl(words[g]), |at| (keys[at.index()] == key).then_some(at.index()));
+        let want =
+            reference::find(&words, SLOTS, hash, u64::from(tag(hash)), low, |i| keys[i] == key);
+        let got = find::<SLOTS, usize>(
+            hash,
+            tag(hash),
+            groups,
+            |g| Ctrl(words[g]),
+            |at| (keys[at.index()] == key).then_some(at.index()),
+        );
         assert_eq!(got, want);
         if words.iter().any(|&w| Ctrl::<SLOTS>(w).empty().any()) {
             let stop = vacant::<SLOTS>(hash, groups, |g| Ctrl(words[g]));
@@ -501,7 +525,11 @@ mod tests {
             }
         }
         assert_eq!(bits(Ctrl::<7>(0x0000_ff00_0081_0000).empty()), 0x0080_0080_8000_8080);
-        assert_eq!(bits(Ctrl::<7>(0x00ff_ffff_ffff_ffff).empty()), 0, "byte 7 is never a free slot");
+        assert_eq!(
+            bits(Ctrl::<7>(0x00ff_ffff_ffff_ffff).empty()),
+            0,
+            "byte 7 is never a free slot"
+        );
         assert_eq!(bits(Ctrl::<7>(0x80).empty()), 0x0080_8080_8080_8000, "dead is not free");
         assert_eq!(bits(Ctrl::<8>(0x0081_80ff_0000_8082).live()), 0x0080_0080_0000_0080);
         assert_eq!(bits(Ctrl::<8>(0x8080_8080_8080_8080).live()), 0);
@@ -509,7 +537,9 @@ mod tests {
 
     #[test]
     fn live_skips_empty_and_dead() {
-        for word in [0u64, 0x80, 0x0081_80ff_0000_8082, 0x00ff_ffff_ffff_ffff, 0x0080_8080_8080_8080] {
+        for word in
+            [0u64, 0x80, 0x0081_80ff_0000_8082, 0x00ff_ffff_ffff_ffff, 0x0080_8080_8080_8080]
+        {
             let want: Vec<usize> = (0..7)
                 .filter(|&slot| {
                     let byte = (word >> (slot * 8)) as u8;
@@ -556,7 +586,9 @@ mod tests {
                 if found.is_none() {
                     let value = keys.len() as u32;
                     keys.push(key);
-                    index.insert(model.len(), hash_of(key), value, |value| hash_of(keys[value as usize]));
+                    index.insert(model.len(), hash_of(key), value, |value| {
+                        hash_of(keys[value as usize])
+                    });
                     model.insert(key, value);
                 }
                 if step % 10_000 == 0 {
@@ -599,7 +631,9 @@ mod tests {
             }
             let value = *len as u32;
             column[value as usize].store(key, Ordering::Relaxed);
-            index.insert(*len, hash_of(key), value, |value| hash_of(column[value as usize].load(Ordering::Relaxed)));
+            index.insert(*len, hash_of(key), value, |value| {
+                hash_of(column[value as usize].load(Ordering::Relaxed))
+            });
             *len += 1;
             value
         };
@@ -613,7 +647,9 @@ mod tests {
                         let value = intern(key);
                         assert_eq!(column[value as usize].load(Ordering::Relaxed), key);
                         let first = (n % 100) as usize;
-                        let found = index.find(hash_of(first as u64), |it| column[it as usize].load(Ordering::Relaxed) == first as u64);
+                        let found = index.find(hash_of(first as u64), |it| {
+                            column[it as usize].load(Ordering::Relaxed) == first as u64
+                        });
                         assert_eq!(found, Some(early[first]));
                     }
                 });
@@ -652,7 +688,10 @@ mod tests {
         }
         blaze_alloc_count::assert_at_most(0, "an index's finds", || {
             for &key in &keys {
-                assert_eq!(index.find(hash_of(key), |it| keys[it as usize] == key), Some(key as u32));
+                assert_eq!(
+                    index.find(hash_of(key), |it| keys[it as usize] == key),
+                    Some(key as u32)
+                );
             }
             assert_eq!(index.find(hash_of(5_000), |it| keys[it as usize] == 5_000), None);
         });
@@ -663,7 +702,8 @@ mod tests {
     fn a_probe_allocates_nothing() {
         let words = [0x0081_8283_8485_8687u64, 0x0000_0000_0000_0081];
         blaze_alloc_count::assert_at_most(0, "a probe", || {
-            let found = find::<7, usize>(1 << 57, 0x81, 2, |g| Ctrl(words[g]), |at| Some(at.index()));
+            let found =
+                find::<7, usize>(1 << 57, 0x81, 2, |g| Ctrl(words[g]), |at| Some(at.index()));
             let free = vacant::<7>(0, 2, |g| Ctrl(words[g]));
             (found, free)
         });
@@ -696,7 +736,9 @@ mod model {
             assert_eq!(index.capacity(), 4);
             let reader = {
                 let index = index.clone();
-                thread::spawn(move || (index.find(HASH, |it| it == 0), index.find(HASH, |it| it == 4)))
+                thread::spawn(move || {
+                    (index.find(HASH, |it| it == 0), index.find(HASH, |it| it == 4))
+                })
             };
             index.insert(4, HASH, 4, |_| HASH);
             index.insert(5, HASH, 5, |_| HASH);
@@ -704,7 +746,11 @@ mod model {
             assert_eq!(zero, Some(0), "a value from before the growth is found");
             assert!(four.is_none() || four == Some(4), "a value is found whole or not at all");
             for value in 0..6 {
-                assert_eq!(index.find(HASH, |it| it == value), Some(value), "kept across the growth");
+                assert_eq!(
+                    index.find(HASH, |it| it == value),
+                    Some(value),
+                    "kept across the growth"
+                );
             }
         });
     }

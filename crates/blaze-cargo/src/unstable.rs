@@ -87,7 +87,9 @@ const TABLE: &[(&str, Row)] = &[
     ("codegen-source-order", Ignored(RUSTC_BACKEND)),
     (
         "contract-checks",
-        Modelled("blaze sets `cfg(contract_checks)` and lowers nightly's contract clauses as rustc does"),
+        Modelled(
+            "blaze sets `cfg(contract_checks)` and lowers nightly's contract clauses as rustc does",
+        ),
     ),
     ("coverage-options", Refused(INSTRUMENTS)),
     ("crate-attr", Refused("blaze's front end does not see the attribute it adds")),
@@ -408,30 +410,45 @@ pub const UNLINKED: &str = "the build is sanitized (`-Z sanitizer`, or Sanitizer
 /// as rustc's `link_sanitizer_runtime` names it in `lib/rustlib/<target>/lib/`: a dylib on
 /// Apple targets, an archive elsewhere. An error names the sanitizer and the path looked at;
 /// blaze's linker checks the same file when it links it.
-pub fn runtimes(sanitizers: Sanitizers, target: &str, sysroot: &std::path::Path) -> Result<(), String> {
+pub fn runtimes(
+    sanitizers: Sanitizers,
+    target: &str,
+    sysroot: &std::path::Path,
+) -> Result<(), String> {
     let apple = target.contains("-apple-");
     let dir = sysroot.join("lib/rustlib").join(target).join("lib");
-    for (one, short) in [(Sanitizers::ADDRESS, "asan"), (Sanitizers::THREAD, "tsan"), (Sanitizers::MEMORY, "msan")] {
+    for (one, short) in
+        [(Sanitizers::ADDRESS, "asan"), (Sanitizers::THREAD, "tsan"), (Sanitizers::MEMORY, "msan")]
+    {
         if !sanitizers.contains(one) {
             continue;
         }
         let name = sanitizer_name(one);
         if target.contains("-windows-") {
-            return Err(format!("`-Zsanitizer={name}` on `{target}`: blaze links no sanitizer runtime for Windows"));
+            return Err(format!(
+                "`-Zsanitizer={name}` on `{target}`: blaze links no sanitizer runtime for Windows"
+            ));
         }
         if apple && one == Sanitizers::MEMORY {
-            return Err(format!("`-Zsanitizer={name}` on `{target}`: rustc has no memory sanitizer runtime for Apple targets"));
+            return Err(format!(
+                "`-Zsanitizer={name}` on `{target}`: rustc has no memory sanitizer runtime for Apple targets"
+            ));
         }
-        let file = dir.join(format!("librustc-nightly_rt.{short}.{}", if apple { "dylib" } else { "a" }));
+        let file =
+            dir.join(format!("librustc-nightly_rt.{short}.{}", if apple { "dylib" } else { "a" }));
         if !file.is_file() {
-            return Err(format!("`-Zsanitizer={name}` needs its runtime `{}`, which blaze's toolchain does not have", file.display()));
+            return Err(format!(
+                "`-Zsanitizer={name}` needs its runtime `{}`, which blaze's toolchain does not have",
+                file.display()
+            ));
         }
     }
     Ok(())
 }
 
 /// The set of each of [`SANITIZERS`], in its order.
-const SANITIZER_SETS: [Sanitizers; 3] = [Sanitizers::ADDRESS, Sanitizers::MEMORY, Sanitizers::THREAD];
+const SANITIZER_SETS: [Sanitizers; 3] =
+    [Sanitizers::ADDRESS, Sanitizers::MEMORY, Sanitizers::THREAD];
 
 /// The pairs rustc refuses together (`SanitizerSet::MUTUALLY_EXCLUSIVE`), of those blaze has.
 const EXCLUSIVE: [(Sanitizers, Sanitizers); 3] = [
@@ -472,9 +489,9 @@ fn sanitizer(name: &str, given: &str) -> Result<Sanitizers, String> {
 
 /// The comma-separated names of a list flag; rustc refuses one with no value.
 fn names<'a>(flag: &Flag<'a>) -> Result<std::str::Split<'a, char>, String> {
-    flag.value
-        .map(|value| value.split(','))
-        .ok_or_else(|| format!("-Z {}: rustc wants a comma-separated list of sanitizers", flag.given))
+    flag.value.map(|value| value.split(',')).ok_or_else(|| {
+        format!("-Z {}: rustc wants a comma-separated list of sanitizers", flag.given)
+    })
 }
 
 /// The build's sanitizers as rustc takes them from the words of its command line:
@@ -500,7 +517,12 @@ pub fn sanitize<S: AsRef<str>>(words: &[S]) -> Result<Sanitize, String> {
                         "memory" => Sanitizers::MEMORY,
                         "thread" => Sanitizers::NONE,
                         _ if UNSANITIZED.contains(&name) => Sanitizers::NONE,
-                        _ => return Err(format!("-Z {}: rustc has no sanitizer `{name}`", flag.given)),
+                        _ => {
+                            return Err(format!(
+                                "-Z {}: rustc has no sanitizer `{name}`",
+                                flag.given
+                            ));
+                        }
                     });
                 }
             }
@@ -515,7 +537,9 @@ pub fn sanitize<S: AsRef<str>>(words: &[S]) -> Result<Sanitize, String> {
             _ => {}
         }
     }
-    if let Some((a, b)) = EXCLUSIVE.into_iter().find(|(a, b)| sanitizers.contains(*a) && sanitizers.contains(*b)) {
+    if let Some((a, b)) =
+        EXCLUSIVE.into_iter().find(|(a, b)| sanitizers.contains(*a) && sanitizers.contains(*b))
+    {
         return Err(format!(
             "`-Zsanitizer={}` is incompatible with `-Zsanitizer={}`",
             sanitizer_name(a),
@@ -585,7 +609,8 @@ fn coverage<S: AsRef<str>>(words: &[S]) -> Result<Coverage, String> {
             "llvm-args" => {
                 for arg in value.split_whitespace() {
                     let option = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
-                    let Some(option) = option.and_then(|it| it.strip_prefix("sanitizer-coverage-")) else {
+                    let Some(option) = option.and_then(|it| it.strip_prefix("sanitizer-coverage-"))
+                    else {
                         continue;
                     };
                     let (option, given) = match option.split_once('=') {
@@ -679,7 +704,8 @@ mod tests {
 
     #[test]
     fn a_sanitizer_runtime_the_toolchain_lacks_is_named() {
-        let sysroot = std::env::temp_dir().join(format!("blaze-sanitizer-runtimes-{}", std::process::id()));
+        let sysroot =
+            std::env::temp_dir().join(format!("blaze-sanitizer-runtimes-{}", std::process::id()));
         let lib = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("librustc-nightly_rt.asan.a"), b"").unwrap();
@@ -688,17 +714,30 @@ mod tests {
         assert_eq!(runtimes(Sanitizers::NONE, "aarch64-apple-darwin", &sysroot), Ok(()));
         let thread = runtimes(Sanitizers::THREAD, linux, &sysroot).unwrap_err();
         assert!(thread.starts_with("`-Zsanitizer=thread` needs its runtime `"), "{thread}");
-        assert!(thread.contains(&lib.join("librustc-nightly_rt.tsan.a").display().to_string()), "{thread}");
+        assert!(
+            thread.contains(&lib.join("librustc-nightly_rt.tsan.a").display().to_string()),
+            "{thread}"
+        );
         let apple = runtimes(Sanitizers::ADDRESS, "aarch64-apple-darwin", &sysroot).unwrap_err();
         assert!(apple.contains("librustc-nightly_rt.asan.dylib"), "{apple}");
-        assert!(runtimes(Sanitizers::MEMORY, "aarch64-apple-darwin", &sysroot).unwrap_err().contains("Apple"));
-        assert!(runtimes(Sanitizers::ADDRESS, "x86_64-pc-windows-msvc", &sysroot).unwrap_err().contains("Windows"));
+        assert!(
+            runtimes(Sanitizers::MEMORY, "aarch64-apple-darwin", &sysroot)
+                .unwrap_err()
+                .contains("Apple")
+        );
+        assert!(
+            runtimes(Sanitizers::ADDRESS, "x86_64-pc-windows-msvc", &sysroot)
+                .unwrap_err()
+                .contains("Windows")
+        );
         std::fs::remove_dir_all(&sysroot).unwrap();
     }
 
     #[test]
     fn the_sanitizer_flags_stay_refused_until_they_link() {
-        for given in ["sanitizer=address", "sanitizer-recover=address", "sanitizer-memory-track-origins"] {
+        for given in
+            ["sanitizer=address", "sanitizer-recover=address", "sanitizer-memory-track-origins"]
+        {
             assert!(matches!(flag(given).treatment(), Treatment::Refused(_)), "{given}");
         }
     }
@@ -706,12 +745,18 @@ mod tests {
     #[test]
     fn sanitizers_as_rustc_reads_them() {
         assert_eq!(sanitize(&["-Copt-level=0", "-Zthreads=8"]).unwrap(), Sanitize::default());
-        let address = sanitize(&["-Zsanitizer=address", "-Z", "sanitizer_recover=address,thread,memory"]).unwrap();
-        assert_eq!((address.sanitizers, address.recover), (Sanitizers::ADDRESS, Sanitizers::ADDRESS));
+        let address =
+            sanitize(&["-Zsanitizer=address", "-Z", "sanitizer_recover=address,thread,memory"])
+                .unwrap();
+        assert_eq!(
+            (address.sanitizers, address.recover),
+            (Sanitizers::ADDRESS, Sanitizers::ADDRESS)
+        );
         assert!(!address.is_empty());
         let memory = sanitize(&["-Zsanitizer=memory", "-Zsanitizer-memory-track-origins"]).unwrap();
         assert_eq!((memory.sanitizers, memory.track_origins), (Sanitizers::MEMORY, 2));
-        let origins = sanitize(&["-Zsanitizer=address", "-Zsanitizer-memory-track-origins=1"]).unwrap();
+        let origins =
+            sanitize(&["-Zsanitizer=address", "-Zsanitizer-memory-track-origins=1"]).unwrap();
         assert_eq!(origins.track_origins, 0);
         // A recover of what is not on changes no code, as in rustc.
         assert_eq!(sanitize(&["-Zsanitizer-recover=address"]).unwrap(), Sanitize::default());
@@ -726,7 +771,9 @@ mod tests {
         assert!(sanitize(&["-Zsanitizer=memory,thread"]).unwrap_err().contains("incompatible"));
         assert!(sanitize(&["-Zsanitizer=cfi"]).unwrap_err().contains("the `cfi` sanitizer"));
         assert!(sanitize(&["-Zsanitizer=nope"]).unwrap_err().contains("no sanitizer `nope`"));
-        assert!(sanitize(&["-Zsanitizer-recover=nope"]).unwrap_err().contains("no sanitizer `nope`"));
+        assert!(
+            sanitize(&["-Zsanitizer-recover=nope"]).unwrap_err().contains("no sanitizer `nope`")
+        );
         assert!(sanitize(&["-Zsanitizer"]).is_err());
         assert!(sanitize(&["-Zsanitizer-memory-track-origins=3"]).is_err());
     }
@@ -740,7 +787,8 @@ mod tests {
             "memory" => Some(Sanitizers::MEMORY),
             _ => None,
         };
-        for name in ["address", "thread", "memory", "cfi", "leak", "shadow-call-stack", "nope", ""] {
+        for name in ["address", "thread", "memory", "cfi", "leak", "shadow-call-stack", "nope", ""]
+        {
             assert_eq!(sanitizer(name, name).ok(), reference(name), "{name}");
         }
         for (at, name) in SANITIZERS.iter().enumerate() {
@@ -773,8 +821,14 @@ mod tests {
             "-Cllvm-args=-sanitizer-coverage-level=2 -sanitizer-coverage-trace-pc \
              -sanitizer-coverage-trace-pc=false -sanitizer-coverage-prune-blocks=0",
         ];
-        assert_eq!(sanitize(&last).unwrap().coverage, Coverage { level: 2, flags: Coverage::NO_PRUNE });
-        let unknown = ["-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=1 -sanitizer-coverage-drop-ctors"];
+        assert_eq!(
+            sanitize(&last).unwrap().coverage,
+            Coverage { level: 2, flags: Coverage::NO_PRUNE }
+        );
+        let unknown = [
+            "-Cpasses=sancov-module",
+            "-Cllvm-args=-sanitizer-coverage-level=1 -sanitizer-coverage-drop-ctors",
+        ];
         assert!(sanitize(&unknown).unwrap_err().contains("-sanitizer-coverage-drop-ctors"));
         assert_eq!(sanitize(&unknown[1..]).unwrap(), Sanitize::default());
         assert!(sanitize(&["-Cllvm-args=-sanitizer-coverage-level=x"]).is_err());

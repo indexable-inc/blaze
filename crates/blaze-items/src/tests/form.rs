@@ -1,7 +1,6 @@
 //! Forms: which edits reach an item's interface, body and closures, and which leave them.
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_def::{
     AdtId, DefWithBodyId, VariantId,
@@ -13,6 +12,7 @@ use hir_ty::{
     db::{HirDatabase, InternedClosure, InternedClosureId},
     mir::{BasicBlockId, MirBody, TerminatorKind},
 };
+use std::alloc::Global;
 
 use super::{TestDB, edit, item, items, single};
 use crate::{
@@ -48,7 +48,8 @@ fn closures(db: &TestDB, f: ItemId) -> Vec<InternedClosureId<'_>> {
         .filter_map(|(expr, it)| match it {
             // An `async` block is a coroutine, interned as an `InternedCoroutineId`.
             Expr::Closure {
-                closure_kind: closure_kind @ (ClosureKind::Closure | ClosureKind::CoroutineClosure(_)),
+                closure_kind:
+                    closure_kind @ (ClosureKind::Closure | ClosureKind::CoroutineClosure(_)),
                 ..
             } => Some(InternedClosureId::new(
                 db,
@@ -618,8 +619,11 @@ fn shared_type_forms_are_the_forms_each_cx_spelled() {
 }
 
 /// A walk's order, block numbers and unwinds, kept as `Canon` kept them before its columns.
-type HashedWalk =
-    (Vec<BasicBlockId>, HashMap<BasicBlockId, u32, Global>, HashMap<(BasicBlockId, usize), BasicBlockId, Global>);
+type HashedWalk = (
+    Vec<BasicBlockId>,
+    HashMap<BasicBlockId, u32, Global>,
+    HashMap<(BasicBlockId, usize), BasicBlockId, Global>,
+);
 
 fn hashed_walk(body: &MirBody<'_>) -> HashedWalk {
     let mut order = Vec::new();

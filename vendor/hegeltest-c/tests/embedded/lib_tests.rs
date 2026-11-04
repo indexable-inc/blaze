@@ -12,22 +12,15 @@ fn ok(rc: hegel_result_t) {
 
 /// Start a database-free, single-seed run and hand back its first live test
 /// case (a run-owned root), keeping the owning context/settings/run alive.
-unsafe fn start_run_and_first_case() -> (
-    *mut HegelContext,
-    *mut HegelSettings,
-    *mut HegelRun,
-    *mut HegelTestCase,
-) {
+unsafe fn start_run_and_first_case()
+-> (*mut HegelContext, *mut HegelSettings, *mut HegelRun, *mut HegelTestCase) {
     let ctx = hegel_context_new();
     let mut s: *mut HegelSettings = ptr::null_mut();
     assert_eq!(unsafe { hegel_settings_new(ctx, &mut s) }, HEGEL_OK);
     ok(unsafe { hegel_settings_set_database(ctx, s, &"".into()) });
     ok(unsafe { hegel_settings_set_seed(ctx, s, 1, true) });
     let mut run: *mut HegelRun = ptr::null_mut();
-    assert_eq!(
-        unsafe { hegel_run_start(ctx, s, None, ptr::null_mut(), &mut run) },
-        HEGEL_OK
-    );
+    assert_eq!(unsafe { hegel_run_start(ctx, s, None, ptr::null_mut(), &mut run) }, HEGEL_OK);
     let mut tc: *mut HegelTestCase = ptr::null_mut();
     assert_eq!(unsafe { hegel_next_test_case(ctx, run, &mut tc) }, HEGEL_OK);
     assert!(!tc.is_null());
@@ -42,12 +35,7 @@ unsafe fn finish(
     tc: *mut HegelTestCase,
 ) {
     unsafe {
-        ok(hegel_mark_complete(
-            ctx,
-            tc,
-            hegel_status_t::HEGEL_STATUS_VALID as u32,
-            ptr::null(),
-        ));
+        ok(hegel_mark_complete(ctx, tc, hegel_status_t::HEGEL_STATUS_VALID as u32, ptr::null()));
         ok(hegel_test_case_free(ctx, tc));
         ok(hegel_run_free(ctx, run));
         ok(hegel_settings_free(ctx, s));
@@ -122,12 +110,7 @@ fn completion_is_reported_before_concurrent_use() {
         let (ctx, s, run, tc) = start_run_and_first_case();
 
         assert_eq!(
-            hegel_mark_complete(
-                ctx,
-                tc,
-                hegel_status_t::HEGEL_STATUS_VALID as u32,
-                ptr::null()
-            ),
+            hegel_mark_complete(ctx, tc, hegel_status_t::HEGEL_STATUS_VALID as u32, ptr::null()),
             HEGEL_OK
         );
 
@@ -176,9 +159,7 @@ fn concurrent_use_of_one_collection_is_rejected() {
                 break;
             }
             let mut value = false;
-            ok(hegel_generate_boolean(
-                ctx, clone, 0.5, false, false, &mut value,
-            ));
+            ok(hegel_generate_boolean(ctx, clone, 0.5, false, false, &mut value));
         }
 
         ok(hegel_collection_free(ctx, collection));
@@ -231,10 +212,7 @@ fn engine_suspending_without_an_offer_becomes_a_run_error() {
         let mut message = ptr::null();
         ok(hegel_run_result_error(ctx, result, &mut message));
         let message = (*message).as_str().unwrap();
-        assert!(
-            message.contains("suspended without offering a test case"),
-            "{message}"
-        );
+        assert!(message.contains("suspended without offering a test case"), "{message}");
         assert!(message.contains("bug in hegel"), "{message}");
         assert_eq!(
             error_kind_of(ctx, result),
@@ -288,21 +266,9 @@ fn every_run_error_maps_to_its_kind_through_the_abi() {
             HEGEL_HC_LARGE_INITIAL_TEST_CASE as u32,
         ),
         (RunError::Flaky("m".to_string()), HEGEL_RUN_ERROR_FLAKY, 0),
-        (
-            RunError::NonDeterministic("m".to_string()),
-            HEGEL_RUN_ERROR_NONDETERMINISTIC,
-            0,
-        ),
-        (
-            RunError::Unsatisfiable("m".to_string()),
-            HEGEL_RUN_ERROR_UNSATISFIABLE,
-            0,
-        ),
-        (
-            RunError::UsageError("m".to_string()),
-            HEGEL_RUN_ERROR_USAGE,
-            0,
-        ),
+        (RunError::NonDeterministic("m".to_string()), HEGEL_RUN_ERROR_NONDETERMINISTIC, 0),
+        (RunError::Unsatisfiable("m".to_string()), HEGEL_RUN_ERROR_UNSATISFIABLE, 0),
+        (RunError::UsageError("m".to_string()), HEGEL_RUN_ERROR_USAGE, 0),
         (
             RunError::Internal(crate::control::InternalError::new(format_args!("m"))),
             HEGEL_RUN_ERROR_INTERNAL,
@@ -389,9 +355,9 @@ fn internal_run_error_surfaces_through_run_result_error() {
     let ctx = hegel_context_new();
     let exchange = Arc::new(CaseExchange::new());
     let engine: EngineFuture = Box::pin(async {
-        Err(crate::backend::RunError::Internal(
-            crate::control::InternalError::new(format_args!("exploration invariant violated")),
-        ))
+        Err(crate::backend::RunError::Internal(crate::control::InternalError::new(format_args!(
+            "exploration invariant violated"
+        ))))
     });
     let run = Box::into_raw(Box::new(HegelRun {
         engine: Some(engine),
@@ -415,10 +381,7 @@ fn internal_run_error_surfaces_through_run_result_error() {
         let mut message = ptr::null();
         ok(hegel_run_result_error(ctx, result, &mut message));
         let message = (*message).as_str().unwrap();
-        assert!(
-            message.contains("exploration invariant violated"),
-            "{message}"
-        );
+        assert!(message.contains("exploration invariant violated"), "{message}");
         assert!(message.contains("bug in hegel"), "{message}");
 
         ok(hegel_run_result_free(ctx, result));
@@ -439,10 +402,7 @@ fn concurrent_use_of_one_printer_handle_is_rejected() {
         ok(hegel_printer_new(ctx, ptr::null(), &mut p));
 
         (*p).busy.store(true, Ordering::Release);
-        assert_eq!(
-            hegel_printer_text(ctx, p, "a".into()),
-            HEGEL_E_CONCURRENT_USE
-        );
+        assert_eq!(hegel_printer_text(ctx, p, "a".into()), HEGEL_E_CONCURRENT_USE);
         (*p).busy.store(false, Ordering::Release);
 
         ok(hegel_printer_text(ctx, p, "a".into()));

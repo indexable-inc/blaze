@@ -15,7 +15,10 @@
 //! zstd. Cold: each column in its smallest codec ([`super::raw_cold`]), then zstd over the
 //! whole form with the schema's dictionary.
 
-use super::{Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed, raw_cold};
+use super::{
+    Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed,
+    raw_cold,
+};
 use crate::{ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of, leb, open_as};
 
 const FORM_VERSION: u8 = 2;
@@ -29,7 +32,10 @@ const SPLIT_ROWS: usize = 16;
 /// Where the word tables of a buffer of schema `schema`, whose root is an `R`, are, in order
 /// and none overlapping: two that overlap are one table of one word a row over both. The
 /// buffer is checked whole first, as [`open_as`] checks it.
-pub fn columns_of<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<Vec<WordTable>, FormatError> {
+pub fn columns_of<R: Record>(
+    buffer: &[u8],
+    schema: SchemaHash,
+) -> Result<Vec<WordTable>, FormatError> {
     let copy;
     let buffer = match (buffer.as_ptr() as usize).is_multiple_of(ALIGN) {
         true => buffer,
@@ -135,7 +141,8 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
     if len > MOST_RAW || rest_len > len {
         return Err(CORRUPT);
     }
-    let rest_end = bytes.at.checked_add(rest_len as usize).filter(|&end| end <= form.len()).ok_or(CORRUPT)?;
+    let rest_end =
+        bytes.at.checked_add(rest_len as usize).filter(|&end| end <= form.len()).ok_or(CORRUPT)?;
     let rest = &form[bytes.at..rest_end];
     bytes.at = rest_end;
     let len = len as usize;
@@ -146,7 +153,8 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
         let gap = count(&mut bytes)?;
         let rows = count(&mut bytes)?;
         let stride = count(&mut bytes)?;
-        let before = taken.checked_add(gap).filter(|&before| before <= rest.len()).ok_or(CORRUPT)?;
+        let before =
+            taken.checked_add(gap).filter(|&before| before <= rest.len()).ok_or(CORRUPT)?;
         let words = rows.checked_mul(stride).ok_or(CORRUPT)?;
         if rows == 0 || stride == 0 || words > (len - out.len().min(len)) / 4 {
             return Err(CORRUPT);
@@ -154,7 +162,8 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
         fields.clear();
         for _ in 0..stride {
             let encoded = count(&mut bytes)?;
-            let end = bytes.at.checked_add(encoded).filter(|&end| end <= form.len()).ok_or(CORRUPT)?;
+            let end =
+                bytes.at.checked_add(encoded).filter(|&end| end <= form.len()).ok_or(CORRUPT)?;
             let column = &form[bytes.at..end];
             bytes.at = end;
             let values = match tier {
@@ -178,7 +187,9 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
         out.reserve(4 * words);
         match &fields[..] {
             [values] => out.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-            _ => (0..rows).for_each(|row| out.extend(fields.iter().flat_map(|field| field[row].to_le_bytes()))),
+            _ => (0..rows).for_each(|row| {
+                out.extend(fields.iter().flat_map(|field| field[row].to_le_bytes()))
+            }),
         }
     }
     out.extend_from_slice(&rest[taken..]);

@@ -29,7 +29,9 @@ pub fn cast<T: Record>(bytes: &[u8]) -> Option<&[T]> {
     // SAFETY: `bytes` is aligned for `T` and holds `len / size_of::<T>()` whole `T`s (checked
     // above), and `T` is plain (asserted above): every bit pattern of its size is a `T`. The
     // result borrows `bytes`, so it lives no longer than they do.
-    Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), bytes.len() / size_of::<T>()) })
+    Some(unsafe {
+        std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), bytes.len() / size_of::<T>())
+    })
 }
 
 #[cfg(test)]

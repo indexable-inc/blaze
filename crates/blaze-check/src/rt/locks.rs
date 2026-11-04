@@ -54,9 +54,7 @@ impl Runtime {
     }
 
     pub(crate) fn rwlock(&mut self, id: &std::sync::atomic::AtomicU64) -> u32 {
-        self.object(id, |_| {
-            Object::RwLock(RwLock { readers: 0, writer: None, sync: Clock::ZERO })
-        })
+        self.object(id, |_| Object::RwLock(RwLock { readers: 0, writer: None, sync: Clock::ZERO }))
     }
 
     pub(crate) fn condvar(&mut self, id: &std::sync::atomic::AtomicU64) -> u32 {

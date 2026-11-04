@@ -331,8 +331,7 @@ impl Printer {
     }
 
     fn print_end(&mut self) {
-        if let PrintFrame::Broken { indent, .. } =
-            self.print_stack.pop().expect("pp: an open box")
+        if let PrintFrame::Broken { indent, .. } = self.print_stack.pop().expect("pp: an open box")
         {
             self.indent = indent;
         }
@@ -427,7 +426,12 @@ impl Printer {
 }
 
 /// Writes the pending indentation, then `string`.
-fn print_string(string: &str, out: &mut String, pending_indentation: &mut isize, space: &mut isize) {
+fn print_string(
+    string: &str,
+    out: &mut String,
+    pending_indentation: &mut isize,
+    space: &mut isize,
+) {
     let pending = *pending_indentation as usize;
     out.reserve(pending + string.len());
     out.extend(std::iter::repeat_n(' ', pending));

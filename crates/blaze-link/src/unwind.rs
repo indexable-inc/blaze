@@ -14,8 +14,8 @@ use std::ops::Range;
 use blaze_format::cursor::{self, Put, Reader};
 use blaze_graph::par;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::Format;
 use crate::model::{Apply, View};
@@ -138,13 +138,27 @@ pub(crate) fn cie(
     pointers: Pointers,
 ) -> Result<Record, String> {
     let mut bytes = Vec::with_capacity(64);
-    let fixups = cie_into(code_align, data_align, return_address, instructions, personality, pointers, &mut bytes)?;
+    let fixups = cie_into(
+        code_align,
+        data_align,
+        return_address,
+        instructions,
+        personality,
+        pointers,
+        &mut bytes,
+    )?;
     Ok(Record { bytes, fixups })
 }
 
 /// An FDE, as [`fde_into`] writes it.
 #[cfg(test)]
-pub(crate) fn fde(size: u64, instructions: &[u8], lsda: bool, has_lsda: bool, pointers: Pointers) -> Result<Record, String> {
+pub(crate) fn fde(
+    size: u64,
+    instructions: &[u8],
+    lsda: bool,
+    has_lsda: bool,
+    pointers: Pointers,
+) -> Result<Record, String> {
     let mut bytes = Vec::with_capacity(64);
     let fixups = fde_into(size, instructions, lsda, has_lsda, pointers, &mut bytes)?;
     Ok(Record { bytes, fixups })
@@ -164,7 +178,9 @@ pub(crate) fn cie_into(
 ) -> Result<Fields, String> {
     let ra = u8::try_from(return_address)
         // alloc: error path
-        .map_err(|_| format!("return address register {return_address} past CIE version 1's 255"))?;
+        .map_err(|_| {
+            format!("return address register {return_address} past CIE version 1's 255")
+        })?;
     // Header 8, version 1, augmentation 6, alignments 5 + 10, register 1, augmentation data
     // 9, then the instructions and at most 7 of padding.
     bytes.clear();
@@ -214,7 +230,9 @@ pub(crate) fn fde_into(
     bytes.extend_from_slice(&[0; 8]);
     bytes.resize(8 + width, 0);
     match pointers {
-        Pointers::Sdata4 => bytes.put_u32(u32::try_from(size).map_err(|_| "a function past 4 GiB in an FDE")?),
+        Pointers::Sdata4 => {
+            bytes.put_u32(u32::try_from(size).map_err(|_| "a function past 4 GiB in an FDE")?)
+        }
         Pointers::Absptr8 => bytes.put_u64(size),
     }
     let mut fixups = Fields::NONE;
@@ -282,7 +300,9 @@ pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
             0 => None,
             back => Some(
                 // alloc: error path
-                (at + 4).checked_sub(back).ok_or_else(|| format!("an FDE at {at:#x} before its CIE"))?,
+                (at + 4)
+                    .checked_sub(back)
+                    .ok_or_else(|| format!("an FDE at {at:#x} before its CIE"))?,
             ),
         };
         if let Some(cie) = cie {
@@ -377,7 +397,11 @@ pub(crate) fn eh_value(reader: &mut Reader<'_>, encoding: u8) -> Result<u64, &'s
 
 /// A pointer in `encoding` with only the section's address (`section`) known: absolute or
 /// relative to where it is.
-pub(crate) fn eh_pointer(reader: &mut Reader<'_>, encoding: u8, section: u64) -> Result<u64, &'static str> {
+pub(crate) fn eh_pointer(
+    reader: &mut Reader<'_>,
+    encoding: u8,
+    section: u64,
+) -> Result<u64, &'static str> {
     if encoding == DW_EH_PE_OMIT {
         return Err("a pointer whose encoding says it is omitted");
     }
@@ -392,7 +416,12 @@ pub(crate) fn eh_pointer(reader: &mut Reader<'_>, encoding: u8, section: u64) ->
 /// The offsets in an image's `.eh_frame` (at `section`, `len` bytes) of every `every`th FDE
 /// the core placed, sorted: record starts a walk of the section can begin at, so its pieces are
 /// walked in parallel. None below two pieces' worth of functions.
-pub(crate) fn fde_splits(placed: &crate::model::Placed<'_>, section: u64, len: usize, every: usize) -> Vec<usize> {
+pub(crate) fn fde_splits(
+    placed: &crate::model::Placed<'_>,
+    section: u64,
+    len: usize,
+    every: usize,
+) -> Vec<usize> {
     if placed.functions.len() < 2 * every {
         // alloc: empty, which allocates nothing
         return Vec::new();
@@ -474,7 +503,12 @@ pub(crate) fn frame(
 /// The FDE pointer encoding of the CIE at `at`, which a walk of another piece met; `across`
 /// holds it where it crosses a page. Any error is the FDE's naming no CIE: a CIE there that
 /// reads wrong is an error of the piece holding it, which comes first.
-fn cie_at(bytes: View<'_>, at: usize, section: u64, across: &mut Vec<u8>) -> Result<u8, &'static str> {
+fn cie_at(
+    bytes: View<'_>,
+    at: usize,
+    section: u64,
+    across: &mut Vec<u8>,
+) -> Result<u8, &'static str> {
     let (body, end) = entry(bytes, at).ok().flatten().ok_or(NO_CIE)?;
     let held = bytes.read(at, end - at, across).ok_or(NO_CIE)?;
     let mut reader = Reader::starting_at(held, body - at).map_err(|_| NO_CIE)?;
@@ -543,7 +577,9 @@ fn walk<T, F: Fn(usize, Frame, &mut Vec<T>) -> Result<(), String>>(
         };
         if found.1 > end {
             // alloc: error path
-            walked.stop = Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
+            walked.stop = Err(format!(
+                "the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"
+            ));
             return walked;
         }
         at = found.1;
@@ -633,11 +669,17 @@ pub(crate) fn scan<T: Copy + Default + Send + Sync>(
     // The pieces the one walk reaches: up to the first that ends the section or fails. A piece's
     // first FDE naming no CIE met before is its first error: the walk went on past it.
     // alloc: once per image, the CIEs
-    let mut cies: Vec<(usize, u8)> = Vec::with_capacity(pieces.iter().map(|it| it.1.cies.len()).sum());
+    let mut cies: Vec<(usize, u8)> =
+        Vec::with_capacity(pieces.iter().map(|it| it.1.cies.len()).sum());
     let (mut kept, mut end) = (pieces.len(), bytes.len());
     for (nth, (_, walked)) in pieces.iter_mut().enumerate() {
         let met = |named: &usize| cies.binary_search_by_key(named, |it| it.0).is_ok();
-        let unmet = walked.foreign.iter().filter(|(named, _)| !met(named)).map(|(_, &(_, record))| record).min();
+        let unmet = walked
+            .foreign
+            .iter()
+            .filter(|(named, _)| !met(named))
+            .map(|(_, &(_, record))| record)
+            .min();
         if let Some(record) = unmet {
             // alloc: error path
             return Err(format!("the entry at offset {record:#x}: {NO_CIE}"));
@@ -787,7 +829,11 @@ mod tests {
         assert_eq!(fde.bytes.len() % 8, 0);
         let fields: Vec<_> = fde.fixups.iter().copied().collect();
         assert_eq!(fields, [(4, Field::CiePointer), (8, Field::Function), (25, Field::Lsda)]);
-        assert_eq!(u64::from_le_bytes(fde.bytes[16..24].try_into().unwrap()), size, "pc-range, 8 bytes");
+        assert_eq!(
+            u64::from_le_bytes(fde.bytes[16..24].try_into().unwrap()),
+            size,
+            "pc-range, 8 bytes"
+        );
         assert_eq!(fde.bytes[24], 8, "the augmentation data: an 8-byte LSDA");
 
         // The section: the CIE, then the FDE, then the terminator.
@@ -852,11 +898,17 @@ mod tests {
     #[test]
     fn elf_fdes_keep_sdata4() {
         let pointers = Pointers::of(Format::Elf);
-        assert_eq!((pointers, pointers.encoding(), pointers.apply()), (Pointers::Sdata4, 0x1b, Apply::Rel32));
+        assert_eq!(
+            (pointers, pointers.encoding(), pointers.apply()),
+            (Pointers::Sdata4, 0x1b, Apply::Rel32)
+        );
         let cie = cie(1, -8, 16, &[], true, pointers).unwrap();
         assert_eq!(&cie.bytes[14 + 3 + 6..14 + 3 + 8], &[0x1b, 0x1b]);
         let fde = fde(0x40, &[], true, true, pointers).unwrap();
-        assert_eq!(fde.fixups.iter().copied().collect::<Vec<_>>(), [(4, Field::CiePointer), (8, Field::Function), (17, Field::Lsda)]);
+        assert_eq!(
+            fde.fixups.iter().copied().collect::<Vec<_>>(),
+            [(4, Field::CiePointer), (8, Field::Function), (17, Field::Lsda)]
+        );
         assert_eq!(fde.bytes[16], 4);
         assert!(super::fde(1 << 32, &[], false, false, pointers).is_err(), "a function past 4 GiB");
         assert!(super::fde(1 << 32, &[], false, false, Pointers::Absptr8).is_ok());

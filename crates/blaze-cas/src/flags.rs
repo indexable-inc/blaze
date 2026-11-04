@@ -146,7 +146,8 @@ mod tests {
     #[cfg(not(blaze_check))]
     fn a_rows_flags_share_one_line() {
         let bits = FlagColumns::new(3 << 10);
-        let flags = [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
+        let flags =
+            [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
         for row in [0, 1, 63, 64, 1000, (3 << 10) - 1] {
             let lines: Vec<usize> = flags
                 .iter()
@@ -163,7 +164,8 @@ mod tests {
     fn the_columns_answer_as_vecs_of_bools_do() {
         let rows = 3 << 20;
         let bits = FlagColumns::new(rows);
-        let flags = [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
+        let flags =
+            [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
         let mut model = vec![vec![false; rows as usize]; FLAGS];
         let mut rng = blaze_ids::rng::SplitMix64::new(5);
         for step in 0..100_000u64 {
@@ -177,7 +179,8 @@ mod tests {
             } else if step % 10_007 == 0 {
                 bits.rotate();
                 for (from, to) in [(Flag::Read, Flag::ReadBefore), (Flag::New, Flag::NewBefore)] {
-                    model[to as usize] = std::mem::replace(&mut model[from as usize], vec![false; rows as usize]);
+                    model[to as usize] =
+                        std::mem::replace(&mut model[from as usize], vec![false; rows as usize]);
                 }
             } else {
                 let want = row < rows && model[flag as usize][row as usize];

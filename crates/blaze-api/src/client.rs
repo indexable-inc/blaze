@@ -40,7 +40,8 @@ pub fn home() -> Result<PathBuf, String> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     // alloc: error path
-    let home = home.ok_or("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?;
+    let home =
+        home.ok_or("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?;
     Ok(PathBuf::from(home).join(".cache/blaze"))
 }
 
@@ -49,10 +50,12 @@ pub fn home() -> Result<PathBuf, String> {
 /// its members are in the same one), else the highest directory from `dir` up with a
 /// `Cargo.toml`, which the workspace's root manifest is in whichever of them it is.
 pub fn checkout(dir: &Path) -> PathBuf {
-    if let Some(repository) = dir.ancestors().find(|it| std::fs::metadata(it.join(".git")).is_ok()) {
+    if let Some(repository) = dir.ancestors().find(|it| std::fs::metadata(it.join(".git")).is_ok())
+    {
         return repository.to_owned();
     }
-    let highest = dir.ancestors().filter(|it| std::fs::metadata(it.join("Cargo.toml")).is_ok()).last();
+    let highest =
+        dir.ancestors().filter(|it| std::fs::metadata(it.join("Cargo.toml")).is_ok()).last();
     highest.unwrap_or(dir).to_owned()
 }
 
@@ -62,7 +65,9 @@ pub enum ClientError {
     /// The daemon's bytes were refused, or it answered over HTTP with an error.
     Refused(ApiError),
     /// The daemon speaks schema `theirs`.
-    Schema { theirs: u32 },
+    Schema {
+        theirs: u32,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -167,7 +172,9 @@ impl Client {
     pub fn unix(path: &Path) -> Result<Client, ClientError> {
         let stream = std::os::unix::net::UnixStream::connect(path)
             // alloc: error path, a connect that failed.
-            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+            })?;
         Ok(Client::over(Link::Unix(stream)))
     }
 
@@ -247,12 +254,16 @@ impl Client {
             Link::Http(link) => {
                 self.writer.append(&mut self.out, &envelope).map_err(|error| {
                     // alloc: error path, a request serde refused.
-                    ClientError::Refused(ApiError::new(format!("a request with no encoding: {error}"), None))
+                    ClientError::Refused(ApiError::new(
+                        format!("a request with no encoding: {error}"),
+                        None,
+                    ))
                 })?;
                 let item = self.out.as_slice();
                 if item.len() > LONGEST_REQUEST as usize {
                     // alloc: error path, a request too long.
-                    let said = format!("a request of {} bytes, longer than {LONGEST_REQUEST}", item.len());
+                    let said =
+                        format!("a request of {} bytes, longer than {LONGEST_REQUEST}", item.len());
                     return Err(ClientError::Refused(ApiError::new(said, None)));
                 }
                 let headers = [
@@ -333,7 +344,8 @@ impl Client {
                 continue;
             };
             let item = self.frames.item(range);
-            let envelope = frames::decode::<ResponseRef<'_>>(item).map_err(|it| refusal(item, it))?;
+            let envelope =
+                frames::decode::<ResponseRef<'_>>(item).map_err(|it| refusal(item, it))?;
             let done = match envelope.body {
                 ResponseRef::Done { ok } => Some(ok),
                 _ => None,
@@ -372,7 +384,10 @@ impl Client {
                     "the daemon still holds the connection {} ms after it said it was {doing}, and has said nothing since",
                     patience.as_millis()
                 ),
-                None => format!("the daemon still holds the connection after {} ms, saying nothing of what it does", patience.as_millis()),
+                None => format!(
+                    "the daemon still holds the connection after {} ms, saying nothing of what it does",
+                    patience.as_millis()
+                ),
             };
             ClientError::Io(io::Error::new(io::ErrorKind::TimedOut, said))
         };
@@ -406,7 +421,12 @@ impl Client {
                 Ok(0) => return Ok(()),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
                     if std::time::Instant::now() < deadline {
                         continue;
                     }
@@ -465,7 +485,10 @@ impl Client {
                 let most = self.frames.wanted(RECEIVE);
                 if self.frames.fill(stream, most)? == 0 {
                     let said = "the daemon hung up";
-                    return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, said)));
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        said,
+                    )));
                 }
                 return Ok(true);
             }
@@ -475,7 +498,10 @@ impl Client {
                 local.receive(&mut self.out)?;
                 if self.out.is_empty() {
                     let said = "the daemon hung up";
-                    return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, said)));
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        said,
+                    )));
                 }
                 self.frames.push(&self.out);
                 return Ok(true);

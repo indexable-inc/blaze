@@ -22,8 +22,11 @@ use blaze_phf::{name_hash_finish, name_hash_start, name_hash_word};
 use rustc_literal_escaper::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
 
 use super::{
-    CHECKPOINT, KIND_BITS, LONG, LexedStr, can_be_raw, err_to_msg,
-    classify::{Classes, NEWLINE, QUOTE, SIMPLE_PUNCT, SLASH_STAR, SPECIAL, START, is_simple_first},
+    CHECKPOINT, KIND_BITS, LONG, LexedStr, can_be_raw,
+    classify::{
+        Classes, NEWLINE, QUOTE, SIMPLE_PUNCT, SLASH_STAR, SPECIAL, START, is_simple_first,
+    },
+    err_to_msg,
 };
 use crate::{Edition, SyntaxKind, T, syntax_kind::keywords};
 
@@ -119,7 +122,13 @@ type Names = Option<blaze_mem::scratch::Lent<Vec<u64>>>;
 /// `edition` or `IDENT`, from one read of its bytes: an 8-byte window when it is 8 bytes or
 /// fewer, which with `HASH` is also its [`blaze_phf::name_hash`], pushed onto `names`.
 #[inline(always)]
-fn kind_of<const HASH: bool>(text: &str, p: usize, len: usize, edition: Edition, names: &mut Names) -> SyntaxKind {
+fn kind_of<const HASH: bool>(
+    text: &str,
+    p: usize,
+    len: usize,
+    edition: Edition,
+    names: &mut Names,
+) -> SyntaxKind {
     let bytes = text.as_bytes();
     match FIRST[bytes[p] as usize] {
         SyntaxKind::IDENT if len <= 8 => {
@@ -165,7 +174,13 @@ fn pack<const HASH: bool>(
 
 /// [`pack`] of a token shorter than 64 bytes: one that starts and ends in the same block.
 #[inline(always)]
-fn pack_short<const HASH: bool>(text: &str, p: usize, e: usize, edition: Edition, names: &mut Names) -> u32 {
+fn pack_short<const HASH: bool>(
+    text: &str,
+    p: usize,
+    e: usize,
+    edition: Edition,
+    names: &mut Names,
+) -> u32 {
     let len = e - p;
     debug_assert!(len < 64);
     let kind = kind_of::<HASH>(text, p, len, edition, names) as u16 as u32;
@@ -244,7 +259,8 @@ pub(super) fn simple<const HASH: bool>(
             if STOPS[after as usize] & FLAGS[bytes[p] as usize] != 0 {
                 break Closed::Stop;
             }
-            window[n & 63] = pack::<HASH>(text, (p, e), edition, base + n, (&mut *long, &mut *names));
+            window[n & 63] =
+                pack::<HASH>(text, (p, e), edition, base + n, (&mut *long, &mut *names));
             starts[n & 63] = p as u32;
             n += 1;
             p = e;
@@ -256,7 +272,9 @@ pub(super) fn simple<const HASH: bool>(
                 if is_simple_first(bytes[p]) {
                     break;
                 }
-                let Some((kind, len)) = special(text, p, classes) else { break 'window Closed::Stop };
+                let Some((kind, len)) = special(text, p, classes) else {
+                    break 'window Closed::Stop;
+                };
                 if p + len >= at + 64 {
                     break 'window Closed::Past(kind, len);
                 }
@@ -265,7 +283,9 @@ pub(super) fn simple<const HASH: bool>(
                 {
                     // A raw identifier, as `LexedStr::push` hashes it.
                     let name = &text[p..p + len];
-                    names.push(blaze_phf::name_hash(name.strip_prefix("r#").unwrap_or(name).as_bytes()));
+                    names.push(blaze_phf::name_hash(
+                        name.strip_prefix("r#").unwrap_or(name).as_bytes(),
+                    ));
                 }
                 window[n & 63] = kind as u16 as u32 | (len as u32) << KIND_BITS;
                 starts[n & 63] = p as u32;
@@ -569,7 +589,8 @@ fn prefixed(text: &str, at: usize, classes: &Classes<'_>) -> Option<(SyntaxKind,
         (b"b", Some(b'"')) => {
             let (close, _) = close_quote(bytes, run + 1, classes)?;
             let end = suffix_end(bytes, close + 1, classes)?;
-            clean_str(&text[run + 1..close], Mode::ByteStr).then_some((SyntaxKind::BYTE_STRING, end - at))
+            clean_str(&text[run + 1..close], Mode::ByteStr)
+                .then_some((SyntaxKind::BYTE_STRING, end - at))
         }
         (b"b", Some(b'\'')) => {
             let close = close_single(bytes, run + 1)?;
@@ -603,7 +624,9 @@ fn raw_string(
         let found = classes.next_bit(QUOTE, from);
         match bytes.get(found) {
             None => return None,
-            Some(b'"') if bytes[found + 1..].iter().take(n).take_while(|&&b| b == b'#').count() == n => {
+            Some(b'"')
+                if bytes[found + 1..].iter().take(n).take_while(|&&b| b == b'#').count() == n =>
+            {
                 break found + 1 + n;
             }
             // A `"` with too few `#`s, or a `\`, which a raw string does not escape with.

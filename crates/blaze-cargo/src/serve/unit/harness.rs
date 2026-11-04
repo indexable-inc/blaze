@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use blaze_api::ApiError;
 use blaze_ids::radix;
+use blaze_lower::{Appended, LowerError, Lowered};
 use blaze_units::schema::Mode;
 use hir_ty_codegen::v2::HARNESS_MODULE;
-use blaze_lower::{Appended, LowerError, Lowered};
 
 use super::{Job, codegen, compile, graph::Waits, lower_error};
 
@@ -42,12 +42,19 @@ use super::{Job, codegen, compile, graph::Waits, lower_error};
 ///
 /// A library's `Doctest` unit has no harness of its own: each of its examples, and its runner,
 /// is made into a crate of its own here ([`compile::doctest::expand`]), refused as above.
-pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), Vec<(usize, ApiError)>> {
+pub(super) fn write(
+    lowered: &mut Lowered,
+    job: &Job,
+    units: impl IntoIterator<Item = u32>,
+) -> Result<(), Vec<(usize, ApiError)>> {
     let paths = Arc::clone(lowered.paths());
     let spellings = Arc::clone(lowered.spellings());
     // alloc: once a write, the units it is given
     let units: Vec<u32> = units.into_iter().collect();
-    let appended = units.iter().copied().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
+    let appended = units
+        .iter()
+        .copied()
+        .filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
     let made = lowered.append_roots(appended, |db, unit, krate| {
         if !blaze_lower::macros_loaded(db, krate) {
             return Ok(None);
@@ -64,8 +71,19 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         }
         let toolchain = codegen::toolchain(job, unit).map_err(refused)?;
         let policy = codegen::policy(job, unit, toolchain).map_err(refused)?;
-        let frontend = codegen::frontend_over(db, &paths, &spellings, &job.mounted, codegen::build_time(job, unit));
-        let harness = frontend.harness(krate, policy.profile.panic, policy.mode, blaze_usercode::test::fork_server);
+        let frontend = codegen::frontend_over(
+            db,
+            &paths,
+            &spellings,
+            &job.mounted,
+            codegen::build_time(job, unit),
+        );
+        let harness = frontend.harness(
+            krate,
+            policy.profile.panic,
+            policy.mode,
+            blaze_usercode::test::fork_server,
+        );
         let Some(harness) = harness.map_err(|it| refused(it.what))? else { return Ok(None) };
         // The module the harness is written in, by its name in the crate's root: what the
         // front end keeps of a root that `#![cfg]` takes away.
@@ -74,7 +92,9 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
     // alloc: an error, once per unit refused
     let mut refused: Vec<(usize, ApiError)> = match made {
         Ok(_) => Vec::new(),
-        Err(refused) => refused.into_iter().map(|(unit, error)| (unit, lower_error(error))).collect(),
+        Err(refused) => {
+            refused.into_iter().map(|(unit, error)| (unit, lower_error(error))).collect()
+        }
     };
     // A library's doctests: each example and the runner a crate of its own
     // ([`compile::doctest::expand`]).
@@ -99,7 +119,7 @@ pub(super) fn refused(refused: &[(usize, ApiError)]) -> ApiError {
         .iter()
         .map(|(_, error)| match &error.at {
             Some(at) => format!("{} (at {at})", error.what), // alloc: an error, once per unit
-            None => error.what.clone(),                     // clone: an error, once per unit
+            None => error.what.clone(),                      // clone: an error, once per unit
         })
         .collect::<Vec<_>>() // alloc: an error, once
         .join("; ");
@@ -142,5 +162,6 @@ pub(super) fn reached(job: &Job, waits: &Waits, loaded: &[u32], ready: &[u32]) -
 /// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check
 /// of one (`cargo check --tests`).
 fn tested(job: &Job, unit: usize) -> bool {
-    job.unit(unit).is_ok_and(|it| it.mode == Mode::Test) || job.plan(unit).is_ok_and(|it| it.checked_as_test)
+    job.unit(unit).is_ok_and(|it| it.mode == Mode::Test)
+        || job.plan(unit).is_ok_and(|it| it.checked_as_test)
 }

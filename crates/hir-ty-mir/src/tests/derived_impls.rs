@@ -2,15 +2,15 @@ use std::{any::TypeId, sync};
 
 use base_db::{Db, all_crates};
 use hir_def::{AssocItemId, DefWithBodyId, nameres::assoc::ImplItems, nameres::crate_def_map};
+use hir_expand::fixture;
 use hir_expand::{
     builtin::quote::quote,
     proc_macro::{
-        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+        Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacroKind,
     },
-    tt::{self, TopSubtree},
 };
 use intern::Symbol;
-use hir_expand::fixture;
 
 use crate::InferenceResult;
 
@@ -23,18 +23,20 @@ impl ProcMacroExpander for ImplDeserializableExpander {
         &self,
         _: &Db,
         ProcMacroCall { call_site, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        Ok(quote! { call_site =>
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        let tree = quote! { call_site =>
             impl a::Deserializable for FixKind {
                 fn deserialize(name: &str) -> Option<Self> {
                     let _text = a::Text::deserialize(name);
                     None
                 }
             }
-        })
+        };
+        Ok(Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }

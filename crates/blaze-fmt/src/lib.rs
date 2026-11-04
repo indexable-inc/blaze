@@ -34,7 +34,7 @@ use thiserror::Error;
 use crate::comment::LineClasses;
 use crate::emitter::Emitter;
 use crate::formatting::{FormatErrorMap, FormattingError, ReportedErrors, SourceFile};
-use crate::modules::ModuleResolutionError;
+use crate::modules::ModuleResolutionErrors;
 use crate::parse::parser::DirectoryOwnership;
 use crate::shape::Indent;
 use crate::utils::indent_next_line;
@@ -57,8 +57,8 @@ mod attr;
 pub mod cargo_fmt;
 mod chains;
 pub mod cli;
-pub mod command;
 mod closures;
+pub mod command;
 mod comment;
 pub(crate) mod config;
 mod coverage;
@@ -128,7 +128,7 @@ pub enum ErrorKind {
     IoError(io::Error),
     /// Error during module resolution.
     #[error("{0}")]
-    ModuleResolutionError(#[from] ModuleResolutionError),
+    ModuleResolutionError(#[from] ModuleResolutionErrors),
     /// Parse error occurred when parsing the input.
     #[error("parse error")]
     ParseError,

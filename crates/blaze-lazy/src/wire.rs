@@ -55,9 +55,16 @@ pub enum Frame<'a> {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum WireError {
-    Short { kind: u32, len: usize, need: usize },
+    Short {
+        kind: u32,
+        len: usize,
+        need: usize,
+    },
     Kind(u32),
-    Trailing { kind: u32, extra: usize },
+    Trailing {
+        kind: u32,
+        extra: usize,
+    },
     LongWhy(usize),
     Utf8,
     /// A `Failed` frame whose four bytes after the reason's length are not zero.
@@ -76,10 +83,14 @@ impl fmt::Display for WireError {
             WireError::Trailing { kind, extra } => {
                 write!(f, "a lazy frame of kind {kind:#x} with {extra} bytes left over")
             }
-            WireError::LongWhy(len) => write!(f, "a failure reason of {len} bytes, past {MOST_WHY}"),
+            WireError::LongWhy(len) => {
+                write!(f, "a failure reason of {len} bytes, past {MOST_WHY}")
+            }
             WireError::Utf8 => write!(f, "a failure reason that is not UTF-8"),
             WireError::Padding => write!(f, "a failure frame whose padding is not zero"),
-            WireError::Unasked => write!(f, "an answer frame from the run process, which only asks"),
+            WireError::Unasked => {
+                write!(f, "an answer frame from the run process, which only asks")
+            }
         }
     }
 }
@@ -112,7 +123,8 @@ impl Frame<'_> {
 
     /// The frame `bytes` are, read in place.
     pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, WireError> {
-        let kind = u32_at(bytes, 0).ok_or(WireError::Short { kind: 0, len: bytes.len(), need: 4 })?;
+        let kind =
+            u32_at(bytes, 0).ok_or(WireError::Short { kind: 0, len: bytes.len(), need: 4 })?;
         let need = match kind {
             ASK => ASK_LEN,
             READY => READY_LEN,
@@ -125,7 +137,11 @@ impl Frame<'_> {
         let lazy = u32_at(bytes, 4).expect("checked");
         let request = u64_at(bytes, 8).expect("checked");
         let exact = |len: usize| {
-            if bytes.len() == len { Ok(()) } else { Err(WireError::Trailing { kind, extra: bytes.len() - len }) }
+            if bytes.len() == len {
+                Ok(())
+            } else {
+                Err(WireError::Trailing { kind, extra: bytes.len() - len })
+            }
         };
         match kind {
             ASK => {
@@ -149,7 +165,8 @@ impl Frame<'_> {
                     return Err(WireError::Short { kind, len: bytes.len(), need: end });
                 }
                 exact(end)?;
-                let why = std::str::from_utf8(&bytes[FAILED_LEN..end]).map_err(|_| WireError::Utf8)?;
+                let why =
+                    std::str::from_utf8(&bytes[FAILED_LEN..end]).map_err(|_| WireError::Utf8)?;
                 Ok(Frame::Failed { request, lazy, why })
             }
         }

@@ -42,7 +42,10 @@ pub enum Hint {
 pub enum Arg {
     Unknown,
     /// An integer or pointer-free constant of `bits` bits, at most 64.
-    Int { bits: u8, value: u64 },
+    Int {
+        bits: u8,
+        value: u64,
+    },
 }
 
 const _: () = assert!(size_of::<Arg>() == 16);
@@ -115,7 +118,9 @@ pub struct Call {
 
 // The callee's key and `count` (36 bytes) and a `Vec`, padded to a word: 64 bytes on a 64-bit
 // target.
-const _: () = assert!(size_of::<Call>() == (36 + size_of::<Vec<Arg>>()).next_multiple_of(align_of::<usize>()));
+const _: () = assert!(
+    size_of::<Call>() == (36 + size_of::<Vec<Arg>>()).next_multiple_of(align_of::<usize>())
+);
 
 // clone: the memo keeps one copy of each summary a build made for the builds after it (driver.rs, flight.rs)
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
@@ -231,7 +236,10 @@ impl Arg {
         match input.u8()? {
             0 => Ok(Arg::Unknown),
             1 => Ok(Arg::Int { bits: input.u8()?, value: read_u64(input)? }),
-            _ => Err(SummaryError { at, what: "an argument tag that is neither unknown (0) nor an integer (1)" }),
+            _ => Err(SummaryError {
+                at,
+                what: "an argument tag that is neither unknown (0) nor an integer (1)",
+            }),
         }
     }
 }
@@ -293,7 +301,15 @@ impl Summary {
     /// its order, and every LEB128 is written in its shortest form.
     pub fn encode(&self) -> Vec<u8> {
         let args: usize = self.calls.iter().map(|it| 12 * it.args.len()).sum();
-        let len = 4 + 32 + 3 + 10 + 15 + (CALL_LEAST + 8) * self.calls.len() + args + 32 * self.addressed.len() + 5 * self.unused.len();
+        let len = 4
+            + 32
+            + 3
+            + 10
+            + 15
+            + (CALL_LEAST + 8) * self.calls.len()
+            + args
+            + 32 * self.addressed.len()
+            + 5 * self.unused.len();
         // alloc: the summary's store bytes, moved into the build's put
         let mut out = Vec::with_capacity(len);
         out.put_bytes(&SUMMARY_MAGIC);
@@ -422,7 +438,12 @@ impl Imports {
     /// two different `Imports` never give the same bytes.
     fn encode(&self, out: &mut Vec<u8>) {
         let dead: usize = self.dead.iter().map(|it| 36 + 4 * it.1.len()).sum();
-        out.reserve(16 + 32 * self.imported.len() + 14 * self.constants.len() + 33 * self.callees.len() + dead);
+        out.reserve(
+            16 + 32 * self.imported.len()
+                + 14 * self.constants.len()
+                + 33 * self.callees.len()
+                + dead,
+        );
         out.put_u32(self.imported.len() as u32);
         for key in &self.imported {
             out.put_bytes(&key.0.0);
@@ -469,7 +490,8 @@ mod tests {
     #[test]
     fn every_whole_program_fact_is_in_the_key() {
         let base = Imports::default().blob_key(key(1));
-        let constant = Imports { constants: vec![(0, Arg::Int { bits: 32, value: 7 })], ..Imports::default() };
+        let constant =
+            Imports { constants: vec![(0, Arg::Int { bits: 32, value: 7 })], ..Imports::default() };
         let attrs = Imports {
             callees: vec![(key(2), Attrs { nounwind: true, ..Attrs::default() })],
             ..Imports::default()
@@ -494,7 +516,10 @@ mod tests {
             Imports { dead: vec![(key(2), vec![0])], ..Imports::default() },
             Imports { dead: vec![(key(2), vec![]), (key(3), vec![])], ..Imports::default() },
             Imports { callees: vec![(key(2), Attrs::default())], ..Imports::default() },
-            Imports { callees: vec![(key(2), Attrs { noreturn: true, ..Attrs::default() })], ..Imports::default() },
+            Imports {
+                callees: vec![(key(2), Attrs { noreturn: true, ..Attrs::default() })],
+                ..Imports::default()
+            },
             Imports { imported: vec![key(2), key(3)], ..Imports::default() },
             Imports { imported: vec![key(3), key(2)], ..Imports::default() },
         ];
@@ -539,7 +564,14 @@ mod tests {
             addressed: vec![key(4), key(5)],
             params: u32::MAX,
             unused: vec![0, 127, 128, u32::MAX],
-            attrs: Attrs { nounwind: true, readonly: true, readnone: true, norecurse: true, willreturn: true, noreturn: true },
+            attrs: Attrs {
+                nounwind: true,
+                readonly: true,
+                readnone: true,
+                norecurse: true,
+                willreturn: true,
+                noreturn: true,
+            },
             body: Attrs { readnone: true, noreturn: true, ..Attrs::default() },
             external: true,
         }

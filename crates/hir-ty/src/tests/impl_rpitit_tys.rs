@@ -2,7 +2,9 @@
 //! each impl's item for a trait method's `impl Trait`, in the impl item's generics, with the
 //! regions it captures mapped to the trait item's own lifetime parameters.
 
-use hir_def::{AssocItemId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
+use hir_def::{
+    AssocItemId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+};
 use hir_expand::fixture;
 
 use crate::{
@@ -297,20 +299,21 @@ fn the_impls_item_has_the_trait_methods_where_clauses() {
             function: impl_fn,
             idx: crate::next_solver::ImplTraitIdx::from_raw(la_arena::RawIdx::from_u32(0)),
         };
-        let traits: Vec<String> = interner // alloc: test
-            .own_clauses_of(crate::next_solver::SolverDefId::RpititId(item))
-            .skip_binder()
-            .into_iter()
-            .filter_map(|clause| match clause.kind().skip_binder() {
-                ClauseKind::Trait(it) => Some(
-                    hir_def::signatures::TraitSignature::of(&db, it.trait_ref.def_id.0)
-                        .name
-                        .as_str()
-                        .to_owned(),
-                ),
-                _ => None,
-            })
-            .collect();
+        let traits: Vec<String> =
+            interner // alloc: test
+                .own_clauses_of(crate::next_solver::SolverDefId::RpititId(item))
+                .skip_binder()
+                .into_iter()
+                .filter_map(|clause| match clause.kind().skip_binder() {
+                    ClauseKind::Trait(it) => Some(
+                        hir_def::signatures::TraitSignature::of(&db, it.trait_ref.def_id.0)
+                            .name
+                            .as_str()
+                            .to_owned(),
+                    ),
+                    _ => None,
+                })
+                .collect();
         assert!(traits.iter().any(|it| it == "Copy"), "{traits:?}");
     });
 }

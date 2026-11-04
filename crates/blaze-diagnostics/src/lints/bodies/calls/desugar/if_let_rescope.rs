@@ -12,7 +12,6 @@
 //! a block's value only, no nested body) (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     ModuleDefId,
@@ -25,6 +24,7 @@ use hir_ty::{
 };
 use rustc_type_ir::inherent::IntoKind as _;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops,
@@ -60,7 +60,8 @@ impl LatePass for IfLetRescope {
     // first when `if_let_rescope` is in `lints_that_dont_need_to_run`, so skipping skips both.
     const LINTS: LintSet = lint_set(["if_let_rescope"]);
     const HOOKS: Hooks = Hooks::BODY;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Block, ExprKind::Match, ExprKind::If, ExprKind::Loop]);
+    const EXPRS: ExprKinds =
+        ExprKinds::of(&[ExprKind::Block, ExprKind::Match, ExprKind::If, ExprKind::Loop]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.skip.clear();
@@ -137,9 +138,7 @@ impl IfLetRescope {
             Expr::If { else_branch, .. } => else_branch,
             _ => None,
         });
-        let has_let = |&it: &ExprId| {
-            matches!(store.expr(it), Expr::If { condition, .. } if matches!(store.expr(condition), Expr::Let { .. }))
-        };
+        let has_let = |&it: &ExprId| matches!(store.expr(it), Expr::If { condition, .. } if matches!(store.expr(condition), Expr::Let { .. }));
         // clone: a copy of an iterator over IDs, allocates nothing
         if !chain.clone().any(|it| has_let(&it)) {
             self.skip.extend(chain);
@@ -170,7 +169,13 @@ impl IfLetRescope {
         while let Expr::If { condition, then_branch, else_branch } = store.expr(expr) {
             self.skip.insert(expr);
             if let Expr::Let { pat, expr: init } = store.expr(condition)
-                && let (Some(expr_span), Some(let_span), Some(pat_span), Some(init_span), Some(conseq_span)) = (
+                && let (
+                    Some(expr_span),
+                    Some(let_span),
+                    Some(pat_span),
+                    Some(init_span),
+                    Some(conseq_span),
+                ) = (
                     util::span(b, expr),
                     util::span(b, condition),
                     b.pat_span(pat),
@@ -178,7 +183,9 @@ impl IfLetRescope {
                     util::span(b, then_branch),
                 )
             {
-                if let Some((drop_span, drop_tys)) = (FindSignificantDropper { b, drops: &mut drops }).check_if_let_scrutinee(init) {
+                if let Some((drop_span, drop_tys)) =
+                    (FindSignificantDropper { b, drops: &mut drops }).check_if_let_scrutinee(init)
+                {
                     let if_let_pat = between(&take_while_parens(b, &expr_span), &init_span);
                     let before_conseq = conseq_span.shrink_to_lo();
                     let lifetime_end = end_point(b, &conseq_span);
@@ -249,12 +256,17 @@ impl IfLetRescope {
         }
         for query in drops.overflowed.drain(..) {
             // alloc: the overflow error's message, an error path
-            let message = format!("overflow while checking whether `{}` requires drop", b.ty(query));
+            let message =
+                format!("overflow while checking whether `{}` requires drop", b.ty(query));
             out.push(Found::new(Diag::new(Level::Error, None, message), Phase::Late));
         }
         let Some((span, at)) = first_if_to_lint else { return };
 
-        let mut diag = Diag::lint("if_let_rescope", "`if let` assigns a shorter lifetime since Edition 2024", span);
+        let mut diag = Diag::lint(
+            "if_let_rescope",
+            "`if let` assigns a shorter lifetime since Edition 2024",
+            span,
+        );
         for (span, message) in destructors {
             match span {
                 Some(span) => diag.span_note(span, message),
@@ -291,7 +303,8 @@ impl IfLetRescope {
         }
         for adt in adts {
             // alloc: the lint's diagnostic
-            let what = format!("the destructor of `{}`", b.cx.def_path(ModuleDefId::AdtId(adt).into()));
+            let what =
+                format!("the destructor of `{}`", b.cx.def_path(ModuleDefId::AdtId(adt).into()));
             diag.fact(Fact::DropCheck(b.cx.key(ItemId::Adt(adt))), what);
         }
         out.push(b.lint(diag, Phase::Late, at));
@@ -302,7 +315,9 @@ impl IfLetRescope {
 /// spaces `span` starts with.
 fn take_while_parens(b: &BodyCx<'_, '_, '_>, span: &Span) -> Span {
     let len = b.cx.snippet(span).map_or(0, |text| {
-        text.char_indices().find(|&(_, c)| c != '(' && !c.is_whitespace()).map_or(text.len(), |(at, _)| at)
+        text.char_indices()
+            .find(|&(_, c)| c != '(' && !c.is_whitespace())
+            .map_or(text.len(), |(at, _)| at)
     });
     span.with_hi(span.lo + len as u32)
 }
@@ -344,7 +359,10 @@ impl<'db> FindSignificantDropper<'_, '_, '_, 'db> {
         let b = self.b;
         match b.store().expr(expr) {
             Expr::Path(_) => {
-                matches!(util::path_value(b, expr), Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_)) | None)
+                matches!(
+                    util::path_value(b, expr),
+                    Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_)) | None
+                )
             }
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
             Expr::Field { expr: base, .. } | Expr::Index { base, .. } => {
@@ -378,7 +396,9 @@ impl<'db> FindSignificantDropper<'_, '_, '_, 'db> {
         }
         let store = b.store();
         match store.expr(expr) {
-            Expr::Ref { expr: inner, .. } | Expr::Field { expr: inner, .. } | Expr::Index { base: inner, .. } => {
+            Expr::Ref { expr: inner, .. }
+            | Expr::Field { expr: inner, .. }
+            | Expr::Index { base: inner, .. } => {
                 if let Some(found) = self.check_promoted_temp_with_drop(inner) {
                     return Some(found);
                 }
@@ -387,7 +407,14 @@ impl<'db> FindSignificantDropper<'_, '_, '_, 'db> {
             Expr::If { .. } => None,
             Expr::Match { expr: scrutinee, arms } => match arms {
                 // A `for` loop: rustc's `DropTemps` around its `match`.
-                [arm] if matches!(store.expr(arm.expr), Expr::Loop { source: LoopSource::ForLoop, .. }) => None,
+                [arm]
+                    if matches!(
+                        store.expr(arm.expr),
+                        Expr::Loop { source: LoopSource::ForLoop, .. }
+                    ) =>
+                {
+                    None
+                }
                 _ => self.visit_expr(scrutinee),
             },
             _ => self.walk_expr(expr),
@@ -404,7 +431,9 @@ impl<'db> FindSignificantDropper<'_, '_, '_, 'db> {
             _ => {
                 let mut children: SmallVec<[ExprId; 4]> = SmallVec::new();
                 store.walk_child_exprs_without_pats(expr, |it| children.push(it));
-                children.into_iter().find_map(|child| stdx::ensure_sufficient_stack(|| self.visit_expr(child)))
+                children
+                    .into_iter()
+                    .find_map(|child| stdx::ensure_sufficient_stack(|| self.visit_expr(child)))
             }
         }
     }

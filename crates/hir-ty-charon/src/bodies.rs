@@ -157,10 +157,8 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         let enum_ty = of.ty();
         let Some(adt) = enum_ty.as_adt().and_then(|tref| self.ctx.adt_of(tref.id)) else {
             // alloc: an error
-            return Err(self.refuse(
-                format!("the discriminant of a value of type `{enum_ty:?}`"),
-                why::TYPES,
-            ));
+            return Err(self
+                .refuse(format!("the discriminant of a value of type `{enum_ty:?}`"), why::TYPES));
         };
         let int = types::enum_discriminant_ty(self.ctx, adt);
         let local = self.local_ids[&dest.local];
