@@ -544,6 +544,11 @@ impl Program {
         &self.memory
     }
 
+    /// The content key of the executable its memory's image part is now ([`Image::key`]).
+    pub fn file(&self) -> [u8; 32] {
+        self.image.lock().key
+    }
+
     /// The command that runs what `command` would have, its program the executable at its
     /// path: arguments, environment, directory, stdin, sandbox and memory limit stay. `forks`
     /// says the process forks children that run the program (a fork server): see

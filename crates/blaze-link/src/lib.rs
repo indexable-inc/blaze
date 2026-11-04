@@ -71,6 +71,7 @@ use blaze_mem::Frame;
 use std::alloc::Global;
 
 pub use layout::Heat;
+pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
 pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{

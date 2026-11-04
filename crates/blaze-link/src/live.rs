@@ -13,8 +13,8 @@
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 use blaze_live::patch::{
-    ARCH_AARCH64, ARCH_X86_64, CodeRef, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message,
-    PatchRef, hash,
+    ARCH_AARCH64, ARCH_X86_64, CodeRef, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION,
+    Descriptor, Message, PatchRef, hash,
 };
 
 use crate::Format;
@@ -28,6 +28,50 @@ use crate::symbols::SymKey;
 /// patch adds in its code region ([`Stage::frames_end`]), and after a native object's it adds
 /// to `.eh_frame`.
 const EH_FRAME_END: [u8; 4] = [0; 4];
+
+/// The descriptor of the live image `bytes`, read back from the file as
+/// [`Stage::fill_descriptor`] wrote it: the descriptor at the address the image exports
+/// [`DESCRIPTOR`] at, by the name the image's format spells it (a Mach-O symbol gains an
+/// underscore), decoded at that address's place in the file. Its `id` is the image's lineage
+/// ([`crate::Image::lineage`]), what a daemon that did not link the image names it by in a
+/// restart message, and its `generation` the one a program of the file starts at. A file with
+/// no such export, or a descriptor that does not decode, is an error naming what is missing.
+pub fn descriptor_of(bytes: &[u8]) -> Result<Descriptor, String> {
+    use object::{Object, ObjectSegment};
+    let file =
+        object::File::parse(bytes).map_err(|it| format!("reading the image's headers: {it}"))?;
+    let (prefix, name) = match file.format() {
+        object::BinaryFormat::MachO => crate::macho::spelled(DESCRIPTOR),
+        _ => ("", DESCRIPTOR),
+    };
+    let named = |it: &[u8]| {
+        it.len() == prefix.len() + name.len()
+            && it.starts_with(prefix.as_bytes())
+            && it.ends_with(name.as_bytes())
+    };
+    let exports = file.exports().map_err(|it| format!("reading the image's exports: {it}"))?;
+    let at = exports
+        .iter()
+        .find(|it| named(it.name()))
+        .map(|it| it.address())
+        .ok_or_else(|| {
+            format!("the image exports no {DESCRIPTOR}: it was not linked as a live image")
+        })?;
+    let place = file.segments().find_map(|segment| {
+        let (offset, len) = segment.file_range();
+        let start = segment.address();
+        let within =
+            at.checked_sub(start).filter(|it| it.saturating_add(Descriptor::SIZE as u64) <= len)?;
+        Some(offset + within)
+    });
+    let place = place
+        .ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} is in no segment's bytes of the file"))?;
+    usize::try_from(place)
+        .ok()
+        .and_then(|place| bytes.get(place..)?.get(..Descriptor::SIZE))
+        .and_then(Descriptor::decode)
+        .ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} (file offset {place:#x}) is no descriptor"))
+}
 
 impl Stage<'_> {
     /// The live descriptor's bytes: where the table and the patch regions are, as linked.

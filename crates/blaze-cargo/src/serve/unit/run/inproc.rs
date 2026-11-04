@@ -12,7 +12,7 @@ use std::sync::Arc;
 use blaze_codegen::plan::Policy;
 use blaze_core::Command;
 use blaze_hash::SharedMap;
-use blaze_ids::ContentId;
+use blaze_cas::Key;
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_inproc::host::{self, Host, Program, Session, Started};
 use blaze_inproc::{CodeMemory, CodeRange, Format};
@@ -21,7 +21,7 @@ use blaze_live::patch::{Answer, Message, MessageView};
 use blaze_units::schema::Mode;
 use blaze_units::stdlib::DEV_RUNTIME;
 
-use crate::serve::unit::{Job, codegen, graph::flag};
+use crate::serve::unit::{Job, codegen, compile::output_key, graph::flag};
 use blaze_live::patch::ask::{
     self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK,
 };
@@ -41,9 +41,6 @@ pub(crate) const ARENA: u64 = 1 << 30;
 
 /// The cells of a tiered run: a pair of words for each tier a function counts in.
 pub(crate) const CELLS_PER_FUNCTION: u64 = 32;
-
-/// The content domain of a dev executable's bytes, its key for [`host::Executable`].
-const DOMAIN: &str = "blaze v2 dev executable 1";
 
 /// The reservations a dev executable is linked with: the arena, the cells of a tiered run of
 /// `functions` functions (none when not tiered), and no fixed maps (no dependency image).
@@ -187,9 +184,9 @@ impl DevRuns {
     /// `blaze run`'s start of the executable at `path` as process `pid`: the start hook's
     /// variables when the daemon holds it as a dev executable ([`Loaded::launch`]); `None` for
     /// a file that is no dev executable (its headers reserve nothing for a code memory's
-    /// arena), which runs as linked. A dev executable this daemon did not link (an earlier
-    /// daemon did, and this one's builds found it done) is an error naming it, never a run of
-    /// its file that edits would not reach.
+    /// arena), which runs as linked. A dev executable this daemon neither linked nor replayed
+    /// from a record ([`DevRuns::adopt`]) is an error naming it, never a run of its file that
+    /// edits would not reach.
     pub(crate) fn launch(
         &self,
         path: &str,
@@ -219,7 +216,8 @@ impl DevRuns {
     /// Why the dev executable at `path` can't start: this daemon holds no code memory under
     /// that path. One it holds under another path of the same file name (a run asking for a
     /// copy its link did not register, [`commit`]'s `runs_from`) is named, as a bug of blaze's,
-    /// never taken for this one; else an earlier daemon linked it (nothing here is ever let go).
+    /// never taken for this one; else no build of this daemon's linked or replayed it (nothing
+    /// here is ever let go).
     fn unheld(&self, path: &str) -> String {
         let name = path.rsplit('/').next().unwrap_or(path);
         let programs = self.programs.pin();
@@ -233,8 +231,8 @@ impl DevRuns {
         match held.is_empty() {
             true => format!(
                 "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
-                 memory of it: an earlier daemon linked it (this daemon lets go of no dev executable it linked). Edit \
-                 the program, or remove the file, and run again so this daemon links it"
+                 memory of it: no build of this daemon's linked it or replayed it (this daemon lets go of no dev \
+                 executable it holds). Build it again (`blaze build`, `run` or `test`) so this daemon holds it"
             ),
             false => format!(
                 "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
@@ -243,6 +241,44 @@ impl DevRuns {
                 held.join(", ")
             ),
         }
+    }
+
+    /// The dev executable a build replayed from its record to `path` (and to `runs_from`, the
+    /// copy a run starts it from), the output the store keeps under `key`, held as the program
+    /// a run of either path starts: a record names the file its link made, and that file, not
+    /// whatever this daemon linked there last, is what the build's outputs are. Held already
+    /// (the program's file is the output under `key`, [`Program::file`]), nothing changes and
+    /// the file is not read; otherwise its `bytes` are laid into a code memory of their own
+    /// ([`adopted`]), which no kept image patches (the next link of the path holds its own
+    /// program again, [`commit`]). A program it replaced that a run still maps is told to start
+    /// again.
+    pub(crate) fn adopt<'b>(
+        &self,
+        path: &str,
+        runs_from: Option<&str>,
+        key: Key,
+        bytes: impl FnOnce() -> Result<&'b [u8], String>,
+    ) -> Result<Told, String> {
+        // clone: a count, once per replayed dev executable
+        let held = self.programs.pin().get(path).cloned().filter(|it| it.program.file() == key.0.0);
+        let loaded = match held {
+            Some(it) => it,
+            None => {
+                let bytes = bytes()?;
+                let len = bytes.len();
+                let _span = tracing::info_span!(target: "blaze", "dev run adopt", path, len).entered();
+                let host = self.host()?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                Arc::new(adopted(&host, name, bytes, key)?)
+            }
+        };
+        let replaced = hold(self, path, runs_from, &loaded);
+        // alloc: once per restart, its reason
+        Ok(restart_running(replaced, || {
+            format!(
+                "{path} is now its build's file, kept from an earlier link, in a code memory of its own"
+            )
+        }))
     }
 }
 
@@ -306,31 +342,48 @@ pub(crate) fn commit(
     let span = tracing::info_span!(target: "blaze", "dev run commit", path, generation = staged.generation(), full = staged.full())
         .entered();
     if let Some(loaded) = kept.as_ref().filter(|_| !staged.full()) {
-        let made = loaded.patch(image, staged, refused);
+        let (bytes, told) = loaded.patch(image, staged, refused)?;
         // A patch keeps the memory: every path it runs from names it still (and one a link
-        // before this registered under no copy now does).
-        hold(runs, path, runs_from, loaded);
+        // before this registered under no copy now does). A program it replaced there is one
+        // adopted from a record since ([`DevRuns::adopt`]): its runs start again.
+        let replaced = hold(runs, path, runs_from, loaded);
+        // alloc: once per restart, its reason
+        let held = restart_running(replaced, || {
+            format!("{path} was linked again: its runs start from this link's code memory")
+        });
         drop(span);
-        return made;
+        let told = match (told, held) {
+            (Told::Nothing, held) => held,
+            (told, _) => told,
+        };
+        return Ok((bytes, told));
     }
     let host = runs.host()?;
     let name = path.rsplit('/').next().unwrap_or(path);
     let (loaded, bytes) = load(&host, name, image, staged, cells)?;
     let loaded = Arc::new(loaded);
     *kept = Some(loaded.clone());
-    let mut told = Told::Nothing;
-    for old in hold(runs, path, runs_from, &loaded) {
-        // No run maps the old memory: nothing to tell.
-        if !old.running() {
-            continue;
-        }
-        // alloc: once per restart, its reason
-        let why = format!("{path} was linked again from scratch: its code is laid out anew");
-        old.restart(&why);
-        told = Told::Restart { why };
-    }
+    let replaced = hold(runs, path, runs_from, &loaded);
+    // alloc: once per restart, its reason
+    let told = restart_running(replaced, || {
+        format!("{path} was linked again from scratch: its code is laid out anew")
+    });
     drop(span);
     Ok((bytes, told))
+}
+
+/// Each of `replaced` that a run still maps told to start again, for `why`; what the runs were
+/// told. One no run maps is told nothing.
+fn restart_running(replaced: Vec<Arc<Loaded>>, why: impl FnOnce() -> String) -> Told {
+    let mut running = replaced.into_iter().filter(|it| it.running()).peekable();
+    if running.peek().is_none() {
+        return Told::Nothing;
+    }
+    let why = why();
+    for old in running {
+        old.restart(&why);
+    }
+    Told::Restart { why }
 }
 
 /// `loaded` held under `path` and `runs_from`, the paths its runs start it from; the other
@@ -376,7 +429,8 @@ pub(crate) struct Loaded {
     patch: Arc<Mutex<Patch>>,
     failures: Failures,
     launched: Launched,
-    /// The image's lineage ([`Image::lineage`]): what a restart message is for.
+    /// The image's lineage ([`Image::lineage`]), or for a file adopted from a record
+    /// ([`DevRuns::adopt`]) its descriptor's: what a restart message is for.
     lineage: [u8; 16],
     /// The executable's file name, for errors.
     name: String,
@@ -412,7 +466,55 @@ pub(crate) fn load(
     memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out: {it}"))?;
     // alloc: once per dev executable linked, the bytes the store keeps.
     let bytes = memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
-    let file = host::Image { key: ContentId::of(DOMAIN, &bytes).0, len, store: None };
+    let file = host::Image { key: output_key(&bytes).0.0, len, store: None };
+    let loaded = held(host, name, memory, file, generation, image.lineage())?;
+    Ok((loaded, bytes))
+}
+
+/// `bytes`, a dev executable's file as a link made it and a record kept it, the output the
+/// store keeps under `key`, laid into a new code memory named `name` as its image part, for this
+/// host's start hook: the program a run of a replayed build starts ([`DevRuns::adopt`]). It is
+/// linked with [`dev_run`]`(None)`'s reservations (a dev executable's link reserves no cells);
+/// a file whose headers reserve no arena is refused by the layout, naming it. Its lineage and
+/// generation are its live descriptor's, read back from the file ([`blaze_link::descriptor_of`]),
+/// so a later link of the path tells its runs to start again as it would its own image's. No
+/// patch comes to it: no image of this daemon's is its file.
+fn adopted(host: &Arc<Host>, name: &str, bytes: &[u8], key: Key) -> Result<Loaded, String> {
+    let format =
+        Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
+    let len = bytes.len() as u64;
+    if len > IMAGE {
+        return Err(format!(
+            "the dev executable `{name}` is {len:#x} bytes, more than its code memory's {IMAGE:#x}"
+        ));
+    }
+    let descriptor = blaze_link::descriptor_of(bytes)
+        .map_err(|it| format!("the dev executable `{name}`'s kept file: {it}"))?;
+    let mut memory = CodeMemory::with_cells(name, IMAGE, ARENA, dev_run(None).cells)
+        .map_err(|it| it.to_string())?;
+    memory
+        .write(0, bytes)
+        .map_err(|it| format!("writing `{name}`'s kept file into its code memory: {it}"))?;
+    memory
+        .publish(CodeRange { offset: 0, len })
+        .map_err(|it| format!("publishing `{name}`'s kept file: {it}"))?;
+    memory
+        .lay_out(format)
+        .map_err(|it| format!("laying `{name}`'s code memory out from its kept file: {it}"))?;
+    let file = host::Image { key: key.0.0, len, store: None };
+    held(host, name, memory, file, descriptor.generation, descriptor.id)
+}
+
+/// `memory`, laid out, as a program whose runs attach through `host`, and the thread that
+/// serves them: the newest patch at `generation`, none yet.
+fn held(
+    host: &Arc<Host>,
+    name: &str,
+    memory: CodeMemory,
+    file: host::Image,
+    generation: u64,
+    lineage: [u8; 16],
+) -> Result<Loaded, String> {
     let patch: Arc<Mutex<Patch>> = Arc::new(Mutex::new(Patch { generation, message: None }));
     let failures: Failures = Arc::default();
     let (sessions, started) = crossbeam_channel::unbounded();
@@ -429,18 +531,8 @@ pub(crate) fn load(
         .name("blaze dev run sessions".to_owned())
         .spawn(move || sessions_of(started, &served))
         .map_err(|it| format!("starting the thread that serves `{name}`'s runs: {it}"))?;
-    // alloc: once per dev executable laid out whole, its name
-    Ok((
-        Loaded {
-            program,
-            patch,
-            failures,
-            launched,
-            lineage: image.lineage(),
-            name: name.to_owned(),
-        },
-        bytes,
-    ))
+    // alloc: once per dev executable held, its name
+    Ok(Loaded { program, patch, failures, launched, lineage, name: name.to_owned() })
 }
 
 /// The runs a `blaze run` started by process ID ([`Loaded::launch`]): each one's start, which
@@ -510,7 +602,7 @@ impl Loaded {
         // alloc: once per patch, the bytes the store keeps.
         let bytes =
             memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
-        let file = host::Image { key: ContentId::of(DOMAIN, &bytes).0, len, store: None };
+        let file = host::Image { key: output_key(&bytes).0.0, len, store: None };
         self.program.relaid(&memory, file).map_err(|it| format!("`{name}`: {it}"))?;
         let told = match &message {
             None => Told::Nothing,
