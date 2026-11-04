@@ -284,15 +284,22 @@ fn latest_of(value: &Value) -> Result<Latest, String> {
                 return Err(format!("its `yanked` names {version:?}, not a release's version"));
             }
             let reason = reason.as_str().ok_or_else(|| format!("its `yanked.{version}` is no string"))?;
-            yanked.push((version.clone(), reason.to_owned()));
+            yanked.push((version.clone(), printable(reason).replace('\n', " ")));
         }
     }
     yanked.sort_by_key(|(version, _)| Version::parse(version));
     Ok(Latest { stable: newest("stable")?, canary: newest("canary")?, yanked })
 }
 
-/// The first [`NOTES_LINES`] lines of `notes`, at most [`NOTES_MOST`] characters.
+/// `text` without control characters but newlines: what `latest.json` says is printed to a
+/// terminal, and an escape sequence in it would be the terminal's to run.
+fn printable(text: &str) -> String {
+    text.chars().filter(|it| *it == '\n' || !it.is_control()).collect() // alloc: a line to print, once a read
+}
+
+/// The first [`NOTES_LINES`] lines of `notes`, at most [`NOTES_MOST`] characters, printable.
 fn trimmed(notes: &str) -> String {
+    let notes = printable(notes);
     let mut kept: String = notes.trim().lines().take(NOTES_LINES).collect::<Vec<_>>().join("\n"); // alloc: a release's notes, once a read
     if kept.len() > NOTES_MOST {
         kept.truncate(kept.floor_char_boundary(NOTES_MOST));
