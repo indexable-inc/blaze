@@ -2060,9 +2060,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     let asked = super::fetch_url::Asked { url, repo, rev, digest, most_bytes, out };
                     self.fetch_urls.ask(from, asked);
                 }
-                Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
+                Out::Pass(Arrived::Request { from, request: Request::Flush }) => {
                     let mut replies = std::mem::take(&mut self.replies);
-                    self.observe.query(from, sql, last_s, &mut replies);
+                    self.observe.flush(from, self.driver.now(), &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(Arrived::Request { from, request: Request::Rebuilt { all, cwd, item } }) => {

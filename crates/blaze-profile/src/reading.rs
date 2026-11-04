@@ -5,7 +5,6 @@
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use arrow_array::{Array, RecordBatch, cast::AsArray, types::{Int64Type, UInt32Type, UInt64Type}};
@@ -36,6 +35,8 @@ pub enum ReadingError {
     Arrow { path: PathBuf, error: arrow_schema::ArrowError },
     /// A column of an `open` file is missing or of another type.
     Column { path: PathBuf, column: &'static str },
+    /// The history's manifest can't be read.
+    History(crate::history::HistoryError),
 }
 
 impl fmt::Display for ReadingError {
@@ -47,34 +48,29 @@ impl fmt::Display for ReadingError {
             ReadingError::Column { path, column } => {
                 write!(f, "the profile history: {} has no column `{column}` of the type the open table has", path.display())
             }
+            ReadingError::History(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for ReadingError {}
 
-/// The last reading of the open spans of the process `pid` in the history `dir`, among its
-/// newest [`FILES`] `open` files; `None` where they hold none of it.
+/// The last reading of the open spans of the process `pid` in the history `dir`, among the
+/// newest [`FILES`] `open` files its manifest lists (by their latest instant, then name);
+/// `None` where they hold none of it.
 pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let suffix = format!(".{}.parquet", schema::OPEN.name); // alloc: once a reading
-    let schema_file = format!("schema{suffix}"); // alloc: once a reading
-    let io = |doing| move |error| ReadingError::Io { path: dir.to_owned(), doing, error }; // alloc: an error
+    let manifest = crate::history::manifest::read(dir).map_err(ReadingError::History)?;
     // alloc: the history's open files, once a reading
-    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io("listing"))? {
-        let entry = entry.map_err(io("listing"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(&suffix) || name == schema_file || name.starts_with('.') {
-            continue;
-        }
-        let modified = entry.metadata().and_then(|it| it.modified()).map_err(io("reading a file's time in"))?;
-        files.push((modified, entry.path()));
-    }
-    // Newest first; the name (build, then flush) breaks a tie in time.
+    let mut files: Vec<(i64, &str)> = manifest
+        .entries(schema::OPEN.name)
+        .filter(|(_, entry)| entry.pid.is_none_or(|it| it == pid))
+        .map(|(name, entry)| (entry.t_ns.map_or(i64::MIN, |it| it[1]), name))
+        .collect();
     files.sort_unstable_by(|a, b| b.cmp(a));
+    // alloc: the files' paths, once a reading
+    let files: Vec<PathBuf> = files.iter().take(FILES).map(|(_, name)| dir.join(name)).collect();
     let mut best: Option<Reading> = None;
-    for (_, path) in files.iter().take(FILES) {
+    for path in &files {
         if let Some(reading) = of_file(path, pid)?
             && best.as_ref().is_none_or(|it| reading.read_ns > it.read_ns)
         {

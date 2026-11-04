@@ -100,12 +100,25 @@ fn put(path: &Path, bytes: &[u8], doing: &'static str) -> Result<(), TimeError> 
 }
 
 pub(crate) fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Result<Vec<RecordBatch>, TimeError> {
-    sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, sql }).map_err(|error| TimeError::Sql { doing, error })
+    sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, scope: sql::Scope::All, sql })
+        .map_err(|error| TimeError::Sql { doing, error })
 }
 
-/// Each of `sqls` in one DuckDB ([`sql::run_all`]): their answers, in order, one for each.
+/// Each of `sqls` in one DuckDB ([`sql::run_all`]) over every file: their answers, in order,
+/// one for each.
 pub(crate) fn query_many(source: &Source<'_>, sqls: &[&str], doing: &'static str) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
-    let answers = sql::run_all(source.duckdb, source.history, sqls).map_err(|error| TimeError::Sql { doing, error })?;
+    query_many_in(source, sql::Scope::All, sqls, doing)
+}
+
+/// [`query_many`] over the files of `scope` alone: a reader of one build reads the footers
+/// of its files, not of every file ([`sql::Scope::Build`]).
+pub(crate) fn query_many_in(
+    source: &Source<'_>,
+    scope: sql::Scope,
+    sqls: &[&str],
+    doing: &'static str,
+) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
+    let answers = sql::run_all(source.duckdb, source.history, scope, sqls).map_err(|error| TimeError::Sql { doing, error })?;
     if answers.len() != sqls.len() {
         return Err(TimeError::BadColumn { table: "answers", column: "count", why: "is not one answer for each query DuckDB was asked" });
     }
@@ -590,9 +603,10 @@ fn events(batches: &[RecordBatch]) -> Result<Vec<EventIn>, TimeError> {
 
 /// The derived tables of `model` written into the history `dir`: their files.
 pub fn write(dir: &Path, model: &Model, path: &CriticalPath) -> Result<Vec<PathBuf>, TimeError> {
-    let mut writer = history::Writer::new();
     // alloc: the files written, once a report
     let mut written = Vec::with_capacity(4);
+    // alloc: the tables' rows, once a report
+    let mut rows = Vec::with_capacity(4);
     for (table, batch) in [
         (&schema::JOB_INTERVALS, job_intervals(model)),
         (&schema::SPAN_TIME, span_time(model)),
@@ -602,9 +616,15 @@ pub fn write(dir: &Path, model: &Model, path: &CriticalPath) -> Result<Vec<PathB
         let batch = batch.map_err(|error| TimeError::Arrow { table: table.name, error })?;
         // alloc: a file's name, once a table a report
         let file = dir.join(format!("{}-00000000.{}.parquet", model.build, table.name));
-        writer.write(&file, table, &[batch]).map_err(TimeError::History)?;
         written.push(file);
+        rows.push((table, [batch]));
     }
+    // Listed in the manifest in one commit, in place of the last report's of the build, which
+    // the same names replace ([`history::write_listed`]).
+    let files: Vec<(&Path, &'static Table, &[RecordBatch])> =
+        // alloc: once a report
+        written.iter().zip(&rows).map(|(file, (table, batch))| (file.as_path(), *table, batch.as_slice())).collect();
+    history::write_listed(dir, &files).map_err(TimeError::History)?;
     Ok(written)
 }
 

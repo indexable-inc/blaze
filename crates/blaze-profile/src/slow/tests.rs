@@ -276,6 +276,7 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb).args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture]).output().unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+    crate::history::manifest::list_written(&dir);
     dir
 }
 

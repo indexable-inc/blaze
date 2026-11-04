@@ -2,10 +2,12 @@
 -- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`, and
 -- `span_sums` over `spans` and `folded`.
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
--- globs of that table's files, `['<dir>/*.<table>.parquet', ...]`: the history's directory and,
--- with `--live`, the recorder's last seconds beside it. Each directory holds an empty
--- `schema.<table>.parquet` of every table, so each glob matches a file with every column: the
--- reader writes those a history older than the table lacks (`history::ensure_schemas`).
+-- that table's files the history's manifest lists (`history/manifest.rs`), all of them or
+-- those that can hold one build's rows: `['<dir>/schema.<table>.parquet', '<dir>/<file>', ...]`.
+-- The list leads with the table's empty `schema.<table>.parquet`, which has every column, so
+-- each view resolves with no file of its own: the reader writes those a history older than the
+-- table lacks (`history::ensure_schemas`). No glob: a glob read a merge's output beside its
+-- inputs.
 
 CREATE OR REPLACE VIEW spans AS
 SELECT * FROM read_parquet(@spans, union_by_name = true);

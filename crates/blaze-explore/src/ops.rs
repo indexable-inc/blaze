@@ -158,7 +158,7 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
                        `blaze explore` passes the one `nix run .#duckdb` pins";
         return Err(WireError::new(Kind::Sql, message).with("query", sql));
     };
-    let query = sql::Query { duckdb, history: &cx.history.dir, sql };
+    let query = sql::Query { duckdb, history: &cx.history.dir, scope: sql::Scope::All, sql };
     sql::run_with(&query, stop).map_err(|error| {
         let kind = match (&error, error.kind()) {
             (sql::SqlError::Stopped, _) => Kind::Cancelled,

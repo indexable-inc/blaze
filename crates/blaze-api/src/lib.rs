@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
-/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
+/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], `Request::Sql`, their
 /// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
 /// [`Request::Hot`] and [`Response::Hot`]. 24: [`Request::Gc`] and [`Response::Collected`]. 25:
 /// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
@@ -78,8 +78,10 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
-/// [`Status::settings`].
-pub const SCHEMA: u32 = 35;
+/// [`Status::settings`]. 36: [`Request::Flush`] and [`Response::Flushed`] in place of
+/// `Request::Sql` (`blaze debug sql --live`) and `Response::Queried`: a reader of the profile
+/// history asks the daemon to flush, then reads the history itself.
+pub const SCHEMA: u32 = 36;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -311,10 +313,12 @@ pub enum Request {
     /// subscriber whose connection has a frame not yet sent is skipped that tick; the next
     /// frame has every row since its last. Answered by the daemon's loop, which holds the feeds.
     Live,
-    /// `blaze debug sql --live`: `sql` over the history and the last `last_s` seconds of the
-    /// daemon's flight recorder, run by the daemon (the recorder is its); answered with
-    /// [`Response::Queried`].
-    Sql { sql: String, last_s: u32 },
+    /// A reader of the profile history (`blaze debug sql`, `blaze slow`, `blaze debug time`,
+    /// `blaze explain`) asks the daemon that writes it to flush what it has recorded, so the
+    /// history's manifest lists every row recorded before the ask; answered with
+    /// [`Response::Flushed`] once that flush has committed. Answered by the daemon's loop,
+    /// which hands it to the history's keeper.
+    Flush,
     /// `blaze debug hot`: the `top` keys (a span and what it is of) that took most time and
     /// each kind of wait's quantiles, from the daemon's live sketches (blaze-profile's `hot`),
     /// no history read; answered with [`Response::Hot`].
@@ -654,12 +658,9 @@ pub enum Response {
         trace: Vec<u8>,
     },
     Live(LiveFrame),
-    /// [`Request::Sql`]'s answer: one Arrow IPC stream of its batches, and its rows.
-    Queried {
-        #[serde(with = "blaze_protocol::bytes")]
-        ipc: Vec<u8>,
-        rows: u64,
-    },
+    /// [`Request::Flush`]'s answer: the number of the flush that committed, which the
+    /// history's manifest says from then on (`Manifest::flushed`).
+    Flushed { seq: u64 },
     /// [`Request::Hot`]'s answer.
     Hot(Hot),
     /// [`Request::Gc`]'s answer: the run's report as `blaze cache gc` prints it (its line, each

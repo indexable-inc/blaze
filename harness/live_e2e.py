@@ -206,7 +206,7 @@ async def spans(blaze: str, project: Path, env: dict[str, str]) -> list[dict[str
         "from spans c join (select build_id, min(start_ns) as first_ns from spans group by build_id) b "
         "using (build_id) where c.name = 'dev run commit' group by c.build_id, b.first_ns order by c.build_id"
     )
-    out = await command("spans", [blaze, "debug", "sql", "--live", "--last", "3600", "--json", query], project, env, 120)
+    out = await command("spans", [blaze, "debug", "sql", "--json", query], project, env, 120)
     rows = []
     for line in out.splitlines():
         line = line.strip()

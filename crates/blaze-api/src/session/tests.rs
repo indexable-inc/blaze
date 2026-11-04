@@ -602,7 +602,7 @@ fn counters() -> Snapshot {
 }
 
 /// A profile request is answered with the daemon's dump of the seconds it asks for; the
-/// explorer, the live feed and live SQL are the daemon loop's, so one that reaches the session
+/// explorer, the live feed and the history's flush are the daemon loop's, so one that reaches the session
 /// fails naming its command.
 #[test]
 fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
@@ -612,7 +612,7 @@ fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
     for (id, request, named) in [
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
-        (4, Request::Sql { sql: "SELECT 1".to_owned(), last_s: 30 }, "blaze debug sql --live"),
+        (4, Request::Flush, "a read of the profile history"),
         (5, Request::Gc { dry_run: true }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);

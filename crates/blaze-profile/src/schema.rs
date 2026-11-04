@@ -21,6 +21,37 @@ use crate::span;
 /// 0 and its spans' self time stays right.
 pub const VERSION: u32 = 3;
 
+/// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
+/// them so takes.
+#[derive(Debug)]
+pub struct Upgrade {
+    pub from: u32,
+    /// What changes between `from` and the next version, and why reading as the next is right.
+    pub how: &'static str,
+}
+
+/// Each older version a reader reads, oldest last. 2 reads as 3 with no rewrite: its files
+/// have no `folded_ns`, which the views read through the table's schema file, all nulls,
+/// and every reader takes a null `folded_ns` as 0, right as no blaze before 3 folded. 1 does
+/// not: its `spans.owner` and `switches.wait_value` name a job by its slot + 1, and its
+/// generation, which 2's `generation << 32 | slot` needs, was never written.
+pub const UPGRADES: &[Upgrade] = &[Upgrade {
+    from: 2,
+    how: "no `folded_ns` column: read through the schema file as null, which reads as 0; no blaze before 3 folded",
+}];
+
+/// Whether a file of `version` reads as [`VERSION`]'s: `Err` says why not, for the reader's
+/// refusal naming the file.
+pub fn readable(version: u32) -> Result<(), &'static str> {
+    if version == VERSION || UPGRADES.iter().any(|it| it.from == version) {
+        return Ok(());
+    }
+    if version > VERSION {
+        return Err("it is of a newer schema than this blaze reads: read it with the blaze that wrote it");
+    }
+    Err("it is of a schema this blaze has no upgrade from: its rows mean something no reader can say (version 1 named jobs without their generation); delete it, or the history")
+}
+
 /// The name of the clock the `*_ns` instants count on, as `hello` says it.
 #[cfg(target_os = "linux")]
 pub const CLOCK: &str = "linux CLOCK_MONOTONIC";

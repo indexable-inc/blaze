@@ -21,9 +21,38 @@ several readers.
     as they come, 16 of a level into one of the next (`history::compact::FAN_IN`), and all of a
     build's into one when it ends, by copying column chunks without decoding them: a build keeps
     at most about 15 files a level a table while it runs and one a table after. Before this a
-    self-build left 6,175 files. A reader that globs the files during a merge can see a merged
-    file and its inputs at once, or miss an input deleted after its glob; it reads a finished
-    build exactly. At open the history deletes inputs a crash left beside their merged file.
+    self-build left 6,175 files.
+
+    **The manifest.** `manifest.json` in the history's directory lists the files a reader reads,
+    by table, each with an entry: its schema version, its rows, the range of `build_id` and of
+    instants its rows span, the boot those instants count from (Linux's `boot_id`, macOS's
+    `kern.bootsessionuuid`), and the process that wrote it
+    (crates/blaze-profile/src/history/manifest.rs). Rewriting it (to a hidden name, renamed over
+    the last, under `manifest.lock`) is the one commit point of every change: a flush lists its
+    files in one commit; a merge lists its output and unlists its inputs in one commit, then
+    deletes the inputs; the cap unlists, then deletes. So a reader reads each row once, during a
+    merge too: until 2026-11-04 the views globbed `*.<table>.parquet`, and a glob during a merge
+    could read a merged file beside its inputs, every row twice. `blaze debug time`'s derived
+    tables and `blaze perf record`'s runs are listed the same way. At open the history deletes
+    what a crash left (a file of a form blaze writes that the manifest does not list, a hidden
+    half-written file) and refuses, naming it, a listed file that is missing or a Parquet file of
+    no form blaze writes. A history from before manifests gets one made of its files, once.
+
+    **What a reader sees.** Every reader (`blaze debug sql`, `blaze explain`, `blaze slow`,
+    `blaze debug time`) first asks the daemon that writes the history to flush
+    (`blaze_api::Request::Flush`), and reads after the manifest shows that flush. So it sees
+    every row recorded before it asked, each once: a flush moves rows from the recorder to a
+    file. `--live` (the recorder's last seconds written beside the history) is gone; it read
+    the rows of seconds a flush had also written twice. A reader of one build can read only the
+    files that can hold its rows (`sql::Scope::Build`: the build's own, and those of no build
+    whose instants overlap its window on the same boot), reading their footers and no other
+    file's; `blaze slow` still reads every file, as its recorder counts take the last counter
+    before the build.
+
+    **The cap.** Past `history::CAP_BYTES` the history deletes its oldest builds whole, every
+    table of a build at once, never one table of a build; files of no build (an idle daemon's
+    flushes) go one at a time. A build is as old as its newest flush; the newest flush's build is
+    kept.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
@@ -35,7 +64,8 @@ several readers.
     with an upper bound (the count-min estimate) and a lower bound (ticks counted exactly once
     listed), and p50, p90, p99 and max of each wait kind. No DuckDB, no history.
 
-DuckDB is never linked into blaze. `blaze debug sql` runs the pinned DuckDB CLI.
+DuckDB is never linked into blaze. `blaze debug sql` runs the pinned DuckDB CLI over the files the
+manifest lists, each table's list led by its `schema.<table>.parquet`.
 
 To profile any other Rust program (not blaze's builds), use ix-prof and `blaze pprof`, described in
 [ix-prof.md](ix-prof.md). Its format is specified in [ix-prof-format.md](ix-prof-format.md).
@@ -45,8 +75,11 @@ blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-p
 
 Defined once, in `crates/blaze-profile/src/schema.rs`. The Arrow schema of each table, the
 Parquet files, the live feed, the DuckDB views and this page all come from it. Schema version
-1. Each Arrow schema's metadata carries `blaze.table`, `blaze.schema` (the version) and
-`blaze.clock`.
+3 (`schema::VERSION`). Each Arrow schema's metadata carries `blaze.table`, `blaze.schema` (the
+version) and `blaze.clock`, and each file's manifest entry says its version. A reader reads a
+file of version 3 as it is and one of version 2 as 3 (its absent `folded_ns` reads as null, which
+every reader takes as 0; `schema::UPGRADES`), and refuses any other, naming the file: version 1
+named a job by its slot alone, and the generation version 2 needs was never written.
 
 **Time.** Every `*_ns` instant is in nanoseconds on the machine's monotonic clock: Linux
 `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW` (`mach_absolute_time`). It is the same clock in

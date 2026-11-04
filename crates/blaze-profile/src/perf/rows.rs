@@ -20,7 +20,7 @@ use arrow_array::{
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_derive::Serialize;
 
-use crate::{batches, history::Writer, schema};
+use crate::{batches, history, schema};
 
 /// The perf rows' format. Bumped when a column changes meaning; a reader refuses another.
 pub const FORMAT: u32 = 1;
@@ -145,8 +145,9 @@ pub fn functions_batch(rows: &[FnRow]) -> Result<RecordBatch, String> {
         .map_err(|error| format!("the {} batch: {error}", schema::PERF_FUNCTIONS.name))
 }
 
-/// Writes the run `run` and its `functions` into the history `dir`: the functions first, the
-/// run row last. A run already there is refused: the same profiles recorded twice.
+/// Writes the run `run` and its `functions` into the history `dir`, both files listed in its
+/// manifest in one commit ([`history::write_listed`]): a reader sees the run with its functions
+/// or neither. A run already there is refused: the same profiles recorded twice.
 pub fn write(dir: &Path, run: &RunRow, functions: &[FnRow]) -> Result<(), String> {
     if !is_run(&run.run) {
         // alloc: an error
@@ -161,36 +162,32 @@ pub fn write(dir: &Path, run: &RunRow, functions: &[FnRow]) -> Result<(), String
             runs.display()
         ));
     }
-    let mut writer = Writer::new();
     let file = functions_file(dir, &run.run);
-    writer
-        .write(&file, &schema::PERF_FUNCTIONS, &[functions_batch(functions)?])
-        .map_err(|error| format!("writing {}: {error}", file.display()))?;
-    writer
-        .write(&runs, &schema::PERF_RUNS, &[runs_batch(std::slice::from_ref(run))?])
-        .map_err(|error| format!("writing {}: {error}", runs.display()))?;
+    let function_rows = [functions_batch(functions)?];
+    let run_rows = [runs_batch(std::slice::from_ref(run))?];
+    history::write_listed(
+        dir,
+        &[(&file, &schema::PERF_FUNCTIONS, &function_rows), (&runs, &schema::PERF_RUNS, &run_rows)],
+    )
+    .map_err(|error| format!("writing run {} into {}: {error}", run.run, dir.display()))?;
     Ok(())
 }
 
 /// Every run recorded in the history `dir`, by when it began, then by name.
 pub fn runs(dir: &Path) -> Result<Vec<RunRow>, String> {
-    let suffix = format!(".{}.parquet", schema::PERF_RUNS.name);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    match dir.try_exists() {
         // alloc: no runs
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(false) => return Ok(Vec::new()),
+        Ok(true) => {}
         Err(error) => return Err(format!("{}: {error}", dir.display())),
-    };
-    // alloc: once a listing, the runs files
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.strip_prefix("perf-").and_then(|it| it.strip_suffix(suffix.as_str())).is_some_and(is_run) {
-            files.push(entry.path());
-        }
     }
+    let manifest = history::manifest::read(dir).map_err(|error| error.to_string())?;
+    // alloc: once a listing, the runs files
+    let mut files: Vec<std::path::PathBuf> = manifest
+        .files(schema::PERF_RUNS.name)
+        .filter(|name| name.strip_prefix("perf-").and_then(|it| it.split_once('.')).is_some_and(|(run, _)| is_run(run)))
+        .map(|name| dir.join(name))
+        .collect();
     files.sort_unstable();
     // alloc: once a listing
     let mut out = Vec::with_capacity(files.len());

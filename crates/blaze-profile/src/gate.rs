@@ -149,7 +149,7 @@ impl From<ViewError> for GateError {
 /// The gate over `build` of the history in `history` (`None`: the last build that ended), run
 /// by the DuckDB at `duckdb`.
 pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdict, GateError> {
-    let run = |sql: &str| sql::run(&Query { duckdb, history, sql });
+    let run = |sql: &str| sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql });
     let which = match asked {
         // alloc: a query, once a check
         Some(build) => format!("build_id = {build}"),
