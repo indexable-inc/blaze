@@ -738,7 +738,7 @@ async def exported(commit: str, dest: Path, log: Path) -> tuple[str, str, str]:
 async def copied(source: Path, dest: Path, log: Path, step: str) -> None:
     """`source` at `dest`, cloned block for block where the volume can (APFS, Btrfs, XFS)."""
     if sys.platform == "darwin":
-        argv = ["cp", "-cR", str(source), str(dest)]
+        argv = ["/bin/cp", "-cR", str(source), str(dest)]
     else:
         argv = ["cp", "-a", "--reflink=auto", str(source), str(dest)]
     await run(step, argv, cwd=source.parent, minutes=FETCH_MINUTES, log=log)
