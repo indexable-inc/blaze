@@ -801,6 +801,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-native-blaze"
+version = "0.1.0"
+
+[[package]]
 name = "harness-native-ecs"
 version = "0.1.0"
 dependencies = [
@@ -854,6 +858,7 @@ dependencies = [
  "dispatch2",
  "harfrust",
  "harness-native-api",
+ "harness-native-blaze",
  "harness-native-flecs",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
@@ -1057,6 +1062,7 @@ name = "harness-video"
 version = "0.1.0"
 dependencies = [
  "harness-native-api",
+ "harness-native-blaze",
  "harness-native-ecs",
  "harness-native-flecs",
  "harness-native-render",
@@ -1069,6 +1075,7 @@ dependencies = [
  "harness-native-ui-motion",
  "harness-native-ui-node-api",
  "harness-native-ui-prims",
+ "harness-native-ui-text-api",
  "harness-native-ui-timeline",
  "harness-native-ui-timeline-api",
  "hyperion-ecs",

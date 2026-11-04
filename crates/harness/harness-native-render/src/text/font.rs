@@ -59,7 +59,17 @@ pub trait FontSource: Clone + Sized {
     /// origin (y up), at `scale` pixels per point and shifted `subx` pixels right: coverage one byte a pixel, or
     /// premultiplied RGBA when [`FontSource::colour`]. Rows top first.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, glyph: u16, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, scale: f64, subx: f64);
+    fn draw(
+        &self,
+        glyph: u16,
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        x0: i32,
+        y0: i32,
+        scale: f64,
+        subx: f64,
+    );
 }
 
 /// A glyph or outline drawn for the atlas: `w` by `h` premultiplied RGBA pixels (a plain glyph's coverage as white), its
@@ -97,4 +107,3 @@ pub fn raster_glyph(font: &Font, glyph: u16, scale: f32, subx: f64) -> Bitmap {
     let rgba = if colour { buf } else { buf.iter().flat_map(|&c| [c; 4]).collect() };
     Bitmap { left: x0, top: y1, w: w as u32, h: h as u32, colour, rgba }
 }
-

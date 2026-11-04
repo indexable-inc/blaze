@@ -48,18 +48,26 @@ pub struct Marks {
 pub fn marks() -> &'static Marks {
     static M: OnceLock<Marks> = OnceLock::new();
     M.get_or_init(|| {
-        let mut out = Marks { names: Vec::new(), marks: Vec::new(), curves: Vec::new(), bands: Vec::new() };
+        let mut out =
+            Marks { names: Vec::new(), marks: Vec::new(), curves: Vec::new(), bands: Vec::new() };
         for &(name, svg) in SOURCES {
             let d = path_data(svg).unwrap_or_else(|| panic!("icons/{name}.svg has no path"));
             let contours = parse(d).unwrap_or_else(|e| panic!("icons/{name}.svg: {e}"));
-            let o = Outline::new(contours).unwrap_or_else(|| panic!("icons/{name}.svg draws nothing"));
+            let o =
+                Outline::new(contours).unwrap_or_else(|| panic!("icons/{name}.svg draws nothing"));
             let (centroid, spread) = ink(&o);
             let p = slug::pack(&o, out.curves.len() as u32);
             let at = out.bands.len() as u32;
             out.curves.extend_from_slice(&p.curves);
             out.bands.extend_from_slice(&p.bands);
             out.names.push(name);
-            out.marks.push(Mark { bbox: p.bbox, band: p.band, gdata: [at, p.max[0], p.max[1], 0], centroid, spread });
+            out.marks.push(Mark {
+                bbox: p.bbox,
+                band: p.band,
+                gdata: [at, p.max[0], p.max[1], 0],
+                centroid,
+                spread,
+            });
         }
         out
     })
@@ -76,7 +84,9 @@ pub fn mark(name: &str) -> Option<&'static Mark> {
 pub fn place(m: &Mark, x: f32, y: f32, side: f32) -> ([f32; 4], [f32; 4]) {
     let [x0, y0, x1, y1] = m.bbox;
     let long = (x1 - x0).max(y1 - y0);
-    let s = ((side * SPREAD / m.spread.max(1e-6)) * (side * FILL / long)).sqrt().min(side * MAX_FILL / long);
+    let s = ((side * SPREAD / m.spread.max(1e-6)) * (side * FILL / long))
+        .sqrt()
+        .min(side * MAX_FILL / long);
     let c = [((x0 + x1) * 0.5 + m.centroid[0]) * 0.5, ((y0 + y1) * 0.5 + m.centroid[1]) * 0.5];
     let (cx, cy) = (x + side * 0.5, y + side * 0.5);
     let rect = [cx + (x0 - c[0]) * s, cy - (y1 - c[1]) * s, (x1 - x0) * s, (y1 - y0) * s];
@@ -98,9 +108,7 @@ fn ink(o: &Outline) -> ([f32; 2], f32) {
     let segs: Vec<([f32; 2], [f32; 2])> = o
         .curves
         .iter()
-        .flat_map(|q| {
-            (0..8).map(move |i| (q.at(i as f32 / 8.0), q.at((i + 1) as f32 / 8.0)))
-        })
+        .flat_map(|q| (0..8).map(move |i| (q.at(i as f32 / 8.0), q.at((i + 1) as f32 / 8.0))))
         .collect();
     let [x0, y0, x1, y1] = o.bbox;
     let (dx, dy) = ((x1 - x0) / N as f32, (y1 - y0) / N as f32);
@@ -137,7 +145,9 @@ struct Lexer<'a> {
 
 impl Lexer<'_> {
     fn skip(&mut self) {
-        while self.i < self.s.len() && (self.s[self.i].is_ascii_whitespace() || self.s[self.i] == b',') {
+        while self.i < self.s.len()
+            && (self.s[self.i].is_ascii_whitespace() || self.s[self.i] == b',')
+        {
             self.i += 1;
         }
     }
@@ -170,14 +180,20 @@ impl Lexer<'_> {
             dot |= at(i) == b'.';
             i += 1;
         }
-        if matches!(at(i), b'e' | b'E') && (at(i + 1).is_ascii_digit() || (matches!(at(i + 1), b'-' | b'+') && at(i + 2).is_ascii_digit())) {
+        if matches!(at(i), b'e' | b'E')
+            && (at(i + 1).is_ascii_digit()
+                || (matches!(at(i + 1), b'-' | b'+') && at(i + 2).is_ascii_digit()))
+        {
             i += 2;
             while at(i).is_ascii_digit() {
                 i += 1;
             }
         }
         self.i = i;
-        std::str::from_utf8(&self.s[start..i]).ok().and_then(|t| t.parse().ok()).ok_or_else(|| format!("bad number at byte {start}"))
+        std::str::from_utf8(&self.s[start..i])
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("bad number at byte {start}"))
     }
 
     fn flag(&mut self) -> Result<bool, String> {
@@ -205,7 +221,9 @@ pub fn parse(d: &str) -> Result<Vec<Vec<Quad>>, String> {
         let rel = cmd.is_ascii_lowercase();
         let up = cmd.to_ascii_uppercase();
         let base = if rel { cur } else { [0.0, 0.0] };
-        let pt = |lx: &mut Lexer<'_>| -> Result<[f64; 2], String> { Ok([base[0] + lx.number()?, base[1] + lx.number()?]) };
+        let pt = |lx: &mut Lexer<'_>| -> Result<[f64; 2], String> {
+            Ok([base[0] + lx.number()?, base[1] + lx.number()?])
+        };
         let reflect = |kind: u8| match last_c {
             Some((k, c)) if k == kind => [2.0 * cur[0] - c[0], 2.0 * cur[1] - c[1]],
             _ => cur,
@@ -286,7 +304,14 @@ pub fn parse(d: &str) -> Result<Vec<Vec<Quad>>, String> {
 
 /// An SVG elliptical arc (endpoint form, SVG 1.1 F.6.5) from `a` to `b` as cubics (control, control, end), a quarter
 /// turn or less each.
-fn arc_cubics(a: [f64; 2], r: [f64; 2], rot_deg: f64, large: bool, sweep: bool, b: [f64; 2]) -> Vec<[[f64; 2]; 3]> {
+fn arc_cubics(
+    a: [f64; 2],
+    r: [f64; 2],
+    rot_deg: f64,
+    large: bool,
+    sweep: bool,
+    b: [f64; 2],
+) -> Vec<[[f64; 2]; 3]> {
     let (mut rx, mut ry) = (r[0].abs(), r[1].abs());
     if a == b {
         return Vec::new();
@@ -310,7 +335,8 @@ fn arc_cubics(a: [f64; 2], r: [f64; 2], rot_deg: f64, large: bool, sweep: bool, 
         co = -co;
     }
     let (cxp, cyp) = (co * rx * y1 / ry, -co * ry * x1 / rx);
-    let (cx, cy) = (cs * cxp - sn * cyp + (a[0] + b[0]) * 0.5, sn * cxp + cs * cyp + (a[1] + b[1]) * 0.5);
+    let (cx, cy) =
+        (cs * cxp - sn * cyp + (a[0] + b[0]) * 0.5, sn * cxp + cs * cyp + (a[1] + b[1]) * 0.5);
     let angle = |ux: f64, uy: f64, vx: f64, vy: f64| (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
     let t1 = angle(1.0, 0.0, (x1 - cxp) / rx, (y1 - cyp) / ry);
     let mut dt = angle((x1 - cxp) / rx, (y1 - cyp) / ry, (-x1 - cxp) / rx, (-y1 - cyp) / ry);
@@ -337,7 +363,11 @@ fn arc_cubics(a: [f64; 2], r: [f64; 2], rot_deg: f64, large: bool, sweep: bool, 
         let (ta, tb) = (t1 + step * i as f64, t1 + step * (i + 1) as f64);
         let p3 = if i + 1 == n { b } else { at(tb) };
         let (da, db) = (dir(ta), dir(tb));
-        out.push([[p0[0] + k * da[0], p0[1] + k * da[1]], [p3[0] - k * db[0], p3[1] - k * db[1]], p3]);
+        out.push([
+            [p0[0] + k * da[0], p0[1] + k * da[1]],
+            [p3[0] - k * db[0], p3[1] - k * db[1]],
+            p3,
+        ]);
         p0 = p3;
     }
     out

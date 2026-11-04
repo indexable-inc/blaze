@@ -78,27 +78,47 @@ impl LineInst {
     /// The pieces of a line `width` points thick through `points` (in order), in the colours `ink` (dark, light) at
     /// `alpha`: round at its ends and at every bend. Repeated points count once; a single point is a dot that wide.
     #[must_use]
-    pub fn stroke(points: &[[f32; 2]], width: f32, ink: ([f32; 4], [f32; 4]), alpha: f32) -> Vec<Self> {
+    pub fn stroke(
+        points: &[[f32; 2]],
+        width: f32,
+        ink: ([f32; 4], [f32; 4]),
+        alpha: f32,
+    ) -> Vec<Self> {
         let mut pts: Vec<[f32; 2]> = Vec::with_capacity(points.len());
         for p in points {
             if pts.last() != Some(p) {
                 pts.push(*p);
             }
         }
-        let piece = |a: [f32; 2], b: [f32; 2], before: Option<[f32; 2]>, after: Option<[f32; 2]>| {
-            let (prev, next) = (before.unwrap_or(a), after.unwrap_or(b));
-            Self {
-                seg: [a[0], a[1], b[0], b[1]],
-                around: [prev[0], prev[1], next[0], next[1]],
-                col_d: ink.0,
-                col_l: ink.1,
-                shape: [width * 0.5, f32::from(u8::from(before.is_some())), f32::from(u8::from(after.is_some())), alpha],
-            }
-        };
+        let piece =
+            |a: [f32; 2], b: [f32; 2], before: Option<[f32; 2]>, after: Option<[f32; 2]>| {
+                let (prev, next) = (before.unwrap_or(a), after.unwrap_or(b));
+                Self {
+                    seg: [a[0], a[1], b[0], b[1]],
+                    around: [prev[0], prev[1], next[0], next[1]],
+                    col_d: ink.0,
+                    col_l: ink.1,
+                    shape: [
+                        width * 0.5,
+                        f32::from(u8::from(before.is_some())),
+                        f32::from(u8::from(after.is_some())),
+                        alpha,
+                    ],
+                }
+            };
         match pts.as_slice() {
             [] => Vec::new(),
             [only] => vec![piece(*only, *only, None, None)],
-            _ => (0..pts.len() - 1).map(|i| piece(pts[i], pts[i + 1], i.checked_sub(1).map(|j| pts[j]), pts.get(i + 2).copied())).collect(),
+            _ => (0..pts.len() - 1)
+                .map(|i| {
+                    piece(
+                        pts[i],
+                        pts[i + 1],
+                        i.checked_sub(1).map(|j| pts[j]),
+                        pts.get(i + 2).copied(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -116,6 +136,19 @@ pub struct SpriteInst {
     pub fg: [f32; 4],
     /// The ground under it, straight RGBA (alpha 0: none, what is already drawn shows).
     pub bg: [f32; 4],
+}
+
+/// A picture drawn as pixel art: its own texture (bound per draw, not an atlas) stretched over `rect`, each texel a crisp
+/// block, never smoothed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct ImageInst {
+    /// x, y, w, h in points.
+    pub rect: [f32; 4],
+    /// The texture's width and height in texels, the opacity, 0.
+    pub size: [f32; 4],
+    /// The band it shows in, as a panel's `clip` (top, foot), then how far it fades in from each (0: a hard cut).
+    pub clip: [f32; 4],
 }
 
 #[repr(C)]
@@ -150,4 +183,3 @@ pub struct GlyphInst {
     /// How far it fades in from its band's top and foot (points; 0: a hard cut), 0, 0.
     pub fade: [f32; 4],
 }
-

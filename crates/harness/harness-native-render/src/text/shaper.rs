@@ -7,7 +7,10 @@
 //! A text is shaped whole to measure where its lines break, and each line is shaped again on its own.
 use super::font::{Font as SystemFont, FontSource};
 use super::{Attrs, FontId, Glyph, Read, breaks, hangs};
-use harfrust::{Buffer, BufferFlags, ClusterLevel, Direction, Feature, Script, ShapeOptions, ShapePlan, ShaperFont, Tag};
+use harfrust::{
+    Buffer, BufferFlags, ClusterLevel, Direction, Feature, Script, ShapeOptions, ShapePlan,
+    ShaperFont, Tag,
+};
 use icu_properties::props::{EmojiPresentation, LineBreak, Script as Uscript};
 use icu_properties::{CodePointMapData, CodePointSetData, PropertyNamesShort};
 use icu_segmenter::options::LineBreakOptions;
@@ -61,7 +64,11 @@ fn face_of(font: &SystemFont) -> Option<Font> {
 /// The variation `font` is set at: the axes the system reports away from their defaults, and its optical size the
 /// point size unless one is reported (the system sizes a font with an `opsz` axis to the size it is set at).
 fn variations_of(font: &SystemFont, size: f32) -> Vec<Variation> {
-    let mut out: Vec<Variation> = font.variations().into_iter().map(|(k, v)| Variation::new(Tag::from_be_bytes(k.to_be_bytes()), v)).collect();
+    let mut out: Vec<Variation> = font
+        .variations()
+        .into_iter()
+        .map(|(k, v)| Variation::new(Tag::from_be_bytes(k.to_be_bytes()), v))
+        .collect();
     if !out.iter().any(|v| v.tag == Tag::new(b"opsz")) {
         out.push(Variation::new(Tag::new(b"opsz"), size));
     }
@@ -76,14 +83,33 @@ fn instance(fonts: &mut super::Fonts, system: &SystemFont) -> Option<Rc<Instance
         return i.clone();
     }
     let size = system.size();
-    let face = fonts.shaper.faces.entry(system.post_script_name()).or_insert_with(|| face_of(system)).clone();
+    let face = fonts
+        .shaper
+        .faces
+        .entry(system.post_script_name())
+        .or_insert_with(|| face_of(system))
+        .clone();
     let made = face.map(|face| {
         let font = face.instance_builder().variations(variations_of(system, size)).build();
         let upem = i32::from(font.units_per_em());
-        let own: Vec<Feature> = key.1.iter().map(|&(t, v)| Feature::new(Tag::from_be_bytes(t.to_be_bytes()), v, ..)).collect();
+        let own: Vec<Feature> = key
+            .1
+            .iter()
+            .map(|&(t, v)| Feature::new(Tag::from_be_bytes(t.to_be_bytes()), v, ..))
+            .collect();
         let mut unkerned = own.clone();
         unkerned.push(Feature::new(Tag::new(b"kern"), 0, ..));
-        Rc::new(Instance { id, font, size, scale: f64::from(size) / f64::from(upem * SUB), features: [own, unkerned], plans: RefCell::new(HashMap::new()), trak: OnceCell::new(), system: system.clone(), advances: RefCell::new(HashMap::new()) })
+        Rc::new(Instance {
+            id,
+            font,
+            size,
+            scale: f64::from(size) / f64::from(upem * SUB),
+            features: [own, unkerned],
+            plans: RefCell::new(HashMap::new()),
+            trak: OnceCell::new(),
+            system: system.clone(),
+            advances: RefCell::new(HashMap::new()),
+        })
     });
     fonts.shaper.instances.insert(key, made.clone());
     made
@@ -97,7 +123,13 @@ impl Instance {
             .entry(key)
             .or_insert_with(|| {
                 let dir = if rtl { Direction::RightToLeft } else { Direction::LeftToRight };
-                Rc::new(ShapePlan::new(&self.font, dir, Some(script), None, &self.features[usize::from(!kerning)]))
+                Rc::new(ShapePlan::new(
+                    &self.font,
+                    dir,
+                    Some(script),
+                    None,
+                    &self.features[usize::from(!kerning)],
+                ))
             })
             .clone()
     }
@@ -115,7 +147,10 @@ impl Instance {
             buf.set_direction(Direction::LeftToRight);
             buf.set_script(Some(Script::COMMON));
             let plan = self.plan(Script::COMMON, false, false);
-            let options = ShapeOptions::new().plan(Some(&plan)).features(&self.features[1]).point_size(Some(self.size));
+            let options = ShapeOptions::new()
+                .plan(Some(&plan))
+                .features(&self.features[1])
+                .point_size(Some(self.size));
             if harfrust::shape(font, &mut buf, options).is_err() {
                 return 0;
             }
@@ -139,7 +174,11 @@ pub struct RunGlyph {
 /// A terminal row run (`cells`, one grapheme each, all set in `system`) shaped by HarfRust with contextual alternates
 /// and ligatures on and kerning off, each glyph keeping the index of the cell it came from as its cluster: a ligature
 /// over N cells is one glyph (or N glyphs, as JetBrains Mono sets them) at the run's first cell of it.
-pub(crate) fn shape_cells(fonts: &mut super::Fonts, system: &SystemFont, cells: &[&str]) -> Vec<RunGlyph> {
+pub(crate) fn shape_cells(
+    fonts: &mut super::Fonts,
+    system: &SystemFont,
+    cells: &[&str],
+) -> Vec<RunGlyph> {
     let Some(inst) = instance(fonts, system) else { return Vec::new() };
     let mut feats = inst.features[1].clone();
     feats.push(Feature::new(Tag::new(b"calt"), 1, ..));
@@ -148,7 +187,11 @@ pub(crate) fn shape_cells(fonts: &mut super::Fonts, system: &SystemFont, cells: 
     buf.set_direction(Direction::LeftToRight);
     buf.set_script(Some(Script::LATIN));
     buf.set_cluster_level(ClusterLevel::MonotoneGraphemes);
-    buf.set_flags(BufferFlags::BEGINNING_OF_TEXT | BufferFlags::END_OF_TEXT | BufferFlags::DO_NOT_INSERT_DOTTED_CIRCLE);
+    buf.set_flags(
+        BufferFlags::BEGINNING_OF_TEXT
+            | BufferFlags::END_OF_TEXT
+            | BufferFlags::DO_NOT_INSERT_DOTTED_CIRCLE,
+    );
     for (i, s) in cells.iter().enumerate() {
         if s.is_empty() {
             buf.push(u32::from(' '), i as u32);
@@ -157,9 +200,11 @@ pub(crate) fn shape_cells(fonts: &mut super::Fonts, system: &SystemFont, cells: 
             buf.push(u32::from(c), i as u32);
         }
     }
-    let plan = ShapePlan::new(&inst.font, Direction::LeftToRight, Some(Script::LATIN), None, &feats);
+    let plan =
+        ShapePlan::new(&inst.font, Direction::LeftToRight, Some(Script::LATIN), None, &feats);
     let font = ShaperFont::new(&inst.font).with_scale(i32::from(inst.font.units_per_em()) * SUB);
-    let options = ShapeOptions::new().plan(Some(&plan)).features(&feats).point_size(Some(inst.size));
+    let options =
+        ShapeOptions::new().plan(Some(&plan)).features(&feats).point_size(Some(inst.size));
     if harfrust::shape(&font, &mut buf, options).is_err() {
         return Vec::new();
     }
@@ -167,7 +212,13 @@ pub(crate) fn shape_cells(fonts: &mut super::Fonts, system: &SystemFont, cells: 
     buf.glyph_infos()
         .iter()
         .zip(buf.glyph_positions())
-        .map(|(i, p)| RunGlyph { id: i.glyph_id as u16, cell: i.cluster, adv: (f64::from(p.x_advance) * s) as f32, dx: (f64::from(p.x_offset) * s) as f32, dy: (f64::from(p.y_offset) * s) as f32 })
+        .map(|(i, p)| RunGlyph {
+            id: i.glyph_id as u16,
+            cell: i.cluster,
+            adv: (f64::from(p.x_advance) * s) as f32,
+            dx: (f64::from(p.x_offset) * s) as f32,
+            dy: (f64::from(p.y_offset) * s) as f32,
+        })
         .collect()
 }
 
@@ -193,17 +244,30 @@ const fn breaks_line(c: u32) -> bool {
 /// (Lucida Grande sets a qamats under resh as nothing, and the alef after takes the qamats' cluster; its bet-dagesh
 /// ligature over a qamats leaves the qamats the dagesh's): a glyph that is just the font's own glyph for a character
 /// a little way off that has none of its own is the nearest such character's.
-fn owners(font: &Font, units: &[u16], start: usize, end: usize, infos: &[harfrust::GlyphInfo], mut owner: Vec<usize>) -> Vec<usize> {
+fn owners(
+    font: &Font,
+    units: &[u16],
+    start: usize,
+    end: usize,
+    infos: &[harfrust::GlyphInfo],
+    mut owner: Vec<usize>,
+) -> Vec<usize> {
     let cmap = font.charmap();
-    let nominal = |u: usize| scalars(units, u, end).next().and_then(|(_, c)| cmap.map_unicode(c)).map(|g| g.to_u32());
+    let nominal = |u: usize| {
+        scalars(units, u, end).next().and_then(|(_, c)| cmap.map_unicode(c)).map(|g| g.to_u32())
+    };
     for k in 0..infos.len() {
         let c = owner[k];
         if nominal(c) == Some(infos[k].glyph_id) {
             continue;
         }
         let ahead = scalars(units, (c + 1).min(end), end).take(4).map(|(u, _)| u);
-        let behind = (c.saturating_sub(8).max(start)..c).filter(|&u| !(0xDC00..0xE000).contains(&units[u]));
-        let near = ahead.chain(behind).filter(|&u| !owner.contains(&u) && nominal(u) == Some(infos[k].glyph_id)).min_by_key(|&u| (u.abs_diff(c), u > c));
+        let behind =
+            (c.saturating_sub(8).max(start)..c).filter(|&u| !(0xDC00..0xE000).contains(&units[u]));
+        let near = ahead
+            .chain(behind)
+            .filter(|&u| !owner.contains(&u) && nominal(u) == Some(infos[k].glyph_id))
+            .min_by_key(|&u| (u.abs_diff(c), u > c));
         if let Some(u) = near {
             owner[k] = u;
         }
@@ -231,7 +295,9 @@ fn scalars(units: &[u16], a: usize, b: usize) -> impl Iterator<Item = (usize, u3
 /// The script HarfRust shapes `s` as (ISO 15924), Common when it has none.
 fn script_of(s: Uscript) -> Script {
     let name = PropertyNamesShort::<Uscript>::new().get(s);
-    name.and_then(|n| <[u8; 4]>::try_from(n.as_bytes()).ok()).and_then(|t| Script::from_iso15924_tag(Tag::new(&t))).unwrap_or(Script::COMMON)
+    name.and_then(|n| <[u8; 4]>::try_from(n.as_bytes()).ok())
+        .and_then(|t| Script::from_iso15924_tag(Tag::new(&t)))
+        .unwrap_or(Script::COMMON)
 }
 
 /// A glyph as shaped, before it is placed: its face, id and unit, its advance (kern included), how much of that is
@@ -288,7 +354,12 @@ fn opportunities(units: &[u16], code: &[bool]) -> Vec<bool> {
     opportunity[0] = false;
     type L = LineBreak;
     let classes = CodePointMapData::<LineBreak>::new();
-    let at = |i: usize| char::decode_utf16(units[i..].iter().copied()).next().and_then(Result::ok).map_or(0xFFFD, u32::from);
+    let at = |i: usize| {
+        char::decode_utf16(units[i..].iter().copied())
+            .next()
+            .and_then(Result::ok)
+            .map_or(0xFFFD, u32::from)
+    };
     // The scalar that ends before unit `i`.
     let before = |i: usize| match i {
         0 => None,
@@ -304,11 +375,16 @@ fn opportunities(units: &[u16], code: &[bool]) -> Vec<bool> {
         let prev = before(p);
         if code.get(p).copied().unwrap_or(false) && code[p - 1] {
             let white = |c: Option<u32>| matches!(c, Some(0x20 | 0x09));
-            opportunity[p] = class(prev).is_some_and(|c| matches!(c, L::BK | L::CR | L::LF | L::NL)) || white(prev) && !white(Some(c));
+            opportunity[p] = class(prev)
+                .is_some_and(|c| matches!(c, L::BK | L::CR | L::LF | L::NL))
+                || white(prev) && !white(Some(c));
             p += if c > 0xFFFF { 2 } else { 1 };
             continue;
         }
-        if (class(prev) == Some(L::HY) || prev == Some(0x2010)) && this == L::AL && class(before(p - 1)).is_none_or(|a| ends(a) || matches!(a, L::GL | L::CB)) {
+        if (class(prev) == Some(L::HY) || prev == Some(0x2010))
+            && this == L::AL
+            && class(before(p - 1)).is_none_or(|a| ends(a) || matches!(a, L::GL | L::CB))
+        {
             opportunity[p] = false;
         }
         p += if c > 0xFFFF { 2 } else { 1 };
@@ -351,7 +427,10 @@ impl Typesetter {
         }
 
         let mut faces: Vec<Rc<Instance>> = Vec::new();
-        let index = |fonts: &mut super::Fonts, faces: &mut Vec<Rc<Instance>>, f: &SystemFont| -> Option<u16> {
+        let index = |fonts: &mut super::Fonts,
+                     faces: &mut Vec<Rc<Instance>>,
+                     f: &SystemFont|
+         -> Option<u16> {
             let inst = instance(fonts, f)?;
             Some(match faces.iter().position(|f| Rc::ptr_eq(f, &inst)) {
                 Some(k) => k as u16,
@@ -361,7 +440,8 @@ impl Typesetter {
                 }
             })
         };
-        let spans: Vec<Option<u16>> = attrs.fonts.iter().map(|f| index(fonts, &mut faces, f)).collect();
+        let spans: Vec<Option<u16>> =
+            attrs.fonts.iter().map(|f| index(fonts, &mut faces, f)).collect();
         let presents = CodePointSetData::new::<EmojiPresentation>();
         let mut face = vec![0u16; n];
         let mut g = 0;
@@ -378,7 +458,9 @@ impl Typesetter {
                 emoji |= c == 0xFE0F || presents.contains32(c);
                 text_style |= c == 0xFE0E;
                 if !invisible(c) {
-                    covered &= base.is_some_and(|b| faces[usize::from(b)].font.charmap().map_unicode(c).is_some());
+                    covered &= base.is_some_and(|b| {
+                        faces[usize::from(b)].font.charmap().map_unicode(c).is_some()
+                    });
                 }
             }
             let chosen = if covered && !(emoji && !text_style) {
@@ -394,7 +476,9 @@ impl Typesetter {
                         let text = String::from_utf16_lossy(cluster);
                         // Private-use symbols (Nerd Font icons) are the bundled Symbols Nerd Font's, which CoreText's
                         // cascade does not know.
-                        let private = text.chars().all(|c| matches!(u32::from(c), 0xE000..=0xF8FF | 0xF0000..));
+                        let private = text
+                            .chars()
+                            .all(|c| matches!(u32::from(c), 0xE000..=0xF8FF | 0xF0000..));
                         private
                             .then(|| {
                                 super::register_term_fonts();
@@ -413,7 +497,21 @@ impl Typesetter {
             // No font could be read: the text sets as nothing, which [`Typesetter::shape`] knows by no faces.
             face.clear();
         }
-        Self { units, face, faces, kern: attrs.kern.clone(), script, classes, levels, paras, opportunity, grapheme, advances: OnceCell::new(), whole: RefCell::new(HashMap::new()), cut: RefCell::new(HashMap::new()) }
+        Self {
+            units,
+            face,
+            faces,
+            kern: attrs.kern.clone(),
+            script,
+            classes,
+            levels,
+            paras,
+            opportunity,
+            grapheme,
+            advances: OnceCell::new(),
+            whole: RefCell::new(HashMap::new()),
+            cut: RefCell::new(HashMap::new()),
+        }
     }
 
     /// The paragraph unit `i` is in: its start, end and level.
@@ -424,7 +522,15 @@ impl Typesetter {
 
     /// The units `a..b` shaped as one run of one face, script and direction, with the units of `ctx` around them as
     /// context: the glyphs of the units `keep`, appended to `out` in visual order.
-    fn shape(&self, a: usize, b: usize, keep: std::ops::Range<usize>, ctx: (usize, usize), rtl: bool, out: &mut Vec<Shaped>) {
+    fn shape(
+        &self,
+        a: usize,
+        b: usize,
+        keep: std::ops::Range<usize>,
+        ctx: (usize, usize),
+        rtl: bool,
+        out: &mut Vec<Shaped>,
+    ) {
         if self.faces.is_empty() {
             return;
         }
@@ -458,14 +564,21 @@ impl Typesetter {
         let post: Vec<u32> = scalars(&self.units, b, ctx.1).take(5).map(|(_, c)| c).collect();
         buf.set_post_context_codepoints(&post);
         let plan = inst.plan(script, rtl, kerning);
-        let font = ShaperFont::new(&inst.font).with_scale(i32::from(inst.font.units_per_em()) * SUB);
-        let options = ShapeOptions::new().plan(Some(&plan)).features(&inst.features[usize::from(!kerning)]).point_size(Some(inst.size));
+        let font =
+            ShaperFont::new(&inst.font).with_scale(i32::from(inst.font.units_per_em()) * SUB);
+        let options = ShapeOptions::new()
+            .plan(Some(&plan))
+            .features(&inst.features[usize::from(!kerning)])
+            .point_size(Some(inst.size));
         if harfrust::shape(&font, &mut buf, options).is_err() {
             return;
         }
         let trak = inst.trak(&font);
         let (infos, positions) = (buf.glyph_infos(), buf.glyph_positions());
-        let units: Vec<usize> = infos.iter().map(|i| if rtl { b - i.cluster as usize } else { i.cluster as usize }).collect();
+        let units: Vec<usize> = infos
+            .iter()
+            .map(|i| if rtl { b - i.cluster as usize } else { i.cluster as usize })
+            .collect();
         let clusters = owners(&inst.font, &self.units, a, b, infos, units);
         let grapheme = |k: usize| (0..=clusters[k]).rev().find(|&u| self.grapheme[u]).unwrap_or(0);
         let from = out.len();
@@ -485,10 +598,22 @@ impl Typesetter {
             let (adv, space, added) = if pos.x_advance == 0 {
                 (kern, kern, 0.0)
             } else {
-                let added = f64::from(pos.x_advance - font.glyph_h_advance(harfrust::GlyphId::new(info.glyph_id)) - trak) * inst.scale;
+                let added = f64::from(
+                    pos.x_advance
+                        - font.glyph_h_advance(harfrust::GlyphId::new(info.glyph_id))
+                        - trak,
+                ) * inst.scale;
                 (inst.advance(info.glyph_id as u16) + added + kern, added + kern, added)
             };
-            out.push(Shaped { face, id: info.glyph_id as u16, idx, adv, space, dx: f64::from(pos.x_offset) * inst.scale, dy: f64::from(pos.y_offset) * inst.scale });
+            out.push(Shaped {
+                face,
+                id: info.glyph_id as u16,
+                idx,
+                adv,
+                space,
+                dx: f64::from(pos.x_offset) * inst.scale,
+                dy: f64::from(pos.y_offset) * inst.scale,
+            });
             kerned.push(added);
         }
         // Right to left, HarfRust sets a kern on the glyph before the pair's gap in the text as advance and an offset as
@@ -502,7 +627,10 @@ impl Typesetter {
                 if d == 0.0 || out[k].adv == 0.0 || (kerned[k - from] - d).abs() >= 1.0e-6 {
                     continue;
                 }
-                let Some(j) = (from..k).rev().find(|&j| start(out[j].idx) != start(out[k].idx)) else { continue };
+                let Some(j) = (from..k).rev().find(|&j| start(out[j].idx) != start(out[k].idx))
+                else {
+                    continue;
+                };
                 out[k].adv -= d;
                 out[k].space -= d;
                 out[k].dx = 0.0;
@@ -517,7 +645,9 @@ impl Typesetter {
 
     /// Whether the scalar at unit `i` is set as nothing: invisible, and not a tab or a line end (set as a space).
     fn hidden(&self, i: usize) -> bool {
-        scalars(&self.units, i, (i + 2).min(self.units.len())).next().is_some_and(|(_, c)| invisible(c) && c != 9 && !breaks_line(c))
+        scalars(&self.units, i, (i + 2).min(self.units.len()))
+            .next()
+            .is_some_and(|(_, c)| invisible(c) && c != 9 && !breaks_line(c))
     }
 
     /// The levels of the units `s..e` set as a line (UAX #9's L1: the white space before a tab or a paragraph's end
@@ -531,7 +661,16 @@ impl Typesetter {
                     levels[i - s] = para;
                     trailing = true;
                 }
-                BidiClass::WS | BidiClass::FSI | BidiClass::LRI | BidiClass::RLI | BidiClass::PDI | BidiClass::BN if trailing => levels[i - s] = para,
+                BidiClass::WS
+                | BidiClass::FSI
+                | BidiClass::LRI
+                | BidiClass::RLI
+                | BidiClass::PDI
+                | BidiClass::BN
+                    if trailing =>
+                {
+                    levels[i - s] = para
+                }
                 _ => trailing = false,
             }
         }
@@ -570,7 +709,11 @@ impl Typesetter {
             }
         }
         let mut shaped = Vec::new();
-        let same = |i: usize, j: usize| self.face[j] == self.face[i] && self.script[j] == self.script[i] && (self.kern[j] != 0.0) == (self.kern[i] != 0.0);
+        let same = |i: usize, j: usize| {
+            self.face[j] == self.face[i]
+                && self.script[j] == self.script[i]
+                && (self.kern[j] != 0.0) == (self.kern[i] != 0.0)
+        };
         let low = |i: usize| self.units.get(i).is_some_and(|u| (0xDC00..0xE000).contains(u));
         for &(a, b, level) in &runs {
             let rtl = level.is_rtl();
@@ -579,7 +722,9 @@ impl Typesetter {
             for (i, c) in scalars(&self.units, a, b) {
                 let w = if c > 0xFFFF { 2 } else { 1 };
                 match items.last_mut() {
-                    Some(it) if same(it.0, i) && self.para(it.0).0 == self.para(i).0 => it.1 = i + w,
+                    Some(it) if same(it.0, i) && self.para(it.0).0 == self.para(i).0 => {
+                        it.1 = i + w
+                    }
                     _ => items.push((i, i + w)),
                 }
             }
@@ -592,7 +737,8 @@ impl Typesetter {
                 // (Berkeley Mono's `|>` broken after the `|`) is the paragraph's; the line's start looks back at nothing.
                 let (pa, pb, _) = self.para(x);
                 let mut y1 = y;
-                while y1 < pb && y1 - y < REACH && same(x, y1) && self.levels[y1] == self.levels[x] {
+                while y1 < pb && y1 - y < REACH && same(x, y1) && self.levels[y1] == self.levels[x]
+                {
                     y1 += 1;
                 }
                 if low(y1) {
@@ -770,7 +916,14 @@ impl<T> std::ops::Index<&usize> for Units<T> {
 impl SetLine {
     /// The glyphs `shaped` (visual order) of units `s..e` placed from the line's start.
     fn place(ts: &Typesetter, s: usize, e: usize, levels: &[Level], shaped: &[Shaped]) -> Self {
-        let mut read = Read { glyphs: Vec::with_capacity(shaped.len()), xs: Vec::with_capacity(shaped.len()), adv: Vec::with_capacity(shaped.len()), ltr: levels.iter().all(|l| l.is_ltr()), width: 0.0, full: 0.0 };
+        let mut read = Read {
+            glyphs: Vec::with_capacity(shaped.len()),
+            xs: Vec::with_capacity(shaped.len()),
+            adv: Vec::with_capacity(shaped.len()),
+            ltr: levels.iter().all(|l| l.is_ltr()),
+            width: 0.0,
+            full: 0.0,
+        };
         // Each grapheme's extent (by the unit it starts at), from where its first glyph starts to where its last ends; a
         // ligature's is its first grapheme's. A caret between two glyphs sits halfway into the space set after the first,
         // as CoreText puts it.
@@ -806,7 +959,13 @@ impl SetLine {
                 _ => {}
             }
             let id = ts.faces[usize::from(g.face)].id;
-            read.glyphs.push(Glyph { font: id, id: g.id, x: (pen + g.dx) as f32, y: g.dy as f32, idx: g.idx });
+            read.glyphs.push(Glyph {
+                font: id,
+                id: g.id,
+                x: (pen + g.dx) as f32,
+                y: g.dy as f32,
+                idx: g.idx,
+            });
             read.xs.push(pen + g.dx);
             read.adv.push(g.adv);
             let key = key(g.idx);
@@ -882,7 +1041,8 @@ impl SetLine {
             let (x0, x1) = extent[&c];
             let (b0, b1) = raw[&c];
             let rtl = levels[c - s].is_rtl();
-            let bounds: Vec<usize> = (c..end).filter(|&u| u == c || (ts.grapheme[u] && !ts.hidden(u))).collect();
+            let bounds: Vec<usize> =
+                (c..end).filter(|&u| u == c || (ts.grapheme[u] && !ts.hidden(u))).collect();
             let n = bounds.len();
             let step = (b1 - b0) / n as f64;
             for (j, &u) in bounds.iter().enumerate() {
@@ -932,7 +1092,11 @@ impl SetLine {
         // left the pen).
         carets[e - s] = match starts.last() {
             Some(&c) => {
-                let (x0, x1) = if based[&c] { bare[&c] } else { (drawn.get(&c).copied().unwrap_or(bare[&c].0), after[&c]) };
+                let (x0, x1) = if based[&c] {
+                    bare[&c]
+                } else {
+                    (drawn.get(&c).copied().unwrap_or(bare[&c].0), after[&c])
+                };
                 if levels[c - s].is_rtl() { x0 } else { x1 }
             }
             None => 0.0,
@@ -965,10 +1129,16 @@ impl SetLine {
     /// The stop nearest `x`, as CoreText picks it: of stops at one place, the first if `x` is before it and the last
     /// if not (a point past a line's end is after its line break); halfway between two places, the later.
     pub(super) fn index_at(&self, x: f64) -> Option<usize> {
-        let mut places: Vec<(f64, usize, Option<i8>)> = self.stops.iter().map(|&u| (self.offset(u), u, self.sides.get(&u).copied())).chain(self.alts.iter().map(|&(p, u, side)| (p, u, Some(side)))).collect();
+        let mut places: Vec<(f64, usize, Option<i8>)> = self
+            .stops
+            .iter()
+            .map(|&u| (self.offset(u), u, self.sides.get(&u).copied()))
+            .chain(self.alts.iter().map(|&(p, u, side)| (p, u, Some(side))))
+            .collect();
         places.sort_by_key(|&(_, u, _)| u);
         let near = places.iter().map(|&(p, _, _)| (p - x).abs()).fold(f64::INFINITY, f64::min);
-        let tied: Vec<(f64, usize, Option<i8>)> = places.into_iter().filter(|&(p, _, _)| (p - x).abs() <= near + 1.0e-9).collect();
+        let tied: Vec<(f64, usize, Option<i8>)> =
+            places.into_iter().filter(|&(p, _, _)| (p - x).abs() <= near + 1.0e-9).collect();
         let at = tied.first()?.0;
         let one_place = tied.iter().all(|&(p, _, _)| (p - at).abs() <= 1.0e-9);
         // Where the direction turns, the unit whose grapheme is on the point's side.

@@ -3,9 +3,20 @@
 //! Apple's tracking in it), hands over their tables to shape from (`CTFontCopyTable`), and CoreGraphics rasterises
 //! glyphs and formula outlines for the atlas. Shaping, breaking, bidi, carets and hits are den's own (text/shaper.rs).
 use super::font::FontSource;
-use objc2_core_foundation::{CFArray, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString, CFType, CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGDataProvider, CGFont, CGPath, CGPathElement, CGPathElementType};
-use objc2_core_text::{CTFont, CTFontDescriptor, CTFontOrientation, CTFontSymbolicTraits, CTFontTableOptions, CTFontUIFontType, kCTFontFeatureSelectorIdentifierKey, kCTFontFeatureSettingsAttribute, kCTFontFeatureTypeIdentifierKey, kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue, kCTFontTraitsAttribute, kCTFontVariationAttribute, kCTFontWeightTrait};
+use objc2_core_foundation::{
+    CFArray, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString, CFType,
+    CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize,
+};
+use objc2_core_graphics::{
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGDataProvider, CGFont, CGPath, CGPathElement,
+    CGPathElementType,
+};
+use objc2_core_text::{
+    CTFont, CTFontDescriptor, CTFontOrientation, CTFontSymbolicTraits, CTFontTableOptions,
+    CTFontUIFontType, kCTFontFeatureSelectorIdentifierKey, kCTFontFeatureSettingsAttribute,
+    kCTFontFeatureTypeIdentifierKey, kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue,
+    kCTFontTraitsAttribute, kCTFontVariationAttribute, kCTFontWeightTrait,
+};
 use read_fonts::model::{Blob, Source};
 use read_fonts::types::Tag;
 use std::ptr::NonNull;
@@ -16,14 +27,18 @@ use std::sync::Arc;
 pub struct Font(CFRetained<CTFont>);
 
 unsafe extern "C-unwind" {
-    fn CFDictionaryGetValue(dict: &CFDictionary, key: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    fn CFDictionaryGetValue(
+        dict: &CFDictionary,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
 }
 
 /// CoreText's normalized weight of 500 (`NSFontWeightMedium`).
 const MEDIUM_WEIGHT: f32 = 0.23;
 
 /// Tables shaping never reads: glyph images, some of them hundreds of megabytes (Apple Color Emoji's `sbix`).
-const IMAGES: [&[u8; 4]; 8] = [b"sbix", b"CBDT", b"CBLC", b"EBDT", b"EBLC", b"bdat", b"bloc", b"SVG "];
+const IMAGES: [&[u8; 4]; 8] =
+    [b"sbix", b"CBDT", b"CBLC", b"EBDT", b"EBLC", b"bdat", b"bloc", b"SVG "];
 
 /// A CoreText object that is safe to share between threads: a font (Apple: "font objects can be used simultaneously
 /// by multiple operations, work queues, or threads") or an immutable `CFData`. read-fonts asks for both bounds.
@@ -57,7 +72,9 @@ impl FontSource for Font {
     /// CoreText answers a missing name with another font: one whose name is not `name` is none.
     fn named(name: &str, size: f32) -> Option<Self> {
         // SAFETY: a valid name and size; a null matrix is the identity.
-        let f = Self(unsafe { CTFont::with_name(&CFString::from_str(name), CGFloat::from(size), std::ptr::null()) });
+        let f = Self(unsafe {
+            CTFont::with_name(&CFString::from_str(name), CGFloat::from(size), std::ptr::null())
+        });
         (f.post_script_name() == name).then_some(f)
     }
 
@@ -69,7 +86,9 @@ impl FontSource for Font {
         // SAFETY: a dictionary of descriptor attributes.
         let desc = unsafe { CTFontDescriptor::with_attributes(attrs.as_opaque()) };
         // SAFETY: a live descriptor; a null matrix is the identity.
-        let f = Self(unsafe { CTFont::with_font_descriptor(&desc, CGFloat::from(size), std::ptr::null()) });
+        let f = Self(unsafe {
+            CTFont::with_font_descriptor(&desc, CGFloat::from(size), std::ptr::null())
+        });
         // SAFETY: a plain getter on a live font.
         let got = unsafe { f.0.family_name() }.to_string();
         got.eq_ignore_ascii_case(family).then_some(f)
@@ -78,19 +97,33 @@ impl FontSource for Font {
     fn system(size: f32, bold: bool) -> Self {
         let kind = if bold { CTFontUIFontType::EmphasizedSystem } else { CTFontUIFontType::System };
         // SAFETY: valid UI font type and size; None language means the current one.
-        Self(unsafe { CTFont::new_ui_font_for_language(kind, CGFloat::from(size), None) }.expect("system UI font"))
+        Self(
+            unsafe { CTFont::new_ui_font_for_language(kind, CGFloat::from(size), None) }
+                .expect("system UI font"),
+        )
     }
 
     fn fixed(size: f32) -> Self {
         // SAFETY: a valid UI font type and size; None is the current language.
-        Self(unsafe { CTFont::new_ui_font_for_language(CTFontUIFontType::UserFixedPitch, CGFloat::from(size), None) }.expect("fixed-pitch font"))
+        Self(
+            unsafe {
+                CTFont::new_ui_font_for_language(
+                    CTFontUIFontType::UserFixedPitch,
+                    CGFloat::from(size),
+                    None,
+                )
+            }
+            .expect("fixed-pitch font"),
+        )
     }
 
     fn from_data(bytes: &[u8], size: f32) -> Option<Self> {
         let provider = CGDataProvider::with_cf_data(Some(&CFData::from_bytes(bytes)))?;
         let graphics = CGFont::with_data_provider(&provider)?;
         // SAFETY: a live graphics font; a null matrix is the identity and no descriptor is asked for.
-        Some(Self(unsafe { CTFont::with_graphics_font(&graphics, CGFloat::from(size), std::ptr::null(), None) }))
+        Some(Self(unsafe {
+            CTFont::with_graphics_font(&graphics, CGFloat::from(size), std::ptr::null(), None)
+        }))
     }
 
     /// Its descriptor with the weight trait set. The system UI font has no name to ask CoreText for (its Medium is only
@@ -99,12 +132,15 @@ impl FontSource for Font {
         let weight = CFNumber::new_f32(MEDIUM_WEIGHT);
         // SAFETY: plain reads of CoreText's key constants.
         let (weight_key, traits_key) = unsafe { (kCTFontWeightTrait, kCTFontTraitsAttribute) };
-        let traits = CFDictionary::<CFType, CFType>::from_slices(&[cf(weight_key)], &[cf(&*weight)]);
+        let traits =
+            CFDictionary::<CFType, CFType>::from_slices(&[cf(weight_key)], &[cf(&*weight)]);
         let attrs = CFDictionary::<CFType, CFType>::from_slices(&[cf(traits_key)], &[cf(&*traits)]);
         // SAFETY: a live font and a dictionary of descriptor attributes.
         let desc = unsafe { self.0.font_descriptor().copy_with_attributes(attrs.as_opaque()) };
         // SAFETY: a live descriptor; a null matrix is the identity.
-        let font = Self(unsafe { CTFont::with_font_descriptor(&desc, CGFloat::from(size), std::ptr::null()) });
+        let font = Self(unsafe {
+            CTFont::with_font_descriptor(&desc, CGFloat::from(size), std::ptr::null())
+        });
         font.post_script_name().ends_with("Medium").then_some(font)
     }
 
@@ -114,14 +150,31 @@ impl FontSource for Font {
         /// AAT: the number-spacing feature type and its monospaced-numbers selector.
         const NUMBER_SPACING: i32 = 6;
         const MONOSPACED_NUMBERS: i32 = 0;
-        let (kind, selector) = (CFNumber::new_i32(NUMBER_SPACING), CFNumber::new_i32(MONOSPACED_NUMBERS));
+        let (kind, selector) =
+            (CFNumber::new_i32(NUMBER_SPACING), CFNumber::new_i32(MONOSPACED_NUMBERS));
         let (tag, on) = (CFString::from_str("tnum"), CFNumber::new_i32(1));
         // SAFETY: plain reads of CoreText's key constants.
-        let (type_key, selector_key, tag_key, value_key, settings_key) = unsafe { (kCTFontFeatureTypeIdentifierKey, kCTFontFeatureSelectorIdentifierKey, kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue, kCTFontFeatureSettingsAttribute) };
-        let aat = CFDictionary::<CFType, CFType>::from_slices(&[cf(type_key), cf(selector_key)], &[cf(&*kind), cf(&*selector)]);
-        let open_type = CFDictionary::<CFType, CFType>::from_slices(&[cf(tag_key), cf(value_key)], &[cf(&*tag), cf(&*on)]);
-        let settings = CFArray::<CFDictionary<CFType, CFType>>::from_retained_objects(&[aat, open_type]);
-        let attrs = CFDictionary::<CFType, CFType>::from_slices(&[cf(settings_key)], &[cf(&*settings)]);
+        let (type_key, selector_key, tag_key, value_key, settings_key) = unsafe {
+            (
+                kCTFontFeatureTypeIdentifierKey,
+                kCTFontFeatureSelectorIdentifierKey,
+                kCTFontOpenTypeFeatureTag,
+                kCTFontOpenTypeFeatureValue,
+                kCTFontFeatureSettingsAttribute,
+            )
+        };
+        let aat = CFDictionary::<CFType, CFType>::from_slices(
+            &[cf(type_key), cf(selector_key)],
+            &[cf(&*kind), cf(&*selector)],
+        );
+        let open_type = CFDictionary::<CFType, CFType>::from_slices(
+            &[cf(tag_key), cf(value_key)],
+            &[cf(&*tag), cf(&*on)],
+        );
+        let settings =
+            CFArray::<CFDictionary<CFType, CFType>>::from_retained_objects(&[aat, open_type]);
+        let attrs =
+            CFDictionary::<CFType, CFType>::from_slices(&[cf(settings_key)], &[cf(&*settings)]);
         // SAFETY: a live font and a dictionary of descriptor attributes.
         let desc = unsafe { self.0.font_descriptor().copy_with_attributes(attrs.as_opaque()) };
         // SAFETY: a live descriptor; a null matrix is the identity.
@@ -129,9 +182,16 @@ impl FontSource for Font {
     }
 
     fn italic(&self, size: f32, bold: bool) -> Option<Self> {
-        let traits = if bold { CTFontSymbolicTraits::ItalicTrait | CTFontSymbolicTraits::BoldTrait } else { CTFontSymbolicTraits::ItalicTrait };
+        let traits = if bold {
+            CTFontSymbolicTraits::ItalicTrait | CTFontSymbolicTraits::BoldTrait
+        } else {
+            CTFontSymbolicTraits::ItalicTrait
+        };
         // SAFETY: a live font; a null matrix is the identity.
-        unsafe { self.0.copy_with_symbolic_traits(CGFloat::from(size), std::ptr::null(), traits, traits) }.map(Self)
+        unsafe {
+            self.0.copy_with_symbolic_traits(CGFloat::from(size), std::ptr::null(), traits, traits)
+        }
+        .map(Self)
     }
 
     /// A copy with `kCTFontVariationAttribute` set to `axes` (keyed by each axis's tag as a number, as CoreText reports
@@ -140,8 +200,10 @@ impl FontSource for Font {
         if axes.is_empty() {
             return None;
         }
-        let tags: Vec<CFRetained<CFNumber>> = axes.iter().map(|&(t, _)| CFNumber::new_i64(i64::from(t))).collect();
-        let values: Vec<CFRetained<CFNumber>> = axes.iter().map(|&(_, v)| CFNumber::new_f64(f64::from(v))).collect();
+        let tags: Vec<CFRetained<CFNumber>> =
+            axes.iter().map(|&(t, _)| CFNumber::new_i64(i64::from(t))).collect();
+        let values: Vec<CFRetained<CFNumber>> =
+            axes.iter().map(|&(_, v)| CFNumber::new_f64(f64::from(v))).collect();
         let keys: Vec<&CFType> = tags.iter().map(|k| cf(&**k)).collect();
         let vals: Vec<&CFType> = values.iter().map(|v| cf(&**v)).collect();
         let variation = CFDictionary::<CFType, CFType>::from_slices(&keys, &vals);
@@ -151,9 +213,13 @@ impl FontSource for Font {
         // SAFETY: a dictionary of descriptor attributes.
         let desc = unsafe { CTFontDescriptor::with_attributes(attrs.as_opaque()) };
         // SAFETY: a live font and descriptor; a null matrix is the identity.
-        let font = Self(unsafe { self.0.copy_with_attributes(CGFloat::from(size), std::ptr::null(), Some(&desc)) });
+        let font = Self(unsafe {
+            self.0.copy_with_attributes(CGFloat::from(size), std::ptr::null(), Some(&desc))
+        });
         let set = font.variations();
-        axes.iter().all(|&(t, v)| set.iter().any(|&(k, x)| k == t && (x - v).abs() < 0.5)).then_some(font)
+        axes.iter()
+            .all(|&(t, v)| set.iter().any(|&(k, x)| k == t && (x - v).abs() < 0.5))
+            .then_some(font)
     }
 
     /// This one when it has the text.
@@ -203,7 +269,13 @@ impl FontSource for Font {
         let n = ch.encode_utf16(&mut units).len();
         let mut glyphs = [0u16; 2];
         // SAFETY: both buffers hold two units and at most `n` (one or two) are read and written.
-        let found = unsafe { self.0.glyphs_for_characters(NonNull::from(&mut units).cast(), NonNull::from(&mut glyphs).cast(), n as isize) };
+        let found = unsafe {
+            self.0.glyphs_for_characters(
+                NonNull::from(&mut units).cast(),
+                NonNull::from(&mut glyphs).cast(),
+                n as isize,
+            )
+        };
         if found { glyphs[0] } else { 0 }
     }
 
@@ -214,7 +286,14 @@ impl FontSource for Font {
         let mut g = glyph;
         let mut adv = CGSize { width: 0.0, height: 0.0 };
         // SAFETY: one glyph and one advance.
-        unsafe { self.0.advances_for_glyphs(CTFontOrientation::Default, NonNull::from(&mut g), &mut adv, 1) };
+        unsafe {
+            self.0.advances_for_glyphs(
+                CTFontOrientation::Default,
+                NonNull::from(&mut g),
+                &mut adv,
+                1,
+            )
+        };
         adv.width
     }
 
@@ -226,7 +305,9 @@ impl FontSource for Font {
                 return None;
             }
             // SAFETY: a live font and a four-byte tag.
-            let data = unsafe { ct.get().table(u32::from_be_bytes(tag.to_be_bytes()), CTFontTableOptions(0)) }?;
+            let data = unsafe {
+                ct.get().table(u32::from_be_bytes(tag.to_be_bytes()), CTFontTableOptions(0))
+            }?;
             Some(Blob::from(Arc::new(Shared(data)) as Arc<dyn AsRef<[u8]> + Send + Sync>))
         };
         Some((Source::from(Arc::new(tables) as Arc<dyn Fn(Tag) -> Option<Blob> + Send + Sync>), 0))
@@ -238,13 +319,18 @@ impl FontSource for Font {
         // SAFETY: a plain getter on a live font; the array holds dictionaries.
         let Some(settings) = (unsafe { self.0.feature_settings() }) else { return out };
         // SAFETY: CoreText's key constants.
-        let (tag_key, value_key) = unsafe { (kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue) };
+        let (tag_key, value_key) =
+            unsafe { (kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue) };
         for i in 0..settings.count() {
             // SAFETY: the index is in range and every value is a dictionary; a missing key reads as null.
             unsafe {
                 let dict = &*settings.value_at_index(i).cast::<CFDictionary>();
-                let tag = CFDictionaryGetValue(dict, std::ptr::from_ref::<CFString>(tag_key).cast()).cast::<CFString>();
-                let value = CFDictionaryGetValue(dict, std::ptr::from_ref::<CFString>(value_key).cast()).cast::<CFNumber>();
+                let tag =
+                    CFDictionaryGetValue(dict, std::ptr::from_ref::<CFString>(tag_key).cast())
+                        .cast::<CFString>();
+                let value =
+                    CFDictionaryGetValue(dict, std::ptr::from_ref::<CFString>(value_key).cast())
+                        .cast::<CFNumber>();
                 let (Some(tag), Some(value)) = (tag.as_ref(), value.as_ref()) else { continue };
                 let tag = tag.to_string();
                 if let (Ok(t), Some(v)) = (<[u8; 4]>::try_from(tag.as_bytes()), value.as_i64()) {
@@ -277,9 +363,17 @@ impl FontSource for Font {
 
     fn bounds(&self, glyph: u16) -> [f64; 4] {
         let mut g = glyph;
-        let mut bb = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } };
+        let mut bb =
+            CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } };
         // SAFETY: one glyph and one rect, both valid.
-        unsafe { self.0.bounding_rects_for_glyphs(CTFontOrientation::Default, NonNull::from(&mut g), &mut bb, 1) };
+        unsafe {
+            self.0.bounding_rects_for_glyphs(
+                CTFontOrientation::Default,
+                NonNull::from(&mut g),
+                &mut bb,
+                1,
+            )
+        };
         [bb.origin.x, bb.origin.y, bb.size.width, bb.size.height]
     }
 
@@ -288,7 +382,17 @@ impl FontSource for Font {
         unsafe { self.0.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitColorGlyphs)
     }
 
-    fn draw(&self, glyph: u16, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, scale: f64, subx: f64) {
+    fn draw(
+        &self,
+        glyph: u16,
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        x0: i32,
+        y0: i32,
+        scale: f64,
+        subx: f64,
+    ) {
         let Some(ctx) = context(buf, w, h, if self.colour() { 4 } else { 1 }) else { return };
         CGContext::translate_ctm(Some(&ctx), -f64::from(x0), -f64::from(y0));
         CGContext::scale_ctm(Some(&ctx), scale, scale);
@@ -323,7 +427,11 @@ impl Font {
         let key = unsafe { kCTFontAttributeName };
         let attrs = CFDictionary::<CFType, CFType>::from_slices(&[cf(key)], &[cf(&*self.0)]);
         // SAFETY: a live string and a dictionary of string attributes.
-        let Some(astr) = (unsafe { CFAttributedString::new(None, Some(&s), Some(attrs.as_opaque())) }) else { return Vec::new() };
+        let Some(astr) =
+            (unsafe { CFAttributedString::new(None, Some(&s), Some(attrs.as_opaque())) })
+        else {
+            return Vec::new();
+        };
         // SAFETY: a live attributed string.
         let line = unsafe { CTLine::with_attributed_string(&astr) };
         // SAFETY: a live line; its runs array holds CTRuns.
@@ -339,7 +447,12 @@ impl Font {
             }
             let mut glyphs = vec![0u16; n as usize];
             // SAFETY: the buffer holds the run's glyph count.
-            unsafe { run.glyphs(CFRange { location: 0, length: 0 }, NonNull::new_unchecked(glyphs.as_mut_ptr())) };
+            unsafe {
+                run.glyphs(
+                    CFRange { location: 0, length: 0 },
+                    NonNull::new_unchecked(glyphs.as_mut_ptr()),
+                )
+            };
             out.extend(glyphs);
         }
         out
@@ -356,7 +469,19 @@ impl Font {
     /// origin at (`tx`, `ty`) pixels, the bitmap's bottom-left pixel being (`x0`, `y0`): a glyph stretched or moved into
     /// a terminal cell.
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_placed(&self, glyph: u16, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, sx: f64, sy: f64, tx: f64, ty: f64) {
+    pub fn draw_placed(
+        &self,
+        glyph: u16,
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        x0: i32,
+        y0: i32,
+        sx: f64,
+        sy: f64,
+        tx: f64,
+        ty: f64,
+    ) {
         let Some(ctx) = context(buf, w, h, if self.colour() { 4 } else { 1 }) else { return };
         CGContext::translate_ctm(Some(&ctx), tx - f64::from(x0), ty - f64::from(y0));
         CGContext::scale_ctm(Some(&ctx), sx, sy);
@@ -379,22 +504,32 @@ pub fn register_fonts(paths: &[std::path::PathBuf]) -> Result<(), String> {
     let array = CFArray::<CFURL>::from_retained_objects(&urls);
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     // objc2 has no block encoding for C `bool`; `Bool` is the same one byte on Apple's targets.
-    let handler = block2::RcBlock::new(move |errors: NonNull<CFArray>, done: objc2::runtime::Bool| -> objc2::runtime::Bool {
-        let done = done.as_bool();
-        // SAFETY: CoreText hands a live array of CFErrors for the duration of the call.
-        let n = unsafe { errors.as_ref() }.count();
-        if n > 0 {
-            let _ = tx.send(Err(format!("{n} font file(s) failed to register")));
-        }
-        if done {
-            let _ = tx.send(Ok(()));
-        }
-        objc2::runtime::Bool::YES
-    });
+    let handler = block2::RcBlock::new(
+        move |errors: NonNull<CFArray>, done: objc2::runtime::Bool| -> objc2::runtime::Bool {
+            let done = done.as_bool();
+            // SAFETY: CoreText hands a live array of CFErrors for the duration of the call.
+            let n = unsafe { errors.as_ref() }.count();
+            if n > 0 {
+                let _ = tx.send(Err(format!("{n} font file(s) failed to register")));
+            }
+            if done {
+                let _ = tx.send(Ok(()));
+            }
+            objc2::runtime::Bool::YES
+        },
+    );
     // SAFETY: the same block layout and calling convention; only the declared argument types differ (Bool for bool).
-    let handler: &block2::DynBlock<dyn Fn(NonNull<CFArray>, bool) -> bool> = unsafe { &*std::ptr::from_ref(&*handler).cast() };
+    let handler: &block2::DynBlock<dyn Fn(NonNull<CFArray>, bool) -> bool> =
+        unsafe { &*std::ptr::from_ref(&*handler).cast() };
     // SAFETY: an array of file URLs and a handler that only sends on a channel.
-    unsafe { CTFontManagerRegisterFontURLs(array.as_opaque(), CTFontManagerScope::Process, true, Some(&handler)) };
+    unsafe {
+        CTFontManagerRegisterFontURLs(
+            array.as_opaque(),
+            CTFontManagerScope::Process,
+            true,
+            Some(&handler),
+        )
+    };
     let mut errs = Vec::new();
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
@@ -415,10 +550,13 @@ fn context(buf: &mut [u8], w: usize, h: usize, px: usize) -> Option<CFRetained<C
     thread_local! {
         static SPACES: (Option<CFRetained<CGColorSpace>>, Option<CFRetained<CGColorSpace>>) = (CGColorSpace::new_device_rgb(), CGColorSpace::new_device_gray());
     }
-    let (space, info) = SPACES.with(|(rgb, gray)| if px == 4 { (rgb.clone(), 1) } else { (gray.clone(), 7) });
+    let (space, info) =
+        SPACES.with(|(rgb, gray)| if px == 4 { (rgb.clone(), 1) } else { (gray.clone(), 7) });
     let space = space?;
     // SAFETY: the buffer is w*h*px bytes, px bytes per pixel; callers drop the context before reading the buffer.
-    let ctx = unsafe { CGBitmapContextCreate(buf.as_mut_ptr().cast(), w, h, 8, w * px, Some(&space), info) }?;
+    let ctx = unsafe {
+        CGBitmapContextCreate(buf.as_mut_ptr().cast(), w, h, 8, w * px, Some(&space), info)
+    }?;
     CGContext::set_should_antialias(Some(&ctx), true);
     CGContext::set_allows_antialiasing(Some(&ctx), true);
     // No font smoothing: it thickens every stem (0.15 px a side at 16 px to the em), and den's text is a browser's
@@ -427,4 +565,3 @@ fn context(buf: &mut [u8], w: usize, h: usize, px: usize) -> Option<CFRetained<C
     CGContext::set_should_smooth_fonts(Some(&ctx), false);
     Some(ctx)
 }
-

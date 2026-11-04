@@ -51,23 +51,12 @@ prefab Plate {
 // ---- the video's own ----
 // Type, in points of a 960 by 540 frame drawn at 2x (1920 by 1080). Big: most people watch it on a phone, a 1080p
 // frame shrunk to a fifth of its width.
-export const size_hero = 52
-export const line_hero = 64
-export const size_title = 34
-export const line_title = 44
-export const size_lead = 26
-export const line_lead = 34
-export const size_row = 22
-export const line_row = 28
-export const size_code = 22
-export const line_code = 30
-// The logo is 43 by 23 cells (gen.py --sheet); a cell is this many points, big then small.
-export const logo_cell = 9
-export const logo_cell_small = 6
-// The race: a cargo bar is this long, a blaze bar its share of it; a project's name column, and room past a bar's tip.
-export const bar_w = 440
-export const bar_h = 14
-export const bar_radius = 4
-export const name_w = 112
-export const tip_room = 70
-export const tone_cargo: Fill = {dark: {0.941, 0.965, 0.988, 0.24}, light: {0.941, 0.965, 0.988, 0.24}}
+export const size_hero = 30
+export const line_hero = 38
+export const size_lead = 19
+export const line_lead = 26
+export const size_code = 21
+export const line_code = 28
+
+// The fire mark: 43 by 23 cells (harness-native-blaze), each this many points.
+export const mark_cell = 12

@@ -75,6 +75,15 @@ pub struct Frames {
     pub fps: f32,
 }
 
+/// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
+/// falling in from the top of the view at `start` seconds on the frame clock, the fire catches a beat after the last lands,
+/// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlazeMark {
+    pub start: f32,
+    pub exit: f32,
+}
+
 /// Words that are code from `file` (a path or a name: its kind says the language): the host colours each stretch in its
 /// role's ink, as it colours a code card.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
@@ -109,6 +118,7 @@ hyperion_api_layouts::api_layouts! {
     "Picture" => alias Picture,
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
+    "BlazeMark" => alias BlazeMark,
     "Highlight" => alias Highlight,
     "LineNumbers" => alias LineNumbers,
     "TextRange" => alias TextRange,
@@ -126,6 +136,7 @@ pub fn register(world: &World) {
     world.component::<Picture>().writable();
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
+    world.component::<BlazeMark>().writable();
     world.component::<Highlight>().writable();
     world.component::<LineNumbers>().writable();
     world.component::<TextRange>().writable();

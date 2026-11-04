@@ -37,7 +37,12 @@ pub struct Theme {
 }
 
 const fn hex(v: u32) -> Rgba {
-    [((v >> 16) & 0xff) as f32 / 255.0, ((v >> 8) & 0xff) as f32 / 255.0, (v & 0xff) as f32 / 255.0, 1.0]
+    [
+        ((v >> 16) & 0xff) as f32 / 255.0,
+        ((v >> 8) & 0xff) as f32 / 255.0,
+        (v & 0xff) as f32 / 255.0,
+        1.0,
+    ]
 }
 
 /// A Ghostty colour as the shaders take it.
@@ -92,7 +97,9 @@ fn colour(theme: &Theme, c: harness_vt::Color, fg: bool) -> Option<Rgba> {
     match c {
         harness_vt::Color::Default => fg.then_some(theme.fg),
         harness_vt::Color::Idx(i) => Some(idx(theme, i)),
-        harness_vt::Color::Rgb(r, g, b) => Some([f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0]),
+        harness_vt::Color::Rgb(r, g, b) => {
+            Some([f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0])
+        }
     }
 }
 
@@ -185,7 +192,8 @@ const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
 
 impl Grid {
     pub fn new(fonts: &mut Fonts, size: f32, scale: f32) -> Self {
-        let faces = [(false, false), (true, false), (false, true), (true, true)].map(|(b, i)| fonts.term_font(size, b, i));
+        let faces = [(false, false), (true, false), (false, true), (true, true)]
+            .map(|(b, i)| fonts.term_font(size, b, i));
         let fm = fonts.term_metrics(faces[0]);
         let s = f64::from(scale);
         let face_w = f64::from(fm.advance) * s;
@@ -196,12 +204,23 @@ impl Grid {
         let face_base = (f64::from(fm.leading) / 2.0 + f64::from(fm.descent)) * s;
         let cell_base = (face_base - (chp - face_h) / 2.0).round();
         let cap = f64::from(fm.cap) * s;
-        let m = Metrics { cell_w: cwp, cell_h: chp, face_w, face_h, face_y: cell_base - face_base, icon_h: face_h, icon_h1: (2.0 * cap + face_h) / 3.0 };
+        let m = Metrics {
+            cell_w: cwp,
+            cell_h: chp,
+            face_w,
+            face_h,
+            face_y: cell_base - face_base,
+            icon_h: face_h,
+            icon_h1: (2.0 * cap + face_h) / 3.0,
+        };
         let (cwp, chp) = (cwp as i32, chp as i32);
         let basep = chp - cell_base as i32;
         // Ghostty: the underline's position rounded from the baseline, its thickness at least a pixel, rounded up.
         let ul_pos = fm.underline_pos.map_or(-f64::from(size) * 0.12 * s, |v| f64::from(v) * s);
-        let ult = fm.underline_thick.map_or((f64::from(size) / 13.0 * s).round(), |v| (f64::from(v) * s).ceil()).max(1.0) as i32;
+        let ult = fm
+            .underline_thick
+            .map_or((f64::from(size) / 13.0 * s).round(), |v| (f64::from(v) * s).ceil())
+            .max(1.0) as i32;
         let ulp = (f64::from(basep) - ul_pos).round() as i32;
         Self {
             size,
@@ -302,7 +321,9 @@ impl Grid {
     /// The cursor's opacity this frame (1 solid, 0 hidden): a smooth fade on the app clock when it blinks and the pane
     /// is focused, held solid for [`BLINK_PAUSE`] after the cursor moved or its row changed.
     fn cursor_alpha(&mut self, snap: &Snapshot, p: &Paint<'_>, blinking: bool, shown: bool) -> f32 {
-        let row = snap.rows.get(usize::from(snap.cursor.0)).map_or(FNV0, |r| r.iter().fold(FNV0, |h, c| fnv_mix(fnv_mix(h, c.text.as_bytes()), &[0])));
+        let row = snap.rows.get(usize::from(snap.cursor.0)).map_or(FNV0, |r| {
+            r.iter().fold(FNV0, |h, c| fnv_mix(fnv_mix(h, c.text.as_bytes()), &[0]))
+        });
         if (snap.cursor, row) != (self.blink.at, self.blink.row) {
             self.blink = Blink { at: snap.cursor, row, since: p.time };
         }
@@ -394,7 +415,8 @@ pub fn snapshot(term: &mut harness_vt::Term, theme: &Theme) -> Snapshot {
                 .map(|cell| {
                     let fg = colour(theme, cell.fg, true).unwrap_or(theme.fg);
                     let bg = colour(theme, cell.bg, false);
-                    let (fg, bg) = if cell.inverse { (bg.unwrap_or(theme.bg), Some(fg)) } else { (fg, bg) };
+                    let (fg, bg) =
+                        if cell.inverse { (bg.unwrap_or(theme.bg), Some(fg)) } else { (fg, bg) };
                     Cell {
                         text: if cell.invisible { String::new() } else { cell.text },
                         fg,
@@ -413,8 +435,19 @@ pub fn snapshot(term: &mut harness_vt::Term, theme: &Theme) -> Snapshot {
     let look = cursor.unwrap_or_default();
     let at = term.cursor();
     let (cols, nrows) = term.size();
-    let input = Input { modes: term.modes(), cursor: (at.y, at.x), size: (cols, nrows), history: term.history() };
-    Snapshot { rows: out, cursor: (look.y, look.x), cursor_shown: cursor.is_some_and(|c| c.visible), cursor_look: look, input }
+    let input = Input {
+        modes: term.modes(),
+        cursor: (at.y, at.x),
+        size: (cols, nrows),
+        history: term.history(),
+    };
+    Snapshot {
+        rows: out,
+        cursor: (look.y, look.x),
+        cursor_shown: cursor.is_some_and(|c| c.visible),
+        cursor_look: look,
+        input,
+    }
 }
 
 /// Glyphs to draw once every plate is down: a shaped run, a glyph constrained into its cells, or a run centred in them.
@@ -429,7 +462,15 @@ enum Job {
 
 /// Draw `snap` at `p.origin`: cell grounds, underlines, the cursor, procedural block and box glyphs, then the text: row
 /// runs of one style and colour shaped with ligatures, Nerd icons and emoji fitted to their cells, fallback glyphs centred.
-pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphCache, snap: &Snapshot, p: &Paint<'_>, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
+pub fn draw(
+    d: &mut Draw,
+    grid: &mut Grid,
+    fonts: &mut Fonts,
+    cache: &mut GlyphCache,
+    snap: &Snapshot,
+    p: &Paint<'_>,
+    upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+) {
     let sc = p.scale;
     let pt = |v: i32| v as f32 / sc;
     // Every cell sits on a whole device pixel: the origin is snapped, cells are whole pixels.
@@ -439,13 +480,19 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     let cursor = snap.cursor;
     let marked = p.marked.filter(|m| !m.is_empty() && p.scroll == 0);
     // The cells the marked (IME) text covers: the grid's own glyphs there give way to it.
-    let marked_span = marked.map(|m| (cursor.0, cursor.1, cursor.1.saturating_add(columns(m) as u16)));
-    let in_marked = |r: u16, c: u16| marked_span.is_some_and(|(mr, a, b)| mr == r && (a..b).contains(&c));
+    let marked_span =
+        marked.map(|m| (cursor.0, cursor.1, cursor.1.saturating_add(columns(m) as u16)));
+    let in_marked =
+        |r: u16, c: u16| marked_span.is_some_and(|(mr, a, b)| mr == r && (a..b).contains(&c));
     let show_cursor = snap.cursor_shown && p.scroll == 0 && marked.is_none();
     let look = snap.cursor_look;
     // The program's DECSCUSR shape and blink (1, 3, 5 blink), else the default (no DECSCUSR, or 0, which Ghostty reads as
     // "the configured default"): a steady thin bar in the accent colour, so an idle pane draws no frames.
-    let (shape, blinking, cursor_ink) = if look.explicit { (look.shape, look.blinking, theme.cursor) } else { (harness_vt::CursorShape::Bar, theme.blink, theme.accent) };
+    let (shape, blinking, cursor_ink) = if look.explicit {
+        (look.shape, look.blinking, theme.cursor)
+    } else {
+        (harness_vt::CursorShape::Bar, theme.blink, theme.accent)
+    };
     let alpha = grid.cursor_alpha(snap, p, blinking, show_cursor);
     let inverts = show_cursor && p.focused && shape == harness_vt::CursorShape::Block;
     let mut sprites: Vec<SpriteInst> = Vec::new();
@@ -481,7 +528,11 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
         };
         for (c, cell) in row.iter().enumerate() {
             let c = c as u16;
-            let bg = if p.sel.is_some_and(|s| s.holds(srow, c)) { Some(blend(cell.bg.unwrap_or(theme.bg), theme.select)) } else { cell.bg };
+            let bg = if p.sel.is_some_and(|s| s.holds(srow, c)) {
+                Some(blend(cell.bg.unwrap_or(theme.bg), theme.select))
+            } else {
+                cell.bg
+            };
             if run.map(|r| r.1) != bg {
                 flush(d, &mut run, c);
                 if let Some(bg) = bg {
@@ -490,7 +541,10 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
             }
             if cell.underline && !cell.cont {
                 let w = if cell.wide { 2 * cw } else { cw };
-                d.panel(rect_panel([pt(ox + i32::from(c) * cw), pt(y + grid.ulp), pt(w), pt(grid.ult)], cell.fg));
+                d.panel(rect_panel(
+                    [pt(ox + i32::from(c) * cw), pt(y + grid.ulp), pt(w), pt(grid.ult)],
+                    cell.fg,
+                ));
             }
         }
         flush(d, &mut run, row.len() as u16);
@@ -509,9 +563,18 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
             let ink = ink_at(cell, r, cu);
             if let Some(sh) = cell.procedural() {
                 // Its own ground under it (selection included), except under the cursor, whose plate shows instead.
-                let bg = if p.sel.is_some_and(|s| s.holds(srow, cu)) { Some(blend(cell.bg.unwrap_or(theme.bg), theme.select)) } else { cell.bg };
+                let bg = if p.sel.is_some_and(|s| s.holds(srow, cu)) {
+                    Some(blend(cell.bg.unwrap_or(theme.bg), theme.select))
+                } else {
+                    cell.bg
+                };
                 let under_cursor = show_cursor && (r, cu) == cursor;
-                sprites.push(SpriteInst { rect: [x, y, w, ch], shape: [sh.kind, sh.a, sh.b, 0], fg: ink, bg: if under_cursor { [0.0; 4] } else { bg.unwrap_or([0.0; 4]) } });
+                sprites.push(SpriteInst {
+                    rect: [x, y, w, ch],
+                    shape: [sh.kind, sh.a, sh.b, 0],
+                    fg: ink,
+                    bg: if under_cursor { [0.0; 4] } else { bg.unwrap_or([0.0; 4]) },
+                });
                 c += 1;
                 continue;
             }
@@ -526,10 +589,19 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
                         while c < row.len() {
                             let n = &row[c];
                             let nu = c as u16;
-                            if n.cont || n.wide || (show_cursor && (r, nu) == cursor) || n.procedural().is_some() || in_marked(r, nu) {
+                            if n.cont
+                                || n.wide
+                                || (show_cursor && (r, nu) == cursor)
+                                || n.procedural().is_some()
+                                || in_marked(r, nu)
+                            {
                                 break;
                             }
-                            if !n.blank() && (n.style() != style || ink_at(n, r, nu) != ink || grid.pick(fonts, &n.text, style) != Pick::Primary) {
+                            if !n.blank()
+                                && (n.style() != style
+                                    || ink_at(n, r, nu) != ink
+                                    || grid.pick(fonts, &n.text, style) != Pick::Primary)
+                            {
                                 break;
                             }
                             texts.push(if n.blank() { " " } else { n.text.as_str() });
@@ -541,20 +613,43 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
                     }
                     let font = grid.faces[usize::from(style)];
                     let glyphs = grid.shaped(fonts, font, &texts);
-                    jobs.push(Job::Run { x: ox + start as i32 * cw, base: y + grid.basep, font, glyphs, ink });
+                    jobs.push(Job::Run {
+                        x: ox + start as i32 * cw,
+                        base: y + grid.basep,
+                        font,
+                        glyphs,
+                        ink,
+                    });
                 }
                 Pick::Nerd(font, con) => {
                     // Two cells free when the next one is blank (Ghostty's constraint width).
-                    let width = if row.get(c + 1).is_some_and(|n| n.blank() && !n.cont) { 2 } else { 1 };
+                    let width =
+                        if row.get(c + 1).is_some_and(|n| n.blank() && !n.cont) { 2 } else { 1 };
                     if let Some(g) = grid.shaped(fonts, font, &[cell.text.as_str()]).first() {
-                        jobs.push(Job::Placed { x, bottom: y + ch, font, glyph: g.id, con, width, ink });
+                        jobs.push(Job::Placed {
+                            x,
+                            bottom: y + ch,
+                            font,
+                            glyph: g.id,
+                            con,
+                            width,
+                            ink,
+                        });
                     }
                     c += 1;
                 }
                 Pick::Emoji(font) => {
                     // CoreText picks the emoji's glyph: Apple Color Emoji joins flags and ZWJ sequences there.
                     if let Some(glyph) = fonts.ct_glyph(font, &cell.text) {
-                        jobs.push(Job::Placed { x, bottom: y + ch, font, glyph, con: Constraint::EMOJI, width: if cell.wide { 2 } else { 1 }, ink });
+                        jobs.push(Job::Placed {
+                            x,
+                            bottom: y + ch,
+                            font,
+                            glyph,
+                            con: Constraint::EMOJI,
+                            width: if cell.wide { 2 } else { 1 },
+                            ink,
+                        });
                     }
                     c += 1;
                 }
@@ -577,7 +672,14 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
             let t: &str = chr.encode_utf8(&mut buf);
             let span = cw * columns(t) as i32;
             let glyphs = grid.shaped(fonts, font, &[t]);
-            jobs.push(Job::Centred { x: cx, base: y + grid.basep, span, font, glyphs, ink: theme.fg });
+            jobs.push(Job::Centred {
+                x: cx,
+                base: y + grid.basep,
+                span,
+                font,
+                glyphs,
+                ink: theme.fg,
+            });
             cx += span;
         }
         d.panel(rect_panel([pt(x), pt(y + grid.ulp), pt(w), pt(grid.ult)], theme.fg));
@@ -586,7 +688,11 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     }
     if show_cursor && alpha > 0.0 {
         let (r, c) = cursor;
-        let wide = snap.rows.get(usize::from(r)).and_then(|row| row.get(usize::from(c))).is_some_and(|cell| cell.wide);
+        let wide = snap
+            .rows
+            .get(usize::from(r))
+            .and_then(|row| row.get(usize::from(c)))
+            .is_some_and(|cell| cell.wide);
         let x = ox + i32::from(c) * cw;
         let y = oy + i32::from(r) * ch;
         let w = cw * if wide { 2 } else { 1 };
@@ -601,7 +707,12 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
         let rects: Vec<[i32; 4]> = match (shape, p.focused) {
             (harness_vt::CursorShape::Block, true) => vec![[x, y, w, ch]],
             // Unfocused: a hollow box.
-            (harness_vt::CursorShape::Block, false) => vec![[x, y, w, hair], [x, y + ch - hair, w, hair], [x, y + hair, hair, ch - 2 * hair], [x + w - hair, y + hair, hair, ch - 2 * hair]],
+            (harness_vt::CursorShape::Block, false) => vec![
+                [x, y, w, hair],
+                [x, y + ch - hair, w, hair],
+                [x, y + hair, hair, ch - 2 * hair],
+                [x + w - hair, y + hair, hair, ch - 2 * hair],
+            ],
             (harness_vt::CursorShape::Bar, _) => vec![[x, y, thick, ch]],
             (harness_vt::CursorShape::Underline, _) => vec![[x, y + ch - thick, w, thick]],
         };
@@ -621,7 +732,12 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
         }
         d.glyph(GlyphInst {
             rect: [left / sc, top / sc, e.w as f32 / sc, e.h as f32 / sc],
-            uv: [e.x as f32 / asz, e.y as f32 / asz, (e.x + e.w) as f32 / asz, (e.y + e.h) as f32 / asz],
+            uv: [
+                e.x as f32 / asz,
+                e.y as f32 / asz,
+                (e.x + e.w) as f32 / asz,
+                (e.y + e.h) as f32 / asz,
+            ],
             col_d: ink,
             col_l: ink,
             anim: [-1.0e9, 30.0, 0.0, 1.0],
@@ -630,7 +746,16 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
         });
     };
     // A shaped run from `x0` pixels: each glyph at its cluster's cell, moved by the advances before it in the cluster.
-    let set_run = |d: &mut Draw, cache: &mut GlyphCache, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]), fonts: &Fonts, x0: f32, base: i32, font: FontId, glyphs: &[RunGlyph], ink: Rgba, cells: bool| {
+    let set_run = |d: &mut Draw,
+                   cache: &mut GlyphCache,
+                   upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+                   fonts: &Fonts,
+                   x0: f32,
+                   base: i32,
+                   font: FontId,
+                   glyphs: &[RunGlyph],
+                   ink: Rgba,
+                   cells: bool| {
         let (mut pen, mut cluster, mut cluster_pen) = (0.0_f32, u32::MAX, 0.0_f32);
         for g in glyphs {
             if g.cell != cluster {
@@ -649,7 +774,9 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     };
     for job in jobs {
         match job {
-            Job::Run { x, base, font, glyphs, ink } => set_run(d, cache, upload, fonts, x as f32, base, font, &glyphs, ink, true),
+            Job::Run { x, base, font, glyphs, ink } => {
+                set_run(d, cache, upload, fonts, x as f32, base, font, &glyphs, ink, true)
+            }
             Job::Centred { x, base, span, font, glyphs, ink } => {
                 let adv: f32 = glyphs.iter().map(|g| g.adv).sum::<f32>() * sc;
                 let off = ((span as f32 - adv) / 2.0).max(0.0).round();
@@ -662,9 +789,24 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
                 }
                 let s = f64::from(sc);
                 let base_up = f64::from(grid.chp - grid.basep);
-                let out = con.constrain(GRect { w: bw * s, h: bh * s, x: bx * s, y: by * s + base_up }, &grid.m, width);
+                let out = con.constrain(
+                    GRect { w: bw * s, h: bh * s, x: bx * s, y: by * s + base_up },
+                    &grid.m,
+                    width,
+                );
                 let (sx, sy) = (out.w / bw, out.h / bh);
-                let Some(e) = cache.get_placed(fonts, font, glyph, sx, sy, out.x - bx * sx, out.y - by * sy, upload) else { continue };
+                let Some(e) = cache.get_placed(
+                    fonts,
+                    font,
+                    glyph,
+                    sx,
+                    sy,
+                    out.x - bx * sx,
+                    out.y - by * sy,
+                    upload,
+                ) else {
+                    continue;
+                };
                 put(d, e, (x + e.left) as f32, (bottom - e.top) as f32, ink);
             }
         }
@@ -673,19 +815,31 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
 
 fn blend(under: Rgba, over: Rgba) -> Rgba {
     let a = over[3];
-    [under[0] * (1.0 - a) + over[0] * a, under[1] * (1.0 - a) + over[1] * a, under[2] * (1.0 - a) + over[2] * a, 1.0]
+    [
+        under[0] * (1.0 - a) + over[0] * a,
+        under[1] * (1.0 - a) + over[1] * a,
+        under[2] * (1.0 - a) + over[2] * a,
+        1.0,
+    ]
 }
 
 /// A plain square plate of colour `c`.
 #[must_use]
 pub fn rect_panel(rect: [f32; 4], c: Rgba) -> PanelInst {
-    PanelInst { rect, fill_d: c, fill_l: c, shape: [0.0, 4.0, 0.0, 0.0], fx2: [0.0, 1.0, 0.0, 0.0], ..Default::default() }
+    PanelInst {
+        rect,
+        fill_d: c,
+        fill_l: c,
+        shape: [0.0, 4.0, 0.0, 0.0],
+        fx2: [0.0, 1.0, 0.0, 0.0],
+        ..Default::default()
+    }
 }
 
 // ---- input: keys, mouse, paste, selection units ----
 
-use harness_vt::ghostty::key::{self as gkey, Key, KittyKeyFlags, OptionAsAlt};
 pub use harness_vt::KeyAction;
+use harness_vt::ghostty::key::{self as gkey, Key, KittyKeyFlags, OptionAsAlt};
 
 /// The modifiers a key or click came with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -748,7 +902,11 @@ impl Keys {
 
     /// The bytes `k` sends to a program in `modes`.
     pub fn encode(&mut self, k: &KeyIn<'_>, modes: &harness_vt::Modes) -> Vec<u8> {
-        let text: String = k.text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+        let text: String = k
+            .text
+            .chars()
+            .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
+            .collect();
         let m = k.mods;
         let mut gm = gkey::Mods::empty();
         gm.set(gkey::Mods::SHIFT, m.shift);
@@ -756,7 +914,8 @@ impl Keys {
         gm.set(gkey::Mods::ALT, m.alt);
         gm.set(gkey::Mods::SUPER, m.cmd);
         // Shift made the text (A, !): it is consumed, so the kitty protocol sends the text, not a shifted key.
-        let consumed = if m.shift && !text.is_empty() { gkey::Mods::SHIFT } else { gkey::Mods::empty() };
+        let consumed =
+            if m.shift && !text.is_empty() { gkey::Mods::SHIFT } else { gkey::Mods::empty() };
         self.enc
             .set_cursor_key_application(modes.app_cursor)
             .set_keypad_key_application(modes.app_keypad)
@@ -776,7 +935,17 @@ impl Keys {
 
     /// An unmodified press of key `code` (arrows for option-click and the wheel).
     pub fn press(&mut self, code: u16, modes: &harness_vt::Modes) -> Vec<u8> {
-        self.encode(&KeyIn { code, text: "", unshifted: None, mods: Mods::default(), action: KeyAction::Press, composing: false }, modes)
+        self.encode(
+            &KeyIn {
+                code,
+                text: "",
+                unshifted: None,
+                mods: Mods::default(),
+                action: KeyAction::Press,
+                composing: false,
+            },
+            modes,
+        )
     }
 }
 
@@ -784,8 +953,19 @@ impl Keys {
 #[must_use]
 pub fn is_function_key(code: u16) -> bool {
     use Key as K;
-    matches!(key_of(code), K::ArrowLeft | K::ArrowRight | K::ArrowUp | K::ArrowDown | K::Home | K::End | K::PageUp | K::PageDown | K::Delete | K::Insert)
-        || matches!(code, 96..=101 | 103 | 105..=107 | 109 | 111 | 113 | 118 | 120 | 122 | 64 | 79 | 80 | 90)
+    matches!(
+        key_of(code),
+        K::ArrowLeft
+            | K::ArrowRight
+            | K::ArrowUp
+            | K::ArrowDown
+            | K::Home
+            | K::End
+            | K::PageUp
+            | K::PageDown
+            | K::Delete
+            | K::Insert
+    ) || matches!(code, 96..=101 | 103 | 105..=107 | 109 | 111 | 113 | 118 | 120 | 122 | 64 | 79 | 80 | 90)
 }
 
 pub const LEFT: u16 = 123;
@@ -800,26 +980,124 @@ pub fn key_of(code: u16) -> Key {
     const TABLE: [Key; 127] = {
         let mut t = [K::Unidentified; 127];
         let pairs: &[(usize, Key)] = &[
-            (0, K::A), (1, K::S), (2, K::D), (3, K::F), (4, K::H), (5, K::G), (6, K::Z), (7, K::X), (8, K::C), (9, K::V),
-            (10, K::IntlBackslash), (11, K::B), (12, K::Q), (13, K::W), (14, K::E), (15, K::R), (16, K::Y), (17, K::T),
-            (18, K::Digit1), (19, K::Digit2), (20, K::Digit3), (21, K::Digit4), (22, K::Digit6), (23, K::Digit5),
-            (24, K::Equal), (25, K::Digit9), (26, K::Digit7), (27, K::Minus), (28, K::Digit8), (29, K::Digit0),
-            (30, K::BracketRight), (31, K::O), (32, K::U), (33, K::BracketLeft), (34, K::I), (35, K::P), (36, K::Enter),
-            (37, K::L), (38, K::J), (39, K::Quote), (40, K::K), (41, K::Semicolon), (42, K::Backslash), (43, K::Comma),
-            (44, K::Slash), (45, K::N), (46, K::M), (47, K::Period), (48, K::Tab), (49, K::Space), (50, K::Backquote),
-            (51, K::Backspace), (53, K::Escape), (54, K::MetaRight), (55, K::MetaLeft), (56, K::ShiftLeft),
-            (57, K::CapsLock), (58, K::AltLeft), (59, K::ControlLeft), (60, K::ShiftRight), (61, K::AltRight),
-            (62, K::ControlRight), (63, K::Fn), (64, K::F17), (65, K::NumpadDecimal), (67, K::NumpadMultiply),
-            (69, K::NumpadAdd), (71, K::NumLock), (72, K::AudioVolumeUp), (73, K::AudioVolumeDown),
-            (74, K::AudioVolumeMute), (75, K::NumpadDivide), (76, K::NumpadEnter), (78, K::NumpadSubtract),
-            (79, K::F18), (80, K::F19), (81, K::NumpadEqual), (82, K::Numpad0), (83, K::Numpad1), (84, K::Numpad2),
-            (85, K::Numpad3), (86, K::Numpad4), (87, K::Numpad5), (88, K::Numpad6), (89, K::Numpad7), (90, K::F20),
-            (91, K::Numpad8), (92, K::Numpad9), (93, K::IntlYen), (94, K::IntlRo), (95, K::NumpadComma), (96, K::F5),
-            (97, K::F6), (98, K::F7), (99, K::F3), (100, K::F8), (101, K::F9), (103, K::F11), (105, K::F13),
-            (106, K::F16), (107, K::F14), (109, K::F10), (110, K::ContextMenu), (111, K::F12), (113, K::F15),
-            (114, K::Insert), (115, K::Home), (116, K::PageUp), (117, K::Delete), (118, K::F4), (119, K::End),
-            (120, K::F2), (121, K::PageDown), (122, K::F1), (123, K::ArrowLeft), (124, K::ArrowRight),
-            (125, K::ArrowDown), (126, K::ArrowUp),
+            (0, K::A),
+            (1, K::S),
+            (2, K::D),
+            (3, K::F),
+            (4, K::H),
+            (5, K::G),
+            (6, K::Z),
+            (7, K::X),
+            (8, K::C),
+            (9, K::V),
+            (10, K::IntlBackslash),
+            (11, K::B),
+            (12, K::Q),
+            (13, K::W),
+            (14, K::E),
+            (15, K::R),
+            (16, K::Y),
+            (17, K::T),
+            (18, K::Digit1),
+            (19, K::Digit2),
+            (20, K::Digit3),
+            (21, K::Digit4),
+            (22, K::Digit6),
+            (23, K::Digit5),
+            (24, K::Equal),
+            (25, K::Digit9),
+            (26, K::Digit7),
+            (27, K::Minus),
+            (28, K::Digit8),
+            (29, K::Digit0),
+            (30, K::BracketRight),
+            (31, K::O),
+            (32, K::U),
+            (33, K::BracketLeft),
+            (34, K::I),
+            (35, K::P),
+            (36, K::Enter),
+            (37, K::L),
+            (38, K::J),
+            (39, K::Quote),
+            (40, K::K),
+            (41, K::Semicolon),
+            (42, K::Backslash),
+            (43, K::Comma),
+            (44, K::Slash),
+            (45, K::N),
+            (46, K::M),
+            (47, K::Period),
+            (48, K::Tab),
+            (49, K::Space),
+            (50, K::Backquote),
+            (51, K::Backspace),
+            (53, K::Escape),
+            (54, K::MetaRight),
+            (55, K::MetaLeft),
+            (56, K::ShiftLeft),
+            (57, K::CapsLock),
+            (58, K::AltLeft),
+            (59, K::ControlLeft),
+            (60, K::ShiftRight),
+            (61, K::AltRight),
+            (62, K::ControlRight),
+            (63, K::Fn),
+            (64, K::F17),
+            (65, K::NumpadDecimal),
+            (67, K::NumpadMultiply),
+            (69, K::NumpadAdd),
+            (71, K::NumLock),
+            (72, K::AudioVolumeUp),
+            (73, K::AudioVolumeDown),
+            (74, K::AudioVolumeMute),
+            (75, K::NumpadDivide),
+            (76, K::NumpadEnter),
+            (78, K::NumpadSubtract),
+            (79, K::F18),
+            (80, K::F19),
+            (81, K::NumpadEqual),
+            (82, K::Numpad0),
+            (83, K::Numpad1),
+            (84, K::Numpad2),
+            (85, K::Numpad3),
+            (86, K::Numpad4),
+            (87, K::Numpad5),
+            (88, K::Numpad6),
+            (89, K::Numpad7),
+            (90, K::F20),
+            (91, K::Numpad8),
+            (92, K::Numpad9),
+            (93, K::IntlYen),
+            (94, K::IntlRo),
+            (95, K::NumpadComma),
+            (96, K::F5),
+            (97, K::F6),
+            (98, K::F7),
+            (99, K::F3),
+            (100, K::F8),
+            (101, K::F9),
+            (103, K::F11),
+            (105, K::F13),
+            (106, K::F16),
+            (107, K::F14),
+            (109, K::F10),
+            (110, K::ContextMenu),
+            (111, K::F12),
+            (113, K::F15),
+            (114, K::Insert),
+            (115, K::Home),
+            (116, K::PageUp),
+            (117, K::Delete),
+            (118, K::F4),
+            (119, K::End),
+            (120, K::F2),
+            (121, K::PageDown),
+            (122, K::F1),
+            (123, K::ArrowLeft),
+            (124, K::ArrowRight),
+            (125, K::ArrowDown),
+            (126, K::ArrowUp),
         ];
         let mut i = 0;
         while i < pairs.len() {
@@ -836,7 +1114,11 @@ pub fn key_of(code: u16) -> Key {
 #[must_use]
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     let body = text.replace("\r\n", "\r").replace('\n', "\r");
-    if bracketed { format!("\x1b[200~{}\x1b[201~", body.replace("\x1b[201~", "")).into_bytes() } else { body.into_bytes() }
+    if bracketed {
+        format!("\x1b[200~{}\x1b[201~", body.replace("\x1b[201~", "")).into_bytes()
+    } else {
+        body.into_bytes()
+    }
 }
 
 /// A mouse button, or none (motion with nothing held), or a wheel step.
@@ -860,7 +1142,14 @@ pub enum MouseAct {
 /// The report a mouse event makes in the program's mouse mode (`CSI ? 1000/1002/1003 h`, encoded per 1006 SGR, 1015
 /// urxvt, 1005 UTF-8 or the X10 default) at cell `(col, row)` of the viewport; empty when that mode does not report it.
 #[must_use]
-pub fn mouse(b: Button, act: MouseAct, col: u16, row: u16, m: Mods, modes: &harness_vt::Modes) -> Vec<u8> {
+pub fn mouse(
+    b: Button,
+    act: MouseAct,
+    col: u16,
+    row: u16,
+    m: Mods,
+    modes: &harness_vt::Modes,
+) -> Vec<u8> {
     use harness_vt::{MouseFormat as F, MouseTracking as T};
     let wheel = matches!(b, Button::WheelUp | Button::WheelDown);
     let wanted = match (modes.mouse, act) {
@@ -891,7 +1180,8 @@ pub fn mouse(b: Button, act: MouseAct, col: u16, row: u16, m: Mods, modes: &harn
     }
     let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
     if matches!(modes.mouse_format, F::Sgr | F::SgrPixels) {
-        return format!("\x1b[<{code};{x};{y}{}", if act == MouseAct::Release { 'm' } else { 'M' }).into_bytes();
+        return format!("\x1b[<{code};{x};{y}{}", if act == MouseAct::Release { 'm' } else { 'M' })
+            .into_bytes();
     }
     // The older formats have no release button: a release is button 3.
     if act == MouseAct::Release {
@@ -925,7 +1215,9 @@ pub fn word_span(cells: &[&str], col: usize) -> (usize, usize) {
     }
     // A wide character's right half belongs to its left half.
     let part = |i: usize| i > 0 && cells[i].is_empty() && wide_char(cells[i - 1]);
-    let stop = |i: usize| !part(i) && (cells[i].is_empty() || cells[i].chars().all(|c| WORD_STOPS.contains(c)));
+    let stop = |i: usize| {
+        !part(i) && (cells[i].is_empty() || cells[i].chars().all(|c| WORD_STOPS.contains(c)))
+    };
     let col = col.min(cells.len() - 1);
     let col = if part(col) { col - 1 } else { col };
     if stop(col) {
@@ -980,7 +1272,11 @@ pub fn selection_text(term: &mut harness_vt::Term, (s, e): ((i64, u16), (i64, u1
             let Some(row) = vrows.get(usize::try_from(v).unwrap_or(0)) else { break };
             let sr = v - n;
             let from = if sr == s.0 { usize::from(s.1) } else { 0 };
-            let to = if sr == e.0 { (usize::from(e.1) + 1).min(row.cells.len()) } else { row.cells.len() };
+            let to = if sr == e.0 {
+                (usize::from(e.1) + 1).min(row.cells.len())
+            } else {
+                row.cells.len()
+            };
             let mut line = String::new();
             for c in row.cells.get(from..to.max(from)).unwrap_or_default() {
                 if !c.spacer {
@@ -1007,8 +1303,25 @@ mod tests {
     use super::*;
     use harness_vt::{Modes, MouseFormat, MouseTracking};
 
-    fn key(keys: &mut Keys, modes: &Modes, code: u16, text: &str, unshifted: char, mods: Mods) -> Vec<u8> {
-        keys.encode(&KeyIn { code, text, unshifted: Some(unshifted), mods, action: KeyAction::Press, composing: false }, modes)
+    fn key(
+        keys: &mut Keys,
+        modes: &Modes,
+        code: u16,
+        text: &str,
+        unshifted: char,
+        mods: Mods,
+    ) -> Vec<u8> {
+        keys.encode(
+            &KeyIn {
+                code,
+                text,
+                unshifted: Some(unshifted),
+                mods,
+                action: KeyAction::Press,
+                composing: false,
+            },
+            modes,
+        )
     }
 
     const NONE: Mods = Mods { cmd: false, shift: false, ctrl: false, alt: false };
@@ -1054,15 +1367,25 @@ mod tests {
         assert_eq!(key(&mut k, &all, 0, "a", 'a', NONE), b"\x1b[97u");
         assert_eq!(key(&mut k, &all, 36, "\r", '\r', NONE), b"\x1b[13u");
         // Releases only with flag 2 (report event types).
-        let rel = KeyIn { code: 0, text: "", unshifted: Some('a'), mods: NONE, action: KeyAction::Release, composing: false };
+        let rel = KeyIn {
+            code: 0,
+            text: "",
+            unshifted: Some('a'),
+            mods: NONE,
+            action: KeyAction::Release,
+            composing: false,
+        };
         assert_eq!(k.encode(&rel, &m), b"");
         assert_eq!(k.encode(&rel, &Modes { kitty_flags: 1 | 2 | 8, ..m }), b"\x1b[97;1:3u");
     }
 
-    
     #[test]
     fn mouse_reports() {
-        let sgr = Modes { mouse: MouseTracking::Normal, mouse_format: MouseFormat::Sgr, ..Modes::default() };
+        let sgr = Modes {
+            mouse: MouseTracking::Normal,
+            mouse_format: MouseFormat::Sgr,
+            ..Modes::default()
+        };
         assert_eq!(mouse(Button::Left, MouseAct::Press, 4, 2, NONE, &sgr), b"\x1b[<0;5;3M");
         assert_eq!(mouse(Button::Left, MouseAct::Release, 4, 2, NONE, &sgr), b"\x1b[<0;5;3m");
         assert_eq!(mouse(Button::Right, MouseAct::Press, 0, 0, CTRL, &sgr), b"\x1b[<18;1;1M");
@@ -1081,7 +1404,8 @@ mod tests {
 
     #[test]
     fn words() {
-        let row = ["l", "s", " ", "/", "t", "m", "p", "/", "a", ".", "t", "x", "t", " ", "(", "x", ")"];
+        let row =
+            ["l", "s", " ", "/", "t", "m", "p", "/", "a", ".", "t", "x", "t", " ", "(", "x", ")"];
         assert_eq!(word_span(&row, 0), (0, 1));
         assert_eq!(word_span(&row, 5), (3, 12));
         assert_eq!(word_span(&row, 2), (2, 2));
@@ -1096,4 +1420,3 @@ mod tests {
         assert_eq!(paste("a\x1b[201~b", true), b"\x1b[200~ab\x1b[201~");
     }
 }
-

@@ -28,7 +28,8 @@ fn main() {
 
 fn slang(out: &Path, name: &str) {
     let src = PathBuf::from(format!("shaders/{name}.slang"));
-    let text = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+    let text =
+        std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
     let entries = entries(&text);
     assert!(!entries.is_empty(), "no [shader(...)] entry points in {}", src.display());
 
@@ -43,11 +44,19 @@ fn slang(out: &Path, name: &str) {
 
     let air = out.join(format!("{name}.air"));
     run(
-        Command::new("xcrun").args(["-sdk", "macosx", "metal", "-c", "-std=metal3.1", "-ffast-math"]).arg(&msl).arg("-o").arg(&air),
+        Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "-c", "-std=metal3.1", "-ffast-math"])
+            .arg(&msl)
+            .arg("-o")
+            .arg(&air),
         "xcrun metal",
     );
     run(
-        Command::new("xcrun").args(["-sdk", "macosx", "metallib"]).arg(&air).arg("-o").arg(out.join(format!("{name}.metallib"))),
+        Command::new("xcrun")
+            .args(["-sdk", "macosx", "metallib"])
+            .arg(&air)
+            .arg("-o")
+            .arg(out.join(format!("{name}.metallib"))),
         "xcrun metallib",
     );
     let msl_text = std::fs::read_to_string(&msl).expect("read msl");
@@ -56,10 +65,15 @@ fn slang(out: &Path, name: &str) {
 
 /// Our Slang fork (github.com/indexable-inc/slang, master: upstream plus the emitter memoisation patch), never a stock slangc:
 /// `$SLANGC`, else the fork's Release build next to this repo, else a failure that says how to build it.
-const FORK: [&str; 2] = ["/Volumes/Projects/indexable-inc/slang/build/Release/bin/slangc", "/Volumes/Projects/indexable-inc/slang/build/bin/slangc"];
+const FORK: [&str; 2] = [
+    "/Volumes/Projects/indexable-inc/slang/build/Release/bin/slangc",
+    "/Volumes/Projects/indexable-inc/slang/build/bin/slangc",
+];
 
 fn slangc() -> PathBuf {
-    let found = std::env::var_os("SLANGC").map(PathBuf::from).or_else(|| FORK.iter().map(PathBuf::from).find(|p| p.is_file()));
+    let found = std::env::var_os("SLANGC")
+        .map(PathBuf::from)
+        .or_else(|| FORK.iter().map(PathBuf::from).find(|p| p.is_file()));
     let Some(p) = found else {
         panic!(
             "slangc (our fork) not found: set SLANGC, or build github.com/indexable-inc/slang: \
@@ -68,7 +82,15 @@ fn slangc() -> PathBuf {
              cmake --build build --config Release --target slangc"
         )
     };
-    let v = Command::new(&p).arg("-v").output().map(|o| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)).trim().to_owned()).unwrap_or_default();
+    let v = Command::new(&p)
+        .arg("-v")
+        .output()
+        .map(|o| {
+            format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+                .trim()
+                .to_owned()
+        })
+        .unwrap_or_default();
     println!("cargo:warning=slangc {} ({v})", p.display());
     p
 }
@@ -76,7 +98,11 @@ fn slangc() -> PathBuf {
 fn run(cmd: &mut Command, what: &str) {
     let o = cmd.output().unwrap_or_else(|e| panic!("{what}: cannot start: {e}"));
     if !o.status.success() {
-        panic!("{what} failed:\n{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        panic!(
+            "{what} failed:\n{}\n{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
 }
 
@@ -99,11 +125,16 @@ fn entries(text: &str) -> Vec<(String, String)> {
 
 /// Binding table from the MSL: each entry's `entryPointParams_NAME_N [[kind(i)]]` parameters.
 fn bindings(msl: &str, entries: &[(String, String)]) -> String {
-    let mut s = String::from("/// (entry, parameter, kind, slot), read from the generated MSL by build.rs.\npub static BINDINGS: &[(&str, &str, &str, u32)] = &[\n");
+    let mut s = String::from(
+        "/// (entry, parameter, kind, slot), read from the generated MSL by build.rs.\npub static BINDINGS: &[(&str, &str, &str, u32)] = &[\n",
+    );
     for (name, _) in entries {
         let line = msl
             .lines()
-            .find(|l| (l.starts_with("[[vertex]]") || l.starts_with("[[fragment]]")) && l.contains(&format!(" {name}(")))
+            .find(|l| {
+                (l.starts_with("[[vertex]]") || l.starts_with("[[fragment]]"))
+                    && l.contains(&format!(" {name}("))
+            })
             .unwrap_or_else(|| panic!("entry {name} not in MSL"));
         for part in line.split(", ") {
             let Some(i) = part.find("entryPointParams_") else { continue };
@@ -112,8 +143,16 @@ fn bindings(msl: &str, entries: &[(String, String)]) -> String {
             let pname = ident.rsplit_once('_').map_or(ident, |(a, _)| a);
             let k = part.find("[[").and_then(|k| part[k..].strip_prefix("[[")).unwrap_or("");
             let kind = k.split('(').next().unwrap();
-            let slot: u32 = k.split('(').nth(1).and_then(|x| x.split(')').next()).and_then(|x| x.parse().ok()).expect("slot");
-            assert!(slot < 31 || kind != "buffer", "{name}.{pname}: buffer slot {slot} past Metal's table");
+            let slot: u32 = k
+                .split('(')
+                .nth(1)
+                .and_then(|x| x.split(')').next())
+                .and_then(|x| x.parse().ok())
+                .expect("slot");
+            assert!(
+                slot < 31 || kind != "buffer",
+                "{name}.{pname}: buffer slot {slot} past Metal's table"
+            );
             writeln!(s, "    (\"{name}\", \"{pname}\", \"{kind}\", {slot}),").unwrap();
         }
     }

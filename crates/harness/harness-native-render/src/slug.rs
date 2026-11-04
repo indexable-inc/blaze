@@ -117,11 +117,7 @@ pub fn cubic_quads(c: [[f64; 2]; 4], tol: f64) -> Vec<[[f64; 2]; 3]> {
         .map(|i| {
             let (t0, t1) = (i as f64 / n as f64, (i + 1) as f64 / n as f64);
             let rest = if i == 0 { c } else { split(c, t0).1 };
-            let piece = if i + 1 == n {
-                rest
-            } else {
-                split(rest, (t1 - t0) / (1.0 - t0)).0
-            };
+            let piece = if i + 1 == n { rest } else { split(rest, (t1 - t0) / (1.0 - t0)).0 };
             let q = [0, 1]
                 .map(|k| (3.0 * (piece[1][k] + piece[2][k]) - (piece[0][k] + piece[3][k])) * 0.25);
             [piece[0], q, piece[3]]
@@ -210,19 +206,11 @@ impl Outline {
                 }
             }
         }
-        let curves: Vec<Quad> = contours
-            .into_iter()
-            .flatten()
-            .filter(|q| !q.is_point())
-            .collect();
-        let bbox = curves.iter().map(Quad::bounds).reduce(|a, b| {
-            [
-                a[0].min(b[0]),
-                a[1].min(b[1]),
-                a[2].max(b[2]),
-                a[3].max(b[3]),
-            ]
-        })?;
+        let curves: Vec<Quad> = contours.into_iter().flatten().filter(|q| !q.is_point()).collect();
+        let bbox = curves
+            .iter()
+            .map(Quad::bounds)
+            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])?;
         (bbox[2] > bbox[0] && bbox[3] > bbox[1]).then_some(Self { curves, bbox })
     }
 }

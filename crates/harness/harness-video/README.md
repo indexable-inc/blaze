@@ -7,9 +7,10 @@ fixed clock (never the wall clock), so the same scene gives the same pixels ever
     cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4   # the video
     cargo run --release -p harness-video -- harness-video/scene/launch.flecs still.png 6.0      # one frame
     cargo run --release -p harness-video -- harness-video/scene/launch.flecs frames/ 0.5        # a frame each 0.5 s
+    cargo run --release -p harness-video -- harness-video/scene/launch.flecs sound.wav          # the soundtrack alone
 
 The mp4 is H.264 High, yuv420p, BT.709, `+faststart` (what X/Twitter, Slack and browsers play), encoded by `ffmpeg`
-from PATH.
+from PATH, with the soundtrack as AAC.
 
 ## A scene
 
@@ -22,8 +23,12 @@ from PATH.
   component can be cued: `Size.w.value` relays out the neighbours, `Pose` (`dx`, `dy`, `shrink`, `fade`, `cut`) moves,
   scales, fades or types on only the node and what is under it. Cues on one member take turns by `at`. Templates name the
   moves a video makes (`cue.FadeIn show(at: 2.0)`; see `scene/launch.flecs`).
-- `Picture: {handle}` with `Pixelated` draws pixel art from a PNG under the scene's directory, crisp at any size;
-  `Frames: {count, fps}` plays a sheet of frames stacked downwards.
+- `BlazeMark: {start, exit}` is blaze's wordmark set on fire, live (`harness-native-blaze`, ported from
+  indexable-inc/anim): its letters drop in from the top of the frame at `start`, the fire catches, and from `exit` the
+  letters burn into embers. Its soundtrack (the landings climbing to A major, the physically modelled fire, the burn) is
+  synthesised offline from the same times and is the video's sound; a scene without a `BlazeMark` is silent.
+- `Picture: {handle}` with `Pixelated` draws pixel art from a PNG under the scene's directory; `Frames: {count, fps}`
+  plays a sheet of frames stacked downwards. Pictures and the mark are textures whose texels are fetched, never
+  filtered: crisp, with no seam between cells, at any size or mid-animation scale.
 
-`scene/launch.flecs` is blaze's launch video; its logo sheet comes from the README's fire generator:
-`uv run docs/brand/fire/gen.py --sheet crates/harness/harness-video/scene/media/blaze-fire.png`.
+`scene/launch.flecs` is blaze's launch video.

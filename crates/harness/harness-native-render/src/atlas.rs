@@ -25,7 +25,8 @@ impl Packer {
         if area <= 0.0 {
             return 0.0;
         }
-        ((f64::from(self.y) * f64::from(self.width) + f64::from(self.x) * f64::from(self.shelf_h)) / area) as f32
+        ((f64::from(self.y) * f64::from(self.width) + f64::from(self.x) * f64::from(self.shelf_h))
+            / area) as f32
     }
 
     /// Top-left of a free `w` by `h` rectangle, or None when the atlas is full.
@@ -48,4 +49,3 @@ impl Packer {
         Some(at)
     }
 }
-
