@@ -927,7 +927,7 @@ impl App {
             ("new-claude".into(), PalGlyph::Kind("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
             ("new-codex".into(), PalGlyph::Kind("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
             ("new-cursor".into(), PalGlyph::Kind("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
-            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), String::new(), Do::New("shell")),
+            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), "\u{2318}N".into(), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
