@@ -385,6 +385,7 @@ fn seeds() -> Vec<Vec<u8>> {
             linked_paths: Vec::new(),
         }),
         Response::Work(Worked {
+            build_id: Some(7),
             link: LinkKind::Patched,
             found: 1,
             green: 2,
