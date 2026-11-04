@@ -1,7 +1,7 @@
 //! The window: raw AppKit (NSApplication, one NSWindow, one flipped layer-hosting NSView over a CAMetalLayer), after
 //! den-native's window.rs. Frames come from a `CAMetalDisplayLink`, paused whenever the app is idle; the daemon's threads
 //! wake it through the main queue.
-use crate::app::{App, Chrome, KeyMods};
+use crate::app::{App, Chrome, KeyMods, MenuLine, Outcome};
 use crate::term::{self, Button, KeyAction};
 use crate::gpu::{self, Dest, Renderer};
 use crate::single::{self, Ask};
@@ -45,6 +45,8 @@ struct State {
     lights: f32,
     /// Drawing at the calm rate: only a running dot's breath moves.
     calm: bool,
+    /// The keys' load the menu bar was made from (made again when the user's keys.flecs changes).
+    menu_gen: u64,
 }
 
 thread_local! {
@@ -193,21 +195,39 @@ define_class!(
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
             let m = mods_of(event.modifierFlags());
-            let key = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
-            // Control-Command-Space: the emoji picker, which types through insertText.
-            let picker = m.cmd && m.ctrl && key == " ";
-            if picker {
-                NSApplication::sharedApplication(self.mtm()).orderFrontCharacterPalette(None);
-            }
-            let took = picker || (m.cmd && !m.ctrl && !matches!(key.as_str(), "c" | "v" | "q" | "h" | "m") && with(|st| st.app.shortcut(&key, event.keyCode(), m)).unwrap_or(false));
-            if took {
-                wake();
-                true
+            // A Command key: the bindings (scene/20-keys.flecs) first, then AppKit's menu.
+            let out = if m.cmd {
+                let unshifted = event.charactersByApplyingModifiers(NSEventModifierFlags::empty()).and_then(|s| s.to_string().chars().next());
+                with(|st| st.app.shortcut(event.keyCode(), unshifted, m)).unwrap_or(Outcome::None)
             } else {
-                // SAFETY: forwarding the same selector to the superclass with its own argument.
-                let handled: objc2::runtime::Bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
-                handled.as_bool()
+                Outcome::None
+            };
+            match out {
+                Outcome::Done => {
+                    wake();
+                    true
+                }
+                Outcome::Selector(sel) => {
+                    send_selector(self.mtm(), &sel);
+                    wake();
+                    true
+                }
+                Outcome::None => {
+                    // SAFETY: forwarding the same selector to the superclass with its own argument.
+                    let handled: objc2::runtime::Bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
+                    handled.as_bool()
+                }
             }
+        }
+
+        /// A menu bar item made from an action (its tag the action's entity).
+        #[unsafe(method(runAction:))]
+        fn run_action(&self, sender: &NSMenuItem) {
+            let id = sender.tag() as u64;
+            if let Some(Outcome::Selector(sel)) = with(|st| st.app.run_action(id, None)) {
+                send_selector(self.mtm(), &sel);
+            }
+            wake();
         }
 
         #[unsafe(method(mouseDown:))]
@@ -537,6 +557,15 @@ impl HarnessView {
         let backing = self.convertSizeToBacking(points).width / points.width.max(1.0);
         let drawable = update.drawable();
         let t = update.targetTimestamp();
+        // The keys were loaded again (the user's keys.flecs changed): the menu bar follows.
+        let menu = with(|st| (st.app.keys_gen() != st.menu_gen).then(|| {
+            st.menu_gen = st.app.keys_gen();
+            st.app.menu()
+        }))
+        .flatten();
+        if let Some(m) = menu {
+            NSApplication::sharedApplication(self.mtm()).setMainMenu(Some(&main_menu(self.mtm(), &m, Some(self))));
+        }
         with(|st| {
             let dt = st.last.map_or(1.0 / 120.0, |l| (t - l).clamp(0.0, 0.1)) as f32;
             st.last = Some(t);
@@ -706,7 +735,10 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     if let Some(sid) = SELECT.with(std::cell::Cell::get) {
         app.select_session(sid);
     }
-    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false }));
+    // The menu bar, from the keys' actions and bindings (rebuilt in `frame` when they are loaded again).
+    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu(mtm, &app.menu(), Some(&*view))));
+    let menu_gen = app.keys_gen();
+    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false, menu_gen }));
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
     // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
@@ -806,12 +838,89 @@ fn submenu(mtm: MainThreadMarker, title: &str, items: &[Retained<NSMenuItem>]) -
     holder
 }
 
-fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+/// The menu bar from the keys' menus (`App::menu`): each action an item, its key equivalent its binding's; an item with
+/// a selector sends it up the responder chain, the others run their action through `target`'s `runAction:`.
+fn main_menu(mtm: MainThreadMarker, bars: &[(String, Vec<MenuLine>)], target: Option<&HarnessView>) -> Retained<NSMenu> {
     let bar = NSMenu::new(mtm);
-    bar.addItem(&submenu(mtm, "harness", &[item(mtm, "Hide harness", sel!(hide:), "h"), item(mtm, "Quit harness", sel!(terminate:), "q")]));
-    bar.addItem(&submenu(mtm, "Edit", &[item(mtm, "Copy", sel!(copy:), "c"), item(mtm, "Paste", sel!(paste:), "v")]));
-    bar.addItem(&submenu(mtm, "Window", &[item(mtm, "Minimize", sel!(performMiniaturize:), "m")]));
+    for (title, lines) in bars {
+        let mut items = Vec::new();
+        for l in lines {
+            if l.sep && !items.is_empty() {
+                items.push(NSMenuItem::separatorItem(mtm));
+            }
+            let sel = l.selector.as_deref().map_or(sel!(runAction:), sel_of);
+            let (key, mask) = l.key.as_ref().map_or((String::new(), NSEventModifierFlags::empty()), |(k, m)| {
+                let mut f = NSEventModifierFlags::empty();
+                for (on, flag) in [(m.cmd, NSEventModifierFlags::Command), (m.shift, NSEventModifierFlags::Shift), (m.alt, NSEventModifierFlags::Option), (m.ctrl, NSEventModifierFlags::Control)] {
+                    if on {
+                        f |= flag;
+                    }
+                }
+                (k.clone(), f)
+            });
+            let it = item(mtm, &l.title, sel, &key);
+            it.setKeyEquivalentModifierMask(mask);
+            if l.selector.is_none() {
+                it.setTag(l.action as isize);
+                // SAFETY: the view outlives the menu bar (both live until the app quits); the item holds it weakly.
+                if let Some(t) = target {
+                    unsafe { it.setTarget(Some(t)) };
+                }
+            }
+            items.push(it);
+        }
+        bar.addItem(&submenu(mtm, title, &items));
+    }
     bar
+}
+
+/// Send AppKit action `sel` (`copy:`) up the responder chain from the key window's first responder to the app.
+fn send_selector(mtm: MainThreadMarker, sel: &str) {
+    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: a registered selector; a nil target walks the responder chain, which only calls methods taking a sender.
+    unsafe { app.sendAction_to_from(sel_of(sel), None, None) };
+}
+
+/// The selector named `name` (`copy:`).
+fn sel_of(name: &str) -> objc2::runtime::Sel {
+    objc2::runtime::Sel::register(&std::ffi::CString::new(name).unwrap_or_default())
+}
+
+/// `HARNESS_NATIVE_MENU_DUMP`: the menu bar as AppKit holds it, one line an item (title, key equivalent and its
+/// modifiers as the menu shows them, action), read back from the NSMenu built for `bars`.
+pub fn dump_menu(bars: &[(String, Vec<MenuLine>)]) -> String {
+    let Some(mtm) = MainThreadMarker::new() else { return String::new() };
+    let menu = main_menu(mtm, bars, None);
+    let mut out = String::new();
+    for i in 0..menu.numberOfItems() {
+        let Some(holder) = menu.itemAtIndex(i) else { continue };
+        out += &format!("{}\n", holder.title());
+        let Some(sub) = holder.submenu() else { continue };
+        for j in 0..sub.numberOfItems() {
+            let Some(it) = sub.itemAtIndex(j) else { continue };
+            if it.isSeparatorItem() {
+                out += "  ----\n";
+                continue;
+            }
+            let m = it.keyEquivalentModifierMask();
+            let mut keys = String::new();
+            for (flag, g) in [(NSEventModifierFlags::Control, '\u{2303}'), (NSEventModifierFlags::Option, '\u{2325}'), (NSEventModifierFlags::Shift, '\u{21E7}'), (NSEventModifierFlags::Command, '\u{2318}')] {
+                if m.contains(flag) {
+                    keys.push(g);
+                }
+            }
+            let k = it.keyEquivalent().to_string();
+            keys += &match k.as_str() {
+                "" => String::new(),
+                " " => "Space".into(),
+                "-" => "\u{2212}".into(),
+                k => k.to_uppercase(),
+            };
+            let action = it.action().map(|s| s.name().to_string_lossy().into_owned()).unwrap_or_default();
+            out += &format!("  {:<18} {:<8} {}{}\n", it.title(), keys, action, if action == "runAction:" { format!(" (tag {})", it.tag()) } else { String::new() });
+        }
+    }
+    out
 }
 
 /// Another launch asked for the window (and maybe a session): bring it forward on the main thread.
@@ -843,7 +952,6 @@ pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u6
     }
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(if no_activate() { NSApplicationActivationPolicy::Accessory } else { NSApplicationActivationPolicy::Regular });
-    app.setMainMenu(Some(&main_menu(mtm)));
     force_appearance(&app);
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

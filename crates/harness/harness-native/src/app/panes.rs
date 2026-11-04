@@ -727,20 +727,31 @@ impl App {
         }
     }
 
-    /// A key: into the palette when it is open, else natural text editing or the program's own encoding, for the focused
-    /// terminal.
+    /// A key: the binding it matches in the active contexts runs (scene/20-keys.flecs: the palette's, the Archive's, the
+    /// tree's, natural text editing in the terminal's); a key none takes goes to the palette's or the Archive's search, or
+    /// (handing the keyboard back from the tree) to the focused terminal's program in its own encoding.
     pub fn key(&mut self, k: &term::KeyIn<'_>) {
         self.poke();
-        if self.palette.is_some() {
-            if k.action != KeyAction::Release {
-                self.palette_key(k.code, k.text);
+        if k.action != KeyAction::Release {
+            if let Some(c) = crate::keys::Chord::of(k.code, k.unshifted, k.mods)
+                && self.dispatch(&c) != super::Outcome::None
+            {
+                return;
             }
-            return;
-        }
-        if self.archive_key(k) {
-            return;
-        }
-        if self.tree_key(k) {
+            if self.palette.is_some() {
+                self.palette_type(k.text);
+                return;
+            }
+            if self.archive_focused() {
+                if !k.mods.cmd && !k.mods.ctrl {
+                    self.archive_search(super::archive::SearchEdit::Type(k.text));
+                }
+                return;
+            }
+            if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
+                self.tree_focus = false;
+            }
+        } else if self.palette.is_some() {
             return;
         }
         let Some(t) = self.focused_term() else { return };
@@ -752,11 +763,6 @@ impl App {
                 let bytes = self.keys.encode(k, &modes);
                 self.send_to(t, &bytes);
             }
-            return;
-        }
-        if let Some(bytes) = term::natural_edit(k.code, k.unshifted, k.mods) {
-            self.typed();
-            self.send_to(t, bytes);
             return;
         }
         let bytes = self.keys.encode(k, &modes);

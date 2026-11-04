@@ -488,38 +488,35 @@ impl App {
         self.focused_pane().and_then(|p| model::shows(self.world.world_ref(), p)).is_some_and(|o| model::pane_kind(o) == model::PaneKind::Archive)
     }
 
-    /// A key while the Archive has the keyboard: typing searches, Backspace and Escape edit the search, Return opens
-    /// the first row. Whether it took the key.
-    pub(super) fn archive_key(&mut self, k: &term::KeyIn<'_>) -> bool {
-        if !self.archive_focused() || k.action == KeyAction::Release || k.mods.cmd || k.mods.ctrl {
-            return false;
-        }
+    /// The Archive's search, edited by its keys (scene/20-keys.flecs, ctx.Archive): cleared (Escape), its last character
+    /// erased (Backspace), or `typed` added (a key no binding takes).
+    pub(super) fn archive_search(&mut self, edit: SearchEdit<'_>) {
         let mut q = self.archive_query();
-        match k.code {
-            53 => q.clear(),
-            51 => {
+        match edit {
+            SearchEdit::Clear => q.clear(),
+            SearchEdit::Erase => {
                 q.pop();
             }
-            36 | 76 => {
-                let first = self.archive_rows().into_iter().find_map(|(_, _, r)| match r {
-                    ARow::Item { e, .. } => Some(e),
-                    _ => None,
-                });
-                if let Some(e) = first {
-                    self.open_from_archive(e);
-                }
-                return true;
-            }
-            _ => {
-                let typed: String = k.text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+            SearchEdit::Type(text) => {
+                let typed: String = text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
                 if typed.is_empty() {
-                    return true;
+                    return;
                 }
                 q.push_str(&typed);
             }
         }
         self.set_archive_query(&q);
-        true
+    }
+
+    /// Return in the Archive: open its first row.
+    pub(super) fn archive_open_first(&mut self) {
+        let first = self.archive_rows().into_iter().find_map(|(_, _, r)| match r {
+            ARow::Item { e, .. } => Some(e),
+            _ => None,
+        });
+        if let Some(e) = first {
+            self.open_from_archive(e);
+        }
     }
 
     /// Text committed (an input method, a paste) while the Archive has the keyboard: into its search. Whether it took it.
@@ -534,3 +531,10 @@ impl App {
 }
 
 use harness_native_ui_layout_api::ScrollState as ScrollStateOf;
+
+/// An edit of the Archive's search.
+pub(super) enum SearchEdit<'a> {
+    Clear,
+    Erase,
+    Type(&'a str),
+}

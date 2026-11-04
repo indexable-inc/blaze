@@ -32,6 +32,8 @@ mod panes;
 mod fold;
 mod sidebar;
 mod archive;
+mod keys;
+pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -56,6 +58,7 @@ enum Do {
     /// An archived object: opened with the way back to the Archive.
     Archived(u64),
     Kill,
+    Sidebar,
     Zoom(i32),
 }
 
@@ -181,6 +184,11 @@ pub struct App {
     tree_focus: bool,
     /// The last press's click count and modifiers (a double click on a row folds it, Option folds its siblings too).
     press: (isize, KeyMods),
+    /// The keyboard's bindings and actions (scene/20-keys.flecs and the user's keys.flecs), the user's file as watched,
+    /// and how many times they have been loaded.
+    keymap: crate::keys::Keymap,
+    key_file: keys::KeyFile,
+    keys_gen: u64,
     /// The sidebar's fold (cmd+S): open or not, and its spring (0 folded away to 1 open); the traffic lights fade with it.
     side_open: bool,
     side_x: harness_native_api::spring::Spring,
@@ -241,6 +249,7 @@ impl App {
         crate::pane::register(&world);
         crate::look::register(&world);
         archive::register(&world);
+        crate::keys::register(&world);
         world.component::<HoverLift>().writable();
         world.component::<Bump>();
         let app = world.entity_named(APP);
@@ -283,6 +292,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let host = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "This Mac".into());
         let (terms, run_terms) = model::install(w, &host, &crate::link::sock().display().to_string(), rx);
+        let key_file = keys::KeyFile::watch(wake.clone());
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
@@ -308,7 +318,7 @@ impl App {
         let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
-        Ok(Self {
+        let mut app = Self {
             world,
             fonts,
             cache: GlyphCache::new(ATLAS_SIZE),
@@ -353,7 +363,12 @@ impl App {
             side_open: true,
             side_x: harness_native_api::spring::Spring::at(1.0),
             corner_x: harness_native_api::spring::Spring::at(0.0),
-        })
+            keymap: crate::keys::Keymap::default(),
+            key_file,
+            keys_gen: 0,
+        };
+        app.load_keys()?;
+        Ok(app)
     }
 
     pub fn zoom(&self) -> f32 {
@@ -620,7 +635,7 @@ impl App {
             let status = me.status_of(e);
             let failed = status == "killed" || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
             if run.is_none() {
-                looks.session(me, row, e, hint.get(&e).filter(|&&i| i < 9).map(|i| format!("\u{2318}{}", i + 1)).unwrap_or_default());
+                looks.session(me, row, e, hint.get(&e).filter(|&&i| i < 9).map(|i| me.hint(&format!("Select{}", i + 1))).unwrap_or_default());
             } else if let Some(p) = row.part("glyph") {
                 // A run: a small dot tinted by how it went, breathing while it runs.
                 crate::look::show_glyph(p.entity(), crate::look::RUN_ICON);
@@ -923,16 +938,16 @@ impl App {
     fn entries(&self) -> Vec<(String, PalGlyph, String, String, Do)> {
         let w = self.world.world_ref();
         let mut out: Vec<(String, PalGlyph, String, String, Do)> = vec![
-            // cmd+N, cmd+T and cmd+shift+T's kinds.
-            ("new-claude".into(), PalGlyph::Kind("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
-            ("new-codex".into(), PalGlyph::Kind("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
-            ("new-cursor".into(), PalGlyph::Kind("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
-            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), "\u{2318}N".into(), Do::New("shell")),
+            // Each hint is the binding that runs the same action (scene/20-keys.flecs, or the user's keys.flecs).
+            ("new-claude".into(), PalGlyph::Kind("claude"), "New claude".into(), self.hint("SpawnClaude"), Do::New("claude")),
+            ("new-codex".into(), PalGlyph::Kind("codex"), "New codex".into(), self.hint("SpawnCodex"), Do::New("codex")),
+            ("new-cursor".into(), PalGlyph::Kind("cursor"), "New cursor".into(), self.hint("SpawnCursor"), Do::New("cursor")),
+            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), self.hint("SpawnShell"), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-            let hint = if i < 9 { format!("\u{2318}{}", i + 1) } else { String::new() };
+            let hint = if i < 9 { self.hint(&format!("Select{}", i + 1)) } else { String::new() };
             out.push((format!("obj{e}"), PalGlyph::Kind(model::kind_name(o)), name, hint, Do::Select(e)));
         }
         // The Archive, then what is in it (newest first; a run by its id and command).
@@ -964,9 +979,10 @@ impl App {
                 out.push((format!("run{e}"), PalGlyph::Kind("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
             }
         }
-        out.push(("kill".into(), PalGlyph::Char("\u{2715}"), "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
-        out.push(("zoom-in".into(), PalGlyph::Char("+"), "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
-        out.push(("zoom-out".into(), PalGlyph::Char("\u{2212}"), "Zoom out".into(), "\u{2318}\u{2212}".into(), Do::Zoom(-1)));
+        out.push(("kill".into(), PalGlyph::Char("\u{2715}"), "Kill current object".into(), self.hint("Archive"), Do::Kill));
+        out.push(("sidebar".into(), PalGlyph::Char("\u{25E7}"), "Toggle sidebar".into(), self.hint("ToggleSidebar"), Do::Sidebar));
+        out.push(("zoom-in".into(), PalGlyph::Char("+"), "Zoom in".into(), self.hint("ZoomIn"), Do::Zoom(1)));
+        out.push(("zoom-out".into(), PalGlyph::Char("\u{2212}"), "Zoom out".into(), self.hint("ZoomOut"), Do::Zoom(-1)));
         let q = self.palette.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
         out.retain(|(_, _, name, _, _)| fuzzy(&name.to_lowercase(), &q));
         out
@@ -1049,6 +1065,7 @@ impl App {
     pub fn frame(&mut self, points: (f32, f32), backing: f32, dt: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Draw {
         self.time += dt;
         self.pending = self.pending.saturating_sub(1);
+        self.reload_keys_if_changed();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
@@ -1311,6 +1328,7 @@ impl App {
             Do::Select(e) => self.select(Some(e)),
             Do::Archived(e) => self.open_from_archive(e),
             Do::Kill => self.kill(),
+            Do::Sidebar => self.toggle_sidebar(),
             Do::Zoom(by) => self.step_zoom(by),
         }
         self.poke();
@@ -1459,79 +1477,16 @@ impl App {
         self.emit_tree_knob(d);
     }
 
-    fn palette_key(&mut self, code: u16, chars: &str) {
-        let n = self.entries().len();
+    /// Text typed into the open palette (a key no binding takes): its query.
+    fn palette_type(&mut self, chars: &str) {
+        let time = self.time;
         let Some(p) = self.palette.as_mut() else { return };
-        match code {
-            53 => self.palette = None,
-            125 => p.at = (p.at + 1).min(n.saturating_sub(1)),
-            126 => p.at = p.at.saturating_sub(1),
-            36 | 76 => {
-                let at = p.at;
-                if let Some((.., d)) = self.entries().into_iter().nth(at) {
-                    self.palette = None;
-                    self.run(d);
-                }
-            }
-            51 => {
-                p.query.pop();
-                p.at = 0;
-                p.changed = self.time;
-            }
-            _ => {
-                let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
-                if !typed.is_empty() {
-                    p.query.push_str(&typed);
-                    p.at = 0;
-                    p.changed = self.time;
-                }
-            }
+        let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+        if !typed.is_empty() {
+            p.query.push_str(&typed);
+            p.at = 0;
+            p.changed = time;
         }
-    }
-
-    /// A Command shortcut: whether it was one of the app's.
-    pub fn shortcut(&mut self, key: &str, code: u16, m: KeyMods) -> bool {
-        self.poke();
-        if self.palette.is_none()
-            && let Some(bytes) = term::natural_edit(code, key.chars().next(), m)
-        {
-            self.typed();
-            self.send(bytes);
-            return true;
-        }
-        let k = key.to_lowercase();
-        match (k.as_str(), m.shift) {
-            ("a", false) => self.select_all(),
-            ("]", _) | ("}", _) => self.step_object(1),
-            ("[", _) | ("{", _) => {
-                // Back to the Archive after opening something from it; else the previous object.
-                if !self.go_back() {
-                    self.step_object(-1);
-                }
-            }
-            ("n", _) => self.spawn("shell"),
-            ("t", false) => self.spawn("claude"),
-            ("t", true) => self.spawn("codex"),
-            ("w", false) => self.kill(),
-            ("s", false) => self.toggle_sidebar(),
-            ("k", false) => {
-                self.palette = if self.palette.is_some() { None } else { Some(Palette::new()) };
-            }
-            ("=", _) | ("+", _) => self.step_zoom(1),
-            ("-", _) | ("_", _) => self.step_zoom(-1),
-            ("0", false) => self.step_zoom(0),
-            (d, false) if d.len() == 1 && ('1'..='9').contains(&d.chars().next().unwrap_or('0')) => {
-                let i = d.parse::<usize>().unwrap_or(1) - 1;
-                if let Some(&e) = self.objects().get(i) {
-                    self.select(Some(e));
-                }
-            }
-            _ => {
-                let _ = code;
-                return false;
-            }
-        }
-        true
     }
 
     /// The sidebar node (the device row's parent).
@@ -1592,7 +1547,7 @@ impl App {
         self.poke();
     }
 
-    fn spawn(&mut self, kind: &'static str) {
+    fn spawn(&mut self, kind: &str) {
         let cwd = self.selected().and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>()).map(|c| c.s.as_str().to_owned()).filter(|c| !c.is_empty()).or_else(|| std::env::var("HOME").ok());
         let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();

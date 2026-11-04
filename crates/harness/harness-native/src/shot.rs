@@ -66,7 +66,8 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_HOVER `x,y,t`: the pointer moves to (x, y) at t seconds (a hover mid-spring for a shot just after).
     let mut hover = std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
-    // object, which kills its session).
+    // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
+    // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
     // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
     // when it is open, the Archive's search when it has the keyboard).
     let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| s.rsplit_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
@@ -109,7 +110,7 @@ pub fn run(path: &str) -> Result<(), String> {
         }
         while keys.first().is_some_and(|k| t >= k.1) {
             let (k, _) = keys.remove(0);
-            app.shortcut(&k, 0, crate::app::KeyMods { cmd: true, ..Default::default() });
+            press(&mut app, &k);
         }
         if up_next {
             app.pointer_up(at.0, at.1, left, none);
@@ -145,6 +146,10 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    // HARNESS_NATIVE_MENU_DUMP: the menu bar the window would have, read back from the NSMenu built from the keys.
+    if std::env::var_os("HARNESS_NATIVE_MENU_DUMP").is_some() {
+        eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));
+    }
     Ok(())
 }
 
@@ -166,4 +171,28 @@ fn write_png(path: &str, app: &App, px: &[u8], w: u32, h: u32) -> Result<(), Str
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().and_then(|mut wr| wr.write_image_data(&px)).map_err(|e| e.to_string())
+}
+
+/// A `HARNESS_NATIVE_SHOT_KEY` key: a Command key through the window's key equivalents (`App::shortcut`), any other
+/// through its keyDown (`App::key`), as AppKit would hand them over.
+fn press(app: &mut App, spec: &str) {
+    let chord = if spec.contains('+') && spec.len() > 1 {
+        crate::keys::Chord::parse(&spec.replace("none+", ""))
+    } else {
+        Some(crate::keys::Chord { key: spec.to_lowercase(), cmd: true, ..Default::default() })
+    };
+    let Some(c) = chord else {
+        eprintln!("harness-native: shot key {spec:?}: not keys");
+        return;
+    };
+    let code = crate::keys::code_of(&c.key).unwrap_or(0);
+    let ch = (c.key.chars().count() == 1).then(|| c.key.chars().next()).flatten();
+    let out = if c.cmd {
+        app.shortcut(code, ch, c.mods())
+    } else {
+        let text = ch.map(String::from).unwrap_or_default();
+        app.key(&crate::term::KeyIn { code, text: &text, unshifted: ch, mods: c.mods(), action: crate::term::KeyAction::Press, composing: false });
+        crate::app::Outcome::Done
+    };
+    eprintln!("harness-native: shot key {spec}: {out:?}");
 }
