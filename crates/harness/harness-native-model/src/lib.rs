@@ -11,6 +11,7 @@
 //!   the device: one "REPL runs" per REPL (the run's `repl`) or per gone session, else one "other runs", all below the live sessions.
 //! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
+//! - [`Trashed`] on an object takes it (and what is under it) out of the tree and into the Trash; [`Hidden`] out of both.
 //! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
@@ -131,6 +132,15 @@ pub struct Unfolded;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Collapsed;
 
+/// On an object: the user killed it with cmd+W (or the palette's or menu's Kill). It leaves the tree for the sidebar's
+/// Trash, where it stays selectable; an object that ended on its own stays in the tree.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Trashed;
+
+/// On an object: the Trash was emptied of it. Never shown again.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Hidden;
+
 /// A group of runs with no listed session, by what they share (`repl:<id>`, `session:<n>`, `other`).
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct GroupKey {
@@ -213,6 +223,8 @@ pub fn register(world: &World) {
     world.component::<Ended>().writable();
     world.component::<Unfolded>();
     world.component::<Collapsed>();
+    world.component::<Trashed>();
+    world.component::<Hidden>();
     world.component::<GroupKey>().writable();
     world.component::<Viewing>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
@@ -632,7 +644,7 @@ pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
     fn walk(w: WorldRef<'_>, e: EntityView<'_>, depth: usize, out: &mut Vec<(u64, usize)>) {
         let mut kids: Vec<(u64, u64)> = Vec::new();
         e.each_child(|c| {
-            if c.has(Object::id()) {
+            if c.has(Object::id()) && !gone(c) {
                 kids.push((c.try_cloned::<&Created>().map_or(0, |c| c.ms), *c.id()));
             }
         });
@@ -684,7 +696,7 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
         fn walk(&mut self, e: EntityView<'_>, depth: usize) {
             let mut kids: Vec<(u64, u64, u64)> = Vec::new();
             e.each_child(|c| {
-                if c.target(Kind::id(), 0).is_some() {
+                if c.target(Kind::id(), 0).is_some() && !gone(c) {
                     let key = match c.try_cloned::<&StageNo>() {
                         Some(s) => u64::from(s.k),
                         None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
@@ -731,6 +743,24 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
         walk.walk(dev, 0);
     }
     walk.out
+}
+
+/// Whether `e` is out of the tree: in the Trash or hidden.
+fn gone(e: EntityView<'_>) -> bool {
+    e.has(Trashed::id()) || e.has(Hidden::id())
+}
+
+/// The objects in the Trash (not hidden), oldest first.
+#[must_use]
+pub fn trashed(world: WorldRef<'_>) -> Vec<u64> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    world.new_query::<&Object>().each_entity(|e, _| {
+        if e.has(Trashed::id()) && !e.has(Hidden::id()) {
+            out.push((e.try_cloned::<&Created>().map_or(0, |c| c.ms), *e.id()));
+        }
+    });
+    out.sort_unstable();
+    out.into_iter().map(|(_, e)| e).collect()
 }
 
 fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {

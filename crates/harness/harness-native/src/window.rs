@@ -214,6 +214,19 @@ define_class!(
             wake();
         }
 
+        #[unsafe(method(ctxPutBack:))]
+        fn ctx_put_back(&self, sender: &NSMenuItem) {
+            let e = sender.tag() as u64;
+            with(|st| st.app.put_back(e));
+            wake();
+        }
+
+        #[unsafe(method(ctxEmptyTrash:))]
+        fn ctx_empty_trash(&self, _sender: &NSMenuItem) {
+            with(|st| st.app.empty_trash());
+            wake();
+        }
+
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -254,15 +267,28 @@ impl HarnessView {
 
     fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
         let p = self.local(event);
-        let e = with(|st| st.app.object_at(p.x as f32, p.y as f32)).flatten()?;
+        let (x, y) = (p.x as f32, p.y as f32);
         let mtm = self.mtm();
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
-        let kill = item(mtm, "Kill", sel!(ctxKill:), "");
-        // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
-        unsafe { kill.setTarget(Some(self)) };
-        kill.setTag(e as isize);
-        menu.addItem(&kill);
+        let add = |title: &str, action: objc2::runtime::Sel, tag: u64| {
+            let it = item(mtm, title, action, "");
+            // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
+            unsafe { it.setTarget(Some(self)) };
+            it.setTag(tag as isize);
+            menu.addItem(&it);
+        };
+        // The trash row: empty it (its objects hidden for good).
+        if with(|st| st.app.trash_at(x, y)).unwrap_or(false) {
+            add("Empty Trash", sel!(ctxEmptyTrash:), 0);
+            return Some(menu);
+        }
+        let e = with(|st| st.app.object_at(x, y)).flatten()?;
+        if with(|st| st.app.is_trashed(e)).unwrap_or(false) {
+            add("Put Back", sel!(ctxPutBack:), e);
+        } else {
+            add("Kill", sel!(ctxKill:), e);
+        }
         Some(menu)
     }
 

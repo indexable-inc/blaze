@@ -12,11 +12,13 @@ use std::rc::Rc;
 use harness_native_flecs::prelude::*;
 use harness_native_api::APP;
 use harness_native_ui_input_api::{Activated, Focusable, Focused, Hoverable, Hovered, PointerState, Pressable, Pressed};
-use harness_native_ui_node_api::{Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_node_api::{Clip, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
 
 struct Hit {
     id: u64,
     laid: Laid,
+    /// Where its `Clip` ancestors let it be hit (their rects intersected); None: nowhere clips it.
+    clip: Option<Laid>,
     /// Paint order: bigger is on top.
     key: (Level, f32, u32, u64),
     pressable: bool,
@@ -29,9 +31,19 @@ pub fn install(world: WorldRef<'_>) {
     let sink = hits.clone();
     world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).each_entity(move |e, (_, laid)| {
         let (mut depth, mut root) = (0u32, e);
+        let mut clip: Option<Laid> = None;
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
+            if p.has(Clip::id()) && let Some(c) = p.try_cloned::<&Laid>() {
+                clip = Some(match clip {
+                    None => c,
+                    Some(a) => {
+                        let (x, y) = (a.x.max(c.x), a.y.max(c.y));
+                        Laid { x, y, w: ((a.x + a.w).min(c.x + c.w) - x).max(0.0), h: ((a.y + a.h).min(c.y + c.h) - y).max(0.0) }
+                    }
+                });
+            }
         }
         if root.has(Offscreen::id()) || root.has(Hosted::id()) {
             return;
@@ -41,6 +53,7 @@ pub fn install(world: WorldRef<'_>) {
         sink.borrow_mut().push(Hit {
             id: *e.id(),
             laid: *laid,
+            clip,
             key: (level, z, depth, *e.id()),
             pressable: e.has(Pressable::id()),
             focusable: e.has(Focusable::id()),
@@ -53,7 +66,7 @@ pub fn install(world: WorldRef<'_>) {
             return;
         }
         hits.sort_by(|a, b| a.key.0.cmp(&b.key.0).then(a.key.1.total_cmp(&b.key.1)).then(a.key.2.cmp(&b.key.2)).then(a.key.3.cmp(&b.key.3)));
-        let top = hits.iter().rev().find(|h| h.laid.contains(p.x, p.y)).map(|h| (h.id, h.pressable, h.focusable));
+        let top = hits.iter().rev().find(|h| h.laid.contains(p.x, p.y) && h.clip.is_none_or(|c| c.contains(p.x, p.y))).map(|h| (h.id, h.pressable, h.focusable));
         hits.clear();
         apply(it.world().entity_from_id(app), top, *p);
     });
