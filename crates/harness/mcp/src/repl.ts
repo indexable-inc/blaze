@@ -1,7 +1,9 @@
 // A persistent TypeScript REPL: each cell is TS, top-level declarations survive into later cells,
-// top-level await works, the last expression is the result, and console output is captured.
+// top-level await works, the last expression is the result, and console output is captured per task
+// (see tasks.ts). Cells run concurrently; the caller decides how long to wait before backgrounding.
 import * as acorn from "acorn";
 import { nuon } from "./nuon.ts";
+import { installCapture, inTask, newTask, type Task } from "./tasks.ts";
 
 const transpiler = new Bun.Transpiler({ loader: "ts", target: "bun", trimUnusedImports: false, deadCodeElimination: false });
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<unknown>;
@@ -63,25 +65,20 @@ export function rewrite(js: string): { body: string; names: string[] } {
 export class Repl {
   /** Persistent bindings; seeded with the exposed functions. */
   readonly scope: Record<string, unknown>;
-  #queue: Promise<unknown> = Promise.resolve();
 
   constructor(globals: Record<string, unknown>) {
     this.scope = { ...globals };
+    installCapture();
   }
 
-  /** Cells run one at a time so console capture stays per-cell. */
-  run(code: string, timeoutMs = 60_000) {
-    const job = this.#queue.then(() => this.#run(code, timeoutMs));
-    this.#queue = job.catch(() => {});
-    return job;
+  /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture. */
+  run(code: string, timeoutMs?: number): Task {
+    const t = newTask(code);
+    inTask(t, () => this.#run(code, timeoutMs)).then(({ ok, value, result }) => t.finish(ok, value, result));
+    return t;
   }
 
-  async #run(code: string, timeoutMs: number): Promise<{ ok: boolean; result: string; logs: string[] }> {
-    const logs: string[] = [];
-    const saved = { log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug };
-    const capture = (level: string) => (...args: unknown[]) =>
-      logs.push((level === "log" ? "" : `[${level}] `) + args.map((a) => (typeof a === "string" ? a : nuon(a, { maxRows: 100 }))).join(" "));
-    for (const k of Object.keys(saved) as (keyof typeof saved)[]) console[k] = capture(k);
+  async #run(code: string, timeoutMs?: number): Promise<{ ok: boolean; value: unknown; result: string }> {
     try {
       const js = transpiler.transformSync(code);
       const { body, names } = rewrite(js);
@@ -89,15 +86,16 @@ export class Repl {
       // Sloppy-mode `with` routes bare identifiers to the persistent scope, falling back to globals.
       const fn = new AsyncFunction("__scope", `with (__scope) { return await (async () => {\n${body}\n})(); }`);
       let timer: Timer | undefined;
-      const value = await Promise.race([
+      const value = await (timeoutMs === undefined ? fn(this.scope) : Promise.race([
         fn(this.scope),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`cell timed out after ${timeoutMs}ms`)), timeoutMs); }),
-      ]).finally(() => clearTimeout(timer));
-      return { ok: true, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }), logs };
+      ]).finally(() => clearTimeout(timer)));
+      return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
-      return { ok: false, result: e instanceof Error ? (e.stack ?? e.message) : String(e), logs };
-    } finally {
-      Object.assign(console, saved);
+      // Drop the harness frames below the cell.
+      const stack = e instanceof Error ? (e.stack ?? e.message).split("\n") : [String(e)];
+      const cut = stack.findIndex((l) => l.includes("at #run "));
+      return { ok: false, value: e, result: (cut > 0 ? stack.slice(0, cut) : stack).join("\n") };
     }
   }
 }

@@ -19,16 +19,31 @@ server.registerTool(
     description: [
       "Run TypeScript in a persistent Bun REPL. Top-level const/let/function/import persist across calls; top-level await works;",
       "the value of the last expression is returned; console.log output is captured. All Bun/Node APIs and fetch are available.",
+      "Every cell is a task (t1, t2, ...) and cells run concurrently. The reply starts with a header '[t3 done 0.12s]' / '[t3 error ...]';",
+      "if the cell is still running after yield_ms (default 10000) the call returns '[t3 running 10.0s, backgrounded]' with logs so far and the cell keeps going:",
+      "check with tasks(), task('t3'), or `await wait('t3')` (logs and result are kept). Long commands: start with sh(...), read with out(p, { new: true }).",
       "Results print as NUON (compact JSON: bare strings/keys; lists of records as [[cols]; [row], ...]), capped at 100 rows with a '# … N more rows' note. Strings print raw.",
       "Functions in scope:",
       ...Object.values(docs).map((d) => `- ${d}`),
     ].join("\n"),
-    inputSchema: { code: z.string().describe("TypeScript to run"), timeout_ms: z.number().optional().describe("default 60000") },
+    inputSchema: {
+      code: z.string().describe("TypeScript to run"),
+      yield_ms: z.number().optional().describe("wait this long before backgrounding; default 10000"),
+      timeout_ms: z.number().optional().describe("hard limit for the cell, rejecting it; default none"),
+    },
   },
-  async ({ code, timeout_ms }) => {
-    const { ok, result, logs } = await repl.run(code, timeout_ms);
-    const text = (logs.length ? logs.join("\n") + "\n" : "") + result;
-    return { content: [{ type: "text", text }], isError: !ok };
+  async ({ code, yield_ms = 10_000, timeout_ms }) => {
+    const t = repl.run(code, timeout_ms);
+    let timer: Timer | undefined;
+    await Promise.race([t.done, new Promise((r) => (timer = setTimeout(r, yield_ms)))]);
+    clearTimeout(timer);
+    const secs = (t.elapsed_ms / 1000).toFixed(2) + "s";
+    const logs = t.logs.length ? t.logs.join("\n") + "\n" : "";
+    if (t.status === "running") {
+      const text = `[${t.id} running ${secs}, backgrounded; await wait('${t.id}') or tasks()]\n${logs}`.trimEnd();
+      return { content: [{ type: "text", text }] };
+    }
+    return { content: [{ type: "text", text: `[${t.id} ${t.status} ${secs}]\n${logs}${t.result}` }], isError: t.status === "error" };
   },
 );
 
