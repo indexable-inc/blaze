@@ -398,15 +398,36 @@ pub struct Recovered {
     pub(crate) images: Vec<(u32, crate::batches::ImageRow)>,
     /// Their files: deleted once their rows are written ([`Recovered::written`]).
     pub files: Vec<PathBuf>,
+    /// Each one's process and the instant of its signal, as `rows` and `files`: what the
+    /// manifest names a record by once a file it lists holds its row
+    /// (`history::manifest::Consumed::crashes`).
+    pub(crate) ids: Vec<(u32, i64)>,
     /// The files refused, each renamed `crash.<pid>.refused` so it is not read again, and why.
     pub refused: Vec<CrashError>,
 }
 
-impl Recovered {
-    /// The rows were written: their files go.
-    pub fn written(&mut self) -> Result<(), CrashError> {
-        self.rows.clear();
-        self.images.clear();
+/// Crash records whose rows a flush wrote: listed in the manifest's commit as consumed
+/// (`ids`), then deleted (`files`), so a crash between the two never writes a row twice.
+#[derive(Debug, Default)]
+pub(crate) struct Written {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) ids: Vec<(u32, i64)>,
+}
+
+impl Written {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.ids.is_empty()
+    }
+
+    pub(crate) fn append(&mut self, other: &mut Written) {
+        self.files.append(&mut other.files);
+        self.ids.append(&mut other.ids);
+    }
+
+    /// Deletes the records, the commit that consumed them done; the first that can't be
+    /// deleted is the error, and the rest stay for the next open, which deletes them unread.
+    pub(crate) fn delete(&mut self) -> Result<(), CrashError> {
+        self.ids.clear();
         for path in self.files.drain(..) {
             match fs::remove_file(&path) {
                 Ok(()) => {}
@@ -421,6 +442,47 @@ impl Recovered {
             }
         }
         Ok(())
+    }
+}
+
+impl Recovered {
+    /// The rows were written and committed: their files go.
+    pub fn written(&mut self) -> Result<(), CrashError> {
+        self.images.clear();
+        self.take_written().delete()
+    }
+
+    /// The rows are written to a file not yet listed: they leave this, and their records
+    /// go once the commit that lists them consumed them ([`Written`]).
+    pub(crate) fn take_written(&mut self) -> Written {
+        self.rows.clear();
+        Written { files: std::mem::take(&mut self.files), ids: std::mem::take(&mut self.ids) }
+    }
+
+    /// Leaves out the records whose rows a listed file holds already (`written`, the
+    /// manifest's): a crash came between that commit and their deletes. Each is deleted now,
+    /// unread; one that can't be is refused, naming it.
+    pub(crate) fn drop_written(&mut self, written: &std::collections::BTreeSet<(u32, i64)>) {
+        let mut at = 0;
+        while at < self.ids.len() {
+            if !written.contains(&self.ids[at]) {
+                at += 1;
+                continue;
+            }
+            let (pid, _) = self.ids.remove(at);
+            self.rows.remove(at);
+            let path = self.files.remove(at);
+            self.images.retain(|it| it.0 != pid);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => self.refused.push(CrashError::Io {
+                    path,
+                    doing: "deleting a crash record whose row the history lists already",
+                    error,
+                }),
+            }
+        }
     }
 }
 
@@ -480,6 +542,7 @@ pub fn recover(dir: &Path) -> Recovered {
                 }
             }
             Ok(Some(crash)) => {
+                out.ids.push((crash.pid, crash.t_ns));
                 out.rows.push(crash.row());
                 if let Some(image) = crash.image() {
                     out.images.push((crash.pid, image));

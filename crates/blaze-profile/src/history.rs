@@ -30,7 +30,9 @@
 //! view's list, so each view resolves even before a table has rows, with today's columns.
 //!
 //! Each file is made in memory, in a buffer kept across flushes, and written with one `write`
-//! to a hidden name, then renamed, so DuckDB never reads half a file. Past [`CAP_BYTES`] (or the
+//! to a hidden name, synced to stable storage, then renamed, so DuckDB never reads half a file
+//! and a power loss never leaves the manifest listing bytes the disk lost ([`durable`]: every
+//! file and the manifest, with the directory synced around the manifest's rename). Past [`CAP_BYTES`] (or the
 //! cap the history is opened with), the oldest builds are retired first, each whole: every
 //! table and flush of a build at once, so a reader of a build reads all of it or none
 //! ([`History::trim`]).
@@ -77,6 +79,16 @@
 //! and each build it was running gets a `builds` row `crashed`, running to the last row read
 //! back; then the file is deleted. A file of another layout is refused with an error naming
 //! it, answered by the next flush, and stays.
+//!
+//! What a commit consumed is part of that commit ([`manifest::Consumed`]), so a crash between
+//! a commit and what follows it never has a row written twice or lost: a flush marks in the
+//! mapping how far it will have written before its commit, and the commit names the mapping's
+//! pid and nonce with its seq, so a postmortem trusts the mark only if the manifest says that
+//! flush committed; the commit that lists a dead mapping's rows names it recovered, so it is
+//! deleted unread if a crash came before its delete; the commit that lists a crash record's
+//! `panics` row names it, so it is deleted unread the same way. A flush whose tables' files
+//! did not all write clears only the rows of those that did, and keeps the others for the
+//! next flush; a file written and not yet listed is listed by the next commit.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -124,6 +136,7 @@ use crate::{
 };
 
 pub(crate) mod compact;
+pub(crate) mod durable;
 pub mod manifest;
 mod pin;
 pub(crate) mod retire;
@@ -191,7 +204,6 @@ pub fn writes(dir: &Path, pid: u32) -> bool {
     }
 }
 
-/// Whether a process `pid` is alive: one this user may not signal is, one that is gone is not.
 /// The process that writes the history `dir` now, if one does: the pid its [`OWNER`] file names,
 /// when that process [`writes`] it. A reader asks that daemon to flush before it reads.
 pub fn writer(dir: &Path) -> Option<u32> {
@@ -199,8 +211,9 @@ pub fn writer(dir: &Path) -> Option<u32> {
     writes(dir, pid).then_some(pid)
 }
 
+/// Whether a process `pid` is alive: one this user may not signal is, one that is gone is not.
 #[cfg(unix)]
-pub(crate) fn alive(pid: u32) -> bool {
+pub fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
     // SAFETY: signal 0 sends nothing: the kernel only checks that `pid` names a process.
     let sent = unsafe { libc::kill(pid, 0) };
@@ -208,8 +221,39 @@ pub(crate) fn alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn alive(_pid: u32) -> bool {
+pub fn alive(_pid: u32) -> bool {
     true
+}
+
+/// How long a daemon starting over a history waits for a reader that holds its [`OWNER`]
+/// file while it writes a dead daemon's last rows ([`recover_dead`]): a mapping's rows, a few
+/// files and their syncs, far less than this.
+pub const RECOVERY_WAIT: Duration = Duration::from_secs(30);
+
+/// The exclusive lock of `file`, waiting at most `wait` for another process to let go of it:
+/// the file back once `wait` passed with it still held. The one bounded wait on a lock of the
+/// history (its manifest's, its owner file's); the caller opens the span naming the lock.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a bounded wait on another process's lock, which has no wake to park on"
+)]
+pub fn lock_within(
+    file: fs::File,
+    wait: Duration,
+) -> io::Result<Result<stdx::file_lock::Locked, fs::File>> {
+    let until = Instant::now() + wait;
+    let mut file = file;
+    let mut spin = blaze_graph::spin::SpinWait::new();
+    loop {
+        match stdx::file_lock::Locked::try_lock(file)? {
+            Ok(locked) => return Ok(Ok(locked)),
+            Err(back) if Instant::now() >= until => return Ok(Err(back)),
+            Err(back) => file = back,
+        }
+        if !spin.spin() {
+            spin = blaze_graph::spin::SpinWait::new();
+        }
+    }
 }
 
 /// Whether the threads `now` are inside the spans `written` were, how long each has run aside.
@@ -622,7 +666,7 @@ impl Writer {
         }
         let buf = writer.into_inner().map_err(parquet)?;
         let hidden = hidden_of(path);
-        let written = fs::write(&hidden, &buf).map_err(io_error(&hidden, "writing"));
+        let written = write_synced(&hidden, &buf);
         let bytes = buf.len() as u64;
         self.buf = buf;
         written.map(|()| (hidden, bytes))
@@ -676,13 +720,28 @@ pub fn ensure_schemas(dir: &Path) -> Result<(), HistoryError> {
     Ok(())
 }
 
-/// Writes `bytes` as `path` in one write, under a hidden name first and renamed into place.
-/// The hidden name is this process's: a reader writing a missing schema file
-/// ([`ensure_schemas`]) while a daemon opens the same history must not write into its file.
+/// Writes `bytes` as the file `hidden` in one write and syncs it to stable storage
+/// ([`durable::sync`]): what every file of the history is before it is renamed into place.
+fn write_synced(hidden: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
+    use std::io::Write as _;
+    let mut file = fs::File::create(hidden).map_err(io_error(hidden, "making"))?;
+    file.write_all(bytes).map_err(io_error(hidden, "writing"))?;
+    durable::sync(&file).map_err(io_error(hidden, "syncing to disk"))
+}
+
+/// Writes `bytes` as `path`, the manifest, in one commit: to a hidden name, synced; then the
+/// directory synced, so every file it lists is on disk under its name before the manifest that
+/// lists it; then renamed into place, and the directory synced again, so the commit is on disk
+/// before anything that follows it (a reap's deletes, a mapping's or crash record's delete) can
+/// be ([`durable`]). The hidden name is this process's: two processes committing in turn never
+/// write into one file.
 fn put(path: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
     let hidden = hidden_of(path);
-    fs::write(&hidden, bytes).map_err(io_error(&hidden, "writing"))?;
-    fs::rename(&hidden, path).map_err(io_error(path, "renaming into place"))
+    let dir = path.parent().unwrap_or(Path::new("."));
+    write_synced(&hidden, bytes)?;
+    durable::sync_dir(dir).map_err(io_error(dir, "syncing to disk the directory of"))?;
+    fs::rename(&hidden, path).map_err(io_error(path, "renaming into place"))?;
+    durable::sync_dir(dir).map_err(io_error(dir, "syncing to disk the directory of"))
 }
 
 /// The hidden name `path` is written to before it is renamed into place:
@@ -821,6 +880,9 @@ struct Kept {
     /// Written by this history since it opened, so it may be merged: a file there before may be
     /// of another blaze's schema.
     ours: bool,
+    /// The manifest lists it. A flush's file whose commit failed is in place and not yet
+    /// listed: the next flush lists it first, and no merge nor the cap takes it meanwhile.
+    listed: bool,
 }
 
 /// A merge as its driver runs it: the paths of the files merged, in seq order, and the name of
@@ -848,7 +910,19 @@ pub(crate) fn concat(
     let name = output.file_name().and_then(|it| it.to_str()).unwrap_or("history");
     // alloc: a file's name, once a merge
     let hidden = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // Synced before it is renamed: the commit that lists it then retires its inputs, which a
+    // reap deletes, so its bytes must be on disk first ([`durable`]).
     let written = concat_into(output, &hidden, inputs, properties).and_then(|()| {
+        fs::File::open(&hidden).and_then(|file| durable::sync(&file)).map_err(|error| {
+            HistoryError::Compact {
+                // alloc: an error
+                output: output.to_owned(),
+                // alloc: an error
+                file: hidden.clone(),
+                doing: "syncing to disk",
+                error: CompactError::Io(error),
+            }
+        })?;
         fs::rename(&hidden, output).map_err(|error| HistoryError::Compact {
             // alloc: an error
             output: output.to_owned(),
@@ -1048,12 +1122,19 @@ pub struct History {
     panicked: u64,
     raised: Vec<panics::Raised>,
     /// The fatal signals of gone processes found as the history opened ([`crash::recover`]):
-    /// their rows go with the next flush, their files once it wrote them.
+    /// their rows go with the next flush, their files once the commit that lists that flush's
+    /// `panics` file consumed them (`crash_listing`).
     crashes: crash::Recovered,
+    /// Crash records whose rows a flush wrote, for the next commit to consume and then delete.
+    crash_listing: crash::Written,
+    /// What failed after a flush's commit (a table that could not be written, a merge, the
+    /// cap, a reap, a dead daemon's rows, a build's identity): the flush committed the rest
+    /// and its number stands; each is reported through [`History::take_failed`].
+    deferred: Vec<HistoryError>,
     /// What a flush writes of DEBUG events ([`History::events_policy`]).
     hold: logs::Hold,
     /// Where the drain was in the rings as the last flush took its rows: what the flight
-    /// recorder's mapping marks written ([`flight::flushed`]).
+    /// recorder's mapping marks written ([`flight::flush_pending`]).
     cursor: Cursor,
     /// Why a dead daemon's rows could not be read back as this history opened: the next flush
     /// answers it, so a damaged mapping never stops the daemon from starting.
@@ -1075,8 +1156,12 @@ pub struct History {
 /// not there is [`manifest::ManifestError::Missing`]. A directory with no manifest has one made
 /// of its files first ([`manifest::hold`]). The files the cap counts (the manifest's flushes',
 /// merges' and derived tables', oldest first; not a perf run's), the highest build they are
-/// named for, and the last flush the manifest says committed.
-fn sweep(dir: &Path) -> Result<(VecDeque<Kept>, u64, u64), HistoryError> {
+/// named for, the last flush the manifest says committed, and the crash records whose rows it
+/// lists ([`manifest::Consumed::crashes`]).
+#[allow(clippy::type_complexity, reason = "one caller, which takes it apart at once")]
+fn sweep(
+    dir: &Path,
+) -> Result<(VecDeque<Kept>, u64, u64, BTreeSet<(u32, i64)>), HistoryError> {
     let mut held = manifest::hold(dir)?;
     // alloc: once a history
     let mut present: BTreeSet<String> = BTreeSet::new();
@@ -1119,6 +1204,8 @@ fn sweep(dir: &Path) -> Result<(VecDeque<Kept>, u64, u64), HistoryError> {
                 // alloc: a file's name, once a history
                 present.insert(name.to_owned());
             }
+            // A newer blaze's table, retired and not yet deleted: as any retired file.
+            manifest::Kind::Unclassified if held.manifest().retired().holds(name) => {}
             manifest::Kind::Unclassified => {
                 // alloc: an error
                 return Err(HistoryError::Unclassified {
@@ -1146,14 +1233,25 @@ fn sweep(dir: &Path) -> Result<(VecDeque<Kept>, u64, u64), HistoryError> {
         let bytes = fs::metadata(&path).map_err(io_error(&path, "reading the size of"))?.len();
         let Some(entry) = held.manifest().entry(name) else { continue };
         // clone: a file's entry, once a history
-        kept.push(Kept { name: named, bytes, path, entry: entry.clone(), ours: false });
+        kept.push(Kept {
+            name: named,
+            bytes,
+            path,
+            entry: entry.clone(),
+            ours: false,
+            listed: true,
+        });
     }
     kept.sort_unstable_by(|a, b| {
         (a.name.last, name_of(&a.path)).cmp(&(b.name.last, name_of(&b.path)))
     });
     let flushed = held.manifest().flushed();
+    // What a past commit consumed of a mapping or crash record since deleted is forgotten.
+    held.prune_consumed(dir);
+    // clone: the crash records consumed, once a history
+    let crashes = held.manifest().consumed().crashes.clone();
     held.commit()?;
-    Ok((kept.into(), last_build, flushed))
+    Ok((kept.into(), last_build, flushed, crashes))
 }
 
 impl History {
@@ -1169,12 +1267,15 @@ impl History {
         cap: u64,
         sampler: &'static sampler::Ring,
     ) -> Result<History, HistoryError> {
-        let (mut kept, mut last_build, flushed) = sweep(dir)?;
+        let (mut kept, mut last_build, flushed, crashes_listed) = sweep(dir)?;
         let mut seq = kept.iter().map(|it| it.name.last).max().unwrap_or(0).max(flushed) + 1;
         let mut total: u64 = kept.iter().map(|it| it.bytes).sum();
         // Each gone process's fatal signal: a row for the first flush. A record refused (another
         // layout, another blaze) is set aside and said; it never stops the history opening.
-        let crashes = crash::recover(dir);
+        let mut crashes = crash::recover(dir);
+        // A record whose row a listed file holds: a crash came between that commit and its
+        // delete. Deleted unread, never written twice.
+        crashes.drop_written(&crashes_listed);
         for refused in &crashes.refused {
             tracing::warn!(target: "blaze", "{refused}");
         }
@@ -1271,6 +1372,9 @@ impl History {
             // alloc: once a history
             raised: Vec::new(),
             crashes,
+            crash_listing: crash::Written::default(),
+            // alloc: once a history
+            deferred: Vec::new(),
             hold: logs::Hold::new(logs::Policy::default()),
             cursor: Cursor::default(),
             postmortem,
@@ -1490,8 +1594,11 @@ impl History {
     /// Then merges files this history wrote ([`Flushed::merged`]; each table of `build` into one
     /// file when `build` is given, as its build ends) and retires the oldest files past the cap,
     /// then deletes the retired files no reader pins.
-    /// A failed write is an error naming the file; the rows it held are not written again. A
-    /// failed merge is an error after the flush's own files are written.
+    /// A flush whose commit fails is the error, naming why; the files it wrote are listed by
+    /// the next. Once its commit is done, its number stands: what fails after it (a table's
+    /// file that could not be written, whose rows of the rings are lost and whose other rows
+    /// the next flush writes; a merge; the cap; a reap; a dead daemon's rows) is said through
+    /// [`History::take_failed`].
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.
@@ -1644,7 +1751,8 @@ impl History {
             false => 0,
         };
         let mut panic_rows = panics::rows(&self.raised);
-        panic_rows.append(&mut self.crashes.rows);
+        // clone: the rows of crashes recovered, once a flush until one writes them
+        panic_rows.extend(self.crashes.rows.iter().cloned());
         let named =
             panic_rows.iter().filter_map(|it| it.build_id).fold(self.named_for(build), u64::max);
         // The spans of `build` are given its commit; the rest (other builds', and none's) none.
@@ -1719,10 +1827,10 @@ impl History {
                 .batch(stacks, seen_ns, self.process)
                 .map_err(arrow_error(&schema::IMAGES))?,
         ]; // alloc: as `spans`
-        for (pid, image) in self.crashes.images.drain(..) {
-            let process = Process { pid, commit: None, ..self.process };
+        for (pid, image) in &self.crashes.images {
+            let process = Process { pid: *pid, commit: None, ..self.process };
             images.push(
-                batches::images(std::slice::from_ref(&image), None, seen_ns, process)
+                batches::images(std::slice::from_ref(image), None, seen_ns, process)
                     .map_err(arrow_error(&schema::IMAGES))?,
             );
         }
@@ -1794,86 +1902,157 @@ impl History {
             (&schema::TEST_RUNS, &test_runs),
             (&schema::IMAGES, &images),
         ];
-        // The files written, listed in one commit after the last: a reader sees all of the
-        // flush or none of it.
-        let first = self.kept.len();
+        // Each table's file is written to its place, then all are listed in one commit: a
+        // reader sees all of the flush or none of it. A table whose file can't be written
+        // loses only its own rows; the others are written still.
+        let mut wrote = [false; schema::TABLES.len()];
         let mut failed = None;
         for (table, parts) in tables {
             if rows(parts) == 0 {
+                wrote[table_at(table)] = true;
                 continue;
             }
             let name = Name { build, table: table_at(table), first: seq, last: seq, level: 0 };
             let path = self.dir.join(name.file_name());
-            let bytes = match self.writer.write(&path, table, parts) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    failed = Some(error);
-                    break;
+            match self.writer.write(&path, table, parts) {
+                Ok(bytes) => {
+                    let entry = manifest::Entry::of_batches(table, parts);
+                    self.kept.push_back(Kept { name, bytes, path, entry, ours: true, listed: false });
+                    self.total += bytes;
+                    flushed.files += 1;
+                    flushed.bytes += bytes;
+                    wrote[table_at(table)] = true;
                 }
-            };
-            let entry = manifest::Entry::of_batches(table, parts);
-            self.kept.push_back(Kept { name, bytes, path, entry, ours: true });
-            self.total += bytes;
-            flushed.files += 1;
-            flushed.bytes += bytes;
+                Err(error) => _ = failed.get_or_insert(error),
+            }
         }
-        // The files written before a failed one are listed still: their rows are not written
-        // again.
-        let mut held = manifest::hold(&self.dir)?;
-        for kept in self.kept.range(first..) {
-            // clone: a file's entry, once a file
-            held.add(name_of(&kept.path), kept.entry.clone())?;
+        // What the flush wrote leaves memory table by table: a table whose file was written
+        // holds those rows now (listed by this commit, or by the next if this one fails), and
+        // one whose file was not keeps them for the next flush. Until 2026-11-04 a failed
+        // table kept every table's rows, which the next flush wrote a second time beside the
+        // files already listed.
+        let done = |table: &Table| wrote[table_at(table)];
+        if done(&schema::BUILDS) {
+            self.ended.clear();
         }
-        held.flush_committed(seq);
-        held.commit()?;
-        drop(held);
-        // The rows drained are in listed files now, or (a table whose write failed) gone as
-        // they would be from a daemon that lives on: a postmortem of this process leaves them
-        // out either way, so no row it reads back is one a listed file holds.
-        flight::flushed(&self.cursor, self.read.at_ns);
-        if let Some(error) = failed {
+        if done(&schema::ERRORS) {
+            self.errors.clear();
+        }
+        if done(&schema::LINKS) {
+            self.links.clear();
+        }
+        if done(&schema::CRATE_DEPS) {
+            self.crate_deps.clear();
+        }
+        if done(&schema::QUERY_COUNTS) {
+            self.query_counts.clear();
+        }
+        if done(&schema::MISSES) {
+            self.misses.clear();
+        }
+        if done(&schema::PROCESSES) {
+            self.processes.clear();
+        }
+        if done(&schema::TEST_RUNS) {
+            self.test_runs.clear();
+        }
+        if done(&schema::KEY_PARTS) {
+            self.key_parts.clear();
+        }
+        if done(&schema::PROVENANCE) {
+            self.provenance.clear();
+        }
+        // The clients' batches went into this flush's parts.
+        self.client_build = 0;
+        // A crash's records are consumed by the commit that lists its `panics` row, and only
+        // then deleted; a record whose row was not written is written by the next flush.
+        if done(&schema::PANICS) {
+            let mut written = self.crashes.take_written();
+            self.crash_listing.append(&mut written);
+        }
+        if done(&schema::IMAGES) {
+            self.crashes.images.clear();
+        }
+        // The rows the flush took, marked in the recorder's mapping as this flush's, pending
+        // its commit: a postmortem reads past them once the manifest says this flush
+        // committed, so a crash on either side of the commit writes no row twice and loses
+        // none. The DEBUG rows still held for builds not ended stay readable before the marks.
+        let recorder = flight::postmortem::recorder();
+        if recorder.is_some() {
+            // alloc: once a flush, at most `logs::HOLD_BUILDS`
+            let held_builds: Vec<u32> = self.hold.held_builds().collect();
+            flight::flush_pending(&self.cursor, self.hold.held_ids(), &held_builds, seq);
+        }
+        // The commit point. A commit that fails (another process held the manifest's lock
+        // past its bound) leaves this flush's files in place, unlisted: the next flush lists
+        // them first, and a crash before it leaves them to the next open's sweep, and their
+        // rings' rows to the postmortem, which reads past the last committed marks.
+        if let Err(error) = self.list(seq, recorder) {
+            self.deferred.extend(failed);
             return Err(error);
         }
-        self.ended.clear();
-        self.errors.clear();
-        self.links.clear();
-        self.crate_deps.clear();
-        self.query_counts.clear();
-        self.misses.clear();
-        // The crashes' rows are written: their records go. One that can't be deleted is read
-        // again by the next daemon, and its row written twice; said, not stopping the flush.
-        let had_crashes = !self.crashes.files.is_empty();
-        if let Err(error) = self.crashes.written() {
-            tracing::warn!(target: "blaze", "{error}");
-        }
-        if had_crashes {
+        flight::flush_committed(seq, self.read.at_ns);
+        if !self.crash_listing.is_empty() {
+            // One that can't be deleted is consumed already: the next open deletes it unread.
+            if let Err(error) = self.crash_listing.delete() {
+                tracing::warn!(target: "blaze", "{error}");
+            }
             // Crash records deleted since the cap last counted them.
             self.side = side_bytes(&self.dir);
         }
-        self.processes.clear();
-        self.test_runs.clear();
-        self.client_build = 0;
-        self.key_parts.clear();
-        self.provenance.clear();
-        let compacted = self.compact(ended, &mut flushed);
-        let trimmed = self.trim().map(|it| flushed.deleted = it);
+        // Committed: what fails from here on is said apart, and the flush's number stands.
+        if let Some(error) = failed {
+            self.deferred.push(error);
+        }
+        if let Err(error) = self.compact(ended, &mut flushed) {
+            self.deferred.push(error);
+        }
+        match self.trim() {
+            Ok(deleted) => flushed.deleted = deleted,
+            Err(error) => self.deferred.push(error),
+        }
         // After every retirement is committed, so a reader either read the manifest that
         // retired a file or pins it.
-        let reaped = self.reap();
-        compacted?;
-        trimmed?;
-        reaped?;
+        if let Err(error) = self.reap() {
+            self.deferred.push(error);
+        }
         let postmortem = self
             .postmortem
             .take()
             .or_else(|| flight::postmortem::failed().map(HistoryError::Postmortem));
-        if let Some(error) = postmortem {
-            return Err(error);
+        self.deferred.extend(postmortem);
+        self.deferred.extend(self.unidentified.take());
+        Ok(flushed)
+    }
+
+    /// Lists every file of the history not yet listed (this flush's, and any a failed commit
+    /// left), notes flush `seq` committed, of this process's recorder when it is persisted
+    /// (`recorder`, its pid and nonce), and consumes the crash records whose rows those files
+    /// hold: one commit.
+    fn list(&mut self, seq: u64, recorder: Option<(u32, u64)>) -> Result<(), HistoryError> {
+        let mut held = manifest::hold(&self.dir)?;
+        for kept in self.kept.iter().filter(|it| !it.listed) {
+            // clone: a file's entry, once a file
+            held.add(name_of(&kept.path), kept.entry.clone())?;
         }
-        match self.unidentified.take() {
-            Some(error) => Err(error),
-            None => Ok(flushed),
+        held.flush_committed(seq);
+        if let Some((pid, nonce)) = recorder {
+            held.recorder_flushed(pid, nonce, seq);
         }
+        held.crashes_written(self.crash_listing.ids.iter().copied());
+        held.commit()?;
+        drop(held);
+        for kept in &mut self.kept {
+            kept.listed = true;
+        }
+        Ok(())
+    }
+
+    /// What failed after the commits of the flushes since the last call, each an error
+    /// naming what failed: the flushes' own numbers stand ([`History::flush`]). The daemon
+    /// reports each, as it does a flush that failed.
+    pub fn take_failed(&mut self) -> Vec<HistoryError> {
+        std::mem::take(&mut self.deferred)
     }
 
     /// Merges the files this history wrote since it opened as [`compact::plan`] says, `ended`
@@ -1883,7 +2062,8 @@ impl History {
     /// fails leaves every input listed and ends the compaction.
     fn compact(&mut self, ended: Option<u64>, flushed: &mut Flushed) -> Result<(), HistoryError> {
         // alloc: once a flush
-        let ours: Vec<usize> = (0..self.kept.len()).filter(|&at| self.kept[at].ours).collect();
+        let ours: Vec<usize> =
+            (0..self.kept.len()).filter(|&at| self.kept[at].ours && self.kept[at].listed).collect();
         // alloc: once a flush
         let names: Vec<Name> = ours.iter().map(|&at| self.kept[at].name).collect();
         let merges = compact::plan(&names, ended);
@@ -1936,7 +2116,10 @@ impl History {
             });
             self.total -= bytes_gone;
             let at = self.kept.partition_point(|it| it.name.last <= job.output.last);
-            self.kept.insert(at, Kept { name: job.output, bytes, path, entry, ours: true });
+            self.kept.insert(
+                at,
+                Kept { name: job.output, bytes, path, entry, ours: true, listed: true },
+            );
             self.total += bytes;
             flushed.compacted += 1;
             flushed.merged += u32::try_from(job.inputs.len()).unwrap_or(u32::MAX);
@@ -2036,7 +2219,8 @@ impl History {
         // alloc: once a flush past the cap
         let mut units: std::collections::BTreeMap<(u64, Option<usize>), (u64, u64)> =
             std::collections::BTreeMap::new();
-        for (at, kept) in self.kept.iter().enumerate() {
+        // A file not yet listed is the next flush's to list ([`Kept::listed`]), not the cap's.
+        for (at, kept) in self.kept.iter().enumerate().filter(|(_, it)| it.listed) {
             let key = (kept.name.build, (kept.name.build == 0).then_some(at));
             let unit = units.entry(key).or_insert((0, 0));
             unit.0 = unit.0.max(kept.name.last);
@@ -2063,7 +2247,7 @@ impl History {
             return Ok(0);
         }
         let goes = |at: usize, kept: &Kept| {
-            gone.contains(&(kept.name.build, (kept.name.build == 0).then_some(at)))
+            kept.listed && gone.contains(&(kept.name.build, (kept.name.build == 0).then_some(at)))
         };
         let mut held = manifest::hold(&self.dir)?;
         held.retire(
@@ -2105,6 +2289,10 @@ impl Drop for History {
         // the mapping for the next history to read.
         if self.persisted && self.clean {
             flight::postmortem::forget();
+        }
+        // What failed after a commit and no one took is said, never dropped unseen.
+        for error in self.deferred.drain(..) {
+            tracing::error!(target: "blaze", "{error}");
         }
     }
 }
@@ -2231,8 +2419,9 @@ pub fn recover_dead(dir: &Path) -> Result<usize, HistoryError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(io_error(&path, "opening the owner file of")(error)),
     };
-    // Held while the files are written, so no daemon starts numbering files meanwhile (one
-    // that starts in these milliseconds is refused as a second writer, and says so).
+    // Held while the files are written, so no daemon starts numbering files meanwhile: one
+    // that starts in these seconds sees the owner file held and its pid dead, and waits for
+    // this to let go (`blaze serve`'s claim, at most [`RECOVERY_WAIT`]).
     let _owner = match stdx::file_lock::Locked::try_lock(file)
         .map_err(io_error(&path, "locking the owner file of"))?
     {
@@ -2275,14 +2464,8 @@ fn recover_into(
     };
     let mut failed = None;
     for found in found {
-        // Each read holds the postmortem's names until it drops: one at a time.
-        let wrote = match found.read() {
-            Ok(recovered) => write_recovered(dir, writer, *seq, &recovered),
-            Err(error) => Err(HistoryError::Postmortem(error)),
-        };
-        match wrote {
+        match recover_one(dir, writer, seq, &found) {
             Ok(files) => {
-                *seq += 1;
                 written.extend(files);
                 if let Err(error) = found.remove() {
                     failed.get_or_insert(HistoryError::Postmortem(error));
@@ -2292,6 +2475,34 @@ fn recover_into(
         }
     }
     (written, failed)
+}
+
+/// Writes the rows of the dead daemon's mapping `found` (it holds the mapping's lock) as files
+/// of flush `seq`, listed in the commit that names the mapping recovered: the files written.
+/// A mapping the manifest names recovered already (a crash came between that commit and the
+/// mapping's delete) is not read again: no files.
+fn recover_one(
+    dir: &Path,
+    writer: &mut Writer,
+    seq: &mut u64,
+    found: &flight::postmortem::Found,
+) -> Result<Vec<Kept>, HistoryError> {
+    let nonce = found.nonce().map_err(HistoryError::Postmortem)?;
+    // Read with the mapping's lock held, so no other reader of it commits meanwhile.
+    let listed = match nonce {
+        Some(nonce) => manifest::read(dir)?.recorder(found.pid(), nonce),
+        None => None,
+    };
+    if listed.is_some_and(|it| it.recovered) {
+        // alloc: empty, allocates nothing
+        return Ok(Vec::new());
+    }
+    // Each read holds the postmortem's names until it drops: one at a time.
+    let recovered =
+        found.read(listed.map(|it| it.flushed)).map_err(HistoryError::Postmortem)?;
+    let files = write_recovered(dir, writer, *seq, &recovered)?;
+    *seq += 1;
+    Ok(files)
 }
 
 /// The rows of `recovered`, a dead daemon's, as files of flush `seq`, written through
@@ -2374,15 +2585,19 @@ fn write_recovered(
         entry.pid = Some(recovered.pid);
         entry.boot = None;
         // Not this history's to merge: of another process, as a file there before it opened.
-        kept.push(Kept { name, bytes, path, entry, ours: false });
+        kept.push(Kept { name, bytes, path, entry, ours: false, listed: true });
     }
-    // Listed in one commit once all are written, before the caller deletes the mapping: a
-    // crash before the commit leaves unlisted files the next open deletes and the mapping it
-    // reads again, never a row twice.
+    // Listed in one commit once all are written, which names the mapping recovered, before
+    // the caller deletes it: a crash before the commit leaves unlisted files the next open
+    // deletes and the mapping it reads again; one after it, a mapping the next open deletes
+    // unread. Never a row twice.
     let mut held = manifest::hold(dir)?;
     for file in &kept {
         // clone: a file's entry, once a file
         held.add(name_of(&file.path), file.entry.clone())?;
+    }
+    if recovered.nonce != 0 {
+        held.recorder_recovered(recovered.pid, recovered.nonce);
     }
     held.commit()?;
     Ok(kept)
