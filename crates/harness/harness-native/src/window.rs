@@ -3,6 +3,7 @@
 //! wake it through the main queue.
 use crate::app::{App, KeyMods};
 use crate::gpu::{self, Dest, Renderer};
+use crate::single::{self, Ask};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -35,6 +36,8 @@ struct State {
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static DELEGATE: OnceCell<Retained<AppDelegate>> = const { OnceCell::new() };
+    /// The session `HARNESS_NATIVE_SELECT` asked for, for the window to show once it is made.
+    static SELECT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Run `f` on the window's state, unless it is in use (an event during a frame).
@@ -198,6 +201,19 @@ define_class!(
             }
         }
 
+        /// A right click (or control-click) on a tree row: what can be done to its object.
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            self.context_menu(event)
+        }
+
+        #[unsafe(method(ctxKill:))]
+        fn ctx_kill(&self, sender: &NSMenuItem) {
+            let e = sender.tag() as u64;
+            with(|st| st.app.kill_object(e));
+            wake();
+        }
+
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -234,6 +250,20 @@ impl HarnessView {
 
     fn local(&self, event: &NSEvent) -> NSPoint {
         self.convertPoint_fromView(event.locationInWindow(), None)
+    }
+
+    fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+        let p = self.local(event);
+        let e = with(|st| st.app.object_at(p.x as f32, p.y as f32)).flatten()?;
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        let kill = item(mtm, "Kill", sel!(ctxKill:), "");
+        // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
+        unsafe { kill.setTarget(Some(self)) };
+        kill.setTag(e as isize);
+        menu.addItem(&kill);
+        Some(menu)
     }
 
     fn sync_size(&self) {
@@ -312,7 +342,10 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // SAFETY: the main run loop and the common modes (frames keep coming during live resize and tracking).
     unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
-    let app = App::new(wake_from_any_thread())?;
+    let mut app = App::new(wake_from_any_thread())?;
+    if let Some(sid) = SELECT.with(std::cell::Cell::get) {
+        app.select_session(sid);
+    }
     STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new() }));
     window.setContentView(Some(&view));
     // The view hears the window's key changes (focus for the cursor).
@@ -348,6 +381,11 @@ define_class!(
                 std::process::exit(1);
             }
             NSApplication::sharedApplication(mtm).activate();
+        }
+
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _note: &NSNotification) {
+            single::release();
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -389,8 +427,33 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     bar
 }
 
-pub fn run() {
+/// Another launch asked for the window (and maybe a session): bring it forward on the main thread.
+fn asked(ask: Ask) {
+    DispatchQueue::main().exec_async(move || {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        with(|st| {
+            if let Ask::Select(sid) = ask {
+                st.app.select_session(sid);
+            }
+            st.app.poke();
+            st.link.setPaused(false);
+            if st.window.isMiniaturized() {
+                st.window.deminiaturize(None);
+            }
+            st.window.makeKeyAndOrderFront(None);
+        });
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    });
+}
+
+/// The app, holding the single-instance `listener` (when it has one) and showing session `select` first.
+pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u64>) {
     let mtm = MainThreadMarker::new().expect("harness-native runs on the main thread");
+    SELECT.with(|s| s.set(select));
+    if let Some(l) = listener {
+        single::serve(l, asked);
+    }
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.setMainMenu(Some(&main_menu(mtm)));

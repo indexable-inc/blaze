@@ -33,7 +33,8 @@ const HARNESS: &str = include_str!("../scene/10-harness.flecs");
 
 /// The terminal's font size at zoom 1 (points), and its padding inside the main card.
 const TERM_SIZE: f32 = 13.0;
-const TERM_PAD: (f32, f32) = (14.0, 10.0);
+/// The terminal's padding inside its pane (Ghostty's window-padding), in points; the cell remainder is added on top.
+const TERM_PAD: (f32, f32) = (18.0, 16.0);
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
 /// The window's ground under the sidebar.
@@ -104,6 +105,12 @@ pub struct App {
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
     spawned: Arc<Mutex<Option<u64>>>,
+    /// The session selected when the app last ran (~/.harness/native.json), selected once the daemon's first list is in.
+    restore: Option<Option<u64>>,
+    /// What was last written to native.json.
+    saved: Option<Option<u64>>,
+    /// Remember the selected object in native.json (not for the offscreen shot).
+    pub persist: bool,
     pub focused: bool,
     pub title: String,
 }
@@ -232,6 +239,9 @@ impl App {
             wheel: 0.0,
             tried: HashMap::new(),
             spawned: Arc::default(),
+            restore: Some(crate::saved::selected()),
+            saved: None,
+            persist: true,
             focused: true,
             title: "harness".into(),
         })
@@ -357,12 +367,20 @@ impl App {
     fn sync_view(&mut self) {
         let w = self.world.world_ref();
         let rows = model::tree(w);
+        // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
+        let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
+        if up && let Some(last) = self.restore.take() {
+            if let Some(e) = last.and_then(|sid| self.entity_of(sid)) {
+                model::select(w, Some(e));
+            }
+        }
         // Nothing selected (or it went): the first running object, else the first.
-        if self.selected().is_none() && !rows.is_empty() {
+        if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
             let first = rows.iter().find(|(e, _)| self.status_of(*e) == "running").or(rows.first()).map(|(e, _)| *e);
             model::select(w, first);
         }
-        let pending = *self.spawned.lock().unwrap();
+        // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
+        let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
         if let Some(sid) = pending {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
@@ -533,7 +551,9 @@ impl App {
                 let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let t = o.try_cloned::<&model::Title>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let cwd = o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
-                let sub = if t.is_empty() || t == name { cwd } else { t };
+                // The program-set title (OSC 0/2) is kept on the entity but never names anything: agents' titles are
+                // spinner frames and "Claude Code", so only a shell's title shows, as the header's dim secondary text.
+                let sub = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
                 let e = *o.id();
                 let state = match (self.run_of(e), self.status_of(e), code) {
@@ -579,6 +599,47 @@ impl App {
         }
         self.title = window;
         self.sync_palette();
+        self.save_selected();
+    }
+
+    /// Write the selected object's session id to native.json when it changed.
+    fn save_selected(&mut self) {
+        if !self.persist || self.restore.is_some() {
+            return;
+        }
+        let now = self.selected().and_then(|e| self.session_of(e));
+        if self.saved != Some(now) {
+            if let Err(e) = crate::saved::set_selected(now) {
+                eprintln!("harness-native: {e}");
+            }
+            self.saved = Some(now);
+        }
+    }
+
+    /// The tree row under `(x, y)` (window points): its object.
+    pub fn object_at(&self, x: f32, y: f32) -> Option<u64> {
+        let (x, y) = (x / self.zoom(), y / self.zoom());
+        let w = self.world.world_ref();
+        let mut hit = None;
+        w.entity_from_id(self.ids.tree).each_child(|c| {
+            if hit.is_none() && c.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
+                hit = c.try_cloned::<&Action>().and_then(|a| a.name.as_str().strip_prefix("select:").and_then(|s| s.parse::<u64>().ok()));
+            }
+        });
+        hit.filter(|&e| w.entity_from_id(e).is_alive())
+    }
+
+    /// The context menu's Kill on object `e` (no asking).
+    pub fn kill_object(&mut self, e: u64) {
+        if !self.world.entity_from_id(e).is_alive() {
+            return;
+        }
+        if self.selected() == Some(e) {
+            self.kill();
+        } else if let Some(sid) = self.session_of(e) {
+            self.link.kill(sid);
+        }
+        self.poke();
     }
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
@@ -587,7 +648,8 @@ impl App {
         let mut out: Vec<(String, &'static str, String, String, Do)> = vec![
             ("new-claude".into(), kind_glyph("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
             ("new-codex".into(), kind_glyph("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
-            ("new-shell".into(), kind_glyph("shell"), "New shell".into(), String::new(), Do::New("shell")),
+            ("new-cursor".into(), kind_glyph("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
+            ("new-sh".into(), kind_glyph("shell"), "New sh".into(), String::new(), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
@@ -816,9 +878,13 @@ impl App {
         }
         let laid = self.world.entity_from_id(self.ids.term).try_cloned::<&Laid>();
         let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { return };
-        let rect = [l.x + TERM_PAD.0, l.y + TERM_PAD.1, l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1];
+        // Fit the grid inside the padding, then split what is left of a cell evenly into the padding on both sides
+        // (Ghostty's window-padding-balance), snapped to whole device pixels so every cell starts on one.
+        let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
+        let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
+        let snap = |v: f32| (v * self.grid.scale).floor() / self.grid.scale;
+        let rect = [snap(l.x + (l.w - gw) * 0.5), snap(l.y + (l.h - gh) * 0.5), gw, gh];
         self.term_rect = Some(rect);
-        let (cols, rows) = self.grid.fit(rect[2], rect[3]);
         let o = self.world.entity_from_id(e);
         if let Some((n, stage)) = self.run_of(e) {
             // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
@@ -1190,7 +1256,7 @@ impl App {
         }
         let at = self.selected().and_then(|s| objs.iter().position(|&e| e == s)).map_or(0, |i| i as i64);
         let n = objs.len() as i64;
-        self.select(Some(objs[((at + by) % n + n) as usize % objs.len()]));
+        self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
 
     pub fn step_zoom(&mut self, by: i32) {

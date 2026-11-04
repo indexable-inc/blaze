@@ -179,6 +179,11 @@ impl FontSource for Font {
         unsafe { self.0.x_height() as f32 }
     }
 
+    fn underline_thickness(&self) -> f32 {
+        // SAFETY: a plain metric getter.
+        unsafe { self.0.underline_thickness() as f32 }
+    }
+
     fn glyph(&self, ch: char) -> u16 {
         let mut units = [0u16; 2];
         let n = ch.encode_utf16(&mut units).len();

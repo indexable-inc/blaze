@@ -384,6 +384,343 @@ float4 line_fs(LineV v, ConstantBuffer<Frame> frame, StructuredBuffer<LineInst> 
     return float4(col.rgb * alpha, alpha);
 }
 
+// ---- sprites --------------------------------------------------------------------------------------------------
+//
+// Box drawing, block elements, braille, sextants and powerline arrows (boxdraw.rs), one instance a cell, drawn from their
+// geometry. The geometry is Ghostty's (src/font/sprite/draw: box.zig, block.zig, braille.zig, common.zig,
+// symbols_for_legacy_computing.zig, powerline.zig; github.com/ghostty-org/ghostty, MIT), ported from its CPU canvas.
+// Everything Ghostty puts on whole pixels is computed here in integers from the cell's whole-pixel size and tested against
+// the pixel, so its coverage is exactly 0 or 1 and a line that leaves one cell meets the next with no seam. Arcs,
+// diagonals and the powerline curves are distances (in pixels) antialiased over the distance's own screen derivative.
+
+struct SpriteInst
+{
+    int4 rect;       // the cell: x, y, w, h (device pixels)
+    uint4 shape;     // kind, a, b (boxdraw.rs `Shape`), a light line's thickness (device pixels)
+    float4 fg;       // ink, straight RGBA
+    float4 bg;       // the ground under it, straight RGBA (alpha 0: none)
+};
+
+static const uint SPRITE_BLOCK = 1;
+static const uint SPRITE_SHADE = 2;
+static const uint SPRITE_MOSAIC = 3;
+static const uint SPRITE_LINES = 4;
+static const uint SPRITE_DASH = 5;
+static const uint SPRITE_ARC = 6;
+static const uint SPRITE_DIAGONAL = 7;
+static const uint SPRITE_BRAILLE = 8;
+static const uint SPRITE_POWERLINE = 9;
+
+struct SpriteV
+{
+    float4 pos : SV_Position;
+    nointerpolation uint inst : TEXCOORD0;
+};
+
+[shader("vertex")]
+SpriteV sprite_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<Frame> frame, StructuredBuffer<SpriteInst> insts)
+{
+    SpriteInst s = insts[iid];
+    float2 px = float2(s.rect.xy) + CORNERS[vid] * float2(s.rect.zw);
+    SpriteV o;
+    o.pos = float4(to_ndc(px / frame.scale, frame.view), 0, 1);
+    o.inst = iid;
+    return o;
+}
+
+// Whether the pixel `p` (whole pixels from the cell's top left) is in the box between corners (x0, y0) and (x1, y1), as
+// Ghostty's canvas.box fills it (its corners in either order).
+bool sp_box(int2 p, int x0, int y0, int x1, int y1)
+{
+    return p.x >= min(x0, x1) && p.x < max(x0, x1) && p.y >= min(y0, y1) && p.y < max(y0, y1);
+}
+
+// Ghostty's Fraction.min and .max (common.zig): where the fraction `f` of `size` falls as a block's start and as its end,
+// rounded so the two halves of an odd size meet (start of the second half = end of the first).
+int frac_lo(float f, int size)
+{
+    return size - int(round((1.0 - f) * float(size)));
+}
+
+int frac_hi(float f, int size)
+{
+    return int(round(f * float(size)));
+}
+
+// Coverage of a signed distance `d` (pixels, negative inside), its edge a pixel wide on screen.
+float sp_aa(float d)
+{
+    float w = length(float2(ddx(d), ddy(d)));
+    return saturate(0.5 - d / max(w, 1e-4));
+}
+
+// box.zig linesChar: up to four arms from the cell's middle, each none, light, heavy or double, joined as Ghostty joins them.
+bool sp_lines(int2 p, int W, int H, int t, uint arms)
+{
+    uint up = arms & 3u;
+    uint right = (arms >> 2) & 3u;
+    uint down = (arms >> 4) & 3u;
+    uint left = (arms >> 6) & 3u;
+    int lt = t;
+    int hv = 2 * t;
+    int h_light_top = max(H - lt, 0) / 2;
+    int h_light_bottom = h_light_top + lt;
+    int h_heavy_top = max(H - hv, 0) / 2;
+    int h_heavy_bottom = h_heavy_top + hv;
+    int h_double_top = max(h_light_top - lt, 0);
+    int h_double_bottom = h_light_bottom + lt;
+    int v_light_left = max(W - lt, 0) / 2;
+    int v_light_right = v_light_left + lt;
+    int v_heavy_left = max(W - hv, 0) / 2;
+    int v_heavy_right = v_heavy_left + hv;
+    int v_double_left = max(v_light_left - lt, 0);
+    int v_double_right = v_light_right + lt;
+
+    int up_bottom = (left == 2u || right == 2u) ? h_heavy_bottom
+        : (left != right || down == up) ? ((left == 3u || right == 3u) ? h_double_bottom : h_light_bottom)
+        : (left == 0u && right == 0u) ? h_light_bottom : h_light_top;
+    int down_top = (left == 2u || right == 2u) ? h_heavy_top
+        : (left != right || up == down) ? ((left == 3u || right == 3u) ? h_double_top : h_light_top)
+        : (left == 0u && right == 0u) ? h_light_top : h_light_bottom;
+    int left_right = (up == 2u || down == 2u) ? v_heavy_right
+        : (up != down || left == right) ? ((up == 3u || down == 3u) ? v_double_right : v_light_right)
+        : (up == 0u && down == 0u) ? v_light_right : v_light_left;
+    int right_left = (up == 2u || down == 2u) ? v_heavy_left
+        : (up != down || right == left) ? ((up == 3u || down == 3u) ? v_double_left : v_light_left)
+        : (up == 0u && down == 0u) ? v_light_left : v_light_right;
+
+    bool on = false;
+    if (up == 1u)
+        on = on || sp_box(p, v_light_left, 0, v_light_right, up_bottom);
+    if (up == 2u)
+        on = on || sp_box(p, v_heavy_left, 0, v_heavy_right, up_bottom);
+    if (up == 3u)
+    {
+        int lb = left == 3u ? h_light_top : up_bottom;
+        int rb = right == 3u ? h_light_top : up_bottom;
+        on = on || sp_box(p, v_double_left, 0, v_light_left, lb) || sp_box(p, v_light_right, 0, v_double_right, rb);
+    }
+    if (right == 1u)
+        on = on || sp_box(p, right_left, h_light_top, W, h_light_bottom);
+    if (right == 2u)
+        on = on || sp_box(p, right_left, h_heavy_top, W, h_heavy_bottom);
+    if (right == 3u)
+    {
+        int tl = up == 3u ? v_light_right : right_left;
+        int bl = down == 3u ? v_light_right : right_left;
+        on = on || sp_box(p, tl, h_double_top, W, h_light_top) || sp_box(p, bl, h_light_bottom, W, h_double_bottom);
+    }
+    if (down == 1u)
+        on = on || sp_box(p, v_light_left, down_top, v_light_right, H);
+    if (down == 2u)
+        on = on || sp_box(p, v_heavy_left, down_top, v_heavy_right, H);
+    if (down == 3u)
+    {
+        int lt2 = left == 3u ? h_light_bottom : down_top;
+        int rt2 = right == 3u ? h_light_bottom : down_top;
+        on = on || sp_box(p, v_double_left, lt2, v_light_left, H) || sp_box(p, v_light_right, rt2, v_double_right, H);
+    }
+    if (left == 1u)
+        on = on || sp_box(p, 0, h_light_top, left_right, h_light_bottom);
+    if (left == 2u)
+        on = on || sp_box(p, 0, h_heavy_top, left_right, h_heavy_bottom);
+    if (left == 3u)
+    {
+        int tr = up == 3u ? v_light_left : left_right;
+        int br = down == 3u ? v_light_left : left_right;
+        on = on || sp_box(p, 0, h_double_top, tr, h_light_top) || sp_box(p, 0, h_light_bottom, br, h_double_bottom);
+    }
+    return on;
+}
+
+// box.zig dashHorizontal / dashVertical: `n` dashes, a horizontal row centred with half gaps at both ends, a vertical
+// column from the top with a whole gap at the foot; spare pixels widen the first dashes.
+bool sp_dash(int2 p, int W, int H, int t, uint n, uint b)
+{
+    bool vert = (b & 1u) != 0u;
+    int thick = (b & 2u) != 0u ? 2 * t : t;
+    uint g = b >> 2;
+    int want = g == 0u ? max(4, t) : (g == 1u ? t : 2 * t);
+    int len = vert ? H : W;
+    int across = vert ? W : H;
+    int2 q = vert ? p.yx : p;
+    int count = int(n);
+    if (len < 2 * count)
+    {
+        int y0 = max(across - t, 0) / 2;
+        return sp_box(q, 0, y0, len, y0 + t);
+    }
+    int gap = min(want, len / (2 * count));
+    int total = len - count * gap;
+    int dash = total / count;
+    int extra = total - dash * count;
+    int y0 = max(across - thick, 0) / 2;
+    int x = vert ? 0 : gap / 2;
+    bool on = false;
+    for (int i = 0; i < 4; i++)
+    {
+        if (i < count)
+        {
+            int x1 = x + dash + (i < extra ? 1 : 0);
+            on = on || sp_box(q, x, y0, x1, y0 + thick);
+            x = x1 + gap;
+        }
+    }
+    return on;
+}
+
+// braille.zig: two columns of four square dots, Ghostty's whole-pixel layout of dot, spacing and margins.
+bool sp_braille(int2 p, int W, int H, uint bits)
+{
+    int w = min(W / 4, H / 8);
+    int xs = W / 4;
+    int ys = H / 8;
+    int xm = xs / 2;
+    int ym = ys / 2;
+    int xl = W - 2 * xm - xs - 2 * w;
+    int yl = H - 2 * ym - 3 * ys - 4 * w;
+    if (xl >= 2 && yl >= 4 && w == 0) { w += 1; xl -= 2; yl -= 4; }
+    if (xl >= 2 && xm == 0) { xm = 1; xl -= 2; }
+    if (yl >= 2 && ym == 0) { ym = 1; yl -= 2; }
+    if (xl >= 1) { xs += 1; xl -= 1; }
+    if (yl >= 3) { ys += 1; yl -= 3; }
+    if (xl >= 2) { xm += 1; xl -= 2; }
+    if (yl >= 2) { ym += 1; yl -= 2; }
+    if (xl >= 2 && yl >= 4) { w += 1; xl -= 2; yl -= 4; }
+    int x0 = xm;
+    int x1 = xm + w + xs;
+    // Dots in bit order: tl, ul, ll, tr, ur, lr, bl, br (the code point's own).
+    int cols[8] = { x0, x0, x0, x1, x1, x1, x0, x1 };
+    int rows[8] = { 0, 1, 2, 0, 1, 2, 3, 3 };
+    bool on = false;
+    for (int i = 0; i < 8; i++)
+    {
+        int y = ym + rows[i] * (w + ys);
+        on = on || (((bits >> uint(i)) & 1u) != 0u && sp_box(p, cols[i], y, cols[i] + w, y + w));
+    }
+    return on;
+}
+
+// box.zig arc: a light line from the middle of one edge, down a straight piece, round a cubic (control points a quarter
+// of the radius from the centre) and out to the middle of the next edge. `corner`: 0 tl, 1 tr, 2 bl, 3 br, the corner it
+// bends toward (Ghostty's names: ╭ is .br). Returns the distance to the stroke's middle, pixels.
+float sp_arc(float2 p, int W, int H, int t, uint corner)
+{
+    float fw = float(W);
+    float fh = float(H);
+    float ft = float(t);
+    float cx = float(max(W - t, 0) / 2) + ft * 0.5;
+    float cy = float(max(H - t, 0) / 2) + ft * 0.5;
+    float r = min(fw, fh) * 0.5;
+    float s = 0.25;
+    float sx = (corner & 1u) != 0u ? 1.0 : -1.0;
+    float sy = (corner & 2u) != 0u ? 1.0 : -1.0;
+    float ey = sy > 0.0 ? fh : 0.0;
+    float ex = sx > 0.0 ? fw : 0.0;
+    float2 p0 = float2(cx, cy + sy * r);
+    float2 p1 = float2(cx, cy + sy * s * r);
+    float2 p2 = float2(cx + sx * s * r, cy);
+    float2 p3 = float2(cx + sx * r, cy);
+    float d = min(sd_stub(p, float2(cx, ey), p0), sd_stub(p, p3, float2(ex, cy)));
+    float2 prev = p0;
+    for (int i = 1; i <= 24; i++)
+    {
+        float u = float(i) / 24.0;
+        float v = 1.0 - u;
+        float2 q = v * v * v * p0 + 3.0 * v * v * u * p1 + 3.0 * v * u * u * p2 + u * u * u * p3;
+        d = min(d, sd_stub(p, prev, q));
+        prev = q;
+    }
+    return d;
+}
+
+float sprite_cov(SpriteInst s, int2 ip)
+{
+    uint kind = s.shape.x;
+    uint a = s.shape.y;
+    uint b = s.shape.z;
+    int t = max(int(s.shape.w), 1);
+    int W = s.rect.z;
+    int H = s.rect.w;
+    float2 p = float2(ip) + 0.5;
+    float fw = float(W);
+    float fh = float(H);
+    float ft = float(t);
+    if (kind == SPRITE_SHADE)
+        return float(a) / 255.0;
+    if (kind == SPRITE_BLOCK)
+    {
+        // block.zig blockShade: a side's share rounded to whole pixels, flush to that side.
+        float f = float(b) / 8.0;
+        int w = int(round(fw * f));
+        int h = int(round(fh * f));
+        bool on = a == 0u ? sp_box(ip, 0, 0, w, H)
+            : a == 1u ? sp_box(ip, W - w, 0, W, H)
+            : a == 2u ? sp_box(ip, 0, 0, W, h)
+            : sp_box(ip, 0, H - h, W, H);
+        return on ? 1.0 : 0.0;
+    }
+    if (kind == SPRITE_MOSAIC)
+    {
+        // Quadrants (block.zig) and sextants (symbols_for_legacy_computing.zig): common.zig `fill` of halves and thirds.
+        float rows = float(b);
+        bool on = false;
+        for (int i = 0; i < 6; i++)
+        {
+            float c = float(i % 2);
+            float r = float(i / 2);
+            on = on || (((a >> uint(i)) & 1u) != 0u && sp_box(ip, frac_lo(c * 0.5, W), frac_lo(r / rows, H), frac_hi((c + 1.0) * 0.5, W), frac_hi((r + 1.0) / rows, H)));
+        }
+        return on ? 1.0 : 0.0;
+    }
+    if (kind == SPRITE_LINES)
+        return sp_lines(ip, W, H, t, a) ? 1.0 : 0.0;
+    if (kind == SPRITE_DASH)
+        return sp_dash(ip, W, H, t, a, b) ? 1.0 : 0.0;
+    if (kind == SPRITE_BRAILLE)
+        return sp_braille(ip, W, H, a) ? 1.0 : 0.0;
+    if (kind == SPRITE_ARC)
+        return sp_aa(sp_arc(p, W, H, t, a) - ft * 0.5);
+    if (kind == SPRITE_DIAGONAL)
+    {
+        // box.zig lightDiagonal*: corner to corner, overshooting each by half a pixel along the slope.
+        float slx = min(1.0, fw / fh);
+        float sly = min(1.0, fh / fw);
+        float d1 = sd_stub(p, float2(fw + 0.5 * slx, -0.5 * sly), float2(-0.5 * slx, fh + 0.5 * sly));
+        float d2 = sd_stub(p, float2(-0.5 * slx, -0.5 * sly), float2(fw + 0.5 * slx, fh + 0.5 * sly));
+        float d = min((a & 1u) != 0u ? d1 : 1e9, (a & 2u) != 0u ? d2 : 1e9);
+        return sp_aa(d - ft * 0.5);
+    }
+    if (kind == SPRITE_POWERLINE)
+    {
+        // powerline.zig: E0B0 a solid triangle, E0B1 its outline as a light chevron, E0B4 a solid half disc (a capsule
+        // against the left edge), E0B5 the same stroked inside its edge; b mirrors them (E0B2, E0B3, E0B6, E0B7).
+        float2 q = b != 0u ? float2(fw - p.x, p.y) : p;
+        if (a == 0u)
+            return sp_aa(sd_quad(q, float2(0.0, 0.0), float2(fw, fh * 0.5), float2(0.0, fh), float2(0.0, 0.0)));
+        if (a == 1u)
+            return sp_aa(min(sd_stub(q, float2(0.0, 0.0), float2(fw, fh * 0.5)), sd_stub(q, float2(fw, fh * 0.5), float2(0.0, fh))) - ft * 0.5);
+        float r = min(fw, fh * 0.5);
+        float d = sd_stub(q, float2(0.0, r), float2(0.0, fh - r)) - r;
+        if (a == 4u)
+            return sp_aa(d);
+        return sp_aa(d) * sp_aa(-(d + ft));
+    }
+    return 0.0;
+}
+
+[shader("fragment")]
+float4 sprite_fs(SpriteV v, StructuredBuffer<SpriteInst> insts)
+{
+    SpriteInst s = insts[v.inst];
+    // The pixel this fragment is, whole pixels from the cell's top left (SV_Position is the pixel's centre).
+    int2 ip = int2(floor(v.pos.xy)) - s.rect.xy;
+    float cov = sprite_cov(s, ip);
+    float fa = s.fg.a * cov;
+    float ga = s.bg.a * (1.0 - fa);
+    return float4(s.fg.rgb * fa + s.bg.rgb * ga, fa + ga);
+}
+
 // ---- text -----------------------------------------------------------------------------------------------------
 
 struct GlyphV
