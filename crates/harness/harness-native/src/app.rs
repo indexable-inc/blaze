@@ -80,6 +80,10 @@ pub struct App {
     run_terms: model::Terms,
     /// The run or stage entity whose output the link follows.
     watching: Option<u64>,
+    /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
+    side_w: Option<f32>,
+    /// Dragging the sidebar's edge.
+    resizing: bool,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
     link: Link,
@@ -193,6 +197,10 @@ impl App {
         let root = View::root(w, "hn.Window");
         let side = root.child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
+        let side_w = crate::prefs::get("sidebar_width").and_then(|v| v.as_f64()).map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
+        if let Some(w) = side_w {
+            set_side_width(side.entity(), w);
+        }
         let tree = side.child("hn.Tree");
         let main = root.child("hn.Main");
         let term = main.part("term").map_or(0, View::id);
@@ -208,6 +216,8 @@ impl App {
             run_terms,
             watching: None,
             pending_run: None,
+            side_w,
+            resizing: false,
             link,
             grid,
             zoom: 4,
@@ -413,11 +423,14 @@ impl App {
             .into_iter()
             .map(|r| match r {
                 model::Row::Obj { e, .. } if self.run_of(e).is_some() => (format!("o{e}"), "hn.RunRow", r),
+                model::Row::Obj { e, .. } if model::is_group(w, e) => (format!("o{e}"), "hn.GroupRow", r),
                 model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
                 model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
             })
             .collect();
         let me = &*self;
+        // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
+        let mut fit: Vec<(u64, String, f32)> = Vec::new();
         let indent = |row: View<'_>, depth: usize| {
             if let Some(p) = row.part("indent") {
                 let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * 14.0, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
@@ -436,7 +449,8 @@ impl App {
                     row.action(&format!("fold:{parent}"));
                     indent(row, depth);
                     if let Some(p) = row.part("glyph") {
-                        p.text(if unfolded { "\u{25B4}" } else { "\u{25BE}" });
+                        // Pointing right while the runs are hidden, down while they show.
+                        p.text(if unfolded { "\u{25BE}" } else { "\u{25B8}" });
                     }
                     if let Some(p) = row.part("name") {
                         p.text(&if unfolded { "fewer runs".to_owned() } else { format!("{hidden} more run{}", if hidden == 1 { "" } else { "s" }) });
@@ -445,6 +459,22 @@ impl App {
                 }
             };
             let o = w.entity_from_id(e);
+            if model::is_group(w, e) {
+                // A group of runs without a listed session: pressing it folds it.
+                row.action(&format!("collapse:{e}"));
+                indent(row, depth);
+                let open = !o.has(model::Collapsed::id());
+                if let Some(p) = row.part("glyph") {
+                    p.text(if open { "\u{25BE}" } else { "\u{25B8}" });
+                }
+                if let Some(p) = row.part("name") {
+                    p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
+                }
+                if let Some(p) = row.part("meta") {
+                    p.text(&model::run_count(w, e).to_string());
+                }
+                return;
+            }
             row.action(&format!("select:{e}"));
             set_if(row, if sel == Some(e) { chosen } else { clear });
             indent(row, depth);
@@ -467,13 +497,18 @@ impl App {
             };
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             if let Some(p) = row.part("name") {
-                // A run's command on one line; the code face is wider, so it gets fewer characters, and fewer again
-                // beside long right-hand words (`killed · 1m04s`).
-                let (name, room) = match run {
-                    Some(_) => (name.split_whitespace().collect::<Vec<_>>().join(" "), 19usize.saturating_sub(meta.chars().count().saturating_sub(6) * 2 / 3)),
-                    None => (name, 26usize),
-                };
-                p.text(&clip_text(&name, room.saturating_sub(depth * 2).max(8)));
+                match run {
+                    // A run's command on one line, cut to the room its row leaves it (measured below).
+                    Some(_) => match name_room(row) {
+                        Some(room) => fit.push((p.id(), name.split_whitespace().collect::<Vec<_>>().join(" "), room)),
+                        None => {
+                            p.text(&clip_text(&name, 14));
+                        }
+                    },
+                    None => {
+                        p.text(&clip_text(&name, (26usize).saturating_sub(depth * 2).max(8)));
+                    }
+                }
             }
             if let Some(p) = row.part("meta") {
                 p.text(&meta);
@@ -482,6 +517,12 @@ impl App {
                 set_if(p, me.dot_tone(e));
             }
         });
+        for (part, text, room) in fit {
+            let style = self.world.entity_from_id(part).try_cloned::<&TextStyle>().unwrap_or_default();
+            let cut = self.fit_text(&text, &style, room);
+            View::of(self.world.entity_from_id(part)).text(&cut);
+        }
+        let w = self.world.world_ref();
         // The main card's header.
         let main = View::of(w.entity_from_id(self.ids.main));
         let head = main.part("head");
@@ -674,6 +715,26 @@ impl App {
         d
     }
 
+    /// `text` cut (with an ellipsis) to the longest front that the typesetter sets within `room` points.
+    fn fit_text(&mut self, text: &str, style: &TextStyle, room: f32) -> String {
+        let width = |me: &mut Self, t: &str| me.layout(t, style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max);
+        if width(self, text) <= room {
+            return text.to_owned();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let t: String = chars[..mid].iter().collect::<String>() + "\u{2026}";
+            if width(self, &t) <= room {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        chars[..lo].iter().collect::<String>().trim_end().to_owned() + "\u{2026}"
+    }
+
     /// Size every `Text` node with the typesetter; how many changed.
     fn typeset(&mut self) -> usize {
         let wanted = typeset::wanted(self.world.world_ref());
@@ -716,6 +777,8 @@ impl App {
             self.poke();
             if let Some(e) = a.strip_prefix("select:").and_then(|s| s.parse().ok()) {
                 self.select(Some(e));
+            } else if let Some(g) = a.strip_prefix("collapse:").and_then(|s| s.parse().ok()) {
+                model::toggle_collapse(self.world.world_ref(), g);
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
             } else if a == "pal:close" {
@@ -921,6 +984,16 @@ impl App {
         let z = self.zoom();
         self.pointer.x = x / z;
         self.pointer.y = y / z;
+        if self.resizing {
+            if let Some(side) = self.sidebar() {
+                let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
+                let v = (self.pointer.x - left).clamp(SIDE_MIN, SIDE_MAX).round();
+                set_side_width(side, v);
+                self.side_w = Some(v);
+            }
+            self.poke();
+            return;
+        }
         if self.selecting {
             let scroll = self.scroll() as i64;
             if let (Some(s), Some(c)) = (self.sel.as_mut(), cell_at(self.term_rect, &self.grid, self.pointer.x, self.pointer.y, 0)) {
@@ -932,6 +1005,13 @@ impl App {
 
     pub fn pointer_down(&mut self, x: f32, y: f32) {
         self.pointer_move(x, y);
+        // On the sidebar's right edge: drag it wider or narrower.
+        if self.palette.is_none() && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
+            if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
+                self.resizing = true;
+                return;
+            }
+        }
         self.pointer.down = true;
         self.pointer.went_down = true;
         if self.palette.is_none()
@@ -945,6 +1025,14 @@ impl App {
     }
 
     pub fn pointer_up(&mut self) {
+        if self.resizing {
+            self.resizing = false;
+            if let Some(v) = self.side_w {
+                crate::prefs::set("sidebar_width", serde_json::json!(v));
+            }
+            self.poke();
+            return;
+        }
         self.pointer.down = false;
         self.pointer.went_up = true;
         if self.selecting {
@@ -1062,6 +1150,11 @@ impl App {
         true
     }
 
+    /// The sidebar node (the device row's parent).
+    fn sidebar(&self) -> Option<EntityView<'_>> {
+        self.world.entity_from_id(self.ids.device).parent()
+    }
+
     /// Command-S: fold the sidebar away (zero wide, clipped, so its rows neither draw nor take clicks; the main card
     /// takes the window) or bring it back at the scene's size.
     fn toggle_sidebar(&mut self) {
@@ -1072,7 +1165,11 @@ impl App {
         let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
         let (Some(mut size), Some(full), Some(pad)) = (side.try_cloned::<&Size>(), proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
         let show = size.w.value == 0.0;
-        size.w = if show { full.w } else { Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 } };
+        size.w = match (show, self.side_w) {
+            (true, Some(v)) => Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 },
+            (true, None) => full.w,
+            (false, _) => Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 },
+        };
         side.set(size);
         side.set(if show { pad } else { Padding::default() });
         if show {
@@ -1177,6 +1274,41 @@ fn cell_at(rect: Option<[f32; 4]>, grid: &Grid, x: f32, y: f32, _: i64) -> Optio
     let col = ((x - r[0]) / grid.cw).floor().max(0.0) as u16;
     let row = ((y - r[1]) / grid.ch).floor().max(0.0) as i64;
     Some((row, col))
+}
+
+/// The sidebar's width range when dragged, and how near its edge a press grabs it (points).
+const SIDE_MIN: f32 = 180.0;
+const SIDE_MAX: f32 = 720.0;
+const SIDE_GRAB: f32 = 5.0;
+
+/// Set the sidebar node's width (a folded-away sidebar, zero wide, stays so).
+fn set_side_width(side: EntityView<'_>, v: f32) {
+    let Some(mut size) = side.try_cloned::<&Size>() else { return };
+    if size.w.value == 0.0 && size.w.kind == SizeKind::Fixed && side.has(harness_native_ui_node_api::Clip::id()) {
+        return;
+    }
+    size.w = Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 };
+    side.set(size);
+}
+
+/// The room (points) a run row leaves its name, from the row's last layout: its width less its padding, the gaps
+/// between its parts and every part but the name and the spacer. None before the row was laid out.
+fn name_room(row: View<'_>) -> Option<f32> {
+    use harness_native_ui_layout_api::{Flex, Padding};
+    let e = row.entity();
+    let laid = e.try_cloned::<&Laid>().filter(|l| l.w > 0.0)?;
+    let pad = e.try_cloned::<&Padding>().unwrap_or_default();
+    let gap = e.try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
+    let mut others = 0.0;
+    let mut parts = 0usize;
+    for name in ["indent", "glyph", "meta", "dot"] {
+        if let Some(p) = row.part(name) {
+            others += p.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+            parts += 1;
+        }
+    }
+    // name and spacer are the other two children: gaps sit between all of them.
+    Some((laid.w - pad.l - pad.r - others - gap * (parts + 1) as f32 - 1.0).max(24.0))
 }
 
 /// A duration for a run's row: `340ms`, `4.2s`, `38s`, `3m04s`, `2h05m`.

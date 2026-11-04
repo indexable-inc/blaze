@@ -7,7 +7,10 @@
 //! - A shell run (`r12`) is an entity with [`Run`], `(Kind, Proc)`, [`Name`] (its command), `(Status, Running | Exited |
 //!   Killed | Lost)`, [`ExitCode`], [`Created`] / [`Ended`], and `ChildOf` its session (or the device). A run split into
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
+//! - A run whose session the daemon does not list goes under a group node (`(Kind, Group)`, [`GroupKey`], [`Name`]) on
+//!   the device: one "REPL runs" per REPL (the run's `repl`) or per gone session, else one "other runs".
 //! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
+//!   [`Collapsed`] on a node hides all its children ("other runs" starts so).
 //! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
@@ -59,6 +62,8 @@ pub struct Shell;
 pub struct Proc;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Stage;
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Group;
 
 /// `(Status, status)`.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -121,6 +126,16 @@ pub struct Ended {
 /// On a session or the device: the tree shows all its runs, not only the last [`KEEP_RUNS`].
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Unfolded;
+
+/// On a node: the tree shows none of its children.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Collapsed;
+
+/// A group of runs with no listed session, by what they share (`repl:<id>`, `session:<n>`, `other`).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct GroupKey {
+    pub s: ScriptString,
+}
 
 /// Finished runs a parent shows while folded (running ones always show).
 pub const KEEP_RUNS: usize = 3;
@@ -197,6 +212,8 @@ pub fn register(world: &World) {
     world.component::<StageNo>().writable();
     world.component::<Ended>().writable();
     world.component::<Unfolded>();
+    world.component::<Collapsed>();
+    world.component::<GroupKey>().writable();
     world.component::<Viewing>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
     world.component::<Inbox>().writable();
@@ -213,6 +230,7 @@ fn for_tags(world: &World) {
     world.component::<Shell>();
     world.component::<Proc>();
     world.component::<Stage>();
+    world.component::<Group>();
     world.component::<Running>();
     world.component::<Exited>();
     world.component::<Lost>();
@@ -269,6 +287,7 @@ struct Index {
     sessions: HashMap<u64, u64>,
     runs: HashMap<u64, u64>,
     stages: HashMap<(u64, u32), u64>,
+    groups: HashMap<String, u64>,
 }
 
 fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms, Terms), msg: Msg) {
@@ -405,8 +424,11 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
         "skipped" => *w.component_id::<Skipped>(),
         _ => *w.component_id::<Exited>(),
     };
+    let group_kind = *w.component_id::<Group>();
     let mut seen = std::collections::HashSet::new();
     let mut seen_stages = std::collections::HashSet::new();
+    // Group key -> its newest run's start.
+    let mut groups_seen: HashMap<String, u64> = HashMap::new();
     for r in runs {
         let Some(n) = r["id"].as_str().and_then(|s| s.strip_prefix('r')).and_then(|s| s.parse::<u64>().ok()) else { continue };
         seen.insert(n);
@@ -428,7 +450,36 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             e.set(Cwd { s: cwd.into() });
         }
         set_times(e, r["start_ms"].as_u64(), r["end_ms"].as_u64());
-        let parent = r["session"].as_u64().and_then(|s| idx.sessions.get(&s).copied()).filter(|&p| w.entity_from_id(p).is_alive()).unwrap_or(dev);
+        let listed = r["session"].as_u64().and_then(|s| idx.sessions.get(&s).copied()).filter(|&p| w.entity_from_id(p).is_alive());
+        let parent = match listed {
+            Some(p) => p,
+            None => {
+                // No listed session: one group per REPL or gone session, else "other runs" (collapsed at first).
+                let (key, name) = match (r["repl"].as_str().filter(|s| !s.is_empty()), r["session"].as_u64()) {
+                    (Some(repl), _) => (format!("repl:{repl}"), format!("REPL runs \u{00B7} {repl}")),
+                    (None, Some(s)) => (format!("session:{s}"), format!("REPL runs \u{00B7} s{s}")),
+                    (None, None) => ("other".to_owned(), "other runs".to_owned()),
+                };
+                let start = r["start_ms"].as_u64().unwrap_or(0);
+                let newest = groups_seen.entry(key.clone()).or_insert(0);
+                *newest = (*newest).max(start);
+                match idx.groups.get(&key).map(|&g| w.entity_from_id(g)).filter(|g| g.is_alive()) {
+                    Some(g) => *g.id(),
+                    None => {
+                        let g = w.entity();
+                        g.set(GroupKey { s: key.as_str().into() });
+                        g.add((Kind::id(), group_kind));
+                        g.set(Name { s: name.as_str().into() });
+                        if key == "other" {
+                            g.add(Collapsed::id());
+                        }
+                        g.child_of(dev);
+                        idx.groups.insert(key, *g.id());
+                        *g.id()
+                    }
+                }
+            }
+        };
         if e.parent().is_none_or(|p| *p.id() != parent) {
             e.child_of(parent);
         }
@@ -456,6 +507,25 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             set_times(c, s["start_ms"].as_u64(), s["end_ms"].as_u64());
         }
     }
+    // Groups sort among the device's children by their newest run; "other runs" goes last. Empty ones go.
+    idx.groups.retain(|key, g| {
+        let g = w.entity_from_id(*g);
+        match groups_seen.get(key) {
+            Some(&newest) => {
+                let created = Created { ms: if key == "other" { u64::MAX } else { newest } };
+                if g.try_cloned::<&Created>() != Some(created) {
+                    g.set(created);
+                }
+                true
+            }
+            None => {
+                if g.is_alive() {
+                    g.destruct();
+                }
+                false
+            }
+        }
+    });
     // Gone runs go with their stages (ChildOf deletes them).
     idx.runs.retain(|n, e| {
         let keep = seen.contains(n);
@@ -638,6 +708,9 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
                     continue;
                 }
                 self.out.push(Row::Obj { e: k, depth });
+                if ke_collapsed(self.w, k) {
+                    continue;
+                }
                 if !self.is_run(k) || self.is_running(k) || self.picked(k) {
                     let ke = self.w.entity_from_id(k);
                     self.walk(ke, depth + 1);
@@ -658,6 +731,34 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
         walk.walk(dev, 0);
     }
     walk.out
+}
+
+fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {
+    w.entity_from_id(e).has(Collapsed::id())
+}
+
+/// Whether `e` is a group of runs (its row folds it rather than selecting it).
+#[must_use]
+pub fn is_group(world: WorldRef<'_>, e: u64) -> bool {
+    world.entity_from_id(e).has(GroupKey::id())
+}
+
+/// How many runs `e` holds directly.
+#[must_use]
+pub fn run_count(world: WorldRef<'_>, e: u64) -> usize {
+    let mut n = 0;
+    world.entity_from_id(e).each_child(|c| n += usize::from(c.has(Run::id())));
+    n
+}
+
+/// Collapse or expand `e`'s children.
+pub fn toggle_collapse(world: WorldRef<'_>, e: u64) {
+    let e = world.entity_from_id(e);
+    if e.has(Collapsed::id()) {
+        e.remove(Collapsed::id());
+    } else {
+        e.add(Collapsed::id());
+    }
 }
 
 /// Fold or unfold `parent`'s runs.

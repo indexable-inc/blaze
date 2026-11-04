@@ -98,6 +98,33 @@ prefab hn.RunRow : ui.Row {
   dot : hn.Dot {}
 }
 
+// A group of runs with no listed session ("REPL runs", "other runs"): a chevron, its name and how many runs it holds;
+// pressed to fold or unfold it.
+prefab hn.GroupRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+  Padding: {l: 8, r: 8, t: 0, b: 0}
+  indent : ui.Node {
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  glyph : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+  name : ui.Words, Muted {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  meta : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
 // The fold of a session's older runs: "N more" (or "fewer"), pressed to unfold (or fold) them.
 prefab hn.MoreRow : ui.Row {
   Pressable

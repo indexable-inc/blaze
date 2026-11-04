@@ -10,7 +10,10 @@
 //! keeps draining upstream into the file instead of breaking the pipe) or, for the last stage of a
 //! pipeline, straight into sN.out. Pipeline exit status and `&&`/`||` semantics are bash's own.
 //!
-//! Store: paths::home()/runs/<id>/ meta.json, sN.out, sN.err, sN.pid, sN.rc, final.err.
+//! Store: paths::home()/runs/<id>/ meta.json, sN.out, sN.err, sN.idx, sN.pid, sN.rc, final.err.
+//! sN.idx is the stage's chunk index: one fixed 24-byte little-endian record per write `harness tee` made,
+//! `ts_ms u64, offset u64, len u32, stream u8 (0 out, 1 err), 3 pad`, so stdout and stderr replay in the order they
+//! were written (`run_read` with stream "ordered"). Runs from before the index have no .idx and read as before.
 //! The caller-visible stdout ("final") is the last stage of each executed pipeline, in order;
 //! the caller-visible stderr is final.err (every stage's stderr, as it arrived).
 use crate::{archive, db, paths};
@@ -40,6 +43,8 @@ pub enum RunReq {
         session: Option<u64>,
         parent: Option<String>,
         stdin: Option<String>,
+        /// The REPL (MCP process) that started it, when it has no session; kept in meta as `repl`.
+        repl: Option<String>,
     },
     RunStatus { id: String },
     Runs { session: Option<u64>, limit: Option<usize> },
@@ -319,7 +324,8 @@ fn script(parts: &[(Op, Vec<String>)], dir: &Path, exe: &Path) -> String {
             if si + 1 < stages.len() {
                 s.push_str(&format!(" | \"$__H\" tee \"$__HD/s{k}.out\" | "));
             } else {
-                s.push_str(&format!(" >\"$__HD/s{k}.out\""));
+                // Through tee too (for the chunk index); a process substitution keeps the stage's exit status.
+                s.push_str(&format!(" > >(\"$__H\" tee \"$__HD/s{k}.out\" >/dev/null)"));
             }
             k += 1;
         }
@@ -432,7 +438,7 @@ fn start(
         let _ = std::io::Write::write_all(w, text.as_bytes());
     }
     let meta = json!({
-        "id": id, "cmd": cmd, "name": name, "cwd": cwd, "session": session, "parent": parent, "pid": pid, "start_ms": now_ms(),
+        "id": id, "cmd": cmd, "name": name, "cwd": cwd, "session": session, "parent": parent, "repl": env.get("HARNESS_REPL"), "pid": pid, "start_ms": now_ms(),
         "end_ms": null, "exit_code": null, "signal": null, "split": parts.len() > 1 || parts[0].1.len() > 1,
         "pipelines": pipelines, "stages": stages,
     });
@@ -679,7 +685,122 @@ fn read_concat(files: &[PathBuf], mut offset: u64, max: usize) -> Result<(Vec<u8
     Ok((data, total))
 }
 
+/// One write of a stage's tee: when, where in which stream file, how long.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chunk {
+    pub ts_ms: u64,
+    pub offset: u64,
+    pub len: u32,
+    pub err: bool,
+}
+
+const IDX_REC: usize = 24;
+
+/// The chunk index file of a stage stream file (`sN.out` / `sN.err` -> `sN.idx`) and the stream's tag there.
+fn idx_of(path: &Path) -> Option<(PathBuf, u8)> {
+    let stream = match path.extension()?.to_str()? {
+        "out" => 0,
+        "err" => 1,
+        _ => return None,
+    };
+    let stem = path.file_stem()?.to_str()?;
+    stem.strip_prefix('s')?.parse::<usize>().ok()?;
+    Some((path.with_extension("idx"), stream))
+}
+
+/// A stage's chunk index, in write order; None when it has none (a run from before the index).
+pub fn chunks(idx: &Path) -> Option<Vec<Chunk>> {
+    let b = std::fs::read(idx).ok()?;
+    Some(
+        b.chunks_exact(IDX_REC)
+            .map(|r| Chunk {
+                ts_ms: u64::from_le_bytes(r[0..8].try_into().unwrap()),
+                offset: u64::from_le_bytes(r[8..16].try_into().unwrap()),
+                len: u32::from_le_bytes(r[16..20].try_into().unwrap()),
+                err: r[20] == 1,
+            })
+            .collect(),
+    )
+}
+
+/// For a stage stream file: (offset, ts_ms) of each of its chunks, by offset (the archive's line timestamps).
+pub fn chunk_times(path: &Path) -> Option<Vec<(u64, u64)>> {
+    let (idx, stream) = idx_of(path)?;
+    let mut v: Vec<(u64, u64)> = chunks(&idx)?.into_iter().filter(|c| u8::from(c.err) == stream).map(|c| (c.offset, c.ts_ms)).collect();
+    v.sort_unstable();
+    Some(v)
+}
+
+/// stdout and stderr together in the order they were written: the stage's (or, for None, every terminal stage's
+/// stdout and every stage's stderr), as `chunks` of `{err, data}`; `offset` counts bytes of that merged sequence.
+fn read_ordered(id: &str, stage: Option<usize>, offset: u64, max: usize, wait_ms: u64) -> Result<Value> {
+    let d = run_dir(id)?;
+    let m = read_meta(&d)?;
+    let n = m["stages"].as_array().map_or(0, Vec::len);
+    let terminal: Vec<usize> = match stage {
+        Some(k) if k >= n => bail!("run {id} has {n} stages (0..{})", n.saturating_sub(1)),
+        Some(k) => vec![k],
+        None => m["pipelines"].as_array().into_iter().flatten().filter_map(|p| p["stages"].as_array()?.last()?.as_u64()).map(|k| k as usize).collect(),
+    };
+    let stages: Vec<usize> = stage.map_or_else(|| (0..n).collect(), |k| vec![k]);
+    if !stages.iter().any(|k| d.join(format!("s{k}.idx")).exists()) && m["end_ms"].is_u64() {
+        bail!("run {id} has no chunk index (it ran before the index existed): read out and err");
+    }
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        let done = !store().live.lock().unwrap().contains_key(id);
+        // (ts, stage, seq) orders the segments; within one stage the index is already in write order.
+        let mut segs: Vec<(u64, usize, usize, Chunk)> = vec![];
+        for &k in &stages {
+            let Some(cs) = chunks(&d.join(format!("s{k}.idx"))) else { continue };
+            for (i, c) in cs.into_iter().enumerate() {
+                if c.err || terminal.contains(&k) {
+                    segs.push((c.ts_ms, k, i, c));
+                }
+            }
+        }
+        segs.sort_unstable_by_key(|s| (s.0, s.1, s.2));
+        let total: u64 = segs.iter().map(|s| u64::from(s.3.len)).sum();
+        let mut out: Vec<(bool, Vec<u8>)> = vec![];
+        let (mut pos, mut taken) = (0u64, 0usize);
+        for (_, k, _, c) in &segs {
+            let len = u64::from(c.len);
+            if pos + len <= offset {
+                pos += len;
+                continue;
+            }
+            if taken >= max {
+                break;
+            }
+            let skip = offset.saturating_sub(pos);
+            let want = ((len - skip) as usize).min(max - taken);
+            let path = d.join(format!("s{k}.{}", if c.err { "err" } else { "out" }));
+            let (bytes, _) = read_concat(&[path], c.offset + skip, want)?;
+            let short = (bytes.len() as u64) < len - skip;
+            taken += bytes.len();
+            pos += skip + bytes.len() as u64;
+            match out.last_mut() {
+                Some((e, b)) if *e == c.err => b.extend_from_slice(&bytes),
+                _ => out.push((c.err, bytes)),
+            }
+            if short {
+                break; // the file is shorter than its index says (still being written): read the rest next time
+            }
+        }
+        let next = offset + taken as u64;
+        let eof = next >= total;
+        if taken > 0 || done || Instant::now() >= deadline {
+            let chunks: Vec<Value> = out.iter().map(|(e, b)| json!({ "err": e, "data": String::from_utf8_lossy(b) })).collect();
+            return Ok(json!({ "chunks": chunks, "offset": offset, "next_offset": next, "size": total, "eof": eof, "done": done }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn read(id: &str, stage: Option<usize>, stream: &str, offset: u64, max: usize, wait_ms: u64) -> Result<Value> {
+    if stream == "ordered" {
+        return read_ordered(id, stage, offset, max, wait_ms);
+    }
     let d = run_dir(id)?;
     let m = read_meta(&d)?;
     let files = match (stage, stream) {
@@ -755,7 +876,10 @@ async fn wait(id: &str, timeout_ms: Option<u64>) -> Result<Value> {
 pub fn handle(req: RunReq) -> Result<Value> {
     let rt = tokio::runtime::Handle::current();
     match req {
-        RunReq::Run { cmd, cwd, env, clear_env, session, parent, stdin } => {
+        RunReq::Run { cmd, cwd, mut env, clear_env, session, parent, stdin, repl } => {
+            if let Some(r) = repl {
+                env.insert("HARNESS_REPL".into(), r);
+            }
             let _g = rt.enter();
             start(cmd, cwd, env, clear_env, session, parent, stdin, None, false)
         }
@@ -778,6 +902,10 @@ pub fn handle(req: RunReq) -> Result<Value> {
 pub fn tee(path: &str) -> Result<()> {
     use std::io::{Read, Write};
     let mut f = std::fs::File::create(path).with_context(|| format!("create {path}"))?;
+    // A stage stream file gets its chunk index records (shared by the stage's out and err tees; O_APPEND keeps each
+    // 24-byte record whole).
+    let mut idx = idx_of(Path::new(path)).and_then(|(p, s)| Some((std::fs::OpenOptions::new().create(true).append(true).open(p).ok()?, s)));
+    let mut at = 0u64;
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
     let mut pass = true;
@@ -790,6 +918,15 @@ pub fn tee(path: &str) -> Result<()> {
             Err(e) => return Err(e.into()),
         };
         f.write_all(&buf[..n])?;
+        if let Some((ix, stream)) = idx.as_mut() {
+            let mut rec = [0u8; IDX_REC];
+            rec[0..8].copy_from_slice(&now_ms().to_le_bytes());
+            rec[8..16].copy_from_slice(&at.to_le_bytes());
+            rec[16..20].copy_from_slice(&(n as u32).to_le_bytes());
+            rec[20] = *stream;
+            ix.write_all(&rec)?;
+        }
+        at += n as u64;
         if pass && (stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err()) {
             pass = false;
         }

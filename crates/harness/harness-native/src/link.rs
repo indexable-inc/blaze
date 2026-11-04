@@ -117,6 +117,37 @@ pub fn ensure_daemon() -> Result<(), String> {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Long-poll `run_read` on one `stream` of run `r{run}` from the start, handing each answer to `got`, while `live()`;
+/// until the run is done and read to the end. False when the daemon refused the stream (no chunk index for
+/// "ordered"), so the caller reads it another way.
+fn follow(run: u64, stage: Option<u32>, stream: &str, live: &dyn Fn() -> bool, mut got: impl FnMut(&Value)) -> bool {
+    let mut offset = 0u64;
+    while live() {
+        let v = match request(&json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS})) {
+            Ok(v) if v.get("error").is_none() => v,
+            Ok(v) => {
+                if stream != "ordered" {
+                    eprintln!("harness-native: run_read r{run} {stream}: {v}");
+                }
+                return false;
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        if !live() {
+            break;
+        }
+        got(&v);
+        offset = v["next_offset"].as_u64().unwrap_or(offset);
+        if v["done"].as_bool() == Some(true) && v["eof"].as_bool() == Some(true) {
+            break;
+        }
+    }
+    true
+}
+
 /// The app's side of the daemon: what it can ask from the main thread. Every call returns at once; answers arrive as
 /// [`Msg`]s.
 #[derive(Clone)]
@@ -270,46 +301,46 @@ impl Link {
         });
     }
 
-    /// Follow run `r{run}`'s output (its stage `stage`, or the caller-visible streams) from the start, read-only: one
-    /// thread per stream long-polls `run_read` and sends `Msg::RunData` until the run is done and read to the end, or
-    /// another watch (or [`Link::unwatch_run`]) replaces it.
+    /// Follow run `r{run}`'s output (its stage `stage`, or the caller-visible streams) from the start, read-only, until
+    /// the run is done and read to the end, or another watch (or [`Link::unwatch_run`]) replaces it. One thread
+    /// long-polls `run_read` with stream "ordered" (stdout and stderr in the order they were written, from the daemon's
+    /// chunk index); a run from before the index (or an older daemon) is read as two streams, each on its own thread.
     pub fn watch_run(&self, run: u64, stage: Option<u32>) {
         let generation = self.run_watch.fetch_add(1, Ordering::Relaxed) + 1;
-        for err in [false, true] {
-            let (tx, wake, current) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
-            let stream = if err { "err" } else { "out" };
-            std::thread::Builder::new()
-                .name(format!("harness-run-r{run}-{stream}"))
-                .spawn(move || {
-                    let mut offset = 0u64;
-                    while current.load(Ordering::Relaxed) == generation {
-                        let v = match request(&json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS})) {
-                            Ok(v) if v.get("error").is_none() => v,
-                            Ok(v) => {
-                                eprintln!("harness-native: run_read r{run} {stream}: {v}");
-                                return;
-                            }
-                            Err(_) => {
-                                std::thread::sleep(Duration::from_millis(500));
-                                continue;
-                            }
-                        };
-                        if current.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let data = v["data"].as_str().unwrap_or("");
-                        if !data.is_empty() {
-                            let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
-                            wake();
-                        }
-                        offset = v["next_offset"].as_u64().unwrap_or(offset);
-                        if v["done"].as_bool() == Some(true) && v["eof"].as_bool() == Some(true) {
-                            return;
-                        }
+        let (tx, wake, current) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
+        std::thread::Builder::new()
+            .name(format!("harness-run-r{run}"))
+            .spawn(move || {
+                let live = || current.load(Ordering::Relaxed) == generation;
+                let send = |err: bool, data: &str| {
+                    if !data.is_empty() {
+                        let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
+                        wake();
                     }
-                })
-                .expect("run reader thread");
-        }
+                };
+                if follow(run, stage, "ordered", &live, |v| {
+                    for c in v["chunks"].as_array().into_iter().flatten() {
+                        send(c["err"].as_bool() == Some(true), c["data"].as_str().unwrap_or(""));
+                    }
+                }) {
+                    return;
+                }
+                let err_side = {
+                    let (tx, wake, current) = (tx.clone(), wake.clone(), current.clone());
+                    std::thread::spawn(move || {
+                        follow(run, stage, "err", &|| current.load(Ordering::Relaxed) == generation, |v| {
+                            let data = v["data"].as_str().unwrap_or("");
+                            if !data.is_empty() {
+                                let _ = tx.send(Msg::RunData { run, stage, err: true, bytes: data.as_bytes().to_vec() });
+                                wake();
+                            }
+                        });
+                    })
+                };
+                follow(run, stage, "out", &live, |v| send(false, v["data"].as_str().unwrap_or("")));
+                let _ = err_side.join();
+            })
+            .expect("run reader thread");
     }
 
     /// Stop following run output.

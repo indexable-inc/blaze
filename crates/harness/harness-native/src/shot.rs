@@ -24,9 +24,30 @@ pub fn run(path: &str) -> Result<(), String> {
         }
     }
     let secs = std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
+    // Pointer input (window points): clicks `x,y;x,y` one every 0.4 s from 1 s in, and a drag `x0,y0,x1,y1` at 0.8 s.
+    let nums = |s: &str| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>();
+    let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK").unwrap_or_default().split(';').map(nums).filter(|v| v.len() == 2).enumerate().map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1])).collect();
+    let mut drag = std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
+    let mut up_next = false;
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
+        let t = start.elapsed().as_secs_f32();
+        if up_next {
+            app.pointer_up();
+            up_next = false;
+        } else if let Some(d) = drag.take_if(|_| t >= 0.8) {
+            app.pointer_down(d[0], d[1]);
+            for k in 1..=8 {
+                let f = k as f32 / 8.0;
+                app.pointer_move(d[0] + (d[2] - d[0]) * f, d[1] + (d[3] - d[1]) * f);
+            }
+            up_next = true;
+        } else if clicks.first().is_some_and(|c| t >= c.0) {
+            let (_, x, y) = clicks.remove(0);
+            app.pointer_down(x, y);
+            up_next = true;
+        }
         let r = &renderer;
         let draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| r.upload_atlas(x, y, gw, gh, b));
         if start.elapsed().as_secs_f32() >= secs {
