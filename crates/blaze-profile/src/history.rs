@@ -94,7 +94,7 @@ use parquet::{
     column::writer::ColumnCloseResult,
     errors::ParquetError,
     file::{
-        metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
+        metadata::{KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
         properties::{WriterProperties, WriterVersion},
         writer::SerializedFileWriter,
     },
@@ -113,7 +113,7 @@ use crate::{
     symbols,
 };
 
-mod compact;
+pub(crate) mod compact;
 pub mod manifest;
 
 use compact::Name;
@@ -502,6 +502,12 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    /// The writer properties of the table at `table` in [`schema::TABLES`]: what a merge of its
+    /// files writes with.
+    pub(crate) fn properties(&self, table: usize) -> &WriterProperties {
+        &self.properties[table]
+    }
+
     pub(crate) fn new() -> Writer {
         // alloc: once a history
         Writer { properties: schema::TABLES.iter().map(|it| properties(it)).collect(), buf: Vec::with_capacity(1 << 20) }
@@ -733,11 +739,17 @@ struct Job {
     output: Name,
 }
 
+/// The key of a merged file's metadata that says how many rows its merge read from its inputs'
+/// footers, in decimal: what the gate (`gate::check`, `merges_exact`) holds the file's own row
+/// count to, long after the inputs are deleted. A merge of merged files says its own.
+pub(crate) const MERGED_ROWS: &str = "blaze.merged_rows";
+
 /// Writes the rows of the Parquet files `inputs`, all of one schema, as the file `output`,
 /// copying their column chunks as they are, with `properties` (the table's); its size. It is
 /// streamed to a hidden name and renamed into place, so a reader never sees half of it; on a
-/// failure the hidden file is deleted and `output` is not made.
-fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
+/// failure the hidden file is deleted and `output` is not made. Its metadata says the rows the
+/// inputs' footers held ([`MERGED_ROWS`]).
+pub(crate) fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
     let name = output.file_name().and_then(|it| it.to_str()).unwrap_or("history");
     // alloc: a file's name, once a merge
     let hidden = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
@@ -798,11 +810,13 @@ fn concat_into(
     let properties = Arc::new(properties.clone());
     let mut writer = SerializedFileWriter::new(out, Arc::clone(&schema), properties)
         .map_err(|error| fail(hidden, "starting to write", CompactError::Parquet(error)))?;
-    // The Arrow schema and blaze's own keys (`blaze.schema`, `blaze.table`, `blaze.clock`).
-    for kv in first_metadata.file_metadata().key_value_metadata().into_iter().flatten() {
+    // The Arrow schema and blaze's own keys (`blaze.schema`, `blaze.table`, `blaze.clock`); an
+    // input's own count of merged rows is its, not this merge's.
+    for kv in first_metadata.file_metadata().key_value_metadata().into_iter().flatten().filter(|it| it.key != MERGED_ROWS) {
         // clone: a key and its value, a few a merge
         writer.append_key_value_metadata(kv.clone());
     }
+    let mut rows: i64 = 0;
     let mut next = Some((first_file, first_metadata));
     for path in inputs {
         let (file, metadata) = match next.take() {
@@ -812,6 +826,7 @@ fn concat_into(
         if metadata.file_metadata().schema() != &*schema {
             return Err(fail(path, "checking the schema of the input", CompactError::SchemaDiffers));
         }
+        rows += metadata.file_metadata().num_rows();
         for (rg_at, row_group) in metadata.row_groups().iter().enumerate() {
             let index = metadata.page_index_for_row_group(rg_at);
             let mut group = writer
@@ -833,6 +848,8 @@ fn concat_into(
             group.close().map_err(|error| fail(hidden, "ending a row group of", CompactError::Parquet(error)))?;
         }
     }
+    // alloc: a key and its value, once a merge
+    writer.append_key_value_metadata(KeyValue::new(MERGED_ROWS.to_owned(), rows.to_string()));
     writer.close().map_err(|error| fail(hidden, "ending", CompactError::Parquet(error)))?;
     Ok(())
 }
@@ -2284,6 +2301,43 @@ mod tests {
     /// Each flush says the process's reported bugs: the counter with each build's flush and
     /// whenever it grew, and a `blaze-bug` row for each site that reported since the last,
     /// naming the value kind, the site and how many more times.
+    #[test]
+    fn a_merge_says_the_rows_its_inputs_held_and_holds_them() {
+        let dir = scratch("merged-rows");
+        let process = Process { pid: 9, name: "blaze test", commit: None };
+        let counters = |n: u64| {
+            let rows: Vec<CounterRow> = (0..n)
+                .map(|i| CounterRow { build: 1, plot: Plot::MemoHits, t_ns: i as i64, value: i, fiber: None })
+                .collect();
+            batches::counters(&rows, process).unwrap()
+        };
+        let mut writer = Writer::new();
+        let (a, b) = (dir.join("1-00000001.counters.parquet"), dir.join("1-00000002.counters.parquet"));
+        writer.write(&a, &schema::COUNTERS, &[counters(3)]).unwrap();
+        writer.write(&b, &schema::COUNTERS, &[counters(4)]).unwrap();
+        let table = table_at(&schema::COUNTERS);
+        let footer = |path: &Path| {
+            let metadata = ParquetMetaDataReader::new().parse_and_finish(&fs::File::open(path).unwrap()).unwrap();
+            let said: Vec<Option<String>> = metadata
+                .file_metadata()
+                .key_value_metadata()
+                .into_iter()
+                .flatten()
+                .filter(|it| it.key == MERGED_ROWS)
+                .map(|it| it.value.clone())
+                .collect();
+            (metadata.file_metadata().num_rows(), said)
+        };
+        let merged = dir.join("1-00000001-00000002-1.counters.parquet");
+        concat(&merged, &[a.clone(), b], writer.properties(table)).unwrap();
+        assert_eq!(footer(&merged), (7, vec![Some("7".to_owned())]));
+        // A merge of a merged file says its own count, once.
+        let again = dir.join("1-00000001-00000002-2.counters.parquet");
+        concat(&again, &[merged, a], writer.properties(table)).unwrap();
+        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));
+        _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;

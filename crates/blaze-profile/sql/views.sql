@@ -246,3 +246,25 @@ SELECT
     self_cpu_ns, alloc_bytes, allocs
 FROM spans
 WHERE function IS NOT NULL AND query_kind IS NULL;
+
+-- One row a span name a build: the per-build summary CI keeps for each self-build (`blaze debug
+-- gate --summary`, `harness/profile_gate.py`) and `slower_between_commits` compares across
+-- builds. Its rows are `spans`' alone, so a name only `folded` holds is missing. The one place it
+-- is defined: a stored summary written with the build keeps these names and columns.
+CREATE OR REPLACE VIEW build_summary AS
+SELECT
+    spans.build_id AS build_id,
+    any_value(builds.commit) AS commit,
+    any_value(builds.tree) AS tree,
+    any_value(builds.blaze) AS blaze,
+    any_value(builds.started_unix_ns) AS started_unix_ns,
+    any_value(builds.dur_ns) AS build_dur_ns,
+    any_value(builds.outcome) AS outcome,
+    spans.name AS name,
+    count(*) AS runs,
+    median(spans.dur_ns) AS median_ns,
+    sum(spans.dur_ns) AS total_ns,
+    sum(spans.self_cpu_ns) AS self_cpu_ns
+FROM spans
+JOIN builds ON builds.build_id = spans.build_id
+GROUP BY spans.build_id, spans.name;

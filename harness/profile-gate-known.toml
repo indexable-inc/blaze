@@ -1,0 +1,28 @@
+# The profile gate's checks known to fail, or to be unable to run, on CI's self-build, each with
+# who owns it and why (harness/profile_gate.py; the checks: crates/blaze-profile/src/gate.rs).
+#
+# CI's self-build is built by the release blaze (.github/blaze-version), so its history is that
+# release's: a check of rows a newer blaze writes cannot run until a release writes them. Each
+# entry is one check, `outcome` "failed" or "unchecked", and `platforms` (CI's platform names,
+# blaze.yaml) when it holds on some only. A check that does anything else fails the run: one
+# listed that passes (take it out), one listed "unchecked" that fails, one unlisted that does
+# not pass. The list only shrinks.
+
+[[known]]
+check = "cpu_matches_process"
+outcome = "unchecked"
+owner = "profile"
+cause = "the release blaze writes no `builds.daemon_user_ns`/`daemon_system_ns` (added with the profile-durability lanes); runs once a release writes them"
+
+[[known]]
+check = "merged_rows_match"
+outcome = "unchecked"
+owner = "profile"
+cause = "the release blaze's merges write no `blaze.merged_rows` (added with this gate); runs once a release writes it"
+
+[[known]]
+check = "blocks_in_waits"
+outcome = "unchecked"
+platforms = ["linux-x64", "linux-arm64"]
+owner = "profile"
+cause = "the release blaze's Linux sampler (perf_event) takes no off-CPU samples, so no sample says a worker blocked; the signal sampler that does (docs/profiling.md) runs once a release has it"

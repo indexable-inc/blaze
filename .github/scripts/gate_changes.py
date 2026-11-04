@@ -50,6 +50,12 @@ CODE = (
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",
+    # The profile-gate job: its script, its known list, and the flake that pins its DuckDB (its
+    # fixtures are under crates/).
+    "harness/profile_gate.py",
+    "harness/profile-gate-known.toml",
+    "flake.nix",
+    "flake.lock",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
     ".github/blaze-version",
     "site/install.sh",

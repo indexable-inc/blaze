@@ -228,7 +228,7 @@ fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
 /// after it) less its last before its start, in the same process: they count from its start.
 /// `of` keeps the rows to the build's process; the folded spans are the build's and its
 /// process's of no build.
-fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
+pub(crate) fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
     // The flush after the build's end has its rows; one flush is at most `history::EVERY` on.
     let after = t1 + crate::history::EVERY.as_nanos() as i64;
     let delta = |name: &str, column: &str| {
@@ -253,7 +253,7 @@ fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
 }
 
 /// What [`recorder_sql`]'s answer says.
-fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
+pub(crate) fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
     let Some((batch, row)) = rows(batches).next() else { return Ok(Recorder::default()) };
     const T: &str = "counters";
     Ok(Recorder {
