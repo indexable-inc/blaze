@@ -105,7 +105,7 @@ const SPAN_HEAD: [Column; 17] = [
     opt(
         "self_cpu_ns",
         Type::I64,
-        "the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job",
+        "its CPU time while it was the innermost span its thread was inside (its job's alone, less the spans under it; a wait's is about 0, as other jobs run while it parks): the thread's CPU clock is read at switches, waits and gaps between root spans and each stretch's CPU is shared among the spans by the time each was innermost in it, so it is off by at most the off-CPU time of the stretches it ran in (`time::cpu`); null when the binary counts no CPU (`flight::count_cpu`) or a read failed",
     ),
     opt("alloc_bytes", Type::U64, "bytes its thread allocated while it was open"),
     opt("allocs", Type::U64, "allocations its thread made while it was open"),
@@ -237,6 +237,11 @@ pub const SWITCHES: Table = Table {
             "queued_ns",
             Type::I64,
             "for started and ran, how long the job waited for a core: from its pool's submit to `since_ns`; null when the pool did not say when it was given",
+        ),
+        opt(
+            "cpu_ns",
+            Type::I64,
+            "the thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`) read at the switch, which ends a stretch of `spans.self_cpu_ns`: two of a thread's rows give the CPU it had between them; null for ready, when the binary counts no CPU, and in files before 2026-11-04",
         ),
     ],
 };

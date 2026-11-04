@@ -517,8 +517,10 @@ dependencies = [
  "blaze-codegen",
  "blaze-format",
  "blaze-ids",
+ "blaze-profile",
  "blaze-query",
  "blaze-rng",
+ "tracing",
 ]
 
 [[package]]

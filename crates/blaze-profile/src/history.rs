@@ -892,6 +892,18 @@ impl History {
                     .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
             );
         }
+        // The recorder's own measured cost ([`flight::cost`]), with each build's flush only: it
+        // grows with every span (this flush's own), so writing it whenever it grew would give an
+        // idle daemon's timer a file each tick. A build's delta runs from the flush of the build
+        // before it, so it holds the idle stretch between them too.
+        if let Some(of) = build {
+            let cost = flight::cost();
+            let build = u32::try_from(of).unwrap_or(0);
+            self.read.counters.extend(
+                [(Plot::ProfileCostNs, cost.ns), (Plot::ProfileSpansMade, cost.spans), (Plot::ProfileCpuReads, cost.cpu_reads)]
+                    .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
+            );
+        }
         self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
         let written = self.write(build);
         // Written or not, the rows drained are this flush's: none goes to the next.

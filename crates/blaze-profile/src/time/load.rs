@@ -356,7 +356,7 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<Rows, TimeError> {
          CAST(event AS VARCHAR) AS event, CAST(job AS UBIGINT) AS job, CAST(fiber AS BIGINT) AS fiber, \
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
          CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as, \
-         CAST(queued_ns AS BIGINT) AS queued_ns FROM {}",
+         CAST(queued_ns AS BIGINT) AS queued_ns, CAST(cpu_ns AS BIGINT) AS cpu_ns FROM {}",
         of_build("switches", build, SWITCHES_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("t_ns BETWEEN {t0} AND {t1}{of}")))
     );
     let of_spans =
@@ -435,9 +435,9 @@ fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeErr
 
 /// The columns schema version 2 added, and typed span columns added since (appended, so they
 /// kept the version), as typed nulls: a history of older files has none of them, and a query
-/// naming a column no file has fails to bind.
+/// naming a column no file has fails to bind. `switches.cpu_ns` came after (2026-11-04).
 const SWITCHES_SINCE_2: &str =
-    "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns";
+    "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns, NULL::BIGINT AS cpu_ns";
 /// And `spans.folded_ns`, which version 3 added: a file of an older version folded nothing
 /// ([`crate::schema::VERSION`]), so its null reads as 0.
 const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job, NULL::UBIGINT AS creator, NULL::BIGINT AS folded_ns";
@@ -501,7 +501,7 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
         let (job, fiber, core) = (uints(batch, T, "job")?, ints(batch, T, "fiber")?, ints(batch, T, "core")?);
         let (wait_kind, wait_value) = (texts(batch, T, "wait_kind")?, uints(batch, T, "wait_value")?);
         let (by_job, since_ns, began_as) = (uints(batch, T, "by_job")?, ints(batch, T, "since_ns")?, uints(batch, T, "began_as")?);
-        let queued_ns = ints(batch, T, "queued_ns")?;
+        let (queued_ns, cpu_ns) = (ints(batch, T, "queued_ns")?, ints(batch, T, "cpu_ns")?);
         for row in 0..batch.num_rows() {
             let name = get(event, row, |it, row| it.value(row)).ok_or(TimeError::BadColumn { table: T, column: "event", why: "is null" })?;
             let wait = get(wait_kind, row, |it, row| it.value(row)).map(|kind| (kind, get(wait_value, row, |it, row| it.value(row))));
@@ -517,6 +517,7 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
                 since_ns: get(since_ns, row, |it, row| it.value(row)),
                 began_as: get(began_as, row, |it, row| it.value(row)),
                 queued_ns: get(queued_ns, row, |it, row| it.value(row)),
+                cpu_ns: get(cpu_ns, row, |it, row| it.value(row)),
             });
         }
     }

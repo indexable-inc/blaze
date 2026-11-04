@@ -305,6 +305,7 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
         column(Int64Array::from_iter(switches.iter().map(|it| it.since_ns))),
         column(UInt64Array::from_iter(switches.iter().map(|it| it.began_as))),
         column(Int64Array::from_iter(switches.iter().map(|it| it.queued_ns))),
+        column(Int64Array::from_iter(switches.iter().map(|it| it.cpu_ns.map(|it| it as i64)))),
     ];
     RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
 }

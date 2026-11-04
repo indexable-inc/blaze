@@ -119,7 +119,8 @@ pub struct Facts {
 }
 
 /// What the flight recorder itself dropped or summed over the build's window, from its own
-/// counters (`profile spans lost`, `profile rows skipped`, `profile rows skipped behind`) and the
+/// counters (`profile spans lost`, `profile rows skipped`, `profile rows skipped behind`, `profile
+/// cost ns`, `profile spans made`, `profile cpu reads`) and the
 /// `folded` table; `None` where the record has none (a blaze before them).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Recorder {
@@ -131,6 +132,12 @@ pub struct Recorder {
     /// Short spans summed into `folded` rows instead of a row each, and their time.
     pub folded_spans: Option<i64>,
     pub folded_ns: Option<i64>,
+    /// The recorder's own measured cost over the window (`profile cost ns`): sampled hook time
+    /// plus every thread-CPU read, and the spans (`profile spans made`) and CPU reads
+    /// (`profile cpu reads`) it covers.
+    pub cost_ns: Option<i64>,
+    pub spans_made: Option<i64>,
+    pub cpu_reads: Option<i64>,
 }
 
 impl Recorder {

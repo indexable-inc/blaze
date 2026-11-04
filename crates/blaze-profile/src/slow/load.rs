@@ -125,12 +125,15 @@ fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
     let folded = format!("(build_id = {build} OR build_id IS NULL{of}) AND to_ns BETWEEN {t0} AND {t1}");
     // alloc: a query, once a report
     format!(
-        "SELECT {}, {}, {}, \
+        "SELECT {}, {}, {}, {}, {}, {}, \
          (SELECT CAST(coalesce(sum(spans), 0) AS BIGINT) FROM folded WHERE {folded}) AS folded_spans, \
          (SELECT CAST(coalesce(sum(dur_ns), 0) AS BIGINT) FROM folded WHERE {folded}) AS folded_ns",
         delta("profile spans lost", "spans_lost"),
         delta("profile rows skipped", "rows_skipped"),
         delta("profile rows skipped behind", "rows_behind"),
+        delta("profile cost ns", "cost_ns"),
+        delta("profile spans made", "spans_made"),
+        delta("profile cpu reads", "cpu_reads"),
     )
 }
 
@@ -144,6 +147,9 @@ fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
         rows_behind: int(batch, T, "rows_behind", row)?,
         folded_spans: int(batch, "folded", "folded_spans", row)?,
         folded_ns: int(batch, "folded", "folded_ns", row)?,
+        cost_ns: int(batch, T, "cost_ns", row)?,
+        spans_made: int(batch, T, "spans_made", row)?,
+        cpu_reads: int(batch, T, "cpu_reads", row)?,
     })
 }
 
