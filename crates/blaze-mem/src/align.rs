@@ -66,8 +66,24 @@ macro_rules! align_fns {
 }
 
 align_fns!(usize, align_up, checked_align_up, align_down, is_aligned, padding_for, align_range);
-align_fns!(u32, align_up_u32, checked_align_up_u32, align_down_u32, is_aligned_u32, padding_for_u32, align_range_u32);
-align_fns!(u64, align_up_u64, checked_align_up_u64, align_down_u64, is_aligned_u64, padding_for_u64, align_range_u64);
+align_fns!(
+    u32,
+    align_up_u32,
+    checked_align_up_u32,
+    align_down_u32,
+    is_aligned_u32,
+    padding_for_u32,
+    align_range_u32
+);
+align_fns!(
+    u64,
+    align_up_u64,
+    checked_align_up_u64,
+    align_down_u64,
+    is_aligned_u64,
+    padding_for_u64,
+    align_range_u64
+);
 
 #[cfg(all(test, not(blaze_check)))]
 mod tests;

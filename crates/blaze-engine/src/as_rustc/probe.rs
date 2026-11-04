@@ -62,7 +62,8 @@ impl Library {
     /// The library at `dir`, refused unless it is a copy of the rustc blaze is.
     pub(super) fn at(dir: PathBuf) -> anyhow::Result<Library> {
         let upstream = dir.join("UPSTREAM");
-        let upstream = std::fs::read_to_string(&upstream).with_context(|| format!("reading {}", upstream.display()))?;
+        let upstream = std::fs::read_to_string(&upstream)
+            .with_context(|| format!("reading {}", upstream.display()))?;
         let commit = stdlib::library_commit(&upstream).map_err(anyhow::Error::msg)?;
         Ok(Library { dir, commit })
     }
@@ -93,9 +94,18 @@ pub(super) struct Checked {
 
 /// The probe `source`, named `shown` in its diagnostics, checked as `asked` says over the
 /// standard library at `library`.
-pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Library) -> anyhow::Result<Checked> {
+pub(super) fn check(
+    asked: &Asked<'_>,
+    shown: &str,
+    source: &str,
+    library: &Library,
+) -> anyhow::Result<Checked> {
     if !EDITIONS.contains(&asked.edition) {
-        bail!("argument for `--edition` must be one of: {}. (instead was `{}`)", EDITIONS.join("|"), asked.edition);
+        bail!(
+            "argument for `--edition` must be one of: {}. (instead was `{}`)",
+            EDITIONS.join("|"),
+            asked.edition
+        );
     }
     if asked.name.is_empty() || !asked.name.chars().all(|it| it.is_alphanumeric() || it == '_') {
         bail!("invalid character in crate name: `{}`", asked.name);
@@ -141,7 +151,9 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     tree.failed()?;
     let units = match planned {
         Planned::Ready(units) => units,
-        Planned::Failed(error) => bail!("loading the probe with the standard library: {}", error.what),
+        Planned::Failed(error) => {
+            bail!("loading the probe with the standard library: {}", error.what)
+        }
         Planned::Needs(fetches) => {
             let named: Vec<String> = fetches.iter().map(|it| format!("`{}`", it.what)).collect();
             bail!("the probe's load reads what nothing fetches for it: {}", named.join(", "));
@@ -153,8 +165,15 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
         .iter()
         .position(|it| !it.is_std && it.mode != UnitMode::RunCustomBuild && it.target.is_lib())
         .context("the load made no unit of the probe's crate")?;
-    let lower = blaze_lower::Lower { units: &units, config: &config, files: &*tree, root: tree.view, host_cpu: None };
-    let mut lowered = blaze_lower::lower(lower).context("lowering the probe with the standard library")?;
+    let lower = blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &*tree,
+        root: tree.view,
+        host_cpu: None,
+    };
+    let mut lowered =
+        blaze_lower::lower(lower).context("lowering the probe with the standard library")?;
     tree.failed()?;
     std_script(&mut lowered, &units, library)?;
     let krate = lowered.krate(index).context("the probe's unit has no crate in the front end")?;
@@ -177,11 +196,24 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     // rustc gives the future-incompatibility report only for `--json=future-incompat`, which
     // the probe refuses.
     let options = Options { lints, keep_duplicates: false, future_breakage_report: false };
-    let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), Files::new(&paths, ""), &options);
-    if let Some(diag) = diags.iter().find(|it| it.code.as_ref().and_then(Code::error) == Some("E0583")) {
-        bail!("blaze reads a probe's one file, and it declares a module in another: {}", diag.message);
+    let diags = blaze_diagnostics::check_crate(
+        db,
+        hir::Crate::from(krate),
+        Files::new(&paths, ""),
+        &options,
+    );
+    if let Some(diag) =
+        diags.iter().find(|it| it.code.as_ref().and_then(Code::error) == Some("E0583"))
+    {
+        bail!(
+            "blaze reads a probe's one file, and it declares a module in another: {}",
+            diag.message
+        );
     }
-    Ok(Checked { failed: diags.iter().any(Diag::is_error), stderr: written(&diags, asked, shown, source, library)? })
+    Ok(Checked {
+        failed: diags.iter().any(Diag::is_error),
+        stderr: written(&diags, asked, shown, source, library)?,
+    })
 }
 
 /// What std's build script (`library/std/build.rs`) gives std, set on its crate: the probe's
@@ -190,7 +222,11 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
 /// script stops the check when it differs), run with the target's cfg variables and none of the
 /// script's own (`RUSTC_STD_NETBSD10`, `WIND_RELEASE_ID`, `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`),
 /// as for the library rustc ships.
-fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Library) -> anyhow::Result<()> {
+fn std_script(
+    lowered: &mut blaze_lower::Lowered,
+    units: &Units,
+    library: &Library,
+) -> anyhow::Result<()> {
     let root = library.dir.join("std/build.rs");
     let root = root.to_str().with_context(|| format!("{} is not UTF-8", root.display()))?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("reading {path}: {e}"));
@@ -199,7 +235,12 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
         .graph
         .units
         .iter()
-        .position(|it| it.is_std && it.target.name == "std" && it.target.is_lib() && it.mode != UnitMode::RunCustomBuild)
+        .position(|it| {
+            it.is_std
+                && it.target.name == "std"
+                && it.target.is_lib()
+                && it.mode != UnitMode::RunCustomBuild
+        })
         .context("the probe's load made no unit of std")?;
     let krate = lowered.krate(index).context("std's unit has no crate in the front end")?;
     let mut cfg = krate.cfg_options(lowered.db()).clone();
@@ -214,7 +255,8 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
     .map(|(name, value)| (OsString::from(name), OsString::from(value)));
     let dir = library.dir.join("std");
     let printed = stdlib::scripts::printed(script, &vars, &dir).map_err(anyhow::Error::msg)?;
-    let printed = String::from_utf8(printed).context("std's build script printed other than UTF-8")?;
+    let printed =
+        String::from_utf8(printed).context("std's build script printed other than UTF-8")?;
     for line in printed.lines() {
         let directive = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"));
         let Some((key, value)) = directive.and_then(|it| it.split_once('=')) else {
@@ -224,10 +266,14 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
             "rerun-if-changed" | "rustc-check-cfg" => {}
             "rustc-cfg" if !value.contains('=') => cfg.insert_atom(Symbol::intern(value)),
             "rustc-env" => {
-                let (name, value) = value.split_once('=').with_context(|| format!("std's build script printed `{line}`"))?;
+                let (name, value) = value
+                    .split_once('=')
+                    .with_context(|| format!("std's build script printed `{line}`"))?;
                 env.set(name, value);
             }
-            _ => bail!("std's build script printed `{line}`, which the rustc stand-in does not read"),
+            _ => {
+                bail!("std's build script printed `{line}`, which the rustc stand-in does not read")
+            }
         }
     }
     lowered.served_db().batch(base_db::Trigger::named("std's build script's run applied"), |db| {
@@ -334,7 +380,10 @@ impl ProbeFiles {
         both.extend_from_slice(&source_id.0);
         ProbeFiles {
             view: ContentId::of(VIEW_DOMAIN, &both),
-            package: [("Cargo.toml", manifest_id, manifest_bytes), (ROOT_FILE, source_id, source_bytes)],
+            package: [
+                ("Cargo.toml", manifest_id, manifest_bytes),
+                (ROOT_FILE, source_id, source_bytes),
+            ],
             library: ContentId::of(LIBRARY_DOMAIN, library.commit.as_bytes()),
             dir: library.dir.clone(),
             failed: Mutex::new(None),
@@ -377,7 +426,9 @@ impl ProbeFiles {
             }
         } else if meta.is_file() {
             match std::fs::read(&at) {
-                Ok(bytes) => (if executable(&meta) { Mode::Executable } else { Mode::Regular }, bytes),
+                Ok(bytes) => {
+                    (if executable(&meta) { Mode::Executable } else { Mode::Regular }, bytes)
+                }
                 Err(error) => {
                     self.fail(&at, &error);
                     return None;
@@ -412,7 +463,10 @@ impl ProbeFiles {
             let name = match entry.file_name().into_string() {
                 Ok(name) => name,
                 Err(_) => {
-                    let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "a name that is not UTF-8");
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "a name that is not UTF-8",
+                    );
                     self.fail(&entry.path(), &error);
                     return None;
                 }
@@ -449,7 +503,11 @@ fn executable(_: &std::fs::Metadata) -> bool {
 }
 
 impl Tree for ProbeFiles {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         if root == self.view {
             let found = self.package.iter().find(|(name, ..)| *name == path);
             return Ok(found.map(|(_, id, bytes)| (*id, Mode::Regular, bytes.clone())));
@@ -460,7 +518,8 @@ impl Tree for ProbeFiles {
         Ok(None)
     }
 
-    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: `Tree`'s, once a directory
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool {
+        // dyn: `Tree`'s, once a directory
         if root == self.view {
             if !path.is_empty() {
                 return false;

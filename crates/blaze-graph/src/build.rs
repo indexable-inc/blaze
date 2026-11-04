@@ -94,7 +94,14 @@ impl Build {
     /// A build script compiled, after its package's source and what it is compiled with.
     pub fn script(&mut self, package: &str, key: Key, deps: &[NodeId], cost: u64) -> NodeId {
         // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
-        self.node(NodeKind::Script, format!("build script {package}"), deps, Pool::Work, cost, Some(key))
+        self.node(
+            NodeKind::Script,
+            format!("build script {package}"),
+            deps,
+            Pool::Work,
+            cost,
+            Some(key),
+        )
     }
 
     /// A build script run in its sandbox: a process, so it waits rather than computes. Not
@@ -105,13 +112,27 @@ impl Build {
         waits.push(script);
         waits.extend_from_slice(deps);
         // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
-        self.node(NodeKind::ScriptRun, format!("run build script {package}"), waits, Pool::Io, 1, None)
+        self.node(
+            NodeKind::ScriptRun,
+            format!("run build script {package}"),
+            waits,
+            Pool::Io,
+            1,
+            None,
+        )
     }
 
     /// A proc macro's library, built and loaded.
     pub fn proc_macro(&mut self, package: &str, key: Key, deps: &[NodeId], cost: u64) -> NodeId {
         // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
-        self.node(NodeKind::Macro, format!("proc macro {package}"), deps, Pool::Work, cost, Some(key))
+        self.node(
+            NodeKind::Macro,
+            format!("proc macro {package}"),
+            deps,
+            Pool::Work,
+            cost,
+            Some(key),
+        )
     }
 
     /// A crate's names: after its source, its scripts' runs, its macros and its dependencies'
@@ -130,14 +151,29 @@ impl Build {
     /// A unit compiled, keyed by its key, and its write to the store after it.
     pub fn unit(&mut self, unit: &str, key: Key, deps: &[NodeId], cost: u64) -> Unit {
         // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
-        let compile = self.node(NodeKind::Codegen, format!("compile {unit}"), deps, Pool::Work, cost, Some(key));
+        let compile = self.node(
+            NodeKind::Codegen,
+            format!("compile {unit}"),
+            deps,
+            Pool::Work,
+            cost,
+            Some(key),
+        );
         // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
-        let store = self.node(NodeKind::Store, format!("store {unit}"), [compile], Pool::Io, 1, None);
+        let store =
+            self.node(NodeKind::Store, format!("store {unit}"), [compile], Pool::Io, 1, None);
         Unit { compile, store }
     }
 
     /// A program linked from its units' compiles and the standard library.
-    pub fn link(&mut self, program: &str, key: Option<Key>, units: &[Unit], std: Option<NodeId>, cost: u64) -> NodeId {
+    pub fn link(
+        &mut self,
+        program: &str,
+        key: Option<Key>,
+        units: &[Unit],
+        std: Option<NodeId>,
+        cost: u64,
+    ) -> NodeId {
         let mut deps = Vec::with_capacity(units.len() + usize::from(std.is_some()));
         deps.extend(units.iter().map(|it| it.compile));
         deps.extend(std);
@@ -218,8 +254,17 @@ mod tests {
             let mut running: Vec<NodeId> = Vec::new();
             // Each set of nodes that ran at once.
             let mut together: Vec<Vec<NodeId>> = Vec::new();
-            let mut outputs = plane.step(PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: false, idle: false }).unwrap();
-            outputs.extend(plane.step(PlaneInput::Add { at_ns: at, request, nodes: specs }).unwrap());
+            let mut outputs = plane
+                .step(PlaneInput::Open {
+                    at_ns: at,
+                    request,
+                    weight: 1,
+                    keep_going: false,
+                    idle: false,
+                })
+                .unwrap();
+            outputs
+                .extend(plane.step(PlaneInput::Add { at_ns: at, request, nodes: specs }).unwrap());
             outputs.extend(plane.step(PlaneInput::Close { at_ns: at, request }).unwrap());
             loop {
                 let mut finished = None;

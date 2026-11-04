@@ -13,7 +13,9 @@
 
 use std::{io, path::Path};
 
-pub use blaze_store_check::bytes::{Simd, available, fastest, first_difference, first_difference_with};
+pub use blaze_store_check::bytes::{
+    Simd, available, fastest, first_difference, first_difference_with,
+};
 
 /// Inputs at least this long are compared across cores: below it one core streams them in
 /// under 3 ms, about what starting the threads and faulting the pages in from each costs.
@@ -31,7 +33,13 @@ pub fn first_difference_across_cores(a: &[u8], b: &[u8]) -> Option<usize> {
     first_difference_in(fastest(), a, b, crate::join::cores(), BLOCK)
 }
 
-fn first_difference_in(path: Simd, a: &[u8], b: &[u8], pieces: usize, block: usize) -> Option<usize> {
+fn first_difference_in(
+    path: Simd,
+    a: &[u8],
+    b: &[u8],
+    pieces: usize,
+    block: usize,
+) -> Option<usize> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let n = a.len().min(b.len());
     let pieces = pieces.clamp(1, n.div_ceil(block).max(1));
@@ -132,8 +140,16 @@ mod tests {
             let serial = first_difference_with(Simd::Scalar, &a, &b);
             assert_eq!(serial, want);
             for pieces in [1, 2, 3, 4, 5, 8, 64] {
-                assert_eq!(first_difference_in(Simd::Scalar, &a, &b, pieces, BLOCK), want, "{pieces} pieces, {want:?}");
-                assert_eq!(first_difference_in(super::fastest(), &a, &b, pieces, BLOCK), want, "{pieces} pieces, {want:?}");
+                assert_eq!(
+                    first_difference_in(Simd::Scalar, &a, &b, pieces, BLOCK),
+                    want,
+                    "{pieces} pieces, {want:?}"
+                );
+                assert_eq!(
+                    first_difference_in(super::fastest(), &a, &b, pieces, BLOCK),
+                    want,
+                    "{pieces} pieces, {want:?}"
+                );
             }
         }
         let mut longer = a.clone();
@@ -155,12 +171,14 @@ mod tests {
         b[len - 3] ^= 1;
         let fastest = super::fastest();
         for path in super::available() {
-            let found =
-                blaze_alloc_count::assert_at_most(0, "a first difference", || first_difference_with(path, &a, &b));
-            assert_eq!(found, Some(len - 3), "{path:?}");
-            let short = blaze_alloc_count::assert_at_most(0, "a first difference of a short input", || {
-                first_difference_with(path, &a[..9], &b[..10])
+            let found = blaze_alloc_count::assert_at_most(0, "a first difference", || {
+                first_difference_with(path, &a, &b)
             });
+            assert_eq!(found, Some(len - 3), "{path:?}");
+            let short =
+                blaze_alloc_count::assert_at_most(0, "a first difference of a short input", || {
+                    first_difference_with(path, &a[..9], &b[..10])
+                });
             assert_eq!(short, Some(9), "{path:?}");
         }
         let same = blaze_alloc_count::assert_at_most(0, "equal bytes by the fastest path", || {

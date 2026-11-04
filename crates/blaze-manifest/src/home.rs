@@ -41,9 +41,12 @@ pub fn root(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 /// error naming the root and why.
 pub fn process_root() -> Result<Option<PathBuf>, String> {
     let Some(it) = root(|name| std::env::var_os(name)) else { return Ok(None) };
-    std::path::absolute(&it)
-        .map(Some)
-        .map_err(|error| format!("blaze's root {} is relative, and the current directory it is taken against: {error}", it.display()))
+    std::path::absolute(&it).map(Some).map_err(|error| {
+        format!(
+            "blaze's root {} is relative, and the current directory it is taken against: {error}",
+            it.display()
+        )
+    })
 }
 
 /// Where the daemon keeps what outlives it: `v2` under [`root`].

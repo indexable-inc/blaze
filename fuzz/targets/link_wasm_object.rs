@@ -64,8 +64,9 @@ fn check(data: &[u8]) {
     let (shifted, at) = copy_at(data, 1);
     let shifted = &shifted[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, OBJECT, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, OBJECT, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -178,7 +179,12 @@ fn has_addend(r_type: u8) -> bool {
 }
 
 /// Relocations: type, offset in the section, symbol or type, addend.
-fn reloc_section(out: &mut Vec<u8>, section_name: &str, section_index: u32, relocs: &[(u8, u32, u32, i64)]) {
+fn reloc_section(
+    out: &mut Vec<u8>,
+    section_name: &str,
+    section_index: u32,
+    relocs: &[(u8, u32, u32, i64)],
+) {
     let mut contents = Vec::new();
     uleb(&mut contents, section_index.into());
     uleb(&mut contents, relocs.len() as u64);
@@ -218,7 +224,11 @@ fn code_relocs() -> Vec<(u8, u32, u32, i64)> {
 fn object(code_relocs: &[(u8, u32, u32, i64)]) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     // Types: 0 is (i32 i32 i32 i32) -> i32, 1 is () -> (), 2 is (i32) -> ().
-    section(&mut out, 1, &vec_of(3, &[0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 0, 0x60, 1, 0x7f, 0]));
+    section(
+        &mut out,
+        1,
+        &vec_of(3, &[0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 0, 0x60, 1, 0x7f, 0]),
+    );
     let mut imports = Vec::new();
     name(&mut imports, "env");
     name(&mut imports, "__linear_memory");
@@ -302,7 +312,8 @@ fn object(code_relocs: &[(u8, u32, u32, i64)]) -> Vec<u8> {
     entry.extend([3, 0, 4]);
     sym(&entry);
     let mut segments = Vec::new();
-    for (segment, align) in [(".rodata.msg", 0), (".bss.buf", 3), (".data.ptr", 2), ("my_items", 2)] {
+    for (segment, align) in [(".rodata.msg", 0), (".bss.buf", 3), (".data.ptr", 2), ("my_items", 2)]
+    {
         name(&mut segments, segment);
         segments.extend([align, 0]);
     }
@@ -365,7 +376,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, OBJECT, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, OBJECT, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

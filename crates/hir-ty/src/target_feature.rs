@@ -3,7 +3,7 @@
 //! The features themselves, rustc's tables and what each implies are the `target-features`
 //! crate's, below `cfg`; this is what a crate's cfg and a function's attributes enable.
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use hir_def::attrs::AttrFlags;
 use hir_def::{FunctionId, HasModule};

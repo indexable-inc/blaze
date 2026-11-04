@@ -81,7 +81,9 @@ fn clock() -> f64 {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn clock() -> f64 {
-    eprintln!("the clock chain is written for x86-64 and AArch64 only; this target has no cycle count");
+    eprintln!(
+        "the clock chain is written for x86-64 and AArch64 only; this target has no cycle count"
+    );
     std::process::exit(1);
 }
 
@@ -110,12 +112,22 @@ fn main() {
     rust_files(&library, &mut paths);
     let texts: Vec<String> =
         paths.iter().filter_map(|path| String::from_utf8(std::fs::read(path).ok()?).ok()).collect();
-    assert!(texts.len() > 1000, "{} files under {}: the corpus is missing", texts.len(), library.display());
+    assert!(
+        texts.len() > 1000,
+        "{} files under {}: the corpus is missing",
+        texts.len(),
+        library.display()
+    );
     let bytes: usize = texts.iter().map(String::len).sum();
 
     // The median of 11 warm passes of `lex` (its token count) over the corpus, in nanoseconds.
     let median = |lex: fn(Edition, &str) -> usize| {
-        let pass = || texts.iter().map(|text| black_box(lex(Edition::CURRENT, black_box(text)))).sum::<usize>();
+        let pass = || {
+            texts
+                .iter()
+                .map(|text| black_box(lex(Edition::CURRENT, black_box(text))))
+                .sum::<usize>()
+        };
         black_box(pass());
         let mut samples: Vec<f64> = (0..11)
             .map(|_| {

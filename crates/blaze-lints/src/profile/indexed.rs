@@ -122,23 +122,32 @@ impl<'a> Cursor<'a> {
 
     fn u64(&mut self, what: &'static str) -> Result<u64, ReadError> {
         let bytes = self.take(8, what)?;
-        Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?))
+        Ok(u64::from_le_bytes(
+            bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?,
+        ))
     }
 
     fn u32(&mut self, what: &'static str) -> Result<u32, ReadError> {
         let bytes = self.take(4, what)?;
-        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?))
+        Ok(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?,
+        ))
     }
 
     fn u16(&mut self, what: &'static str) -> Result<u16, ReadError> {
         let bytes = self.take(2, what)?;
-        Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?))
+        Ok(u16::from_le_bytes(
+            bytes.try_into().map_err(|_| ReadError::Truncated { at: self.at, what })?,
+        ))
     }
 }
 
 /// Reads the indexed profile `bytes`, handing each record to `each` in the order the file has
 /// them (the hash table's bucket order: the same for the same bytes).
-pub(crate) fn read<'a>(bytes: &'a [u8], mut each: impl FnMut(Record<'a>)) -> Result<Header, ReadError> {
+pub(crate) fn read<'a>(
+    bytes: &'a [u8],
+    mut each: impl FnMut(Record<'a>),
+) -> Result<Header, ReadError> {
     let mut cur = Cursor { bytes, at: 0 };
     if cur.u64("the magic").map_err(|_| ReadError::NotIndexed)? != MAGIC {
         return Err(ReadError::NotIndexed);
@@ -150,7 +159,9 @@ pub(crate) fn read<'a>(bytes: &'a [u8], mut each: impl FnMut(Record<'a>)) -> Res
     }
     let flags = word & VARIANT_MASKS;
     if flags & BYTE_COVERAGE != 0 {
-        return Err(ReadError::Kind("a byte coverage profile (`-pgo-instrument-entry` with single-byte counters)"));
+        return Err(ReadError::Kind(
+            "a byte coverage profile (`-pgo-instrument-entry` with single-byte counters)",
+        ));
     }
     let _unused = cur.u64("the header's unused word")?;
     let _hash_type = cur.u64("the hash type")?;
@@ -188,7 +199,10 @@ pub(crate) fn read<'a>(bytes: &'a [u8], mut each: impl FnMut(Record<'a>)) -> Res
         if in_bucket == 0 {
             in_bucket = cur.u16("a bucket's entry count")?;
             if in_bucket == 0 {
-                return Err(ReadError::Malformed { at: cur.at, what: "an empty bucket in the payload" });
+                return Err(ReadError::Malformed {
+                    at: cur.at,
+                    what: "an empty bucket in the payload",
+                });
             }
         }
         in_bucket -= 1;
@@ -214,7 +228,9 @@ fn records<'a>(
 ) -> Result<(), ReadError> {
     let at = |data: &Cursor<'_>| start + data.at;
     while data.at < data.bytes.len() {
-        let _hash = data.u64("a record's hash").map_err(|_| ReadError::Truncated { at: at(&data), what: "a record's hash" })?;
+        let _hash = data
+            .u64("a record's hash")
+            .map_err(|_| ReadError::Truncated { at: at(&data), what: "a record's hash" })?;
         let counts = data.u64("a record's counter count")?;
         let counters = data
             .take(counts.saturating_mul(8), "a record's counters")
@@ -227,10 +243,14 @@ fn records<'a>(
         // `ValueProfData`: its total size, a `u32` it counts itself in, then the rest.
         let total = data.u32("a record's value profile size")?;
         if total < 8 {
-            return Err(ReadError::Malformed { at: at(&data), what: "a value profile smaller than its own header" });
+            return Err(ReadError::Malformed {
+                at: at(&data),
+                what: "a value profile smaller than its own header",
+            });
         }
-        data.take(u64::from(total) - 4, "a record's value profile")
-            .map_err(|_| ReadError::Truncated { at: at(&data), what: "a record's value profile" })?;
+        data.take(u64::from(total) - 4, "a record's value profile").map_err(|_| {
+            ReadError::Truncated { at: at(&data), what: "a record's value profile" }
+        })?;
         each(Record { name, counters });
     }
     Ok(())
@@ -287,7 +307,9 @@ mod tests {
     fn records_read_back_with_their_counters() {
         let bytes = written(IR_PROF | INSTR_ENTRY, &[("a", 7, &[3, 4]), ("b", 9, &[])]);
         let mut seen = Vec::new();
-        let header = read(&bytes, |it| seen.push((it.name.to_vec(), it.counts().collect::<Vec<_>>()))).unwrap();
+        let header =
+            read(&bytes, |it| seen.push((it.name.to_vec(), it.counts().collect::<Vec<_>>())))
+                .unwrap();
         assert_eq!(header.version, 12);
         assert!(header.entry_counted());
         assert_eq!(seen, [(b"a".to_vec(), vec![3, 4]), (b"b".to_vec(), vec![])]);
@@ -301,7 +323,11 @@ mod tests {
         assert!(matches!(read(&bytes, |_| {}), Err(ReadError::Version(_))));
         let bytes = written(IR_PROF, &[("a", 7, &[3, 4])]);
         let cut = &bytes[..bytes.len() / 2];
-        assert!(matches!(read(cut, |_| {}), Err(ReadError::Truncated { .. })), "{:?}", read(cut, |_| {}).err());
+        assert!(
+            matches!(read(cut, |_| {}), Err(ReadError::Truncated { .. })),
+            "{:?}",
+            read(cut, |_| {}).err()
+        );
         assert!(matches!(read(&written(BYTE_COVERAGE, &[]), |_| {}), Err(ReadError::Kind(_))));
     }
 }

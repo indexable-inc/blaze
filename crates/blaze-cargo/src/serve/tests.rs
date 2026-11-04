@@ -12,8 +12,9 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, CrateType, Diagnostic, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table,
-    TargetKind, Targets, TestOutcome, TestResult, Ub, UnitOf, UnitTarget, Verb, ViewRef,
+    ApiError, Artifact, CrateType, Diagnostic, Envelope, FetchVerb, Level, Reach, Request,
+    Response, SCHEMA, Table, TargetKind, Targets, TestOutcome, TestResult, Ub, UnitOf, UnitTarget,
+    Verb, ViewRef,
     frames::{self, Frames},
 };
 use blaze_cas::Store;
@@ -25,8 +26,8 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
     query::{
-        BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, LockFile, LockWrite, Origin, PackagePlan, Planned, TestSandbox,
-        UnitPlan, Units,
+        BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, LockFile, LockWrite,
+        Origin, PackagePlan, Planned, TestSandbox, UnitPlan, Units,
     },
     schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
@@ -38,8 +39,9 @@ use super::{
     job::{DURABLE_WITHIN, ENDED_ROWS, RECHECK},
     plane::{Inline, Runner},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Output, Phase, Put,
-        RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying_fallible,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut,
+        Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
+        applying_fallible,
     },
 };
 
@@ -50,7 +52,8 @@ const STD: &str = "cache/blaze/std/0b";
 const FINISHED: &str = "`dev` profile [unoptimized + debuginfo]";
 const LIBRARY: &str = "/rustc/0123abcd/library";
 const DEP: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dep-1.0.0";
-const INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/de/p/dep";
+const INDEX: &str =
+    "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/de/p/dep";
 /// How many turns a test gives the daemon before it says it hangs.
 const TURNS: usize = 100_000;
 
@@ -171,7 +174,13 @@ fn shared_kept_key() -> blaze_cas::Key {
 /// Whether `store` holds all a build of `checkout` left for it.
 fn holds_kept(store: &Store, checkout: &str) -> bool {
     let shared = store.get(&shared_kept_key()).unwrap().is_some_and(|it| it.bytes == SHARED_KEPT);
-    shared && (0..2).all(|at| store.get(&kept_key(checkout, at)).unwrap().is_some_and(|it| it.bytes == kept_value(checkout, at)))
+    shared
+        && (0..2).all(|at| {
+            store
+                .get(&kept_key(checkout, at))
+                .unwrap()
+                .is_some_and(|it| it.bytes == kept_value(checkout, at))
+        })
 }
 
 const SCRIPT: &[u8] = b"\x7fELF a build script\n";
@@ -192,7 +201,14 @@ fn warning_of_app(message: &str) -> Diagnostic {
         src_path: "/w/src/main.rs".into(),
         crate_types: vec![CrateType::Bin],
     };
-    let unit = UnitOf { id: 0, test: false, doctest: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
+    let unit = UnitOf {
+        id: 0,
+        test: false,
+        doctest: false,
+        target,
+        package_id: "app".into(),
+        manifest_path: "/w/Cargo.toml".into(),
+    };
     Diagnostic {
         level: Level::Warning,
         code: None,
@@ -241,24 +257,39 @@ impl Query for FakePlan {
 
     fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Planned>, Cancelled> {
         PLANS.with(|it| it.set(it.get() + 1));
-        let config = BuildConfig::decode(cx.config()?).expect("a view of the daemon has a build config");
+        let config =
+            BuildConfig::decode(cx.config()?).expect("a view of the daemon has a build config");
         SAW.with(|it| it.borrow_mut().push(config.clone()));
-        let manifest = cx.file("Cargo.toml")?.map(|it| String::from_utf8_lossy(it.bytes).into_owned()).unwrap_or_default();
+        let manifest = cx
+            .file("Cargo.toml")?
+            .map(|it| String::from_utf8_lossy(it.bytes).into_owned())
+            .unwrap_or_default();
         if manifest.starts_with("fail") {
             let at = Some(format!("{}/Cargo.toml", config.invocation.root));
-            return Ok(Cbor(Planned::Failed(LoadError { what: "error: the fake load refuses this manifest".into(), at })));
+            return Ok(Cbor(Planned::Failed(LoadError {
+                what: "error: the fake load refuses this manifest".into(),
+                at,
+            })));
         }
-        let missing: Vec<Fetch> =
-            needed().into_iter().filter(|fetch| !config.mounts.iter().any(|it| it.at == fetch.at)).collect();
+        let missing: Vec<Fetch> = needed()
+            .into_iter()
+            .filter(|fetch| !config.mounts.iter().any(|it| it.at == fetch.at))
+            .collect();
         if !missing.is_empty() {
             return Ok(Cbor(Planned::Needs(missing)));
         }
         let wave = manifest.strip_prefix("wave ").and_then(|it| it.trim().parse().ok());
         Ok(Cbor(Planned::Ready(match wave {
             Some(scripts) => wave_units(&config.invocation.root, manifest, scripts),
-            None if manifest.starts_with("two scripts") => two_script_units(&config.invocation.root, manifest),
-            None if manifest.starts_with("links scripts") => links_script_units(&config.invocation.root, manifest),
-            None if manifest.starts_with("proc macro") => proc_macro_units(&config.invocation.root, manifest),
+            None if manifest.starts_with("two scripts") => {
+                two_script_units(&config.invocation.root, manifest)
+            }
+            None if manifest.starts_with("links scripts") => {
+                links_script_units(&config.invocation.root, manifest)
+            }
+            None if manifest.starts_with("proc macro") => {
+                proc_macro_units(&config.invocation.root, manifest)
+            }
             None => units(&config.invocation.root, manifest),
         })))
     }
@@ -418,18 +449,19 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
         clippy: None,
         macro_wasm: false,
     };
-    let package = |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
-        id: id.into(),
-        name: name.into(),
-        version: version.into(),
-        manifest_path: format!("{root}/Cargo.toml"),
-        source,
-        is_member,
-        default_run: None,
-        checksum: None,
-        tests: TestSandbox::default(),
-        const_macros: None,
-    };
+    let package =
+        |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
+            id: id.into(),
+            name: name.into(),
+            version: version.into(),
+            manifest_path: format!("{root}/Cargo.toml"),
+            source,
+            is_member,
+            default_run: None,
+            checksum: None,
+            tests: TestSandbox::default(),
+            const_macros: None,
+        };
     Units {
         plans: vec![plan; graph.units.len()],
         graph,
@@ -477,13 +509,20 @@ impl Steps for Fake {
         }
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
-                files: vec![SourceFile { path: "dep".into(), bytes: blaze_vfs::Bytes::from_static(b"{}\n"), mode: blaze_vfs::Mode::Regular }],
+                files: vec![SourceFile {
+                    path: "dep".into(),
+                    bytes: blaze_vfs::Bytes::from_static(b"{}\n"),
+                    mode: blaze_vfs::Mode::Regular,
+                }],
                 under: "dep".into(),
             },
             _ => Source {
                 files: vec![SourceFile {
                     path: "Cargo.toml".into(),
-                    bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, format!("# {}\n", fetch.what).as_bytes()),
+                    bytes: blaze_vfs::Bytes::copy_kept(
+                        blaze_mem::Tag::Vfs,
+                        format!("# {}\n", fetch.what).as_bytes(),
+                    ),
                     mode: blaze_vfs::Mode::Regular,
                 }],
                 under: String::new(),
@@ -498,8 +537,16 @@ impl Steps for Fake {
             return Ok(Library { at: LIBRARY.into(), fingerprint, source: None });
         }
         LIBRARY_READS.set(LIBRARY_READS.get() + 1);
-        let file = SourceFile { path: "core/src/lib.rs".into(), bytes: blaze_vfs::Bytes::from_static(b"#![no_core]\n"), mode: blaze_vfs::Mode::Regular };
-        Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
+        let file = SourceFile {
+            path: "core/src/lib.rs".into(),
+            bytes: blaze_vfs::Bytes::from_static(b"#![no_core]\n"),
+            mode: blaze_vfs::Mode::Regular,
+        };
+        Ok(Library {
+            at: LIBRARY.into(),
+            fingerprint,
+            source: Some(Source { files: vec![file], under: String::new() }),
+        })
     }
 
     /// The fakes' build dirs are paths in the simulation (`/w/target`), never on disk: no lease.
@@ -516,20 +563,34 @@ impl Steps for Fake {
         if PUTS_NOTHING.with_borrow(|it| *it == kept.checkout) {
             return Ok(Vec::new());
         }
-        let put = |key, bytes, what: &str| KeptPut { put: Put { key, kind: blaze_cas::Kind::Query, bytes }, what: Arc::from(what) };
+        let put = |key, bytes, what: &str| KeptPut {
+            put: Put { key, kind: blaze_cas::Kind::Query, bytes },
+            what: Arc::from(what),
+        };
         let checkout = &kept.checkout;
         // The shared value last: a job that waited on its last put's ticket alone answers before
         // its own two are durable once another checkout put the shared one first (review C1).
         Ok(vec![
-            put(kept_key(checkout, 0), kept_value(checkout, 0), "the fakes' first value of a checkout"),
-            put(kept_key(checkout, 1), kept_value(checkout, 1), "the fakes' second value of a checkout"),
+            put(
+                kept_key(checkout, 0),
+                kept_value(checkout, 0),
+                "the fakes' first value of a checkout",
+            ),
+            put(
+                kept_key(checkout, 1),
+                kept_value(checkout, 1),
+                "the fakes' second value of a checkout",
+            ),
             put(shared_kept_key(), SHARED_KEPT.to_vec(), "the fakes' value of every checkout"),
         ])
     }
 
     fn lower(&self, job: &JobInput, kept: Option<FakeInputs>) -> Result<FrontEnd<Fake>, Failed> {
         if kept.as_ref().is_some_and(|it| !it.stored) {
-            return Err(Failed::Error(ApiError::new("the fakes' kept front end is lowered into unstored", None)));
+            return Err(Failed::Error(ApiError::new(
+                "the fakes' kept front end is lowered into unstored",
+                None,
+            )));
         }
         let inputs = match kept {
             Some(inputs) => {
@@ -542,7 +603,13 @@ impl Steps for Fake {
                 // A real lowering anew serves its dependencies from what the last build left
                 // in the store: the fakes count whether it is all there.
                 let guard = blaze_cas::enter();
-                let read = |at| job.store.get(&guard, &kept_key(&checkout, at)).ok().flatten().is_some_and(|it| it.bytes == kept_value(&checkout, at));
+                let read = |at| {
+                    job.store
+                        .get(&guard, &kept_key(&checkout, at))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|it| it.bytes == kept_value(&checkout, at))
+                };
                 if read(0) && read(1) {
                     KEPT_READS.set(KEPT_READS.get() + 1);
                 }
@@ -550,7 +617,12 @@ impl Steps for Fake {
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
-        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer, puts: Vec::new(), misses: Vec::new() })
+        Ok(FrontEnd {
+            front: Arc::new(FakeFront { goal: job.goal }),
+            writer,
+            puts: Vec::new(),
+            misses: Vec::new(),
+        })
     }
 
     fn register(&self, db: &mut Database) {
@@ -638,7 +710,10 @@ impl Writer<Fake> for FakeWriter {
     }
 
     fn macros(&mut self, unit: usize, _: blaze_lower::ProcMacroLoadResult) -> Result<(), ApiError> {
-        Err(ApiError::new(format!("the fakes build no proc macro, and unit {unit} is not one"), None))
+        Err(ApiError::new(
+            format!("the fakes build no proc macro, and unit {unit} is not one"),
+            None,
+        ))
     }
 
     fn waiting(&self) -> bool {
@@ -658,14 +733,20 @@ impl Writer<Fake> for FakeWriter {
             return Ok(true);
         }
         if FAILS_APPLY.get() {
-            return Err(ApiError::new(format!("serve-test: applying runs {:?} fails", self.asked), None));
+            return Err(ApiError::new(
+                format!("serve-test: applying runs {:?} fails", self.asked),
+                None,
+            ));
         }
         let Some(inputs) = Arc::get_mut(&mut self.inputs) else { return Ok(false) };
         for run in self.asked.drain(..) {
             let applied = applying_fallible(run, "a build script's run", || {
                 assert_ne!(PANICS_RUN.get(), Some(run), "serve-test: the run's write panics");
                 if FAILS_RUN.get() == Some(run) {
-                    return Err(ApiError::new("serve-test: the run's write fails", Some("serve-test's run".into())));
+                    return Err(ApiError::new(
+                        "serve-test: the run's write fails",
+                        Some("serve-test's run".into()),
+                    ));
                 }
                 inputs.runs.push(run);
                 Ok(())
@@ -691,10 +772,14 @@ impl Writer<Fake> for FakeWriter {
 
     fn keep(mut self) -> Result<FakeInputs, ApiError> {
         if !self.apply()? {
-            return Err(ApiError::new("the fakes' runs are kept while a task still reads them", None));
+            return Err(ApiError::new(
+                "the fakes' runs are kept while a task still reads them",
+                None,
+            ));
         }
-        let mut inputs = Arc::into_inner(self.inputs)
-            .ok_or_else(|| ApiError::new("the fakes' inputs are kept while a task still holds them", None))?;
+        let mut inputs = Arc::into_inner(self.inputs).ok_or_else(|| {
+            ApiError::new("the fakes' inputs are kept while a task still holds them", None)
+        })?;
         // Kept again: what this build left is not stored yet, as a real front end's is not.
         inputs.stored = false;
         Ok(inputs)
@@ -780,7 +865,13 @@ impl Runs<Fake> for FakeRuns {
 pub(super) struct Script(usize);
 
 impl Runs<Fake> for Script {
-    fn start(&mut self, _: &Store, writer: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _: &Store,
+        writer: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
         let writer = writer.expect("a build script's run is given its job's writer");
         Some(writer.ran(self.0, blaze_lower::Ran::default()).is_ok())
     }
@@ -818,7 +909,13 @@ pub(super) struct Slow {
 }
 
 impl Runs<Fake> for Slow {
-    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, effects: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _: &Store,
+        _: Option<&mut FakeWriter>,
+        effects: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
         effects.push(Effect::Timer { after: self.after, tag: self.tag });
         None
     }
@@ -836,7 +933,9 @@ impl Runs<Fake> for Slow {
         _: &mut Vec<Response>,
     ) -> Option<bool> {
         // A run that ends after its job left its build has no writer to ask: it fails.
-        Some(writer.is_some_and(|writer| writer.ran(self.unit, blaze_lower::Ran::default()).is_ok()))
+        Some(
+            writer.is_some_and(|writer| writer.ran(self.unit, blaze_lower::Ran::default()).is_ok()),
+        )
     }
 
     fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
@@ -853,7 +952,13 @@ impl Runs<Fake> for Slow {
 pub(super) struct Lost;
 
 impl Runs<Fake> for Lost {
-    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _: &Store,
+        _: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
         None
     }
 
@@ -899,7 +1004,13 @@ pub(super) struct Keeps {
 }
 
 impl Runs<Fake> for Keeps {
-    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, effects: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _: &Store,
+        _: Option<&mut FakeWriter>,
+        effects: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
         effects.push(Effect::Timer { after: KEEPS_FOR.get(), tag: self.tag });
         KEEPS_STARTED.set(KEEPS_STARTED.get() + 1);
         None
@@ -920,12 +1031,16 @@ impl Runs<Fake> for Keeps {
         let off_loop = UNTOLD_WRITER.with_borrow_mut(|writer| {
             writer.as_mut().map(|writer| {
                 let guard = blaze_cas::enter();
-                writer.put(&guard, test_record_key(), blaze_cas::Kind::Query, TEST_RECORD).expect("one value under its key")
+                writer
+                    .put(&guard, test_record_key(), blaze_cas::Kind::Query, TEST_RECORD)
+                    .expect("one value under its key")
             })
         });
         let ticket = match off_loop {
             Some(ticket) => ticket,
-            None => store.put(test_record_key(), blaze_cas::Kind::Query, TEST_RECORD).expect("one value under its key"),
+            None => store
+                .put(test_record_key(), blaze_cas::Kind::Query, TEST_RECORD)
+                .expect("one value under its key"),
         };
         if self.tells {
             self.puts.kept([ticket]);
@@ -946,7 +1061,13 @@ impl Runs<Fake> for Keeps {
 pub(super) struct Over(Vec<Response>);
 
 impl Runs<Fake> for Over {
-    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _: &Store,
+        _: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         out.append(&mut self.0);
         Some(true)
     }
@@ -980,11 +1101,20 @@ impl Front<Fake> for FakeFront {
         false
     }
 
-    fn compile(&self, reader: FakeReader, unit: usize, phase: Phase, _: &mut Vec<Image<Fake>>) -> Result<Option<Compiled>, Failed> {
+    fn compile(
+        &self,
+        reader: FakeReader,
+        unit: usize,
+        phase: Phase,
+        _: &mut Vec<Image<Fake>>,
+    ) -> Result<Option<Compiled>, Failed> {
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
         assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
         if ERRS_COMPILE.get() == Some(unit) {
-            return Err(Failed::Error(ApiError::new("serve-test: unsupported: no `lang_start`", Some(format!("unit {unit}")))));
+            return Err(Failed::Error(ApiError::new(
+                "serve-test: unsupported: no `lang_start`",
+                Some(format!("unit {unit}")),
+            )));
         }
         if phase == Phase::Names {
             SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
@@ -1007,46 +1137,95 @@ impl Front<Fake> for FakeFront {
             outputs.push(Output { path: APP_AT.into(), key, executable: true });
         }
         let diagnostics = match unit == 3 && WARNS.get() {
-            true => vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")],
+            true => {
+                vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")]
+            }
             false => Vec::new(),
         };
         let share = match unit == 0 && SHARES.get() {
-            true => vec![Put { key: shared_key(), kind: blaze_cas::Kind::Query, bytes: SHARED.to_vec() }],
+            true => vec![Put {
+                key: shared_key(),
+                kind: blaze_cas::Kind::Query,
+                bytes: SHARED.to_vec(),
+            }],
             false => Vec::new(),
         };
-        Ok(Some(Compiled { diagnostics, ok: true, open: false, why: None, puts, share, outputs, artifact: None, macros: None, links: Vec::new(), misses: Vec::new() }))
+        Ok(Some(Compiled {
+            diagnostics,
+            ok: true,
+            open: false,
+            why: None,
+            puts,
+            share,
+            outputs,
+            artifact: None,
+            macros: None,
+            links: Vec::new(),
+            misses: Vec::new(),
+        }))
     }
 
     fn refused(&self, _: usize, what: String) -> Diagnostic {
-        Diagnostic { level: Level::Error, rendered: format!("error: {what}\n"), ..warning_of_app(&what) }
+        Diagnostic {
+            level: Level::Error,
+            rendered: format!("error: {what}\n"),
+            ..warning_of_app(&what)
+        }
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<FakeRuns, ApiError> {
         SCRIPTS.with_borrow_mut(|it| it.push(unit));
         Ok(match (LOSES_RUNS.get(), SLOW_SCRIPT.get()) {
             (true, _) => FakeRuns::Lost(Lost),
-            (false, Some((slow, after))) if slow == unit => FakeRuns::Slow(Slow { unit, tag: Tag(tags), after }),
+            (false, Some((slow, after))) if slow == unit => {
+                FakeRuns::Slow(Slow { unit, tag: Tag(tags), after })
+            }
             (false, _) => FakeRuns::Script(Script(unit)),
         })
     }
 
-    fn tests(&self, _: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<FakeRuns, ApiError> {
+    fn tests(
+        &self,
+        _: &[Artifact],
+        selection: Selection<'_>,
+        tags: u64,
+    ) -> Result<FakeRuns, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
         if TESTS_KEEP.get() {
-            return Ok(FakeRuns::Keeps(Keeps { tag: Tag(tags), puts: RunPuts::default(), tells: !TESTS_KEEP_UNTOLD.get() }));
+            return Ok(FakeRuns::Keeps(Keeps {
+                tag: Tag(tags),
+                puts: RunPuts::default(),
+                tells: !TESTS_KEEP_UNTOLD.get(),
+            }));
         }
         Ok(FakeRuns::Over(Over(Vec::new())))
     }
 
-    fn ub_tests(&self, FakeReader(_): FakeReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+    fn ub_tests(
+        &self,
+        FakeReader(_): FakeReader,
+        selection: Selection<'_>,
+    ) -> Result<Vec<String>, Failed> {
         assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
         let all = ["a::adds", "a::overflows", "b::reads"];
-        Ok(all.iter().filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter))).map(|it| (*it).to_owned()).collect())
+        Ok(all
+            .iter()
+            .filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter)))
+            .map(|it| (*it).to_owned())
+            .collect())
     }
 
-    fn evaluate(&self, FakeReader(_): FakeReader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
+    fn evaluate(
+        &self,
+        FakeReader(_): FakeReader,
+        test: &str,
+        ub: Ub,
+    ) -> Result<TestResult, Failed> {
         let (outcome, output) = match test {
-            "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
+            "a::overflows" => (
+                TestOutcome::Failed,
+                format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes(),
+            ),
             _ => (TestOutcome::Passed, Vec::new()),
         };
         Ok(TestResult {
@@ -1061,16 +1240,41 @@ impl Front<Fake> for FakeFront {
         })
     }
 
-    fn run(&self, _: &[Artifact], _: Option<&str>, _: &[String], _: u64) -> Result<FakeRuns, ApiError> {
-        Ok(FakeRuns::Over(Over(vec![Response::Ran { code: Some(0), stdout: b"hi\n".to_vec(), stderr: Vec::new() }])))
+    fn run(
+        &self,
+        _: &[Artifact],
+        _: Option<&str>,
+        _: &[String],
+        _: u64,
+    ) -> Result<FakeRuns, ApiError> {
+        Ok(FakeRuns::Over(Over(vec![Response::Ran {
+            code: Some(0),
+            stdout: b"hi\n".to_vec(),
+            stderr: Vec::new(),
+        }])))
     }
 
-    fn reach(&self, FakeReader(to): FakeReader, _: &FakeFront, FakeReader(from): FakeReader, changes: &[Change]) -> Result<Reach, Failed> {
+    fn reach(
+        &self,
+        FakeReader(to): FakeReader,
+        _: &FakeFront,
+        FakeReader(from): FakeReader,
+        changes: &[Change],
+    ) -> Result<Reach, Failed> {
         REACHED.with_borrow_mut(|it| it.push((from.runs.clone(), to.runs.clone())));
-        Ok(Reach { changes: changes.to_vec(), items: Vec::new(), compiled: Vec::new(), tests: Vec::new() })
+        Ok(Reach {
+            changes: changes.to_vec(),
+            items: Vec::new(),
+            compiled: Vec::new(),
+            tests: Vec::new(),
+        })
     }
 
-    fn edit(&self, FakeReader(read): FakeReader, _: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+    fn edit(
+        &self,
+        FakeReader(read): FakeReader,
+        _: &[blaze_api::Edit],
+    ) -> Result<blaze_api::Edited, Failed> {
         EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
     }
@@ -1084,9 +1288,16 @@ impl Front<Fake> for FakeFront {
         Ok(Vec::new())
     }
 
-    fn tables(&self, mut writer: FakeWriter, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+    fn tables(
+        &self,
+        mut writer: FakeWriter,
+        _: &[(&'static str, u64, u64)],
+    ) -> Result<Vec<Table>, Failed> {
         let counted = writer.tables()?;
-        Ok(counted.into_iter().map(|(name, elements, bytes)| Table { name: name.to_owned(), elements, bytes }).collect())
+        Ok(counted
+            .into_iter()
+            .map(|(name, elements, bytes)| Table { name: name.to_owned(), elements, bytes })
+            .collect())
     }
 
     /// The program and the build scripts' runs its front end had applied, read with the front
@@ -1102,16 +1313,30 @@ impl Front<Fake> for FakeFront {
 
     /// One page naming the build scripts' runs its front end had applied, read with the front
     /// end exclusive, as the real documentation sets `cfg(doc)`.
-    fn doc(&self, mut writer: FakeWriter, no_deps: bool, private: bool) -> Result<Vec<Response>, Failed> {
+    fn doc(
+        &self,
+        mut writer: FakeWriter,
+        no_deps: bool,
+        private: bool,
+    ) -> Result<Vec<Response>, Failed> {
         assert_eq!(self.goal, Goal::Check, "the documentation only checks its units");
         writer.apply()?;
         let Some(inputs) = Arc::get_mut(&mut writer.inputs) else {
             return Err(ApiError::new("a task still reads the front end", None).into());
         };
         let page = format!("{no_deps} {private} {:?}", inputs.runs).into_bytes();
-        let crates = vec![blaze_api::DocumentedCrate { name: "app".into(), package: "app v0.1.0 (/w)".into(), asked: true }];
+        let crates = vec![blaze_api::DocumentedCrate {
+            name: "app".into(),
+            package: "app v0.1.0 (/w)".into(),
+            asked: true,
+        }];
         Ok(vec![
-            Response::Documented(blaze_api::Documented { dir: "/w/target/doc".into(), crates, pages: 1, source_pages: 0 }),
+            Response::Documented(blaze_api::Documented {
+                dir: "/w/target/doc".into(),
+                crates,
+                pages: 1,
+                source_pages: 0,
+            }),
             Response::DocPage { path: "app/index.html".into(), page },
         ])
     }
@@ -1155,7 +1380,8 @@ type SimDaemon = Daemon<Sim, Fake>;
 fn start(sim: Sim, steps: &Arc<Fake>, seed: u64) -> SimDaemon {
     // A view's build config names the blaze that runs it (`BuildConfig::blaze`).
     crate::release::for_tests();
-    Daemon::start(sim, options(), steps.clone(), Runner::Inline(Inline::new(seed))).unwrap_or_else(|why| panic!("{why}"))
+    Daemon::start(sim, options(), steps.clone(), Runner::Inline(Inline::new(seed)))
+        .unwrap_or_else(|why| panic!("{why}"))
 }
 
 struct Client {
@@ -1253,7 +1479,10 @@ impl Client {
                 self.of(id)
             );
         }
-        panic!("request {id} never ended in {TURNS} turns with the process's worker pool idle ({busy} with it busy); it got {:?}", self.of(id));
+        panic!(
+            "request {id} never ended in {TURNS} turns with the process's worker pool idle ({busy} with it busy); it got {:?}",
+            self.of(id)
+        );
     }
 }
 
@@ -1273,7 +1502,9 @@ fn warnings(responses: &[Response]) -> Vec<String> {
     responses
         .iter()
         .filter_map(|it| match it {
-            Response::Diagnostic(diagnostic) if diagnostic.level == Level::Warning => Some(diagnostic.message.clone()),
+            Response::Diagnostic(diagnostic) if diagnostic.level == Level::Warning => {
+                Some(diagnostic.message.clone())
+            }
             _ => None,
         })
         .collect()
@@ -1323,7 +1554,8 @@ fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
     std::fs::create_dir_all(root.path().join(SOCKET).parent().unwrap()).unwrap();
     let driver = blaze_core::native(root.path(), 2).unwrap();
     let steps = Arc::new(Fake::default());
-    let daemon = Daemon::start(driver, options(), steps, Runner::Inline(Inline::new(63))).unwrap_or_else(|why| panic!("{why}"));
+    let daemon = Daemon::start(driver, options(), steps, Runner::Inline(Inline::new(63)))
+        .unwrap_or_else(|why| panic!("{why}"));
     let reached = std::os::unix::net::UnixStream::connect(root.path().join(SOCKET));
     assert!(reached.is_ok(), "a CLI that connects as start returns finds no socket: {reached:?}");
     drop(daemon);
@@ -1336,12 +1568,22 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 1);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
 
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
-    assert!(got.contains(&Response::Fetched { verb: FetchVerb::Downloaded, what: "dep v1.0.0".into() }), "{got:#?}");
-    assert!(got.contains(&Response::Fetched { verb: FetchVerb::Updating, what: "crates.io index".into() }), "{got:#?}");
+    assert!(
+        got.contains(&Response::Fetched { verb: FetchVerb::Downloaded, what: "dep v1.0.0".into() }),
+        "{got:#?}"
+    );
+    assert!(
+        got.contains(&Response::Fetched {
+            verb: FetchVerb::Updating,
+            what: "crates.io index".into()
+        }),
+        "{got:#?}"
+    );
     assert_eq!(warnings(&got), vec!["[package]\nname = \"app\"\n".to_owned()]);
     let units: Vec<(String, Verb)> = got
         .iter()
@@ -1351,8 +1593,13 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
         })
         .collect();
     assert_eq!(units.len(), 2, "one `Compiling` for each package: {units:?}");
-    assert!(units.contains(&("dep".into(), Verb::Compiling)) && units.contains(&("app".into(), Verb::Compiling)));
-    let built = got.iter().position(|it| matches!(it, Response::Built { profile, .. } if profile == FINISHED));
+    assert!(
+        units.contains(&("dep".into(), Verb::Compiling))
+            && units.contains(&("app".into(), Verb::Compiling))
+    );
+    let built = got
+        .iter()
+        .position(|it| matches!(it, Response::Built { profile, .. } if profile == FINISHED));
     let worked = got.iter().position(|it| matches!(it, Response::Work(_)));
     assert!(built.is_some() && built < worked, "`Built`, then `Work`: {got:#?}");
     assert_eq!(daemon.driver().contents(&name("w/Cargo.lock")), b"# a lock\n");
@@ -1371,7 +1618,8 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 3);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait_for_the_pool(&mut daemon, id);
     LOSES_RUNS.set(false);
 
@@ -1379,7 +1627,9 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
     let said = got
         .iter()
         .find_map(|it| match it {
-            Response::Error(error) if error.what.starts_with("blaze stalled: for") => Some(error.what.clone()),
+            Response::Error(error) if error.what.starts_with("blaze stalled: for") => {
+                Some(error.what.clone())
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("the build fails with the stall: {got:#?}"));
@@ -1391,8 +1641,12 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
     ] {
         assert!(said.contains(part), "the stall says `{part}`: {said}");
     }
-    let quiet: f64 = said["blaze stalled: for ".len()..].split(' ').next().unwrap().parse().unwrap();
-    assert!((2.0..10.0).contains(&quiet), "the stall is said within seconds of the build going still: {said}");
+    let quiet: f64 =
+        said["blaze stalled: for ".len()..].split(' ').next().unwrap().parse().unwrap();
+    assert!(
+        (2.0..10.0).contains(&quiet),
+        "the stall is said within seconds of the build going still: {said}"
+    );
 }
 
 /// Lane seedmem's hang (2026-11-02): a blaze built without `net` fails every fetch (`NoNet`),
@@ -1409,7 +1663,8 @@ fn a_build_whose_fetches_all_fail_ends_with_the_fetch_error_rather_than_hanging(
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 4);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     for _ in 0..3 {
         turns(&mut daemon, &mut client, 5_000);
         if client.done(id) {
@@ -1430,11 +1685,18 @@ fn a_build_whose_fetches_all_fail_ends_with_the_fetch_error_rather_than_hanging(
             _ => None,
         })
         .collect();
-    assert!(errors.iter().any(|it| it.contains("has no HTTP client")), "the build fails with the fetch's error: {errors:?}");
-    assert!(!errors.iter().any(|it| it.starts_with("blaze stalled")), "the build ends, not stalls: {errors:?}");
+    assert!(
+        errors.iter().any(|it| it.contains("has no HTTP client")),
+        "the build fails with the fetch's error: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|it| it.starts_with("blaze stalled")),
+        "the build ends, not stalls: {errors:?}"
+    );
     // Lane earlyfail: every source that failed is named in one error, not the first a run
     // (`hashbrown v0.16.1`, then `fnv v1.0.7` the next run), with where blaze looked.
-    let all: Vec<&&str> = errors.iter().filter(|it| it.starts_with("2 of the 2 sources this build needs")).collect();
+    let all: Vec<&&str> =
+        errors.iter().filter(|it| it.starts_with("2 of the 2 sources this build needs")).collect();
     assert_eq!(all.len(), 1, "one error names both failed fetches: {errors:?}");
     for part in [
         "crates.io index (index file) from https://index.crates.io/de/p/dep",
@@ -1470,7 +1732,8 @@ fn a_build_script_run_held_for_its_program_fails_when_its_job_ends_rather_than_s
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 41);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     SCRIPT_OUTPUT.set(None);
     SLOW_SCRIPT.set(None);
@@ -1481,10 +1744,19 @@ fn a_build_script_run_held_for_its_program_fails_when_its_job_ends_rather_than_s
     // The setup did what it means to: one run was held for its program, and the job ended
     // while it still was.
     assert_eq!(held.len(), 1, "exactly one run is held for its program's placement: {held:?}");
-    assert_eq!(ended.len(), 1, "the held run is ended as its job ends: held {held:?}, ended {ended:?}");
+    assert_eq!(
+        ended.len(),
+        1,
+        "the held run is ended as its job ends: held {held:?}, ended {ended:?}"
+    );
     let (node, why) = &ended[0];
     assert_eq!(*node, held[0], "the run ended is the run held");
-    for part in ["the build script run of `app`", "never started", "its job ended while its program was still being placed", "serve-test: applying runs"] {
+    for part in [
+        "the build script run of `app`",
+        "never started",
+        "its job ended while its program was still being placed",
+        "serve-test: applying runs",
+    ] {
         assert!(why.contains(part), "the held run's failure says `{part}`: {why}");
     }
 
@@ -1497,8 +1769,14 @@ fn a_build_script_run_held_for_its_program_fails_when_its_job_ends_rather_than_s
             _ => None,
         })
         .collect();
-    assert!(!errors.iter().any(|it| it.starts_with("blaze stalled")), "the build ends, not stalls: {errors:#?}");
-    assert!(errors.iter().any(|it| it.contains("serve-test: applying runs")), "the build says the job's own error: {errors:#?}");
+    assert!(
+        !errors.iter().any(|it| it.starts_with("blaze stalled")),
+        "the build ends, not stalls: {errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|it| it.contains("serve-test: applying runs")),
+        "the build says the job's own error: {errors:#?}"
+    );
     // Only the run that was never held reached the writer: the held one never started.
     assert_eq!(ASKED.get(), 1, "the held run never starts after its job ended");
 }
@@ -1513,11 +1791,15 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
     let steps = Arc::new(Fake::default());
     let mut first = start(sim, &steps, 23);
     let mut client = dial(&mut first);
-    let id = client.send(&mut first, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut first, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut first, id);
     SHARES.set(false);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
-    assert_eq!(first.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()), Some(SHARED.to_vec()));
+    assert_eq!(
+        first.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
+        Some(SHARED.to_vec())
+    );
     first.stop();
     let mut turns = 0;
     while first.turn() {
@@ -1531,10 +1813,17 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
         writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
         ..options()
     };
-    let second = Daemon::start(first.into_driver(), other, steps.clone(), Runner::Inline(Inline::new(24)))
-        .unwrap_or_else(|why| panic!("{why}"));
-    assert_eq!(second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()), Some(SHARED.to_vec()));
-    assert!(second.store().get(&shared_key()).unwrap().is_none(), "the home's own store has none of it");
+    let second =
+        Daemon::start(first.into_driver(), other, steps.clone(), Runner::Inline(Inline::new(24)))
+            .unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(
+        second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
+        Some(SHARED.to_vec())
+    );
+    assert!(
+        second.store().get(&shared_key()).unwrap().is_none(),
+        "the home's own store has none of it"
+    );
 }
 
 /// A reach reads each view's front end as rustc compiles it, so before it is answered each
@@ -1556,7 +1845,8 @@ fn a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them()
     let mut daemon = start(sim, &steps, 61);
     let mut client = dial(&mut daemon);
     let head = || ViewRef::Head("/w".into());
-    let id = client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
+    let id =
+        client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert!(got.iter().any(|it| matches!(it, Response::Reached(_))), "{got:#?}");
@@ -1564,16 +1854,31 @@ fn a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them()
     let ran = PHASES.with(|it| it.take());
     for unit in [0, 1, 2] {
         let stores = ran.iter().filter(|it| **it == (unit, Phase::Store)).count();
-        assert_eq!(stores, 2, "unit {unit} is built once for each of the reach's two views: {ran:?}");
+        assert_eq!(
+            stores, 2,
+            "unit {unit} is built once for each of the reach's two views: {ran:?}"
+        );
     }
-    assert!(!ran.iter().any(|it| it.0 == 4), "the library a reach reads is never compiled: {ran:?}");
+    assert!(
+        !ran.iter().any(|it| it.0 == 4),
+        "the library a reach reads is never compiled: {ran:?}"
+    );
     let reached = REACHED.with(|it| it.take());
-    assert_eq!(reached, vec![(vec![3], vec![3])], "both views read with the build script's run applied: {reached:?}");
+    assert_eq!(
+        reached,
+        vec![(vec![3], vec![3])],
+        "both views read with the build script's run applied: {reached:?}"
+    );
     let rows = ENDED_ROWS.with(|it| it.take());
-    assert_eq!(rows, ["reach"], "a reach is one plane request and one row of the history, both views' builds in it");
+    assert_eq!(
+        rows,
+        ["reach"],
+        "a reach is one plane request and one row of the history, both views' builds in it"
+    );
 
     // Again, with every record kept: its builds make nothing again, and still cost no row.
-    let id = client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
+    let id =
+        client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     let rows = ENDED_ROWS.with(|it| it.take());
@@ -1603,7 +1908,8 @@ fn an_edit_builds_its_views_proc_macros_and_build_scripts_before_it_reads_it() {
     }) else {
         panic!("the open said no root: {got:#?}")
     };
-    let id = client.send(&mut daemon, Request::Edit { base: root, head: "/w".into(), edits: Vec::new() });
+    let id = client
+        .send(&mut daemon, Request::Edit { base: root, head: "/w".into(), edits: Vec::new() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert!(got.iter().any(|it| matches!(it, Response::Edited(_))), "{got:#?}");
@@ -1613,11 +1919,22 @@ fn an_edit_builds_its_views_proc_macros_and_build_scripts_before_it_reads_it() {
         let stores = ran.iter().filter(|it| **it == (unit, Phase::Store)).count();
         assert_eq!(stores, 1, "unit {unit} is built once, for the edit's view: {ran:?}");
     }
-    assert!(!ran.iter().any(|it| it.0 == 4), "the library an edit reads is never compiled: {ran:?}");
+    assert!(
+        !ran.iter().any(|it| it.0 == 4),
+        "the library an edit reads is never compiled: {ran:?}"
+    );
     let edited = EDITED.with(|it| it.take());
-    assert_eq!(edited, vec![vec![3]], "the edit read its view with the build script's run applied: {edited:?}");
+    assert_eq!(
+        edited,
+        vec![vec![3]],
+        "the edit read its view with the build script's run applied: {edited:?}"
+    );
     let rows = ENDED_ROWS.with(|it| it.take());
-    assert_eq!(rows, ["edit"], "an edit is one plane request and one row of the history, its view's build in it");
+    assert_eq!(
+        rows,
+        ["edit"],
+        "an edit is one plane request and one row of the history, its view's build in it"
+    );
 }
 
 /// A build ahead chooses its tests from its view's def maps: before it chooses, the view builds
@@ -1633,18 +1950,30 @@ fn a_build_ahead_builds_its_views_proc_macros_and_build_scripts_before_it_choose
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 271);
     let mut client = dial(&mut daemon);
-    let intent = Request::WillTest { view: ViewRef::Head("/w".into()), filter: vec!["adds".into()], targets: agent(), wait_ms: 600_000 };
+    let intent = Request::WillTest {
+        view: ViewRef::Head("/w".into()),
+        filter: vec!["adds".into()],
+        targets: agent(),
+        wait_ms: 600_000,
+    };
     let id = client.send(&mut daemon, intent);
     let got = client.wait(&mut daemon, id);
     assert!(got.iter().any(|it| matches!(it, Response::Announced { .. })), "{got:#?}");
     turn_until(&mut daemon, |_| ENDED_ROWS.with_borrow(|it| !it.is_empty()));
 
     let read = AHEAD_READ.with(|it| it.take());
-    assert_eq!(read, vec![vec![3]], "the build ahead chose with the build script's run applied: {read:?}");
+    assert_eq!(
+        read,
+        vec![vec![3]],
+        "the build ahead chose with the build script's run applied: {read:?}"
+    );
     let ran = PHASES.with(|it| it.take());
     let first = ran.iter().position(|it| *it == (1, Phase::Store));
     assert!(first.is_some(), "the view's proc macro was built: {ran:?}");
-    assert!(!ran.iter().any(|it| it.0 == 4), "the library no chosen test needs is never compiled: {ran:?}");
+    assert!(
+        !ran.iter().any(|it| it.0 == 4),
+        "the library no chosen test needs is never compiled: {ran:?}"
+    );
     let rows = ENDED_ROWS.with(|it| it.take());
     assert_eq!(rows, ["ahead"], "a build ahead is one plane request and one row of the history");
 }
@@ -1659,7 +1988,8 @@ fn a_units_compile_runs_each_of_its_phases_once_in_order() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 17);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
 
@@ -1673,9 +2003,16 @@ fn a_units_compile_runs_each_of_its_phases_once_in_order() {
         let mut each = phases.clone();
         each.sort_unstable_by_key(|it| *it as u8);
         assert!(each == Phase::BUILD || each == Phase::CHECK, "unit {unit} ran {phases:?}");
-        assert_eq!((phases[0], phases[phases.len() - 1]), (Phase::Names, Phase::Store), "unit {unit}: {phases:?}");
+        assert_eq!(
+            (phases[0], phases[phases.len() - 1]),
+            (Phase::Names, Phase::Store),
+            "unit {unit}: {phases:?}"
+        );
         if let Some(link) = phases.iter().position(|it| *it == Phase::Link) {
-            assert!(phases[..link].contains(&Phase::Bodies) && phases[..link].contains(&Phase::Codegen), "unit {unit}: {phases:?}");
+            assert!(
+                phases[..link].contains(&Phase::Bodies) && phases[..link].contains(&Phase::Codegen),
+                "unit {unit}: {phases:?}"
+            );
         }
     }
 }
@@ -1688,14 +2025,16 @@ fn a_unit_that_warned_ends_after_its_warnings_and_built_counts_the_members() {
     let mut daemon = start(sim, &steps, 31);
     WARNS.set(true);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     WARNS.set(false);
 
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     let of_app = |it: &Response| matches!(it, Response::Diagnostic(it) if it.unit.is_some());
     let said: Vec<usize> = (0..got.len()).filter(|&at| of_app(&got[at])).collect();
-    let ended: Vec<usize> = (0..got.len()).filter(|&at| matches!(got[at], Response::UnitEnded(_))).collect();
+    let ended: Vec<usize> =
+        (0..got.len()).filter(|&at| matches!(got[at], Response::UnitEnded(_))).collect();
     assert_eq!(said.len(), 2, "{got:#?}");
     assert_eq!(ended, [said[1] + 1], "the unit ends once, right after its last warning: {got:#?}");
     let Response::UnitEnded(unit) = &got[ended[0]] else { unreachable!() };
@@ -1714,12 +2053,16 @@ fn a_request_on_a_checkout_sees_what_was_saved_before_it() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 2);
     let mut client = dial(&mut daemon);
-    let first = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let first = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(warnings(&client.wait(&mut daemon, first)), vec!["first\n".to_owned()]);
     for round in 0..8 {
         let saved = format!("saved before request {round}\n");
         daemon.driver().change(&name("w/Cargo.toml"), saved.as_bytes());
-        let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Check { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         let got = client.wait(&mut daemon, id);
         assert_eq!(warnings(&got), vec![saved], "{got:#?}");
     }
@@ -1732,7 +2075,8 @@ fn the_mount_table_survives_a_restart() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 3);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     let sorted = |daemon: &SimDaemon| {
         let mut all: Vec<_> = daemon.mounts().all().cloned().collect();
@@ -1748,13 +2092,21 @@ fn the_mount_table_survives_a_restart() {
     assert_eq!(sorted(&daemon), before);
     assert_eq!(daemon.mounts().roots(), roots);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
-    assert!(!got.iter().any(|it| matches!(it, Response::Fetched { .. })), "nothing fetched again: {got:#?}");
+    assert!(
+        !got.iter().any(|it| matches!(it, Response::Fetched { .. })),
+        "nothing fetched again: {got:#?}"
+    );
     let fetched = steps.fetched.lock().clone();
     assert!(fetched.values().all(|&it| it == 1), "each source fetched once: {fetched:?}");
-    assert_eq!(LIBRARY_READS.get(), 1, "the library's files are read once, not again by the next daemon");
+    assert_eq!(
+        LIBRARY_READS.get(),
+        1,
+        "the library's files are read once, not again by the next daemon"
+    );
 }
 
 #[test]
@@ -1764,7 +2116,11 @@ fn an_agents_targets_are_the_views_invocation() {
     let mut daemon = start(sim, &steps, 5);
     let mut client = dial(&mut daemon);
     let base = daemon.vfs().empty();
-    let ops = vec![Op::Write { path: "Cargo.toml".into(), bytes: b"agent\n".to_vec(), mode: blaze_vfs::Mode::Regular }];
+    let ops = vec![Op::Write {
+        path: "Cargo.toml".into(),
+        bytes: b"agent\n".to_vec(),
+        mode: blaze_vfs::Mode::Regular,
+    }];
     let commit = client.send(&mut daemon, Request::Commit { head: "agents/one".into(), base, ops });
     let root = match client.wait(&mut daemon, commit).first() {
         Some(Response::Committed { root, .. }) => *root,
@@ -1780,7 +2136,8 @@ fn an_agents_targets_are_the_views_invocation() {
         cargo: None,
     };
     SAW.with(|it| it.borrow_mut().clear());
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("agents/one".into()), targets });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("agents/one".into()), targets });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert_eq!(warnings(&got), vec!["agent\n".to_owned()]);
@@ -1801,10 +2158,14 @@ fn an_agents_targets_are_the_views_invocation() {
     );
     assert_eq!(config.library, LIBRARY);
     assert_eq!(config.host, "x86_64-unknown-linux-gnu");
-    let view = config.mounts.iter().find(|it| it.origin == Origin::View).expect("the view is mounted");
+    let view =
+        config.mounts.iter().find(|it| it.origin == Origin::View).expect("the view is mounted");
     assert_eq!(view.at, at);
     assert!(config.mounts.windows(2).all(|it| it[0].at <= it[1].at), "mounts sorted by where");
-    assert_eq!(daemon.driver().contents(&FileName::new(&format!("{}/Cargo.lock", &at[1..])).unwrap()), b"# a lock\n");
+    assert_eq!(
+        daemon.driver().contents(&FileName::new(&format!("{}/Cargo.lock", &at[1..])).unwrap()),
+        b"# a lock\n"
+    );
 }
 
 #[test]
@@ -1814,20 +2175,29 @@ fn a_start_from_the_image_runs_no_load_again() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 6);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     turn_until(&mut daemon, |it| it.settled());
-    assert!(daemon.driver().exists(&name(&format!("{STATE}/db/image"))), "the cold build wrote the image");
+    assert!(
+        daemon.driver().exists(&name(&format!("{STATE}/db/image"))),
+        "the cold build wrote the image"
+    );
 
     let mut daemon = restart(daemon, &steps, 7);
     PLANS.with(|it| it.set(0));
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     // Started again in this process, its database is warm only if nothing here had interned a
     // symbol before the restart restored them.
     let loads = PLANS.with(Cell::get);
-    assert_eq!(loads == 0, daemon.warm(), "the load ran again exactly when the database started empty ({loads})");
+    assert_eq!(
+        loads == 0,
+        daemon.warm(),
+        "the load ran again exactly when the database started empty ({loads})"
+    );
 }
 
 #[test]
@@ -1838,11 +2208,15 @@ fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_r
     let mut daemon = start(sim, &steps, 9);
     assert!(daemon.started().restored.is_none(), "the first start has no image");
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     // Stopped before the loop turns idle, where a build's image is otherwise asked.
     let mut daemon = restart(daemon, &steps, 10);
-    assert!(daemon.driver().exists(&name(&format!("{STATE}/db/image"))), "the stop wrote the build's image");
+    assert!(
+        daemon.driver().exists(&name(&format!("{STATE}/db/image"))),
+        "the stop wrote the build's image"
+    );
     // A second daemon in one process can't take the image's symbols (`Cold::Interned`); every
     // other start opens it.
     let started = daemon.started();
@@ -1883,11 +2257,16 @@ fn a_stop_during_an_unchanged_settle_writes_one_image_and_a_change_between_write
             assert!(turns < TURNS, "the daemon never stopped");
         }
         let made = daemon.images_made();
-        assert_eq!(made, if changed { 2 } else { 1 }, "changed between the settle and the stop: {changed}");
+        assert_eq!(
+            made,
+            if changed { 2 } else { 1 },
+            "changed between the settle and the stop: {changed}"
+        );
         let daemon = start(daemon.into_driver(), &steps, seed + 10);
         let started = daemon.started();
         assert!(
-            started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
+            started.restored.is_some()
+                || matches!(started.cold, Some(super::daemon::Cold::Interned)),
             "the next start opens the stop's image: {started}"
         );
     }
@@ -1914,7 +2293,10 @@ fn what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_cra
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         let got = client.wait(&mut daemon, id);
         ERRS_COMPILE.set(None);
         assert_eq!(got.last(), Some(&Response::Done { ok: errs.is_none() }), "{got:#?}");
@@ -1923,7 +2305,10 @@ fn what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_cra
         let mut sim = daemon.into_driver();
         sim.crash();
         let daemon = start(sim, &steps, seed + 1000);
-        assert!(holds_kept(daemon.store(), "/w"), "a crash after the answer keeps it (failing build: {errs:?})");
+        assert!(
+            holds_kept(daemon.store(), "/w"),
+            "a crash after the answer keeps it (failing build: {errs:?})"
+        );
     }
 }
 
@@ -1962,19 +2347,33 @@ fn a_checkout_whose_last_put_another_put_first_answers_once_its_own_are_durable(
         let mut daemon = start(sim, &steps, seed);
         let mut writer = daemon.store_mut().writer();
         let guard = blaze_cas::enter();
-        let first = writer.put(&guard, shared_kept_key(), blaze_cas::Kind::Query, SHARED_KEPT).unwrap();
+        let first =
+            writer.put(&guard, shared_kept_key(), blaze_cas::Kind::Query, SHARED_KEPT).unwrap();
         drop(guard);
         let mut client = dial(&mut daemon);
         for head in ["/v", "/w"] {
-            let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head(head.into()), targets: agent() });
-            assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "{head}");
+            let id = client.send(
+                &mut daemon,
+                Request::Build { view: ViewRef::Head(head.into()), targets: agent() },
+            );
+            assert_eq!(
+                client.wait(&mut daemon, id).last(),
+                Some(&Response::Done { ok: true }),
+                "{head}"
+            );
             // `/v` answered on the writer's put, so it waited for it.
-            assert!(daemon.store().durable(first), "seed {seed}: {head} answered before the value it put was durable");
+            assert!(
+                daemon.store().durable(first),
+                "seed {seed}: {head} answered before the value it put was durable"
+            );
         }
         let mut sim = daemon.into_driver();
         sim.crash();
         let daemon = start(sim, &steps, seed + 1000);
-        assert!(holds_kept(daemon.store(), "/w") && holds_kept(daemon.store(), "/v"), "seed {seed}");
+        assert!(
+            holds_kept(daemon.store(), "/w") && holds_kept(daemon.store(), "/v"),
+            "seed {seed}"
+        );
         drop(writer);
     }
 }
@@ -1996,7 +2395,8 @@ fn a_build_that_puts_nothing_waits_for_what_the_loop_put_before_it_ended() {
     let mut client = dial(&mut daemon);
     daemon.driver().hold_syncs(store_dir());
     let start = daemon.driver().now();
-    let w = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let w = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     for _ in 0..TURNS {
         if holds_kept(daemon.store(), "/w") {
             break;
@@ -2005,10 +2405,19 @@ fn a_build_that_puts_nothing_waits_for_what_the_loop_put_before_it_ended() {
         client.take(&mut daemon);
     }
     assert!(holds_kept(daemon.store(), "/w"), "the build of /w never put what it left");
-    let v = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/v".into()), targets: agent() });
+    let v = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/v".into()), targets: agent() });
     turns(&mut daemon, &mut client, 3000);
-    assert!(client.of(v).iter().any(|it| matches!(it, Response::Built { .. })), "/v was built: {:#?}", client.of(v));
-    assert!(!client.done(v), "/v answered on a loop whose puts are not durable: {:#?}", client.of(v));
+    assert!(
+        client.of(v).iter().any(|it| matches!(it, Response::Built { .. })),
+        "/v was built: {:#?}",
+        client.of(v)
+    );
+    assert!(
+        !client.done(v),
+        "/v answered on a loop whose puts are not durable: {:#?}",
+        client.of(v)
+    );
     assert!(!client.done(w), "/w answered with what it left not durable: {:#?}", client.of(w));
     // The waits above ran on the clock's own pace, far short of the bound: they did not
     // answer because they wait, not because time ran out first.
@@ -2042,7 +2451,8 @@ fn a_build_whose_store_commit_hangs_fails_naming_it_once_the_store_answers_nothi
     let mut client = dial(&mut daemon);
     daemon.driver().hold_syncs(store_dir());
     let start = daemon.driver().now();
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     turns(&mut daemon, &mut client, 3000);
     assert!(!client.done(id), "answered with what it left not durable: {:#?}", client.of(id));
     assert!(daemon.driver().held_syncs() > 0, "the store's commit is held");
@@ -2090,11 +2500,15 @@ fn a_build_whose_store_commit_is_slow_but_moving_waits_past_the_bound_and_succee
     let step = DURABLE_WITHIN * 4 / 10;
     daemon.driver().slow_writes(store_dir(), step);
     let start = daemon.driver().now();
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     let took = daemon.driver().now() - start;
-    assert!(took > DURABLE_WITHIN, "the commit took {took:?}, not past the bound: the test tests nothing");
+    assert!(
+        took > DURABLE_WITHIN,
+        "the commit took {took:?}, not past the bound: the test tests nothing"
+    );
     assert!(holds_kept(daemon.store(), "/w"), "answered, and what it left is not in the store");
 }
 
@@ -2114,16 +2528,29 @@ fn a_put_no_one_hands_over_is_durable_once_its_job_answers() {
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
-        let request =
-            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let request = Request::Test {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        };
         let id = client.send(&mut daemon, request);
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
-        assert!(daemon.store().get(&test_record_key()).unwrap().is_some(), "seed {seed}: the run kept nothing");
+        assert!(
+            daemon.store().get(&test_record_key()).unwrap().is_some(),
+            "seed {seed}: the run kept nothing"
+        );
         let mut sim = daemon.into_driver();
         sim.crash();
         let daemon = start(sim, &steps, seed + 1000);
-        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
+        let kept = daemon
+            .store()
+            .get(&test_record_key())
+            .unwrap()
+            .is_some_and(|it| it.bytes == TEST_RECORD);
         assert!(kept, "seed {seed}: the job answered and a crash lost a put no one handed over");
     }
     TESTS_KEEP_UNTOLD.set(false);
@@ -2147,8 +2574,14 @@ fn a_put_no_one_hands_over_through_another_segment_is_durable_once_its_job_answe
         let writer = daemon.store_mut().writer();
         UNTOLD_WRITER.with_borrow_mut(|it| *it = Some(writer));
         let mut client = dial(&mut daemon);
-        let request =
-            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let request = Request::Test {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        };
         let id = client.send(&mut daemon, request);
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
@@ -2159,8 +2592,15 @@ fn a_put_no_one_hands_over_through_another_segment_is_durable_once_its_job_answe
         sim.crash();
         drop(written);
         let daemon = start(sim, &steps, seed + 1000);
-        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
-        assert!(kept, "seed {seed}: the job answered and a crash lost a put no one handed over, made on another segment");
+        let kept = daemon
+            .store()
+            .get(&test_record_key())
+            .unwrap()
+            .is_some_and(|it| it.bytes == TEST_RECORD);
+        assert!(
+            kept,
+            "seed {seed}: the job answered and a crash lost a put no one handed over, made on another segment"
+        );
     }
     TESTS_KEEP_UNTOLD.set(false);
     TESTS_KEEP.set(false);
@@ -2182,14 +2622,19 @@ fn a_put_counted_and_not_yet_published_is_waited_for_and_answered_soon_after_it_
     let held = writer.hold_put();
     let mut client = dial(&mut daemon);
     let start = daemon.driver().now();
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     turns(&mut daemon, &mut client, 3000);
     assert!(daemon.store_deadline().is_some(), "the job waits at its gate: {:#?}", client.of(id));
     for _ in 0..20 {
         daemon.driver().advance(RECHECK);
         turns(&mut daemon, &mut client, 5);
     }
-    assert!(!client.done(id), "answered while a put it could have read is not published: {:#?}", client.of(id));
+    assert!(
+        !client.done(id),
+        "answered while a put it could have read is not published: {:#?}",
+        client.of(id)
+    );
     let ran = daemon.driver().now() - start;
     assert!(ran < DURABLE_WITHIN / 2, "the wait ran {ran:?} of the clock while held");
     // The put ends with nothing else of the store's in flight: only the gate's recheck wakes
@@ -2204,7 +2649,11 @@ fn a_put_counted_and_not_yet_published_is_waited_for_and_answered_soon_after_it_
         turns(&mut daemon, &mut client, 5);
     }
     let got = client.of(id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "not answered soon after the put ended: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "not answered soon after the put ended: {got:#?}"
+    );
     let took = daemon.driver().now() - ended;
     assert!(took <= RECHECK * 10, "answered {took:?} after the put ended");
     drop(writer);
@@ -2226,8 +2675,14 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 268);
     let mut client = dial(&mut daemon);
-    let request =
-        Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+    let request = Request::Test {
+        view: ViewRef::Head("/w".into()),
+        targets: agent(),
+        filter: Vec::new(),
+        all: false,
+        args: Vec::new(),
+        ub: None,
+    };
     let started = KEEPS_STARTED.get();
     let id = client.send(&mut daemon, request);
     turn_until(&mut daemon, |daemon| {
@@ -2254,7 +2709,10 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     assert!(daemon.store().broken().is_some(), "the store broke");
     let took = daemon.driver().now() - start;
     let got = client.of(id);
-    assert!(took < Duration::from_secs(3600), "not answered while its run was still going ({took:?} on the clock): {got:#?}");
+    assert!(
+        took < Duration::from_secs(3600),
+        "not answered while its run was still going ({took:?} on the clock): {got:#?}"
+    );
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
     let named = |it: &Response| {
         matches!(it, Response::Error(error) if error.what.contains("the daemon's store")
@@ -2290,8 +2748,14 @@ fn a_stop_hangs_up_on_a_client_that_stopped_reading_once_its_last_sends_outlast_
     }
     let took = daemon.driver().now() - asked;
     let bound = super::daemon::LAST_EFFECTS;
-    assert!(took > bound && took < bound + Duration::from_secs(1), "stopped {took:?} after it was asked; its bound for last sends is {bound:?}");
-    assert!(daemon.driver().peer_hung_up_on(client.conn), "the stop left the client that stopped reading connected");
+    assert!(
+        took > bound && took < bound + Duration::from_secs(1),
+        "stopped {took:?} after it was asked; its bound for last sends is {bound:?}"
+    );
+    assert!(
+        daemon.driver().peer_hung_up_on(client.conn),
+        "the stop left the client that stopped reading connected"
+    );
     assert_eq!(daemon.driver().held_sends(), 0, "the hang-up ends the held send");
     client.take(&mut daemon);
     assert!(!client.done(id), "a held send reached the client: {:?}", client.of(id));
@@ -2316,28 +2780,38 @@ fn a_hung_commit_fails_at_the_bound_though_the_store_answers_placements_meanwhil
     let mut client = dial(&mut daemon);
     daemon.driver().hold_syncs(store_dir());
     let start = daemon.driver().now();
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     turns(&mut daemon, &mut client, 3000);
     assert!(!client.done(id), "answered with what it left not durable: {:#?}", client.of(id));
     assert!(daemon.driver().held_syncs() > 0, "the store's commit is held");
     let ran = daemon.driver().now() - start;
     assert!(ran < Duration::from_secs(1), "the build took {ran:?} of the clock before the advance");
     let deadline = daemon.store_deadline().expect("the job waits at its gate");
-    assert!(deadline >= start + DURABLE_WITHIN, "the job's next deadline {deadline:?} is no bound from {start:?}");
+    assert!(
+        deadline >= start + DURABLE_WITHIN,
+        "the job's next deadline {deadline:?} is no bound from {start:?}"
+    );
     let mut placed = 0;
     for quarter in 0..12 {
         if client.done(id) {
             break;
         }
         daemon.driver().advance(DURABLE_WITHIN / 4);
-        assert!(daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{quarter}"))).is_some(), "a placement asked");
+        assert!(
+            daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{quarter}"))).is_some(),
+            "a placement asked"
+        );
         turns(&mut daemon, &mut client, 50);
         placed += 1;
     }
     // The wait began within the opening turns, under a second in, so the bound falls on the
     // fourth quarter: the placement asked then answers in the bound's own tick, dispatched
     // before the turn's expiry judges the wait (`>=` in `gave_up`), and the build fails there.
-    assert!(placed >= 4, "the store answered placements every quarter up to the bound ({placed} quarters)");
+    assert!(
+        placed >= 4,
+        "the store answered placements every quarter up to the bound ({placed} quarters)"
+    );
     let got = client.of(id);
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
     let named = |it: &Response| matches!(it, Response::Error(error) if error.what.contains("answered nothing") && error.what.contains("store ticket"));
@@ -2367,33 +2841,56 @@ fn a_commit_step_that_answers_at_the_bound_counts_whatever_else_answers_then() {
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
         daemon.driver().hold_syncs(store_dir());
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         turns(&mut daemon, &mut client, 3000);
-        assert!(!client.done(id), "seed {seed}: answered with what it left not durable: {:#?}", client.of(id));
+        assert!(
+            !client.done(id),
+            "seed {seed}: answered with what it left not durable: {:#?}",
+            client.of(id)
+        );
         assert!(daemon.driver().held_syncs() > 0, "seed {seed}: the store's commit is held");
         // The syncs and the placements all answer at the deadline itself: the bound from the
         // tick the wait began, less what the clock has run since.
         let deadline = daemon.store_deadline().expect("a job waits for the store");
         let after = deadline - daemon.driver().now();
-        assert!(after > DURABLE_WITHIN / 2 && after <= DURABLE_WITHIN, "seed {seed}: the wait's deadline is {after:?} away");
+        assert!(
+            after > DURABLE_WITHIN / 2 && after <= DURABLE_WITHIN,
+            "seed {seed}: the wait's deadline is {after:?} away"
+        );
         daemon.driver().record(vec![store_dir(), name("placed")]);
         daemon.driver().slow_writes(name("placed"), after);
         daemon.driver().release_held(after);
         for at in 0..4 {
-            assert!(daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{at}"))).is_some(), "a placement asked");
+            assert!(
+                daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{at}"))).is_some(),
+                "a placement asked"
+            );
         }
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
         let recorded = daemon.driver().recorded();
         let placed = name("placed");
-        let sync_at = recorded.iter().position(|(_, file, sync)| *sync && file.is_under(&store_dir()));
-        let sync_at = sync_at.unwrap_or_else(|| panic!("seed {seed}: no sync of the store was told: {recorded:?}"));
+        let sync_at =
+            recorded.iter().position(|(_, file, sync)| *sync && file.is_under(&store_dir()));
+        let sync_at = sync_at
+            .unwrap_or_else(|| panic!("seed {seed}: no sync of the store was told: {recorded:?}"));
         let tick = recorded[sync_at].0;
-        assert_eq!(tick, deadline, "seed {seed}: the released sync was told at {tick:?}, not at the deadline");
-        let before = recorded[..sync_at].iter().any(|(at, file, sync)| *at == tick && !*sync && file.is_under(&placed));
+        assert_eq!(
+            tick, deadline,
+            "seed {seed}: the released sync was told at {tick:?}, not at the deadline"
+        );
+        let before = recorded[..sync_at]
+            .iter()
+            .any(|(at, file, sync)| *at == tick && !*sync && file.is_under(&placed));
         placement_first += usize::from(before);
     }
-    assert!(placement_first > 0, "no seed told a placement before the commit's sync in the deadline's tick: the test tests nothing");
+    assert!(
+        placement_first > 0,
+        "no seed told a placement before the commit's sync in the deadline's tick: the test tests nothing"
+    );
 }
 
 /// Bounded progress: a store that breaks (its syncs fail until it gives up) never makes a
@@ -2407,7 +2904,8 @@ fn a_build_whose_store_breaks_fails_naming_why() {
     let mut daemon = start(sim, &steps, 195);
     let mut client = dial(&mut daemon);
     daemon.driver().fail_syncs(store_dir());
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert!(daemon.store().broken().is_some(), "the store broke");
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
@@ -2419,7 +2917,12 @@ fn a_build_whose_store_breaks_fails_naming_why() {
     // And the daemon stops, naming its store, as it does for the shared one: the next
     // request starts a fresh daemon rather than build on a store that can't commit.
     let failed = daemon.failed().map(ToString::to_string);
-    assert!(failed.as_deref().is_some_and(|it| it.contains("the daemon's store") && it.contains("Input/output error")), "{failed:?}");
+    assert!(
+        failed.as_deref().is_some_and(
+            |it| it.contains("the daemon's store") && it.contains("Input/output error")
+        ),
+        "{failed:?}"
+    );
 }
 
 /// Review round 2, C1 and C2: what user code run by the job put (here the tests' run keeping
@@ -2435,16 +2938,29 @@ fn what_a_run_put_is_durable_once_its_job_answers() {
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
-        let request =
-            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let request = Request::Test {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        };
         let id = client.send(&mut daemon, request);
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
-        assert!(daemon.store().get(&test_record_key()).unwrap().is_some(), "seed {seed}: the run kept nothing");
+        assert!(
+            daemon.store().get(&test_record_key()).unwrap().is_some(),
+            "seed {seed}: the run kept nothing"
+        );
         let mut sim = daemon.into_driver();
         sim.crash();
         let daemon = start(sim, &steps, seed + 1000);
-        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
+        let kept = daemon
+            .store()
+            .get(&test_record_key())
+            .unwrap()
+            .is_some_and(|it| it.bytes == TEST_RECORD);
         assert!(kept, "seed {seed}: the job answered and a crash lost what its run put");
     }
     TESTS_KEEP.set(false);
@@ -2452,10 +2968,16 @@ fn what_a_run_put_is_durable_once_its_job_answers() {
 
 /// What a build of `/w` gives that a restart must not change: whether it is done, and the
 /// bytes of its program and of each value it left for the store.
-fn outcome(daemon: &mut SimDaemon, got: &[Response]) -> (Option<Response>, Vec<u8>, Vec<Option<Vec<u8>>>) {
+fn outcome(
+    daemon: &mut SimDaemon,
+    got: &[Response],
+) -> (Option<Response>, Vec<u8>, Vec<Option<Vec<u8>>>) {
     let app = daemon.driver().contents(&name(&APP_AT[1..]));
     let keys = [kept_key("/w", 0), kept_key("/w", 1), shared_kept_key()];
-    let kept = keys.iter().map(|key| daemon.store().get(key).unwrap().map(|it| it.bytes.to_vec())).collect();
+    let kept = keys
+        .iter()
+        .map(|key| daemon.store().get(key).unwrap().map(|it| it.bytes.to_vec()))
+        .collect();
     (got.last().cloned(), app, kept)
 }
 
@@ -2476,7 +2998,10 @@ fn a_crash_after_any_turn_keeps_what_was_answered_and_restores_to_a_fresh_build(
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, 140);
         let mut client = dial(&mut daemon);
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         let got = client.wait(&mut daemon, id);
         outcome(&mut daemon, &got)
     };
@@ -2488,7 +3013,8 @@ fn a_crash_after_any_turn_keeps_what_was_answered_and_restores_to_a_fresh_build(
         second_checkout(&mut sim);
         let mut daemon = start(sim, steps, seed);
         let mut client = dial(&mut daemon);
-        let builds = ["/w", "/v"].map(|head| Request::Build { view: ViewRef::Head(head.into()), targets: agent() });
+        let builds = ["/w", "/v"]
+            .map(|head| Request::Build { view: ViewRef::Head(head.into()), targets: agent() });
         let ids = client.send_together(&mut daemon, builds.into());
         (daemon, client, ids)
     };
@@ -2528,20 +3054,32 @@ fn a_crash_after_any_turn_keeps_what_was_answered_and_restores_to_a_fresh_build(
         sim.crash();
         let mut daemon = start(sim, &steps, seed + 1000 + k as u64);
         for head in &answered {
-            assert!(holds_kept(daemon.store(), head), "crash after turn {k}: {head} answered, and lost what it left");
+            assert!(
+                holds_kept(daemon.store(), head),
+                "crash after turn {k}: {head} answered, and lost what it left"
+            );
         }
         let mut client = dial(&mut daemon);
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         let got = client.wait(&mut daemon, id);
         assert_eq!(outcome(&mut daemon, &got), fresh, "crash after turn {k}");
     }
-    assert!(answered_any > 0, "no crash point came after an answer, of {turns} turns: the test checks nothing kept");
+    assert!(
+        answered_any > 0,
+        "no crash point came after an answer, of {turns} turns: the test checks nothing kept"
+    );
     assert!(
         answered_one > 0,
         "no crash point came after one checkout answered and before the other did, of {turns} turns: the race it is for \
          was never crashed in"
     );
-    eprintln!("crash points: {} in all, {answered_any} after an answer, {answered_one} after one alone", turns + 1);
+    eprintln!(
+        "crash points: {} in all, {answered_any} after an answer, {answered_one} after one alone",
+        turns + 1
+    );
     OUTPUT.set(false);
 }
 
@@ -2561,22 +3099,37 @@ fn a_build_asked_while_its_front_end_is_stored_waits_and_lowers_into_it() {
         let mut daemon = start(sim, &steps, seed);
         daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, true);
         let mut client = dial(&mut daemon);
-        let first = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let first = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         turn_until(&mut daemon, |daemon| {
             client.take(daemon);
             daemon.storing() > 0 || client.done(first)
         });
-        assert!(!client.done(first), "seed {seed}: answered before its front end was stored: {:#?}", client.of(first));
+        assert!(
+            !client.done(first),
+            "seed {seed}: answered before its front end was stored: {:#?}",
+            client.of(first)
+        );
         let (anew, into_kept) = (ANEW.get(), INTO_KEPT.get());
-        let second = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let second = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         // Let go in the turn it is seen: with the store and the lowering both waiting, nothing
         // else is in flight, and the simulation's clock would jump to the stall's timer.
         turn_until(&mut daemon, |daemon| {
             client.take(daemon);
-            let held = daemon.held_lowerings().iter().any(|it| it.checkout == "/w" && it.on.is_some());
+            let held =
+                daemon.held_lowerings().iter().any(|it| it.checkout == "/w" && it.on.is_some());
             held || client.done(second)
         });
-        assert!(!client.done(second), "seed {seed}: the second build never waited for the store: {:#?}", client.of(second));
+        assert!(
+            !client.done(second),
+            "seed {seed}: the second build never waited for the store: {:#?}",
+            client.of(second)
+        );
         assert!(daemon.storing() > 0, "seed {seed}: the store ended while held");
         daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, false);
         turn_until(&mut daemon, |daemon| {
@@ -2585,7 +3138,11 @@ fn a_build_asked_while_its_front_end_is_stored_waits_and_lowers_into_it() {
         });
         assert_eq!(client.of(first).last(), Some(&Response::Done { ok: true }), "seed {seed}");
         assert_eq!(client.of(second).last(), Some(&Response::Done { ok: true }), "seed {seed}");
-        assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 1), "seed {seed}: the second lowers into the stored front end");
+        assert_eq!(
+            (ANEW.get(), INTO_KEPT.get()),
+            (anew, into_kept + 1),
+            "seed {seed}: the second lowers into the stored front end"
+        );
     }
 }
 
@@ -2601,9 +3158,16 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
         let reads = KEPT_READS.get();
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-        assert_eq!(KEPT_READS.get(), reads, "the first build of a fresh daemon finds nothing stored");
+        assert_eq!(
+            KEPT_READS.get(),
+            reads,
+            "the first build of a fresh daemon finds nothing stored"
+        );
         let mut daemon = match crash {
             false => restart(daemon, &steps, seed + 1000),
             true => {
@@ -2614,10 +3178,17 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
         };
         let mut client = dial(&mut daemon);
         let anew = ANEW.get();
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
         assert_eq!(ANEW.get(), anew + 1, "a restarted daemon lowers anew");
-        assert_eq!(KEPT_READS.get(), reads + 1, "and reads what the last build stored (crash: {crash})");
+        assert_eq!(
+            KEPT_READS.get(),
+            reads + 1,
+            "and reads what the last build stored (crash: {crash})"
+        );
     }
 }
 
@@ -2632,10 +3203,17 @@ fn a_build_lowers_into_the_front_end_its_last_build_stored() {
     let mut client = dial(&mut daemon);
     let (anew, into_kept, stores) = (ANEW.get(), INTO_KEPT.get(), STORES.get());
     for _ in 0..2 {
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     }
-    assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew + 1, into_kept + 1), "the second build lowers into the first's");
+    assert_eq!(
+        (ANEW.get(), INTO_KEPT.get()),
+        (anew + 1, into_kept + 1),
+        "the second build lowers into the first's"
+    );
     assert_eq!(STORES.get(), stores + 2, "each build stores what it left");
 }
 
@@ -2648,7 +3226,12 @@ fn a_run_reports_what_ran_after_built() {
     let mut client = dial(&mut daemon);
     let id = client.send(
         &mut daemon,
-        Request::Run { view: ViewRef::Head("/w".into()), targets: agent(), bin: None, args: Vec::new() },
+        Request::Run {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            bin: None,
+            args: Vec::new(),
+        },
     );
     let got = client.wait(&mut daemon, id);
     let at = |what: fn(&Response) -> bool| got.iter().position(what);
@@ -2677,12 +3260,21 @@ fn a_run_starts_only_once_its_program_is_placed() {
     let mut client = dial(&mut daemon);
     let id = client.send(
         &mut daemon,
-        Request::Run { view: ViewRef::Head("/w".into()), targets: agent(), bin: None, args: Vec::new() },
+        Request::Run {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            bin: None,
+            args: Vec::new(),
+        },
     );
     let got = client.wait(&mut daemon, id);
     OUTPUT.set(false);
     let started = RUNS_STARTED_PLACING.with_borrow_mut(std::mem::take);
-    assert_eq!(started, [0], "the run starts once, with none of its job's placements in flight: {got:#?}");
+    assert_eq!(
+        started,
+        [0],
+        "the run starts once, with none of its job's placements in flight: {got:#?}"
+    );
     assert_eq!(daemon.driver().contents(&name(&APP_AT[1..])), APP, "the program is placed whole");
     assert!(got.iter().any(|it| matches!(it, Response::Ran { code: Some(0), .. })), "{got:#?}");
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
@@ -2695,17 +3287,26 @@ fn a_pack_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 41);
     let mut client = dial(&mut daemon);
-    let pack = Request::Pack { view: ViewRef::Head("/w".into()), targets: agent(), program: "app".into() };
+    let pack =
+        Request::Pack { view: ViewRef::Head("/w".into()), targets: agent(), program: "app".into() };
     let id = client.send(&mut daemon, pack);
     let got = client.wait(&mut daemon, id);
     let built = got.iter().position(|it| matches!(it, Response::Built { .. }));
     let packed = got.iter().position(|it| matches!(it, Response::Packed { .. }));
     assert!(built.is_some() && built < packed, "`Built`, then `Packed`: {got:#?}");
-    assert!(got.contains(&Response::Packed { pack: b"app [2]".to_vec() }), "app's build script ran first: {got:#?}");
+    assert!(
+        got.contains(&Response::Packed { pack: b"app [2]".to_vec() }),
+        "app's build script ran first: {got:#?}"
+    );
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
 
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
-    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "the head builds after a pack");
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(
+        client.wait(&mut daemon, id).last(),
+        Some(&Response::Done { ok: true }),
+        "the head builds after a pack"
+    );
 }
 
 #[test]
@@ -2715,21 +3316,38 @@ fn the_documentation_is_made_once_its_check_is_built_with_every_scripts_run_appl
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 42);
     let mut client = dial(&mut daemon);
-    let doc = Request::Doc { view: ViewRef::Head("/w".into()), targets: agent(), no_deps: true, private: false };
+    let doc = Request::Doc {
+        view: ViewRef::Head("/w".into()),
+        targets: agent(),
+        no_deps: true,
+        private: false,
+    };
     let id = client.send(&mut daemon, doc);
     let got = client.wait(&mut daemon, id);
     let at = |what: fn(&Response) -> bool| got.iter().position(what);
     let built = at(|it| matches!(it, Response::Built { .. }));
     let documented = at(|it| matches!(it, Response::Documented(_)));
     let page = at(|it| matches!(it, Response::DocPage { .. }));
-    assert!(built.is_some() && built < documented && documented < page, "`Built`, `Documented`, then its pages: {got:#?}");
-    let made = Response::DocPage { path: "app/index.html".into(), page: b"true false [2]".to_vec() };
-    assert!(got.contains(&made), "app's build script ran first, and the request's flags came through: {got:#?}");
+    assert!(
+        built.is_some() && built < documented && documented < page,
+        "`Built`, `Documented`, then its pages: {got:#?}"
+    );
+    let made =
+        Response::DocPage { path: "app/index.html".into(), page: b"true false [2]".to_vec() };
+    assert!(
+        got.contains(&made),
+        "app's build script ran first, and the request's flags came through: {got:#?}"
+    );
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
 
-    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     let after = client.wait(&mut daemon, id);
-    assert_eq!(after.last(), Some(&Response::Done { ok: true }), "the head builds after its documentation");
+    assert_eq!(
+        after.last(),
+        Some(&Response::Done { ok: true }),
+        "the head builds after its documentation"
+    );
 }
 
 #[test]
@@ -2762,11 +3380,16 @@ fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() 
     let got = client.wait(&mut daemon, id);
     assert_eq!(
         results(&got),
-        vec![("a::adds".to_owned(), TestOutcome::Passed), ("a::overflows".to_owned(), TestOutcome::Failed)],
+        vec![
+            ("a::adds".to_owned(), TestOutcome::Passed),
+            ("a::overflows".to_owned(), TestOutcome::Failed)
+        ],
         "{got:#?}"
     );
     let failed = got.iter().find_map(|it| match it {
-        Response::TestResult(result) if result.outcome == TestOutcome::Failed => Some(result.output.clone()),
+        Response::TestResult(result) if result.outcome == TestOutcome::Failed => {
+            Some(result.output.clone())
+        }
         _ => None,
     });
     assert_eq!(failed.as_deref(), Some(&b"undefined behavior\nseed: 3\n"[..]));
@@ -2784,15 +3407,19 @@ fn a_build_whose_load_fails_before_its_units_ends_not_ok_and_the_daemon_answers_
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 42);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
-    let refused = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("refuses this manifest")));
+    let refused = got.iter().any(
+        |it| matches!(it, Response::Error(error) if error.what.contains("refuses this manifest")),
+    );
     assert!(refused, "the load's error is the build's: {got:#?}");
     assert!(!got.iter().any(|it| matches!(it, Response::Built { .. })), "{got:#?}");
 
     daemon.driver().change(&name("w/Cargo.toml"), b"[package]\n");
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
 }
@@ -2836,12 +3463,23 @@ fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest()
     });
     assert!(named, "the build's error names the panic and the write: {got:#?}");
     let ran = PHASES.with(|it| it.take());
-    assert!(ran.contains(&(0, Phase::Store)), "dep's library, which needs no run, is built: {ran:?}");
-    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the run, is never compiled: {ran:?}");
+    assert!(
+        ran.contains(&(0, Phase::Store)),
+        "dep's library, which needs no run, is built: {ran:?}"
+    );
+    assert!(
+        !ran.iter().any(|it| it.0 == 3),
+        "the program, after the run, is never compiled: {ran:?}"
+    );
 
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// A write to the front end that fails with an error as it is applied (as a real writer's does
@@ -2882,24 +3520,47 @@ fn a_write_that_fails_fails_only_the_units_after_it_and_keep_going_builds_the_re
         matches!(it, Response::Error(error) if error.what.starts_with("applying a build script's run of custom-build of ")
             && error.what.contains("it failed at serve-test's run: serve-test: the run's write fails"))
     });
-    assert!(named, "the build's error names the write, its unit, where it failed and why: {got:#?}");
+    assert!(
+        named,
+        "the build's error names the write, its unit, where it failed and why: {got:#?}"
+    );
     // The program, which depends on the run, is refused naming the write and its unit.
     let refused = REFUSED_UNITS.with_borrow_mut(std::mem::take);
-    let program: Vec<&String> = refused.iter().filter(|(unit, _)| *unit == 3).map(|(_, why)| why).collect();
+    let program: Vec<&String> =
+        refused.iter().filter(|(unit, _)| *unit == 3).map(|(_, why)| why).collect();
     assert!(!program.is_empty(), "the program is refused: {refused:#?}");
     for why in program {
-        for part in ["a write it depends on broke", "applying a build script's run of custom-build of path+file://", "#app@0.1.0", "it failed at serve-test's run"] {
+        for part in [
+            "a write it depends on broke",
+            "applying a build script's run of custom-build of path+file://",
+            "#app@0.1.0",
+            "it failed at serve-test's run",
+        ] {
             assert!(why.contains(part), "the program's refusal says `{part}`: {why}");
         }
     }
-    assert!(refused.iter().all(|(unit, _)| *unit == 3), "only what depends on the run is refused: {refused:#?}");
+    assert!(
+        refused.iter().all(|(unit, _)| *unit == 3),
+        "only what depends on the run is refused: {refused:#?}"
+    );
     let ran = PHASES.with(|it| it.take());
-    assert!(ran.contains(&(0, Phase::Store)), "dep's library, which needs no run, is built: {ran:?}");
-    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the run, is never compiled: {ran:?}");
+    assert!(
+        ran.contains(&(0, Phase::Store)),
+        "dep's library, which needs no run, is built: {ran:?}"
+    );
+    assert!(
+        !ran.iter().any(|it| it.0 == 3),
+        "the program, after the run, is never compiled: {ran:?}"
+    );
 
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// Under `--fail-fast`, a write that fails as it is applied ends the job at once, as a
@@ -2945,11 +3606,19 @@ fn under_fail_fast_a_write_that_fails_ends_the_job_at_once() {
     });
     assert!(named, "the build's error names the write, its unit and its error: {got:#?}");
     assert_eq!(ASKED.get(), 1, "the slow run never finished to ask its write: the job ended first");
-    assert!(took < Duration::from_secs(3600), "the job ended without waiting for the slow run: it took {took:?}");
+    assert!(
+        took < Duration::from_secs(3600),
+        "the job ended without waiting for the slow run: it took {took:?}"
+    );
 
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// A build script's run refused by a write that broke never reaches the runner. The plane
@@ -2992,17 +3661,32 @@ fn a_build_script_run_after_a_write_that_failed_never_reaches_the_runner() {
     let refused = REFUSED_UNITS.with_borrow_mut(std::mem::take);
 
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
-    assert_eq!(scripts, vec![2], "only dep's run reached the runner; the program's, after it, never did");
-    let run: Vec<&String> = refused.iter().filter(|(unit, _)| *unit == 4).map(|(_, why)| why).collect();
+    assert_eq!(
+        scripts,
+        vec![2],
+        "only dep's run reached the runner; the program's, after it, never did"
+    );
+    let run: Vec<&String> =
+        refused.iter().filter(|(unit, _)| *unit == 4).map(|(_, why)| why).collect();
     let [why] = &run[..] else { panic!("the program's run is refused once: {refused:#?}") };
-    for part in ["a write it depends on broke", "applying a build script's run of custom-build of registry+", "#dep@1.0.0", "it failed at serve-test's run"] {
+    for part in [
+        "a write it depends on broke",
+        "applying a build script's run of custom-build of registry+",
+        "#dep@1.0.0",
+        "it failed at serve-test's run",
+    ] {
         assert!(why.contains(part), "the run's refusal says `{part}`: {why}");
     }
 
     daemon.driver().change(&name("w/Cargo.toml"), b"[package]\n");
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// A unit whose compile panics, as blaze-diagnostics did on a span past its file's end (the
@@ -3043,15 +3727,25 @@ fn a_unit_whose_compile_panics_fails_with_the_panic_while_its_sibling_builds() {
             && diagnostic.message.contains("serve-test: the unit's compile panics"))
     });
     assert!(said, "the unit's error names the panic: {got:#?}");
-    let job_failed = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("panicked")));
+    let job_failed = got
+        .iter()
+        .any(|it| matches!(it, Response::Error(error) if error.what.contains("panicked")));
     assert!(!job_failed, "the panic fails its unit, not the job: {got:#?}");
     let ran = PHASES.with(|it| it.take());
     assert!(ran.contains(&(0, Phase::Store)), "dep's library, the sibling, is built: {ran:?}");
-    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the build script, is never compiled: {ran:?}");
+    assert!(
+        !ran.iter().any(|it| it.0 == 3),
+        "the program, after the build script, is never compiled: {ran:?}"
+    );
 
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// A unit whose compile ends in an error (no panic, no refusal) fails that unit with the error
@@ -3093,15 +3787,25 @@ fn a_unit_whose_compile_errs_fails_alone_while_its_sibling_builds() {
             && diagnostic.message.contains("unit 1"))
     });
     assert!(said, "the unit's error says what and where: {got:#?}");
-    let job_failed = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("lang_start")));
+    let job_failed = got
+        .iter()
+        .any(|it| matches!(it, Response::Error(error) if error.what.contains("lang_start")));
     assert!(!job_failed, "the error fails its unit, not the job: {got:#?}");
     let ran = PHASES.with(|it| it.take());
     assert!(ran.contains(&(0, Phase::Store)), "dep's library, the sibling, is built: {ran:?}");
-    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the build script, is never compiled: {ran:?}");
+    assert!(
+        !ran.iter().any(|it| it.0 == 3),
+        "the program, after the build script, is never compiled: {ran:?}"
+    );
 
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+    assert_eq!(
+        got.last(),
+        Some(&Response::Done { ok: true }),
+        "the daemon builds the next: {got:#?}"
+    );
 }
 
 /// A stop (what SIGTERM asks) right after a build failed on a unit's panicking compile writes
@@ -3114,7 +3818,8 @@ fn a_daemon_stopped_after_a_build_failed_on_a_panic_writes_the_image_the_next_st
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 46);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     PANICS_COMPILE.set(None);
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
@@ -3137,7 +3842,11 @@ fn a_build_cancelled_while_nothing_of_it_runs_ends_not_ok_and_the_daemon_answers
     let mut daemon = start(sim, &steps, 43);
     let mut client = dial(&mut daemon);
     let base = daemon.vfs().empty();
-    let ops = vec![Op::Write { path: "Cargo.toml".into(), bytes: b"[package]\n".to_vec(), mode: blaze_vfs::Mode::Regular }];
+    let ops = vec![Op::Write {
+        path: "Cargo.toml".into(),
+        bytes: b"[package]\n".to_vec(),
+        mode: blaze_vfs::Mode::Regular,
+    }];
     let commit = client.send(&mut daemon, Request::Commit { head: "agents/one".into(), base, ops });
     assert!(matches!(client.wait(&mut daemon, commit).first(), Some(Response::Committed { .. })));
 
@@ -3146,7 +3855,8 @@ fn a_build_cancelled_while_nothing_of_it_runs_ends_not_ok_and_the_daemon_answers
     // nothing of the second's request running.
     let build = || Request::Build { view: ViewRef::Head("agents/one".into()), targets: agent() };
     let (first, second) = (client.next, client.next + 1);
-    let ids = client.send_together(&mut daemon, vec![build(), build(), Request::Cancel { id: second }]);
+    let ids =
+        client.send_together(&mut daemon, vec![build(), build(), Request::Cancel { id: second }]);
     let got = client.wait(&mut daemon, second);
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
     assert!(!got.iter().any(|it| matches!(it, Response::Built { .. })), "{got:#?}");
@@ -3172,8 +3882,11 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let front = Arc::new(FakeFront { goal: Goal::Check });
     let inputs = Arc::new(FakeInputs { runs: vec![4, 7], ..FakeInputs::default() });
-    let reading = || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
-    let run = |does: Does<Fake>, readers: Readers<Fake>| match Step::of(&cancelled, does).run(0, readers) {
+    let reading =
+        || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
+    let run = |does: Does<Fake>, readers: Readers<Fake>| match Step::of(&cancelled, does)
+        .run(0, readers)
+    {
         Some(Did { outcome: blaze_graph::Outcome::Built, value }) => value,
         _ => panic!("a step of the fakes is built at once"),
     };
@@ -3184,45 +3897,89 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let ub = Ub { seed: Some(5), schedules: None };
 
     let from = Readers::<Fake> { from: Some(FakeReader(inputs.clone())), ..reading() };
-    let reached = answered(run(Does::Reach { to: front.clone(), from: front.clone(), changes: Vec::new() }, from));
-    assert!(matches!(&reached, Response::Reached(Reach { changes, .. }) if changes.is_empty()), "{reached:?}");
+    let reached = answered(run(
+        Does::Reach { to: front.clone(), from: front.clone(), changes: Vec::new() },
+        from,
+    ));
+    assert!(
+        matches!(&reached, Response::Reached(Reach { changes, .. }) if changes.is_empty()),
+        "{reached:?}"
+    );
 
     let codegen = answered(run(Does::CodegenInputs { front: front.clone() }, reading()));
     assert_eq!(codegen, Response::CodegenInputs(Vec::new()));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3], ..FakeInputs::default() }), asked: Vec::new(), broke: Vec::new() };
+    let writer = FakeWriter {
+        inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3], ..FakeInputs::default() }),
+        asked: Vec::new(),
+        broke: Vec::new(),
+    };
     let tables = Does::Tables { front: front.clone(), images: Vec::new() };
     let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1], ..FakeInputs::default() }), asked: vec![2], broke: Vec::new() };
+    let writer = FakeWriter {
+        inputs: Arc::new(FakeInputs { runs: vec![1], ..FakeInputs::default() }),
+        asked: vec![2],
+        broke: Vec::new(),
+    };
     let pack = Does::Pack { front: front.clone(), program: "app".into() };
     let packed = answered(run(pack, Readers { writer: Some(writer), ..Readers::default() }));
-    assert_eq!(packed, Response::Packed { pack: b"app [1, 2]".to_vec() }, "a write asked for is applied first");
+    assert_eq!(
+        packed,
+        Response::Packed { pack: b"app [1, 2]".to_vec() },
+        "a write asked for is applied first"
+    );
 
     let db = Arc::new(Database::new(blaze_query::Config::memory()));
     let queries = db.open_with(blaze_vfs::View { root: ContentId([0; 32]) }, b"");
-    let traced = answered(run(Does::Trace { db, queries, root: Fake::default().plan_key() }, Readers::default()));
+    let traced = answered(run(
+        Does::Trace { db, queries, root: Fake::default().plan_key() },
+        Readers::default(),
+    ));
     assert_eq!(traced, Response::Trace(Vec::new()), "a view no query ran in traces nothing");
 
-    let select = Does::Select { front: front.clone(), filter: vec!["a::".into()], args: Vec::new(), all: true, ub };
+    let select = Does::Select {
+        front: front.clone(),
+        filter: vec!["a::".into()],
+        args: Vec::new(),
+        all: true,
+        ub,
+    };
     match run(select, reading()) {
         Value::Selected(Ok(tests)) => assert_eq!(tests, ["a::adds", "a::overflows"]),
         _ => panic!("the selection gave no tests"),
     }
-    let evaluate = Does::Evaluate { front: front.clone(), tests: vec!["a::overflows".to_owned()].into(), ub };
+    let evaluate =
+        Does::Evaluate { front: front.clone(), tests: vec!["a::overflows".to_owned()].into(), ub };
     match run(evaluate, reading()) {
-        Value::Evaluated(Ok(result)) => assert_eq!((result.name.as_str(), result.outcome), ("a::overflows", TestOutcome::Failed)),
+        Value::Evaluated(Ok(result)) => assert_eq!(
+            (result.name.as_str(), result.outcome),
+            ("a::overflows", TestOutcome::Failed)
+        ),
         _ => panic!("the evaluation gave no result"),
     }
 
-    let compile = || Step::of(&cancelled, Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }), back: Default::default() });
+    let compile = || {
+        Step::of(
+            &cancelled,
+            Does::Compile {
+                front: Arc::new(FakeFront { goal: Goal::Build }),
+                back: Default::default(),
+            },
+        )
+    };
     match compile().run(Phase::Names.arg(0), reading()) {
-        Some(Did { outcome: blaze_graph::Outcome::Built, value: Value::Phase(0, images) }) => assert!(images.is_empty()),
+        Some(Did { outcome: blaze_graph::Outcome::Built, value: Value::Phase(0, images) }) => {
+            assert!(images.is_empty())
+        }
         _ => panic!("a phase before the last gives no compile"),
     }
     match compile().run(Phase::Store.arg(0), reading()) {
-        Some(Did { outcome: blaze_graph::Outcome::Built, value: Value::Compiled(0, Ok(compiled), images) }) => {
+        Some(Did {
+            outcome: blaze_graph::Outcome::Built,
+            value: Value::Compiled(0, Ok(compiled), images),
+        }) => {
             assert!(compiled.ok && images.is_empty());
         }
         _ => panic!("the compile gave no unit"),
@@ -3248,7 +4005,8 @@ fn a_wave_of_build_scripts_waits_for_the_readers_before_it_and_is_one_write() {
     let mut daemon = start(sim, &steps, 10);
     KEEP.set(true);
     let mut client = dial(&mut daemon);
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     turn_until(&mut daemon, |_| ASKED.get() == SCRIPTS);
     for _ in 0..500 {
         daemon.turn();
@@ -3275,7 +4033,10 @@ fn no_reader_posted_after_a_write_sees_the_inputs_before_it_over_many_seeds() {
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, seed);
         let mut client = dial(&mut daemon);
-        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
         let all: Vec<usize> = (1..=SCRIPTS).collect();
@@ -3292,7 +4053,8 @@ fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_
     let mut daemon = start(sim, &steps, 11);
     let mut client = dial(&mut daemon);
     let build = |client: &mut Client, daemon: &mut SimDaemon| {
-        let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client
+            .send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
         let got = client.wait(daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     };
@@ -3302,7 +4064,11 @@ fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_
     let (asks, anew, into_kept) = (ASKS.get(), ANEW.get(), INTO_KEPT.get());
     assert!(into_kept >= 1, "the second build lowers into the first's front end");
     build(&mut client, &mut daemon);
-    assert_eq!(ASKS.get(), asks, "the view and its config are the last build's: its plan is not asked");
+    assert_eq!(
+        ASKS.get(),
+        asks,
+        "the view and its config are the last build's: its plan is not asked"
+    );
     assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 1));
 
     daemon.driver().change(&name("w/src/main.rs"), b"fn main() { }\n");
@@ -3321,7 +4087,8 @@ fn an_output_is_placed_again_once_its_file_is_not_as_placed() {
     let mut client = dial(&mut daemon);
     let app = name(&APP_AT[1..]);
     let mut build = |daemon: &mut SimDaemon| {
-        let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let id = client
+            .send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
         let got = client.wait(daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
         assert_eq!(daemon.driver().contents(&app), APP);
@@ -3349,10 +4116,17 @@ fn keeps_the_contract(got: &[(u64, Response)], ids: &[u64]) {
         let of: Vec<&Response> = got.iter().filter(|(at, _)| *at == id).map(|(_, it)| it).collect();
         let dones = of.iter().filter(|it| matches!(it, Response::Done { .. })).count();
         assert_eq!(dones, 1, "request {id} got {dones} `Done`s: {of:#?}");
-        assert!(matches!(of.last(), Some(Response::Done { .. })), "request {id} got something after its `Done`: {of:#?}");
+        assert!(
+            matches!(of.last(), Some(Response::Done { .. })),
+            "request {id} got something after its `Done`: {of:#?}"
+        );
         for (at, it) in of.iter().enumerate() {
             if matches!(it, Response::Error(_)) {
-                assert_eq!(at + 2, of.len(), "request {id}'s error is not right before its `Done`: {of:#?}");
+                assert_eq!(
+                    at + 2,
+                    of.len(),
+                    "request {id}'s error is not right before its `Done`: {of:#?}"
+                );
             }
         }
     }
@@ -3364,7 +4138,10 @@ fn keeps_the_contract(got: &[(u64, Response)], ids: &[u64]) {
 fn every_request_ends_once_over_many_seeds() {
     for seed in 0..48 {
         let mut rng = Rng::new(seed);
-        let faults = Faults { max_latency: std::time::Duration::from_millis(rng.below(4)), ..Faults::default() };
+        let faults = Faults {
+            max_latency: std::time::Duration::from_millis(rng.below(4)),
+            ..Faults::default()
+        };
         let mut sim = Sim::new(seed, faults);
         checkout(&mut sim, "[package]\n");
         let steps = Arc::new(Fake::default());
@@ -3379,14 +4156,25 @@ fn every_request_ends_once_over_many_seeds() {
                 0 => ViewRef::Head("/w".into()),
                 1 => ViewRef::WhatIf {
                     base: Box::new(ViewRef::Head("/w".into())),
-                    ops: vec![Op::Write { path: "Cargo.toml".into(), bytes: b"what if\n".to_vec(), mode: blaze_vfs::Mode::Regular }],
+                    ops: vec![Op::Write {
+                        path: "Cargo.toml".into(),
+                        bytes: b"what if\n".to_vec(),
+                        mode: blaze_vfs::Mode::Regular,
+                    }],
                 },
                 _ => ViewRef::Head("agents/none".into()),
             };
             let request = match rng.below(6) {
                 0 => Request::Check { view, targets: agent() },
                 1 => Request::Build { view, targets: agent() },
-                2 => Request::Test { view, targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
+                2 => Request::Test {
+                    view,
+                    targets: agent(),
+                    filter: Vec::new(),
+                    all: false,
+                    args: Vec::new(),
+                    ub: None,
+                },
                 3 => Request::Pack { view, targets: agent(), program: "app".into() },
                 4 => Request::Doc { view, targets: agent(), no_deps: false, private: true },
                 _ => Request::Run { view, targets: agent(), bin: None, args: Vec::new() },
@@ -3414,8 +4202,12 @@ fn every_request_ends_once_over_many_seeds() {
                 }
             }
             let live = |client: usize| !(hung_up && client == gone);
-            let over = asked.iter().filter(|it| live(it.client)).all(|it| clients[it.client].done(it.id))
-                && cancels.iter().filter(|it| live(it.0)).all(|(client, id)| clients[*client].done(*id));
+            let over =
+                asked.iter().filter(|it| live(it.client)).all(|it| clients[it.client].done(it.id))
+                    && cancels
+                        .iter()
+                        .filter(|it| live(it.0))
+                        .all(|(client, id)| clients[*client].done(*id));
             if over && turn > hang_up_at.unwrap_or(0) && turn > 300 {
                 break;
             }
@@ -3430,7 +4222,8 @@ fn every_request_ends_once_over_many_seeds() {
             if hung_up && at == gone {
                 continue;
             }
-            let mut ids: Vec<u64> = asked.iter().filter(|it| it.client == at).map(|it| it.id).collect();
+            let mut ids: Vec<u64> =
+                asked.iter().filter(|it| it.client == at).map(|it| it.id).collect();
             ids.extend(cancels.iter().filter(|it| it.0 == at).map(|it| it.1));
             keeps_the_contract(&client.got, &ids);
         }
@@ -3520,7 +4313,10 @@ fn the_loops_wait_between_turns_is_a_wait_span_naming_what_ends_it() {
         .filter_map(|row| blaze_profile::span::read::<blaze_profile::span::Wait>(row).unwrap())
         .filter_map(|it| it.fields.awaits.text().map(|it| it.to_string()))
         .collect();
-    assert!(awaits.iter().any(|it| it.starts_with("io daemon loop: ")), "the idle loop's waits say what ends them: {awaits:?}");
+    assert!(
+        awaits.iter().any(|it| it.starts_with("io daemon loop: ")),
+        "the idle loop's waits say what ends them: {awaits:?}"
+    );
 }
 
 /// The limit the daemon runs under: `--memory-gb` first, else `BLAZE_DAEMON_MEMORY_GB`, each a
@@ -3533,7 +4329,10 @@ fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
     let var = |it: &str| Some(std::ffi::OsString::from(it));
     assert_eq!(told_limit(None, None).unwrap(), None);
     assert_eq!(told_limit(None, var("48")).unwrap(), Some((48 * GIB, format!("{MEMORY_VAR}=48"))));
-    assert_eq!(told_limit(None, var("1.5")).unwrap(), Some((3 * GIB / 2, format!("{MEMORY_VAR}=1.5"))));
+    assert_eq!(
+        told_limit(None, var("1.5")).unwrap(),
+        Some((3 * GIB / 2, format!("{MEMORY_VAR}=1.5")))
+    );
     let flag = told_memory("--memory-gb", "24").unwrap();
     assert_eq!(flag, (24 * GIB, "--memory-gb=24".to_owned()));
     assert_eq!(told_limit(Some(flag.clone()), var("48")).unwrap(), Some(flag), "the flag wins");
@@ -3554,15 +4353,21 @@ fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_again
     // Far past what any test holds, so no other daemon's release in this process is made due,
     // and no budget it sets (32 TiB at least) weighs on another test's sweep.
     const LIMIT: u64 = (1 << 50) + (64 << 20);
-    let budget = blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned(), kept_back: 0 };
+    let budget =
+        blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned(), kept_back: 0 };
     let said = super::limit_said(&budget);
     assert!(said.starts_with("memory limit 1048576.06 GiB (a test's limit): "), "{said}");
     assert!(said.contains("holds 917504.05 GiB") && said.contains("mir "), "{said}");
     let mut options = options();
     options.budget = Some(budget);
     let steps = Arc::new(Fake::default());
-    let _daemon = Daemon::start(Sim::new(3, Faults::default()), options, steps, Runner::Inline(Inline::new(3)))
-        .unwrap_or_else(|why| panic!("{why}"));
+    let _daemon = Daemon::start(
+        Sim::new(3, Faults::default()),
+        options,
+        steps,
+        Runner::Inline(Inline::new(3)),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(admission::limit(), LIMIT, "the release's limit is the daemon's");
     assert_eq!(blaze_mem::tag::budget(Tag::Mir), LIMIT / 64 * share(Tag::Mir), "so is each budget");
 }

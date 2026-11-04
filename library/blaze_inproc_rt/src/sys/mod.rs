@@ -163,15 +163,23 @@ pub enum Rights {
 
 /// The words of an object the start hook mapped at `at`, `len` bytes and at least `least`, for
 /// the rest of the process: the control words, the asks.
-pub fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
+pub fn adopt_words(
+    at: u64,
+    len: u64,
+    least: u64,
+) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
     if at == 0 || !at.is_multiple_of(8) || len < least || len > isize::MAX as u64 {
-        return Err(crate::Error::new(format!("words of {len} bytes at {at:#x}, where {least} are needed")));
+        return Err(crate::Error::new(format!(
+            "words of {len} bytes at {at:#x}, where {least} are needed"
+        )));
     }
     // SAFETY: the start hook mapped a words object shared and writable at `at`, `len` bytes,
     // with `Granted::map_anywhere`, which never unmaps it. It is non-null, 8-aligned and of
     // `len / 8` whole words (checked above). Every access to it, here and in the daemon's
     // process, is atomic, so a `&[AtomicU64]` to it is sound for the rest of the process.
-    Ok(unsafe { std::slice::from_raw_parts(at as *const std::sync::atomic::AtomicU64, (len / 8) as usize) })
+    Ok(unsafe {
+        std::slice::from_raw_parts(at as *const std::sync::atomic::AtomicU64, (len / 8) as usize)
+    })
 }
 
 /// Stores `value` in the 8 bytes at `at` of this process, unaligned: a word of a fixed map's

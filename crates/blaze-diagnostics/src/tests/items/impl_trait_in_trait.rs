@@ -26,7 +26,18 @@ impl Foo for () {
 fn main() {}
 ";
     let stderr = ui_core("deep-match.rs", "sized", source);
-    assert_reports(&stderr, &[error(8, &["E0053", "method `bar` has an incompatible return type for trait", "`Wrapper<_>`", "`i32`"])]);
+    assert_reports(
+        &stderr,
+        &[error(
+            8,
+            &[
+                "E0053",
+                "method `bar` has an incompatible return type for trait",
+                "`Wrapper<_>`",
+                "`i32`",
+            ],
+        )],
+    );
 }
 
 #[test]
@@ -44,7 +55,13 @@ impl Foo for () {
 fn main() {}
 ";
     let stderr = ui_std("doesnt-satisfy.rs", "sized, fmt", "pub use core::fmt;\n", "", source);
-    assert_reports(&stderr, &[error(6, &["E0277", "Display", "()", "required by a bound in `Foo::bar::{anon_assoc#0}`"])]);
+    assert_reports(
+        &stderr,
+        &[error(
+            6,
+            &["E0277", "Display", "()", "required by a bound in `Foo::bar::{anon_assoc#0}`"],
+        )],
+    );
 }
 
 #[test]
@@ -70,9 +87,10 @@ impl Foo<char> for Bar {
 fn main() {}
 ";
     let stderr = ui_core("return-dont-satisfy-bounds.rs", "sized", source);
-    assert_reports(&stderr, &[
-        error(8, &["E0277", "`impl Foo<u8>: Foo<char>`", "Foo::foo::{anon_assoc#0}"]),
-    ]);
+    assert_reports(
+        &stderr,
+        &[error(8, &["E0277", "`impl Foo<u8>: Foo<char>`", "Foo::foo::{anon_assoc#0}"])],
+    );
 }
 
 #[test]
@@ -92,7 +110,19 @@ impl Uwu for () {
 fn main() {}
 ";
     let stderr = ui_core("method-signature-matches.rs", "sized", source);
-    assert_reports(&stderr, &[error(8, &["E0053", "incompatible type for trait", "expected `()`, found `u8`", "fn(())", "fn(u8)"])]);
+    assert_reports(
+        &stderr,
+        &[error(
+            8,
+            &[
+                "E0053",
+                "incompatible type for trait",
+                "expected `()`, found `u8`",
+                "fn(())",
+                "fn(u8)",
+            ],
+        )],
+    );
 }
 
 #[test]
@@ -132,7 +162,10 @@ impl Trait for () {
 fn main() {}
 ";
     let stderr = ui_core("rpitit-impl-captures-too-much.rs", "sized", source);
-    assert_reports(&stderr, &[error(8, &["return type captures more lifetimes than trait definition", "hidden type"])]);
+    assert_reports(
+        &stderr,
+        &[error(8, &["return type captures more lifetimes than trait definition", "hidden type"])],
+    );
 }
 
 /// An impl's `impl Trait` that leaves out a lifetime the trait's leaves out too names none it
@@ -181,12 +214,15 @@ impl Foo for Bar {
 fn main() {}
 ";
     let stderr = ui_core("issue-35869.rs", "sized, option", source);
-    assert_reports(&stderr, &[
-        error(11, &["E0053", "method `foo`", "fn(u8)", "fn(u16)", "type in trait"]),
-        error(13, &["E0053", "method `bar`", "Option<u8>", "Option<u16>"]),
-        error(15, &["E0053", "method `baz`", "(u8, u16)", "(u16, u16)"]),
-        error(17, &["E0053", "method `qux`", "expected `u8`, found `u16`"]),
-    ]);
+    assert_reports(
+        &stderr,
+        &[
+            error(11, &["E0053", "method `foo`", "fn(u8)", "fn(u16)", "type in trait"]),
+            error(13, &["E0053", "method `bar`", "Option<u8>", "Option<u16>"]),
+            error(15, &["E0053", "method `baz`", "(u8, u16)", "(u16, u16)"]),
+            error(17, &["E0053", "method `qux`", "expected `u8`, found `u16`"]),
+        ],
+    );
 }
 
 #[test]
@@ -209,7 +245,18 @@ impl Mumbo for usize {
 fn main() {}
 ";
     let stderr = ui_core("impl-method-mismatch.rs", "sized, add, deref, copy", source);
-    assert_reports(&stderr, &[error(9, &["E0053", "method `jumbo` has an incompatible type for trait", "expected signature `fn", "found signature `unsafe fn"])]);
+    assert_reports(
+        &stderr,
+        &[error(
+            9,
+            &[
+                "E0053",
+                "method `jumbo` has an incompatible type for trait",
+                "expected signature `fn",
+                "found signature `unsafe fn",
+            ],
+        )],
+    );
 }
 
 /// The `[const]` bound of a const trait's `impl Trait` is the trait item's: a const caller

@@ -34,7 +34,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutRefInImmRefPat) -> Vec<Found> {
     let mut diag =
         Diag::error(Some("E0596"), "cannot borrow as mutable inside an `&` pattern", span);
     if let Some(and) = and_pat_prefix(cx, node.map(|it| it.syntax())) {
-        diag.suggestion(and, "replace this `&` with `&mut`", "&mut ", Applicability::MachineApplicable);
+        diag.suggestion(
+            and,
+            "replace this `&` with `&mut`",
+            "&mut ",
+            Applicability::MachineApplicable,
+        );
     }
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
@@ -53,7 +58,8 @@ fn and_pat_prefix<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option
                 }
                 let start = it.text_range().start();
                 let end = pat.pat()?.syntax().text_range().start();
-                return (end > start).then(|| cx.span(ancestor.with_value(TextRange::new(start, end))));
+                return (end > start)
+                    .then(|| cx.span(ancestor.with_value(TextRange::new(start, end))));
             }
             SyntaxKind::RECORD_PAT_FIELD
             | SyntaxKind::RECORD_PAT_FIELD_LIST

@@ -10,13 +10,13 @@ use anyhow::bail;
 
 use super::features::CliFeatures;
 use super::{CargoResult, HashMap, HashSet};
-use std::alloc::Global;
 use crate::dependency::Dependency;
 use crate::edit_distance::{closest_msg, edit_distance};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::package_id_spec::PackageIdSpec;
 use crate::summary::{FeatureValue, Summary};
+use std::alloc::Global;
 
 /// The workspace, as far as choosing its members' features goes.
 #[derive(Clone, Copy)]

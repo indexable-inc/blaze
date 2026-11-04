@@ -40,7 +40,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std
     if !ty.is_sized(db) {
         return false;
     }
-    let threshold = u64::try_from(cx.conf().int("vec-box-size-threshold", 4096)).expect("a count, checked as the configuration loads");
+    let threshold = u64::try_from(cx.conf().int("vec-box-size-threshold", 4096))
+        .expect("a count, checked as the configuration loads");
     let Ok(layout) = ty.layout(db) else { return false };
     if layout.size() >= threshold {
         return false;
@@ -53,7 +54,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std
             inner.ty().is_some_and(|it| std_of(cx, it) == Some(Std::Global))
         }
         (Some(ast::GenericArg::TypeArg(l)), Some(ast::GenericArg::TypeArg(r))) => {
-            match (l.ty().and_then(|it| cx.resolve_type(it)), r.ty().and_then(|it| cx.resolve_type(it))) {
+            match (
+                l.ty().and_then(|it| cx.resolve_type(it)),
+                r.ty().and_then(|it| cx.resolve_type(it)),
+            ) {
                 (Some(l), Some(r)) => l == r,
                 _ => false,
             }
@@ -79,7 +83,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std
     };
     let code = format!("Vec<{}{alloc}>", cx.snippet(boxed_range));
     let span = cx.span(range);
-    cx.lint(LINT, path.syntax(), span.clone(), "`Vec<T>` is already on the heap, the boxing is unnecessary")
-        .suggestion(span, "try", code, Applicability::Unspecified);
+    cx.lint(
+        LINT,
+        path.syntax(),
+        span.clone(),
+        "`Vec<T>` is already on the heap, the boxing is unnecessary",
+    )
+    .suggestion(span, "try", code, Applicability::Unspecified);
     true
 }

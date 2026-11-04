@@ -46,7 +46,11 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
     let restricted = restricted.unwrap_or_else(|| visibility::restricted_to(cx, item));
     let grandparent = item.module.parent(cx.db);
     let new_vis = match restricted {
-        Some(it) if item.in_body.is_none() && Some(it) == grandparent && !it.is_crate_root(cx.db) => "pub(super)",
+        Some(it)
+            if item.in_body.is_none() && Some(it) == grandparent && !it.is_crate_root(cx.db) =>
+        {
+            "pub(super)"
+        }
         _ => "pub(crate)",
     };
     let vis_span = cx.span(item.node.with_value(vis.syntax().text_range()));
@@ -64,9 +68,18 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
     spans
         .into_iter()
         .map(|range| {
-            let mut diag = Diag::lint("unreachable_pub", "unreachable `pub` item", cx.span(item.node.with_value(range)));
+            let mut diag = Diag::lint(
+                "unreachable_pub",
+                "unreachable `pub` item",
+                cx.span(item.node.with_value(range)),
+            );
             // clone: the span of a lint that fires, once per leaf
-            diag.suggestion(vis_span.clone(), "consider restricting its visibility", new_vis, applicability);
+            diag.suggestion(
+                vis_span.clone(),
+                "consider restricting its visibility",
+                new_vis,
+                applicability,
+            );
             if exportable {
                 diag.help("or consider exporting it for use by other crates");
             }

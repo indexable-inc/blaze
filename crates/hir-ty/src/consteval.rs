@@ -2,7 +2,7 @@
 
 use std::mem::offset_of;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_format::{FormatError, Placed, Slice, Writer};
 use hir_def::{
     ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
@@ -19,14 +19,15 @@ use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
-    ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
+    ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, Span,
+    StaticMemory,
     db::{AnonConstId, AnonConstLoc, HirDatabase},
     generics::Generics,
     lower::LoweringMode,
     mir::{IsSigned, MirEvalError, MirLowerError, pad16},
     next_solver::{
-        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstExt,
-        ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
+        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const,
+        ConstExt, ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
         InherentAssocConstId, IsRigid, ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder,
         StoredGenericArgs, StoredTy, TraitAssocConstId, Ty, TyKind, ValTreeKind, default_types,
         persist::{TyTableReader, TyTableWriter},
@@ -70,7 +71,8 @@ fn intern_const_ref<'db>(
     // As rustc's `lit_to_const`: an integer literal is truncated to its type's width (the
     // `overflowing_literals` lint is what refuses one too large).
     let trunc = |size: Size, bits: u128| {
-        ScalarInt::try_from_uint(size.truncate(bits), size).expect("a truncated value fits its size")
+        ScalarInt::try_from_uint(size.truncate(bits), size)
+            .expect("a truncated value fits its size")
     };
     let valtree = match (ty.kind(), value) {
         (TyKind::Uint(uint), Literal::Uint(value, _)) => {
@@ -217,10 +219,7 @@ pub fn allocation_as_usize(ec: Allocation<'_>) -> u128 {
 /// The alias kind of a MIR constant naming `konst` with its own (impl-form) args. A const in a
 /// trait impl has none: MIR names the trait's const (a projection) and `lookup_impl_const`
 /// resolves it at eval time, so meeting one here is a bug.
-pub fn mir_const_alias_kind<'db>(
-    db: &'db Db,
-    konst: ConstId,
-) -> AliasConstKind<'db> {
+pub fn mir_const_alias_kind<'db>(db: &'db Db, konst: ConstId) -> AliasConstKind<'db> {
     match konst.lookup(db).container {
         ItemContainerId::TraitId(_) => {
             AliasConstKind::Projection { def_id: TraitAssocConstId(konst) }
@@ -237,10 +236,7 @@ pub fn mir_const_alias_kind<'db>(
 
 /// The value of `unevaluated`, read from the cached result by reference: an array length asks
 /// this on every check, and one that fails to evaluate clones no error.
-fn evaluated<'db>(
-    db: &'db Db,
-    unevaluated: AliasConst<'db>,
-) -> Option<Allocation<'db>> {
+fn evaluated<'db>(db: &'db Db, unevaluated: AliasConst<'db>) -> Option<Allocation<'db>> {
     let result = match unevaluated.kind {
         AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
         | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
@@ -419,21 +415,19 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
             None => Err(CreateConstError::UnderscoreExpr),
         },
         Expr::Path(path)
-            if let konst =
-                path_to_const(
-                    interner.db,
-                    resolver,
-                    generics,
-                    forbid_params_after,
-                    path,
-                    store.expr_path_hygiene(path_expr),
-                )
-                && !matches!(
-                    konst,
-                    Err(CreateConstError::DoesNotResolve
-                        | CreateConstError::ConstHasGenerics
-                        | CreateConstError::NeedsAnonConst)
-                ) =>
+            if let konst = path_to_const(
+                interner.db,
+                resolver,
+                generics,
+                forbid_params_after,
+                path,
+                store.expr_path_hygiene(path_expr),
+            ) && !matches!(
+                konst,
+                Err(CreateConstError::DoesNotResolve
+                    | CreateConstError::ConstHasGenerics
+                    | CreateConstError::NeedsAnonConst)
+            ) =>
         {
             konst
         }
@@ -913,11 +907,8 @@ fn write_memory_map<'db>(
                     id: crate::check_cache::id_bits(it.id),
                 }),
             );
-            columns.vtable = Placed::push_each(
-                out,
-                map.vtable.tys().len(),
-                map.vtable.tys().map(&mut *ty),
-            );
+            columns.vtable =
+                Placed::push_each(out, map.vtable.tys().len(), map.vtable.tys().map(&mut *ty));
             columns.vtable_dyns = Placed::push_each(
                 out,
                 map.vtable.tys().len(),

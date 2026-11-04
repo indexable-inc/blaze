@@ -7,9 +7,9 @@ use hir_def::{
         EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature, UnionSignature,
     },
 };
+use hir_expand::fixture;
 use rustc_type_ir::inherent::GenericArgs as _;
 use syntax::ToSmolStr;
-use hir_expand::fixture;
 
 use crate::{
     InferenceResult, ParamEnvAndCrate,

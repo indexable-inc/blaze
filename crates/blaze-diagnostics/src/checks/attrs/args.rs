@@ -313,7 +313,12 @@ struct Reader<'a, 'c, 'db> {
 
 /// rustc's `ArgParser::from_attr_args` of `attr`, whose path is `path`: its arguments, or `None`
 /// for arguments rustc cannot read, with the errors of reading them in `errors`.
-pub(crate) fn parse<'db>(cx: &Cx<'_, 'db>, attr: &Attr<'db>, path: &[&str], errors: &mut Vec<Diag>) -> Option<ArgParser> {
+pub(crate) fn parse<'db>(
+    cx: &Cx<'_, 'db>,
+    attr: &Attr<'db>,
+    path: &[&str],
+    errors: &mut Vec<Diag>,
+) -> Option<ArgParser> {
     let edition = attr.file.edition(cx.db);
     let lenient = matches!(path, ["rustc_dummy"] | ["diagnostic", ..]);
     let mut reader = Reader { cx, attr, edition, forbidden: false, errors };
@@ -357,7 +362,8 @@ fn is_paren(tt: ast::TokenTree<'_>) -> bool {
 /// The tokens between a token tree's delimiters, trivia left out: a nested token tree is one
 /// element.
 fn inside<'t>(tt: ast::TokenTree<'t>) -> SmallVec<[ast::Element<'t>; 8]> {
-    let mut elements = tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
+    let mut elements =
+        tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
     let _open = elements.next_if(|it| it.kind().is_l_delimiter());
     // alloc: inline up to 8 elements; spills only for a longer attribute argument list
     let mut elements: SmallVec<[ast::Element<'t>; 8]> = elements.collect();
@@ -416,8 +422,9 @@ impl<'t> Cursor<'_, 't> {
             SyntaxKind::COLON2 => Some(1),
             SyntaxKind::COLON => {
                 let second = self.elements.get(self.at + 1).copied()?.into_token()?;
-                (second.kind() == SyntaxKind::COLON && second.text_range().start() == first.text_range().end())
-                    .then_some(2)
+                (second.kind() == SyntaxKind::COLON
+                    && second.text_range().start() == first.text_range().end())
+                .then_some(2)
             }
             _ => None,
         }
@@ -454,14 +461,19 @@ impl Reader<'_, '_, '_> {
     /// `MetaBadDelim`: `#[path[..]]` or `#[path{..}]`.
     fn bad_delim(&mut self, tt: ast::TokenTree<'_>) {
         let range = tt.syntax().text_range();
-        let (Some(open), Some(close)) = (tt.syntax().first_child_or_token(), tt.syntax().last_child_or_token()) else {
+        let (Some(open), Some(close)) =
+            (tt.syntax().first_child_or_token(), tt.syntax().last_child_or_token())
+        else {
             return;
         };
         let mut diag = Diag::error(None, "wrong meta list delimiters", self.span(range));
         diag.multipart_suggestion(
             "the delimiters should be `(` and `)`",
             // alloc: the error's suggestion
-            vec![(self.span(open.text_range()), "(".to_owned()), (self.span(close.text_range()), ")".to_owned())],
+            vec![
+                (self.span(open.text_range()), "(".to_owned()),
+                (self.span(close.text_range()), ")".to_owned()),
+            ],
             Applicability::MachineApplicable,
         );
         self.error(diag);
@@ -470,7 +482,11 @@ impl Reader<'_, '_, '_> {
     /// rustc's `MetaItemListParserContext::parse`: the elements of a list.
     fn list(&mut self, tt: ast::TokenTree<'_>) -> Option<Vec<MetaItemOrLit>> {
         let elements = inside(tt);
-        let mut cursor = Cursor { elements: &elements, at: 0, prev_end: tt.l_paren_token().map(|it| it.text_range()) };
+        let mut cursor = Cursor {
+            elements: &elements,
+            at: 0,
+            prev_end: tt.l_paren_token().map(|it| it.text_range()),
+        };
         let mut items = Vec::with_capacity(1);
         while !cursor.done() {
             let (item, after) = match self.inner(&mut cursor) {
@@ -501,7 +517,8 @@ impl Reader<'_, '_, '_> {
             return Some(false);
         }
         if !self.forbidden {
-            let mut probe = Cursor { elements: cursor.elements, at: cursor.at, prev_end: cursor.prev_end };
+            let mut probe =
+                Cursor { elements: cursor.elements, at: cursor.at, prev_end: cursor.prev_end };
             // alloc: on the error path: neither a `,` nor the end follows, so an error is said
             let mut missing = Vec::new();
             let mut found_comma = false;
@@ -531,7 +548,8 @@ impl Reader<'_, '_, '_> {
             if let Some(first) = missing.next() {
                 let span = self.span(first);
                 // clone: the error's span, used again for its suggestion
-                let mut diag = Diag::error(None, "attribute items not separated with `,`", span.clone());
+                let mut diag =
+                    Diag::error(None, "attribute items not separated with `,`", span.clone());
                 diag.suggestion_with_style(
                     // alloc: the error's suggestion
                     vec![(span, ",".to_owned())],
@@ -574,7 +592,8 @@ impl Reader<'_, '_, '_> {
         let descr = self.descr(found);
         let span = self.span(found.text_range());
         // alloc: the error's message; clone: its span, used again for its label
-        let mut diag = Diag::error(None, format!("expected {expected}, found {descr}"), span.clone());
+        let mut diag =
+            Diag::error(None, format!("expected {expected}, found {descr}"), span.clone());
         // alloc: the error's label
         diag.span_label(span, format!("expected {expected}"));
         self.error(diag);
@@ -657,7 +676,8 @@ impl Reader<'_, '_, '_> {
         let descr = self.descr(found);
         let span = self.span(found.text_range());
         // alloc: the error's message; clone: its span, used again for its label
-        let mut diag = Diag::error(None, format!("expected identifier, found {descr}"), span.clone());
+        let mut diag =
+            Diag::error(None, format!("expected identifier, found {descr}"), span.clone());
         diag.span_label(span, "expected identifier");
         self.error(diag);
         Fail::Said
@@ -682,7 +702,8 @@ impl Reader<'_, '_, '_> {
 
     /// `SuffixedLiteralInAttribute`.
     fn suffixed(&mut self, range: TextRange) {
-        let mut diag = Diag::error(None, "suffixed literals are not allowed in attributes", self.span(range));
+        let mut diag =
+            Diag::error(None, "suffixed literals are not allowed in attributes", self.span(range));
         diag.help("instead of using a suffixed literal (`1u8`, `1.0f32`, etc.), use an unsuffixed version (`1`, `1.0`, etc.)");
         self.error(diag);
     }
@@ -712,7 +733,9 @@ impl Reader<'_, '_, '_> {
                 let mut diag = Diag::error(
                     None,
                     // alloc: the error's message
-                    format!("expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found {descr}"),
+                    format!(
+                        "expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found {descr}"
+                    ),
                     // clone: the error's span, used again for its label and suggestion
                     span.clone(),
                 );
@@ -741,7 +764,9 @@ impl Reader<'_, '_, '_> {
                 let diag = Diag::error(
                     None,
                     // alloc: the error's message
-                    format!("expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found {descr}"),
+                    format!(
+                        "expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found {descr}"
+                    ),
                     self.span(found.text_range()),
                 );
                 self.error(diag);
@@ -779,7 +804,10 @@ impl Reader<'_, '_, '_> {
                     diag.multipart_suggestion(
                         "you might have meant to write a string literal",
                         // alloc: the error's suggestion
-                        vec![(span.shrink_to_lo(), "\"".to_owned()), (span.shrink_to_hi(), "\"".to_owned())],
+                        vec![
+                            (span.shrink_to_lo(), "\"".to_owned()),
+                            (span.shrink_to_hi(), "\"".to_owned()),
+                        ],
                         Applicability::MaybeIncorrect,
                     );
                 }
@@ -800,18 +828,23 @@ impl Reader<'_, '_, '_> {
             SyntaxKind::INT_NUMBER => {
                 let int = ast::IntNumber::cast(token)?;
                 let suffix = int.suffix().map(SmolStr::new);
-                let symbol = SmolStr::new(&text[..text.len() - suffix.as_deref().map_or(0, str::len)]);
+                let symbol =
+                    SmolStr::new(&text[..text.len() - suffix.as_deref().map_or(0, str::len)]);
                 match suffix.as_deref() {
-                    None | Some("i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize") => {
-                        match int.value() {
-                            Ok(value) => (LitKind::Int(value), symbol, suffix),
-                            Err(_) => {
-                                self.int_too_large(range, int.radix() as u32);
-                                (LitKind::Err, symbol, suffix)
-                            }
+                    None
+                    | Some(
+                        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
+                        | "u64" | "u128" | "usize",
+                    ) => match int.value() {
+                        Ok(value) => (LitKind::Int(value), symbol, suffix),
+                        Err(_) => {
+                            self.int_too_large(range, int.radix() as u32);
+                            (LitKind::Err, symbol, suffix)
                         }
+                    },
+                    Some("f16" | "f32" | "f64" | "f128") if int.radix() as u32 == 10 => {
+                        (LitKind::Float, symbol, suffix)
                     }
-                    Some("f16" | "f32" | "f64" | "f128") if int.radix() as u32 == 10 => (LitKind::Float, symbol, suffix),
                     Some(other) => {
                         self.invalid_int_suffix(range, &symbol, other);
                         (LitKind::Err, symbol, suffix)
@@ -821,7 +854,8 @@ impl Reader<'_, '_, '_> {
             SyntaxKind::FLOAT_NUMBER => {
                 let float = ast::FloatNumber::cast(token)?;
                 let suffix = float.suffix().map(SmolStr::new);
-                let symbol = SmolStr::new(&text[..text.len() - suffix.as_deref().map_or(0, str::len)]);
+                let symbol =
+                    SmolStr::new(&text[..text.len() - suffix.as_deref().map_or(0, str::len)]);
                 match suffix.as_deref() {
                     None | Some("f16" | "f32" | "f64" | "f128") => (LitKind::Float, symbol, suffix),
                     Some(other) => {
@@ -840,7 +874,9 @@ impl Reader<'_, '_, '_> {
                     }
                     None => match string.value() {
                         // clone: inline, or a refcount on the one copy the symbol and value share
-                        Ok(Cow::Borrowed(value)) if value == symbol => (LitKind::Str(symbol.clone()), symbol, None),
+                        Ok(Cow::Borrowed(value)) if value == symbol => {
+                            (LitKind::Str(symbol.clone()), symbol, None)
+                        }
                         Ok(value) => (LitKind::Str(SmolStr::from(value)), symbol, None),
                         Err(_) => (LitKind::Err, symbol, None),
                     },
@@ -932,21 +968,35 @@ impl Reader<'_, '_, '_> {
             && suffix[1..].chars().all(|it| it.is_ascii_digit());
         if looks_like_width {
             // alloc: the error's message
-            let mut diag = Diag::error(None, format!("invalid width `{}` for integer literal", &suffix[1..]), span);
+            let mut diag = Diag::error(
+                None,
+                format!("invalid width `{}` for integer literal", &suffix[1..]),
+                span,
+            );
             diag.help("valid widths are 8, 16, 32, 64 and 128");
             self.error(diag);
             return;
         }
         if let Some(fixed) = fix_base_capitalisation(symbol, suffix) {
             // clone: the error's span, used again for its suggestion
-            let mut diag = Diag::error(None, "invalid base prefix for number literal", span.clone());
+            let mut diag =
+                Diag::error(None, "invalid base prefix for number literal", span.clone());
             diag.note("base prefixes (`0xff`, `0b1010`, `0o755`) are lowercase");
-            diag.suggestion(span, "try making the prefix lowercase", fixed, Applicability::MaybeIncorrect);
+            diag.suggestion(
+                span,
+                "try making the prefix lowercase",
+                fixed,
+                Applicability::MaybeIncorrect,
+            );
             self.error(diag);
             return;
         }
         // alloc: the error's message; clone: its span, used again for its label
-        let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for number literal"), span.clone());
+        let mut diag = Diag::error(
+            None,
+            format!("invalid suffix `{suffix}` for number literal"),
+            span.clone(),
+        );
         // alloc: the error's label
         diag.span_label(span, format!("invalid suffix `{suffix}`"));
         diag.help("the suffix must be one of the numeric types (`u32`, `isize`, `f32`, etc.)");
@@ -956,15 +1006,23 @@ impl Reader<'_, '_, '_> {
     /// `InvalidFloatLiteralWidth` or `InvalidFloatLiteralSuffix`.
     fn invalid_float_suffix(&mut self, range: TextRange, suffix: &str) {
         let span = self.span(range);
-        if suffix.len() > 1 && suffix.starts_with('f') && suffix[1..].chars().all(|it| it.is_ascii_digit()) {
+        if suffix.len() > 1
+            && suffix.starts_with('f')
+            && suffix[1..].chars().all(|it| it.is_ascii_digit())
+        {
             // alloc: the error's message
-            let mut diag = Diag::error(None, format!("invalid width `{}` for float literal", &suffix[1..]), span);
+            let mut diag = Diag::error(
+                None,
+                format!("invalid width `{}` for float literal", &suffix[1..]),
+                span,
+            );
             diag.help("valid widths are 32 and 64");
             self.error(diag);
             return;
         }
         // alloc: the error's message; clone: its span, used again for its label
-        let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for float literal"), span.clone());
+        let mut diag =
+            Diag::error(None, format!("invalid suffix `{suffix}` for float literal"), span.clone());
         // alloc: the error's label
         diag.span_label(span, format!("invalid suffix `{suffix}`"));
         diag.help("valid suffixes are `f32` and `f64`");
@@ -975,7 +1033,8 @@ impl Reader<'_, '_, '_> {
     fn invalid_suffix(&mut self, range: TextRange, kind: &str, suffix: &str) {
         let span = self.span(range);
         // alloc: the error's message; clone: its span, used again for its label
-        let mut diag = Diag::error(None, format!("suffixes on {kind} literals are invalid"), span.clone());
+        let mut diag =
+            Diag::error(None, format!("suffixes on {kind} literals are invalid"), span.clone());
         // alloc: the error's label
         diag.span_label(span, format!("invalid suffix `{suffix}`"));
         self.error(diag);
@@ -1002,7 +1061,9 @@ impl Reader<'_, '_, '_> {
             // alloc: an error's message
             return format!("reserved keyword `{text}`");
         }
-        if SyntaxKind::from_keyword(text, self.edition).is_some_and(|it| it.is_strict_keyword(self.edition)) {
+        if SyntaxKind::from_keyword(text, self.edition)
+            .is_some_and(|it| it.is_strict_keyword(self.edition))
+        {
             // alloc: an error's message
             return format!("keyword `{text}`");
         }
@@ -1041,17 +1102,26 @@ fn statement(elements: &[ast::Element<'_>]) -> Option<Statement> {
     let mut end = first.text_range().end();
     let mut segments = 1;
     loop {
-        let (Some(a), Some(b)) = (elements.get(at).and_then(|it| it.as_token()), elements.get(at + 1)) else { break };
+        let (Some(a), Some(b)) =
+            (elements.get(at).and_then(|it| it.as_token()), elements.get(at + 1))
+        else {
+            break;
+        };
         let sep = match a.kind() {
             SyntaxKind::COLON2 => 1,
             SyntaxKind::COLON
-                if b.as_token().is_some_and(|it| it.kind() == SyntaxKind::COLON && it.text_range().start() == a.text_range().end()) =>
+                if b.as_token().is_some_and(|it| {
+                    it.kind() == SyntaxKind::COLON
+                        && it.text_range().start() == a.text_range().end()
+                }) =>
             {
                 2
             }
             _ => break,
         };
-        let Some(next) = elements.get(at + sep).and_then(|it| it.as_token()).filter(|it| is_segment(it.kind())) else {
+        let Some(next) =
+            elements.get(at + sep).and_then(|it| it.as_token()).filter(|it| is_segment(it.kind()))
+        else {
             break;
         };
         end = next.text_range().end();
@@ -1077,7 +1147,10 @@ fn statement(elements: &[ast::Element<'_>]) -> Option<Statement> {
     let mut sentence_end = end;
     for element in &elements[at..] {
         let Some(token) = element.as_token() else { break };
-        if token.kind() == SyntaxKind::IDENT || is_lit(token.kind()) || token.kind() == SyntaxKind::DOT {
+        if token.kind() == SyntaxKind::IDENT
+            || is_lit(token.kind())
+            || token.kind() == SyntaxKind::DOT
+        {
             sentence_end = token.text_range().end();
         } else {
             break;
@@ -1091,7 +1164,11 @@ fn statement(elements: &[ast::Element<'_>]) -> Option<Statement> {
 fn is_segment(kind: SyntaxKind) -> bool {
     matches!(
         kind,
-        SyntaxKind::IDENT | SyntaxKind::SELF_KW | SyntaxKind::SUPER_KW | SyntaxKind::CRATE_KW | SyntaxKind::SELF_TYPE_KW
+        SyntaxKind::IDENT
+            | SyntaxKind::SELF_KW
+            | SyntaxKind::SUPER_KW
+            | SyntaxKind::CRATE_KW
+            | SyntaxKind::SELF_TYPE_KW
     )
 }
 
@@ -1104,7 +1181,18 @@ fn is_lit(kind: SyntaxKind) -> bool {
 fn is_reserved_keyword(text: &str, edition: Edition) -> bool {
     matches!(
         text,
-        "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield"
+        "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
     ) || (edition >= Edition::Edition2018 && text == "try")
         || (edition >= Edition::Edition2024 && text == "gen")
 }
@@ -1131,7 +1219,10 @@ fn fix_base_capitalisation(symbol: &str, suffix: &str) -> Option<String> {
         _ => return None,
     };
     let valid = symbol == "0"
-        && chars.filter(|it| *it != '_').take_while(|it| *it != 'i' && *it != 'u').all(|it| it.to_digit(base).is_some());
+        && chars
+            .filter(|it| *it != '_')
+            .take_while(|it| *it != 'i' && *it != 'u')
+            .all(|it| it.to_digit(base).is_some());
     // alloc: the error's suggestion
     valid.then(|| format!("0{}{}", base_char.to_ascii_lowercase(), &suffix[1..]))
 }
@@ -1163,7 +1254,8 @@ mod tests {
     fn a_token_trees_elements_are_those_between_its_delimiters() {
         use syntax::{SourceFile, view::AstNode as _};
 
-        let text = "#[a(b = 1, c::d(e), -2 x, [f], m!(g))]\n#[h[i]]\n#[j{ k }]\n#[l()]\nfn f() {}\n";
+        let text =
+            "#[a(b = 1, c::d(e), -2 x, [f], m!(g))]\n#[h[i]]\n#[j{ k }]\n#[l()]\nfn f() {}\n";
         let parse = SourceFile::parse(text, Edition::Edition2021);
         let trees: Vec<_> = parse
             .root()
@@ -1178,7 +1270,8 @@ mod tests {
                         NodeOrToken::Node(node) => node.text(),
                     })
                     .collect();
-                let nested = elements.iter().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE).count();
+                let nested =
+                    elements.iter().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE).count();
                 assert!(elements.iter().all(|it| !it.kind().is_trivia()));
                 (tt.syntax().text(), joined, nested, is_paren(tt))
             })
@@ -1192,7 +1285,10 @@ mod tests {
             ("{ k }", "k", 0, false),
             ("()", "", 0, true),
         ];
-        let expected: Vec<_> = expected.iter().map(|&(tt, inside, nested, paren)| (tt, inside.to_owned(), nested, paren)).collect();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|&(tt, inside, nested, paren)| (tt, inside.to_owned(), nested, paren))
+            .collect();
         assert_eq!(trees, expected);
     }
 

@@ -29,7 +29,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::DuplicateField) -> Vec<Found> {
     let Some(at) = record.fields.iter().position(|it| it.range == range) else { return vec![] };
     let field = &record.fields[at];
     // alloc: empty, allocates nothing
-    let Some(first) = record.fields[..at].iter().find(|it| it.name == field.name) else { return vec![] };
+    let Some(first) = record.fields[..at].iter().find(|it| it.name == field.name) else {
+        return vec![];
+    };
     let name = &field.name;
     let first_span = record.span(cx, first.range);
     let mut diag = match record.is_pat {

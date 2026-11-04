@@ -5,12 +5,12 @@
 use std::mem::offset_of;
 
 use blaze_format::{FormatError, Persist, Record, SchemaHash, Slice, Str, Writer, open_as};
+use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
-use blaze_query::db::{AsId, FromId};
 
 use crate::{Site, WfDiagnostic, WfResult};
 
@@ -223,9 +223,9 @@ fn decode<'a>(row: &'a WfRow, buffer: &'a [u8]) -> Result<WfDiagnosticRef<'a>, F
 #[cfg(test)]
 mod tests {
     use blaze_format::{Aligned, Persist, to_bytes};
+    use blaze_query::db::FromId;
     use hir_def::{FunctionId, GenericDefId, ImplId, StructId, VariantId};
     use la_arena::{Idx, RawIdx};
-    use blaze_query::db::FromId;
 
     use crate::{Site, WfDiagnostic, WfResult};
 
@@ -305,8 +305,12 @@ mod tests {
         let written = to_bytes(&result);
         let word = u64::from(blaze_query::db::AsId::as_id(&function).as_u32()).to_ne_bytes();
         // alloc: a test's list of matches
-        let places: Vec<usize> =
-            written.windows(8).enumerate().filter(|(_, it)| *it == word).map(|(at, _)| at).collect();
+        let places: Vec<usize> = written
+            .windows(8)
+            .enumerate()
+            .filter(|(_, it)| *it == word)
+            .map(|(at, _)| at)
+            .collect();
         let [place] = places[..] else { panic!("the id's word is in the buffer once: {places:?}") };
         // The error names the row's byte, the id's word being its field.
         let at = place - std::mem::offset_of!(super::WfRow, id);

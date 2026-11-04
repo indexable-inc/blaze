@@ -47,7 +47,8 @@ fn check_resolutions(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &E
                 Some(ValueNs::FunctionId(it)) => describe(&db, it),
                 Some(ValueNs::StaticId(it)) => {
                     let src = it.lookup(&db).source_view(&db).value;
-                    let init = src.body().map_or_else(String::new, |it| it.syntax().text().to_string());
+                    let init =
+                        src.body().map_or_else(String::new, |it| it.syntax().text().to_string());
                     format!("static = {init}")
                 }
                 Some(ValueNs::StructId(it)) => {
@@ -88,7 +89,8 @@ fn collect_functions(db: &TestDB, map: &DefMap, out: &mut Vec<FunctionId>) {
 /// `fn name -> ret`, the return type as written (`()` for none).
 fn describe(db: &TestDB, function: FunctionId) -> String {
     let src = function.lookup(db).source_view(db).value;
-    let name = view::HasName::name(&src).map_or_else(String::new, |it| it.syntax().text().to_string());
+    let name =
+        view::HasName::name(&src).map_or_else(String::new, |it| it.syntax().text().to_string());
     let ret = src
         .ret_type()
         .and_then(|it| it.ty())
@@ -329,8 +331,11 @@ fn main_blocks(
         dump.push_str(&map.dump(&db));
         for (name, _) in map.module(&db, map.root_module_id()).scope(&db).entries() {
             let Some(key) = name.key() else { continue };
-            let expn = hir_expand::MacroCallId::from(key.outer_expn(&db).expect("a keyed name's context has a mark"));
-            let at = calls.iter().position(|&it| it == expn).expect("a call of `main`'s body wrote it");
+            let expn = hir_expand::MacroCallId::from(
+                key.outer_expn(&db).expect("a keyed name's context has a mark"),
+            );
+            let at =
+                calls.iter().position(|&it| it == expn).expect("a call of `main`'s body wrote it");
             keys.push((key.into_u32(), at));
         }
     }
@@ -362,7 +367,10 @@ fn main() {
     };
     let (ids, reversed) = (by_call(&first_keys), by_call(&second_keys));
     assert_eq!(ids.len(), 2, "two keyed `S`s: {first_keys:?}");
-    assert!(ids[0] < ids[1] && reversed[0] > reversed[1], "the second build numbers the contexts the other way: {ids:?} {reversed:?}");
+    assert!(
+        ids[0] < ids[1] && reversed[0] > reversed[1],
+        "the second build numbers the contexts the other way: {ids:?} {reversed:?}"
+    );
     expect![[r#"
         (block scope)
         - S : type value
@@ -669,9 +677,11 @@ fn check_generic_params(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect:
                     let hygiene = store.type_path_hygiene(ty);
                     match self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene) {
                         Some((TypeNs::GenericParam(id), None, ..)) => self.type_or_const(id.into()),
-                        Some((TypeNs::BuiltinType(_), None, ..)) => path
-                            .mod_path()
-                            .map_or_else(String::new, |it| it.display_verbatim(self.db).to_string()),
+                        Some((TypeNs::BuiltinType(_), None, ..)) => {
+                            path.mod_path().map_or_else(String::new, |it| {
+                                it.display_verbatim(self.db).to_string()
+                            })
+                        }
                         Some((other, ..)) => format!("{other:?}"),
                         None => "unresolved".to_owned(),
                     }
@@ -681,7 +691,9 @@ fn check_generic_params(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect:
                     let tys: Vec<_> = tys.iter().map(|&it| self.ty(it)).collect();
                     format!("({})", tys.join(", "))
                 }
-                TypeRef::Reference(it) => format!("&{} {}", self.lifetime(it.lifetime), self.ty(it.ty)),
+                TypeRef::Reference(it) => {
+                    format!("&{} {}", self.lifetime(it.lifetime), self.ty(it.ty))
+                }
                 TypeRef::Array(it) => format!("[{}; {}]", self.ty(it.ty), self.konst(it.len.expr)),
                 other => format!("{other:?}"),
             }
@@ -719,10 +731,8 @@ fn check_generic_params(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect:
         let signature = FunctionSignature::of(&db, function);
         let cx = Cx { db: &db, resolver: function.resolver(&db), signature, def: function.into() };
         let params = cx.params();
-        let mut list: Vec<String> = params
-            .iter_lt()
-            .map(|(id, it)| label(&it.name, id.into_raw().into_u32()))
-            .collect();
+        let mut list: Vec<String> =
+            params.iter_lt().map(|(id, it)| label(&it.name, id.into_raw().into_u32())).collect();
         list.extend(params.iter_type_or_consts().map(|(id, it)| {
             let name = it.name().expect("a named parameter");
             let kind = if it.const_param().is_some() { "const " } else { "" };

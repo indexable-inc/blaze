@@ -6,7 +6,9 @@ use blaze_ids::{ContentId, rng::SplitMix64};
 use blaze_mem::Tag;
 use hir_def::LocalFieldId;
 use la_arena::RawIdx;
-use rustc_abi::{FieldsShape, Integer, NicheOptimizations, Primitive, ReprOptions, Size, TargetDataLayout};
+use rustc_abi::{
+    FieldsShape, Integer, NicheOptimizations, Primitive, ReprOptions, Size, TargetDataLayout,
+};
 use rustc_index::{Idx as _, IndexSlice};
 
 use super::{FieldLayouts, HotFields, HotFirst, hot_first, same_outside};
@@ -51,7 +53,10 @@ fn fields_of<'a, 'b>(variants: &'a [Vec<&'b Layout>]) -> FieldLayouts<'a, 'b> {
 }
 
 /// Variant `v`'s field offsets, memory order and size.
-fn variant(layout: &Layout, v: usize) -> (&IndexSlice<RustcFieldIdx, Size>, &[RustcFieldIdx], Size) {
+fn variant(
+    layout: &Layout,
+    v: usize,
+) -> (&IndexSlice<RustcFieldIdx, Size>, &[RustcFieldIdx], Size) {
     match &layout.variants {
         Variants::Single { index } if index.0 == v => match &layout.fields {
             FieldsShape::Arbitrary { offsets, in_memory_order } => {
@@ -81,10 +86,21 @@ fn a_hot_field_declared_last_is_laid_out_first() {
     let with = |repr: &ReprOptions, it: &FieldLayouts<'_, '_>| layout_of(&cx, false, repr, it);
     let rustc = with(&ReprOptions::default(), &fields).unwrap();
     let last = RustcFieldIdx(field(8));
-    assert_eq!(variant(&rustc, 0).0[last], Size::from_bytes(64), "rustc puts `last` after the `u64`s");
+    assert_eq!(
+        variant(&rustc, 0).0[last],
+        Size::from_bytes(64),
+        "rustc puts `last` after the `u64`s"
+    );
     blaze_mem::frame::task(Tag::Infer, |frame| {
-        let outcome =
-            hot_first(&ranks(&[vec![8]]), &rustc, &fields, &ReprOptions::default(), &dl, frame, with);
+        let outcome = hot_first(
+            &ranks(&[vec![8]]),
+            &rustc,
+            &fields,
+            &ReprOptions::default(),
+            &dl,
+            frame,
+            with,
+        );
         let HotFirst::Applied { layout, hot: 1, .. } = outcome else {
             panic!("`last` is not moved first: {outcome:?}")
         };
@@ -182,7 +198,10 @@ fn hot_first_never_changes_what_other_types_see() {
             assert_eq!(offsets.len(), own.len(), "case {case} variant {v}");
             let mut seen: Vec<usize> = in_memory_order.iter().map(|f| f.index()).collect();
             seen.sort_unstable();
-            assert!(seen.iter().enumerate().all(|(i, &f)| f == i), "case {case}: not a permutation");
+            assert!(
+                seen.iter().enumerate().all(|(i, &f)| f == i),
+                "case {case}: not a permutation"
+            );
             assert!(
                 in_memory_order.windows(2).all(|it| offsets[it[0]] <= offsets[it[1]]),
                 "case {case} variant {v}: memory order is not by offset"
@@ -215,10 +234,19 @@ fn the_same_ranks_give_the_same_layout() {
         let run = || {
             let cx = LayoutCx::new(&dl);
             let fields = fields_of(&declared);
-            let with = |repr: &ReprOptions, it: &FieldLayouts<'_, '_>| layout_of(&cx, false, repr, it);
+            let with =
+                |repr: &ReprOptions, it: &FieldLayouts<'_, '_>| layout_of(&cx, false, repr, it);
             let rustc = with(&ReprOptions::default(), &fields).ok()?;
             blaze_mem::frame::task(Tag::Infer, |frame| {
-                match hot_first(&ranks(&hot), &rustc, &fields, &ReprOptions::default(), &dl, frame, with) {
+                match hot_first(
+                    &ranks(&hot),
+                    &rustc,
+                    &fields,
+                    &ReprOptions::default(),
+                    &dl,
+                    frame,
+                    with,
+                ) {
                     HotFirst::Applied { layout, hot, tried } => Some((Some(layout), hot, tried)),
                     HotFirst::AlreadyFirst | HotFirst::Shape(_) => Some((None, 0, 0)),
                     HotFirst::NoneFits { tried } => Some((None, 0, tried)),

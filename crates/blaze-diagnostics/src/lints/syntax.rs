@@ -32,12 +32,12 @@ pub use check_cfg::CheckCfg;
 use blaze_hash::hash_map::Entry;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId, ModuleSourceView};
 use hir_def::AdtId;
+use std::alloc::Global;
 use syntax::{
     FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, WalkEvent,
     view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
@@ -107,13 +107,19 @@ impl Emitted {
     /// The lint `diag` of `phase`, its level decided at `at`, emitted in `pass` as rustc's walk
     /// comes to `at`.
     pub(crate) fn new(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
-        let found = Found { pre_expansion: pass == Pass::PreExpansion, ..Found::lint(diag, phase, at) };
+        let found =
+            Found { pre_expansion: pass == Pass::PreExpansion, ..Found::lint(diag, phase, at) };
         Emitted { found, pass, stage: Stage::default(), place: Some(at) }
     }
 
     /// `diag`, an error or warning that is no lint's, emitted in `pass` as rustc's walk comes
     /// to `at` (E0783 of the early lint pass).
-    pub(crate) fn placed(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
+    pub(crate) fn placed(
+        diag: Diag,
+        phase: Phase,
+        pass: Pass,
+        at: InFile<SyntaxNodePtr>,
+    ) -> Emitted {
         Emitted { found: Found::new(diag, phase), pass, stage: Stage::default(), place: Some(at) }
     }
 
@@ -173,13 +179,23 @@ impl<'db> Tree<'db> {
 
     /// The nodes whose kind `wanted` holds, in pre-order: a scan of the kind column, each node
     /// read only when it is wanted.
-    pub(crate) fn of_kind(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = ast::Node<'db>> {
-        self.kinds.iter().zip(&self.nodes).filter(move |(kind, _)| wanted(**kind)).map(|(_, &node)| node)
+    pub(crate) fn of_kind(
+        &self,
+        wanted: impl Fn(SyntaxKind) -> bool,
+    ) -> impl Iterator<Item = ast::Node<'db>> {
+        self.kinds
+            .iter()
+            .zip(&self.nodes)
+            .filter(move |(kind, _)| wanted(**kind))
+            .map(|(_, &node)| node)
     }
 
     /// The nodes whose kind `wanted` holds and which may have an attribute ([`Tree::attrs`]),
     /// in pre-order: a scan of two columns, each node read only when it is wanted.
-    pub(crate) fn with_attrs(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = ast::Node<'db>> {
+    pub(crate) fn with_attrs(
+        &self,
+        wanted: impl Fn(SyntaxKind) -> bool,
+    ) -> impl Iterator<Item = ast::Node<'db>> {
         (self.kinds.iter().zip(&self.attrs).zip(&self.nodes))
             .filter(move |((kind, attrs), _)| **attrs && wanted(**kind))
             .map(|(_, &node)| node)
@@ -236,7 +252,13 @@ impl<'db> Walk<'db> {
     }
 
     /// Adds the tree `root` of `file`, and the trees of what the macros in it expand to.
-    fn add(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, root: ast::Node<'db>, place: Vec<(u32, u32)>) {
+    fn add(
+        &mut self,
+        cx: &Cx<'_, 'db>,
+        file: HirFileId,
+        root: ast::Node<'db>,
+        place: Vec<(u32, u32)>,
+    ) {
         // The tree's index is taken now: what it expands to is added after it is pushed.
         match self.index.entry(file) {
             Entry::Occupied(_) => return,
@@ -330,8 +352,11 @@ impl<'db> Walk<'db> {
             attrs.push(false);
         }
         // alloc: setup, once per tree, as above
-        let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
-        radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
+        let mut skips: Vec<TextRange> =
+            off.iter().chain(&replaced).map(|it| it.text_range()).collect();
+        radix::sort_copy_by_key(&mut skips, |it| {
+            radix::pack_32(it.start().into(), it.end().into())
+        });
         self.trees.push(Tree {
             file,
             root,
@@ -355,7 +380,12 @@ impl<'db> Walk<'db> {
 
     /// The file of the out-of-line module `node` declares in a block (`fn f() { mod m; }`): it
     /// is in a block's def map, not the crate's, so only the walk coming to `node` finds it.
-    fn block_module(&self, cx: &Cx<'_, 'db>, file: HirFileId, node: ast::Node<'db>) -> Option<InFile<ast::Node<'db>>> {
+    fn block_module(
+        &self,
+        cx: &Cx<'_, 'db>,
+        file: HirFileId,
+        node: ast::Node<'db>,
+    ) -> Option<InFile<ast::Node<'db>>> {
         let module = ast::Module::cast(node)?;
         if module.item_list().is_some() {
             return None;
@@ -367,7 +397,9 @@ impl<'db> Walk<'db> {
         let source = def.definition_source_view(cx.db);
         match source.value {
             // The root `cx.vsema` hands out, so what is found under it maps back to its file.
-            ModuleSourceView::SourceFile(_) => Some(InFile::new(source.file_id, cx.root(source.file_id))),
+            ModuleSourceView::SourceFile(_) => {
+                Some(InFile::new(source.file_id, cx.root(source.file_id)))
+            }
             ModuleSourceView::Module(_) | ModuleSourceView::BlockExpr(_) => None,
         }
     }
@@ -406,7 +438,12 @@ impl<'db> Walk<'db> {
     /// Where rustc's walk comes to `at` in `pass`: as it enters it, or for [`Pass::Post`] as it
     /// leaves it. A node of an expansion the walk does not have is placed at the call it came
     /// from.
-    pub(crate) fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>, pass: Pass) -> Vec<(u32, u32)> {
+    pub(crate) fn place(
+        &self,
+        cx: &Cx<'_, '_>,
+        at: InFile<SyntaxNodePtr>,
+        pass: Pass,
+    ) -> Vec<(u32, u32)> {
         let (mut file, mut range) = (at.file_id, at.value.text_range());
         loop {
             if let Some(tree) = self.tree(file) {
@@ -513,7 +550,10 @@ fn signature_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId,
             if let Some(it) = ast::Const::cast(ancestor) {
                 let def = cx.vsema.to_def2(node.with_value(it))?;
                 // alloc: the name of an unnamed const, as above
-                return Some((ItemId::Const(def.into()), name(it.name()).unwrap_or_else(|| "_".to_owned())));
+                return Some((
+                    ItemId::Const(def.into()),
+                    name(it.name()).unwrap_or_else(|| "_".to_owned()),
+                ));
             }
             if let Some(it) = ast::Static::cast(ancestor) {
                 let def = cx.vsema.to_def2(node.with_value(it))?;
@@ -565,11 +605,17 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
 /// rustc's `par_hir_for_each_module`), in it every item whose module it is, then for the
 /// crate root the crate's own attributes. A module file's inner attributes are of its `mod`
 /// item, checked in the module that has it.
-fn checked_in(cx: &Cx<'_, '_>, modules: &HashMap<hir::Module, usize, Global>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
+fn checked_in(
+    cx: &Cx<'_, '_>,
+    modules: &HashMap<hir::Module, usize, Global>,
+    at: InFile<SyntaxNodePtr>,
+) -> (usize, bool) {
     let node = cx.syntax_view(at);
     let rank = |module: hir::Module| modules.get(&module).copied().unwrap_or(usize::MAX);
     if let Some(file) = ast::SourceFile::cast(node.value) {
-        let Some(module) = cx.vsema.to_def2(node.with_value(file)) else { return (usize::MAX, false) };
+        let Some(module) = cx.vsema.to_def2(node.with_value(file)) else {
+            return (usize::MAX, false);
+        };
         return match module.parent(cx.db) {
             None => (rank(module), true),
             Some(parent) => (rank(parent), false),
@@ -650,7 +696,8 @@ mod tests {
 
     fn place_of(cx: &Cx<'_, '_>, walk: &Walk<'_>, name: &str) -> Vec<(u32, u32)> {
         let fns = fns(walk);
-        let (_, tree, node) = fns.iter().find(|(it, ..)| it == name).unwrap_or_else(|| panic!("no `{name}`"));
+        let (_, tree, node) =
+            fns.iter().find(|(it, ..)| it == name).unwrap_or_else(|| panic!("no `{name}`"));
         walk.place(cx, tree.ptr(*node), Pass::Early)
     }
 
@@ -738,12 +785,19 @@ pub fn inner() {
         let mut messages: Vec<String> = checked
             .messages()
             .into_iter()
-            .filter(|it| it.starts_with("while_true") || it.starts_with("deprecated") || it.starts_with("blaze can't"))
+            .filter(|it| {
+                it.starts_with("while_true")
+                    || it.starts_with("deprecated")
+                    || it.starts_with("blaze can't")
+            })
             .collect();
         messages.sort();
         assert_eq!(
             messages,
-            ["deprecated: use of deprecated function `d`", "while_true: denote infinite loops with `loop { ... }`"]
+            [
+                "deprecated: use of deprecated function `d`",
+                "while_true: denote infinite loops with `loop { ... }`"
+            ]
         );
     }
 
@@ -762,10 +816,18 @@ fn after() {}
                 let (_, tree, made) = fns.iter().find(|(it, ..)| it == "made").unwrap();
                 assert!(tree.call.is_some() && !tree.in_file());
                 assert!(from_expansion(cx, InFile::new(tree.file, *made)));
-                let sum = tree.nodes.iter().copied().find(|it| ast::BinExpr::can_cast(it.kind())).unwrap();
+                let sum = tree
+                    .nodes
+                    .iter()
+                    .copied()
+                    .find(|it| ast::BinExpr::can_cast(it.kind()))
+                    .unwrap();
                 assert!(!from_expansion(cx, InFile::new(tree.file, sum)));
-                let (before, made, after) =
-                    (place_of(cx, walk, "before"), place_of(cx, walk, "made"), place_of(cx, walk, "after"));
+                let (before, made, after) = (
+                    place_of(cx, walk, "before"),
+                    place_of(cx, walk, "made"),
+                    place_of(cx, walk, "after"),
+                );
                 assert!(before < made && made < after, "{before:?} {made:?} {after:?}");
             },
         );
@@ -788,9 +850,11 @@ fn after() {}
             crate::lints::with_cx(&crate::lints::quiet_crate(fns), &["-A", "unused"], |cx| {
                 let walk = cx.walk();
                 cx.lint_may_fire(crate::lints::registry::LintId::WARNINGS);
-                let found = blaze_alloc_count::assert_at_most(0, "delims, all of its lints allowed", || {
-                    delims::lints(cx, walk)
-                });
+                let found = blaze_alloc_count::assert_at_most(
+                    0,
+                    "delims, all of its lints allowed",
+                    || delims::lints(cx, walk),
+                );
                 assert!(found.is_empty());
             });
         }
@@ -802,7 +866,9 @@ fn after() {}
         walked(&crate::lints::quiet_crate(3), |_, walk| {
             for tree in &walk.trees {
                 assert_eq!(tree.kinds.len(), tree.nodes.len());
-                assert!(tree.nodes.iter().zip(&tree.kinds).all(|(node, &kind)| node.kind() == kind));
+                assert!(
+                    tree.nodes.iter().zip(&tree.kinds).all(|(node, &kind)| node.kind() == kind)
+                );
                 let fns: Vec<_> = tree.of_kind(|it| it == SyntaxKind::FN).collect();
                 assert_eq!(fns.len(), 3);
             }

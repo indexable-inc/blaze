@@ -10,7 +10,6 @@
 
 use blaze_format::cursor::Reader;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cranelift_codegen::gimli::{
     self, DW_AT_GNU_addr_base, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_GNU_ranges_base,
     DW_AT_comp_dir, DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, DW_CHILDREN_no,
@@ -24,6 +23,7 @@ use cranelift_object::object::{
     self, BinaryFormat, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
 };
+use std::alloc::Global;
 
 use super::{Section, SectionWriter, Sidecar, Target};
 
@@ -204,7 +204,8 @@ impl Split {
                     return Err("a unit kept apart names an address".to_owned());
                 }
             };
-            info.write_udata_at(reloc.offset as usize, value as u64, reloc.size).map_err(message)?;
+            info.write_udata_at(reloc.offset as usize, value as u64, reloc.size)
+                .map_err(message)?;
         }
         let name = file(&self.name, self.files.len());
         let lists = std::mem::take(&mut self.loc_apart);

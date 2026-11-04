@@ -19,8 +19,16 @@ const ROUNDS: i64 = 24_000;
 fn long(mk: &Mk) -> ir::Function {
     mk.func(0, mk.sig_of(&[I64, I64, I64], &[I64]), |b, p| {
         let (n, x, d) = (p[0], p[1], p[2]);
-        let acc = b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, 8, 3));
-        let left = b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, 8, 3));
+        let acc = b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        let left = b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
         let body = b.create_block();
         let exit = b.create_block();
         let pool = b.func.dfg.constants.insert(ir::ConstantData::from(
@@ -59,9 +67,14 @@ fn a_function_past_every_branch_reach_runs_as_cranelifts() {
     for counts in [true, false] {
         let mk = Mk::new(crate::Target { counts, ..host.target });
         let func = long(&mk);
-        let code = crate::compile(&func, &mk.target).unwrap_or_else(|e| panic!("counts {counts}: {e}"));
+        let code =
+            crate::compile(&func, &mk.target).unwrap_or_else(|e| panic!("counts {counts}: {e}"));
         if !mk.x64() {
-            assert!(code.bytes.len() > 9 << 17, "counts {counts}: {} bytes reach no limit", code.bytes.len());
+            assert!(
+                code.bytes.len() > 9 << 17,
+                "counts {counts}: {} bytes reach no limit",
+                code.bytes.len()
+            );
         }
         let again = crate::compile(&func, &mk.target).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(code.bytes, again.bytes, "counts {counts}: two compiles differ");

@@ -70,7 +70,8 @@ impl World {
         let workers = 1 + rng.below(4) as u32;
         let mut fetcher = Fetcher::new(functions, workers).unwrap();
         for _ in 0..rng.below(6) {
-            let priority = [Priority::Callee, Priority::History, Priority::Idle][rng.below(3) as usize];
+            let priority =
+                [Priority::Callee, Priority::History, Priority::Idle][rng.below(3) as usize];
             fetcher.want(LazyId(rng.below(u64::from(functions)) as u32), priority);
         }
         World {
@@ -121,15 +122,22 @@ impl World {
                 Action::Answer { to, lazy, outcome } => {
                     let mut bytes = Vec::new();
                     match &outcome {
-                        Outcome::Ready(at) => Frame::Ready { request: to.request, lazy, target: *at }.encode(&mut bytes),
+                        Outcome::Ready(at) => {
+                            Frame::Ready { request: to.request, lazy, target: *at }
+                                .encode(&mut bytes)
+                        }
                         Outcome::Failed(why) => {
-                            Frame::Failed { request: to.request, lazy, why: &**why }.encode(&mut bytes)
+                            Frame::Failed { request: to.request, lazy, why: &**why }
+                                .encode(&mut bytes)
                         }
                     }
                     self.network.push(Message::ToThread { client: to.client, bytes });
                 }
                 Action::Stop { lazy, .. } => {
-                    assert!(self.failing[lazy as usize], "the run was stopped for {lazy}, which compiled");
+                    assert!(
+                        self.failing[lazy as usize],
+                        "the run was stopped for {lazy}, which compiled"
+                    );
                     self.stops.push(lazy);
                 }
             }
@@ -139,7 +147,9 @@ impl World {
     fn deliver(&mut self, message: Message) {
         match message {
             Message::ToDaemon { client, bytes } => {
-                let Frame::Ask { request, lazy } = Frame::decode(&bytes).unwrap() else { panic!("not an ask") };
+                let Frame::Ask { request, lazy } = Frame::decode(&bytes).unwrap() else {
+                    panic!("not an ask")
+                };
                 self.note(request ^ u64::from(lazy) << 7);
                 let mut actions = Vec::new();
                 let seq = request as u32;
@@ -152,7 +162,10 @@ impl World {
                 let (request, lazy) = match frame {
                     Frame::Ready { request, lazy, target: at } => {
                         assert_eq!(at, target(lazy), "function {lazy} answered at two addresses");
-                        assert!(!self.failing[lazy as usize], "function {lazy} failed and was answered ready");
+                        assert!(
+                            !self.failing[lazy as usize],
+                            "function {lazy} failed and was answered ready"
+                        );
                         (request, lazy)
                     }
                     Frame::Failed { request, lazy, why } => {
@@ -190,7 +203,8 @@ impl World {
             0 if !self.compiling.is_empty() => {
                 let at = self.rng.below(self.compiling.len() as u64) as usize;
                 let id = self.compiling.swap_remove(at);
-                let result = if self.failing[id.index()] { Err("no MIR") } else { Ok(target(id.0)) };
+                let result =
+                    if self.failing[id.index()] { Err("no MIR") } else { Ok(target(id.0)) };
                 let mut actions = Vec::new();
                 self.fetcher.done(id, result, &mut actions);
                 self.act(actions);
@@ -204,8 +218,12 @@ impl World {
                 }
                 if self.rng.one_in(12) {
                     let copy = match &message {
-                        Message::ToDaemon { client, bytes } => Message::ToDaemon { client: *client, bytes: bytes.clone() },
-                        Message::ToThread { client, bytes } => Message::ToThread { client: *client, bytes: bytes.clone() },
+                        Message::ToDaemon { client, bytes } => {
+                            Message::ToDaemon { client: *client, bytes: bytes.clone() }
+                        }
+                        Message::ToThread { client, bytes } => {
+                            Message::ToThread { client: *client, bytes: bytes.clone() }
+                        }
                     };
                     self.network.push(copy);
                 }
@@ -224,11 +242,19 @@ impl World {
             assert!(steps < 1_000_000, "the run did not end");
         }
         for (lazy, failing) in self.failing.iter().enumerate() {
-            let called = self.threads.iter().any(|it| it.calls[..it.next.min(it.calls.len())].contains(&(lazy as u32)))
+            let called = self
+                .threads
+                .iter()
+                .any(|it| it.calls[..it.next.min(it.calls.len())].contains(&(lazy as u32)))
                 || self.threads.iter().any(|it| it.stopped && it.calls[it.next] == lazy as u32);
             let stops = self.stops.iter().filter(|it| **it == lazy as u32).count();
-            if *failing && self.threads.iter().any(|it| it.stopped && it.calls[it.next] == lazy as u32) {
-                assert_eq!(stops, 1, "function {lazy} failed, was called, and stopped the run {stops} times");
+            if *failing
+                && self.threads.iter().any(|it| it.stopped && it.calls[it.next] == lazy as u32)
+            {
+                assert_eq!(
+                    stops, 1,
+                    "function {lazy} failed, was called, and stopped the run {stops} times"
+                );
             }
             if !called {
                 assert_eq!(stops, 0, "function {lazy} was never called and stopped the run");
@@ -286,15 +312,27 @@ fn the_waiters_in_a_slab_answer_as_a_list_per_function_did() {
             expected.clear();
             match rng.below(3) {
                 0 => {
-                    let to = Waiter { client: rng.below(3) as u32, seq: rng.below(3) as u32, request: rng.below(2) };
+                    let to = Waiter {
+                        client: rng.below(3) as u32,
+                        seq: rng.below(3) as u32,
+                        request: rng.below(2),
+                    };
                     let lazy = rng.below(u64::from(functions)) as u32;
                     fetcher.ask(to, lazy, &mut out);
                     let at = lazy as usize;
                     match done[at] {
-                        Done::Ready(target) => expected.push(Action::Answer { to, lazy, outcome: Outcome::Ready(target) }),
+                        Done::Ready(target) => expected.push(Action::Answer {
+                            to,
+                            lazy,
+                            outcome: Outcome::Ready(target),
+                        }),
                         Done::Failed => {
                             let why: Arc<str> = "no MIR".into();
-                            expected.push(Action::Answer { to, lazy, outcome: Outcome::Failed(Arc::clone(&why)) });
+                            expected.push(Action::Answer {
+                                to,
+                                lazy,
+                                outcome: Outcome::Failed(Arc::clone(&why)),
+                            });
                             if !std::mem::replace(&mut stopped[at], true) {
                                 expected.push(Action::Stop { lazy, why });
                             }
@@ -315,7 +353,11 @@ fn the_waiters_in_a_slab_answer_as_a_list_per_function_did() {
                         let why: Arc<str> = "no MIR".into();
                         let asked = std::mem::take(&mut waiters[at]);
                         for to in &asked {
-                            expected.push(Action::Answer { to: *to, lazy, outcome: Outcome::Failed(Arc::clone(&why)) });
+                            expected.push(Action::Answer {
+                                to: *to,
+                                lazy,
+                                outcome: Outcome::Failed(Arc::clone(&why)),
+                            });
                         }
                         if !asked.is_empty() {
                             stopped[at] = true;
@@ -326,7 +368,11 @@ fn the_waiters_in_a_slab_answer_as_a_list_per_function_did() {
                         fetcher.done(id, Ok(target), &mut out);
                         done[at] = Done::Ready(target);
                         for to in std::mem::take(&mut waiters[at]) {
-                            expected.push(Action::Answer { to, lazy, outcome: Outcome::Ready(target) });
+                            expected.push(Action::Answer {
+                                to,
+                                lazy,
+                                outcome: Outcome::Ready(target),
+                            });
                         }
                     }
                 }
@@ -351,11 +397,14 @@ fn an_ask_is_taken_before_prefetches_and_moves_a_queued_function_up() {
     fetcher.done(LazyId(2), Ok(0x40), &mut actions);
     assert!(actions.is_empty(), "nobody waited for a prefetch");
     fetcher.done(LazyId(0), Ok(0x80), &mut actions);
-    assert_eq!(actions, vec![Action::Answer {
-        to: Waiter { client: 0, seq: 1, request: 1 },
-        lazy: 0,
-        outcome: Outcome::Ready(0x80)
-    }]);
+    assert_eq!(
+        actions,
+        vec![Action::Answer {
+            to: Waiter { client: 0, seq: 1, request: 1 },
+            lazy: 0,
+            outcome: Outcome::Ready(0x80)
+        }]
+    );
     assert_eq!(fetcher.next(), Some((LazyId(1), Priority::History)));
     assert_eq!(fetcher.next(), None, "one worker stays free for asks");
     fetcher.ask(Waiter { client: 1, seq: 9, request: 9 }, 3, &mut actions);

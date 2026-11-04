@@ -58,7 +58,10 @@ const ORIGIN_PATH: &str = "\0origin/";
 /// kept under, one per checkout ([`origin_trace`]).
 pub fn copies(run: &RunKey, shared: &Traced) -> RunKey {
     let result = index::result_key(run, shared);
-    RunKey { code: run.code, given: Hasher::new("blaze v2 unverified copies 2").id(&run.given).id(&result.0).finish() }
+    RunKey {
+        code: run.code,
+        given: Hasher::new("blaze v2 unverified copies 2").id(&run.given).id(&result.0).finish(),
+    }
 }
 
 /// Which checkout a set of roots is, root by root: each role's root hashed as its mark is
@@ -84,7 +87,12 @@ impl Origin {
                     }
                 }
                 // alloc: error path
-                _ => return Err(format!("a copy whose roots are not this run's: one has a {} root and one not", role.name())),
+                _ => {
+                    return Err(format!(
+                        "a copy whose roots are not this run's: one has a {} root and one not",
+                        role.name()
+                    ));
+                }
             }
         }
         Ok(out)
@@ -106,24 +114,34 @@ impl Origin {
     fn of_shape(bytes: &[u8]) -> Result<Origin, String> {
         let shape = Shape::decode(bytes)?;
         let [path] = shape.files.as_slice() else {
-            return Err(format!("a copy's shape reads {} files, not its origin alone", shape.files.len())); // alloc: error path
+            return Err(format!(
+                "a copy's shape reads {} files, not its origin alone",
+                shape.files.len()
+            )); // alloc: error path
         };
         let rest = path.to_str().and_then(|it| it.strip_prefix(ORIGIN_PATH));
-        let mut rest = rest.ok_or_else(|| format!("a copy's shape reads {}, not an origin", path.display()))?.as_bytes(); // alloc: error path
+        let mut rest = rest
+            .ok_or_else(|| format!("a copy's shape reads {}, not an origin", path.display()))?
+            .as_bytes(); // alloc: error path
         let mut out = [None; Role::ALL.len()];
         let mut last = None;
         while let [tag, tail @ ..] = rest {
-            let role = Role::of(*tag).ok_or_else(|| format!("a copy's origin names no role {:?}", char::from(*tag)))?; // alloc: error path
+            let role = Role::of(*tag)
+                .ok_or_else(|| format!("a copy's origin names no role {:?}", char::from(*tag)))?; // alloc: error path
             let at = Role::ALL.iter().position(|it| *it == role).unwrap_or(0);
             if last.is_some_and(|last| at <= last) {
                 return Err(format!("a copy's origin names the {} root out of order", role.name())); // alloc: error path
             }
             last = Some(at);
-            let (hex, tail) = tail.split_at_checked(64).ok_or_else(|| format!("a copy's origin is short in its {} root", role.name()))?; // alloc: error path
+            let (hex, tail) = tail
+                .split_at_checked(64)
+                .ok_or_else(|| format!("a copy's origin is short in its {} root", role.name()))?; // alloc: error path
             let mut hash = [0u8; 32];
             for (i, byte) in hash.iter_mut().enumerate() {
-                let pair = std::str::from_utf8(&hex[2 * i..2 * i + 2]).map_err(|error| format!("a copy's origin: {error}"))?; // alloc: error path
-                *byte = u8::from_str_radix(pair, 16).map_err(|error| format!("a copy's origin {pair:?}: {error}"))?; // alloc: error path
+                let pair = std::str::from_utf8(&hex[2 * i..2 * i + 2])
+                    .map_err(|error| format!("a copy's origin: {error}"))?; // alloc: error path
+                *byte = u8::from_str_radix(pair, 16)
+                    .map_err(|error| format!("a copy's origin {pair:?}: {error}"))?; // alloc: error path
             }
             out[at] = Some(hash);
             rest = tail;
@@ -158,7 +176,12 @@ fn copied(bytes: &[u8]) -> Result<Key, String> {
 /// it ([`index::find`] asks), and none is verified again.
 pub fn retraction(run: &RunKey, unmarked: &Key) -> Put {
     // alloc: once, a record
-    Put { run: index::depends(run, unmarked), traced: Traced::default(), value: DEPENDS.to_vec(), durable: true }
+    Put {
+        run: index::depends(run, unmarked),
+        traced: Traced::default(),
+        value: DEPENDS.to_vec(),
+        durable: true,
+    }
 }
 
 /// One value to keep: what [`keeps`] says to put, through [`index::keep`].
@@ -211,7 +234,10 @@ pub fn keeps<'s>(
     let result = index::result_key(run, &shared);
     if get(&index::depends_key(run, &result)).map_err(KeepError::Corrupt)?.is_some() {
         // alloc: once per run kept, its one put
-        return Ok((vec![here(value)], Verdict::Depends { what: "the store recorded it before".to_owned() }));
+        return Ok((
+            vec![here(value)],
+            Verdict::Depends { what: "the store recorded it before".to_owned() },
+        ));
     }
     let copies = copies(run, &shared);
     let ours = Origin::of(roots);
@@ -238,7 +264,9 @@ pub fn keeps<'s>(
         // Their own entry, which a copy names: gone only with a store that lost it.
         let Some(kept) = get(&pointed).map_err(KeepError::Corrupt)? else { continue };
         others += 1;
-        if let Some(what) = differs(kept, &value).map_err(|why| KeepError::NotACopy { key: pointed, why })? {
+        if let Some(what) =
+            differs(kept, &value).map_err(|why| KeepError::NotACopy { key: pointed, why })?
+        {
             differed = Some(what);
             break;
         }
@@ -246,7 +274,10 @@ pub fn keeps<'s>(
             pairs.push(roles);
         }
     }
-    if differed.is_none() && n == MOST_COPIES && get(&index::slot(&copies, n)).map_err(KeepError::Corrupt)?.is_some() {
+    if differed.is_none()
+        && n == MOST_COPIES
+        && get(&index::slot(&copies, n)).map_err(KeepError::Corrupt)?.is_some()
+    {
         // alloc: error path, a verdict said
         differed = Some(format!("{MOST_COPIES} checkouts kept copies and none was verified"));
     }
@@ -271,7 +302,12 @@ pub fn keeps<'s>(
             (puts, Verdict::Verified)
         }
         None => {
-            let copy = Put { run: copies, traced: origin_trace(&ours), value: copy_of(&here_key), durable: false };
+            let copy = Put {
+                run: copies,
+                traced: origin_trace(&ours),
+                value: copy_of(&here_key),
+                durable: false,
+            };
             (vec![here(value), copy], Verdict::Copied) // alloc: as above
         }
     })
@@ -317,12 +353,14 @@ pub fn keep(
     differs: impl Fn(&[u8], &[u8]) -> Result<Option<String>, String>,
 ) -> Result<Kept, NotKept> {
     let held: &Store = store;
-    let (puts, verdict) = keeps(|key| Ok(held.get(key)?.map(|it| it.bytes)), roots, run, marked, value, differs)?;
+    let (puts, verdict) =
+        keeps(|key| Ok(held.get(key)?.map(|it| it.bytes)), roots, run, marked, value, differs)?;
     let mut tickets = Vec::new(); // alloc: once per run kept, its tickets
     let mut retracted = None;
     for put in puts {
         let from = tickets.len();
-        let kept = index::keep_into(store, Unit::SHARED, &put.run, &put.traced, &put.value, &mut tickets);
+        let kept =
+            index::keep_into(store, Unit::SHARED, &put.run, &put.traced, &put.value, &mut tickets);
         // The record's own ticket, the first its put made. [`keeps`] gives at most one
         // durable put, so the `max` folds at most one ticket: no tickets of two segments are
         // compared (a record that dedupes gets the ticket of another segment's put). Every

@@ -52,7 +52,11 @@ fn a_closures_binder_gives_its_signature_its_late_bound_lifetimes() {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == "main" => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == "main" =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .expect("the fixture's `main`");
@@ -65,7 +69,8 @@ fn a_closures_binder_gives_its_signature_its_late_bound_lifetimes() {
             .expect("the closure");
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         assert!(infer.diagnostics().is_empty(), "{:?}", infer.diagnostics());
-        let ty = infer.type_of_expr_or_pat(ExprOrPatId::ExprId(closure)).expect("the closure's type");
+        let ty =
+            infer.type_of_expr_or_pat(ExprOrPatId::ExprId(closure)).expect("the closure's type");
         let TyKind::Closure(_, args) = ty.kind() else { panic!("the closure is {ty:?}") };
         let sig = args.as_closure().sig();
         // `'a` and `'c`, and no lifetime left out.

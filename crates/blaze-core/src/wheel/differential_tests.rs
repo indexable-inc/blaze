@@ -114,7 +114,8 @@ mod queue {
                 if at > to {
                     break;
                 }
-                let level = (0..LEVELS).find(|it| self.occupied[*it] != 0).expect("an occupied level");
+                let level =
+                    (0..LEVELS).find(|it| self.occupied[*it] != 0).expect("an occupied level");
                 let slot = self.occupied[level].trailing_zeros() as usize;
                 self.now = at;
                 let mut id = self.heads[level][slot];
@@ -245,13 +246,17 @@ fn the_queue_wheel_and_this_one_fire_alike(tc: TestCase) {
                 wheel.advance(now, |deadline, step| fired.push((deadline, step)));
                 let mut old_fired = Vec::new();
                 old.advance(now, &mut old_fired);
-                let mut due: Vec<(u64, u64)> = set.iter().filter(|it| it.2 <= now).map(|it| (it.2, it.3)).collect();
+                let mut due: Vec<(u64, u64)> =
+                    set.iter().filter(|it| it.2 <= now).map(|it| (it.2, it.3)).collect();
                 due.sort_unstable();
                 assert_eq!(&fired, &due);
                 old_fired.sort_unstable();
                 let mut due_steps: Vec<u64> = due.iter().map(|it| it.1).collect();
                 due_steps.sort_unstable();
-                assert_eq!(old_fired, due_steps, "the queue wheel fires the same timers, in any order");
+                assert_eq!(
+                    old_fired, due_steps,
+                    "the queue wheel fires the same timers, in any order"
+                );
                 set.retain(|it| it.2 > now);
             }
         }
@@ -260,7 +265,9 @@ fn the_queue_wheel_and_this_one_fire_alike(tc: TestCase) {
         let earliest = set.iter().map(|it| it.2).min();
         assert_eq!(wheel.next_deadline(), earliest);
         match (old.next(), earliest) {
-            (Some(expiry), Some(due)) => assert!(expiry > now && expiry <= due, "{expiry} {now} {due}"),
+            (Some(expiry), Some(due)) => {
+                assert!(expiry > now && expiry <= due, "{expiry} {now} {due}")
+            }
             (None, None) => {}
             other => panic!("{other:?}"),
         }
@@ -275,7 +282,8 @@ fn a_wheel_in_its_steady_state_allocates_nothing() {
     let mut wheel: Wheel<u32> = Wheel::new();
     let mut fired = Vec::with_capacity(8);
     let mut round = |wheel: &mut Wheel<u32>, fired: &mut Vec<u32>, now: u64| {
-        let handles: [Handle; 8] = std::array::from_fn(|k| wheel.insert(now + 1 + 1_000 * k as u64, k as u32));
+        let handles: [Handle; 8] =
+            std::array::from_fn(|k| wheel.insert(now + 1 + 1_000 * k as u64, k as u32));
         for handle in &handles[..4] {
             wheel.cancel(*handle);
         }
@@ -331,7 +339,8 @@ fn the_wheel_fires_what_a_list_would() {
                         fired.push(step);
                     });
                     fired.sort_unstable();
-                    let mut expected: Vec<u64> = set.iter().filter(|it| it.1 <= now).map(|it| it.2).collect();
+                    let mut expected: Vec<u64> =
+                        set.iter().filter(|it| it.1 <= now).map(|it| it.2).collect();
                     expected.sort_unstable();
                     assert_eq!(fired, expected, "seed {seed} step {step}");
                     set.retain(|it| it.1 > now);

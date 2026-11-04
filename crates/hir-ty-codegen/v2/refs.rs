@@ -18,7 +18,6 @@ use std::{borrow::Cow, hash::BuildHasher};
 use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_query::db::AsId;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
@@ -36,9 +35,10 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    AssertKind, BasicBlockId, devirt::DevirtWorld, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
-    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind, dispatch,
-    interpret_mir, is_by_move_coroutine,
+    AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
+    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    devirt::DevirtWorld,
+    dispatch, interpret_mir, is_by_move_coroutine,
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
 };
@@ -46,6 +46,7 @@ use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use smallvec::{SmallVec, smallvec};
+use std::alloc::Global;
 
 use super::{
     HirInstance, Kind,
@@ -54,8 +55,8 @@ use super::{
     places::{self, Ref},
 };
 use crate::{
-    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm,
-    fn_trait_methods, fncache,
+    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm, fn_trait_methods,
+    fncache,
     fragment::{Asked, DataRequest, FuncTarget, Recorder},
     is_integer, is_thread_local,
 };
@@ -114,11 +115,7 @@ impl Walking {
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
 /// owned.
-pub(crate) fn walk(
-    db: &Db,
-    instance: &HirInstance,
-    walking: Walking,
-) -> Result<Vec<Ref>, String> {
+pub(crate) fn walk(db: &Db, instance: &HirInstance, walking: Walking) -> Result<Vec<Ref>, String> {
     listed(db, instance, walking).map(Cow::into_owned)
 }
 
@@ -170,11 +167,17 @@ pub(crate) fn built_in<'db>(
 /// one of them and two in the other: their code differs only here, so a generic shared under
 /// its compile identity is keyed by this too ([`super::frontend`]'s `generic_args`, rule 18).
 /// The default for an instance that names nothing.
-pub(crate) fn placement(db: &Db, instance: &HirInstance, walking: Walking) -> Result<ContentId, String> {
+pub(crate) fn placement(
+    db: &Db,
+    instance: &HirInstance,
+    walking: Walking,
+) -> Result<ContentId, String> {
     match &instance.0 {
         // Its references are listed per entry ([`super::allocator::walk`]), never shared.
         Kind::Allocator(_) => Ok(ContentId::default()),
-        _ => memo(db, instance, walking).map(|it| it.map_or(ContentId::default(), |it| it.placement)),
+        _ => {
+            memo(db, instance, walking).map(|it| it.map_or(ContentId::default(), |it| it.placement))
+        }
     }
 }
 
@@ -243,7 +246,9 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(blaze_query::db::attach(db, || format!("the references of {}: {what}", super::Named(db, instance)))),
+        Err(what) => Err(blaze_query::db::attach(db, || {
+            format!("the references of {}: {what}", super::Named(db, instance))
+        })),
     }
 }
 
@@ -313,7 +318,10 @@ fn code_refs(
     let mut bodies: SmallVec<[(Build, _); 3]> = SmallVec::new();
     for &build in &builds {
         // clone: `instance_body` takes the env by value; two `Copy` ids in a `Clone`-only type
-        bodies.push((build, crate::instance_body(db, instance, env.clone(), Some(build)).map_err(told)?));
+        bodies.push((
+            build,
+            crate::instance_body(db, instance, env.clone(), Some(build)).map_err(told)?,
+        ));
     }
     let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
@@ -404,7 +412,10 @@ fn pass<'db>(
     done.expect("the walk ran")
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of the walk's every step, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of the walk's every step, which hands it the error by value"
+)]
 fn told(error: CodegenError) -> String {
     // alloc: the error's message
     error.to_string()
@@ -617,7 +628,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let requests = &fx.cg.wants.requests;
         let Some(asks) = fx.cg.wants.asks.as_deref() else {
             // alloc: the error's message
-            return Err("the walk's recorder logs no asks (`Wants::asks`), which its places are read from".to_owned());
+            return Err(
+                "the walk's recorder logs no asks (`Wants::asks`), which its places are read from"
+                    .to_owned(),
+            );
         };
         // Each ask in order, one asked for before included: a request's first ask is listed,
         // and every later one given the place the first was ([`placement`]).
@@ -631,16 +645,20 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         }
                         std::cmp::Ordering::Equal => {
                             let place = match &requests.funcs[at as usize].target {
-                                FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol.as_str())),
+                                FuncTarget::Symbol(symbol) => {
+                                    listed.symbol(Cow::Borrowed(symbol.as_str()))
+                                }
                                 target => listed.add(places::func_ref(db, target)?),
                             };
                             func_places.push(place);
                         }
                         // alloc: the error's message
-                        std::cmp::Ordering::Greater => return Err(format!(
-                            "the walk's recorder gave function request {at} before request {known} \
+                        std::cmp::Ordering::Greater => {
+                            return Err(format!(
+                                "the walk's recorder gave function request {at} before request {known} \
                              was asked for: an ask that `Wants::asks` did not log"
-                        )),
+                            ));
+                        }
                     }
                 }
                 Asked::Data(at) => {
@@ -654,7 +672,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         },
                         std::cmp::Ordering::Equal => {
                             let request = &requests.datas[at as usize];
-                            if let DataRequest::Vtable { ty, trait_ref: Some((trait_, args)), .. } = request {
+                            if let DataRequest::Vtable {
+                                ty, trait_ref: Some((trait_, args)), ..
+                            } = request
+                            {
                                 facts.vtable(ty, *trait_, args);
                             }
                             let place = match request {
@@ -662,9 +683,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                                     let place = listed.add(places::static_ref(db, *id)?);
                                     // A static of an `extern` block is at the program's edge, as a foreign
                                     // function's signature is: code outside the program made what it holds.
-                                    let flags = hir_def::signatures::StaticSignature::of(db, *id).flags;
+                                    let flags =
+                                        hir_def::signatures::StaticSignature::of(db, *id).flags;
                                     if flags.contains(hir_def::signatures::StaticFlags::EXTERN) {
-                                        facts.foreign(&fx.infcx, fx.env.param_env, fx.static_ty(*id));
+                                        facts.foreign(
+                                            &fx.infcx,
+                                            fx.env.param_env,
+                                            fx.static_ty(*id),
+                                        );
                                     }
                                     if is_thread_local(db, *id) {
                                         listed.libcall(ir::LibCall::ElfTlsGetAddr);
@@ -679,10 +705,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                             data_places.push(place);
                         }
                         // alloc: the error's message
-                        std::cmp::Ordering::Greater => return Err(format!(
-                            "the walk's recorder gave data request {at} before request {known} \
+                        std::cmp::Ordering::Greater => {
+                            return Err(format!(
+                                "the walk's recorder gave data request {at} before request {known} \
                              was asked for: an ask that `Wants::asks` did not log"
-                        )),
+                            ));
+                        }
                     }
                 }
             }
@@ -721,7 +749,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
         }
         for (_, block) in body.basic_blocks.iter() {
-            let Some(TerminatorKind::Call { func, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+            let Some(TerminatorKind::Call { func, .. }) =
+                block.terminator.as_ref().map(|it| &it.kind)
             else {
                 continue;
             };
@@ -1043,7 +1072,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 match ty.closure_upvars_ty().map(|it| it.kind()) {
                     Some(TyKind::Tuple(fields)) => Some(fields),
                     // alloc: the error's message
-                    _ => return Err("builtin `Clone` of a closure without tupled upvars".to_owned()),
+                    _ => {
+                        return Err("builtin `Clone` of a closure without tupled upvars".to_owned());
+                    }
                 }
             }
             _ => None,
@@ -1275,9 +1306,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let Some(args) = promoted.args(body, self.fx.args.as_ref()) else { continue };
             // A promoted constant whose MIR does not build is the IR builder's error too
             // (`promoted_constant`), never left out of the walk.
-            let constant =
-                monomorphized_promoted_mir_body_query(db, promoted.owner, promoted.expr, args, env.store())
-                    .map_err(|error| crate::no_promoted_mir(db, promoted, error).to_string())?;
+            let constant = monomorphized_promoted_mir_body_query(
+                db,
+                promoted.owner,
+                promoted.expr,
+                args,
+                env.store(),
+            )
+            .map_err(|error| crate::no_promoted_mir(db, promoted, error).to_string())?;
             let allocation = interpret_mir(db, constant, Some(env)).ok().and_then(|it| it.0.ok());
             if let Some(allocation) = allocation {
                 // A constant whose data can't be made is not promoted, and leaves what it
@@ -1500,7 +1536,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         // A check of an arbitrary width panics through core's `panic`, naming it
         // (`FunctionCx::panic_if`).
         if let AssertKind::Overflow(
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr,
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::Shl
+            | BinOp::Shr,
             of,
             _,
         )

@@ -17,7 +17,10 @@
 //! `NonUpperCaseGlobals`) and `compiler/rustc_lint/src/lints.rs` (`NonSnakeCaseDiag`,
 //! `NonUpperCaseGlobal`) (MIT or Apache-2.0).
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 use std::cell::OnceCell;
 
 use base_db::TargetKind;
@@ -45,7 +48,11 @@ type Read = Vec<(Fact, String)>;
 pub(super) fn krate(cx: &Cx<'_, '_>) -> Option<Found> {
     let executable = matches!(
         cx.krate.target_kind(cx.db),
-        TargetKind::Bin | TargetKind::Example | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript
+        TargetKind::Bin
+            | TargetKind::Example
+            | TargetKind::Test
+            | TargetKind::Bench
+            | TargetKind::BuildScript
     );
     if executable {
         return None;
@@ -67,8 +74,18 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Option<Found> {
             return None;
         }
         let start = token.text_range().start();
-        let range = TextRange::new(start + TextSize::from(left as u32 + 1), start + TextSize::from(right as u32));
-        return snake(cx, "crate", &text[left + 1..right], Some(InFile::new(file, range)), at, read);
+        let range = TextRange::new(
+            start + TextSize::from(left as u32 + 1),
+            start + TextSize::from(right as u32),
+        );
+        return snake(
+            cx,
+            "crate",
+            &text[left + 1..right],
+            Some(InFile::new(file, range)),
+            at,
+            read,
+        );
     }
     // As cargo runs rustc, `--crate-name` names it, with no span.
     let name = cx.krate.display_name(cx.db)?;
@@ -78,7 +95,10 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Option<Found> {
 /// What rustc's `NonSnakeCase` and `NonUpperCaseGlobals` lint of `item` that `IncorrectCase`
 /// does not, in the order rustc visits its nodes. Each node is told apart by its kind, and a
 /// name is tested for its case before anything resolves it.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
     // alloc: empty, no allocation, unless a name fires a lint
     let mut found = Vec::new();
@@ -100,18 +120,35 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
         && let Some(name) = it.name()
     {
         let range = item.node.with_value(name.syntax().text_range());
-        found.extend(snake(cx, "trait method", name.text(), Some(range), item.ptr(), read(Fact::Name, "name")));
+        found.extend(snake(
+            cx,
+            "trait method",
+            name.text(),
+            Some(range),
+            item.ptr(),
+            read(Fact::Name, "name"),
+        ));
     }
-    let bindings = matches!(&item.node.value, ast::Item::Const(_) | ast::Item::Static(_) | ast::Item::Enum(_));
+    let bindings =
+        matches!(&item.node.value, ast::Item::Const(_) | ast::Item::Static(_) | ast::Item::Enum(_));
     for &node in item.nodes() {
         let at = || node.map(ast::ptr);
         match node.value.kind() {
             SyntaxKind::LIFETIME_PARAM => {
-                let Some(lifetime) = ast::LifetimeParam::cast(node.value).and_then(|it| it.lifetime()) else {
+                let Some(lifetime) =
+                    ast::LifetimeParam::cast(node.value).and_then(|it| it.lifetime())
+                else {
                     continue;
                 };
                 let range = node.with_value(lifetime.syntax().text_range());
-                found.extend(snake(cx, "lifetime", lifetime.text(), Some(range), at(), read(Fact::Signature, "signature")));
+                found.extend(snake(
+                    cx,
+                    "lifetime",
+                    lifetime.text(),
+                    Some(range),
+                    at(),
+                    read(Fact::Signature, "signature"),
+                ));
             }
             SyntaxKind::CONST_PARAM => {
                 let Some(param) = ast::ConstParam::cast(node.value) else { continue };
@@ -119,7 +156,15 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
                 let range = node.with_value(name.syntax().text_range());
                 let usages = || const_param_usages(cx, item, node.with_value(param), name.text());
                 let read = read(Fact::Signature, "signature");
-                found.extend(upper(cx, "const parameter", name.text(), range, Some(usages), at(), read));
+                found.extend(upper(
+                    cx,
+                    "const parameter",
+                    name.text(),
+                    range,
+                    Some(usages),
+                    at(),
+                    read,
+                ));
             }
             SyntaxKind::FN_PTR_TYPE => {
                 let Some(ty) = ast::FnPtrType::cast(node.value) else { continue };
@@ -129,13 +174,25 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
                     {
                         let range = node.with_value(name.syntax().text_range());
                         let at = node.with_value(ast::ptr(pat.syntax()));
-                        found.extend(snake(cx, "variable", name.text(), Some(range), at, read(Fact::Signature, "signature")));
+                        found.extend(snake(
+                            cx,
+                            "variable",
+                            name.text(),
+                            Some(range),
+                            at,
+                            read(Fact::Signature, "signature"),
+                        ));
                     }
                 }
             }
             SyntaxKind::IDENT_PAT => {
                 let Some(pat) = ast::IdentPat::cast(node.value) else { continue };
-                found.extend(ident_pat(cx, node.with_value(pat), bindings, read(Fact::Code, "code")));
+                found.extend(ident_pat(
+                    cx,
+                    node.with_value(pat),
+                    bindings,
+                    read(Fact::Code, "code"),
+                ));
             }
             SyntaxKind::PATH_PAT => {
                 if let Some(pat) = ast::PathPat::cast(node.value)
@@ -145,10 +202,19 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
                     && segment.generic_arg_list().is_none()
                     && let Some(name) = segment.name_ref()
                     && !is_upper_case(name.text())
-                    && let Some(PathResolution::Def(ModuleDef::Const(_))) = cx.vsema.resolve_path(path)
+                    && let Some(PathResolution::Def(ModuleDef::Const(_))) =
+                        cx.vsema.resolve_path(path)
                 {
                     let range = node.with_value(name.syntax().text_range());
-                    found.extend(upper(cx, "constant in pattern", name.text(), range, NO_USAGES, at(), read(Fact::Code, "code")));
+                    found.extend(upper(
+                        cx,
+                        "constant in pattern",
+                        name.text(),
+                        range,
+                        NO_USAGES,
+                        at(),
+                        read(Fact::Code, "code"),
+                    ));
                 }
             }
             _ => {}
@@ -164,7 +230,12 @@ const NO_USAGES: Option<fn() -> Vec<Span>> = None;
 /// not look into (`bindings`: the item is a constant, a static or an enum's discriminants).
 /// The name's case is tested first: most names neither lint could fire for are never
 /// resolved.
-fn ident_pat<'db>(cx: &Cx<'_, 'db>, pat: InFile<ast::IdentPat<'db>>, bindings: bool, read: impl FnOnce() -> Read) -> Option<Found> {
+fn ident_pat<'db>(
+    cx: &Cx<'_, 'db>,
+    pat: InFile<ast::IdentPat<'db>>,
+    bindings: bool,
+    read: impl FnOnce() -> Read,
+) -> Option<Found> {
     let name = pat.value.name()?;
     let text = name.text();
     let upper_case = is_upper_case(text);
@@ -179,10 +250,14 @@ fn ident_pat<'db>(cx: &Cx<'_, 'db>, pat: InFile<ast::IdentPat<'db>>, bindings: b
     }
     let range = pat.with_value(name.syntax().text_range());
     let at = pat.map(|it| ast::ptr(it.syntax()));
-    let plain = pat.value.pat().is_none() && pat.value.ref_token().is_none() && pat.value.mut_token().is_none();
+    let plain = pat.value.pat().is_none()
+        && pat.value.ref_token().is_none()
+        && pat.value.mut_token().is_none();
     if plain && let Some(def) = cx.vsema.resolve_bind_pat_to_const(pat.value) {
         return match def {
-            ModuleDef::Const(_) => upper(cx, "constant in pattern", text, range, NO_USAGES, at, read),
+            ModuleDef::Const(_) => {
+                upper(cx, "constant in pattern", text, range, NO_USAGES, at, read)
+            }
             _ => None,
         };
     }
@@ -190,8 +265,12 @@ fn ident_pat<'db>(cx: &Cx<'_, 'db>, pat: InFile<ast::IdentPat<'db>>, bindings: b
         return None;
     }
     // A shorthand field pattern names the field, not a new binding: the field is linted.
-    let shorthand =
-        pat.value.syntax().parent().and_then(ast::RecordPatField::cast).is_some_and(|it| it.name_ref().is_none());
+    let shorthand = pat
+        .value
+        .syntax()
+        .parent()
+        .and_then(ast::RecordPatField::cast)
+        .is_some_and(|it| it.name_ref().is_none());
     if shorthand {
         return None;
     }
@@ -199,7 +278,12 @@ fn ident_pat<'db>(cx: &Cx<'_, 'db>, pat: InFile<ast::IdentPat<'db>>, bindings: b
 }
 
 /// The paths in `item` naming the const parameter `param`, which the suggestion renames too.
-fn const_param_usages<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, param: InFile<ast::ConstParam<'db>>, name: &str) -> Vec<Span> {
+fn const_param_usages<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
+    param: InFile<ast::ConstParam<'db>>,
+    name: &str,
+) -> Vec<Span> {
     // alloc: the renames of a lint that fires, read only then
     let Some(def) = cx.vsema.to_def2(param) else { return Vec::new() };
     let mut usages = Vec::new(); // alloc: as above
@@ -249,7 +333,8 @@ fn snake(
         Some(span) => Diag::lint("non_snake_case", message, span.clone()), // clone: the span of a lint that fires
         None => {
             // alloc: the code of a lint that fires
-            let mut diag = Diag::new(Level::Warning, Some(Code::Lint("non_snake_case".to_owned())), message);
+            let mut diag =
+                Diag::new(Level::Warning, Some(Code::Lint("non_snake_case".to_owned())), message);
             diag.span = MultiSpan::default();
             diag
         }
@@ -276,7 +361,12 @@ fn snake(
             }
         }
         Some(span) => {
-            diag.suggestion(span, "convert the identifier to snake case", sc, Applicability::MaybeIncorrect);
+            diag.suggestion(
+                span,
+                "convert the identifier to snake case",
+                sc,
+                Applicability::MaybeIncorrect,
+            );
         }
     }
     for (fact, what) in read() {
@@ -365,7 +455,11 @@ pub(super) fn to_snake_case(mut name: &str) -> String {
             continue;
         }
         for ch in s.chars() {
-            if !buf.is_empty() && buf != "'" && (ch.is_uppercase() || is_titlecase(ch)) && !last_upper {
+            if !buf.is_empty()
+                && buf != "'"
+                && (ch.is_uppercase() || is_titlecase(ch))
+                && !last_upper
+            {
                 words.push(buf.to_lowercase());
                 buf = String::new(); // alloc: the suggestion of a lint that fires
             }
@@ -388,10 +482,11 @@ fn is_titlecase(c: char) -> bool {
 /// rustc's `Symbol::is_reserved`: a special identifier or a keyword of `edition`.
 fn is_reserved(name: &str, edition: Edition) -> bool {
     const ALWAYS: &[&str] = &[
-        "$crate", "{{root}}", "_", "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become",
-        "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+        "$crate", "{{root}}", "_", "as", "break", "const", "continue", "crate", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
+        "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
     ];
     ALWAYS.contains(&name)
         || (matches!(name, "async" | "await" | "dyn" | "try") && edition >= Edition::Edition2018)

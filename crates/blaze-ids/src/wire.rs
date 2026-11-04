@@ -71,7 +71,8 @@ impl<'de, const N: usize> Visitor<'de> for Exact<N> {
         }
         let mut bytes = [0u8; N];
         for (at, byte) in bytes.iter_mut().enumerate() {
-            *byte = seq.next_element::<u8>()?.ok_or_else(|| de::Error::invalid_length(at, &self))?;
+            *byte =
+                seq.next_element::<u8>()?.ok_or_else(|| de::Error::invalid_length(at, &self))?;
         }
         if seq.next_element::<u8>()?.is_some() {
             return Err(de::Error::invalid_length(N + 1, &self));

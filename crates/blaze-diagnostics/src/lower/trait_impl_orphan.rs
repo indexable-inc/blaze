@@ -21,7 +21,10 @@ use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use crate::{
     cx::Cx,
-    lower::{Found, Phase, incoherent_impl::{ImplAt, unresolved}},
+    lower::{
+        Found, Phase,
+        incoherent_impl::{ImplAt, unresolved},
+    },
     model::{Applicability, Diag, Span},
     print,
 };
@@ -158,9 +161,12 @@ impl<'db> Checker<'_, '_, 'db> {
             } else {
                 self.uncovered(ty)
             }
-        } else if ty.as_associated_type_parent_trait(db).is_some() || ty.as_impl_traits(db).is_some() {
+        } else if ty.as_associated_type_parent_trait(db).is_some()
+            || ty.as_impl_traits(db).is_some()
+        {
             let projection = ty.as_associated_type_parent_trait(db).is_some();
-            if ty.generic_params(db).iter().any(|it| matches!(it, hir::GenericParam::TypeParam(_))) {
+            if ty.generic_params(db).iter().any(|it| matches!(it, hir::GenericParam::TypeParam(_)))
+            {
                 match (projection, self.mode) {
                     (true, Mode::Compat) => ControlFlow::Continue(()),
                     _ => self.uncovered(ty),
@@ -178,7 +184,11 @@ impl<'db> Checker<'_, '_, 'db> {
                 // rustc: the `owned_box` lang item is looked into by its first argument only
                 // (`OwnedBox => args.type_at(0)`), so a local allocator does not make
                 // `Box<Foreign, LocalAlloc>` local; any other fundamental type by all of them.
-                let take = if struct_flags(self.cx, adt).contains(StructFlags::IS_BOX) { 1 } else { usize::MAX };
+                let take = if struct_flags(self.cx, adt).contains(StructFlags::IS_BOX) {
+                    1
+                } else {
+                    usize::MAX
+                };
                 // alloc: the error's parts, for an error hir found
                 let args: Vec<_> = ty.type_arguments().take(take).collect();
                 let mut result = ControlFlow::Continue(());
@@ -246,7 +256,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplOrphan) -> Vec<Found> {
 /// refuses is refused (E0117, E0210), never what only hir's stricter `check_orphan_rules` does;
 /// the `uncovered_param_in_projection` lint is left out, as `--cap-lints` leaves a dependency's.
 /// Each error's message names the impl, its trait, the rule and the crate that seals.
-pub(crate) fn in_sealed_graph(cx: &Cx<'_, '_>, d: &hir::diagnostics::ForeignTraitImpl) -> Vec<Found> {
+pub(crate) fn in_sealed_graph(
+    cx: &Cx<'_, '_>,
+    d: &hir::diagnostics::ForeignTraitImpl,
+) -> Vec<Found> {
     let Some(at) = ImplAt::of_ptr(cx, d.file_id, d.impl_) else {
         return unresolved(cx, d.file_id, d.impl_, "an orphan check in a sealed graph");
     };
@@ -325,18 +338,26 @@ pub(crate) fn report<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>) -> Vec<Found> {
     let Err(proper) = orphan_check(cx, at.impl_, Mode::Proper) else { return Vec::new() };
     match orphan_check(cx, at.impl_, Mode::Compat) {
         Ok(()) => match proper {
-            OrphanError::Uncovered { params, local } => uncovered(cx, at, &params, local.as_ref(), true),
+            OrphanError::Uncovered { params, local } => {
+                uncovered(cx, at, &params, local.as_ref(), true)
+            }
             // alloc: empty, allocates nothing
             OrphanError::NonLocal(_) => Vec::new(),
         },
         // alloc: the error's parts, for an error hir found
         Err(OrphanError::NonLocal(tys)) => vec![Found::new(non_local(cx, at, &tys), Phase::Items)],
-        Err(OrphanError::Uncovered { params, local }) => uncovered(cx, at, &params, local.as_ref(), false),
+        Err(OrphanError::Uncovered { params, local }) => {
+            uncovered(cx, at, &params, local.as_ref(), false)
+        }
     }
 }
 
 /// E0117: `OnlyCurrentTraits`, with a label on each input type that is not local.
-pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Type<'db>, bool)]) -> Diag {
+pub(crate) fn non_local<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'db>,
+    tys: &[(hir::Type<'db>, bool)],
+) -> Diag {
     let db = cx.db;
     let span = at.span(cx);
     let self_ty = at.impl_.self_ty(db);
@@ -351,9 +372,10 @@ pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Ty
     let mut diag = Diag::error(Some("E0117"), message, span.clone());
     let self_span = at.self_ty_span(cx);
     let trait_span = at.trait_span(cx);
-    let self_has_param = self_ty.generic_params(db).iter().any(|it| {
-        matches!(it, hir::GenericParam::TypeParam(_) | hir::GenericParam::ConstParam(_))
-    });
+    let self_has_param = self_ty
+        .generic_params(db)
+        .iter()
+        .any(|it| matches!(it, hir::GenericParam::TypeParam(_) | hir::GenericParam::ConstParam(_)));
     let mut wrapper = None;
     for (ty, is_self) in tys {
         // clone: on the error path, for an error hir found
@@ -362,9 +384,12 @@ pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Ty
         let foreign = !is_self;
         let always_foreign = |name: &str| match foreign {
             // alloc: the error's text, for an error hir found
-            true => "this is not defined in the current crate because this is a foreign trait".to_owned(),
+            true => "this is not defined in the current crate because this is a foreign trait"
+                .to_owned(),
             // alloc: the error's text, for an error hir found
-            false => format!("this is not defined in the current crate because {name} are always foreign"),
+            false => format!(
+                "this is not defined in the current crate because {name} are always foreign"
+            ),
         };
         let label = if ty.is_slice() {
             always_foreign("slices")
@@ -385,10 +410,16 @@ pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Ty
                 wrapper = Some(format!("struct WrapperType(*{mut_key}{});\n\n", cx.ty(&pointee)));
             }
             // alloc: the error's text, for an error hir found
-            format!("`{}` is not defined in the current crate because raw pointers are always foreign", cx.ty(ty))
+            format!(
+                "`{}` is not defined in the current crate because raw pointers are always foreign",
+                cx.ty(ty)
+            )
         } else if let Some(adt) = ty.as_adt() {
             // alloc: the error's text, for an error hir found
-            format!("`{}` is not defined in the current crate", cx.def_path(hir::ModuleDef::Adt(adt)))
+            format!(
+                "`{}` is not defined in the current crate",
+                cx.def_path(hir::ModuleDef::Adt(adt))
+            )
         } else {
             // alloc: the error's text, for an error hir found
             format!("`{}` is not defined in the current crate", cx.ty(ty))
@@ -396,7 +427,10 @@ pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Ty
         diag.span_label(at_span, label);
         if let Some(adt) = ty.as_adt() {
             // alloc: the error's text, for an error hir found
-            diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("where `{}` is defined", cx.ty(ty)));
+            diag.fact(
+                Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+                format!("where `{}` is defined", cx.ty(ty)),
+            );
         }
     }
     diag.note("impl doesn't have any local type before any uncovered type parameters");
@@ -412,7 +446,10 @@ pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Ty
     }
     diag.fact(at.coherence(cx), "the orphan check of the impl");
     if let Some(trait_) = at.impl_.trait_(db) {
-        diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), "where the trait is defined");
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Trait(trait_.into()))),
+            "where the trait is defined",
+        );
     }
     diag
 }

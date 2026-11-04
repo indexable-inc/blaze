@@ -4,14 +4,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    cell::RefCell,
-    fmt::Write,
-    sync::Arc,
-};
+use std::{cell::RefCell, fmt::Write, sync::Arc};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -25,6 +20,7 @@ use rustc_type_ir::{
     inherent::{IntoKind, Safety as _, Term as _},
 };
 use span::ErasedFileAstId;
+use std::alloc::Global;
 
 use base_db::{Crate, Db};
 

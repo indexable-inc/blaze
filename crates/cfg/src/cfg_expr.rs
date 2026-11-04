@@ -128,7 +128,9 @@ impl CfgExpr {
                         let key = Symbol::intern(key.text());
                         match atom.string_token().and_then(ast::String::cast) {
                             Some(value) => match value.value() {
-                                Ok(value) => CfgAtom::KeyValue { key, value: Symbol::intern(&value) },
+                                Ok(value) => {
+                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }
+                                }
                                 Err(_) => return CfgExpr::Invalid,
                             },
                             None => CfgAtom::Flag(key),

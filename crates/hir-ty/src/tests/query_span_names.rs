@@ -4,7 +4,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base_db::all_crates;
-use hir_def::{DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+};
 use hir_expand::fixture;
 use parking_lot::Mutex;
 

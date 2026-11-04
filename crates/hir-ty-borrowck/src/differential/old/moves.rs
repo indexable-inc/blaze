@@ -17,8 +17,8 @@
 use std::ops::Range;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use rustc_type_ir::inherent::IntoKind;
+use std::alloc::Global;
 
 use hir_ty::{
     consteval::try_const_usize,
@@ -290,7 +290,9 @@ impl MoveData {
         let mut path = self.locals[local.into_raw().into_u32() as usize];
         let mut ty = PlaceTy::from_ty(body.locals[local].ty.as_ref());
         for elem in projection {
-            let Some(step) = ctx.old_trackable(ty, elem) else { return Lookup::Parent(path as Mpi) };
+            let Some(step) = ctx.old_trackable(ty, elem) else {
+                return Lookup::Parent(path as Mpi);
+            };
             match self.steps.get(&(path, step)) {
                 Some(&it) => path = it,
                 None => return Lookup::Parent(path as Mpi),
@@ -428,7 +430,9 @@ impl Tree {
         let mut path = local.into_raw().into_u32();
         let mut ty = PlaceTy::from_ty(body.locals[local].ty.as_ref());
         for elem in projection {
-            let Some(step) = ctx.old_trackable(ty, elem) else { return Lookup::Parent(path as Mpi) };
+            let Some(step) = ctx.old_trackable(ty, elem) else {
+                return Lookup::Parent(path as Mpi);
+            };
             path = self.child(path, local, step);
             ty = ctx.project(ty, elem);
         }

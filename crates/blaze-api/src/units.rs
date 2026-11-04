@@ -136,7 +136,9 @@ fn refused(what: String) -> UnitError {
 pub fn files(unit: &Unit, place: &Place) -> Result<Vec<UnitFile>, UnitError> {
     let checked = Checked::of(unit, place.manager)?;
     // alloc: error path, a unit refused once per `blaze daemon install`.
-    let dir = place.dir.to_str().ok_or_else(|| refused(format!("the units' directory {} is not UTF-8", place.dir.display())))?;
+    let dir = place.dir.to_str().ok_or_else(|| {
+        refused(format!("the units' directory {} is not UTF-8", place.dir.display()))
+    })?;
     if !place.dir.is_absolute() {
         // alloc: error path, a unit refused once per `blaze daemon install`.
         return Err(refused(format!("the units' directory {dir} is not an absolute path")));
@@ -221,9 +223,12 @@ pub fn run(steps: &[Step]) -> Result<(), UnitError> {
     for step in steps {
         match step {
             // alloc: error path, as `failed`.
-            Step::MakeDir(path) => private_dir(path).map_err(|error| failed(step, error.to_string()))?,
+            Step::MakeDir(path) => {
+                private_dir(path).map_err(|error| failed(step, error.to_string()))?
+            }
             // alloc: error path, as `failed`.
-            Step::Write(file) => private_write(&file.path, &file.text).map_err(|error| failed(step, error.to_string()))?,
+            Step::Write(file) => private_write(&file.path, &file.text)
+                .map_err(|error| failed(step, error.to_string()))?,
             Step::Run(argv) => {
                 if let Err(said) = command(argv) {
                     return Err(failed(step, said));
@@ -234,12 +239,17 @@ pub fn run(steps: &[Step]) -> Result<(), UnitError> {
                     && command(loaded).is_ok()
                 {
                     // alloc: error path, as `failed`.
-                    return Err(failed(step, format!("{said}; and `{}` says it is still loaded", loaded.join(" "))));
+                    return Err(failed(
+                        step,
+                        format!("{said}; and `{}` says it is still loaded", loaded.join(" ")),
+                    ));
                 }
             }
             Step::Remove(path) => match std::fs::remove_file(path) {
                 // alloc: error path, as `failed`.
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(failed(step, error.to_string())),
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(failed(step, error.to_string()));
+                }
                 _ => {}
             },
         }
@@ -250,7 +260,9 @@ pub fn run(steps: &[Step]) -> Result<(), UnitError> {
 /// `argv` run to its end: what it said when it did not exit 0.
 fn command(argv: &[String]) -> Result<(), String> {
     // alloc: error path, a command that failed, once per step.
-    let Some((program, args)) = argv.split_first() else { return Err("an empty command".to_owned()) };
+    let Some((program, args)) = argv.split_first() else {
+        return Err("an empty command".to_owned());
+    };
     let ran = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -362,7 +374,11 @@ pub fn place_here() -> Result<Place, UnitError> {
         // alloc: error path, no HOME.
         .ok_or_else(|| refused("HOME is not set, and the units go under it".to_owned()))?;
     let config = std::env::var_os("XDG_CONFIG_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    Ok(Place { manager, dir: unit_dir(manager, &home, config.as_deref()), uid: crate::activation::uid() })
+    Ok(Place {
+        manager,
+        dir: unit_dir(manager, &home, config.as_deref()),
+        uid: crate::activation::uid(),
+    })
 }
 
 /// The [`Unit`] of `program` serving `socket`, logging to `log`, with this process's
@@ -370,7 +386,12 @@ pub fn place_here() -> Result<Place, UnitError> {
 /// its life, so a socket-started daemon has the installing shell's), and this user's [`Place`]
 /// for it.
 #[cfg(unix)]
-pub fn here(program: PathBuf, socket: PathBuf, log: PathBuf, settings: &[&str]) -> Result<(Unit, Place), UnitError> {
+pub fn here(
+    program: PathBuf,
+    socket: PathBuf,
+    log: PathBuf,
+    settings: &[&str],
+) -> Result<(Unit, Place), UnitError> {
     let place = place_here()?;
     let env = captured(settings, |name| std::env::var(name).ok());
     Ok((Unit { program, socket, log, env }, place))
@@ -400,7 +421,9 @@ impl<'a> Checked<'a> {
     fn of(unit: &'a Unit, manager: Manager) -> Result<Checked<'a>, UnitError> {
         let path = |what: &str, path: &'a Path| -> Result<&'a str, UnitError> {
             // alloc: error path, a unit refused once per `blaze daemon install`.
-            let text = path.to_str().ok_or_else(|| refused(format!("{what} {} is not UTF-8", path.display())))?;
+            let text = path
+                .to_str()
+                .ok_or_else(|| refused(format!("{what} {} is not UTF-8", path.display())))?;
             if !path.is_absolute() {
                 // alloc: error path, a unit refused once per `blaze daemon install`.
                 return Err(refused(format!("{what} {text} is not an absolute path")));
@@ -411,7 +434,9 @@ impl<'a> Checked<'a> {
                 && let Some(bad) = text.chars().find(|it| it.is_whitespace() || *it == '\\')
             {
                 // alloc: error path, a unit refused once per `blaze daemon install`.
-                return Err(refused(format!("{what} {text:?} holds {bad:?}, which a systemd unit cannot name it with")));
+                return Err(refused(format!(
+                    "{what} {text:?} holds {bad:?}, which a systemd unit cannot name it with"
+                )));
             }
             Ok(text)
         };
@@ -512,7 +537,10 @@ fn key_string(out: &mut String, depth: usize, key: &str, value: &str) {
 fn socket_unit(unit: &Checked<'_>) -> String {
     // alloc: the file's text, once per `blaze daemon install`.
     let mut out = String::with_capacity(512);
-    let _ = write!(out, "# {WRITTEN}\n[Unit]\nDescription=blaze's daemon socket\n\n[Socket]\nListenStream=");
+    let _ = write!(
+        out,
+        "# {WRITTEN}\n[Unit]\nDescription=blaze's daemon socket\n\n[Socket]\nListenStream="
+    );
     escaped(&mut out, unit.socket, Escape::Specifiers);
     let _ = write!(
         out,
@@ -544,7 +572,9 @@ fn service_unit(unit: &Checked<'_>) -> String {
          Type=simple\n\
          ExecStart="
     );
-    for (at, arg) in [unit.program, "serve", "--activated", "--socket", unit.socket].into_iter().enumerate() {
+    for (at, arg) in
+        [unit.program, "serve", "--activated", "--socket", unit.socket].into_iter().enumerate()
+    {
         if at > 0 {
             out.push(' ');
         }
@@ -597,7 +627,8 @@ fn escaped(out: &mut String, text: &str, escape: Escape) {
 /// One word of an `ExecStart=` line: as it is when nothing in it is special, else quoted.
 /// `$` is doubled either way, as systemd expands variables in command lines.
 fn word(out: &mut String, text: &str) {
-    let special = text.is_empty() || text.chars().any(|it| it.is_whitespace() || matches!(it, '"' | '\'' | '\\' | ';'));
+    let special = text.is_empty()
+        || text.chars().any(|it| it.is_whitespace() || matches!(it, '"' | '\'' | '\\' | ';'));
     match special {
         true => {
             out.push('"');

@@ -55,7 +55,8 @@ pub enum Wanted {
     End { left: usize },
 }
 
-const _: () = assert!(size_of::<Error>() <= 32, "an error stays small, so a result of one is cheap");
+const _: () =
+    assert!(size_of::<Error>() <= 32, "an error stays small, so a result of one is cheap");
 
 impl Error {
     /// What went wrong, without where: for a caller whose errors are `&'static str`.
@@ -75,7 +76,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let at = self.at;
         match self.wanted {
-            Wanted::Bytes { len, left } => write!(f, "at byte {at}: {len} bytes wanted, {left} left"),
+            Wanted::Bytes { len, left } => {
+                write!(f, "at byte {at}: {len} bytes wanted, {left} left")
+            }
             Wanted::Leb(error) => write!(f, "at byte {at}: {error}"),
             Wanted::Utf8 { len } => write!(f, "at byte {at}: {len} bytes that are not UTF-8"),
             Wanted::Nul { left } => {
@@ -423,7 +426,10 @@ impl<'a> Reader<'a> {
     #[cold]
     #[inline(never)]
     fn past(&self, at: usize) -> Error {
-        Error { at: self.whole.len(), wanted: Wanted::Bytes { len: at - self.whole.len(), left: 0 } }
+        Error {
+            at: self.whole.len(),
+            wanted: Wanted::Bytes { len: at - self.whole.len(), left: 0 },
+        }
     }
 
     #[cold]

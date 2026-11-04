@@ -43,11 +43,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     {
         return;
     }
-    let (Some(range), Some(map_name), Some(call_site)) = (
-        cx.range(node),
-        cx.range(map.name_ref.syntax()),
-        cx.range(format.syntax()),
-    ) else {
+    let (Some(range), Some(map_name), Some(call_site)) =
+        (cx.range(node), cx.range(map.name_ref.syntax()), cx.range(format.syntax()))
+    else {
         return;
     };
     let span = cx.span(range);

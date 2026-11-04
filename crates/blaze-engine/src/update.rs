@@ -155,7 +155,8 @@ impl Config {
 fn config(home: &Path) -> Result<Config, UpdateError> {
     let file = config_file(home);
     let Some(text) = text(&file)? else { return Ok(Config::DEFAULT) };
-    let table = toml::from_str::<toml::Table>(&text).map_err(|error| UpdateError::NotToml { file: file.clone(), error })?;
+    let table = toml::from_str::<toml::Table>(&text)
+        .map_err(|error| UpdateError::NotToml { file: file.clone(), error })?;
     let mut config = Config::DEFAULT;
     let Some(update) = table.get("update") else { return Ok(config) };
     let bad = |key: &str, wants, got: &toml::Value| UpdateError::Setting {
@@ -167,14 +168,25 @@ fn config(home: &Path) -> Result<Config, UpdateError> {
     let update = update.as_table().ok_or_else(|| bad("update", "a table", update))?;
     for (key, value) in update {
         match key.as_str() {
-            "mode" => config.mode = value.as_str().and_then(Mode::parse).ok_or_else(|| bad("update.mode", Mode::NAMES, value))?,
+            "mode" => {
+                config.mode = value
+                    .as_str()
+                    .and_then(Mode::parse)
+                    .ok_or_else(|| bad("update.mode", Mode::NAMES, value))?
+            }
             "channel" => {
                 config.channel = value
                     .as_str()
                     .and_then(Channel::parse)
                     .ok_or_else(|| bad("update.channel", "\"stable\" or \"canary\"", value))?
             }
-            _ => return Err(bad(&format!("update.{key}"), "a setting of blaze's: `[update]` has `mode` and `channel`", value)),
+            _ => {
+                return Err(bad(
+                    &format!("update.{key}"),
+                    "a setting of blaze's: `[update]` has `mode` and `channel`",
+                    value,
+                ));
+            }
         }
     }
     Ok(config)
@@ -186,10 +198,13 @@ fn set(home: &Path, key: &str, value: &str) -> anyhow::Result<()> {
     let shown = file.display();
     let mut doc: toml_edit::DocumentMut =
         text(&file)?.unwrap_or_default().parse().with_context(|| format!("reading {shown}"))?;
-    let update = doc.entry("update").or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let update = update.as_table_mut().with_context(|| format!("`update` in {shown} is not a table"))?;
+    let update =
+        doc.entry("update").or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let update =
+        update.as_table_mut().with_context(|| format!("`update` in {shown} is not a table"))?;
     update.insert(key, toml_edit::value(value));
-    versions::kept(&file, doc.to_string().as_bytes()).with_context(|| format!("writing {shown}"))?;
+    versions::kept(&file, doc.to_string().as_bytes())
+        .with_context(|| format!("writing {shown}"))?;
     println!("{shown}: [update] {key} = \"{value}\"");
     Ok(())
 }
@@ -224,7 +239,8 @@ impl State {
         }
         let string = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
         let install_failed = value.get("install_failed").filter(|it| !it.is_null()).map(|it| {
-            let field = |key: &str| it.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let field =
+                |key: &str| it.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
             (field("version"), field("why"))
         });
         Ok(State {
@@ -239,7 +255,10 @@ impl State {
     }
 
     fn write(&self, file: &Path) -> anyhow::Result<()> {
-        let install_failed = self.install_failed.as_ref().map(|(version, why)| serde_json::json!({"version": version, "why": why}));
+        let install_failed = self
+            .install_failed
+            .as_ref()
+            .map(|(version, why)| serde_json::json!({"version": version, "why": why}));
         let value = serde_json::json!({
             "schema": 1,
             "checked_at": self.checked_at,
@@ -267,7 +286,8 @@ impl State {
 fn hosts() -> anyhow::Result<Vec<String>> {
     let mut hosts = vec!["github.com".to_owned()]; // alloc: at most two hosts, once a read
     if let versions::Source::Mirror(base) = versions::source()? {
-        let base = url::Url::parse(&base).with_context(|| format!("`BLAZE_RELEASES` is {base}, which is not an address"))?;
+        let base = url::Url::parse(&base)
+            .with_context(|| format!("`BLAZE_RELEASES` is {base}, which is not an address"))?;
         hosts.extend(base.host_str().map(str::to_owned));
     }
     Ok(hosts)
@@ -284,7 +304,9 @@ fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
     let newest = |channel: &str| -> Result<Newest, String> {
         let it = value.get(channel).ok_or_else(|| format!("it has no `{channel}`"))?;
         let field = |key: &str| {
-            it.get(key).and_then(Value::as_str).ok_or_else(|| format!("its `{channel}.{key}` is no string"))
+            it.get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("its `{channel}.{key}` is no string"))
         };
         let version = field("version")?;
         if !blaze_units::lock::is_version(version) {
@@ -293,11 +315,22 @@ fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
         let given = field("url")?;
         let url = url::Url::parse(given)
             .ok()
-            .filter(|it| it.scheme() == "https" && it.host_str().is_some_and(|host| hosts.iter().any(|it| it == host)))
+            .filter(|it| {
+                it.scheme() == "https"
+                    && it.host_str().is_some_and(|host| hosts.iter().any(|it| it == host))
+            })
             .ok_or_else(|| {
-                format!("its `{channel}.url` is {:?}, not an https:// page on {}", printable(given), hosts.join(" or "))
+                format!(
+                    "its `{channel}.url` is {:?}, not an https:// page on {}",
+                    printable(given),
+                    hosts.join(" or ")
+                )
             })?;
-        Ok(Newest { version: version.to_owned(), url: printable(url.as_str()), notes: trimmed(field("notes")?) })
+        Ok(Newest {
+            version: version.to_owned(),
+            url: printable(url.as_str()),
+            notes: trimmed(field("notes")?),
+        })
     };
     let mut yanked = Vec::new(); // alloc: the yanked releases, once a read
     if let Some(listed) = value.get("yanked") {
@@ -306,7 +339,8 @@ fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
             if !blaze_units::lock::is_version(version) {
                 return Err(format!("its `yanked` names {version:?}, not a release's version"));
             }
-            let reason = reason.as_str().ok_or_else(|| format!("its `yanked.{version}` is no string"))?;
+            let reason =
+                reason.as_str().ok_or_else(|| format!("its `yanked.{version}` is no string"))?;
             yanked.push((version.clone(), printable(reason).replace('\n', " ")));
         }
     }
@@ -365,7 +399,10 @@ fn trimmed(notes: &str) -> String {
 enum Read {
     /// The same as the ETag sent: `304`.
     Same,
-    New { etag: Option<String>, body: Vec<u8> },
+    New {
+        etag: Option<String>,
+        body: Vec<u8>,
+    },
 }
 
 /// Reads `latest.json`, sending `etag` as `If-None-Match`. From [`LATEST`], or `latest.json`
@@ -375,7 +412,8 @@ fn read_latest(etag: Option<&str>) -> anyhow::Result<(String, Read)> {
     let address = match versions::source()? {
         versions::Source::Dir(dir) => {
             let file = dir.join("latest.json");
-            let body = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let body =
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             return Ok((file.display().to_string(), Read::New { etag: None, body }));
         }
         versions::Source::GitHub => LATEST.to_owned(),
@@ -471,13 +509,16 @@ fn refresh(forced: bool) -> anyhow::Result<Duration> {
     let Some(latest) = state.latest() else { return Ok(CHECK_EVERY) };
     let runs = policy::runs_unpinned(pin::OURS, default.as_deref());
     let failed = state.install_failed.as_ref().map(|(version, _)| version.as_str());
-    if let Some(version) = policy::auto_install(config.mode, config.channel, &latest, runs, failed) {
+    if let Some(version) = policy::auto_install(config.mode, config.channel, &latest, runs, failed)
+    {
         match install(&home, version) {
             Ok(()) => versions::kept(&updated_file(&home), format!("{version}\n").as_bytes())
                 .with_context(|| format!("writing {}", updated_file(&home).display()))?,
             Err(why) => {
                 let why = printable(&format!("{why:#}"));
-                eprintln!("blaze: `[update] mode = \"auto\"` could not install blaze {version}: {why}");
+                eprintln!(
+                    "blaze: `[update] mode = \"auto\"` could not install blaze {version}: {why}"
+                );
                 state.problem = Some(format!(
                     "`[update] mode = \"auto\"` could not install blaze {version} ({why}); `blaze update` tries again"
                 ));
@@ -527,10 +568,12 @@ pub(crate) fn runs_unpinned() -> Result<String, UpdateError> {
 
 /// The release `version` fetched and checked (`versions::fetch_for`) and made the default.
 fn install(home: &Path, version: &str) -> anyhow::Result<()> {
-    let _span = tracing::info_span!("update: installing a release as the default", version).entered();
+    let _span =
+        tracing::info_span!("update: installing a release as the default", version).entered();
     versions::fetch_for(version, "which `blaze update` installs")?;
     let file = default_file(home);
-    versions::kept(&file, format!("{version}\n").as_bytes()).with_context(|| format!("writing {}", file.display()))
+    versions::kept(&file, format!("{version}\n").as_bytes())
+        .with_context(|| format!("writing {}", file.display()))
 }
 
 /// Whether this process was started by a launcher that said the lines already: as the default
@@ -545,7 +588,8 @@ pub(crate) fn launched() -> bool {
 /// or with stderr no terminal, only a yanked release is said.
 pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
     let Ok(home) = home() else { return };
-    let quiet = std::env::var_os("CI").is_some_and(|it| !it.is_empty()) || !std::io::stderr().is_terminal();
+    let quiet =
+        std::env::var_os("CI").is_some_and(|it| !it.is_empty()) || !std::io::stderr().is_terminal();
     let config = config(&home).unwrap_or_else(|error| {
         if !quiet {
             eprintln!("warning: {error}; blaze says only what is yanked until it is fixed");
@@ -566,7 +610,11 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
     }
     let latest = state.latest();
     let updated_file = updated_file(&home);
-    let updated = text(&updated_file).ok().flatten().map(|it| it.trim().to_owned()).filter(|it| blaze_units::lock::is_version(it));
+    let updated = text(&updated_file)
+        .ok()
+        .flatten()
+        .map(|it| it.trim().to_owned())
+        .filter(|it| blaze_units::lock::is_version(it));
     let here = Here {
         runs,
         pin,
@@ -576,21 +624,28 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
         quiet,
         updated: updated.as_deref(),
     };
-    let workspace = manifest.map_or_else(|| "this workspace".to_owned(), |it| it.display().to_string());
+    let workspace =
+        manifest.map_or_else(|| "this workspace".to_owned(), |it| it.display().to_string());
     for said in policy::decide(&here) {
         let line = match said {
             Say::Yanked { version, reason, fix } => {
                 let fix = match fix {
-                    Fix::Pin(newest) => format!("{workspace} pins it: `blaze pin {newest}` moves it to blaze {newest}"),
+                    Fix::Pin(newest) => format!(
+                        "{workspace} pins it: `blaze pin {newest}` moves it to blaze {newest}"
+                    ),
                     Fix::Update(newest) => format!("`blaze update` installs blaze {newest}"),
                     Fix::None if matches!(pin, Pin::Channel) => {
-                        format!("{workspace} pins a channel that still names it; it moves on with the channel's next release")
+                        format!(
+                            "{workspace} pins a channel that still names it; it moves on with the channel's next release"
+                        )
                     }
                     Fix::None => "no release to move to is out yet".to_owned(),
                 };
                 format!("warning: blaze {version} is YANKED: {reason}\nwarning: {fix}")
             }
-            Say::Behind { runs, newest, url } => format!("blaze {newest} is out (this is {runs}): blaze update · notes: {url}"),
+            Say::Behind { runs, newest, url } => {
+                format!("blaze {newest} is out (this is {runs}): blaze update · notes: {url}")
+            }
             Say::PinBehind { pin, newest, days } => {
                 let behind = match days {
                     0 => format!("behind {newest} (the same day)"),
@@ -624,13 +679,18 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
             None => (arg.clone(), None),
         };
         let mut value = |name: &str| {
-            inline.clone().or_else(|| args.next()).with_context(|| format!("`blaze update {name}` takes a value\n{USAGE}"))
+            inline
+                .clone()
+                .or_else(|| args.next())
+                .with_context(|| format!("`blaze update {name}` takes a value\n{USAGE}"))
         };
         match flag.as_str() {
             "--check" => only_check = true,
             "--mode" => {
                 let given = value("--mode")?;
-                mode = Some(Mode::parse(&given).with_context(|| format!("`blaze update --mode {given}`: the modes are {}", Mode::NAMES))?);
+                mode = Some(Mode::parse(&given).with_context(|| {
+                    format!("`blaze update --mode {given}`: the modes are {}", Mode::NAMES)
+                })?);
             }
             "--channel" => {
                 let given = value("--channel")?;
@@ -669,7 +729,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
     if let Some(failed) = &state.failed {
         bail!("blaze's newest releases could not be read: {failed}");
     }
-    let latest = state.latest().with_context(|| format!("{} holds no latest.json after a check", file.display()))?;
+    let latest = state
+        .latest()
+        .with_context(|| format!("{} holds no latest.json after a check", file.display()))?;
     let channel = config.channel;
     let newest = latest.newest(channel);
     // A `default` that names no release is what `blaze update` is for: it is written again.
@@ -683,7 +745,11 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         if let Some(corrupt) = &corrupt {
             println!("{corrupt}");
         }
-        println!("blaze {runs} runs outside pinned workspaces; the newest {} release is blaze {}", channel.name(), newest.version);
+        println!(
+            "blaze {runs} runs outside pinned workspaces; the newest {} release is blaze {}",
+            channel.name(),
+            newest.version
+        );
         if let Some(reason) = latest.yanked(&runs) {
             println!("blaze {runs} is YANKED: {reason}");
         }
@@ -732,7 +798,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
             println!("{corrupt}; replaced with blaze {}", newest.version);
         }
         let how = match yanked {
-            Some(reason) if to < from => format!(", back from a yanked release ({reason}): a downgrade"),
+            Some(reason) if to < from => {
+                format!(", back from a yanked release ({reason}): a downgrade")
+            }
             Some(reason) => format!(", off a yanked release ({reason})"),
             None => String::new(),
         };
@@ -744,7 +812,11 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         print_notes(newest);
     }
     if let Some((manifest, version)) = pinned.filter(|(_, version)| *version != newest.version) {
-        println!("{} pins blaze {version}, which `blaze update` never moves: `blaze pin {}` does", manifest.display(), newest.version);
+        println!(
+            "{} pins blaze {version}, which `blaze update` never moves: `blaze pin {}` does",
+            manifest.display(),
+            newest.version
+        );
     }
     Ok(0)
 }
@@ -779,7 +851,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blaze-update-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("update").join("state.json");
-        let page = |version: &str| format!("https://github.com/indexable-inc/blaze/releases/tag/v{version}");
+        let page = |version: &str| {
+            format!("https://github.com/indexable-inc/blaze/releases/tag/v{version}")
+        };
         let latest = serde_json::json!({
             "schema": 1,
             "stable": {"version": "0.20261104.0", "url": page("0.20261104.0"), "notes": "- a\n- b"},

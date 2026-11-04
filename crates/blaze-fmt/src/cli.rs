@@ -16,7 +16,7 @@ use crate::getopts::{Matches, Options};
 
 use crate::term;
 use crate::{
-    CliOptions, Color, Config, Edition, EmitMode, FileLines, FileName,
+    CliOptions, Color, Config, Edition, EmitMode, ErrorKind, FileLines, FileName,
     FormatReportFormatterBuilder, Input, Session, StyleEdition, Verbosity, Version, load_config,
 };
 
@@ -384,6 +384,14 @@ fn format_and_emit_report<T: Write>(session: &mut Session<'_, T>, input: Input) 
                         .build()
                 );
             }
+        }
+        // blaze: a module that does not resolve is not a write failure; its message names the
+        // `mod`, where it is declared and the file it points at, one line each.
+        Err(ErrorKind::ModuleResolutionError(errors)) => {
+            for error in &errors.0 {
+                eprintln!("error: {error}");
+            }
+            session.add_operational_error();
         }
         Err(msg) => {
             eprintln!("Error writing files: {msg}");

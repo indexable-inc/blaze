@@ -62,7 +62,9 @@ fn function(db: &Db, name: &str) -> FunctionId {
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => Some(it),
+            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
             _ => None,
         })
         .collect();
@@ -84,9 +86,11 @@ fn instance(db: &Db, name: &str) -> Instance {
 }
 
 fn identity(db: &Db, name: &str, compiled: Compiled) -> CompileIdentity {
-    blaze_query::db::attach(db, || match instance_identity(db, &instance(db, name), &env(db), compiled) {
-        Ok(it) => *it,
-        Err(error) => panic!("`{name}` has no identity: {error}"),
+    blaze_query::db::attach(db, || {
+        match instance_identity(db, &instance(db, name), &env(db), compiled) {
+            Ok(it) => *it,
+            Err(error) => panic!("`{name}` has no identity: {error}"),
+        }
     })
 }
 
@@ -189,7 +193,9 @@ fn inlines(db: &Db, name: &str) -> bool {
 #[test]
 fn an_inlined_callee_is_in_its_callers_identity_by_its_code() {
     let text = |body: &str| {
-        format!("#[inline(always)]\nfn callee(x: u32) -> u32 {{ {body} }}\npub fn caller(x: u32) -> u32 {{ callee(x) + 1 }}\n")
+        format!(
+            "#[inline(always)]\nfn callee(x: u32) -> u32 {{ {body} }}\npub fn caller(x: u32) -> u32 {{ callee(x) + 1 }}\n"
+        )
     };
     let plain = program("/src/lib.rs", &text("let y = x; y ^ 1"));
     let commented = program("/src/lib.rs", &text("/* why */ let y = x; // and how\n y ^ 1"));
@@ -197,8 +203,16 @@ fn an_inlined_callee_is_in_its_callers_identity_by_its_code() {
     assert!(inlines(&plain, "caller"), "the release unit inlines `callee` into `caller`");
     let inlined = |db: &Db| identity(db, "caller", INLINE);
     assert_eq!(inlined(&plain), inlined(&commented), "a comment in the callee is not code");
-    assert_ne!(inlined(&plain), inlined(&edited), "the callee's edited body is in the caller's identity");
-    assert_eq!(identity(&plain, "caller", DEBUG), identity(&edited, "caller", DEBUG), "nothing is inlined at level 1");
+    assert_ne!(
+        inlined(&plain),
+        inlined(&edited),
+        "the callee's edited body is in the caller's identity"
+    );
+    assert_eq!(
+        identity(&plain, "caller", DEBUG),
+        identity(&edited, "caller", DEBUG),
+        "nothing is inlined at level 1"
+    );
 }
 
 /// A callee's body is in a caller's code only where it was inlined: a plain call names it by
@@ -206,7 +220,9 @@ fn an_inlined_callee_is_in_its_callers_identity_by_its_code() {
 #[test]
 fn a_callee_body_edit_changes_only_an_inlining_caller() {
     let text = |mask: u32| {
-        format!("#[inline]\npub fn callee(x: u32) -> u32 {{ x ^ {mask} }}\npub fn caller(x: u32) -> u32 {{ callee(x) }}\n")
+        format!(
+            "#[inline]\npub fn callee(x: u32) -> u32 {{ x ^ {mask} }}\npub fn caller(x: u32) -> u32 {{ callee(x) }}\n"
+        )
     };
     let before = program("/src/lib.rs", &text(1));
     let after = program("/src/lib.rs", &text(2));
@@ -488,7 +504,9 @@ fn a_vtable_for_a_dyn_and_one_inside_a_struct_tail_is_hashed_for_both_traits() {
 /// and refused it.
 #[test]
 fn a_vtable_only_inside_a_struct_tail_is_accepted() {
-    let held = format!("{INNER}pub type S = &'static Wrap<dyn Tr + Sync>;\npub static S: S = &Wrap(0, Inner(&MyT(2)));");
+    let held = format!(
+        "{INNER}pub type S = &'static Wrap<dyn Tr + Sync>;\npub static S: S = &Wrap(0, Inner(&MyT(2)));"
+    );
     step(&debug_and_tail("1", &held), "f");
 }
 
@@ -609,7 +627,10 @@ fn impl_const(db: &Db, name: &str) -> hir_def::ConstId {
         .flat_map(|imp| imp.impl_items(db).items.to_vec())
         .filter_map(|(_, item)| match item {
             hir_def::AssocItemId::ConstId(it)
-                if hir_def::signatures::ConstSignature::of(db, it).name.as_ref().is_some_and(|it| it.as_str() == name) =>
+                if hir_def::signatures::ConstSignature::of(db, it)
+                    .name
+                    .as_ref()
+                    .is_some_and(|it| it.as_str() == name) =>
             {
                 Some(it)
             }
@@ -638,18 +659,32 @@ fn evaluated(db: &Db, name: &str) -> Evaluated {
     use hir_ty::db::HirDatabase as _;
     let id = impl_const(db, name);
     blaze_query::db::attach(db, || {
-        let value = db.const_eval(id, GenericArgs::empty(), None).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+        let value = db
+            .const_eval(id, GenericArgs::empty(), None)
+            .unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
         let map = &value.memory_map;
         let (pieces, statics) = match map {
             hir_ty::MemoryMap::Complex(complex) => (
                 (complex.memory.iter())
-                    .map(|(&at, bytes)| (at, bytes.to_vec(), map.align_at(at), map.pointers_in(at..at + bytes.len()).to_vec()))
+                    .map(|(&at, bytes)| {
+                        (
+                            at,
+                            bytes.to_vec(),
+                            map.align_at(at),
+                            map.pointers_in(at..at + bytes.len()).to_vec(),
+                        )
+                    })
                     .collect(),
                 complex.statics.iter().map(|it| (it.start, it.size)).collect(),
             ),
             _ => (Vec::new(), Vec::new()),
         };
-        Evaluated { bytes: value.memory.to_vec(), pieces, value_pointers: map.value_pointers().to_vec(), statics }
+        Evaluated {
+            bytes: value.memory.to_vec(),
+            pieces,
+            value_pointers: map.value_pointers().to_vec(),
+            statics,
+        }
     })
 }
 
@@ -671,9 +706,17 @@ fn a_constant_pointing_at_one_of_two_statics_named_before_names_which() {
         )
     };
     let (a, b) = (case("A"), case("B"));
-    assert_eq!(evaluated(&a, "P"), evaluated(&b, "P"), "the constant's value is the same bytes either way");
+    assert_eq!(
+        evaluated(&a, "P"),
+        evaluated(&b, "P"),
+        "the constant's value is the same bytes either way"
+    );
     assert_eq!(step(&a, "f"), step(&case("A"), "f"), "built twice");
-    assert_ne!(step(&a, "f"), step(&b, "f"), "which static the constant points at is in `f`'s code id");
+    assert_ne!(
+        step(&a, "f"),
+        step(&b, "f"),
+        "which static the constant points at is in `f`'s code id"
+    );
 }
 
 /// Two builds of a constant whose value differs only in whether one word is a pointer with
@@ -697,10 +740,20 @@ fn a_word_a_pointer_in_one_build_and_an_equal_number_in_another_is_two_code_ids(
     let address = usize::from_le_bytes(before.bytes[..8].try_into().expect("a word"));
     let number = case(&format!("U {{ n: {address:#x} }}"));
     let after = evaluated(&number, "P");
-    assert_eq!((&before.bytes, &before.pieces, &before.statics), (&after.bytes, &after.pieces, &after.statics));
-    assert_ne!(before.value_pointers, after.value_pointers, "one word has provenance in one build only");
+    assert_eq!(
+        (&before.bytes, &before.pieces, &before.statics),
+        (&after.bytes, &after.pieces, &after.statics)
+    );
+    assert_ne!(
+        before.value_pointers, after.value_pointers,
+        "one word has provenance in one build only"
+    );
     assert_eq!(step(&pointer, "f"), step(&case("U { p: &SX as *const u8 }"), "f"), "built twice");
-    assert_ne!(step(&pointer, "f"), step(&number, "f"), "which words are pointers is in `f`'s code id");
+    assert_ne!(
+        step(&pointer, "f"),
+        step(&number, "f"),
+        "which words are pointers is in `f`'s code id"
+    );
 }
 
 /// Two builds of a constant whose one piece of memory differs only in its alignment, at the
@@ -725,12 +778,24 @@ fn a_piece_aligned_otherwise_at_the_same_address_is_two_code_ids() {
     let word = case("&0u64 as *const u64 as *const u8");
     let (before, after) = (evaluated(&bytes, "P"), evaluated(&word, "P"));
     let without_align = |it: &Evaluated| {
-        let pieces: Vec<_> = it.pieces.iter().map(|(at, bytes, _, pointers)| (*at, bytes.clone(), pointers.clone())).collect();
+        let pieces: Vec<_> = it
+            .pieces
+            .iter()
+            .map(|(at, bytes, _, pointers)| (*at, bytes.clone(), pointers.clone()))
+            .collect();
         (it.bytes.clone(), pieces, it.value_pointers.clone(), it.statics.clone())
     };
-    assert_eq!(without_align(&before), without_align(&after), "the values differ in alignment only");
+    assert_eq!(
+        without_align(&before),
+        without_align(&after),
+        "the values differ in alignment only"
+    );
     assert_ne!(before, after, "one piece's alignment differs");
-    assert_eq!(step(&bytes, "f"), step(&case("&[0u8; 8] as *const [u8; 8] as *const u8"), "f"), "built twice");
+    assert_eq!(
+        step(&bytes, "f"),
+        step(&case("&[0u8; 8] as *const [u8; 8] as *const u8"), "f"),
+        "built twice"
+    );
     assert_ne!(step(&bytes, "f"), step(&word, "f"), "a piece's alignment is in `f`'s code id");
 }
 

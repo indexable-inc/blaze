@@ -18,7 +18,6 @@
 //! check the rewrite against the IR it must give and leave what is not an address alone.
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use inkwell::{
     llvm_sys::{
         LLVMOpcode,
@@ -38,6 +37,7 @@ use inkwell::{
     module::Module,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 /// The most integers one address is made of that are rewritten as pointers.
 const LARGEST: usize = 64;

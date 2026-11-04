@@ -82,7 +82,11 @@ pub(crate) struct Summary {
 /// change to the kernel past its doors does not. A crate of the toolchain has no setting of its
 /// own (its bodies take their callers'), so a root compiled in one is refused, naming the crate:
 /// the key never guesses the bit.
-pub fn code_id(db: &Db, root: &Instance, env: &StoredParamEnvAndCrate) -> Result<CodeId, Unidentified> {
+pub fn code_id(
+    db: &Db,
+    root: &Instance,
+    env: &StoredParamEnvAndCrate,
+) -> Result<CodeId, Unidentified> {
     let Some(checked) = overflow::crate_checks_overflow(db, env.krate) else {
         let krate = env.krate.named(db);
         return Err(Unidentified::of(
@@ -118,18 +122,29 @@ pub fn fn_code_id<'db>(
             ),
             TyKind::FnDef(def, args) => {
                 let hir_def::CallableDefId::FunctionId(f) = def.0 else {
-                    return Err(refuse("it is a constructor, which has no code of its own".to_owned())); // alloc: error path
+                    return Err(refuse(
+                        "it is a constructor, which has no code of its own".to_owned(),
+                    )); // alloc: error path
                 };
                 let args = args.skip_binder();
                 match f.loc(db).container {
-                    ItemContainerId::TraitId(_) => match dispatch::call(&cx.infcx, cx.env, f, args) {
+                    ItemContainerId::TraitId(_) => match dispatch::call(&cx.infcx, cx.env, f, args)
+                    {
                         Call::Method(Ok(Callee::Fn(g, g_args))) => (Body::Fn(g), g_args),
-                        _ => return Err(refuse(format!("it is `{}`, which its arguments select no method with a body of", fn_path(db, f)))), // alloc: error path
+                        _ => {
+                            return Err(refuse(format!(
+                                "it is `{}`, which its arguments select no method with a body of",
+                                fn_path(db, f)
+                            )));
+                        } // alloc: error path
                     },
                     _ => (Body::Fn(f), args),
                 }
             }
-            _ => return Err(refuse("it is not a function item or closure: only those have code known when compiling".to_owned())), // alloc: error path
+            _ => return Err(refuse(
+                "it is not a function item or closure: only those have code known when compiling"
+                    .to_owned(),
+            )), // alloc: error path
         };
         if !within_longest(args) {
             return Err(refuse(format!("its type arguments are past {LONGEST} types long"))); // alloc: error path
@@ -139,7 +154,10 @@ pub fn fn_code_id<'db>(
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = code_id_cycle)]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn code_id_of(
     db: &Db,
     root: Instance,
@@ -148,14 +166,21 @@ fn code_id_of(
 ) -> Result<CodeId, Unidentified> {
     let Subject::Body(body) = root.subject else {
         // alloc: error path
-        return Err(Unidentified::of(db, &root, "a compute step's root is a function, closure or `async` block".to_owned()));
+        return Err(Unidentified::of(
+            db,
+            &root,
+            "a compute step's root is a function, closure or `async` block".to_owned(),
+        ));
     };
     root_params(db, &env, body, &root.args).map_err(|what| Unidentified::of(db, &root, what))?;
     // clone: the query's keys, reference counts; an error's text, once
     node_id(db, env.clone(), Node::Walk(body, root.args.clone()), checked).clone().map(CodeId)
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value"
+)]
 fn code_id_cycle(
     db: &Db,
     _: blaze_query::db::Id,
@@ -168,7 +193,10 @@ fn code_id_cycle(
 
 /// The behaviour identity of `node`: of the step rooted at it.
 #[blaze_query::tracked(returns(ref), cycle_result = node_id_cycle)]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn node_id(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -178,7 +206,10 @@ fn node_id(
     scc::identity(&Behaviour { db, env: &env, checked }, CODE_ID_DOMAIN, &node, INSTANCES)
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value"
+)]
 fn node_id_cycle(
     db: &Db,
     _: blaze_query::db::Id,
@@ -249,8 +280,12 @@ impl<'a> Graph<'a> for Behaviour<'a> {
                 args
             }
         };
-        let args = share::args(db, args.as_ref())
-            .map_err(|it| Unidentified::named(node_name(db, node), format!("its arguments have no identity: {it}")))?; // alloc: error path
+        let args = share::args(db, args.as_ref()).map_err(|it| {
+            Unidentified::named(
+                node_name(db, node),
+                format!("its arguments have no identity: {it}"),
+            )
+        })?; // alloc: error path
         Ok(h.id(&args).finish())
     }
 
@@ -260,7 +295,10 @@ impl<'a> Graph<'a> for Behaviour<'a> {
 
     fn exhausted(&self, node: &Node, fuel: usize) -> Unidentified {
         // alloc: error path
-        Unidentified::named(node_name(self.db, node), format!("its recursion has more than {fuel} instances"))
+        Unidentified::named(
+            node_name(self.db, node),
+            format!("its recursion has more than {fuel} instances"),
+        )
     }
 }
 
@@ -294,7 +332,11 @@ fn root_params(
     Ok(())
 }
 
-fn outside_code<'db>(cx: &Cx<'db>, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>) -> Option<&'static str> {
+fn outside_code<'db>(
+    cx: &Cx<'db>,
+    ty: Ty<'db>,
+    seen: &mut HashSet<Ty<'db>, Global>,
+) -> Option<&'static str> {
     let ty = cx.normalize(ty);
     if !seen.insert(ty) {
         return None;
@@ -303,7 +345,9 @@ fn outside_code<'db>(cx: &Cx<'db>, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Glob
         TyKind::FnPtr(..) => Some("a function pointer, whose code the step's walk does not see"),
         TyKind::Dynamic(bounds, _) => match bounds.principal() {
             Some(principal) if trusted(cx.db, principal.skip_binder().def_id.0.into()) => None,
-            _ => Some("a trait object of a trait not `#[blaze::pure(trusted)]`, whose vtable the step's walk does not see"),
+            _ => Some(
+                "a trait object of a trait not `#[blaze::pure(trusted)]`, whose vtable the step's walk does not see",
+            ),
         },
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => {
             outside_code(cx, pointee, seen)
@@ -330,7 +374,10 @@ fn outside_code<'db>(cx: &Cx<'db>, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Glob
 /// constants are evaluated here, so a body whose constant reads the CodeId of a step that runs
 /// it re-enters this query: [`SELF_READ`].
 #[blaze_query::tracked(returns(ref), cycle_result = summary_cycle)]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn summary(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -369,7 +416,8 @@ fn summary(
                 }
                 LeafKind::Door => {}
             }
-            let args = share::args(db, args.as_ref()).map_err(|it| format!("its arguments have no identity: {it}"))?; // alloc: error path
+            let args = share::args(db, args.as_ref())
+                .map_err(|it| format!("its arguments have no identity: {it}"))?; // alloc: error path
             h.id(&args);
             h.finish()
         }
@@ -437,7 +485,9 @@ impl<'db> Follow<'_, 'db> {
 
     fn walk(&mut self, body: Body, args: GenericArgs<'db>) {
         if !within_longest(args) {
-            return self.fail(|| format!("reaches an instance whose type arguments are past {LONGEST} types long")); // alloc: error path
+            return self.fail(|| {
+                format!("reaches an instance whose type arguments are past {LONGEST} types long")
+            }); // alloc: error path
         }
         self.push(Node::Walk(body, args.store()));
     }
@@ -469,25 +519,43 @@ impl<'db> Follow<'_, 'db> {
         }
         match dispatch::call(&cx.infcx, cx.env, f, args) {
             Call::DropGlue(ty) => self.drop_glue(ty),
-            Call::ConstEvalSelect(Some((hir_def::CallableDefId::FunctionId(g), g_args))) => self.call(g, g_args),
+            Call::ConstEvalSelect(Some((hir_def::CallableDefId::FunctionId(g), g_args))) => {
+                self.call(g, g_args)
+            }
             Call::FnItem(hir_def::CallableDefId::FunctionId(g), g_args) => self.call(g, g_args),
             // A constructor, the code generator's own code, or a pointer made where it was.
-            Call::ConstEvalSelect(Some(_)) | Call::Intrinsic(_) | Call::FnItem(..) | Call::Indirect => {}
+            Call::ConstEvalSelect(Some(_))
+            | Call::Intrinsic(_)
+            | Call::FnItem(..)
+            | Call::Indirect => {}
             Call::ConstEvalSelect(None) => {
-                self.fail(|| "calls `const_eval_select` with a run-time function not known".to_owned()) // alloc: error path
+                self.fail(|| {
+                    "calls `const_eval_select` with a run-time function not known".to_owned()
+                }) // alloc: error path
             }
-            Call::UnknownIntrinsic(unknown) => self.fail(|| format!("calls an intrinsic not known: {unknown}")), // alloc: error path
+            Call::UnknownIntrinsic(unknown) => {
+                self.fail(|| format!("calls an intrinsic not known: {unknown}"))
+            } // alloc: error path
             Call::Closure(body, parent) => self.walk(body, parent),
-            Call::AsyncClosure => self.fail(|| "calls an `async` closure, which the walk does not follow".to_owned()), // alloc: error path
+            Call::AsyncClosure => {
+                self.fail(|| "calls an `async` closure, which the walk does not follow".to_owned())
+            } // alloc: error path
             Call::Method(Err(why)) => self.fail(|| {
-                format!("calls `{}` for `{:?}`, which no impl's method is found for: {}", fn_path(db, f), args.type_at(0), why.describe()) // alloc: error path
+                format!(
+                    "calls `{}` for `{:?}`, which no impl's method is found for: {}",
+                    fn_path(db, f),
+                    args.type_at(0),
+                    why.describe()
+                ) // alloc: error path
             }),
             Call::Method(Ok(callee)) => match callee {
                 Callee::Poll(body, parent) => self.walk(body, parent),
                 // Made where the vtable or the pointer was: an edge there, or the root's refusal.
                 Callee::Virtual | Callee::FnPtr(_) => {}
                 Callee::Derived(..) => {
-                    self.fail(|| format!("calls a derived `{}`, which blaze does not build", fn_path(db, f))) // alloc: error path
+                    self.fail(|| {
+                        format!("calls a derived `{}`, which blaze does not build", fn_path(db, f))
+                    }) // alloc: error path
                 }
                 Callee::CloneBuiltin(_) => self.clone_builtin(f, args.type_at(0)),
                 Callee::Fn(g, g_args) => self.function(f, g, g_args),
@@ -508,9 +576,15 @@ impl<'db> Follow<'_, 'db> {
             return self.leaf(g, args, LeafKind::Foreign);
         }
         if !FunctionSignature::of(db, g).has_body() {
-            return self.fail(|| match g == f && matches!(f.loc(db).container, ItemContainerId::TraitId(_)) {
-                true => format!("calls `{}` for `{:?}`, which no impl gives a body", fn_path(db, f), args.type_at(0)), // alloc: error path
-                false => format!("calls `{}`, which has no body", fn_path(db, g)), // alloc: error path
+            return self.fail(|| {
+                match g == f && matches!(f.loc(db).container, ItemContainerId::TraitId(_)) {
+                    true => format!(
+                        "calls `{}` for `{:?}`, which no impl gives a body",
+                        fn_path(db, f),
+                        args.type_at(0)
+                    ), // alloc: error path
+                    false => format!("calls `{}`, which has no body", fn_path(db, g)), // alloc: error path
+                }
             });
         }
         self.walk(Body::Fn(g), args);
@@ -531,7 +605,10 @@ impl<'db> Follow<'_, 'db> {
                 }
             }
             TyKind::CoroutineClosure(..) => {
-                self.fail(|| "gives a trusted function an `async` closure, which the walk does not follow".to_owned()) // alloc: error path
+                self.fail(|| {
+                    "gives a trusted function an `async` closure, which the walk does not follow"
+                        .to_owned()
+                }) // alloc: error path
             }
             _ => {}
         }
@@ -556,11 +633,14 @@ impl<'db> Follow<'_, 'db> {
         for step in steps {
             match step {
                 DropStep::Drop(drop, args) => self.call(drop, args),
-                DropStep::NoDropTrait => self.fail(|| "drops a value, but the toolchain has no `Drop::drop`".to_owned()), // alloc: error path
+                DropStep::NoDropTrait => {
+                    self.fail(|| "drops a value, but the toolchain has no `Drop::drop`".to_owned())
+                } // alloc: error path
                 // An `async` block's drop glue drops what its `poll` holds: its body's.
                 DropStep::Unknown(ty) => match coroutine_poll(cx.db, ty) {
                     Some((body, parent)) => self.walk(body, parent),
-                    None => self.fail(|| format!("drops `{ty:?}`, whose drop glue the walk does not know")), // alloc: error path
+                    None => self
+                        .fail(|| format!("drops `{ty:?}`, whose drop glue the walk does not know")), // alloc: error path
                 },
             }
         }

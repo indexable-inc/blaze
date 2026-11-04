@@ -19,15 +19,17 @@ use std::{
 
 use base_db::Crate;
 use blaze_ids::ContentId;
+use blaze_lower::{Lower, Lowered, Ran};
 use blaze_query::{Config, Database, MemTree};
 use blaze_units::{
-    query::{self, BuildConfig, Command, FetchKind, Invocation, Mount, Origin, Plan, Planned, Units},
+    query::{
+        self, BuildConfig, Command, FetchKind, Invocation, Mount, Origin, Plan, Planned, Units,
+    },
     schema::Mode,
     stdlib,
 };
 use blaze_vfs::View;
 use hir_expand::proc_macro::ProcMacro;
-use blaze_lower::{Lower, Lowered, Ran};
 
 use crate::config::Homes;
 
@@ -55,7 +57,9 @@ impl Workspace {
             .graph
             .units
             .iter()
-            .position(|it| it.pkg_id == id && !it.is_std && it.mode == Mode::Build && it.target.is_lib())
+            .position(|it| {
+                it.pkg_id == id && !it.is_std && it.mode == Mode::Build && it.target.is_lib()
+            })
             .ok_or_else(|| format!("package `{package}` of {} has no library unit", self.dir))?;
         self.lowered.krate(unit).ok_or_else(|| format!("the library of `{package}` has no crate"))
     }
@@ -99,22 +103,32 @@ fn library() -> Result<&'static Library, String> {
 
 /// Every file under `dir` by its `/`-separated path under it that `keep` keeps, but those under
 /// a directory named `.git` or one of `skipped` (paths under `dir`).
-fn read_tree(dir: &Path, keep: &dyn Fn(&str) -> bool, skipped: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_tree(
+    dir: &Path,
+    keep: &dyn Fn(&str) -> bool,
+    skipped: &[&str],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut dirs = vec![(dir.to_path_buf(), String::new())];
     while let Some((at, under)) = dirs.pop() {
-        let entries = std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?;
+        let entries =
+            std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?;
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?;
-            let name = entry.file_name().into_string().map_err(|it| format!("{}: {it:?} is not UTF-8", at.display()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|it| format!("{}: {it:?} is not UTF-8", at.display()))?;
             let path = if under.is_empty() { name.clone() } else { format!("{under}/{name}") };
-            let metadata = std::fs::metadata(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            let metadata = std::fs::metadata(entry.path())
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
             if metadata.is_dir() {
                 if name != ".git" && !skipped.contains(&path.as_str()) {
                     dirs.push((entry.path(), path));
                 }
             } else if keep(&path) {
-                let bytes = std::fs::read(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|error| format!("{}: {error}", entry.path().display()))?;
                 files.push((path, bytes));
             }
         }
@@ -123,7 +137,8 @@ fn read_tree(dir: &Path, keep: &dyn Fn(&str) -> bool, skipped: &[&str]) -> Resul
 }
 
 fn root_of(files: &[(String, Vec<u8>)]) -> ContentId {
-    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> =
+        files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
     tree().root(&files)
 }
 
@@ -144,9 +159,16 @@ fn host() -> Result<&'static str, String> {
 /// plans them there, each package it needs mounted from where cargo fetched it.
 /// `homes` is where the daemon that built it placed build directories and the standard
 /// library's, so that each build script's `OUT_DIR` in the plan is where that build left its run.
-fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Homes<'_>) -> Result<(Units, BuildConfig), String> {
+fn plan(
+    db: &Database,
+    dir: &str,
+    view: ContentId,
+    cargo_home: &str,
+    homes: Homes<'_>,
+) -> Result<(Units, BuildConfig), String> {
     let library = library()?;
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set, and cargo reads it".to_owned())?;
+    let home =
+        std::env::var("HOME").map_err(|_| "HOME is not set, and cargo reads it".to_owned())?;
     let mut env = vec![("CARGO_HOME".to_owned(), cargo_home.to_owned()), ("HOME".to_owned(), home)];
     env.sort();
     let config_toml = format!("{cargo_home}/config.toml");
@@ -181,7 +203,11 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Home
             blaze: String::new(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
-        let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();
+        let planned = db
+            .pin()
+            .get::<Plan>(opened, &())
+            .map_err(|error| format!("planning {dir}: {error:?}"))?
+            .get();
         let needs = match planned {
             Planned::Ready(units) => return Ok((units, config)),
             Planned::Failed(error) => return Err(format!("planning {dir}: {}", error.what)),
@@ -189,10 +215,16 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Home
         };
         for fetch in needs {
             if fetched.contains(&fetch.at) {
-                return Err(format!("planning {dir} needs {} again once it is mounted at {}", fetch.what, fetch.at));
+                return Err(format!(
+                    "planning {dir} needs {} again once it is mounted at {}",
+                    fetch.what, fetch.at
+                ));
             }
             if matches!(fetch.kind, FetchKind::IndexFile) {
-                return Err(format!("planning {dir} reads the index file {}: its Cargo.lock does not pin {}", fetch.url, fetch.what));
+                return Err(format!(
+                    "planning {dir} reads the index file {}: its Cargo.lock does not pin {}",
+                    fetch.url, fetch.what
+                ));
             }
             let at = Path::new(&fetch.at);
             if !at.is_dir() {
@@ -202,7 +234,11 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Home
                 ));
             }
             let files = read_tree(at, &|_: &str| true, &[])?;
-            mounts.push(Mount { at: fetch.at.clone(), origin: Origin::Root(root_of(&files)), under: String::new() });
+            mounts.push(Mount {
+                at: fetch.at.clone(),
+                origin: Origin::Root(root_of(&files)),
+                under: String::new(),
+            });
             fetched.push(fetch.at);
         }
     }
@@ -215,8 +251,10 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Home
 /// `OUT_DIR` still the plan's.
 fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
     let plan = &units.plans[unit];
-    let out_dir = plan.out_dir.as_deref().ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
-    let output_at = plan.outputs.first().ok_or_else(|| format!("build script run {unit} names no stdout"))?;
+    let out_dir =
+        plan.out_dir.as_deref().ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
+    let output_at =
+        plan.outputs.first().ok_or_else(|| format!("build script run {unit} names no stdout"))?;
     let (read_from, output_at) = match std_placed(output_at, std)? {
         Some((planned, placed)) => {
             let under = |path: &str| {
@@ -236,7 +274,10 @@ fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
     })?;
     let mut ran = Ran { out_dir: out_dir.to_owned(), ..Ran::default() };
     for line in String::from_utf8_lossy(&output).lines() {
-        let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) else { continue };
+        let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))
+        else {
+            continue;
+        };
         let Some((key, value)) = directive.split_once('=') else { continue };
         match key {
             "rustc-cfg" => ran.cfgs.push(value.to_owned()),
@@ -259,9 +300,13 @@ fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
 /// daemon's mount byte for byte, so the file is looked for under every key and found in
 /// exactly one: none, or two, is an error naming them. None when `path` is not under `std`.
 fn std_placed(path: &str, std: &str) -> Result<Option<(String, PathBuf)>, String> {
-    let Some(rest) = path.strip_prefix(std).and_then(|it| it.strip_prefix('/')) else { return Ok(None) };
-    let (key, below) = rest.split_once('/').ok_or_else(|| format!("{path} names no file under a key of {std}"))?;
-    let entries = std::fs::read_dir(std).map_err(|error| format!("the standard library's directory {std}: {error}"))?;
+    let Some(rest) = path.strip_prefix(std).and_then(|it| it.strip_prefix('/')) else {
+        return Ok(None);
+    };
+    let (key, below) =
+        rest.split_once('/').ok_or_else(|| format!("{path} names no file under a key of {std}"))?;
+    let entries = std::fs::read_dir(std)
+        .map_err(|error| format!("the standard library's directory {std}: {error}"))?;
     let mut found = Vec::new();
     for entry in entries {
         let dir = entry.map_err(|error| format!("{std}: {error}"))?.path();
@@ -317,12 +362,20 @@ pub(crate) fn lower_with(
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home, homes)?;
-    let mut lowered = blaze_lower::lower(Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None })
-        .map_err(|error| format!("lowering {dir}: {error}"))?;
+    let mut lowered = blaze_lower::lower(Lower {
+        units: &units,
+        config: &config,
+        files: &**tree,
+        root: view,
+        host_cpu: None,
+    })
+    .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {
             let run = ran(&units, unit, homes.std)?;
-            lowered.ran(unit, &run).map_err(|error| format!("applying build script run {unit} of {dir}: {error}"))?;
+            lowered
+                .ran(unit, &run)
+                .map_err(|error| format!("applying build script run {unit} of {dir}: {error}"))?;
         }
     }
     let toolchain = toolchain()?;
@@ -331,9 +384,12 @@ pub(crate) fn lower_with(
             continue;
         }
         let name = units.graph.units[unit].target.name.clone();
-        let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
+        let krate =
+            lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
         let macros = load(lowered.db(), krate, toolchain, &name)?;
-        lowered.macros(unit, Ok(macros)).map_err(|error| format!("the macros of `{name}`: {error}"))?;
+        lowered
+            .macros(unit, Ok(macros))
+            .map_err(|error| format!("the macros of `{name}`: {error}"))?;
     }
     Ok(Workspace { dir: dir.to_owned(), units, lowered })
 }

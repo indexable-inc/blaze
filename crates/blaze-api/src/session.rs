@@ -25,14 +25,14 @@ use std::collections::VecDeque;
 
 use blaze_core::Conn;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{
     Handle, Slab, Tag,
     tag::{Rate, Snapshot},
 };
 use blaze_query::QueryKey;
-use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
+use blaze_vfs::{CommitError, OpError, Ticket, Vfs, View, ViewId};
+use std::alloc::Global;
 
 use crate::{
     ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, Targets,
@@ -158,7 +158,12 @@ impl Sink {
 }
 
 enum Kind {
-    Commit { root: ContentId, rebased: bool, ticket: Ticket, head: String },
+    Commit {
+        root: ContentId,
+        rebased: bool,
+        ticket: Ticket,
+        head: String,
+    },
     /// One job of the build, with the views it holds, and the one whose database view is kept
     /// for [`Request::Why`] when it ends. `owes_work` until a build, test or run has reported
     /// [`Response::Work`]: one that ends without it fails, naming it.
@@ -319,7 +324,8 @@ impl Session {
             !matches!(response, Response::Done { .. } | Response::Error(_)),
             "job {job:?} reported {response:?}: a job ends through `Session::finish`"
         );
-        let Some(&Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.get(it))
+        let Some(&Job::Request { serial, candidate }) =
+            handle(job).and_then(|it| self.jobs.get(it))
         else {
             return;
         };
@@ -376,7 +382,8 @@ impl Session {
         mut queries: Option<ViewId>,
         out: &mut Vec<Reply>,
     ) {
-        let Some(Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.remove(it))
+        let Some(Job::Request { serial, candidate }) =
+            handle(job).and_then(|it| self.jobs.remove(it))
         else {
             if let Some(opened) = self.intents.finish(job) {
                 close(cx, opened);
@@ -632,7 +639,13 @@ impl Session {
                 })?;
                 let work = if test {
                     // alloc: none, empty lists.
-                    Work::Test { targets, filter: Vec::new(), all: false, args: Vec::new(), ub: None }
+                    Work::Test {
+                        targets,
+                        filter: Vec::new(),
+                        all: false,
+                        args: Vec::new(),
+                        ub: None,
+                    }
                 } else {
                     Work::Check(targets)
                 };
@@ -663,7 +676,8 @@ impl Session {
                     match root.and_then(|root| open(cx, root)) {
                         Ok(opened) => {
                             self.intents.take_over(cx.builder, opened.view.root);
-                            let job = self.job(Job::Request { serial, candidate: Some(best.next()) });
+                            let job =
+                                self.job(Job::Request { serial, candidate: Some(best.next()) });
                             best.started(job, opened);
                             starts.push((job, opened));
                         }
@@ -721,7 +735,10 @@ impl Session {
                 let Some(why) = cx.db.why(queries, &query) else {
                     return Err(ApiError::new(
                         // alloc: error path, a query that did not rerun.
-                        format!("{} did not rerun in the last build of {root:x}", query_name(&query)),
+                        format!(
+                            "{} did not rerun in the last build of {root:x}",
+                            query_name(&query)
+                        ),
                         Some(query_name(&query)),
                     ));
                 };
@@ -918,7 +935,10 @@ impl Session {
         let mut requests = std::mem::take(&mut self.buffers.going);
         requests.clear();
         requests.extend(
-            self.live.iter().filter(|(req, _)| req.conn == conn).map(|(req, serial)| (*req, *serial)),
+            self.live
+                .iter()
+                .filter(|(req, _)| req.conn == conn)
+                .map(|(req, serial)| (*req, *serial)),
         );
         radix::sort_copy_by_key_in(&mut requests, |it| it.0.id, &mut self.buffers.going_scratch);
         for &(req, serial) in &requests {

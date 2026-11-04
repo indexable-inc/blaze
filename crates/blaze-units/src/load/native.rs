@@ -119,12 +119,16 @@ struct PinTarget {
 }
 
 fn wrong(manifest: &Path, what: &str) -> LoadError {
-    LoadError { what: format!("{TABLE} in {}: {what}", manifest.display()), at: Some(manifest.display().to_string()) }
+    LoadError {
+        what: format!("{TABLE} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
+    }
 }
 
 /// The inputs `metadata` (the root manifest's `[workspace.metadata]`) declares, sorted by name.
 fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Declared>, LoadError> {
-    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("native")) else {
+    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("native"))
+    else {
         return Ok(Vec::new());
     };
     let table = table.as_table().ok_or_else(|| wrong(manifest, "is a table of inputs by name"))?;
@@ -132,22 +136,32 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
     let mut out: Vec<Declared> = Vec::with_capacity(table.len()); // alloc: a manifest's few inputs, once a load
     for (name, input) in table {
         let wrong = |what: &str| wrong(manifest, &format!("input `{name}`: {what}"));
-        let input = input.as_table().ok_or_else(|| wrong("is a table with `pin`, `env` and `packages`"))?;
+        let input =
+            input.as_table().ok_or_else(|| wrong("is a table with `pin`, `env` and `packages`"))?;
         let (mut pin, mut env, mut packages) = (None, None, None);
         for (key, value) in input {
             match key.as_str() {
                 "pin" => {
-                    let path = value.as_str().ok_or_else(|| wrong("`pin` is a path, as a string"))?;
-                    let absolute = super::files::normal(&root.join(path))
-                        .ok_or_else(|| wrong(&format!("`pin` names `{path}`, which is not a UTF-8 path")))?;
+                    let path =
+                        value.as_str().ok_or_else(|| wrong("`pin` is a path, as a string"))?;
+                    let absolute = super::files::normal(&root.join(path)).ok_or_else(|| {
+                        wrong(&format!("`pin` names `{path}`, which is not a UTF-8 path"))
+                    })?;
                     pin = Some(absolute);
                 }
                 "env" => {
-                    let var = value.as_str().ok_or_else(|| wrong("`env` is a variable's name, as a string"))?;
-                    env = Some(variable(var).map_err(|why| wrong(&format!("`env` is `{var}`, which {why}")))?);
+                    let var = value
+                        .as_str()
+                        .ok_or_else(|| wrong("`env` is a variable's name, as a string"))?;
+                    env = Some(
+                        variable(var)
+                            .map_err(|why| wrong(&format!("`env` is `{var}`, which {why}")))?,
+                    );
                 }
                 "packages" => {
-                    let list = value.as_array().ok_or_else(|| wrong("`packages` is a list of package names"))?;
+                    let list = value
+                        .as_array()
+                        .ok_or_else(|| wrong("`packages` is a list of package names"))?;
                     let mut names = list
                         .iter()
                         .map(|it| {
@@ -162,11 +176,17 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
                     names.sort_unstable();
                     names.dedup();
                     if names.is_empty() {
-                        return Err(wrong("`packages` is empty: it names the packages whose build scripts are given the input"));
+                        return Err(wrong(
+                            "`packages` is empty: it names the packages whose build scripts are given the input",
+                        ));
                     }
                     packages = Some(names);
                 }
-                other => return Err(wrong(&format!("`{other}` is not known (`pin`, `env` and `packages` are)"))),
+                other => {
+                    return Err(wrong(&format!(
+                        "`{other}` is not known (`pin`, `env` and `packages` are)"
+                    )));
+                }
             }
         }
         let (Some(pin), Some(env), Some(packages)) = (pin, env, packages) else {
@@ -180,10 +200,15 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
     for (i, a) in out.iter().enumerate() {
         for b in &out[i + 1..] {
             let theirs: Vec<String> = b.packages.iter().map(package).collect(); // alloc: an error check, once a pair
-            if a.env == b.env && let Some(shared) = a.packages.iter().map(package).find(|it| theirs.contains(it)) {
+            if a.env == b.env
+                && let Some(shared) = a.packages.iter().map(package).find(|it| theirs.contains(it))
+            {
                 return Err(wrong(
                     manifest,
-                    &format!("inputs `{}` and `{}` both give `{shared}`'s build script `{}`", a.name, b.name, a.env),
+                    &format!(
+                        "inputs `{}` and `{}` both give `{shared}`'s build script `{}`",
+                        a.name, b.name, a.env
+                    ),
                 ));
             }
         }
@@ -206,7 +231,8 @@ fn variable(var: &str) -> Result<String, &'static str> {
 
 /// Whether `sha256` is 64 lowercase hex digits.
 fn is_sha256(sha256: &str) -> bool {
-    sha256.len() == 64 && sha256.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+    sha256.len() == 64
+        && sha256.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
 }
 
 /// The inputs the root manifest at `manifest` (its `[workspace.metadata]` is `metadata`)

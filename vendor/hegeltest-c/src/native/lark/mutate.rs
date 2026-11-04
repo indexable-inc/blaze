@@ -56,24 +56,14 @@ impl Moves {
                     (None, Some(&(next_start, _))) => (start, next_start),
                     (None, None) => (start, end),
                 };
-                duplicates.push(Move::Duplicate {
-                    start,
-                    end,
-                    at: end,
-                });
+                duplicates.push(Move::Duplicate { start, end, at: end });
             }
         }
-        Moves {
-            same_rule,
-            duplicates,
-        }
+        Moves { same_rule, duplicates }
     }
 
     pub fn len(&self) -> usize {
-        self.same_rule
-            .iter()
-            .map(|nodes| nodes.len() * (nodes.len() - 1))
-            .sum::<usize>()
+        self.same_rule.iter().map(|nodes| nodes.len() * (nodes.len() - 1)).sum::<usize>()
             + self.duplicates.len()
     }
 

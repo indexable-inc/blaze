@@ -30,7 +30,13 @@ pub(crate) struct At<'db> {
 }
 
 /// The E0433 of segment `at` of `path`, `module` what the segments before it named.
-pub(crate) fn diag<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, path: &[Segment], at: usize, module: Option<ModuleDef>) -> Diag {
+pub(crate) fn diag<'db>(
+    cx: &Cx<'_, 'db>,
+    place: &At<'db>,
+    path: &[Segment],
+    at: usize,
+    module: Option<ModuleDef>,
+) -> Diag {
     let ident = &path[at];
     let name = ident.name.as_str();
     let span = |range: TextRange| cx.span(InFile::new(place.file, range));
@@ -54,12 +60,16 @@ pub(crate) fn diag<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, path: &[Segment], at:
     } else if module == Some(ModuleDef::Module(crate_root)) {
         if let Some(candidate) = module_candidate(cx, place, path, at) {
             // alloc: the error's text, on the error path
-            suggestion = Some((vec![(span(ident.range), candidate)], "a similar path exists".to_owned()));
+            suggestion =
+                Some((vec![(span(ident.range), candidate)], "a similar path exists".to_owned()));
             // alloc: the error's text, on the error path
             "unresolved import".to_owned()
         } else if name == "core" {
             // alloc: the error's text, on the error path
-            suggestion = Some((vec![(span(ident.range), "std".to_owned())], "try using `std` instead of `core`".to_owned()));
+            suggestion = Some((
+                vec![(span(ident.range), "std".to_owned())],
+                "try using `std` instead of `core`".to_owned(),
+            ));
             // alloc: the error's text, on the error path
             "you might be missing crate `core`".to_owned()
         } else if name == "_" {
@@ -92,7 +102,9 @@ pub(crate) fn diag<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, path: &[Segment], at:
         };
         match value(cx, place, Some(&path[..at]), name) {
             // alloc: the error's text, on the error path
-            Some(def) => format!("expected type, found {} `{name}` in {parent}", value_descr(cx, def)),
+            Some(def) => {
+                format!("expected type, found {} `{name}` in {parent}", value_descr(cx, def))
+            }
             // alloc: the error's text, on the error path
             None => format!("could not find `{name}` in {parent}"),
         }
@@ -115,12 +127,18 @@ pub(crate) fn diag<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, path: &[Segment], at:
     } else {
         if name == "alloc" {
             // alloc: the error's text, on the error path
-            suggestion = Some((Vec::new(), "add `extern crate alloc` to use the `alloc` crate".to_owned()));
+            suggestion =
+                Some((Vec::new(), "add `extern crate alloc` to use the `alloc` crate".to_owned()));
         }
         if suggestion.is_none() {
             suggestion = similar_module_or_crate(cx, place, name)
                 // alloc: the error's text, on the error path
-                .map(|it| (vec![(span(ident.range), it)], "there is a crate or module with a similar name".to_owned()));
+                .map(|it| {
+                    (
+                        vec![(span(ident.range), it)],
+                        "there is a crate or module with a similar name".to_owned(),
+                    )
+                });
         }
         // alloc: the error's text, on the error path
         message = format!("cannot find module or crate `{name}` in {scope}");
@@ -172,7 +190,12 @@ pub(crate) fn kind_of(path: &[Segment]) -> (PathKind, &[Segment]) {
 }
 
 /// What `name` names as a value in the module `scope` names, or where the path is.
-fn value<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, scope: Option<&[Segment]>, name: &str) -> Option<ModuleDef> {
+fn value<'db>(
+    cx: &Cx<'_, 'db>,
+    place: &At<'db>,
+    scope: Option<&[Segment]>,
+    name: &str,
+) -> Option<ModuleDef> {
     let mut path: Vec<Segment> = scope.map_or_else(Vec::new, <[Segment]>::to_vec);
     // alloc: a path looked up for the error's label, on the error path
     path.push(Segment { name: name.to_owned(), range: TextRange::default() });
@@ -205,7 +228,12 @@ fn def_start(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<String> {
 
 /// rustc's `lookup_import_candidates` of a module named as the segment `at` of `path`, as the
 /// path that names it with what it shares with `path` left out.
-fn module_candidate<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, path: &[Segment], at: usize) -> Option<String> {
+fn module_candidate<'db>(
+    cx: &Cx<'_, 'db>,
+    place: &At<'db>,
+    path: &[Segment],
+    at: usize,
+) -> Option<String> {
     let db = cx.db;
     let name = path[at].name.as_str();
     let current = cx.vsema.scope(place.node)?.module();
@@ -249,7 +277,10 @@ fn after_inner_attributes(source: ast::Node<'_>) -> syntax::TextSize {
     let is_token = |token: ast::Token<'_>| {
         !matches!(
             token.kind(),
-            SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::COMMENT | SyntaxKind::INNER_DOC_COMMENT
+            SyntaxKind::WHITESPACE
+                | SyntaxKind::SHEBANG
+                | SyntaxKind::COMMENT
+                | SyntaxKind::INNER_DOC_COMMENT
         )
     };
     source
@@ -259,7 +290,9 @@ fn after_inner_attributes(source: ast::Node<'_>) -> syntax::TextSize {
                 if ast::Attr::cast(node).is_some_and(|it| it.excl_token().is_some()) {
                     return None;
                 }
-                node.descendants_with_tokens().filter_map(syntax::NodeOrToken::into_token).find(|it| is_token(*it))
+                node.descendants_with_tokens()
+                    .filter_map(syntax::NodeOrToken::into_token)
+                    .find(|it| is_token(*it))
             }
             syntax::NodeOrToken::Token(token) => is_token(token).then_some(token),
         })
@@ -274,7 +307,8 @@ fn similar_module_or_crate<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, name: &str) -
     // alloc: the error's suggestion, on the error path
     let mut candidates: Vec<Name> = cx.krate.dependencies_iter(db).map(|it| it.name).collect();
     for module in cx.krate.modules_iter(db) {
-        let below = std::iter::successors(module.parent(db), |it| it.parent(db)).any(|it| it == current);
+        let below =
+            std::iter::successors(module.parent(db), |it| it.parent(db)).any(|it| it == current);
         if below && let Some(it) = module.name(db) {
             candidates.push(it);
         }
@@ -284,7 +318,10 @@ fn similar_module_or_crate<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, name: &str) -
     candidates.dedup();
     // alloc: the error's suggestion, on the error path
     let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
-    find_best_match_for_name(&candidates, name, None).copied().filter(|it| *it != name).map(str::to_owned)
+    find_best_match_for_name(&candidates, name, None)
+        .copied()
+        .filter(|it| *it != name)
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

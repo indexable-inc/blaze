@@ -11,8 +11,8 @@ use rustc_abi::ExternAbi;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 
 use crate::{
-    db::HirDatabase,
     InferBodyId,
+    db::HirDatabase,
     drop::{DropGlue, has_drop_glue},
     intrinsic::{
         AtomicOp, AtomicOrdering, AtomicOrders, FloatWidth, Intrinsic, SimdOp, atomic_orderings,
@@ -20,12 +20,12 @@ use crate::{
     },
     mir::MirLowerError,
     mir::eval::{
-        Address, AdtId, Evaluator, FunctionId, GenericArgs, Interned, InternedLayout,
-        Interval, IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
+        Address, AdtId, Evaluator, FunctionId, GenericArgs, Interned, InternedLayout, Interval,
+        IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind,
-        VTableOfBytes,
-        VariantId, from_bytes, not_supported, pad16, try_const_usize,
+        VTableOfBytes, VariantId, from_bytes,
         machine::{Access, AtomicOrd, Machine, RetagMode, Shadow},
+        not_supported, pad16, try_const_usize,
     },
     mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::{Region, RegionExt},
@@ -286,8 +286,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
-                let align = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(align.interval)?);
+                let size =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let align =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(align.interval)?);
                 let zeroed = alloc_fn.contains(AttrFlags::RUSTC_ALLOCATOR_ZEROED);
                 let result = self.allocate(size, align, Origin::Allocator, zeroed)?;
                 self.write_pointer(destination.addr, result)?;
@@ -307,7 +309,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let new_size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(new_size.interval)?);
+                let new_size =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(new_size.interval)?);
                 let ptr = self.read_pointer(ptr.interval.addr)?;
                 let result = self.reallocate(ptr, new_size, Origin::Allocator, "__rust_realloc")?;
                 self.write_pointer(destination.addr, result)?;
@@ -490,7 +493,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let addr1 = self.read_pointer(ptr1.interval.addr)?;
                 let addr2 = self.read_pointer(ptr2.interval.addr)?;
-                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let size =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 let slice1 = self.read_scalar(Interval::new(addr1, size))?;
                 let slice2 = self.read_scalar(Interval::new(addr2, size))?;
                 let r: i128 = match slice1.cmp(slice2) {
@@ -509,7 +513,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let dst = self.read_pointer(dst.interval.addr)?;
                 let src = self.read_pointer(src.interval.addr)?;
-                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let size =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 self.copy_memory(dst, src, size, 1, as_str == "memmove")?;
                 self.write_pointer(destination.addr, dst)
             }
@@ -522,7 +527,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let Some(&byte) = self.read_scalar(byte.interval)?.first() else {
                     return Err(MirEvalError::InternalError("memset byte is of no size".into()));
                 };
-                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let size =
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 self.write_memory_using_ref(dst, size)?.fill(byte);
                 self.write_pointer(destination.addr, dst)
             }
@@ -635,7 +641,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             "realloc" => {
                 let [ptr, size] = args else {
-                    return Err(MirEvalError::InternalError("realloc args are not provided".into()));
+                    return Err(MirEvalError::InternalError(
+                        "realloc args are not provided".into(),
+                    ));
                 };
                 let ptr = self.read_pointer(ptr.interval.addr)?;
                 let size = from_bytes!(usize, self.cached_ptr_size, size.get(self)?);
@@ -2251,7 +2259,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             not_supported!("the caller's location: no place for {span:?}");
         };
         // Named as the crate of the code the place is in names its files.
-        let Some(name) = source_path(self.db, hir_def::HasModule::krate(&body, self.db), file) else {
+        let Some(name) = source_path(self.db, hir_def::HasModule::krate(&body, self.db), file)
+        else {
             not_supported!("the caller's location: the build did not name its file");
         };
         let Some(id) = self.lang_items().PanicLocation else {
@@ -2283,7 +2292,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let location = self.heap_allocate(size, layout.align.abi.bytes() as usize)?;
         self.write_memory(location, &bytes)?;
         // The file name's pointer again, with the provenance of the name's allocation.
-        if M::CHECKS && let Some(i) = file_field {
+        if M::CHECKS
+            && let Some(i) = file_field
+        {
             let at = location.offset(layout.fields.offset(i).bytes_usize());
             self.write_pointer(at, addr)?;
         }

@@ -3,7 +3,10 @@
 //! model build (docs/v2/plan/lanes/safety/model.md, "The switch").
 
 #[cfg(not(blaze_check))]
-#[allow(clippy::disallowed_types, reason = "named only by `arena::lock::InsertLock`, which allows it")]
+#[allow(
+    clippy::disallowed_types,
+    reason = "named only by `arena::lock::InsertLock`, which allows it"
+)]
 pub(crate) use parking_lot::{Mutex, MutexGuard};
 #[cfg(not(blaze_check))]
 pub(crate) use std::sync::{OnceLock, atomic};

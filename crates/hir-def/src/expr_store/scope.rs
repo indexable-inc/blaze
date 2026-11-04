@@ -105,9 +105,11 @@ impl ScopeByExpr {
 
     /// Each expression with a scope and its scope, in the order of the expressions.
     pub fn iter(&self) -> impl Iterator<Item = (ExprId, &ScopeId)> + '_ {
-        self.0.iter().enumerate().filter(|(_, it)| **it != UNSCOPED).map(|(at, it)| {
-            (ExprId::from_raw(RawIdx::from_u32(at as u32)), it)
-        })
+        self.0
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| **it != UNSCOPED)
+            .map(|(at, it)| (ExprId::from_raw(RawIdx::from_u32(at as u32)), it))
     }
 }
 
@@ -320,15 +322,8 @@ impl Building {
             macro_defs: Box::from(&*self.macro_defs),
             scope_by_expr: ScopeByExpr(Box::from(&*self.scope_by_expr)),
         };
-        let Building {
-            parent,
-            kind,
-            data,
-            scope_entries: _,
-            blocks,
-            macro_defs,
-            scope_by_expr,
-        } = self;
+        let Building { parent, kind, data, scope_entries: _, blocks, macro_defs, scope_by_expr } =
+            self;
         parent.clear();
         kind.clear();
         data.clear();
@@ -367,7 +362,8 @@ fn walk_body(sink: &mut impl ScopeSink, body: &Body) {
     if let Some(Param { formal: self_param, user_written: _ }) = body.self_param {
         add_binding(&mut *sink, body, root, self_param);
     }
-    let mut visitor = ExprScopeVisitor { store: body, scopes: sink, scope: root, const_scope: root };
+    let mut visitor =
+        ExprScopeVisitor { store: body, scopes: sink, scope: root, const_scope: root };
     body.params.iter().for_each(|param| visitor.on_pat(param.formal));
     visitor.on_expr(body.root_expr());
 }
@@ -554,6 +550,7 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
 #[cfg(test)]
 mod tests {
     use hir_expand::InFile;
+    use hir_expand::fixture;
     use itertools::Itertools as _;
     use la_arena::ArenaMap;
     use span::FileId;
@@ -561,7 +558,6 @@ mod tests {
         TextSize,
         view::{self, AstNode as _},
     };
-    use hir_expand::fixture;
     use test_utils::{assert_eq_text, extract_offset};
 
     use super::*;

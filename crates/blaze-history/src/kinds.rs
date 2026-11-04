@@ -4,8 +4,8 @@
 
 use blaze_graph::admission::TaskKind;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
+use std::alloc::Global;
 
 /// A new run's weight against the mean, as a shift: an eighth.
 const SHIFT: u32 = 3;

@@ -9,11 +9,11 @@
 
 use std::alloc::Allocator;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_ids::radix;
 use blaze_mem::Frame;
-use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 use blaze_query::db::AsId;
+use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 
 use crate::{
     TyLoweringDiagnostic,
@@ -60,8 +60,10 @@ pub struct SideTable<'db> {
 // Boxed slices only, two words each (16 bytes on a 64-bit target).
 const SLICE: usize = size_of::<Box<[u32]>>();
 const _: () = assert!(size_of::<SideTable<'static>>() == 5 * SLICE);
-const _: () = assert!(size_of::<CrateImplSelfTys<'static>>() == 2 * SLICE + size_of::<SideTable<'static>>());
-const _: () = assert!(size_of::<CrateFieldTypes<'static>>() == 3 * SLICE + size_of::<SideTable<'static>>());
+const _: () =
+    assert!(size_of::<CrateImplSelfTys<'static>>() == 2 * SLICE + size_of::<SideTable<'static>>());
+const _: () =
+    assert!(size_of::<CrateFieldTypes<'static>>() == 3 * SLICE + size_of::<SideTable<'static>>());
 
 impl<'db> SideTable<'db> {
     /// The diagnostics and anonymous constants of `row`.
@@ -283,9 +285,8 @@ impl<'db> CrateFieldTypes<'db> {
             blaze_mem::frame::task(crate::db::INFER_TAG, |item| {
                 let lowered = lower(variant, item);
                 fields.extend(lowered.value);
-                starts.push(
-                    u32::try_from(fields.len()).expect("more than 2^32 fields in one crate"),
-                );
+                starts
+                    .push(u32::try_from(fields.len()).expect("more than 2^32 fields in one crate"));
                 side.push(row as u32, lowered.diagnostics, lowered.anon_consts);
             });
         }
@@ -450,9 +451,8 @@ mod tests {
     #[test]
     fn an_empty_side_table_allocates_nothing_and_has_nothing() {
         blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
-            let (side, used) = blaze_alloc_count::measure(|| {
-                SideTableBuilder::<'_, 'static>::new(frame).finish()
-            });
+            let (side, used) =
+                blaze_alloc_count::measure(|| SideTableBuilder::<'_, 'static>::new(frame).finish());
             assert_eq!(used.allocations, 0);
             assert_eq!(side.len(), 0);
             assert!(side.get(0).0.is_empty() && side.get(0).1.is_empty());

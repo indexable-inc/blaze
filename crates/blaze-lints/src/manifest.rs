@@ -70,8 +70,9 @@ fn of_table(lints: &toml::Table, path: &Path) -> Result<Vec<ManifestLint>, Strin
                     };
                     let priority = match it.get("priority") {
                         None => 0,
-                        Some(toml::Value::Integer(it)) => i8::try_from(*it)
-                            .map_err(|_| wrong(&at, &format!("invalid value: integer `{it}`, expected i8")))?,
+                        Some(toml::Value::Integer(it)) => i8::try_from(*it).map_err(|_| {
+                            wrong(&at, &format!("invalid value: integer `{it}`, expected i8"))
+                        })?,
                         Some(_) => return Err(wrong(&at, "`priority` is not an integer")),
                     };
                     (level, priority)
@@ -86,7 +87,9 @@ fn of_table(lints: &toml::Table, path: &Path) -> Result<Vec<ManifestLint>, Strin
                 other => {
                     return Err(wrong(
                         &at,
-                        &format!("unknown variant `{other}`, expected one of `forbid`, `deny`, `warn`, `allow`"),
+                        &format!(
+                            "unknown variant `{other}`, expected one of `forbid`, `deny`, `warn`, `allow`"
+                        ),
                     ));
                 }
             };
@@ -134,7 +137,10 @@ mod tests {
         for (table, says) in [
             ("[lints.clippy]\nall = \"loud\"\n", "unknown variant `loud`"),
             ("[lints.clippy]\nall = { priority = 1 }\n", "missing field `level`"),
-            ("[lints.clippy]\nall = { level = \"warn\", priority = 300 }\n", "integer `300`, expected i8"),
+            (
+                "[lints.clippy]\nall = { level = \"warn\", priority = 300 }\n",
+                "integer `300`, expected i8",
+            ),
             ("[lints]\nclippy = 1\n", "`lints.clippy`: expected a table"),
             ("[lints]\nworkspace = true\n", "`workspace.lints` was not defined"),
         ] {

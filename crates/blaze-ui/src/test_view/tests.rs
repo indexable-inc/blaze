@@ -24,7 +24,10 @@ fn text(buf: &Buffer) -> String {
 }
 
 fn lines(lines: &[Line<'_>]) -> String {
-    lines.iter().map(|line| line.spans.iter().map(|it| it.content.as_ref()).collect::<String>() + "\n").collect()
+    lines
+        .iter()
+        .map(|line| line.spans.iter().map(|it| it.content.as_ref()).collect::<String>() + "\n")
+        .collect()
 }
 
 const PANIC: &str = "some stdout\nthread 'math::adds' panicked at src/lib.rs:7:9:\nassertion `left == right` failed\n  left: 3\n right: 4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
@@ -38,13 +41,14 @@ fn transcript(view: &mut TestView) {
         order: order.to_owned(),
         rerun: format!("-p {label}"),
     };
-    let ended = |binary: u32, name: &str, verdict: Verdict, took: u64, output: &str| Event::TestEnded {
-        binary,
-        name: name.to_owned(),
-        verdict,
-        took: Some(ms(took)),
-        output: output.to_owned(),
-    };
+    let ended =
+        |binary: u32, name: &str, verdict: Verdict, took: u64, output: &str| Event::TestEnded {
+            binary,
+            name: name.to_owned(),
+            verdict,
+            took: Some(ms(took)),
+            output: output.to_owned(),
+        };
     let events = [
         (0, Event::UnitBegan { id: 0, label: "calc lib test".to_owned() }),
         (5, Event::UnitBegan { id: 1, label: "calc test it".to_owned() }),
@@ -72,33 +76,107 @@ fn a_run_shows_its_build_and_tests_together_then_a_sorted_summary() {
     let mut buf = Buffer::empty(area);
     view.render(area, &mut buf);
     let shown = text(&buf);
-    assert!(shown.contains("blaze test") && shown.contains("compiling and testing") && shown.contains("2.40s"), "{shown}");
-    assert!(shown.contains("✔ 0") && shown.contains("✘ 1") && shown.contains("⊘ 1") && shown.contains("2/3+"), "{shown}");
-    assert!(shown.contains("1/2") && shown.contains("calc test it"), "the build row names the unit under way: {shown}");
-    assert!(shown.contains("math::waits") && shown.contains("calc lib"), "the test under way, and its executable: {shown}");
+    assert!(
+        shown.contains("blaze test")
+            && shown.contains("compiling and testing")
+            && shown.contains("2.40s"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("✔ 0")
+            && shown.contains("✘ 1")
+            && shown.contains("⊘ 1")
+            && shown.contains("2/3+"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("1/2") && shown.contains("calc test it"),
+        "the build row names the unit under way: {shown}"
+    );
+    assert!(
+        shown.contains("math::waits") && shown.contains("calc lib"),
+        "the test under way, and its executable: {shown}"
+    );
 
     let above = lines(&view.take_above(60));
     assert!(above.starts_with("╭─ ✘ FAIL  math::adds"), "{above}");
-    assert!(above.contains("▸ src/lib.rs:7:9") && above.contains("assertion `left == right` failed"), "{above}");
+    assert!(
+        above.contains("▸ src/lib.rs:7:9") && above.contains("assertion `left == right` failed"),
+        "{above}"
+    );
     assert!(above.contains("some stdout") && !above.contains("RUST_BACKTRACE"), "{above}");
-    assert!(above.lines().all(|it| unicode_width::UnicodeWidthStr::width(it) <= 60), "every line fits: {above}");
+    assert!(
+        above.lines().all(|it| unicode_width::UnicodeWidthStr::width(it) <= 60),
+        "every line fits: {above}"
+    );
     assert!(view.take_above(60).is_empty(), "a block is printed once");
 
     // The second executable finishes first; the summary still lists by executable and name.
     view.apply(ms(2500), Event::BuildEnded { ok: true });
-    view.apply(ms(2500), Event::BinaryQueued { binary: 1, label: "calc it".into(), order: "calc 2 it".into(), rerun: "-p calc --test it".into() });
+    view.apply(
+        ms(2500),
+        Event::BinaryQueued {
+            binary: 1,
+            label: "calc it".into(),
+            order: "calc 2 it".into(),
+            rerun: "-p calc --test it".into(),
+        },
+    );
     view.apply(ms(2500), Event::BinaryStarted { binary: 1 });
-    view.apply(ms(2510), Event::TestEnded { binary: 1, name: "b".into(), verdict: Verdict::Failed, took: Some(ms(3)), output: String::new() });
-    view.apply(ms(2600), Event::BinaryEnded { binary: 1, end: BinaryEnd::Failed { status: "exit status: 101".into() }, output: String::new() });
-    view.apply(ms(7000), Event::TestEnded { binary: 0, name: "math::waits".into(), verdict: Verdict::Passed, took: None, output: String::new() });
-    view.apply(ms(7001), Event::BinaryEnded { binary: 0, end: BinaryEnd::Failed { status: "exit status: 101".into() }, output: String::new() });
+    view.apply(
+        ms(2510),
+        Event::TestEnded {
+            binary: 1,
+            name: "b".into(),
+            verdict: Verdict::Failed,
+            took: Some(ms(3)),
+            output: String::new(),
+        },
+    );
+    view.apply(
+        ms(2600),
+        Event::BinaryEnded {
+            binary: 1,
+            end: BinaryEnd::Failed { status: "exit status: 101".into() },
+            output: String::new(),
+        },
+    );
+    view.apply(
+        ms(7000),
+        Event::TestEnded {
+            binary: 0,
+            name: "math::waits".into(),
+            verdict: Verdict::Passed,
+            took: None,
+            output: String::new(),
+        },
+    );
+    view.apply(
+        ms(7001),
+        Event::BinaryEnded {
+            binary: 0,
+            end: BinaryEnd::Failed { status: "exit status: 101".into() },
+            output: String::new(),
+        },
+    );
     let summary = lines(&view.summary(80));
     let first = summary.find("✘ math::adds").expect(&summary);
     let second = summary.find("✘ b").expect(&summary);
     assert!(first < second, "sorted by executable order, not by finish: {summary}");
-    assert!(summary.contains("1 passed") && summary.contains("2 failed") && summary.contains("1 ignored"), "{summary}");
-    assert!(summary.contains("slowest") && summary.contains("6.08s") && summary.contains("math::waits"), "{summary}");
-    assert!(summary.contains("src/lib.rs:7:9") && summary.contains("blaze test -p calc lib"), "{summary}");
+    assert!(
+        summary.contains("1 passed")
+            && summary.contains("2 failed")
+            && summary.contains("1 ignored"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("slowest") && summary.contains("6.08s") && summary.contains("math::waits"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("src/lib.rs:7:9") && summary.contains("blaze test -p calc lib"),
+        "{summary}"
+    );
     assert!(summary.trim_end().ends_with("FAIL  some tests failed"), "{summary}");
 }
 
@@ -121,7 +199,11 @@ fn drawing_never_panics_at_any_size_and_is_the_same_twice() {
         transcript(&mut again);
         let above = again.take_above(width);
         let summary = again.summary(width);
-        assert!(above.iter().chain(&summary).all(|it| it.width() <= (width as usize).max(1)), "{width}: {}", lines(&above));
+        assert!(
+            above.iter().chain(&summary).all(|it| it.width() <= (width as usize).max(1)),
+            "{width}: {}",
+            lines(&above)
+        );
     }
 }
 

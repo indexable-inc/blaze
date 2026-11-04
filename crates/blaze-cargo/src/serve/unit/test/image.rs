@@ -3,15 +3,14 @@
 //! [`Image`] a selector reads it as ([`image`]), what a test executed as a [`Record`]
 //! ([`record`]), and the daemon's one [`Selector`] per suite ([`Selectors`]).
 
-
 use blaze_codegen::{ExecTable, InstanceKey, driver::Built};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_testsel::{Bound, FnId, Image, Record, Selector, Version};
 use blaze_usercode::test::Executed;
 use hir_ty_codegen::v2::RootTest;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 /// The execution table of the test binary `binary`, linked from `built` with the span tables
 /// `spans` (`LinkInputs::spans`): `slots` is how many
@@ -39,7 +38,11 @@ pub(crate) fn table(
 /// given as it is: a slot is never dropped, as a record names slots by place.
 pub(crate) fn image(binary: &str, table: &ExecTable) -> Result<Image, String> {
     // alloc: once per test binary relinked, the selector's copy of its functions
-    let fns = table.fns.iter().map(|(id, bound)| Version { id: FnId(*id), bound: Bound(*bound) }).collect();
+    let fns = table
+        .fns
+        .iter()
+        .map(|(id, bound)| Version { id: FnId(*id), bound: Bound(*bound) })
+        .collect();
     // clone: once per test binary relinked, the selector's copy of its slots
     Image::new(fns, table.slot_fn.clone(), table.beside)
         // alloc: error path

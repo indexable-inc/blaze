@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use base_db::{ContentId, Crate, Env, all_crates};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     ConstId, ModuleDefId,
     deps::{Held, ImageBuf, ImageStore, Mode},
@@ -13,6 +12,7 @@ use hir_def::{
 };
 use hir_expand::fixture;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::{
     consteval::{
@@ -166,7 +166,11 @@ fn a_served_constant_equals_the_evaluated_one() {
     let evaluated = evaluated(&store);
     let (db, lib) = database(&store, Some(BASE), Mode::Serve);
     assert_eq!(values(&db, lib, &KEPT), evaluated);
-    assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained::default()), "every one was served");
+    assert_eq!(
+        drain(&db, &HashMap::new_in(Global)),
+        Ok(Drained::default()),
+        "every one was served"
+    );
     let main = crate_named(&db, "main");
     let mine = db.const_eval(const_named(&db, main, "MINE"), GenericArgs::empty(), None).unwrap();
     assert_eq!(mine.memory[..], [2], "a member's constant reads a served one");

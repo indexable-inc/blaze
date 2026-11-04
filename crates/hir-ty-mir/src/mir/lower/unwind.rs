@@ -22,10 +22,7 @@ use std::{cell::Cell, ops::Deref};
 
 use blaze_mem::Frame;
 
-use crate::mir::{
-    BasicBlockId, LocalId,
-    framed::local_index,
-};
+use crate::mir::{BasicBlockId, LocalId, framed::local_index};
 
 use super::{DropScope, MirLowerCtx};
 
@@ -373,12 +370,7 @@ impl<'f> Unwinds<'f> {
             copy: Vec::new_in(frame),
             storage: false,
             epoch: 0,
-            memo: Memo {
-                epoch: 0,
-                base: None,
-                seq: Vec::new_in(frame),
-                at: Vec::new_in(frame),
-            },
+            memo: Memo { epoch: 0, base: None, seq: Vec::new_in(frame), at: Vec::new_in(frame) },
         }
     }
 
@@ -697,7 +689,11 @@ impl<'f> MirLowerCtx<'_, 'f, '_> {
 
     /// The way out of a drop of `locals[at]` of a scope that drops `locals`: what is declared
     /// before it, then, in a coroutine, its own storage.
-    pub(super) fn unwind_from_drop(&mut self, locals: &[LocalId], at: usize) -> Option<BasicBlockId> {
+    pub(super) fn unwind_from_drop(
+        &mut self,
+        locals: &[LocalId],
+        at: usize,
+    ) -> Option<BasicBlockId> {
         let mut unwinds = self.take_unwinds();
         let unwind = unwinds.from_drop(self, locals, at);
         self.put_unwinds(unwinds);

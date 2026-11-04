@@ -115,7 +115,12 @@ struct Node<'a> {
 impl<'a> Node<'a> {
     /// Its attributes whose path is the one word `name`, in order.
     fn named(&self, name: &'a str) -> impl Iterator<Item = &'a Attr<'a>> + 'a {
-        self.owner.attrs.iter().zip(self.words).filter(move |(_, word)| **word == Some(name)).map(|(attr, _)| attr)
+        self.owner
+            .attrs
+            .iter()
+            .zip(self.words)
+            .filter(move |(_, word)| **word == Some(name))
+            .map(|(attr, _)| attr)
     }
 }
 
@@ -152,18 +157,26 @@ impl CrateTypes {
     /// of the crate, else `bin`.
     fn of(cx: &Cx<'_, '_>, owners: &[Owner<'_>]) -> CrateTypes {
         match cx.krate.target_kind(cx.db) {
-            TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => CrateTypes::BIN,
-            TargetKind::Lib { is_proc_macro: true } => CrateTypes { executable: Some(false), needs_link: Some(true) },
+            TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => {
+                CrateTypes::BIN
+            }
+            TargetKind::Lib { is_proc_macro: true } => {
+                CrateTypes { executable: Some(false), needs_link: Some(true) }
+            }
             // A cargo library is never an executable; its `crate-type` can be an rlib or a
             // cdylib. An example can be a library too.
-            TargetKind::Lib { is_proc_macro: false } => CrateTypes { executable: Some(false), needs_link: None },
+            TargetKind::Lib { is_proc_macro: false } => {
+                CrateTypes { executable: Some(false), needs_link: None }
+            }
             TargetKind::Example => CrateTypes { executable: None, needs_link: None },
             TargetKind::Other => CrateTypes::from_attrs(owners),
         }
     }
 
     fn from_attrs(owners: &[Owner<'_>]) -> CrateTypes {
-        let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else { return CrateTypes::BIN };
+        let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else {
+            return CrateTypes::BIN;
+        };
         let (mut any, mut executable, mut needs_link) = (false, false, false);
         for attr in root.attrs.iter().filter(|it| it.inner && word(it) == Some("crate_type")) {
             let Some(value) = string_value(attr) else { continue };
@@ -186,13 +199,20 @@ impl CrateTypes {
 
 /// rustc's `check_unused_attribute` of an attribute it leaves unparsed, whose path is the one
 /// word `name`.
-fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, attr: &Attr<'_>, name: &str, types: CrateTypes) -> Option<Diag> {
+fn unused(
+    cx: &Cx<'_, '_>,
+    owner: &Owner<'_>,
+    attr: &Attr<'_>,
+    name: &str,
+    types: CrateTypes,
+) -> Option<Diag> {
     let note = match name {
         "allow" | "expect" | "warn" | "deny" | "forbid" => {
             let Args::List(tt) = attr.args() else { return None };
             let list = meta::list(tt)?;
             let lints_named = |names: &[&str]| {
-                list.iter().any(|it| it.item().is_some_and(|it| names.iter().any(|name| it.is(name))))
+                list.iter()
+                    .any(|it| it.item().is_some_and(|it| names.iter().any(|name| it.is(name))))
             };
             if list.is_empty() {
                 // alloc: the diagnostic's text, as is each note below
@@ -241,12 +261,21 @@ fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, attr: &Attr<'_>, name: &str, types
 fn crate_level(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Diag {
     let span = span_of(cx, attr);
     if attr.inner {
-        return Diag::lint("unused_attributes", "crate-level attribute should be in the root module", span);
+        return Diag::lint(
+            "unused_attributes",
+            "crate-level attribute should be in the root module",
+            span,
+        );
     }
     let bang = until_bracket(cx, &span).shrink_to_hi();
-    let mut diag = Diag::lint("unused_attributes", "crate-level attribute should be an inner attribute", span);
+    let mut diag =
+        Diag::lint("unused_attributes", "crate-level attribute should be an inner attribute", span);
     // alloc: the diagnostic's text
-    diag.multipart_suggestion("add a `!`", vec![(bang, "!".to_owned())], Applicability::Unspecified);
+    diag.multipart_suggestion(
+        "add a `!`",
+        vec![(bang, "!".to_owned())],
+        Applicability::Unspecified,
+    );
     diag
 }
 
@@ -273,12 +302,16 @@ fn inline(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     if !functions {
         return None;
     }
-    let (attr, never) = node.named("inline").find_map(|it| inline_never(it).map(|never| (it, never)))?;
+    let (attr, never) =
+        node.named("inline").find_map(|it| inline_never(it).map(|never| (it, never)))?;
     if never || !exported(node) {
         return None;
     }
-    let mut diag =
-        Diag::lint("unused_attributes", "`#[inline]` is ignored on externally exported functions", span_of(cx, attr));
+    let mut diag = Diag::lint(
+        "unused_attributes",
+        "`#[inline]` is ignored on externally exported functions",
+        span_of(cx, attr),
+    );
     diag.help("externally exported functions are functions with `#[no_mangle]`, `#[export_name]`, or `#[linkage]`");
     Some(diag)
 }
@@ -326,7 +359,9 @@ fn weak_lang_item(node: &Node<'_>) -> bool {
     let lang = node.named("lang").find_map(string_value);
     let weak = |lang: &str| matches!(lang, "panic_impl" | "eh_personality");
     match (lang, first_of("panic_handler")) {
-        (Some(lang), Some(panic_handler)) => first_of("lang").is_none_or(|it| it > panic_handler) || weak(&lang),
+        (Some(lang), Some(panic_handler)) => {
+            first_of("lang").is_none_or(|it| it > panic_handler) || weak(&lang)
+        }
         (Some(lang), None) => weak(&lang),
         (None, panic_handler) => panic_handler.is_some(),
     }
@@ -371,8 +406,11 @@ fn link(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     if abi.value().is_ok_and(|it| &*it != "Rust" && ABIS.contains(&&*it)) {
         return None;
     }
-    let mut diag =
-        Diag::lint("unused_attributes", "attribute should be applied to an `extern` block with non-Rust ABI", span_of(cx, attr));
+    let mut diag = Diag::lint(
+        "unused_attributes",
+        "attribute should be applied to an `extern` block with non-Rust ABI",
+        span_of(cx, attr),
+    );
     diag.warn("this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!");
     Some(diag)
 }
@@ -427,8 +465,11 @@ fn macro_export(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
         return None;
     }
     let attr = node.named("macro_export").find(|it| macro_export_parses(it))?;
-    let mut diag =
-        Diag::lint("unused_attributes", "`#[macro_export]` has no effect on declarative macro definitions", span_of(cx, attr));
+    let mut diag = Diag::lint(
+        "unused_attributes",
+        "`#[macro_export]` has no effect on declarative macro definitions",
+        span_of(cx, attr),
+    );
     diag.note("declarative macros follow the same exporting rules as regular items");
     Some(diag)
 }
@@ -478,7 +519,8 @@ fn repr(cx: &Cx<'_, '_>, walk: &Walk<'_>, node: &Node<'_>) -> Option<Diag> {
         return None;
     }
     let mut spans = hints.iter().map(|(_, at)| cx.span(*at));
-    let mut diag = Diag::lint("conflicting_repr_hints", "conflicting representation hints", spans.next()?);
+    let mut diag =
+        Diag::lint("conflicting_repr_hints", "conflicting representation hints", spans.next()?);
     for span in spans {
         diag.primary(span);
     }
@@ -489,15 +531,16 @@ fn repr(cx: &Cx<'_, '_>, walk: &Walk<'_>, node: &Node<'_>) -> Option<Diag> {
 fn hint(item: &meta::Item<'_>) -> Option<Hint> {
     let word = item.word()?;
     match (word, item.args) {
-        ("align", ItemArgs::List(tt)) | ("packed", ItemArgs::List(tt)) => alignment(tt).then_some(Hint::Other),
+        ("align", ItemArgs::List(tt)) | ("packed", ItemArgs::List(tt)) => {
+            alignment(tt).then_some(Hint::Other)
+        }
         ("packed", ItemArgs::Word) => Some(Hint::Other),
         (_, ItemArgs::Word) => match word {
             "C" => Some(Hint::C),
             "simd" => Some(Hint::Simd),
             "Rust" | "transparent" => Some(Hint::Other),
-            "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64" | "i128" | "u128" | "isize" | "usize" => {
-                Some(Hint::Int)
-            }
+            "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64" | "i128" | "u128"
+            | "isize" | "usize" => Some(Hint::Int),
             _ => None,
         },
         _ => None,
@@ -529,17 +572,22 @@ fn c_like_enum(walk: &Walk<'_>, owner: &Owner<'_>) -> bool {
 fn no_mangle_with_export_name(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     let no_mangle = node.named("no_mangle").next()?;
     let export = node.named("export_name").find(|it| export_name(it).is_some())?;
-    let written = |attr: &Attr<'_>, safe: &'static str, unsafe_: &'static str| match attr.file.edition(cx.db) >= Edition::Edition2024 {
-        true => unsafe_,
-        false => safe,
-    };
+    let written =
+        |attr: &Attr<'_>, safe: &'static str, unsafe_: &'static str| match attr.file.edition(cx.db)
+            >= Edition::Edition2024
+        {
+            true => unsafe_,
+            false => safe,
+        };
     let no_mangle_attr = written(no_mangle, "#[no_mangle]", "#[unsafe(no_mangle)]");
     let export_name_attr = written(export, "#[export_name]", "#[unsafe(export_name)]");
     let no_mangle_span = span_of(cx, no_mangle);
     let mut diag = Diag::lint(
         "unused_attributes",
         // alloc: the diagnostic's text and spans, as is all below
-        format!("`{no_mangle_attr}` attribute may not be used in combination with `{export_name_attr}`"),
+        format!(
+            "`{no_mangle_attr}` attribute may not be used in combination with `{export_name_attr}`"
+        ),
         // clone: as above
         no_mangle_span.clone(),
     );

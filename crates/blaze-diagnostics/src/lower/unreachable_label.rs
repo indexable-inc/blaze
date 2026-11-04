@@ -22,7 +22,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnreachableLabel) -> Vec<Found> {
     let name = node.value.text();
     let span = cx.span_of_ptr(d.node);
     let mut diag = match resolve(cx, node.map(|it| it.syntax()), name) {
-        Resolution::Unreachable { defined, similar } => unreachable(cx, span, name, Some(defined), similar),
+        Resolution::Unreachable { defined, similar } => {
+            unreachable(cx, span, name, Some(defined), similar)
+        }
         _ => unreachable(cx, span, name, None, None),
     };
     code_fact(cx, &mut diag, d.node.map(|it| it.syntax_node_ptr()));
@@ -39,7 +41,8 @@ pub(crate) fn unreachable(
     similar: Option<Similar>,
 ) -> Diag {
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(Some("E0767"), format!("use of unreachable label `{name}`"), span.clone());
+    let mut diag =
+        Diag::error(Some("E0767"), format!("use of unreachable label `{name}`"), span.clone());
     // alloc: clone: the error's parts, for an error hir found
     diag.span_label(span.clone(), format!("unreachable label `{name}`"));
     if let Some(defined) = defined {
@@ -48,11 +51,19 @@ pub(crate) fn unreachable(
     diag.note("labels are unreachable through functions, closures, async blocks and modules");
     match similar {
         Some(similar) if similar.reachable => {
-            diag.suggestion(span, "try using similarly named label", similar.name, Applicability::MaybeIncorrect);
+            diag.suggestion(
+                span,
+                "try using similarly named label",
+                similar.name,
+                Applicability::MaybeIncorrect,
+            );
             diag.span_label(cx.span(similar.at), "a label with a similar name is reachable");
         }
         Some(similar) => {
-            diag.span_label(cx.span(similar.at), "a label with a similar name exists but is also unreachable");
+            diag.span_label(
+                cx.span(similar.at),
+                "a label with a similar name exists but is also unreachable",
+            );
         }
         None => {}
     }

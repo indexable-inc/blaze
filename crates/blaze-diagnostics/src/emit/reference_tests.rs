@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use hegel::TestCase;
 use hegel::generators as gs;
 use serde::Serialize;
+use std::alloc::Global;
 
 use super::{Style, WIDTH};
 use crate::model::{
@@ -112,7 +112,10 @@ pub(super) fn rendered(diagnostic: &Diag, sources: &mut Sources, style: Style) -
             group = group.element(level.message(child.message.clone()));
             continue;
         }
-        report.push(std::mem::replace(&mut group, Group::with_title(level.secondary_title(child.message.clone()))));
+        report.push(std::mem::replace(
+            &mut group,
+            Group::with_title(level.secondary_title(child.message.clone())),
+        ));
         for (file, annotations) in primary_first(collect_annotations(&child.span), &child.span) {
             if let Some(snippet) = annotated_snippet(&file, annotations, sources) {
                 group = group.element(snippet);
@@ -126,7 +129,9 @@ pub(super) fn rendered(diagnostic: &Diag, sources: &mut Sources, style: Style) -
             SuggestionStyle::HideCodeAlways => {
                 group = group.element(annotate_snippets::Level::HELP.message(suggestion.message));
             }
-            SuggestionStyle::HideCodeInline | SuggestionStyle::ShowCode | SuggestionStyle::ShowAlways => {
+            SuggestionStyle::HideCodeInline
+            | SuggestionStyle::ShowCode
+            | SuggestionStyle::ShowAlways => {
                 let substitutions: Vec<Vec<(Span, String)>> = suggestion
                     .substitutions
                     .into_iter()
@@ -152,26 +157,33 @@ pub(super) fn rendered(diagnostic: &Diag, sources: &mut Sources, style: Style) -
                 for parts in substitutions.into_iter().take(MAX_SUGGESTIONS) {
                     let mut confusion = Confusion::None;
                     for (span, snippet) in &parts {
-                        confusion = confusion.combine(detect_confusion_type(sources, snippet, span));
+                        confusion =
+                            confusion.combine(detect_confusion_type(sources, snippet, span));
                     }
                     if confusion != Confusion::None {
                         message.push_str(confusion.label_text());
                     }
-                    let mut parts: Vec<(Span, String)> =
-                        parts.into_iter().filter(|(span, snippet)| is_different(sources, snippet, span)).collect();
+                    let mut parts: Vec<(Span, String)> = parts
+                        .into_iter()
+                        .filter(|(span, snippet)| is_different(sources, snippet, span))
+                        .collect();
                     if parts.is_empty() {
                         continue;
                     }
                     let fold = !attribute_suggestion(&file, &mut parts);
                     let spans: Vec<Span> = parts.iter().map(|(span, _)| span.clone()).collect();
                     let Some((lo, source, line)) = shrink_file(&file, &spans) else { continue };
-                    subs.push(Snippet::source(source).line_start(line).path(file_name.clone()).fold(fold).patches(
-                        parts.into_iter().map(move |(span, replacement)| {
-                            let from = (span.lo as usize).saturating_sub(lo);
-                            let to = (span.hi as usize).saturating_sub(lo);
-                            Patch::new(from..to, replacement)
-                        }),
-                    ));
+                    subs.push(
+                        Snippet::source(source)
+                            .line_start(line)
+                            .path(file_name.clone())
+                            .fold(fold)
+                            .patches(parts.into_iter().map(move |(span, replacement)| {
+                                let from = (span.lo as usize).saturating_sub(lo);
+                                let to = (span.hi as usize).saturating_sub(lo);
+                                Patch::new(from..to, replacement)
+                            })),
+                    );
                 }
                 if !subs.is_empty() {
                     report.push(std::mem::replace(
@@ -182,7 +194,9 @@ pub(super) fn rendered(diagnostic: &Diag, sources: &mut Sources, style: Style) -
                     if others > 0 {
                         let plural = if others == 1 { "" } else { "s" };
                         group = group.element(
-                            annotate_snippets::Level::NOTE.no_name().message(format!("and {others} other candidate{plural}")),
+                            annotate_snippets::Level::NOTE
+                                .no_name()
+                                .message(format!("and {others} other candidate{plural}")),
                         );
                     }
                 }
@@ -229,7 +243,11 @@ fn collect_annotations(span: &MultiSpan) -> Vec<(String, Vec<Annotation>)> {
     let mut output: Vec<(String, Vec<Annotation>)> = Vec::new();
     for label in span.span_labels() {
         let kind = if label.is_primary { AnnotationKind::Primary } else { AnnotationKind::Context };
-        let annotation = Annotation { kind, span: label.span.clone(), label: label.label.map(normalize_whitespace) };
+        let annotation = Annotation {
+            kind,
+            span: label.span.clone(),
+            label: label.label.map(normalize_whitespace),
+        };
         match output.iter_mut().find(|(file, _)| *file == label.span.file) {
             Some((_, annotations)) => annotations.push(annotation),
             None => output.push((label.span.file.clone(), vec![annotation])),
@@ -238,7 +256,10 @@ fn collect_annotations(span: &MultiSpan) -> Vec<(String, Vec<Annotation>)> {
     output
 }
 
-fn primary_first(mut files: Vec<(String, Vec<Annotation>)>, span: &MultiSpan) -> Vec<(String, Vec<Annotation>)> {
+fn primary_first(
+    mut files: Vec<(String, Vec<Annotation>)>,
+    span: &MultiSpan,
+) -> Vec<(String, Vec<Annotation>)> {
     if let Some(primary) = span.primary_span()
         && let Ok(at) = files.binary_search_by(|(file, _)| file.as_str().cmp(&primary.file))
     {
@@ -256,8 +277,8 @@ fn annotated_snippet<'a>(
     radix::sort_by_key(&mut annotations, |it| file.line_of(it.span.lo as usize) as u64);
     let spans: Vec<Span> = annotations.iter().map(|it| it.span.clone()).collect();
     let (lo, source, line) = shrink_file(&file, &spans)?;
-    Some(Snippet::source(source).line_start(line).path(file_name.to_owned()).annotations(annotations.into_iter().map(
-        move |it| {
+    Some(Snippet::source(source).line_start(line).path(file_name.to_owned()).annotations(
+        annotations.into_iter().map(move |it| {
             let from = (it.span.lo as usize).saturating_sub(lo);
             let to = (it.span.hi as usize).saturating_sub(lo);
             let annotation = it.kind.span(from..to);
@@ -265,8 +286,8 @@ fn annotated_snippet<'a>(
                 Some(label) => annotation.label(label),
                 None => annotation,
             }
-        },
-    )))
+        }),
+    ))
 }
 
 fn shrink_file(file: &File, spans: &[Span]) -> Option<(usize, String, usize)> {
@@ -300,7 +321,11 @@ fn attribute_suggestion(file: &File, parts: &mut [(Span, String)]) -> bool {
     true
 }
 
-fn primary_span_formatted(span: &mut MultiSpan, suggestions: &mut Vec<Suggestion>, sources: &mut Sources) {
+fn primary_span_formatted(
+    span: &mut MultiSpan,
+    suggestions: &mut Vec<Suggestion>,
+    sources: &mut Sources,
+) {
     let [suggestion] = &suggestions[..] else { return };
     let [substitution] = &suggestion.substitutions[..] else { return };
     let [(part_span, snippet)] = &substitution[..] else { return };
@@ -308,7 +333,9 @@ fn primary_span_formatted(span: &mut MultiSpan, suggestions: &mut Vec<Suggestion
         && !snippet.contains('\n')
         && !matches!(
             suggestion.style,
-            SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden | SuggestionStyle::ShowAlways
+            SuggestionStyle::HideCodeAlways
+                | SuggestionStyle::CompletelyHidden
+                | SuggestionStyle::ShowAlways
         );
     if !inline {
         return;
@@ -351,7 +378,8 @@ impl Confusion {
             (Confusion::None, other) => other,
             (this, Confusion::None) => this,
             (Confusion::Both, _) | (_, Confusion::Both) => Confusion::Both,
-            (Confusion::Case, Confusion::DigitLetter) | (Confusion::DigitLetter, Confusion::Case) => Confusion::Both,
+            (Confusion::Case, Confusion::DigitLetter)
+            | (Confusion::DigitLetter, Confusion::Case) => Confusion::Both,
             (this, _) => this,
         }
     }
@@ -362,8 +390,10 @@ fn detect_confusion_type(sources: &mut Sources, suggested: &str, span: &Span) ->
     if found.len() != suggested.len() {
         return Confusion::None;
     }
-    const ASCII_CONFUSABLES: &[char] = &['c', 'f', 'i', 'k', 'o', 's', 'u', 'v', 'w', 'x', 'y', 'z'];
-    const DIGIT_LETTER: [(char, char); 5] = [('0', 'O'), ('1', 'l'), ('5', 'S'), ('8', 'B'), ('9', 'g')];
+    const ASCII_CONFUSABLES: &[char] =
+        &['c', 'f', 'i', 'k', 'o', 's', 'u', 'v', 'w', 'x', 'y', 'z'];
+    const DIGIT_LETTER: [(char, char); 5] =
+        [('0', 'O'), ('1', 'l'), ('5', 'S'), ('8', 'B'), ('9', 'g')];
     let (mut case, mut digit_letter, mut other) = (false, false, false);
     for (f, s) in std::iter::zip(found.chars(), suggested.chars()) {
         if f == s {
@@ -543,22 +573,34 @@ pub(super) fn json(diagnostic: &Diag, sources: &mut Sources, rendered: String) -
         level: if diagnostic.is_error() { "error" } else { "warning" },
         message: diagnostic.message.clone(),
         spans: json_spans(&diagnostic.span, sources),
-        code: diagnostic.code.as_ref().map(|it| JsonCode { code: it.as_str().to_owned(), explanation: None }),
+        code: diagnostic
+            .code
+            .as_ref()
+            .map(|it| JsonCode { code: it.as_str().to_owned(), explanation: None }),
     }
 }
 
 fn json_spans(span: &MultiSpan, sources: &mut Sources) -> Vec<JsonSpan> {
-    span.span_labels().into_iter().filter_map(|it| json_span(it.span, it.is_primary, it.label, sources)).collect()
+    span.span_labels()
+        .into_iter()
+        .filter_map(|it| json_span(it.span, it.is_primary, it.label, sources))
+        .collect()
 }
 
-fn json_span(span: &Span, is_primary: bool, label: Option<&str>, sources: &mut Sources) -> Option<JsonSpan> {
+fn json_span(
+    span: &Span,
+    is_primary: bool,
+    label: Option<&str>,
+    sources: &mut Sources,
+) -> Option<JsonSpan> {
     let file = sources.file(&span.file)?;
     let (line_start, column_start) = file.position(span.lo as usize);
     let (line_end, column_end) = file.position(span.hi as usize);
     let text = (line_start..=line_end).map(|line| {
         let text = file.line_text(line - 1);
         let highlight_start = if line == line_start { column_start + 1 } else { 1 };
-        let highlight_end = if line == line_end { column_end + 1 } else { text.chars().count() + 1 };
+        let highlight_end =
+            if line == line_end { column_end + 1 } else { text.chars().count() + 1 };
         JsonLine { highlight_end, highlight_start, text: text.to_owned() }
     });
     Some(JsonSpan {
@@ -583,7 +625,8 @@ const OTHER: &str = "src/other.rs";
 
 /// ASCII lines with `\n` ends, the last with or without one.
 fn text(tc: &TestCase) -> String {
-    let lines: Vec<String> = tc.draw(gs::vecs(gs::from_regex("[ -~]{0,30}")).min_size(1).max_size(7));
+    let lines: Vec<String> =
+        tc.draw(gs::vecs(gs::from_regex("[ -~]{0,30}")).min_size(1).max_size(7));
     let mut text = lines.join("\n");
     if tc.draw(gs::booleans()) {
         text.push('\n');
@@ -594,7 +637,8 @@ fn text(tc: &TestCase) -> String {
 fn span(tc: &TestCase, len: u32, other: u32) -> Span {
     let in_other = tc.draw(gs::weighted_booleans(0.2));
     let end = if in_other { other } else { len };
-    let (a, b): (u32, u32) = tc.draw(gs::tuples!(gs::integers().max_value(end), gs::integers().max_value(end)));
+    let (a, b): (u32, u32) =
+        tc.draw(gs::tuples!(gs::integers().max_value(end), gs::integers().max_value(end)));
     let file = if in_other { OTHER } else { FILE };
     Span { file: file.to_owned(), lo: a.min(b), hi: a.max(b), expansion: None }
 }
@@ -688,16 +732,19 @@ fn diag(tc: &TestCase, len: u32, other: u32) -> Diag {
 fn the_emitter_writes_what_the_reference_wrote(tc: TestCase) {
     let (main, other) = (text(&tc), text(&tc));
     let diag = diag(&tc, main.len() as u32, other.len() as u32);
-    let (short, ansi, narrow) = tc.draw(gs::tuples!(gs::booleans(), gs::booleans(), gs::booleans()));
+    let (short, ansi, narrow) =
+        tc.draw(gs::tuples!(gs::booleans(), gs::booleans(), gs::booleans()));
     let style = Style { short, ansi, width: if narrow { 40 } else { WIDTH }, ui_testing: false };
     let files = [(FILE.to_owned(), main), (OTHER.to_owned(), other)];
     let mut ours = super::Sources::of(files.clone());
     let mut theirs = Sources::of(files);
     let rendered = written(&diag, &mut theirs, style);
     assert_eq!(&super::written(&diag, &mut ours, style).unwrap(), &rendered);
-    let json: serde_json::Value = serde_json::from_str(&super::json(&diag, &mut ours, style).unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&super::json(&diag, &mut ours, style).unwrap()).unwrap();
     let expected = serde_json::to_value(self::json(&diag, &mut theirs, rendered.clone())).unwrap();
     assert_eq!(&json, &expected);
-    let given: serde_json::Value = serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered).unwrap()).unwrap();
+    let given: serde_json::Value =
+        serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered).unwrap()).unwrap();
     assert_eq!(given, json);
 }

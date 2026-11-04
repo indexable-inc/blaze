@@ -191,9 +191,9 @@ unsafe fn store_atomic(bytes: &[u8], to: *mut u8) {
 
 // A view of the image's bytes and of its words: the dev runtime's (`blaze_inproc_rt::live::mem`),
 // which reads the descriptor and the execution log's header through them.
-pub(super) use blaze_inproc_rt::live::mem::{cell, view};
 #[cfg(test)]
 pub(super) use blaze_inproc_rt::live::mem::byte;
+pub(super) use blaze_inproc_rt::live::mem::{cell, view};
 
 /// `len` 8-byte words of the image at `at`, which [`crate::slots::publish`] may store to while
 /// they are read.

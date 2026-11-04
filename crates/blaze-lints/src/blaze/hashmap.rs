@@ -90,13 +90,18 @@ impl Std {
     pub(super) fn is_random_map(self, ty: Ty<'_>) -> bool {
         let Some((adt, args)) = ty.as_adt() else { return false };
         let Some(at) = self.hasher_at(adt) else { return false };
-        args.types().nth(at).and_then(|it| it.as_adt()).is_some_and(|(hasher, _)| self.random == Some(hasher))
+        args.types()
+            .nth(at)
+            .and_then(|it| it.as_adt())
+            .is_some_and(|(hasher, _)| self.random == Some(hasher))
     }
 }
 
 /// `BuildHasher`, from `core` or, for a crate that names `core` only through `std`, `std`.
 fn build_hasher(cx: &Cx<'_, '_>) -> Option<TraitId> {
-    cx.std_trait(&["core", "hash", "BuildHasher"]).or_else(|| cx.std_trait(&["std", "hash", "BuildHasher"])).map(TraitId::from)
+    cx.std_trait(&["core", "hash", "BuildHasher"])
+        .or_else(|| cx.std_trait(&["std", "hash", "BuildHasher"]))
+        .map(TraitId::from)
 }
 
 /// The type parameters of `adt` that are its hasher, as bits by their index among its type
@@ -193,8 +198,13 @@ pub(super) fn check_type(cx: &Cx<'_, '_>, ty: ast::PathType<'_>) -> Option<Writt
             }
             Some(hasher) => {
                 let random = cx.resolve_type(hasher).and_then(|it| it.as_adt());
-                if let Some(random) = random.filter(|it| is_random(db, std.random, AdtId::from(*it))) {
-                    why = Some(format!("hashes with {}, seeded at random per process", said(db, random)));
+                if let Some(random) =
+                    random.filter(|it| is_random(db, std.random, AdtId::from(*it)))
+                {
+                    why = Some(format!(
+                        "hashes with {}, seeded at random per process",
+                        said(db, random)
+                    ));
                     break;
                 }
             }
@@ -229,10 +239,14 @@ fn swap(
     };
     let db = cx.db();
     let krate = cx.krate();
-    if facts::crate_is(db, krate, "blaze_hash") || facts::dep_type(db, krate.base(), "blaze_hash", &["HashMap"]).is_none() {
+    if facts::crate_is(db, krate, "blaze_hash")
+        || facts::dep_type(db, krate.base(), "blaze_hash", &["HashMap"]).is_none()
+    {
         return None;
     }
-    let hash = cx.std_trait(&["core", "hash", "Hash"]).or_else(|| cx.std_trait(&["std", "hash", "Hash"]))?;
+    let hash = cx
+        .std_trait(&["core", "hash", "Hash"])
+        .or_else(|| cx.std_trait(&["std", "hash", "Hash"]))?;
     let key = cx.resolve_type(key?)?;
     if !key.impls_trait(db, hash, &[]) {
         return None;

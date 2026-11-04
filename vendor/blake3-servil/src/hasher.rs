@@ -147,11 +147,18 @@ pub fn push<C: Chunk, K: Feed<C>>(k: &K, stack: &mut CvStack, initial: u64, cv: 
 
 /// The partial chunk filled from `input`; when more input follows, the full
 /// chunk goes onto the stack and a new chunk begins. Returns the rest.
-pub fn fill<'a, C: Chunk, K: Feed<C>>(k: &K, chunk: &mut C, stack: &mut CvStack, initial: u64, input: &'a [u8]) -> &'a [u8] {
+pub fn fill<'a, C: Chunk, K: Feed<C>>(
+    k: &K,
+    chunk: &mut C,
+    stack: &mut CvStack,
+    initial: u64,
+    input: &'a [u8],
+) -> &'a [u8] {
     if chunk.len() == 0 {
         return input;
     }
-    let take = if CHUNK_LEN - chunk.len() < input.len() { CHUNK_LEN - chunk.len() } else { input.len() };
+    let take =
+        if CHUNK_LEN - chunk.len() < input.len() { CHUNK_LEN - chunk.len() } else { input.len() };
     chunk.update(&input[..take]);
     let rest = &input[take..];
     if rest.is_empty() {
@@ -165,7 +172,13 @@ pub fn fill<'a, C: Chunk, K: Feed<C>>(k: &K, chunk: &mut C, stack: &mut CvStack,
 
 /// `input` after an empty chunk: whole subtrees onto the stack, then at most
 /// a chunk into the chunk, and the stack merged behind it.
-pub fn feed<C: Chunk, K: Feed<C>>(k: &K, chunk: &mut C, stack: &mut CvStack, initial: u64, input: &[u8]) {
+pub fn feed<C: Chunk, K: Feed<C>>(
+    k: &K,
+    chunk: &mut C,
+    stack: &mut CvStack,
+    initial: u64,
+    input: &[u8],
+) {
     let mut input = input;
     while input.len() > CHUNK_LEN {
         let counter = chunk.counter();
@@ -288,11 +301,26 @@ impl<P: Blocks + Copy, H> Nodes<ChunkState<P>, Output<P>> for Kernels<'_, P, H> 
 pub trait Blocks {
     /// `cv` compressed with `block`, its first `block_len` bytes the
     /// message's and the rest zero.
-    fn compress_in_place(&self, cv: &mut [u32; 8], block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8);
+    fn compress_in_place(
+        &self,
+        cv: &mut [u32; 8],
+        block: &[u8; BLOCK_LEN],
+        block_len: u8,
+        counter: u64,
+        flags: u8,
+    );
     /// `cv` compressed with the `count` (1 to 16) whole blocks at the start
     /// of `blocks` in turn: the first with `flags | flags_start`, the
     /// others with `flags`.
-    fn compress_blocks(&self, cv: &mut [u32; 8], blocks: &[u8], count: usize, counter: u64, flags: u8, flags_start: u8);
+    fn compress_blocks(
+        &self,
+        cv: &mut [u32; 8],
+        blocks: &[u8],
+        count: usize,
+        counter: u64,
+        flags: u8,
+        flags_start: u8,
+    );
 }
 
 /// A chunk's state: the chaining value after its blocks so far but the
@@ -312,7 +340,15 @@ pub struct ChunkState<P> {
 
 impl<P: Blocks> ChunkState<P> {
     pub fn new(key: &[u32; 8], chunk_counter: u64, flags: u8, platform: P) -> Self {
-        ChunkState { buf: [0; BLOCK_LEN], cv: *key, chunk_counter, buf_len: 0, blocks_compressed: 0, flags, platform }
+        ChunkState {
+            buf: [0; BLOCK_LEN],
+            cv: *key,
+            chunk_counter,
+            buf_len: 0,
+            blocks_compressed: 0,
+            flags,
+            platform,
+        }
     }
 
     /// The bytes so far.
@@ -343,7 +379,13 @@ impl<P: Blocks> ChunkState<P> {
             input = &input[take..];
             if !input.is_empty() {
                 let block_flags = self.flags | self.start_flag();
-                self.platform.compress_in_place(&mut self.cv, &self.buf, BLOCK_LEN as u8, self.chunk_counter, block_flags);
+                self.platform.compress_in_place(
+                    &mut self.cv,
+                    &self.buf,
+                    BLOCK_LEN as u8,
+                    self.chunk_counter,
+                    block_flags,
+                );
                 self.buf_len = 0;
                 self.buf = [0; BLOCK_LEN];
                 self.blocks_compressed += 1;
@@ -352,7 +394,14 @@ impl<P: Blocks> ChunkState<P> {
         if input.len() > BLOCK_LEN {
             let count = (input.len() - 1) / BLOCK_LEN;
             let start_flag = self.start_flag();
-            self.platform.compress_blocks(&mut self.cv, input, count, self.chunk_counter, self.flags, start_flag);
+            self.platform.compress_blocks(
+                &mut self.cv,
+                input,
+                count,
+                self.chunk_counter,
+                self.flags,
+                start_flag,
+            );
             self.blocks_compressed += count as u8;
             input = &input[count * BLOCK_LEN..];
         }
@@ -395,7 +444,13 @@ impl<P: Blocks> Output<P> {
     /// The node's chaining value.
     pub fn chaining_value(&self) -> [u8; 32] {
         let mut cv = self.input_chaining_value;
-        self.platform.compress_in_place(&mut cv, &self.block, self.block_len, self.counter, self.flags);
+        self.platform.compress_in_place(
+            &mut cv,
+            &self.block,
+            self.block_len,
+            self.counter,
+            self.flags,
+        );
         le_bytes(&cv)
     }
 
@@ -424,11 +479,24 @@ impl<P: Blocks + Copy> ChunkState<P> {
 }
 
 /// The parent node of two chaining values.
-pub fn parent_output<P>(left: &[u8; 32], right: &[u8; 32], key: &[u32; 8], flags: u8, platform: P) -> Output<P> {
+pub fn parent_output<P>(
+    left: &[u8; 32],
+    right: &[u8; 32],
+    key: &[u32; 8],
+    flags: u8,
+    platform: P,
+) -> Output<P> {
     let mut block = [0u8; BLOCK_LEN];
     block[..32].copy_from_slice(left);
     block[32..].copy_from_slice(right);
-    Output { block, input_chaining_value: *key, block_len: BLOCK_LEN as u8, counter: 0, flags: flags | PARENT, platform }
+    Output {
+        block,
+        input_chaining_value: *key,
+        block_len: BLOCK_LEN as u8,
+        counter: 0,
+        flags: flags | PARENT,
+        platform,
+    }
 }
 
 /// The chunk state the Hasher's loop (above) works with.

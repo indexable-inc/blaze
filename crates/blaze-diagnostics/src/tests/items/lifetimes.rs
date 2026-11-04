@@ -65,7 +65,8 @@ fn main() {
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`), as
 /// compiletest runs a test of `mode`.
 fn ui_core(mode: Mode, name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(mode, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -364,7 +365,10 @@ LL |     S.func::<'a, U>()
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui_core(Mode::RunPass, "late-bound-lifetime-arguments-warning-72278.rs", "todo", source), stderr);
+    assert_eq!(
+        ui_core(Mode::RunPass, "late-bound-lifetime-arguments-warning-72278.rs", "todo", source),
+        stderr
+    );
 }
 
 #[test]
@@ -432,7 +436,10 @@ LL |     type V;
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("enum-variant-priority-lint-ambiguous_associated_items.rs", "2015", source), stderr);
+    assert_eq!(
+        ui("enum-variant-priority-lint-ambiguous_associated_items.rs", "2015", source),
+        stderr
+    );
 }
 
 #[test]
@@ -461,7 +468,9 @@ both!('a);
 
 fn main() {}
 "#;
-    let fixture = format!("//- minicore: sized\n//- /lifetime-hygiene.rs crate:other:main edition:2021\n{source}");
+    let fixture = format!(
+        "//- minicore: sized\n//- /lifetime-hygiene.rs crate:other:main edition:2021\n{source}"
+    );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let stderr = normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }));
     let errors: Vec<&str> = stderr.lines().filter(|it| it.starts_with("error[")).collect();

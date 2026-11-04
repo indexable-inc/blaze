@@ -85,15 +85,27 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>) -> Vec<Fo
 enum Context<'db> {
     /// An arm after the first that does not diverge: `MatchExpressionArm`.
     /// `prior` is the arms before it that do not diverge, as `block_span` gives them.
-    MatchArm { match_expr: ast::MatchExpr<'db>, prior: Vec<TextRange> },
+    MatchArm {
+        match_expr: ast::MatchExpr<'db>,
+        prior: Vec<TextRange>,
+    },
     /// The `else` of an `if`: `IfExpression`.
-    Else { if_expr: ast::IfExpr<'db> },
+    Else {
+        if_expr: ast::IfExpr<'db>,
+    },
     /// The initializer of a `let` with a type.
-    Let { ty: ast::Type<'db> },
+    Let {
+        ty: ast::Type<'db>,
+    },
     /// An argument of a call, its index among the written arguments.
-    Arg { call: Call<'db>, index: usize },
+    Arg {
+        call: Call<'db>,
+        index: usize,
+    },
     /// The value a function returns: its body's tail, or `return`'s value.
-    Return { item: ast::Fn<'db> },
+    Return {
+        item: ast::Fn<'db>,
+    },
     Plain,
 }
 
@@ -105,7 +117,11 @@ enum Call<'db> {
 
 /// The mismatch's "mismatched types", none for an argument of a call that has more than this
 /// error, which the call's `IncorrectArguments` reports.
-fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>) -> Option<Diag> {
+fn mismatch<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::TypeMismatch<'db>,
+    node: InFile<ast::Node<'db>>,
+) -> Option<Diag> {
     let span = cx.span(node.map(|it| it.text_range()));
     let outer = outer_of(node.value);
     let context = context(cx, outer, d.cause);
@@ -119,7 +135,9 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
         }
     }
     let message = match d.cause {
-        hir::ObligationCauseCode::MatchExpressionArm { .. } => "`match` arms have incompatible types",
+        hir::ObligationCauseCode::MatchExpressionArm { .. } => {
+            "`match` arms have incompatible types"
+        }
         hir::ObligationCauseCode::IfExpression => "`if` and `else` have incompatible types",
         _ => "mismatched types",
     };
@@ -143,7 +161,10 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
                 let at = in_file(range);
                 multiline |= is_multiline(cx, &at);
                 // alloc: the error's text, for an error hir found
-                diag.span_label(at, format!("this and all prior arms are found to be of type `{t}`"));
+                diag.span_label(
+                    at,
+                    format!("this and all prior arms are found to be of type `{t}`"),
+                );
             }
             let whole = in_file(match_expr.syntax().text_range());
             let outer = match match_expr.expr() {
@@ -163,7 +184,8 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
                 diag.note("`if` expressions without `else` evaluate to `()`");
                 diag.note("consider adding an `else` block that evaluates to the expected type");
             }
-            let then = if_expr.then_branch().map(|it| in_file(block_span(ast::Expr::BlockExpr(it))));
+            let then =
+                if_expr.then_branch().map(|it| in_file(block_span(ast::Expr::BlockExpr(it))));
             let else_ = if_expr.else_branch().map(|it| match it {
                 ast::ElseBranch::Block(it) => in_file(block_span(ast::Expr::BlockExpr(it))),
                 ast::ElseBranch::IfExpr(it) => in_file(it.syntax().text_range()),
@@ -173,9 +195,13 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
                 diag.span_label(then.clone(), "expected because of this");
             }
             if is_multiline(cx, &whole) {
-                let ends_with_branch = [&then, &else_].iter().any(|it| it.as_ref().is_some_and(|it| it.hi == whole.hi));
+                let ends_with_branch = [&then, &else_]
+                    .iter()
+                    .any(|it| it.as_ref().is_some_and(|it| it.hi == whole.hi));
                 let outer = match if_expr.condition() {
-                    Some(cond) if ends_with_branch => whole.shrink_to_lo().to(&in_file(cond.syntax().text_range())),
+                    Some(cond) if ends_with_branch => {
+                        whole.shrink_to_lo().to(&in_file(cond.syntax().text_range()))
+                    }
                     _ => whole,
                 };
                 diag.span_label(outer, "`if` and `else` have incompatible types");
@@ -193,7 +219,9 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
                     format!("expected `{}` because of return type", cx.ty(&d.expected)),
                 );
             }
-            None if d.expected.is_unit() => missing_return_type(cx, node, *item, &d.actual, &mut diag),
+            None if d.expected.is_unit() => {
+                missing_return_type(cx, node, *item, &d.actual, &mut diag)
+            }
             None => {}
         },
         Context::Plain => {}
@@ -283,7 +311,9 @@ fn outer_of(mut node: ast::Node<'_>) -> ast::Node<'_> {
         if list.tail_expr().is_none_or(|it| it.syntax() != node) {
             return node;
         }
-        let Some(block) = list.syntax().parent().and_then(ast::BlockExpr::cast) else { return node };
+        let Some(block) = list.syntax().parent().and_then(ast::BlockExpr::cast) else {
+            return node;
+        };
         if block.async_token().is_some()
             || block.const_token().is_some()
             || block.try_block_modifier().is_some()
@@ -295,12 +325,17 @@ fn outer_of(mut node: ast::Node<'_>) -> ast::Node<'_> {
     }
 }
 
-fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>, cause: hir::ObligationCauseCode) -> Context<'db> {
+fn context<'db>(
+    cx: &Cx<'_, 'db>,
+    outer: ast::Node<'db>,
+    cause: hir::ObligationCauseCode,
+) -> Context<'db> {
     let Some(parent) = outer.parent() else { return Context::Plain };
     if matches!(cause, hir::ObligationCauseCode::MatchExpressionArm { .. })
         && let Some(arm) = ast::MatchArm::cast(parent)
         && arm.expr().is_some_and(|it| it.syntax() == outer)
-        && let Some(match_expr) = arm.syntax().parent().and_then(|it| it.parent()).and_then(ast::MatchExpr::cast)
+        && let Some(match_expr) =
+            arm.syntax().parent().and_then(|it| it.parent()).and_then(ast::MatchExpr::cast)
     {
         let prior: Vec<TextRange> = match_expr
             .match_arm_list()
@@ -312,7 +347,11 @@ fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>, cause: hir::ObligationC
             .map(block_span)
             // alloc: the error's parts, for an error hir found
             .collect();
-        return if prior.is_empty() { Context::Plain } else { Context::MatchArm { match_expr, prior } };
+        return if prior.is_empty() {
+            Context::Plain
+        } else {
+            Context::MatchArm { match_expr, prior }
+        };
     }
     if cause == hir::ObligationCauseCode::IfExpression
         && let Some(if_expr) = ast::IfExpr::cast(parent)
@@ -334,7 +373,9 @@ fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>, cause: hir::ObligationC
         && let Some(index) = list.args().position(|it| it.syntax() == outer)
     {
         let call = match list.syntax().parent() {
-            Some(it) if ast::CallExpr::can_cast(it.kind()) => ast::CallExpr::cast(it).map(Call::Call),
+            Some(it) if ast::CallExpr::can_cast(it.kind()) => {
+                ast::CallExpr::cast(it).map(Call::Call)
+            }
             Some(it) => ast::MethodCallExpr::cast(it).map(Call::Method),
             None => None,
         };
@@ -407,7 +448,13 @@ fn is_multiline(cx: &Cx<'_, '_>, span: &Span) -> bool {
 /// An argument that does not match its parameter: rustc's `report_arg_errors` with one error,
 /// "arguments to this function are incorrect" on the callee and the note of where it is
 /// defined, the parameter labelled.
-fn arg_context<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, call: Call<'db>, index: usize, diag: &mut Diag) {
+fn arg_context<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    call: Call<'db>,
+    index: usize,
+    diag: &mut Diag,
+) {
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let (callee_range, callable) = match call {
         Call::Call(call) => {
@@ -442,7 +489,9 @@ fn arg_context<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, call: Call<'
     let mut at = MultiSpan::of(name);
     // A method called by its path takes its receiver as the first argument.
     let index = match callable.kind() {
-        hir::CallableKind::Function(f) if f.has_self_param(cx.db) && matches!(call, Call::Call(_)) => {
+        hir::CallableKind::Function(f)
+            if f.has_self_param(cx.db) && matches!(call, Call::Call(_)) =>
+        {
             index.checked_sub(1).map_or(Some(None), |it| Some(Some(it)))
         }
         _ => Some(Some(index)),
@@ -493,7 +542,9 @@ fn def_params(cx: &Cx<'_, '_>, callable: &hir::Callable<'_>) -> Option<(Span, Pa
             let name = src.value.name()?;
             let fields = match src.value.field_list()? {
                 // alloc: the error's parts, for an error hir found
-                ast::FieldList::TupleFieldList(it) => it.fields().map(|f| f.syntax().text_range()).collect(),
+                ast::FieldList::TupleFieldList(it) => {
+                    it.fields().map(|f| f.syntax().text_range()).collect()
+                }
                 // alloc: empty, allocates nothing
                 ast::FieldList::RecordFieldList(_) => Vec::new(),
             };
@@ -509,7 +560,9 @@ fn def_params(cx: &Cx<'_, '_>, callable: &hir::Callable<'_>) -> Option<(Span, Pa
             let name = src.value.name()?;
             let fields = match src.value.field_list()? {
                 // alloc: the error's parts, for an error hir found
-                ast::FieldList::TupleFieldList(it) => it.fields().map(|f| f.syntax().text_range()).collect(),
+                ast::FieldList::TupleFieldList(it) => {
+                    it.fields().map(|f| f.syntax().text_range()).collect()
+                }
                 // alloc: empty, allocates nothing
                 ast::FieldList::RecordFieldList(_) => Vec::new(),
             };
@@ -538,15 +591,17 @@ fn missing_return_type<'db>(
     let at = cx.span(node.with_value(TextRange::empty(params.syntax().text_range().end())));
     let is_main = item.name().is_some_and(|it| it.text() == "main")
         && item.syntax().parent().is_some_and(|it| ast::SourceFile::can_cast(it.kind()));
-    let in_trait_impl = item
-        .syntax()
-        .ancestors()
-        .find_map(ast::Impl::cast)
-        .is_some_and(|it| it.trait_().is_some());
+    let in_trait_impl =
+        item.syntax().ancestors().find_map(ast::Impl::cast).is_some_and(|it| it.trait_().is_some());
     if is_main || in_trait_impl {
         diag.span_label(at, "expected `()` because of default return type");
     } else if found.contains_unknown() || found.is_closure() || found.as_callable(cx.db).is_some() {
-        diag.suggestion(at, "a return type might be missing here", " -> _", Applicability::HasPlaceholders);
+        diag.suggestion(
+            at,
+            "a return type might be missing here",
+            " -> _",
+            Applicability::HasPlaceholders,
+        );
     } else {
         diag.suggestion(
             at,
@@ -593,7 +648,8 @@ fn remove_semicolon<'db>(
     expected: &hir::Type<'db>,
     diag: &mut Diag,
 ) {
-    if let Some(ast::Stmt::ExprStmt(stmt)) = block.value.stmt_list().and_then(|it| it.statements().last())
+    if let Some(ast::Stmt::ExprStmt(stmt)) =
+        block.value.stmt_list().and_then(|it| it.statements().last())
         && let Some(semi) = stmt.semicolon_token()
         && let Some(expr) = stmt.expr()
         && let Some(ty) = cx.vsema.type_of_expr(expr)
@@ -612,7 +668,12 @@ fn remove_semicolon<'db>(
 /// rustc's `suggest_turning_stmt_into_expr`: a block whose tail of type `()` names a local whose
 /// `let` is initialized by an `if`, `match` or block, each of whose blocks may have its last
 /// statement's semicolon removed.
-fn stmt_into_expr<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>, diag: &mut Diag) {
+fn stmt_into_expr<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::TypeMismatch<'db>,
+    node: InFile<ast::Node<'db>>,
+    diag: &mut Diag,
+) {
     // A `match` arm's cause is of the arm, not of a block.
     let in_block = node.value.parent().is_some_and(|it| ast::StmtList::can_cast(it.kind()));
     let in_arm = outer_of(node.value).parent().is_some_and(|it| ast::MatchArm::can_cast(it.kind()));
@@ -620,12 +681,16 @@ fn stmt_into_expr<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFil
         return;
     }
     let Some(ast::Expr::PathExpr(path)) = ast::Expr::cast(node.value) else { return };
-    let Some(hir::PathResolution::Local(local)) = path.path().and_then(|it| cx.vsema.resolve_path(it)) else {
+    let Some(hir::PathResolution::Local(local)) =
+        path.path().and_then(|it| cx.vsema.resolve_path(it))
+    else {
         return;
     };
     let source = local.primary_source_view(cx.db);
     cx.root(source.file());
-    let Some(init) = source.syntax().parent().and_then(ast::LetStmt::cast).and_then(|it| it.initializer()) else {
+    let Some(init) =
+        source.syntax().parent().and_then(ast::LetStmt::cast).and_then(|it| it.initializer())
+    else {
         return;
     };
     // alloc: the error's parts, for an error hir found
@@ -650,7 +715,9 @@ fn collect_blocks<'db>(expr: ast::Expr<'db>, blocks: &mut Vec<ast::BlockExpr<'db
             }
         }
         ast::Expr::MatchExpr(it) => {
-            for body in it.match_arm_list().into_iter().flat_map(|it| it.arms()).filter_map(|it| it.expr()) {
+            for body in
+                it.match_arm_list().into_iter().flat_map(|it| it.arms()).filter_map(|it| it.expr())
+            {
                 collect_blocks(body, blocks);
             }
         }
@@ -678,7 +745,9 @@ fn no_else<'db>(
             diag.span_label(at, label);
         }
         None => {
-            if let Some(tail) = if_expr.then_branch().and_then(|it| it.stmt_list()).and_then(|it| it.tail_expr()) {
+            if let Some(tail) =
+                if_expr.then_branch().and_then(|it| it.stmt_list()).and_then(|it| it.tail_expr())
+            {
                 diag.span_label(in_file(tail.syntax().text_range()), "found here");
             }
         }
@@ -790,10 +859,7 @@ fn value_of(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
     }
     if let Some(adt) = ty.as_adt() {
         let name = adt.name(cx.db);
-        let std = matches!(
-            adt.module(cx.db).krate(cx.db).origin(cx.db),
-            CrateOrigin::Lang(_)
-        );
+        let std = matches!(adt.module(cx.db).krate(cx.db).origin(cx.db), CrateOrigin::Lang(_));
         let mut args = ty.type_arguments();
         return match (std, name.as_str()) {
             // alloc: the error's text, for an error hir found
@@ -801,11 +867,15 @@ fn value_of(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
             // alloc: the error's text, for an error hir found
             (true, "String") => Some("String::new()".to_owned()),
             // alloc: the error's text, for an error hir found
-            (true, "Box") => args.next().and_then(|it| value_of(cx, &it)).map(|it| format!("Box::new({it})")),
+            (true, "Box") => {
+                args.next().and_then(|it| value_of(cx, &it)).map(|it| format!("Box::new({it})"))
+            }
             // alloc: the error's text, for an error hir found
             (true, "Option") => Some("None".to_owned()),
             // alloc: the error's text, for an error hir found
-            (true, "Result") => args.next().and_then(|it| value_of(cx, &it)).map(|it| format!("Ok({it})")),
+            (true, "Result") => {
+                args.next().and_then(|it| value_of(cx, &it)).map(|it| format!("Ok({it})"))
+            }
             _ => None,
         };
     }
@@ -828,7 +898,8 @@ fn suggest<'db>(
     }
     if let ast::Expr::Literal(lit) = expr.value
         && let Some(suffix) = numeric_suffix(lit)
-        && (expected.is_int_or_uint() && found.is_int_or_uint() || expected.is_float() && found.is_float())
+        && (expected.is_int_or_uint() && found.is_int_or_uint()
+            || expected.is_float() && found.is_float())
     {
         let token = lit.token().text_range();
         let at = TextRange::new(token.end() - suffix, token.end());
@@ -848,7 +919,8 @@ fn suggest<'db>(
     if let Some((inner, m)) = expected.as_reference()
         && inner == *found
     {
-        let (prefix, how) = if m == hir::Mutability::Mut { ("&mut ", "mutably ") } else { ("&", "") };
+        let (prefix, how) =
+            if m == hir::Mutability::Mut { ("&mut ", "mutably ") } else { ("&", "") };
         let code = if needs_parens(expr.value) {
             // alloc: the error's text, for an error hir found
             vec![(span.shrink_to_lo(), format!("{prefix}(")), (span.shrink_to_hi(), ")".to_owned())]

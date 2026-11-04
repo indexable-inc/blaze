@@ -30,10 +30,12 @@ const DEPTH: u32 = 4;
 const OUTER: &[&str] = &["Vec", "VecDeque", "HashMap", "HashSet", "BTreeMap", "BTreeSet"];
 
 /// The std types that own heap memory.
-const HEAP: &[&str] = &["Vec", "VecDeque", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "String", "Box"];
+const HEAP: &[&str] =
+    &["Vec", "VecDeque", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "String", "Box"];
 
 fn std_named(db: &base_db::Db, adt: hir::Adt, names: &[&str]) -> bool {
-    names.contains(&adt.name(db).as_str()) && general_facts::is_std_crate(db, adt.module(db).krate(db))
+    names.contains(&adt.name(db).as_str())
+        && general_facts::is_std_crate(db, adt.module(db).krate(db))
 }
 
 /// Whether every type in `ty` is a scalar, a tuple or array of such, or a std collection,
@@ -86,10 +88,15 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let hir::DefWithBody::Function(f) = analysis.def() else { return found };
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let db = cx.db();
-    if f.name(db).as_str() != "main" || !f.module(db).is_crate_root(db) || !f.assoc_fn_params(db).is_empty() {
+    if f.name(db).as_str() != "main"
+        || !f.module(db).is_crate_root(db)
+        || !f.assoc_fn_params(db).is_empty()
+    {
         return found;
     }
-    if general_facts::calls_std(db, analysis, "process", "exit") || general_facts::calls_std(db, analysis, "mem", "forget") {
+    if general_facts::calls_std(db, analysis, "process", "exit")
+        || general_facts::calls_std(db, analysis, "mem", "forget")
+    {
         return found;
     }
     let body = analysis.body();

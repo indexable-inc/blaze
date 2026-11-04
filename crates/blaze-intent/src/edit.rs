@@ -48,7 +48,12 @@ pub fn file_of(edit: &Edit) -> Option<&str> {
 
 /// Makes `edit`, which is no rename, in `file` (the request's `index`th), adding what it
 /// touched to `out`.
-pub fn apply(file: &mut Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> Result<(), String> {
+pub fn apply(
+    file: &mut Working,
+    index: u32,
+    edit: &Edit,
+    out: &mut Vec<Touch>,
+) -> Result<(), String> {
     let (delete, insert) = splice_of(file, index, edit, out)?;
     let inserted = TextRange::at(delete.start(), TextSize::of(insert.as_str()));
     file.splice(delete, insert)?;
@@ -60,9 +65,15 @@ pub fn apply(file: &mut Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) 
 
 /// The one splice `edit` makes in `file` as the edits before it left it, adding what it touches
 /// to `out`.
-fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> Result<(TextRange, String), String> {
+fn splice_of(
+    file: &Working,
+    index: u32,
+    edit: &Edit,
+    out: &mut Vec<Touch>,
+) -> Result<(TextRange, String), String> {
     let root = file.root();
-    let found = |item: &str| path::find(root, item).map_err(|error| format!("{}: {error}", file.path));
+    let found =
+        |item: &str| path::find(root, item).map_err(|error| format!("{}: {error}", file.path));
     match edit {
         Edit::ReplaceBody { body, item } => {
             let node = expect(found(&item.item)?, &[Kind::Fn], &item.item)?;
@@ -79,7 +90,10 @@ fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> R
                 }
                 None => {
                     let semicolon = function.semicolon_token().ok_or_else(|| {
-                        format!("`{}` has neither a body nor a `;` to put one in place of", item.item)
+                        format!(
+                            "`{}` has neither a body nor a `;` to put one in place of",
+                            item.item
+                        )
                     })?;
                     out.push(Touch { file: index, at, how: How::Whole });
                     Ok((semicolon.text_range(), format!(" {body}")))
@@ -107,16 +121,26 @@ fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> R
             Ok((node.text_range(), text.clone()))
         }
         Edit::AddField { field, strukt } => {
-            let node = expect(found(&strukt.item)?, &[Kind::Struct, Kind::Union, Kind::Variant], &strukt.item)?;
+            let node = expect(
+                found(&strukt.item)?,
+                &[Kind::Struct, Kind::Union, Kind::Variant],
+                &strukt.item,
+            )?;
             let top = path::top_of(node).expect("a struct, union or variant is in a top item");
             out.push(Touch { file: index, at: base_of(file, top)?, how: How::Fields });
             add_field(file.text(), node, field)
         }
         Edit::RemoveField { field, strukt } => {
-            let node = expect(found(&strukt.item)?, &[Kind::Struct, Kind::Union, Kind::Variant], &strukt.item)?;
+            let node = expect(
+                found(&strukt.item)?,
+                &[Kind::Struct, Kind::Union, Kind::Variant],
+                &strukt.item,
+            )?;
             let target = path::members(node)
                 .find(|it| path::name_of(*it).as_deref() == Some(field.as_str()))
-                .ok_or_else(|| format!("{}: `{}` has no field `{field}`", file.path, strukt.item))?;
+                .ok_or_else(|| {
+                    format!("{}: `{}` has no field `{field}`", file.path, strukt.item)
+                })?;
             let top = path::top_of(node).expect("a struct, union or variant is in a top item");
             out.push(Touch { file: index, at: base_of(file, top)?, how: How::Fields });
             Ok((remove_entry(file.text(), target), String::new()))
@@ -148,7 +172,11 @@ fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> R
             }
             let container = container(file, into.as_deref())?;
             if container.is_some_and(|it| it.kind() != SyntaxKind::MODULE) {
-                return Err(format!("{}: a use goes in a module, and `{}` is none", file.path, into.as_deref().unwrap_or("")));
+                return Err(format!(
+                    "{}: a use goes in a module, and `{}` is none",
+                    file.path,
+                    into.as_deref().unwrap_or("")
+                ));
             }
             let scope = container.unwrap_or(root);
             let wanted = used.chars().filter(|it| !it.is_whitespace());
@@ -204,7 +232,9 @@ pub fn item_at(root: Node<'_>, offset: TextSize) -> Option<Node<'_>> {
 /// added it; empty for the file's own module.
 pub fn path_at(file: &Working, at: &At) -> String {
     match at {
-        At::Item(offset) => path::of(item_at(file.base(), *offset).expect("a touched item starts there")),
+        At::Item(offset) => {
+            path::of(item_at(file.base(), *offset).expect("a touched item starts there"))
+        }
         At::File => String::new(),
         At::Added(path) => path.clone(),
     }
@@ -297,7 +327,9 @@ fn comma_after(node: Node<'_>) -> Option<Token<'_>> {
     let mut at = node.next_sibling_or_token();
     while let Some(element) = at {
         match element {
-            NodeOrToken::Token(token) if token.kind().is_trivia() => at = token.next_sibling_or_token(),
+            NodeOrToken::Token(token) if token.kind().is_trivia() => {
+                at = token.next_sibling_or_token()
+            }
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::COMMA => return Some(token),
             _ => return None,
         }
@@ -329,9 +361,7 @@ fn line_end(text: &str, at: usize, limit: usize) -> usize {
 fn is_named(field: &str) -> bool {
     let bytes = field.as_bytes();
     bytes.iter().enumerate().any(|(at, &byte)| {
-        byte == b':'
-            && bytes.get(at + 1) != Some(&b':')
-            && (at == 0 || bytes[at - 1] != b':')
+        byte == b':' && bytes.get(at + 1) != Some(&b':') && (at == 0 || bytes[at - 1] != b':')
     })
 }
 
@@ -344,7 +374,9 @@ fn size(at: usize) -> TextSize {
 fn add_field(text: &str, node: Node<'_>, field: &str) -> Result<(TextRange, String), String> {
     let field = field.trim();
     let named = is_named(field);
-    let list = node.child_where(|it| it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST);
+    let list = node.child_where(|it| {
+        it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST
+    });
     let Some(list) = list else {
         let (open, close) = if named { (" { ", " }") } else { ("(", ")") };
         let insert = format!("{open}{field}{close}");
@@ -423,8 +455,10 @@ fn add_entry(
 fn remove_entry(text: &str, entry: Node<'_>) -> TextRange {
     let list = entry.parent().expect("a field or variant is in a list");
     let kind = entry.kind();
-    let previous = std::iter::successors(entry.prev_sibling(), |it| it.prev_sibling()).find(|it| it.kind() == kind);
-    let next = std::iter::successors(entry.next_sibling(), |it| it.next_sibling()).find(|it| it.kind() == kind);
+    let previous = std::iter::successors(entry.prev_sibling(), |it| it.prev_sibling())
+        .find(|it| it.kind() == kind);
+    let next = std::iter::successors(entry.next_sibling(), |it| it.next_sibling())
+        .find(|it| it.kind() == kind);
     let range = entry.text_range();
     if let Some(next) = next {
         return TextRange::new(range.start(), next.text_range().start());
@@ -436,7 +470,8 @@ fn remove_entry(text: &str, entry: Node<'_>) -> TextRange {
     };
     match comma_after(entry) {
         Some(own) => {
-            let start = comma_after(previous).expect("a list's entries before the last end in commas");
+            let start =
+                comma_after(previous).expect("a list's entries before the last end in commas");
             let stop = usize::from(own.text_range().end());
             let close = usize::from(list.text_range().end());
             TextRange::new(start.text_range().end(), size(line_end(text, stop, close)))
@@ -472,7 +507,12 @@ fn remove_line(text: &str, end: usize, range: TextRange) -> TextRange {
 }
 
 /// The splice adding `item` after the last item of `scope`.
-fn add_item(text: &str, end: usize, scope: Node<'_>, item: &str) -> Result<(TextRange, String), String> {
+fn add_item(
+    text: &str,
+    end: usize,
+    scope: Node<'_>,
+    item: &str,
+) -> Result<(TextRange, String), String> {
     let item = item.trim();
     if item.is_empty() {
         return Err("the item to add is empty".to_owned());
@@ -493,13 +533,21 @@ fn add_item(text: &str, end: usize, scope: Node<'_>, item: &str) -> Result<(Text
         None => {
             let outer = indent_at(text, usize::from(scope.text_range().start()));
             let inner = format!("{outer}    ");
-            Ok((TextRange::new(open, close), format!("\n{inner}{}\n{outer}", indented(item, &inner))))
+            Ok((
+                TextRange::new(open, close),
+                format!("\n{inner}{}\n{outer}", indented(item, &inner)),
+            ))
         }
     }
 }
 
 /// The splice adding `use used;` after the scope's last use, or before its first item.
-pub(crate) fn add_use(text: &str, end: usize, scope: Node<'_>, used: &str) -> Result<(TextRange, String), String> {
+pub(crate) fn add_use(
+    text: &str,
+    end: usize,
+    scope: Node<'_>,
+    used: &str,
+) -> Result<(TextRange, String), String> {
     let line = format!("use {used};");
     if let Some(last) = items_of(scope).filter(|it| it.kind() == SyntaxKind::USE).last() {
         let indent = indent_at(text, usize::from(last.text_range().start()));
@@ -546,7 +594,11 @@ fn added(file: &Working, index: u32, inserted: TextRange, out: &mut Vec<Touch>) 
             .filter(|it| path::is_top(*it) && inserted.contains_range(it.text_range()))
             .peekable();
         if items.peek().is_some() {
-            out.extend(items.map(|it| Touch { file: index, at: At::Added(path::of(it)), how: How::Added }));
+            out.extend(items.map(|it| Touch {
+                file: index,
+                at: At::Added(path::of(it)),
+                how: How::Added,
+            }));
             return;
         }
     }

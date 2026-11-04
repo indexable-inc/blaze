@@ -45,8 +45,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
     let Some(span) = cx.item_span(f.syntax()) else { return };
     let name = f.name().map_or("this function", |it| it.text());
     let message = match panics.len() {
-        1 => format!("`{name}` returns a `Result` and has a panic: a caller can't handle a panic as an error"),
-        n => format!("`{name}` returns a `Result` and has {n} panics: a caller can't handle a panic as an error"),
+        1 => format!(
+            "`{name}` returns a `Result` and has a panic: a caller can't handle a panic as an error"
+        ),
+        n => format!(
+            "`{name}` returns a `Result` and has {n} panics: a caller can't handle a panic as an error"
+        ),
     };
     let mut at = MultiSpan::default();
     at.primary = panics.iter().map(|it| cx.span(*it)).collect(); // alloc: as `panics`

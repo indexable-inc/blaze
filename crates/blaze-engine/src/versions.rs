@@ -155,7 +155,9 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
         if blaze_units::lock::is_version(given) {
             fetch_for(given, "which `blaze pin` pins")?;
         } else if !pin::is_channel(given) {
-            bail!("`blaze pin {given}`: {given} is not a release of blaze (`0.YYYYMMDD.N`) or a channel (stable, canary)");
+            bail!(
+                "`blaze pin {given}`: {given} is not a release of blaze (`0.YYYYMMDD.N`) or a channel (stable, canary)"
+            );
         }
     }
     if given.is_none() && !blaze_units::lock::is_version(pin::OURS) {
@@ -289,7 +291,9 @@ pub(crate) fn source() -> Result<Source, FetchError> {
     let given = match std::env::var(RELEASES_FROM) {
         Ok(given) => Some(given).filter(|it| !it.is_empty()),
         Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(value)) => return Err(FetchError::ReleasesNotText(value)),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(FetchError::ReleasesNotText(value));
+        }
     };
     Ok(match given {
         None => Source::GitHub,
@@ -350,8 +354,11 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
         );
     }
     let file = pin::channel_file(channel).ok_or(FetchError::NoHome)?;
-    kept(&file, format!("{version}\n").as_bytes())
-        .map_err(|error| FetchError::ChannelUnkept { channel: channel.to_owned(), file, error })?;
+    kept(&file, format!("{version}\n").as_bytes()).map_err(|error| FetchError::ChannelUnkept {
+        channel: channel.to_owned(),
+        file,
+        error,
+    })?;
     Ok(version)
 }
 
@@ -388,7 +395,10 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FetchError::ReleasesNotText(value) => {
-                write!(f, "`{RELEASES_FROM}` is {value:?}, which is not text: it names an address or a directory")
+                write!(
+                    f,
+                    "`{RELEASES_FROM}` is {value:?}, which is not text: it names an address or a directory"
+                )
             }
             FetchError::NotHttps(given) => write!(
                 f,
@@ -562,7 +572,10 @@ mod tests {
         let staging = root.join(format!("home/versions/.{top}.{}", std::process::id()));
         std::fs::write(&staging, b"not a directory").unwrap();
         let error = unpacked(&bytes, &elsewhere, &top).unwrap_err();
-        assert!(matches!(error.downcast_ref::<FetchError>(), Some(FetchError::Staging { .. })), "{error:#}");
+        assert!(
+            matches!(error.downcast_ref::<FetchError>(), Some(FetchError::Staging { .. })),
+            "{error:#}"
+        );
         assert!(!elsewhere.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -7,7 +7,6 @@
 
 use blaze_format::cursor::Put;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cranelift_module::FuncId;
 use cranelift_object::{
     ObjectProduct,
@@ -17,6 +16,7 @@ use cranelift_object::{
         write::{Relocation, RelocationFlags},
     },
 };
+use std::alloc::Global;
 use std::fmt::Write;
 
 use super::FunctionDebug;

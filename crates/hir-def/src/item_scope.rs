@@ -164,12 +164,19 @@ impl<A: Allocator + Clone> PerNsGlobImports<A> {
     /// The glob marks of `scope`, the scope of `module`, sized to them.
     pub(crate) fn of_scope_in(module: ModuleId, scope: &ItemScope, alloc: A) -> Self {
         let types = || {
-            scope.types.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
+            scope
+                .types
+                .iter()
+                .filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
         };
-        let values =
-            || scope.values.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrGlob::Glob(_))));
+        let values = || {
+            scope.values.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrGlob::Glob(_))))
+        };
         let macros = || {
-            scope.macros.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
+            scope
+                .macros
+                .iter()
+                .filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
         };
         let set = |len: usize, alloc: A| {
             hashbrown::HashSet::with_capacity_and_hasher_in(len, FixedState, alloc)
@@ -545,7 +552,9 @@ impl PackedImport for ImportOrExternCrate {
     fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self> {
         let id = id?;
         Some(match tag {
-            IMPORT_GLOB => ImportOrExternCrate::Glob(GlobId { use_: typed(id), idx: tree_at(tree) }),
+            IMPORT_GLOB => {
+                ImportOrExternCrate::Glob(GlobId { use_: typed(id), idx: tree_at(tree) })
+            }
             IMPORT_USE => {
                 ImportOrExternCrate::Import(ImportId { use_: typed(id), idx: tree_at(tree) })
             }
@@ -782,7 +791,8 @@ impl<K: Copy + Eq + Hash, V> Keyed<K, V> {
         let entries = &self.entries;
         if entries.len() <= LINEAR {
             self.index = Index::default();
-            return (1..entries.len()).all(|at| entries[..at].iter().all(|it| it.0 != entries[at].0));
+            return (1..entries.len())
+                .all(|at| entries[..at].iter().all(|it| it.0 != entries[at].0));
         }
         let mut index = Index::with_capacity(capacity);
         let mut unique = true;
@@ -868,12 +878,18 @@ pub struct ItemScope {
     /// Every name of the scope once, by text, as `namespace << 30 | position`: what
     /// [`ItemScope::entries`] lists. Made by the first `entries` after a name was added, and
     /// written only that once for a scope that is handed over.
-    #[expect(clippy::disallowed_types, reason = "names sorted by text, set once per settled scope: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "names sorted by text, set once per settled scope: not global"
+    )]
     pub(crate) sorted: std::sync::OnceLock<Box<[u32]>>,
     /// The entries of the three namespaces by def, as `namespace << 30 | position` sorted by
     /// namespace, def and position: what [`ItemScope::name_of`] searches in a scope of more than
     /// [`LINEAR`] names. 4 bytes an entry, made by the first `name_of` after a def changed.
-    #[expect(clippy::disallowed_types, reason = "entries sorted by definition, set once per settled scope: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "entries sorted by definition, set once per settled scope: not global"
+    )]
     pub(crate) by_def: std::sync::OnceLock<Box<[u32]>>,
 
     /// The defs declared in this scope. Each def has a single scope where it is
@@ -1053,19 +1069,23 @@ impl BuiltinScope {
     }
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one builtin scope: all name resolution shares the same builtin types")]
-pub(crate) static BUILTIN_SCOPE: std::sync::LazyLock<BuiltinScope> = std::sync::LazyLock::new(|| {
-    let all = BuiltinType::all_builtin_types();
-    // alloc: once per process (LazyLock)
-    let names: Box<[Name]> = all.iter().map(|(name, _)| *name).collect();
-    let defs = all.iter().map(|&(_, ty)| PerNs::types(ty.into(), Visibility::Public, None));
-    let mut index = Index::with_capacity(names.len());
-    for (pos, name) in names.iter().enumerate() {
-        index.insert(name_hash(name), 0, pos);
-    }
-    // alloc: once per process (LazyLock)
-    BuiltinScope { names, defs: defs.collect(), index }
-});
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one builtin scope: all name resolution shares the same builtin types"
+)]
+pub(crate) static BUILTIN_SCOPE: std::sync::LazyLock<BuiltinScope> =
+    std::sync::LazyLock::new(|| {
+        let all = BuiltinType::all_builtin_types();
+        // alloc: once per process (LazyLock)
+        let names: Box<[Name]> = all.iter().map(|(name, _)| *name).collect();
+        let defs = all.iter().map(|&(_, ty)| PerNs::types(ty.into(), Visibility::Public, None));
+        let mut index = Index::with_capacity(names.len());
+        for (pos, name) in names.iter().enumerate() {
+            index.insert(name_hash(name), 0, pos);
+        }
+        // alloc: once per process (LazyLock)
+        BuiltinScope { names, defs: defs.collect(), index }
+    });
 
 /// Shadow mode for builtin type which can be shadowed by module.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1193,7 +1213,8 @@ impl ItemScope {
         let mut unique = true;
         for (ns, pos, name) in self.all_names() {
             let hash = name_hash(name);
-            unique &= !names.probe(hash).any(|(at, other)| at == ns && self.name_at(at, other) == name);
+            unique &=
+                !names.probe(hash).any(|(at, other)| at == ns && self.name_at(at, other) == name);
             names.insert(hash, ns, pos);
         }
         self.names = names;
@@ -1273,7 +1294,10 @@ impl ItemScope {
 
     /// Builds the tables a settled scope is read by when it has more than [`LINEAR`] names, and
     /// drops them when it has fewer (a small scope scans its columns).
-    #[expect(clippy::disallowed_types, reason = "scope lookup tables, set once per settled scope: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "scope lookup tables, set once per settled scope: not global"
+    )]
     fn fill_tables(&mut self) {
         if self.indexed_len() <= LINEAR {
             self.sorted = std::sync::OnceLock::new();
@@ -1581,9 +1605,7 @@ impl ItemScope {
                     all,
                     |&at| {
                         let it = self.entry_at(at);
-                        let def = it.def.map_or(0, |id| {
-                            1u128 << 64 | u128::from(id.as_u32())
-                        });
+                        let def = it.def.map_or(0, |id| 1u128 << 64 | u128::from(id.as_u32()));
                         u128::from(at >> 30) << 97
                             | u128::from(it.def_tag) << 89
                             | def << 24
@@ -1653,10 +1675,7 @@ impl ItemScope {
     pub(crate) fn resolutions(&self) -> impl Iterator<Item = (Option<Name>, PerNs)> + '_ {
         self.entries().map(|(name, res)| (Some(*name), res)).chain(
             self.unnamed_trait_imports.iter().map(|(tr, trait_)| {
-                (
-                    None,
-                    PerNs::types(ModuleDefId::TraitId(*tr), trait_.vis, trait_.import),
-                )
+                (None, PerNs::types(ModuleDefId::TraitId(*tr), trait_.vis, trait_.import))
             }),
         )
     }
@@ -2268,7 +2287,12 @@ impl ItemScope {
     }
 
     /// [`Self::rebind_glob_types`] in the value namespace.
-    pub(crate) fn rebind_glob_values(&mut self, name: &Name, mut item: crate::per_ns::ValuesItem, glob: GlobId) {
+    pub(crate) fn rebind_glob_values(
+        &mut self,
+        name: &Name,
+        mut item: crate::per_ns::ValuesItem,
+        glob: GlobId,
+    ) {
         let pos = self.position(VALUES, name).expect("tried to rebind a non-existent value");
         item.import = Some(ImportOrGlob::Glob(glob));
         self.values.entries[pos] = Entry::new(*name, item);
@@ -2276,7 +2300,12 @@ impl ItemScope {
     }
 
     /// [`Self::rebind_glob_types`] in the macro namespace.
-    pub(crate) fn rebind_glob_macros(&mut self, name: &Name, mut item: crate::per_ns::MacrosItem, glob: GlobId) {
+    pub(crate) fn rebind_glob_macros(
+        &mut self,
+        name: &Name,
+        mut item: crate::per_ns::MacrosItem,
+        glob: GlobId,
+    ) {
         let pos = self.position(MACROS, name).expect("tried to rebind a non-existent macro");
         item.import = Some(ImportOrExternCrate::Glob(glob));
         self.macros.entries[pos] = Entry::new(*name, item);
@@ -2376,11 +2405,11 @@ mod tests {
     mod budgets;
 
     use blaze_hash::{HashMap, HashSet};
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use indexmap::map::Entry as MapEntry;
     use intern::Symbol;
     use itertools::Itertools;
+    use std::alloc::Global;
 
     use super::*;
     use crate::{
@@ -2395,7 +2424,9 @@ mod tests {
     }
 
     fn names() -> Vec<Name> {
-        (0..40).map(|it| Name::new_symbol_root(Symbol::intern(&format!("scope_test_{it}")))).collect()
+        (0..40)
+            .map(|it| Name::new_symbol_root(Symbol::intern(&format!("scope_test_{it}"))))
+            .collect()
     }
 
     fn def(rng: &mut SplitMix64) -> ModuleDefId {
@@ -2724,8 +2755,7 @@ mod tests {
                 match rng.below(16) {
                     0..=8 => {
                         let lookup = (id(rng.below(2)), name);
-                        let def =
-                            if rng.one_in(8) { PerNs::none() } else { per_ns(&mut rng) };
+                        let def = if rng.one_in(8) { PerNs::none() } else { per_ns(&mut rng) };
                         let import = import(&mut rng);
                         assert_eq!(
                             scope.push_res_with_import(&mut globs, lookup, def, import),
@@ -2734,7 +2764,8 @@ mod tests {
                     }
                     9 => {
                         let vis = vis(&mut rng);
-                        let glob = GlobId { use_: id(rng.below(4)), idx: tree_at(rng.below(3) as u32) };
+                        let glob =
+                            GlobId { use_: id(rng.below(4)), idx: tree_at(rng.below(3) as u32) };
                         let ns = [Namespace::Types, Namespace::Values, Namespace::Macros]
                             [rng.below(3) as usize];
                         match ns {

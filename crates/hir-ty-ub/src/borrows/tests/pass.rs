@@ -51,8 +51,17 @@ fn all(len: u64) -> [Span; 1] {
 }
 
 /// The function-entry retag of an argument, with implicit writes `implicit_writes`.
-fn entry(s: &mut Sim, kind: PtrKind, freeze: bool, cells: &[Span], implicit_writes: bool, p: Ptr, len: u64) -> R<Ptr> {
-    let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells).with_implicit_writes(implicit_writes);
+fn entry(
+    s: &mut Sim,
+    kind: PtrKind,
+    freeze: bool,
+    cells: &[Span],
+    implicit_writes: bool,
+    p: Ptr,
+    len: u64,
+) -> R<Ptr> {
+    let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells)
+        .with_implicit_writes(implicit_writes);
     s.retag_with(p, &new, len)
 }
 
@@ -136,9 +145,16 @@ fn assert_tree(s: &Sim, p: Ptr, show_unnamed: bool, expected: &str) {
 /// tags, as wide as `<TAG>`, so a border here is the widest line's width after erasing, cut at
 /// 50.
 fn normalize_tree(printed: &str) -> String {
-    let lines: Vec<String> = printed.lines().map(|line| erase_named_tags(&normalize(line))).collect();
+    let lines: Vec<String> =
+        printed.lines().map(|line| erase_named_tags(&normalize(line))).collect();
     let is_border = |line: &str| !line.is_empty() && line.chars().all(|c| c == '─');
-    let width = lines.iter().filter(|l| !is_border(l.as_str())).map(|l| l.chars().count()).max().unwrap_or(0).min(50);
+    let width = lines
+        .iter()
+        .filter(|l| !is_border(l.as_str()))
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(50);
     let mut out = String::with_capacity(printed.len());
     for line in &lines {
         if is_border(line.as_str()) {
@@ -760,7 +776,14 @@ fn mem_forget_implicit_writes() -> R {
 /// `fn dereference<T>(x: T, y: *mut u8) -> T { let _ = unsafe { *y }; x }` with `x` the
 /// `&mut` (or `Box`, `PtrKind::Box`) `x` to the 1 byte `UnsafeCell<u8>` (`cell`) or `u8`;
 /// returns the result in the caller.
-fn dereference(s: &mut Sim, implicit_writes: bool, kind: PtrKind, cell: bool, x: Ptr, y: Ptr) -> R<Ptr> {
+fn dereference(
+    s: &mut Sim,
+    implicit_writes: bool,
+    kind: PtrKind,
+    cell: bool,
+    x: Ptr,
+    y: Ptr,
+) -> R<Ptr> {
     let c = all(1);
     let cells: &[Span] = if cell { &c } else { &[] };
     s.call();

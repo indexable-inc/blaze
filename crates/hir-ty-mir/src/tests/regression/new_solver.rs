@@ -1,7 +1,7 @@
 use expect_test::expect;
 use hir_def::{AdtId, ModuleDefId};
-use rustc_type_ir::inherent::IntoKind as _;
 use hir_expand::fixture;
+use rustc_type_ir::inherent::IntoKind as _;
 
 use crate::{
     db::HirDatabase,

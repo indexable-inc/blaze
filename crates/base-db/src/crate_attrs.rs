@@ -17,16 +17,17 @@
 //! others are [`applied_crate_attr_files`], which rustc appends after the crate root's own inner
 //! attributes (`krate.attrs.push`).
 
+use crate::FileId;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::db::Durability;
 use smallvec::SmallVec;
 use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
-use crate::FileId;
 
 use crate::{
-    Crate, Db, EditionedFileId, FileSourceRootInput, FileText, Files, relevant_crates,
+    Crate, Db, EditionedFileId, FileSourceRootInput, FileText, Files,
     files::{Writer, set},
+    relevant_crates,
 };
 
 /// The name rustc shows a crate attribute's file by (`FileName::CliCrateAttr`).
@@ -221,9 +222,9 @@ impl Files {
                         Some(input) if input.source_root_id(&*db) == root => {}
                         Some(input) => set(input.set_source_root_id(db), durability, root),
                         None => {
-                            let builder = FileSourceRootInput::builder(root)
-                                .durability(durability.unwrap_or(Durability::MEDIUM));
-                            self.file_source_roots.set(file.index(), Some(builder.new(&*db)));
+                            let durability = durability.unwrap_or(Durability::MEDIUM);
+                            let input = FileSourceRootInput::new(&*db, durability, root);
+                            self.file_source_roots.set(file.index(), Some(input));
                         }
                     }
                     writer.crate_attrs.insert(file, krate);

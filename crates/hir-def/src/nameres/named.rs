@@ -35,9 +35,9 @@
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use either::Either;
 use hir_expand::{HirFileId, MacroCallId};
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, SyntaxKind, T, WalkEvent,
     view::{self as ast, AstNode as _, Node, Token},
@@ -121,7 +121,9 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
         .iter()
         .filter(|it| {
             walk.named.contains(it.name.as_str())
-                || (lang(it.crate_id) && !by_name(it.crate_id, it.name.as_str()) && !is_panic_runtime(db, it.crate_id))
+                || (lang(it.crate_id)
+                    && !by_name(it.crate_id, it.name.as_str())
+                    && !is_panic_runtime(db, it.crate_id))
         })
         .map(|it| it.crate_id)
         // alloc: the memo's value, once per crate

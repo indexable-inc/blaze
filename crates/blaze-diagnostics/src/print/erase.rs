@@ -11,11 +11,12 @@
 use base_db::Db;
 use hir_def::{GenericDefId, hir::generics::GenericParamDataRef};
 use hir_ty::next_solver::{
-    Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArg, GenericArgKind, GenericArgs, Region, Ty, TyKind,
+    Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArg, GenericArgKind, GenericArgs, Region,
+    Ty, TyKind,
 };
 use rustc_type_ir::{
-    TypeFolder, TypeSuperFoldable as _, TypeSuperVisitable as _, TypeVisitable as _, TypeVisitableExt as _,
-    TypeVisitor,
+    TypeFolder, TypeSuperFoldable as _, TypeSuperVisitable as _, TypeVisitable as _,
+    TypeVisitableExt as _, TypeVisitor,
     inherent::{IntoKind as _, Ty as _},
 };
 use smallvec::SmallVec;
@@ -25,7 +26,12 @@ use smallvec::SmallVec;
 /// one is folded, one whose parameter has a default is kept and any other type is `_`; any other
 /// type that holds a variable, and the whole type, is folded; the rest is `_`. Lifetimes and
 /// constants are kept.
-pub(super) fn erase<'t>(db: &'t Db, interner: DbInterner<'t>, undecided: Ty<'t>, named: Ty<'t>) -> Ty<'t> {
+pub(super) fn erase<'t>(
+    db: &'t Db,
+    interner: DbInterner<'t>,
+    undecided: Ty<'t>,
+    named: Ty<'t>,
+) -> Ty<'t> {
     Eraser { db, interner }.ty(1, undecided, named)
 }
 
@@ -56,29 +62,36 @@ impl<'t> Eraser<'t> {
             }
             (TyKind::Adt(_, args), _) if !args.references_error() => self.unknown(),
             (TyKind::Adt(def, args), TyKind::Adt(_, named_args)) => {
-                let generics = hir_ty::generics::generics(self.db, GenericDefId::AdtId(def.def_id()));
-                let args = generics.iter_self().zip(args.iter().zip(named_args.iter())).map(|((_, param), (arg, named))| {
-                    let has_default = match param {
-                        GenericParamDataRef::TypeParamData(it) => it.default.is_some(),
-                        GenericParamDataRef::ConstParamData(it) => it.default.is_some(),
-                        GenericParamDataRef::LifetimeParamData(_) => false,
-                    };
-                    if arg.references_error() {
-                        self.arg(depth, arg, named)
-                    } else if has_default {
-                        named
-                    } else if let GenericArgKind::Type(_) = named.kind() {
-                        self.unknown().into()
-                    } else {
-                        named
-                    }
-                });
+                let generics =
+                    hir_ty::generics::generics(self.db, GenericDefId::AdtId(def.def_id()));
+                let args = generics.iter_self().zip(args.iter().zip(named_args.iter())).map(
+                    |((_, param), (arg, named))| {
+                        let has_default = match param {
+                            GenericParamDataRef::TypeParamData(it) => it.default.is_some(),
+                            GenericParamDataRef::ConstParamData(it) => it.default.is_some(),
+                            GenericParamDataRef::LifetimeParamData(_) => false,
+                        };
+                        if arg.references_error() {
+                            self.arg(depth, arg, named)
+                        } else if has_default {
+                            named
+                        } else if let GenericArgKind::Type(_) = named.kind() {
+                            self.unknown().into()
+                        } else {
+                            named
+                        }
+                    },
+                );
                 Ty::new(self.interner, TyKind::Adt(def, GenericArgs::new_from_iter(args)))
             }
             _ if undecided.references_error() || depth == 1 => {
                 let mut children = Children(SmallVec::new());
                 undecided.super_visit_with(&mut children);
-                named.super_fold_with(&mut Fold { eraser: self, depth, undecided: children.0.into_iter() })
+                named.super_fold_with(&mut Fold {
+                    eraser: self,
+                    depth,
+                    undecided: children.0.into_iter(),
+                })
             }
             _ => self.unknown(),
         }
@@ -86,9 +99,16 @@ impl<'t> Eraser<'t> {
 
     /// `fold_with` of an argument: a type one deeper; a lifetime or constant is kept, as rustc's
     /// `fold_region` and `fold_const` keep them.
-    fn arg(&self, depth: usize, undecided: GenericArg<'t>, named: GenericArg<'t>) -> GenericArg<'t> {
+    fn arg(
+        &self,
+        depth: usize,
+        undecided: GenericArg<'t>,
+        named: GenericArg<'t>,
+    ) -> GenericArg<'t> {
         match (undecided.kind(), named.kind()) {
-            (GenericArgKind::Type(undecided), GenericArgKind::Type(named)) => self.ty(depth + 1, undecided, named).into(),
+            (GenericArgKind::Type(undecided), GenericArgKind::Type(named)) => {
+                self.ty(depth + 1, undecided, named).into()
+            }
             _ => named,
         }
     }

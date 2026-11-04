@@ -61,10 +61,15 @@ impl EventRef<'_> {
             EventRef::Push { branch, commit } => {
                 Event::Push { branch: branch.into_owned(), commit: commit.into_owned() }
             }
-            EventRef::PullRequest { number, head, base, from_fork } => {
-                Event::PullRequest { number, head: head.into_owned(), base: base.into_owned(), from_fork }
+            EventRef::PullRequest { number, head, base, from_fork } => Event::PullRequest {
+                number,
+                head: head.into_owned(),
+                base: base.into_owned(),
+                from_fork,
+            },
+            EventRef::Tag { name, commit } => {
+                Event::Tag { name: name.into_owned(), commit: commit.into_owned() }
             }
-            EventRef::Tag { name, commit } => Event::Tag { name: name.into_owned(), commit: commit.into_owned() },
         }
     }
 }
@@ -112,16 +117,24 @@ impl Verifier {
     /// [`verify`] under this key.
     pub fn verify(&self, body: &[u8], signature: Option<&str>) -> Result<(), WebhookError> {
         let Some(key) = &self.key else {
-            return Err(WebhookError::new(500, "the webhook secret is empty, so no signature can check"));
+            return Err(WebhookError::new(
+                500,
+                "the webhook secret is empty, so no signature can check",
+            ));
         };
-        let signature =
-            signature.ok_or_else(|| WebhookError::new(400, "the delivery has no X-Hub-Signature-256"))?;
+        let signature = signature
+            .ok_or_else(|| WebhookError::new(400, "the delivery has no X-Hub-Signature-256"))?;
         let tag = signature
             .strip_prefix("sha256=")
             .and_then(blaze_format::hex::decode::<32>)
-            .ok_or_else(|| WebhookError::new(401, "X-Hub-Signature-256 is not sha256=<64 hex digits>"))?;
+            .ok_or_else(|| {
+                WebhookError::new(401, "X-Hub-Signature-256 is not sha256=<64 hex digits>")
+            })?;
         hmac::verify(key, body, &tag).map_err(|_| {
-            WebhookError::new(401, "X-Hub-Signature-256 does not match the body under the webhook secret")
+            WebhookError::new(
+                401,
+                "X-Hub-Signature-256 does not match the body under the webhook secret",
+            )
         })
     }
 }
@@ -137,7 +150,11 @@ pub fn parse(kind: &str, id: &str, body: &[u8]) -> Result<Delivery, WebhookError
 
 /// [`parse`], lent from `id` and `body`: nothing is allocated unless the payload escaped a
 /// string CI reads.
-pub fn parse_ref<'a>(kind: &str, id: &'a str, body: &'a [u8]) -> Result<DeliveryRef<'a>, WebhookError> {
+pub fn parse_ref<'a>(
+    kind: &str,
+    id: &'a str,
+    body: &'a [u8],
+) -> Result<DeliveryRef<'a>, WebhookError> {
     parse_by::<Sonic>(kind, id, body)
 }
 
@@ -195,7 +212,8 @@ pub(crate) fn parse_by<'a, J: Json>(
                 return Ok(DeliveryRef { id, repo, event: None });
             }
             // alloc: error path
-            let missing = |field: &str| WebhookError::new(400, format!("the {kind} payload has no {field}"));
+            let missing =
+                |field: &str| WebhookError::new(400, format!("the {kind} payload has no {field}"));
             let repository = pr.repository.ok_or_else(|| missing("repository"))?;
             let number = pr.number.ok_or_else(|| missing("number"))?;
             let pull = pr.pull_request.ok_or_else(|| missing("pull_request"))?;
@@ -243,7 +261,10 @@ fn receive_parts<'a>(
 ) -> Result<DeliveryRef<'a>, WebhookError> {
     if method != "POST" {
         // alloc: error path
-        return Err(WebhookError::new(405, format!("a webhook delivery is a POST, this was a {method}")));
+        return Err(WebhookError::new(
+            405,
+            format!("a webhook delivery is a POST, this was a {method}"),
+        ));
     }
     verifier.verify(body, header("X-Hub-Signature-256"))?;
     if let Some(kind) = header("Content-Type") {

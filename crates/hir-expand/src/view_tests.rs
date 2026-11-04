@@ -24,8 +24,7 @@ use crate::{
     AstId, ExpandTo, ExpansionInfo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId,
     MacroDefKind,
     attrs::{
-        AstKeyValueMetaExt, AstPathExt, AttrId, collect_item_tree_attrs_view,
-        expand_cfg_attr_view,
+        AstKeyValueMetaExt, AstPathExt, AttrId, collect_item_tree_attrs_view, expand_cfg_attr_view,
     },
     builtin::{BuiltinFnLikeExpander, EagerExpander},
     eager::expand_eager_macro_input_view,
@@ -364,21 +363,9 @@ fn what_a_call_expands_to_in_every_position() {
         Items,
         // `fn g`: a statement, a pattern and its initializer, a type, a tuple's and an array's
         // element, a scrutinee, an arm's pattern and its body
-        Statements,
-        Pattern,
-        Expr,
-        Type,
-        Expr,
-        Expr,
-        Expr,
-        Pattern,
-        Expr,
+        Statements, Pattern, Expr, Type, Expr, Expr, Expr, Pattern, Expr,
         // a tuple field's type, the impl's, trait's and extern block's items, an array length
-        Type,
-        Items,
-        Items,
-        Items,
-        Expr,
+        Type, Items, Items, Items, Expr,
     ];
     assert_eq!(got, expected.map(Ok));
 }
@@ -461,15 +448,23 @@ fn attributes() {
         let Some(owner) = view::AnyHasAttrs::cast(node) else { continue };
         let at = (node.kind(), node.text_range());
         let mut metas = Vec::new();
-        let _ = expand_cfg_attr_view(view::attrs_including_inner(&owner), || &cfg, |meta, top| {
-            metas.push((meta.syntax().text_range(), top.syntax().text_range()));
-            ControlFlow::<()>::Continue(())
-        });
+        let _ = expand_cfg_attr_view(
+            view::attrs_including_inner(&owner),
+            || &cfg,
+            |meta, top| {
+                metas.push((meta.syntax().text_range(), top.syntax().text_range()));
+                ControlFlow::<()>::Continue(())
+            },
+        );
         let mut kept = Vec::new();
-        let result = collect_item_tree_attrs_view(owner, || &cfg, |meta, top| {
-            kept.push((meta.syntax().text_range(), top.syntax().text_range()));
-            ControlFlow::<()>::Continue(())
-        });
+        let result = collect_item_tree_attrs_view(
+            owner,
+            || &cfg,
+            |meta, top| {
+                kept.push((meta.syntax().text_range(), top.syntax().text_range()));
+                ControlFlow::<()>::Continue(())
+            },
+        );
         put!(out, "{at:?}: metas {metas:?}; kept {kept:?}, stopped {}", result.is_some());
 
         if let Some(adt) = view::Adt::cast(node) {
@@ -518,7 +513,16 @@ fn an_eager_expansion_replaces_its_nested_calls() {
         }
         let mut nested = Vec::new();
         let result = expand_eager_macro_input_view(
-            db, f.krate, call, ast_id, concat, ctxt, 0, 128, &resolver, &mut nested,
+            db,
+            f.krate,
+            call,
+            ast_id,
+            concat,
+            ctxt,
+            0,
+            128,
+            &resolver,
+            &mut nested,
         );
         assert!(result.err.is_some(), "`nope!` is unresolved");
         let id = result.value.expect("the call expands past the unresolved one");
@@ -585,10 +589,14 @@ fn the_twins_walks_allocate_nothing() {
     );
     let attrs = || {
         let mut n = 0;
-        let _ = collect_item_tree_attrs_view(owner, || &cfg, |_, _| {
-            n += 1;
-            ControlFlow::<()>::Continue(())
-        });
+        let _ = collect_item_tree_attrs_view(
+            owner,
+            || &cfg,
+            |_, _| {
+                n += 1;
+                ControlFlow::<()>::Continue(())
+            },
+        );
         n
     };
     let warm = attrs();

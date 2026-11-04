@@ -121,9 +121,7 @@ impl<'a> Dlls<'a> {
     /// `Shared` owns the name) out of the ones behind the lock.
     fn get(self, descriptor: &str) -> Option<Cow<'a, str>> {
         match self {
-            Dlls::Read(map) => {
-                map.lock().get(descriptor).cloned().map(Cow::Owned)
-            }
+            Dlls::Read(map) => map.lock().get(descriptor).cloned().map(Cow::Owned),
             Dlls::Library(map) => map.get(descriptor).map(|it| Cow::Borrowed(it.as_str())),
         }
     }
@@ -159,16 +157,29 @@ fn shared(dll: String) -> Shared {
 /// version of its own (each import's differs).
 fn add(shared: &mut Shared, input: Input<'_>, import: &Imported<'_>) -> Result<(), String> {
     let version = u16::try_from(shared.versions.len()).map_err(|_| {
-        fail(input, format_args!("more than 65,536 imports of {}, more than a DLL can export", shared.name))
+        fail(
+            input,
+            format_args!("more than 65,536 imports of {}, more than a DLL can export", shared.name),
+        )
     })?;
     let name = shared.names.push(&import.name).map_err(|e| fail(input, e))?;
     let export = shared.names.push(&import.version).map_err(|e| fail(input, e))?;
     shared.versions.push(export);
-    shared.symbols.push(SharedSymbol { name, version: Some(version), kind: import.kind, weak: false });
+    shared.symbols.push(SharedSymbol {
+        name,
+        version: Some(version),
+        kind: import.kind,
+        weak: false,
+    });
     Ok(())
 }
 
-pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
+pub(super) fn read(
+    pe: &Pe,
+    name: &str,
+    bytes: &[u8],
+    kind: &NativeKind,
+) -> Result<NativeFile, String> {
     let input = Input { file: name, member: None };
     match kind {
         NativeKind::Object => match member(pe, Dlls::Read(&pe.descriptors), input, bytes)? {
@@ -191,8 +202,15 @@ pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Resu
 }
 
 /// A relocatable input: an object, or an import member of an archive, read where it is.
-fn member<'a>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, bytes: &'a [u8]) -> Result<Parsed<'a>, String> {
-    if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0) && u16_at(bytes, 2) == Some(0xffff) {
+fn member<'a>(
+    pe: &Pe,
+    dlls: Dlls<'a>,
+    name: Input<'_>,
+    bytes: &'a [u8],
+) -> Result<Parsed<'a>, String> {
+    if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0)
+        && u16_at(bytes, 2) == Some(0xffff)
+    {
         let version = u16_at(bytes, 4).ok_or_else(|| fail(name, "a truncated COFF header"))?;
         if version == 0 {
             let (dll, symbol) = short_import(name, bytes)?;
@@ -215,11 +233,17 @@ fn strip(name: &str) -> &str {
 }
 
 /// A short import member: one symbol of one DLL, the symbol's and the DLL's names borrowed from it.
-fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Imported<'d>), String> {
+fn short_import<'d>(
+    name: Input<'_>,
+    data: &'d [u8],
+) -> Result<(Cow<'d, str>, Imported<'d>), String> {
     let short = || fail(name, "a truncated import member");
     let machine = u16_at(data, 6).ok_or_else(short)?;
     if machine != pe::IMAGE_FILE_MACHINE_AMD64.0 {
-        return Err(fail(name, format_args!("an import member for machine {machine:#x}, not x86-64")));
+        return Err(fail(
+            name,
+            format_args!("an import member for machine {machine:#x}, not x86-64"),
+        ));
     }
     let size = u32_at(data, 12).ok_or_else(short)? as usize;
     let ordinal_or_hint = u16_at(data, 16).ok_or_else(short)?;
@@ -231,7 +255,12 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Im
     let kind = match types.import_type() {
         pe::IMPORT_OBJECT_CODE => SymbolKind::Function,
         pe::IMPORT_OBJECT_DATA | pe::IMPORT_OBJECT_CONST => SymbolKind::Data,
-        other => return Err(fail(name, format_args!("import type {other} of {symbol}, which no DLL has"))),
+        other => {
+            return Err(fail(
+                name,
+                format_args!("import type {other} of {symbol}, which no DLL has"),
+            ));
+        }
     };
     let export_as: Cow<'_, str>;
     let named = |name| ImportName::Name { hint: ordinal_or_hint, name };
@@ -239,13 +268,18 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Im
         pe::IMPORT_OBJECT_ORDINAL => ImportName::Ordinal(ordinal_or_hint),
         pe::IMPORT_OBJECT_NAME => named(&*symbol),
         pe::IMPORT_OBJECT_NAME_NO_PREFIX => named(strip(&symbol)),
-        pe::IMPORT_OBJECT_NAME_UNDECORATE => named(strip(&symbol).split('@').next().unwrap_or_default()),
+        pe::IMPORT_OBJECT_NAME_UNDECORATE => {
+            named(strip(&symbol).split('@').next().unwrap_or_default())
+        }
         pe::IMPORT_OBJECT_NAME_EXPORTAS => {
             export_as = text(strings.next().ok_or_else(short)?).map_err(|e| fail(name, e))?;
             named(&*export_as)
         }
         other => {
-            return Err(fail(name, format_args!("import name type {other} of {symbol}, which blaze does not link")));
+            return Err(fail(
+                name,
+                format_args!("import name type {other} of {symbol}, which blaze does not link"),
+            ));
         }
     };
     let version = export.version();
@@ -261,7 +295,10 @@ pub(crate) enum ImportName<'a> {
 }
 
 impl<'a> ImportName<'a> {
-    pub(crate) fn parse(symbol: &'a str, version: Option<&'a str>) -> Result<ImportName<'a>, String> {
+    pub(crate) fn parse(
+        symbol: &'a str,
+        version: Option<&'a str>,
+    ) -> Result<ImportName<'a>, String> {
         let Some(version) = version else {
             return Ok(ImportName::Name { hint: 0, name: symbol });
         };
@@ -279,10 +316,13 @@ impl<'a> ImportName<'a> {
     pub(crate) fn version(self) -> String {
         let mut digits = [0; 20];
         let (prefix, number, name) = match self {
-            ImportName::Name { hint, name } => ("", decimal(u64::from(hint), &mut digits), Some(name)),
+            ImportName::Name { hint, name } => {
+                ("", decimal(u64::from(hint), &mut digits), Some(name))
+            }
             ImportName::Ordinal(ordinal) => ("#", decimal(u64::from(ordinal), &mut digits), None),
         };
-        let mut out = String::with_capacity(prefix.len() + number.len() + name.map_or(0, |it| it.len() + 1));
+        let mut out =
+            String::with_capacity(prefix.len() + number.len() + name.map_or(0, |it| it.len() + 1));
         out.push_str(prefix);
         out.push_str(number);
         if let Some(name) = name {
@@ -297,7 +337,8 @@ impl<'a> ImportName<'a> {
 /// first pass over the member headers and the index sizes the three columns, so the read
 /// allocates them once each (and two names per DLL an import library's descriptors name).
 fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descriptors), String> {
-    let file = ArchiveFile::parse(bytes).map_err(|e| fail(name, format_args!("not an archive: {e}")))?;
+    let file =
+        ArchiveFile::parse(bytes).map_err(|e| fail(name, format_args!("not an archive: {e}")))?;
     if file.is_thin() {
         return Err(fail(name, "a thin archive, which link.exe does not read"));
     }
@@ -328,7 +369,9 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
             .and_then(|start| Some(start..start.checked_add(usize::try_from(size).ok()?)?))
             .filter(|it| it.end <= bytes.len())
             .ok_or_else(|| fail(name, "a member past the end of the archive"))?;
-        let member_name = names.push(&text(member.name()).map_err(|e| fail(name, e))?).map_err(|e| fail(name, e))?;
+        let member_name = names
+            .push(&text(member.name()).map_err(|e| fail(name, e))?)
+            .map_err(|e| fail(name, e))?;
         members.push(Member { name: member_name, bytes: range });
     }
     let mut index = Vec::with_capacity(symbol_count);
@@ -344,7 +387,9 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
                 .map_err(|_| {
                     fail(name, format_args!("the index names {symbol_name} in a member at {offset:#x}, where none starts"))
                 })? as u32;
-            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_") && !descriptors.contains_key(&*symbol_name) {
+            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_")
+                && !descriptors.contains_key(&*symbol_name)
+            {
                 let it = &members[member as usize];
                 let input = Input { file: name.file, member: Some(names.at(it.name)) };
                 let dll = descriptor_dll(input, &bytes[it.bytes.start..it.bytes.end])?;
@@ -367,8 +412,9 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
 /// The DLL an import descriptor member names: its `.idata$6`.
 fn descriptor_dll(name: Input<'_>, data: &[u8]) -> Result<String, String> {
     let mut offset = 0;
-    let header = pe::ImageFileHeader::parse(data, &mut offset)
-        .map_err(|e| fail(name, format_args!("an import descriptor that is not a COFF object: {e}")))?;
+    let header = pe::ImageFileHeader::parse(data, &mut offset).map_err(|e| {
+        fail(name, format_args!("an import descriptor that is not a COFF object: {e}"))
+    })?;
     let sections = header.sections(data, offset).map_err(|e| fail(name, e))?;
     let symbols = header.symbols(data).map_err(|e| fail(name, e))?;
     for section in sections.iter() {
@@ -407,7 +453,8 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         Vec::with_capacity(archive.members.len());
     par::extend(&mut parsed, &archive.members, |it| {
         let input = input_of(it);
-        match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])? {
+        match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])?
+        {
             Parsed::Import(dll, import) => Ok(Some((dll, import))),
             Parsed::Object(object) if object.sections.is_empty() => Ok(None),
             Parsed::Object(_) => Err(fail(
@@ -419,19 +466,21 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
     });
     // The members before the first that fails to parse are added; its error is given unless
     // adding one of them fails.
-    let failed = match par::find_map_first(par::enumerate(&parsed), |(at, it)| it.is_err().then_some(at)) {
-        Some(at) => {
-            let error = parsed.swap_remove(at).err();
-            parsed.truncate(at);
-            error
-        }
-        None => None,
-    };
+    let failed =
+        match par::find_map_first(par::enumerate(&parsed), |(at, it)| it.is_err().then_some(at)) {
+            Some(at) => {
+                let error = parsed.swap_remove(at).err();
+                parsed.truncate(at);
+                error
+            }
+            None => None,
+        };
     // Each DLL's imports together, in member order.
-    let mut imports: Vec<(Cow<'_, str>, u32, Imported<'_>)> = par::filter_map(par::enumerate(parsed), |(at, it)| match it {
-        Ok(Some((dll, import))) => Some((dll, at as u32, import)),
-        _ => None,
-    }); // alloc: once per library: its imports, to sort
+    let mut imports: Vec<(Cow<'_, str>, u32, Imported<'_>)> =
+        par::filter_map(par::enumerate(parsed), |(at, it)| match it {
+            Ok(Some((dll, import))) => Some((dll, at as u32, import)),
+            _ => None,
+        }); // alloc: once per library: its imports, to sort
     imports.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
     // Each DLL's `Shared` built on its own thread, keyed by its first member; a failure keyed
     // by the member that failed.
@@ -464,7 +513,9 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         }
         (first, Ok(dll))
     }); // alloc: once per library: one entry per DLL
-    if let Some((_, error)) = built.iter_mut().filter_map(|(_, it)| it.as_mut().err()).min_by_key(|it| it.0) {
+    if let Some((_, error)) =
+        built.iter_mut().filter_map(|(_, it)| it.as_mut().err()).min_by_key(|it| it.0)
+    {
         return Err(std::mem::take(error));
     }
     if let Some(error) = failed {
@@ -487,13 +538,22 @@ struct Sections<'d> {
     names: Vec<Cow<'d, str>>,
 }
 
-fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &'a [u8]) -> Result<Parsed<'a>, String> {
+fn coff<'a, C: CoffHeader>(
+    pe: &Pe,
+    dlls: Dlls<'a>,
+    name: Input<'_>,
+    data: &'a [u8],
+) -> Result<Parsed<'a>, String> {
     let mut offset = 0;
-    let header = C::parse(data, &mut offset).map_err(|e| fail(name, format_args!("not a COFF object: {e}")))?;
+    let header = C::parse(data, &mut offset)
+        .map_err(|e| fail(name, format_args!("not a COFF object: {e}")))?;
     match header.machine() {
         pe::IMAGE_FILE_MACHINE_AMD64 | pe::IMAGE_FILE_MACHINE_UNKNOWN => {}
         machine => {
-            return Err(fail(name, format_args!("a COFF object for machine {machine:#x}, not x86-64")));
+            return Err(fail(
+                name,
+                format_args!("a COFF object for machine {machine:#x}, not x86-64"),
+            ));
         }
     }
     let table = header.sections(data, offset).map_err(|e| fail(name, e))?;
@@ -531,7 +591,9 @@ fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &'a [
         + directive_bytes.min(data.len())
         + comdats * (name.len() + 12);
     let columns = Columns { names: capacity, comdats, relocations };
-    Reader { pe, name, data, sections: &sections, symbols: &symbols, columns }.object().map(Parsed::Object)
+    Reader { pe, name, data, sections: &sections, symbols: &symbols, columns }
+        .object()
+        .map(Parsed::Object)
 }
 
 /// What an object's columns are allocated with, from its section headers.
@@ -610,13 +672,23 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 continue;
             }
             let start = self.run(object.fixups.len())?;
-            self.fixups(index, header, &object.sections[index].data, &read, &object.names, &mut object.fixups)?;
+            self.fixups(
+                index,
+                header,
+                &object.sections[index].data,
+                &read,
+                &object.names,
+                &mut object.fixups,
+            )?;
             object.sections[index].fixups = start..self.run(object.fixups.len())?;
         }
         object.symbols = read.symbols;
         for (index, section_name) in self.sections.names.iter().enumerate() {
             if section_name == ".drectve" {
-                let bytes = self.header(index).coff_data(self.data).map_err(|()| self.err("a truncated .drectve"))?;
+                let bytes = self
+                    .header(index)
+                    .coff_data(self.data)
+                    .map_err(|()| self.err("a truncated .drectve"))?;
                 self.directives(bytes, &mut object)?;
             }
         }
@@ -625,7 +697,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
 
     /// The end of a run of one of the object's columns, as the contract's `u32` ranges hold it.
     fn run(&self, len: usize) -> Result<u32, String> {
-        u32::try_from(len).map_err(|_| self.err("more than 4 Gi relocations or COMDAT members in one object"))
+        u32::try_from(len)
+            .map_err(|_| self.err("more than 4 Gi relocations or COMDAT members in one object"))
     }
 
     fn section(
@@ -642,7 +715,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             ))
         })?;
         let base = section_name.split('$').next().unwrap_or_default();
-        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_LNK_INFO.0) != 0 || dropped_name(section_name);
+        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_LNK_INFO.0) != 0
+            || dropped_name(section_name);
         let zero = flags & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA.0 != 0;
         let data = if dropped {
             Data::Input(0..0)
@@ -664,8 +738,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         } else {
             let write = flags & pe::IMAGE_SCN_MEM_WRITE.0 != 0;
             let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0;
-            let (class, rank) =
-                self.pe.section(section_name, write, exec, base == ".tls").map_err(|e| self.err(e))?;
+            let (class, rank) = self
+                .pe
+                .section(section_name, write, exec, base == ".tls")
+                .map_err(|e| self.err(e))?;
             let class = match class {
                 Class::Data if zero => Class::Bss,
                 Class::Bss if !zero => Class::Data,
@@ -720,17 +796,22 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             if !linkable || number == pe::IMAGE_SYM_DEBUG.0 {
                 continue;
             }
-            let symbol_name = text(symbol.name(strings).map_err(|e| self.err(e))?).map_err(|e| self.err(e))?;
+            let symbol_name =
+                text(symbol.name(strings).map_err(|e| self.err(e))?).map_err(|e| self.err(e))?;
             let value = u64::from(symbol.value());
             let function = symbol.derived_type() == pe::IMAGE_SYM_DTYPE_FUNCTION;
             let (def, kind) = if class == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL {
                 if !symbol.has_aux_weak_external() {
-                    return Err(self.err(format_args!("weak external {symbol_name} names no default")));
+                    return Err(
+                        self.err(format_args!("weak external {symbol_name} names no default"))
+                    );
                 }
                 let aux = self.symbols.aux_weak_external(index).map_err(|e| self.err(e))?;
                 let search = match aux.weak_search_type.get(LE) {
                     pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY => false,
-                    pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY | pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS => true,
+                    pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY | pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS => {
+                        true
+                    }
                     other => {
                         return Err(self.err(format_args!(
                             "weak external {symbol_name} has search type {other}, which blaze does not link"
@@ -755,7 +836,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 let flags = header.characteristics.get(LE).0;
                 let (kind, size) = if symbol.has_aux_section() && value == 0 {
                     (SymbolKind::Section, u64::from(header.size_of_raw_data.get(LE)))
-                } else if function || flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0 {
+                } else if function
+                    || flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0
+                {
                     (SymbolKind::Function, 0)
                 } else {
                     (SymbolKind::Data, 0)
@@ -775,7 +858,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     (SymbolDef::Undefined, kind)
                 }
             } else {
-                return Err(self.err(format_args!("symbol {symbol_name} has section number {number}")));
+                return Err(
+                    self.err(format_args!("symbol {symbol_name} has section number {number}"))
+                );
             };
             let binding = match class {
                 pe::IMAGE_SYM_CLASS_EXTERNAL => Binding::Global,
@@ -817,17 +902,21 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         }
         if weak > 0 {
             for symbol in &mut read.symbols {
-                let (Binding::Weak, SymbolDef::Fallback { symbol: default, .. }) = (symbol.binding, &mut symbol.def)
+                let (Binding::Weak, SymbolDef::Fallback { symbol: default, .. }) =
+                    (symbol.binding, &mut symbol.def)
                 else {
                     continue;
                 };
                 let coff = *default;
-                *default = read.map.get(coff as usize).copied().filter(|it| *it != NONE).ok_or_else(|| {
-                    self.err(format_args!(
-                        "weak external {} defaults to symbol {coff}, which is not one",
-                        names.at(symbol.name)
-                    ))
-                })?;
+                *default =
+                    read.map.get(coff as usize).copied().filter(|it| *it != NONE).ok_or_else(
+                        || {
+                            self.err(format_args!(
+                                "weak external {} defaults to symbol {coff}, which is not one",
+                                names.at(symbol.name)
+                            ))
+                        },
+                    )?;
             }
         }
         Ok(read)
@@ -850,7 +939,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let aux = index_of(read.marks[index].first)
             .filter(|it| self.symbols.symbol(*it).is_ok_and(|it| it.has_aux_section()))
             .ok_or_else(|| {
-                self.err(format_args!("COMDAT section {} has no section symbol", self.sections.names[index]))
+                self.err(format_args!(
+                    "COMDAT section {} has no section symbol",
+                    self.sections.names[index]
+                ))
             })?;
         let aux = self.symbols.aux_section(aux).map_err(|e| self.err(e))?;
         let mut parent = u32::from(aux.number.get(LE));
@@ -902,16 +994,23 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 }
             };
             let second = read.marks[index].second;
-            let leader = index_of(second).and_then(|it| self.symbols.symbol(it).ok()).ok_or_else(|| {
-                self.err(format_args!("COMDAT section {} has no COMDAT symbol", self.sections.names[index]))
-            })?;
+            let leader =
+                index_of(second).and_then(|it| self.symbols.symbol(it).ok()).ok_or_else(|| {
+                    self.err(format_args!(
+                        "COMDAT section {} has no COMDAT symbol",
+                        self.sections.names[index]
+                    ))
+                })?;
             let name = if leader.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
                 // An external symbol in a section is always one of the object's.
                 match read.map.get(second as usize).copied().filter(|it| *it != NONE) {
                     Some(symbol) => read.symbols[symbol as usize].name,
                     None => object
                         .names
-                        .push(&text(leader.name(strings).map_err(|e| self.err(e))?).map_err(|e| self.err(e))?)
+                        .push(
+                            &text(leader.name(strings).map_err(|e| self.err(e))?)
+                                .map_err(|e| self.err(e))?,
+                        )
                         .map_err(|e| self.err(e))?,
                 }
             } else {
@@ -956,7 +1055,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             // nothing by itself.
             let tie = Tie { section: index as u32, to: (parent - 1) as u32, ordered: false };
             match group_of[root - 1] {
-                NONE if self.header(root - 1).characteristics.get(LE).0 & pe::IMAGE_SCN_LNK_COMDAT.0 == 0 => {
+                NONE if self.header(root - 1).characteristics.get(LE).0
+                    & pe::IMAGE_SCN_LNK_COMDAT.0
+                    == 0 =>
+                {
                     object.sections[index].retain = true;
                     object.ties.push(tie);
                 }
@@ -991,11 +1093,16 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
     ) -> Result<(), String> {
         let relocations = header.coff_relocations(self.data).map_err(|e| self.err(e))?;
         let section_name = &self.sections.names[index];
-        let bytes = match data.bytes(self.data).map_err(|e| self.err(format_args!("section {section_name}: {e}")))? {
+        let bytes = match data
+            .bytes(self.data)
+            .map_err(|e| self.err(format_args!("section {section_name}: {e}")))?
+        {
             Some(bytes) => bytes,
             None if relocations.is_empty() => return Ok(()),
             None => {
-                return Err(self.err(format_args!("relocations in {section_name}, which has no bytes")));
+                return Err(
+                    self.err(format_args!("relocations in {section_name}, which has no bytes"))
+                );
             }
         };
         fixups.reserve(relocations.len());
@@ -1015,19 +1122,29 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let target = &read.symbols[symbol as usize];
             let branch = matches!(target.kind, SymbolKind::Function)
                 || matches!(target.def, SymbolDef::Undefined | SymbolDef::Fallback { .. });
-            let short = || self.err(format_args!("a relocation in {section_name} at {at:#x} past its end"));
+            let short =
+                || self.err(format_args!("a relocation in {section_name} at {at:#x} past its end"));
             let (apply, addend) = match typ {
-                pe::IMAGE_REL_AMD64_ADDR64 => (Apply::Abs64, u64_at(bytes, at).ok_or_else(short)? as i64),
-                pe::IMAGE_REL_AMD64_ADDR32 => (Apply::Abs32, i64::from(u32_at(bytes, at).ok_or_else(short)?)),
+                pe::IMAGE_REL_AMD64_ADDR64 => {
+                    (Apply::Abs64, u64_at(bytes, at).ok_or_else(short)? as i64)
+                }
+                pe::IMAGE_REL_AMD64_ADDR32 => {
+                    (Apply::Abs32, i64::from(u32_at(bytes, at).ok_or_else(short)?))
+                }
                 pe::IMAGE_REL_AMD64_ADDR32NB => {
                     (Apply::ImageRel32, i64::from(u32_at(bytes, at).ok_or_else(short)? as i32))
                 }
-                rel32 if (pe::IMAGE_REL_AMD64_REL32..=pe::IMAGE_REL_AMD64_REL32_5).contains(&rel32) => {
+                rel32
+                    if (pe::IMAGE_REL_AMD64_REL32..=pe::IMAGE_REL_AMD64_REL32_5)
+                        .contains(&rel32) =>
+                {
                     let implicit = i64::from(u32_at(bytes, at).ok_or_else(short)? as i32);
                     let past = 4 + i64::from(rel32.0 - pe::IMAGE_REL_AMD64_REL32.0);
                     (if branch { Apply::X86Branch32 } else { Apply::Rel32 }, implicit - past)
                 }
-                pe::IMAGE_REL_AMD64_SECTION => (Apply::Section16, i64::from(u16_at(bytes, at).ok_or_else(short)?)),
+                pe::IMAGE_REL_AMD64_SECTION => {
+                    (Apply::Section16, i64::from(u16_at(bytes, at).ok_or_else(short)?))
+                }
                 pe::IMAGE_REL_AMD64_SECREL => {
                     (Apply::SecRel32, i64::from(u32_at(bytes, at).ok_or_else(short)? as i32))
                 }
@@ -1048,7 +1165,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
     /// A `.drectve`'s options, its words borrowed from the input but for quoted ones, which are
     /// made in one buffer reused for each.
     fn directives(&self, bytes: &[u8], object: &mut Object) -> Result<(), String> {
-        let all = text(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)).map_err(|e| self.err(e))?;
+        let all =
+            text(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)).map_err(|e| self.err(e))?;
         scratch::with_string(|quoted| words(&all, quoted, |word| self.directive(word, object)))
     }
 
@@ -1079,7 +1197,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 }
             }
             // alloc: once per directive of the file: `Directive` holds owned names
-            b"include" => object.directives.push(Directive::Include(arg.ok_or_else(need)?.to_owned())),
+            b"include" => {
+                object.directives.push(Directive::Include(arg.ok_or_else(need)?.to_owned()))
+            }
             b"alternatename" => {
                 let arg = arg.ok_or_else(need)?;
                 let (from, to) = arg
@@ -1092,11 +1212,13 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             b"export" => object.directives.push(self.export(arg.ok_or_else(need)?)?),
             b"failifmismatch" => {
                 let arg = arg.ok_or_else(need)?;
-                let (key, value) = arg
-                    .split_once('=')
-                    .ok_or_else(|| self.err(format_args!("/FAILIFMISMATCH:{arg} is not key=value")))?;
+                let (key, value) = arg.split_once('=').ok_or_else(|| {
+                    self.err(format_args!("/FAILIFMISMATCH:{arg} is not key=value"))
+                })?;
                 // alloc: once per directive of the file: `Directive` holds owned names
-                object.directives.push(Directive::Mismatch { key: key.to_owned(), value: value.to_owned() });
+                object
+                    .directives
+                    .push(Directive::Mismatch { key: key.to_owned(), value: value.to_owned() });
             }
             b"nodefaultlib" => {
                 let library = arg.map(|it| {
@@ -1126,7 +1248,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let first = parts.next().unwrap_or_default();
         let (name, symbol) = first.split_once('=').unwrap_or((first, first));
         if name.is_empty() || symbol.contains('.') {
-            return Err(self.err(format_args!("/EXPORT:{arg}: a forwarder or no name, which blaze does not link")));
+            return Err(self.err(format_args!(
+                "/EXPORT:{arg}: a forwarder or no name, which blaze does not link"
+            )));
         }
         let mut data = false;
         for part in parts {
@@ -1147,8 +1271,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
 /// defines or refers to (a new undefined one when it has none).
 fn alternate(object: &mut Object, from: Name, to: Name) {
     let names = &object.names;
-    let found =
-        object.symbols.iter().position(|it| it.binding != Binding::Local && names.at(it.name) == names.at(to));
+    let found = object
+        .symbols
+        .iter()
+        .position(|it| it.binding != Binding::Local && names.at(it.name) == names.at(to));
     let target = match found {
         Some(at) => at as u32,
         None => {
@@ -1186,7 +1312,10 @@ pub(super) fn alignment(flags: u32) -> Option<u64> {
 fn dropped_name(name: &str) -> bool {
     let base = name.split('$').next().unwrap_or_default();
     name.starts_with(".debug")
-        || matches!(base, ".gfids" | ".giats" | ".gljmp" | ".gehcont" | ".sxdata" | ".voltbl" | ".chks64")
+        || matches!(
+            base,
+            ".gfids" | ".giats" | ".gljmp" | ".gehcont" | ".sxdata" | ".voltbl" | ".chks64"
+        )
         || matches!(name, ".llvm_addrsig" | ".llvm.call-graph-profile" | ".llvmbc" | ".llvmcmd")
 }
 
@@ -1206,7 +1335,8 @@ fn default_library(name: &str) -> (&str, &'static str) {
 /// engine refuses such a member if it is ever taken.
 pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     let input = Input { file: name, member: None };
-    let file = ArchiveFile::parse(bytes).map_err(|e| fail(input, format_args!("not an archive: {e}")))?;
+    let file =
+        ArchiveFile::parse(bytes).map_err(|e| fail(input, format_args!("not an archive: {e}")))?;
     if file.is_thin() {
         return Err(fail(input, "a thin archive, which link.exe does not read"));
     }
@@ -1229,7 +1359,8 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, S
             _ => drectve::<pe::ImageFileHeader>(at, data)?,
         };
         let Some(drectve) = drectve else { continue };
-        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve)).map_err(|e| fail(at, e))?;
+        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve))
+            .map_err(|e| fail(at, e))?;
         let start = out.len();
         let mut none = false;
         // alloc: none unless a member takes out more than four of its own libraries
@@ -1241,7 +1372,8 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, S
                 None => (option, None),
             };
             if option.eq_ignore_ascii_case("defaultlib") {
-                let arg = arg.ok_or_else(|| fail(at, "the .drectve option /DEFAULTLIB needs an argument"))?;
+                let arg = arg
+                    .ok_or_else(|| fail(at, "the .drectve option /DEFAULTLIB needs an argument"))?;
                 let (stem, extension) = default_library(arg);
                 if !out.iter().any(|it| joins_ignoring_case(&it.1, stem, extension)) {
                     // alloc: once per default library an archive's members name (setup)
@@ -1278,12 +1410,16 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, S
 /// The `.drectve` of the COFF object `data`, if it has one.
 fn drectve<'d, C: CoffHeader>(name: Input<'_>, data: &'d [u8]) -> Result<Option<&'d [u8]>, String> {
     let mut offset = 0;
-    let header = C::parse(data, &mut offset).map_err(|e| fail(name, format_args!("not a COFF object: {e}")))?;
+    let header = C::parse(data, &mut offset)
+        .map_err(|e| fail(name, format_args!("not a COFF object: {e}")))?;
     let sections = header.sections(data, offset).map_err(|e| fail(name, e))?;
     let symbols = header.symbols(data).map_err(|e| fail(name, e))?;
     for section in sections.iter() {
         if section.name(symbols.strings()).map_err(|e| fail(name, e))? == b".drectve" {
-            return section.coff_data(data).map(Some).map_err(|()| fail(name, "a truncated .drectve"));
+            return section
+                .coff_data(data)
+                .map(Some)
+                .map_err(|()| fail(name, "a truncated .drectve"));
         }
     }
     Ok(None)
@@ -1368,7 +1504,8 @@ fn relocation_name(typ: pe::RelocationType) -> &'static str {
         typ if (pe::IMAGE_REL_AMD64_CFG_BR..=pe::IMAGE_REL_AMD64_INDIR_CALL).contains(&typ) => {
             "a control-flow-guard one"
         }
-        typ if (pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_FIRST..=pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_LAST)
+        typ if (pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_FIRST
+            ..=pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_LAST)
             .contains(&typ) =>
         {
             "a switch-table one"
@@ -1411,7 +1548,9 @@ fn long_import<'a, C: CoffHeader>(
             {
                 imp = Some((stripped, section));
             }
-        } else if number == pe::IMAGE_SYM_UNDEFINED.0 && symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_") {
+        } else if number == pe::IMAGE_SYM_UNDEFINED.0
+            && symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_")
+        {
             descriptor = Some(symbol_name);
         }
     }
@@ -1428,7 +1567,10 @@ fn long_import<'a, C: CoffHeader>(
     })?)
     .map_err(|e| fail(name, e))?;
     let dll = dlls.get(&descriptor).ok_or_else(|| {
-        fail(name, format_args!("no archive read so far has {descriptor}, the DLL {symbol} is from"))
+        fail(
+            name,
+            format_args!("no archive read so far has {descriptor}, the DLL {symbol} is from"),
+        )
     })?;
     let header = headers.get(section).ok_or_else(|| fail(name, "no .idata$5"))?;
     let thunk = header.coff_data(data).map_err(|()| fail(name, "a truncated .idata$5"))?;
@@ -1439,10 +1581,10 @@ fn long_import<'a, C: CoffHeader>(
                 .symbol(SymbolIndex(relocation.symbol_table_index.get(LE) as usize))
                 .map_err(|e| fail(name, e))?;
             let number = target.section_number().0;
-            let names = (number > 0)
-                .then(|| headers.get(number as usize - 1))
-                .flatten()
-                .ok_or_else(|| fail(name, format_args!("the import name of {symbol} is in no section")))?;
+            let names =
+                (number > 0).then(|| headers.get(number as usize - 1)).flatten().ok_or_else(
+                    || fail(name, format_args!("the import name of {symbol} is in no section")),
+                )?;
             let bytes = names.coff_data(data).map_err(|()| fail(name, "a truncated .idata$6"))?;
             let addend = u64_at(thunk, 0).ok_or_else(|| fail(name, "a truncated .idata$5"))?;
             let at = usize::try_from(addend)
@@ -1456,7 +1598,10 @@ fn long_import<'a, C: CoffHeader>(
         None => {
             let value = u64_at(thunk, 0).ok_or_else(|| fail(name, "a truncated .idata$5"))?;
             if value & pe::IMAGE_ORDINAL_FLAG64 == 0 {
-                return Err(fail(name, format_args!("the import of {symbol} has neither a name nor an ordinal")));
+                return Err(fail(
+                    name,
+                    format_args!("the import of {symbol} has neither a name nor an ordinal"),
+                ));
             }
             ImportName::Ordinal(value as u16).version()
         }
@@ -1466,9 +1611,13 @@ fn long_import<'a, C: CoffHeader>(
         let number = it.section_number().0;
         it.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
             && number > 0
-            && it.name(strings).is_ok_and(|it| it == stripped && !it.starts_with(super::IMP.as_bytes()))
+            && it
+                .name(strings)
+                .is_ok_and(|it| it == stripped && !it.starts_with(super::IMP.as_bytes()))
             && headers.get(number as usize - 1).is_some_and(|header| {
-                header.characteristics.get(LE).0 & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0
+                header.characteristics.get(LE).0
+                    & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0)
+                    != 0
             })
     });
     let kind = if code { SymbolKind::Function } else { SymbolKind::Data };

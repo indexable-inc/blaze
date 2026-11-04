@@ -38,7 +38,13 @@
 
 #![feature(allocator_api)]
 #![cfg_attr(test, feature(hashmap_internals))]
-#![cfg_attr(test, allow(internal_features, reason = "std's SipHasher13, the reference `sip`'s tests check against"))]
+#![cfg_attr(
+    test,
+    allow(
+        internal_features,
+        reason = "std's SipHasher13, the reference `sip`'s tests check against"
+    )
+)]
 
 use std::hash::{BuildHasher, Hasher};
 

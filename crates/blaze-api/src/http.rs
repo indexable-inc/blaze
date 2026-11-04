@@ -144,9 +144,15 @@ pub struct RequestParser {
 enum RequestState {
     Head(HeadScan),
     /// The head, checked, is `bytes[start..end]`; its body is being read.
-    Body { start: usize, end: usize, body: BodyRead },
+    Body {
+        start: usize,
+        end: usize,
+        body: BodyRead,
+    },
     /// A request was lent out of `bytes[..used]` (and `chunked`): dropped at the next call.
-    Lent { used: usize },
+    Lent {
+        used: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -404,7 +410,17 @@ impl ResponseParser {
         // alloc: none until a push; once per response, a client's.
         let (bytes, out) = (Vec::new(), Vec::new());
         let (scan, body) = (HeadScan::default(), ResponseBody::Done);
-        ResponseParser { most_body, bytes, scan, head: None, body, out, decoded: 0, ended: false, broken: None }
+        ResponseParser {
+            most_body,
+            bytes,
+            scan,
+            head: None,
+            body,
+            out,
+            decoded: 0,
+            ended: false,
+            broken: None,
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), HttpError> {
@@ -698,7 +714,8 @@ fn framing<'a>(
             }
             let number = !value.is_empty() && value.bytes().all(|it| it.is_ascii_digit());
             let len = value.parse::<u64>().ok().filter(|_| number);
-            let len = len.ok_or_else(|| HttpError::new(400, "a Content-Length that is not a number"))?;
+            let len =
+                len.ok_or_else(|| HttpError::new(400, "a Content-Length that is not a number"))?;
             length = Some(len);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if chunked {
@@ -1014,7 +1031,9 @@ pub fn read_response(from: &mut impl io::Read, most_body: usize) -> io::Result<H
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        parser.push(&buffer[..read]).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        parser
+            .push(&buffer[..read])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         // The parser's first piece is taken whole, not copied.
         match body.is_empty() {
             true => body = parser.take_body(),

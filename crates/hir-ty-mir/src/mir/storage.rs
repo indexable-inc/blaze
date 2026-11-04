@@ -49,7 +49,11 @@ impl StorageConflicts {
 
     /// [`Self::conflict`] of the first `count` locals as a matrix in `frame`, for
     /// [`share_greedily`]: no local conflicts with itself there.
-    pub fn matrix_in<'f>(&self, count: usize, frame: &'f Frame) -> BitMatrix<usize, Vec<u64, &'f Frame>> {
+    pub fn matrix_in<'f>(
+        &self,
+        count: usize,
+        frame: &'f Frame,
+    ) -> BitMatrix<usize, Vec<u64, &'f Frame>> {
         let mut data = Vec::with_capacity_in(count * words_for(count), frame);
         data.resize(count * words_for(count), 0);
         let mut matrix = BitMatrix::from_words(count, count, data);
@@ -93,7 +97,8 @@ pub fn share_greedily<'f, S: Words>(
     let row_words = conflicts.row_words();
     let mut words = Vec::with_capacity_in(count * row_words, frame);
     words.resize(count * row_words, 0);
-    let mut groups: BitMatrix<usize, Vec<u64, &Frame>> = BitMatrix::from_words(count, row_words * 64, words);
+    let mut groups: BitMatrix<usize, Vec<u64, &Frame>> =
+        BitMatrix::from_words(count, row_words * 64, words);
     let mut group_of = Vec::with_capacity_in(count, frame);
     group_of.resize(count, 0);
     let mut first = Vec::new_in(frame);
@@ -470,8 +475,7 @@ mod tests {
             conflicts.insert(b, a);
         }
         frame::task(Tag::Mir, |scratch| {
-            let shared =
-                share_greedily(&[(0, 8), (1, 16), (2, 8), (3, 4)], &conflicts, scratch);
+            let shared = share_greedily(&[(0, 8), (1, 16), (2, 8), (3, 4)], &conflicts, scratch);
             // Largest first: row 1 opens a group, row 0 opens the next (ties by row), row 2
             // joins row 0's, row 3 joins row 1's, the first it fits.
             assert_eq!(&shared.group_of[..], &[1, 0, 1, 0]);

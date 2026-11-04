@@ -89,7 +89,11 @@ pub(super) struct Indexed<'a> {
 }
 
 /// Each index the module docs find in the body of `analysis`, written in the file, in order.
-pub(super) fn scan(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, mut f: impl FnMut(Indexed<'_>)) {
+pub(super) fn scan(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    mut f: impl FnMut(Indexed<'_>),
+) {
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return };
     let db = cx.db();
     let body = analysis.body();
@@ -106,7 +110,9 @@ pub(super) fn scan(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, mut f: imp
         let Expr::Call { args: [head], .. } = body.expr(iterator) else { continue };
         let Some(end) = range_end(db, analysis, *head) else { continue };
         let Some((var, loop_body)) = loop_var(body, inner) else { continue };
-        let (Some(end_range), Some(loop_range)) = (analysis.expr_range(end), analysis.expr_range(for_)) else {
+        let (Some(end_range), Some(loop_range)) =
+            (analysis.expr_range(end), analysis.expr_range(for_))
+        else {
             continue;
         };
         let bound = cx.snippet(end_range).trim();
@@ -116,14 +122,21 @@ pub(super) fn scan(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, mut f: imp
         while let Some(at) = stack.pop() {
             body.walk_child_exprs(at, |child| stack.push(child));
             let Expr::Index { base, index } = body.expr(at) else { continue };
-            if !indexed_by(cx, def, body, index, var) || !loops::written(analysis, at) || !place(body, base) {
+            if !indexed_by(cx, def, body, index, var)
+                || !loops::written(analysis, at)
+                || !place(body, base)
+            {
                 continue;
             }
             let ty = analysis.ty(analysis.infer().expr_ty(base)).strip_references();
             if !(ty.is_slice() || (ty.as_adt().is_some() && ty.as_adt() == vec)) {
                 continue;
             }
-            let (Some(base_range), Some(range)) = (analysis.expr_range(base), analysis.expr_range(at)) else { continue };
+            let (Some(base_range), Some(range)) =
+                (analysis.expr_range(base), analysis.expr_range(at))
+            else {
+                continue;
+            };
             let place = cx.snippet(base_range).trim();
             let len = format!("{place}.len()");
             let proven = bound.contains(&len) || proven_before(before, place, &len, bound);
@@ -154,7 +167,13 @@ fn loop_var(body: &Body, inner: ExprId) -> Option<(BindingId, ExprId)> {
 }
 
 /// Whether `index` is `var`, or `var + k` / `k + var` with `k` a literal or another local.
-fn indexed_by(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, index: ExprId, var: BindingId) -> bool {
+fn indexed_by(
+    cx: &Cx<'_, '_>,
+    def: DefWithBodyId,
+    body: &Body,
+    index: ExprId,
+    var: BindingId,
+) -> bool {
     let db = cx.db();
     let is_var = |it: ExprId| local_of(db, def, body, it) == Some(var);
     let offset = |it: ExprId| match body.expr(it) {

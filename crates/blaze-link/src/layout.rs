@@ -61,7 +61,8 @@ impl Heat {
         calls: impl IntoIterator<Item = (InstanceKey, InstanceKey, u64)>,
     ) -> Heat {
         // alloc: once per profile, the heat its caller keeps across links
-        let mut functions: Vec<(InstanceKey, u64)> = functions.into_iter().filter(|it| it.1 != 0).collect();
+        let mut functions: Vec<(InstanceKey, u64)> =
+            functions.into_iter().filter(|it| it.1 != 0).collect();
         functions.sort_unstable_by_key(|it| it.0);
         functions.dedup_by(|later, kept| {
             let same = later.0 == kept.0;
@@ -71,7 +72,8 @@ impl Heat {
             same
         });
         // alloc: once per profile, as above
-        let mut calls: Vec<(InstanceKey, InstanceKey, u64)> = calls.into_iter().filter(|it| it.2 != 0).collect();
+        let mut calls: Vec<(InstanceKey, InstanceKey, u64)> =
+            calls.into_iter().filter(|it| it.2 != 0).collect();
         calls.sort_unstable_by_key(|it| (it.0, it.1));
         calls.dedup_by(|later, kept| {
             let same = (later.0, later.1) == (kept.0, kept.1);
@@ -195,7 +197,11 @@ fn leader_of(leader: &mut [u32], mut at: u32) -> u32 {
 
 /// The order of `functions` (instance key and code size, any order, keys once each) given
 /// the heat and the cold set (sorted, once each).
-pub(crate) fn order(functions: &mut [(InstanceKey, u64)], heat: Option<&Heat>, cold: &[InstanceKey]) -> Order {
+pub(crate) fn order(
+    functions: &mut [(InstanceKey, u64)],
+    heat: Option<&Heat>,
+    cold: &[InstanceKey],
+) -> Order {
     functions.sort_unstable_by_key(|it| it.0);
     let n = functions.len();
     let index = |key: &InstanceKey| functions.binary_search_by_key(key, |it| it.0).ok();
@@ -237,10 +243,13 @@ pub(crate) fn order(functions: &mut [(InstanceKey, u64)], heat: Option<&Heat>, c
     let mut next: Vec<u32> = (0..n as u32).collect();
     let mut prev = next.clone();
     let mut leader = next.clone();
-    let nodes: Vec<u32> = (0..n as u32).filter(|at| profiled[*at as usize] && size[*at as usize] > 0).collect();
+    let nodes: Vec<u32> =
+        (0..n as u32).filter(|at| profiled[*at as usize] && size[*at as usize] > 0).collect();
     let mut sorted = nodes.clone();
     // Densest first; a stable sort, so equal densities keep instance-key order.
-    sorted.sort_by(|a, b| density((weight[*b as usize], size[*b as usize]), (weight[*a as usize], size[*a as usize])));
+    sorted.sort_by(|a, b| {
+        density((weight[*b as usize], size[*b as usize]), (weight[*a as usize], size[*a as usize]))
+    });
     for at in sorted {
         let l = at as usize;
         let (from, edge) = best[l];
@@ -254,7 +263,9 @@ pub(crate) fn order(functions: &mut [(InstanceKey, u64)], heat: Option<&Heat>, c
         }
         // The merged cluster's density under an eighth of the caller's cluster's.
         let merged = u128::from(weight[p]) + u128::from(weight[l]);
-        if merged * u128::from(size[p]) * MAX_DEGRADATION < u128::from(weight[p]) * u128::from(size[p] + size[l]) {
+        if merged * u128::from(size[p]) * MAX_DEGRADATION
+            < u128::from(weight[p]) * u128::from(size[p] + size[l])
+        {
             continue;
         }
         leader[l] = p as u32;
@@ -270,8 +281,11 @@ pub(crate) fn order(functions: &mut [(InstanceKey, u64)], heat: Option<&Heat>, c
         weight[l] = 0;
     }
     // alloc: as above
-    let mut clusters: Vec<u32> = nodes.iter().copied().filter(|at| size[*at as usize] > 0).collect();
-    clusters.sort_by(|a, b| density((weight[*b as usize], size[*b as usize]), (weight[*a as usize], size[*a as usize])));
+    let mut clusters: Vec<u32> =
+        nodes.iter().copied().filter(|at| size[*at as usize] > 0).collect();
+    clusters.sort_by(|a, b| {
+        density((weight[*b as usize], size[*b as usize]), (weight[*a as usize], size[*a as usize]))
+    });
     // alloc: once per full link, the order the layout looks keys up in
     let mut keys: Vec<(InstanceKey, u64)> = Vec::with_capacity(nodes.len() + cold.len());
     for head in &clusters {
@@ -308,7 +322,11 @@ mod tests {
     }
 
     /// The functions in the order their keys sort them, ties by instance key as content does.
-    fn laid_out(functions: &[(InstanceKey, u64)], heat: Option<&Heat>, cold: &[InstanceKey]) -> Vec<InstanceKey> {
+    fn laid_out(
+        functions: &[(InstanceKey, u64)],
+        heat: Option<&Heat>,
+        cold: &[InstanceKey],
+    ) -> Vec<InstanceKey> {
         let mut cold = cold.to_vec();
         cold.sort_unstable();
         cold.dedup();
@@ -334,9 +352,15 @@ mod tests {
     #[test]
     fn cold_goes_last_unless_the_profile_saw_it_run() {
         let functions: Vec<_> = (1..=5).map(|n| (key(n), 32)).collect();
-        assert_eq!(laid_out(&functions, None, &[key(4), key(2), key(4)]), [key(1), key(3), key(5), key(2), key(4)]);
+        assert_eq!(
+            laid_out(&functions, None, &[key(4), key(2), key(4)]),
+            [key(1), key(3), key(5), key(2), key(4)]
+        );
         let heat = Heat::new([(key(4), 10)], []);
-        assert_eq!(laid_out(&functions, Some(&heat), &[key(4), key(2)]), [key(4), key(1), key(3), key(5), key(2)]);
+        assert_eq!(
+            laid_out(&functions, Some(&heat), &[key(4), key(2)]),
+            [key(4), key(1), key(3), key(5), key(2)]
+        );
     }
 
     /// The same functions, heat and cold set give the same order and heat id whatever order
@@ -354,7 +378,10 @@ mod tests {
         backwards.reverse();
         let mut cold_backwards = cold;
         cold_backwards.reverse();
-        assert_eq!(laid_out(&functions, Some(&heat), &cold), laid_out(&backwards, Some(&reversed), &cold_backwards));
+        assert_eq!(
+            laid_out(&functions, Some(&heat), &cold),
+            laid_out(&backwards, Some(&reversed), &cold_backwards)
+        );
     }
 
     /// A merge that would grow a cluster past 1 MiB is not made.

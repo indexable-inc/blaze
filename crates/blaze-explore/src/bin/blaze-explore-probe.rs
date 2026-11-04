@@ -17,7 +17,9 @@ use std::{
 };
 
 use blaze_explore::cert::{Cert, Validity};
-use wtransport::{Connection, Endpoint, RecvStream, SendStream, ServerConfig, endpoint::IncomingSession};
+use wtransport::{
+    Connection, Endpoint, RecvStream, SendStream, ServerConfig, endpoint::IncomingSession,
+};
 
 /// Where the probe page is published: indexable-inc/ix serves `probe/index.html` there.
 const PAGE: &str = "https://ix.dev/explore/probe";
@@ -49,24 +51,35 @@ fn input() -> Result<Input, String> {
     let mut args = std::env::args().skip(1);
     let text = match (args.next(), args.next()) {
         (None, _) => "{}".to_owned(),
-        (Some(_), Some(extra)) => return Err(format!("it takes one JSON value, and `{extra}` is a second")),
+        (Some(_), Some(extra)) => {
+            return Err(format!("it takes one JSON value, and `{extra}` is a second"));
+        }
         (Some(arg), None) if arg == "-" => {
             let mut text = String::new();
             std::io::stdin().read_to_string(&mut text).map_err(|why| format!("stdin: {why}"))?;
             text
         }
         (Some(arg), None) if arg.trim_start().starts_with('{') => arg,
-        (Some(path), None) => std::fs::read_to_string(&path).map_err(|why| format!("{path}: {why}"))?,
+        (Some(path), None) => {
+            std::fs::read_to_string(&path).map_err(|why| format!("{path}: {why}"))?
+        }
     };
-    serde_json::from_str(&text).map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\"}}: {why}"))
+    serde_json::from_str(&text)
+        .map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\"}}: {why}"))
 }
 
 fn run() -> Result<(), String> {
     let input = input()?;
     if !input.page.starts_with("https://") {
-        return Err(format!("the page `{}` is not https: a browser opens WebTransport only from a secure page", input.page));
+        return Err(format!(
+            "the page `{}` is not https: a browser opens WebTransport only from a secure page",
+            input.page
+        ));
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|why| format!("the wall clock: {why}"))?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|why| format!("the wall clock: {why}"))?
+        .as_secs();
     let cert = Cert::make(Validity::starting(now)).map_err(|why| why.to_string())?;
     let identity = cert.identity().map_err(|why| why.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -82,10 +95,14 @@ async fn serve(input: &Input, identity: wtransport::Identity, cert: &Cert) -> Re
         .with_identity(identity)
         .keep_alive_interval(Some(Duration::from_secs(5)))
         .build();
-    let endpoint = Endpoint::server(config).map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
+    let endpoint = Endpoint::server(config)
+        .map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
     let port = endpoint.local_addr().map_err(|why| format!("the bound port: {why}"))?.port();
     println!("{}#127.0.0.1:{port}/{}", input.page, cert.hash);
-    println!("certificate valid until {} (Unix seconds); Ctrl-C stops the probe", cert.validity.not_after_s);
+    println!(
+        "certificate valid until {} (Unix seconds); Ctrl-C stops the probe",
+        cert.validity.not_after_s
+    );
     loop {
         tokio::spawn(echo(endpoint.accept().await));
     }

@@ -95,7 +95,10 @@ pub(crate) mod tests {
                     self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
                     Ok(())
                 }
-                None => Err(Stop(format!("wrote {} bytes at {addr:#x}, outside its memory", bytes.len()))),
+                None => Err(Stop(format!(
+                    "wrote {} bytes at {addr:#x}, outside its memory",
+                    bytes.len()
+                ))),
             }
         }
 

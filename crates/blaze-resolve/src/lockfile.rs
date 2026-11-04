@@ -11,8 +11,8 @@ use std::str::FromStr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use serde::{Deserialize, de};
+use std::alloc::Global;
 use url::Url;
 
 use crate::graph::Graph;
@@ -260,7 +260,11 @@ pub fn into_resolve(
     };
 
     // name -> version -> source -> id, to find the ids of edges written briefly.
-    let mut map: HashMap<&str, HashMap<String, HashMap<SourceId, PackageId, Global>, Global>, Global> = HashMap::new_in(Global);
+    let mut map: HashMap<
+        &str,
+        HashMap<String, HashMap<SourceId, PackageId, Global>, Global>,
+        Global,
+    > = HashMap::new_in(Global);
     for (id, _) in live_pkgs.values() {
         map.entry(id.name().as_str())
             .or_default()

@@ -7,10 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use hir_expand::fixture;
 
-use crate::{
-    nameres::crate_def_map,
-    test_db::TestDBExt,
-};
+use crate::{nameres::crate_def_map, test_db::TestDBExt};
 
 #[test]
 fn a_module_id_kept_past_its_deletion_panics_or_reads_a_module() {

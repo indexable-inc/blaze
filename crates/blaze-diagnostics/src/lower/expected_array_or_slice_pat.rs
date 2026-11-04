@@ -56,7 +56,9 @@ fn suggest<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>, diag: &
     {
         return;
     }
-    let Some(origin) = origin(cx, cx.syntax_view(d.pat.map(|it| it.syntax_node_ptr()))) else { return };
+    let Some(origin) = origin(cx, cx.syntax_view(d.pat.map(|it| it.syntax_node_ptr()))) else {
+        return;
+    };
     let Some(root) = cx.vsema.type_of_expr(origin.expr.value).map(|it| it.original) else {
         return;
     };
@@ -77,13 +79,17 @@ fn suggest<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>, diag: &
 
 /// rustc's `is_slice_or_array_or_vector`: whether `ty` behind its references is a `Vec`, an
 /// array or a slice, and `ty` without them.
-fn slice_or_array_or_vector<'db>(cx: &Cx<'_, 'db>, mut ty: hir::Type<'db>) -> (bool, hir::Type<'db>) {
+fn slice_or_array_or_vector<'db>(
+    cx: &Cx<'_, 'db>,
+    mut ty: hir::Type<'db>,
+) -> (bool, hir::Type<'db>) {
     while let Some((inner, _)) = ty.as_reference() {
         ty = inner;
     }
     let vec = match ty.as_adt() {
         Some(hir::Adt::Struct(it)) => {
-            it.name(cx.db) == sym::Vec && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Alloc)
+            it.name(cx.db) == sym::Vec
+                && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Alloc)
         }
         _ => false,
     };
@@ -112,8 +118,9 @@ fn origin<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<Origin<
     for ancestor in cx.vsema.ancestors_with_macros_file(node).skip(1) {
         let it = ancestor.value;
         let top_level = depth == 0;
-        let found =
-            |expr: Option<ast::Expr<'db>>| expr.map(|expr| Origin { expr: ancestor.with_value(expr), top_level });
+        let found = |expr: Option<ast::Expr<'db>>| {
+            expr.map(|expr| Origin { expr: ancestor.with_value(expr), top_level })
+        };
         let kind = it.kind();
         if is_pat {
             match kind {

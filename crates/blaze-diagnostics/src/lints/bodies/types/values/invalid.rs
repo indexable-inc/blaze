@@ -5,7 +5,6 @@
 //! `variant_find_init_error`) and `compiler/rustc_lint/src/lints.rs`
 //! (`BuiltinUnpermittedTypeInit`) (MIT or Apache-2.0).
 
-use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
 use hir_def::{
@@ -13,6 +12,7 @@ use hir_def::{
     hir::{Expr, ExprId, Literal},
     src::{HasChildSourceView as _, HasSource as _},
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::{
     ParamEnvAndCrate,
     consteval::try_const_usize,
@@ -26,7 +26,7 @@ use syntax::view::AstNode as _;
 use super::inhabited::{Pred, Preds};
 use crate::{
     cx::def_range_view,
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -81,7 +81,8 @@ impl LatePass for InvalidValue {
             layouts: Vec::new(),
         };
         let Some(err) = cx.ty_find_init_error(conjured, init) else { return };
-        let (Some(span), Some(node), Some(ty)) = (util::span(b, expr), b.expr_node(expr), super::print(b, expr, conjured))
+        let (Some(span), Some(node), Some(ty)) =
+            (util::span(b, expr), b.expr_node(expr), super::print(b, expr, conjured))
         else {
             return;
         };
@@ -187,15 +188,27 @@ impl<'db> InitCx<'_, '_, 'db> {
             TyKind::RawPtr(pointee, _) if matches!(pointee.kind(), TyKind::Dynamic(..)) => {
                 Some(InitError::new("the vtable of a wide raw pointer must be non-null"))
             }
-            TyKind::Bool if uninit => Some(InitError::new("booleans must be either `true` or `false`")),
-            TyKind::Char if uninit => Some(InitError::new("characters must be a valid Unicode codepoint")),
-            TyKind::Int(_) | TyKind::Uint(_) if uninit => Some(InitError::new("integers must be initialized")),
+            TyKind::Bool if uninit => {
+                Some(InitError::new("booleans must be either `true` or `false`"))
+            }
+            TyKind::Char if uninit => {
+                Some(InitError::new("characters must be a valid Unicode codepoint"))
+            }
+            TyKind::Int(_) | TyKind::Uint(_) if uninit => {
+                Some(InitError::new("integers must be initialized"))
+            }
             TyKind::Float(_) if uninit => Some(InitError::new("floats must be initialized")),
-            TyKind::RawPtr(..) if uninit => Some(InitError::new("raw pointers must be initialized")),
+            TyKind::RawPtr(..) if uninit => {
+                Some(InitError::new("raw pointers must be initialized"))
+            }
             TyKind::Adt(def, args) if !def.is_union() => match def.def_id() {
-                AdtId::StructId(it) => {
-                    self.variant_find_init_error(ty, VariantId::StructId(it), args, "struct field", init)
-                }
+                AdtId::StructId(it) => self.variant_find_init_error(
+                    ty,
+                    VariantId::StructId(it),
+                    args,
+                    "struct field",
+                    init,
+                ),
                 AdtId::EnumId(it) => self.enum_find_init_error(ty, it, args, init),
                 AdtId::UnionId(_) => None,
             },
@@ -218,7 +231,8 @@ impl<'db> InitCx<'_, '_, 'db> {
     ) -> Option<InitError> {
         let db = self.b.db();
         let source = def.lookup(db).source_view(db);
-        let span = self.b.cx.span(InFile::new(source.file_id, def_range_view(source.value.syntax())));
+        let span =
+            self.b.cx.span(InFile::new(source.file_id, def_range_view(source.value.syntax())));
         // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         let mut potential = Vec::new();
         for &(variant, _) in def.enum_variants(db).variants.values() {
@@ -270,7 +284,10 @@ impl<'db> InitCx<'_, '_, 'db> {
             let Some(mut err) = self.ty_find_init_error(field_ty, init) else { continue };
             if local {
                 let source = variant.child_source_view(db, field);
-                let node = source.value.expect("a local variant's field has a node").either(|it| it.syntax(), |it| it.syntax());
+                let node = source
+                    .value
+                    .expect("a local variant's field has a node")
+                    .either(|it| it.syntax(), |it| it.syntax());
                 let span = b.cx.span(InFile::new(source.file_id, def_range_view(node)));
                 if err.0[0].1.is_none() {
                     err.0[0].1 = Some(span);
@@ -278,7 +295,8 @@ impl<'db> InitCx<'_, '_, 'db> {
                     err.0[0].0.push_str(&format!(" (in this {descr})"));
                 } else {
                     // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
-                    err = InitError::new(format!("in this {descr}")).spanned(span).nested(Some(err));
+                    err =
+                        InitError::new(format!("in this {descr}")).spanned(span).nested(Some(err));
                 }
             }
             field_err = Some(err);

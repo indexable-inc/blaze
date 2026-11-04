@@ -55,36 +55,179 @@ pub enum Intrinsic {
     MaximumNumberNsz(FloatWidth),
     /// `minimum_number_nsz_f16` to `minimum_number_nsz_f128`.
     MinimumNumberNsz(FloatWidth),
-    AbortImmediate, AddWithOverflow, AggregateRawPtr, AlignOf, AlignOfVal, AmdgpuDispatchPtr,
-    ArithOffset, AssertInhabited, AssertMemUninitializedValid, AssertZeroValid, Assume, Autodiff,
-    Bitreverse, BlackBox, BoxNew, Breakpoint, Bswap, CallerLocation, CarryingMulAdd, CarrylessMul,
-    CatchUnwind, Ceil, CodeviewAnnotation, ColdPath, CompareBytes, ConstAllocate, ConstDeallocate,
-    ConstEvalSelect, ConstMakeGlobal, ContractCheckEnsures, ContractCheckRequires, Copy,
-    CopyNonoverlapping, Cos, Ctlz, CtlzNonzero, Ctpop, Cttz, CttzNonzero, DiscriminantValue,
-    DisjointBitor, ExactDiv, Exp, Exp2, Fabs, FaddAlgebraic, FaddFast, FdivAlgebraic, FdivFast,
-    FieldOffset, FieldRepresentingTypeActualTypeId, FieldRepresentingTypeName,
-    FieldRepresentingTypeOffset, FloatToIntUnchecked, Floor, Fma, FmulAlgebraic, FmulFast, Fmuladd,
-    Forget, FremAlgebraic, FremFast, FsubAlgebraic, FsubFast, GpuLaunchSizedWorkgroupMem,
-    IntegerMax, IntegerMin, IsValStaticallyKnown, Log, Log10, Log2, MulWithOverflow, NeedsDrop,
-    NontemporalStore, Offload, OffloadGetNumDevices, Offset, OffsetOf, OverflowChecks, Powf, Powi,
-    PrefetchReadData, PrefetchReadInstruction, PrefetchWriteData, PrefetchWriteInstruction,
-    PtrGuaranteedCmp, PtrMask, PtrMetadata, PtrOffsetFrom, PtrOffsetFromUnsigned, RawEq,
-    ReadViaCopy, ReturnAddress, RotateLeft, RotateRight, Round, RoundTiesEven, RustcPeek,
-    SaturatingAdd, SaturatingSub, SelectUnpredictable, Sin, SizeOf, SizeOfVal, SliceGetUnchecked,
-    Sqrt, SubWithOverflow, SveTupleCreate2, SveTupleCreate3, SveTupleCreate4, SveTupleGet,
-    SveTupleSet, ThreeWayCompare, Transmute, TransmuteUnchecked, Trunc, TypeId, TypeIdArrayLen,
-    TypeIdElementTy, TypeIdEq, TypeIdFieldRepresentingType, TypeIdFields, TypeIdFunctionPtr,
-    TypeIdGenerics, TypeIdIsSigned, TypeIdNonExhaustive, TypeIdPointsMutably, TypeIdPointsTo,
-    TypeIdSizeOf, TypeIdTypeOf, TypeIdVariantName, TypeIdVariantNonExhaustive, TypeIdVariants,
-    TypeIdVtable, TypeName, TypedSwapNonoverlapping, UbChecks, UnalignedVolatileLoad,
-    UnalignedVolatileStore, UncheckedAdd, UncheckedDiv, UncheckedFunnelShl, UncheckedFunnelShr,
-    UncheckedMul, UncheckedRem, UncheckedShl, UncheckedShr, UncheckedSub, Unreachable, VaArg,
-    VaCopy, VaEnd, VariantCount, VolatileCopyMemory, VolatileCopyNonoverlappingMemory,
-    VolatileLoad, VolatileSetMemory, VolatileStore, VtableAlign, VtableSize, WrappingAdd,
-    WrappingMul, WrappingSub, WriteBoxViaMove, WriteBytes, WriteViaMove,
+    AbortImmediate,
+    AddWithOverflow,
+    AggregateRawPtr,
+    AlignOf,
+    AlignOfVal,
+    AmdgpuDispatchPtr,
+    ArithOffset,
+    AssertInhabited,
+    AssertMemUninitializedValid,
+    AssertZeroValid,
+    Assume,
+    Autodiff,
+    Bitreverse,
+    BlackBox,
+    BoxNew,
+    Breakpoint,
+    Bswap,
+    CallerLocation,
+    CarryingMulAdd,
+    CarrylessMul,
+    CatchUnwind,
+    Ceil,
+    CodeviewAnnotation,
+    ColdPath,
+    CompareBytes,
+    ConstAllocate,
+    ConstDeallocate,
+    ConstEvalSelect,
+    ConstMakeGlobal,
+    ContractCheckEnsures,
+    ContractCheckRequires,
+    Copy,
+    CopyNonoverlapping,
+    Cos,
+    Ctlz,
+    CtlzNonzero,
+    Ctpop,
+    Cttz,
+    CttzNonzero,
+    DiscriminantValue,
+    DisjointBitor,
+    ExactDiv,
+    Exp,
+    Exp2,
+    Fabs,
+    FaddAlgebraic,
+    FaddFast,
+    FdivAlgebraic,
+    FdivFast,
+    FieldOffset,
+    FieldRepresentingTypeActualTypeId,
+    FieldRepresentingTypeName,
+    FieldRepresentingTypeOffset,
+    FloatToIntUnchecked,
+    Floor,
+    Fma,
+    FmulAlgebraic,
+    FmulFast,
+    Fmuladd,
+    Forget,
+    FremAlgebraic,
+    FremFast,
+    FsubAlgebraic,
+    FsubFast,
+    GpuLaunchSizedWorkgroupMem,
+    IntegerMax,
+    IntegerMin,
+    IsValStaticallyKnown,
+    Log,
+    Log10,
+    Log2,
+    MulWithOverflow,
+    NeedsDrop,
+    NontemporalStore,
+    Offload,
+    OffloadGetNumDevices,
+    Offset,
+    OffsetOf,
+    OverflowChecks,
+    Powf,
+    Powi,
+    PrefetchReadData,
+    PrefetchReadInstruction,
+    PrefetchWriteData,
+    PrefetchWriteInstruction,
+    PtrGuaranteedCmp,
+    PtrMask,
+    PtrMetadata,
+    PtrOffsetFrom,
+    PtrOffsetFromUnsigned,
+    RawEq,
+    ReadViaCopy,
+    ReturnAddress,
+    RotateLeft,
+    RotateRight,
+    Round,
+    RoundTiesEven,
+    RustcPeek,
+    SaturatingAdd,
+    SaturatingSub,
+    SelectUnpredictable,
+    Sin,
+    SizeOf,
+    SizeOfVal,
+    SliceGetUnchecked,
+    Sqrt,
+    SubWithOverflow,
+    SveTupleCreate2,
+    SveTupleCreate3,
+    SveTupleCreate4,
+    SveTupleGet,
+    SveTupleSet,
+    ThreeWayCompare,
+    Transmute,
+    TransmuteUnchecked,
+    Trunc,
+    TypeId,
+    TypeIdArrayLen,
+    TypeIdElementTy,
+    TypeIdEq,
+    TypeIdFieldRepresentingType,
+    TypeIdFields,
+    TypeIdFunctionPtr,
+    TypeIdGenerics,
+    TypeIdIsSigned,
+    TypeIdNonExhaustive,
+    TypeIdPointsMutably,
+    TypeIdPointsTo,
+    TypeIdSizeOf,
+    TypeIdTypeOf,
+    TypeIdVariantName,
+    TypeIdVariantNonExhaustive,
+    TypeIdVariants,
+    TypeIdVtable,
+    TypeName,
+    TypedSwapNonoverlapping,
+    UbChecks,
+    UnalignedVolatileLoad,
+    UnalignedVolatileStore,
+    UncheckedAdd,
+    UncheckedDiv,
+    UncheckedFunnelShl,
+    UncheckedFunnelShr,
+    UncheckedMul,
+    UncheckedRem,
+    UncheckedShl,
+    UncheckedShr,
+    UncheckedSub,
+    Unreachable,
+    VaArg,
+    VaCopy,
+    VaEnd,
+    VariantCount,
+    VolatileCopyMemory,
+    VolatileCopyNonoverlappingMemory,
+    VolatileLoad,
+    VolatileSetMemory,
+    VolatileStore,
+    VtableAlign,
+    VtableSize,
+    WrappingAdd,
+    WrappingMul,
+    WrappingSub,
+    WriteBoxViaMove,
+    WriteBytes,
+    WriteViaMove,
     /// `core::reflect`'s (`#![feature(blaze_comptime)]`), answered only by blaze's const
     /// evaluator: each is called from a constant's initializer alone.
-    BlazeAdtName, BlazeFieldAttrs, BlazeFieldIndex, BlazeVariantDiscriminant, BlazeVariantIndex,
+    BlazeAdtName,
+    BlazeFieldAttrs,
+    BlazeFieldIndex,
+    BlazeVariantDiscriminant,
+    BlazeVariantIndex,
     /// `core::num::arbitrary`'s (`#![blaze::arbitrary_ints]`): `x as D` between two integer
     /// types of any width, which the const evaluator and the code generator both answer.
     BlazeIntCast,
@@ -97,8 +240,23 @@ const _: () = assert!(size_of::<Option<Intrinsic>>() == 2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AtomicOp {
-    And, Cxchg, CxchgWeak, Fence, Load, Max, Min, Nand, Or, SingleThreadFence, Store, Umax, Umin,
-    Xadd, Xchg, Xor, Xsub,
+    And,
+    Cxchg,
+    CxchgWeak,
+    Fence,
+    Load,
+    Max,
+    Min,
+    Nand,
+    Or,
+    SingleThreadFence,
+    Store,
+    Umax,
+    Umin,
+    Xadd,
+    Xchg,
+    Xor,
+    Xsub,
 }
 
 /// Where an atomic intrinsic's orderings are: in its const generic arguments, as the pinned
@@ -113,9 +271,21 @@ pub enum AtomicOrders {
     Release,
     AcqRel,
     SeqCst,
-    RelaxedRelaxed, RelaxedAcquire, RelaxedSeqCst, AcquireRelaxed, AcquireAcquire, AcquireSeqCst,
-    ReleaseRelaxed, ReleaseAcquire, ReleaseSeqCst, AcqRelRelaxed, AcqRelAcquire, AcqRelSeqCst,
-    SeqCstRelaxed, SeqCstAcquire, SeqCstSeqCst,
+    RelaxedRelaxed,
+    RelaxedAcquire,
+    RelaxedSeqCst,
+    AcquireRelaxed,
+    AcquireAcquire,
+    AcquireSeqCst,
+    ReleaseRelaxed,
+    ReleaseAcquire,
+    ReleaseSeqCst,
+    AcqRelRelaxed,
+    AcqRelAcquire,
+    AcqRelSeqCst,
+    SeqCstRelaxed,
+    SeqCstAcquire,
+    SeqCstSeqCst,
 }
 
 impl AtomicOrders {
@@ -197,10 +367,7 @@ pub fn atomic_orderings<'db>(
 
 /// The `AtomicOrdering` a const generic argument is: a value's variant index (core declares the
 /// variants in discriminant order), or what an unevaluated constant evaluates to.
-pub fn atomic_ordering_of<'db>(
-    db: &'db Db,
-    ordering: Const<'db>,
-) -> Option<AtomicOrdering> {
+pub fn atomic_ordering_of<'db>(db: &'db Db, ordering: Const<'db>) -> Option<AtomicOrdering> {
     let discriminant = match ordering.kind() {
         ConstKind::Value(value) => {
             let ValTreeKind::Branch(fields) = value.value.inner() else { return None };
@@ -219,14 +386,81 @@ pub fn atomic_ordering_of<'db>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SimdOp {
-    Add, And, ArithOffset, As, Bitmask, Bitreverse, Bswap, CarrylessMul, Cast, CastPtr, Ceil, Ctlz,
-    Ctpop, Cttz, Div, Eq, ExposeProvenance, Extract, ExtractDyn, Fabs, Fcos, Fexp, Fexp2, Flog,
-    Flog10, Flog2, Floor, Fma, Fsin, Fsqrt, FunnelShl, FunnelShr, Gather, Ge, Gt, Insert,
-    InsertDyn, Le, Lt, MaskedLoad, MaskedStore, MaximumNumberNsz, MinimumNumberNsz, Mul, Ne, Neg,
-    Or, ReduceAddOrdered, ReduceAddUnordered, ReduceAll, ReduceAnd, ReduceAny, ReduceMax,
-    ReduceMin, ReduceMulOrdered, ReduceMulUnordered, ReduceOr, ReduceXor, RelaxedFma, Rem, Round,
-    RoundTiesEven, SaturatingAdd, SaturatingSub, Scatter, Select, SelectBitmask, Shl, Shr, Shuffle,
-    Splat, Sub, Trunc, WithExposedProvenance, Xor,
+    Add,
+    And,
+    ArithOffset,
+    As,
+    Bitmask,
+    Bitreverse,
+    Bswap,
+    CarrylessMul,
+    Cast,
+    CastPtr,
+    Ceil,
+    Ctlz,
+    Ctpop,
+    Cttz,
+    Div,
+    Eq,
+    ExposeProvenance,
+    Extract,
+    ExtractDyn,
+    Fabs,
+    Fcos,
+    Fexp,
+    Fexp2,
+    Flog,
+    Flog10,
+    Flog2,
+    Floor,
+    Fma,
+    Fsin,
+    Fsqrt,
+    FunnelShl,
+    FunnelShr,
+    Gather,
+    Ge,
+    Gt,
+    Insert,
+    InsertDyn,
+    Le,
+    Lt,
+    MaskedLoad,
+    MaskedStore,
+    MaximumNumberNsz,
+    MinimumNumberNsz,
+    Mul,
+    Ne,
+    Neg,
+    Or,
+    ReduceAddOrdered,
+    ReduceAddUnordered,
+    ReduceAll,
+    ReduceAnd,
+    ReduceAny,
+    ReduceMax,
+    ReduceMin,
+    ReduceMulOrdered,
+    ReduceMulUnordered,
+    ReduceOr,
+    ReduceXor,
+    RelaxedFma,
+    Rem,
+    Round,
+    RoundTiesEven,
+    SaturatingAdd,
+    SaturatingSub,
+    Scatter,
+    Select,
+    SelectBitmask,
+    Shl,
+    Shr,
+    Shuffle,
+    Splat,
+    Sub,
+    Trunc,
+    WithExposedProvenance,
+    Xor,
 }
 
 /// The float type a float intrinsic's name ends in.
@@ -250,6 +484,114 @@ impl FloatWidth {
     }
 }
 
+/// One of x86's gathers as LLVM names it, for the code generators and the evaluator to agree on
+/// what each is: AVX2's `llvm.x86.avx2.gather.{d,q}.{d,q,ps,pd}` (`.256` for 256 bits), whose
+/// mask is a vector, and AVX-512's `llvm.x86.avx512.gather.{d,q}p{d,s,q,i}.512` and, of 128 and
+/// 256 bits, `llvm.x86.avx512.gather3{s,d}iv{2,4,8}.{si,di,sf,df}`, whose mask is an integer,
+/// as `core::arch` calls them. Every one takes `(src, base: *const i8, offsets, mask, scale)`,
+/// `scale` a constant of 1, 2, 4 or 8. Lane `i` of the result is the lane at `base +
+/// offsets[i] * scale`, the index sign-extended, where the mask enables it (bit `i` of an
+/// integer mask, the sign bit of lane `i` of a vector one), and `src`'s lane `i` where it does
+/// not, with no memory read for it; lanes past those gathered are zero (a gather of two by
+/// qword index into a vector of four dword lanes leaves the upper two zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct X86Gather {
+    /// The bytes of an index: 4 (`d`) or 8 (`q`).
+    pub index: u32,
+    /// The bytes of a lane of `src` and of the result: 4 or 8.
+    pub lane: u32,
+    /// Whether the lanes are floats (`ps`, `pd`): which instruction it is, not what it does.
+    pub float: bool,
+    /// Whether the mask is a vector of lanes like `src`'s (AVX2), not an integer of bits.
+    pub vector_mask: bool,
+    /// The bytes of the wider of `src` and `offsets`: 16, 32 or 64.
+    pub width: u32,
+}
+
+impl X86Gather {
+    /// The gather `name` (without `llvm.`) is, or `None` for any other intrinsic.
+    pub fn of(name: &str) -> Option<X86Gather> {
+        let int = |bytes: u32| (bytes, false);
+        let float = |bytes: u32| (bytes, true);
+        let index = |letter: &str| match letter {
+            "d" => Some(4),
+            "q" => Some(8),
+            _ => None,
+        };
+        let (index, (lane, float), vector_mask, width) =
+            if let Some(rest) = name.strip_prefix("x86.avx2.gather.") {
+                let (rest, width) = match rest.strip_suffix(".256") {
+                    Some(rest) => (rest, 32),
+                    None => (rest, 16),
+                };
+                let (by, lanes) = rest.split_once('.')?;
+                let lanes = match lanes {
+                    "d" => int(4),
+                    "q" => int(8),
+                    "ps" => float(4),
+                    "pd" => float(8),
+                    _ => return None,
+                };
+                (index(by)?, lanes, true, width)
+            } else if let Some(rest) = name.strip_prefix("x86.avx512.gather.") {
+                let (by, lanes) = rest.strip_suffix(".512")?.split_once('p')?;
+                let lanes = match lanes {
+                    "i" => int(4),
+                    "q" => int(8),
+                    "s" => float(4),
+                    "d" => float(8),
+                    _ => return None,
+                };
+                (index(by)?, lanes, false, 64)
+            } else if let Some(rest) = name.strip_prefix("x86.avx512.gather3") {
+                // `siv4.si`: dword (`s`) or qword (`d`) indices, a count and the lanes, whose
+                // product of the two is the wider vector's bytes.
+                let (shape, lanes) = rest.split_once('.')?;
+                let (by, count) = shape.split_at_checked(1)?;
+                let count: u32 = match count {
+                    "iv2" => 2,
+                    "iv4" => 4,
+                    "iv8" => 8,
+                    _ => return None,
+                };
+                let lanes = match lanes {
+                    "si" => int(4),
+                    "di" => int(8),
+                    "sf" => float(4),
+                    "df" => float(8),
+                    _ => return None,
+                };
+                let by = match by {
+                    "s" => 4,
+                    "d" => 8,
+                    _ => return None,
+                };
+                let width = count * lanes.0;
+                if !matches!(width, 16 | 32) {
+                    return None;
+                }
+                (by, lanes, false, width)
+            } else {
+                return None;
+            };
+        Some(X86Gather { index, lane, float, vector_mask, width })
+    }
+
+    /// How many lanes it gathers into a result of `src` bytes by `offsets` bytes of indices,
+    /// or `None` where no instruction has those shapes: the narrower of a dword and a qword
+    /// vector has half as many bytes, or 16.
+    pub fn lanes(self, src: u32, offsets: u32) -> Option<u32> {
+        let narrower = |wider: u32| (wider / 2).max(16);
+        let fits = match self.lane.cmp(&self.index) {
+            std::cmp::Ordering::Equal => src == offsets,
+            std::cmp::Ordering::Less => src == narrower(offsets),
+            std::cmp::Ordering::Greater => offsets == narrower(src),
+        };
+        (fits && src.max(offsets) == self.width)
+            .then(|| (src / self.lane).min(offsets / self.index))
+    }
+}
+
 /// A `#[rustc_intrinsic]` function whose name is none of rustc's intrinsics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnknownIntrinsic(pub Symbol);
@@ -267,10 +609,7 @@ impl fmt::Display for UnknownIntrinsic {
 
 /// The intrinsic `func` is: `None` for a function that is not `#[rustc_intrinsic]`, an error
 /// for one whose name is none of rustc's.
-pub fn intrinsic_of(
-    db: &Db,
-    func: FunctionId,
-) -> Result<Option<Intrinsic>, UnknownIntrinsic> {
+pub fn intrinsic_of(db: &Db, func: FunctionId) -> Result<Option<Intrinsic>, UnknownIntrinsic> {
     if !FunctionSignature::is_intrinsic(db, func) {
         return Ok(None);
     }
@@ -761,6 +1100,53 @@ intrinsics! {
 mod tests {
     use super::*;
 
+    /// Every gather the pinned nightly's `core::arch` links to, with the bytes of its `src` and
+    /// `offsets` and how many lanes it gathers.
+    #[test]
+    fn every_gather_of_core_arch_is_known() {
+        #[rustfmt::skip]
+        let gathers = [
+            ("x86.avx2.gather.d.d", 16, 16, 4), ("x86.avx2.gather.d.d.256", 32, 32, 8),
+            ("x86.avx2.gather.d.q", 16, 16, 2), ("x86.avx2.gather.d.q.256", 32, 16, 4),
+            ("x86.avx2.gather.q.d", 16, 16, 2), ("x86.avx2.gather.q.d.256", 16, 32, 4),
+            ("x86.avx2.gather.q.q", 16, 16, 2), ("x86.avx2.gather.q.q.256", 32, 32, 4),
+            ("x86.avx2.gather.d.pd", 16, 16, 2), ("x86.avx2.gather.d.pd.256", 32, 16, 4),
+            ("x86.avx2.gather.q.pd", 16, 16, 2), ("x86.avx2.gather.q.pd.256", 32, 32, 4),
+            ("x86.avx2.gather.d.ps", 16, 16, 4), ("x86.avx2.gather.d.ps.256", 32, 32, 8),
+            ("x86.avx2.gather.q.ps", 16, 16, 2), ("x86.avx2.gather.q.ps.256", 16, 32, 4),
+            ("x86.avx512.gather.dpd.512", 64, 32, 8), ("x86.avx512.gather.dps.512", 64, 64, 16),
+            ("x86.avx512.gather.qpd.512", 64, 64, 8), ("x86.avx512.gather.qps.512", 32, 64, 8),
+            ("x86.avx512.gather.dpq.512", 64, 32, 8), ("x86.avx512.gather.dpi.512", 64, 64, 16),
+            ("x86.avx512.gather.qpq.512", 64, 64, 8), ("x86.avx512.gather.qpi.512", 32, 64, 8),
+            ("x86.avx512.gather3siv4.si", 16, 16, 4), ("x86.avx512.gather3siv2.di", 16, 16, 2),
+            ("x86.avx512.gather3siv2.df", 16, 16, 2), ("x86.avx512.gather3siv4.sf", 16, 16, 4),
+            ("x86.avx512.gather3div4.si", 16, 16, 2), ("x86.avx512.gather3div2.di", 16, 16, 2),
+            ("x86.avx512.gather3div2.df", 16, 16, 2), ("x86.avx512.gather3div4.sf", 16, 16, 2),
+            ("x86.avx512.gather3siv8.si", 32, 32, 8), ("x86.avx512.gather3siv4.di", 32, 16, 4),
+            ("x86.avx512.gather3siv4.df", 32, 16, 4), ("x86.avx512.gather3siv8.sf", 32, 32, 8),
+            ("x86.avx512.gather3div8.si", 16, 32, 4), ("x86.avx512.gather3div4.di", 32, 32, 4),
+            ("x86.avx512.gather3div4.df", 32, 32, 4), ("x86.avx512.gather3div8.sf", 16, 32, 4),
+        ];
+        for (name, src, offsets, lanes) in gathers {
+            let gather = X86Gather::of(name).unwrap_or_else(|| panic!("{name} is a gather"));
+            assert_eq!(gather.lanes(src, offsets), Some(lanes), "{name}");
+            assert_eq!(gather.vector_mask, name.starts_with("x86.avx2."), "{name}");
+        }
+        let qps = X86Gather::of("x86.avx512.gather.qps.512").unwrap();
+        assert_eq!((qps.index, qps.lane, qps.float), (8, 4, true));
+        assert_eq!(qps.lanes(64, 64), None);
+        for name in [
+            "x86.avx512.gather.qpq",
+            "x86.avx512.gather.qpq.256",
+            "x86.avx2.gather.s.d",
+            "x86.avx512.gather3siv16.si",
+            "x86.avx512.scatter.dpd.512",
+            "x86.avx512.mask.gather.dpd.512",
+        ] {
+            assert_eq!(X86Gather::of(name), None, "{name}");
+        }
+    }
+
     #[test]
     fn every_name_is_its_own_intrinsic() {
         assert_eq!(Intrinsic::COUNT, 383);
@@ -785,7 +1171,9 @@ mod tests {
             let (a, b) = (pair[0].symbol(), pair[1].symbol());
             assert!(a.as_str().as_bytes() < b.as_str().as_bytes(), "{a} before {b}");
         }
-        assert!(rustc.iter().all(|it| !it.is_blaze() && !it.symbol().as_str().starts_with("blaze_")));
+        assert!(
+            rustc.iter().all(|it| !it.is_blaze() && !it.symbol().as_str().starts_with("blaze_"))
+        );
     }
 
     /// Persisted MIR and code identity hold these numbers: adding blaze's intrinsics renumbers

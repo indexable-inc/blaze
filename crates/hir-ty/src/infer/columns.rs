@@ -8,11 +8,7 @@
 //! whatever order inference wrote them in, so derived `Eq` and `Hash` agree with what the
 //! result means.
 
-use std::{
-    fmt,
-    marker::PhantomData,
-    ops::Index,
-};
+use std::{fmt, marker::PhantomData, ops::Index};
 
 use blaze_ids::bits::{BitSet, Bits, Ranked};
 use blaze_mem::Frame;
@@ -367,7 +363,9 @@ impl<K, V> Default for IndexColumn<K, V> {
 impl<K, V> IndexColumn<K, V> {
     /// The heap its keys and rows hold, and what `row` says each row owns.
     pub(crate) fn heap_bytes(&self, row: impl Fn(&V) -> usize) -> usize {
-        self.present.heap_bytes() + size_of_val(&*self.rows) + self.rows.iter().map(row).sum::<usize>()
+        self.present.heap_bytes()
+            + size_of_val(&*self.rows)
+            + self.rows.iter().map(row).sum::<usize>()
     }
 }
 
@@ -544,7 +542,8 @@ impl FieldColumn {
 
     pub(crate) fn from_dense(slots: &[Option<either::Either<FieldId, TupleFieldId>>]) -> Self {
         let slots = &slots[..used(slots)];
-        let tuple_count = slots.iter().filter(|it| matches!(it, Some(either::Either::Right(_)))).count();
+        let tuple_count =
+            slots.iter().filter(|it| matches!(it, Some(either::Either::Right(_)))).count();
         let field_count = slots.iter().filter(|it| it.is_some()).count() - tuple_count;
         // alloc: the column's own parts, each at its length
         let (mut fields, mut tuple_fields) =
@@ -578,7 +577,9 @@ impl FieldColumn {
     pub(crate) fn from_entries(
         entries: impl IntoIterator<Item = (ExprId, either::Either<FieldId, TupleFieldId>)>,
     ) -> Self {
-        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Self::from_dense(&dense_in(frame, entries)))
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            Self::from_dense(&dense_in(frame, entries))
+        })
     }
 
     /// The column of the parts [`Self::tags`], [`Self::data`], [`Self::fields`] and
@@ -637,7 +638,9 @@ impl FieldColumn {
         let index = expr.to_index();
         match self.tags.get(index).copied()? {
             FIELD => Some(either::Either::Left(self.fields[self.data[index] as usize])),
-            TUPLE_FIELD => Some(either::Either::Right(self.tuple_fields[self.data[index] as usize])),
+            TUPLE_FIELD => {
+                Some(either::Either::Right(self.tuple_fields[self.data[index] as usize]))
+            }
             _ => None,
         }
     }
@@ -645,8 +648,9 @@ impl FieldColumn {
     pub fn iter(
         &self,
     ) -> impl Iterator<Item = (ExprId, either::Either<FieldId, TupleFieldId>)> + '_ {
-        (0..self.tags.len())
-            .filter_map(|index| Some((ExprId::from_index(index), self.get(ExprId::from_index(index))?)))
+        (0..self.tags.len()).filter_map(|index| {
+            Some((ExprId::from_index(index), self.get(ExprId::from_index(index))?))
+        })
     }
 }
 
@@ -694,7 +698,12 @@ pub struct Csr<K, T> {
 
 impl<K, T> Default for Csr<K, T> {
     fn default() -> Self {
-        Csr { present: Presence::default(), ends: Box::default(), items: Box::default(), key: PhantomData }
+        Csr {
+            present: Presence::default(),
+            ends: Box::default(),
+            items: Box::default(),
+            key: PhantomData,
+        }
     }
 }
 
@@ -939,7 +948,9 @@ impl<'f, K: DenseKey, T> CsrBuilder<'f, K, T> {
         // alloc: the column's own items, at their length
         let mut flat = Vec::with_capacity(next);
         for range in ranges.iter().filter(|range| !range.is_absent()) {
-            flat.extend(slots[range.slice()].iter_mut().map(|it: &mut Option<T>| it.take().unwrap()));
+            flat.extend(
+                slots[range.slice()].iter_mut().map(|it: &mut Option<T>| it.take().unwrap()),
+            );
         }
         Csr { present, ends, items: flat.into_boxed_slice(), key: PhantomData }
     }
@@ -1193,7 +1204,9 @@ impl<K: DenseKey> ModeColumn<K> {
 
     #[cfg(test)]
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, BindingMode)>) -> Self {
-        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Self::from_dense(&dense_in(frame, entries)))
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            Self::from_dense(&dense_in(frame, entries))
+        })
     }
 
     pub(crate) fn from_codes(codes: Box<[u8]>) -> Result<Self, &'static str> {
@@ -1212,7 +1225,8 @@ impl<K: DenseKey> ModeColumn<K> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (K, &BindingMode)> + '_ {
-        (0..self.codes.len()).filter_map(|index| Some((K::from_index(index), self.get(K::from_index(index))?)))
+        (0..self.codes.len())
+            .filter_map(|index| Some((K::from_index(index), self.get(K::from_index(index))?)))
     }
 
     pub fn codes(&self) -> &[u8] {
@@ -1256,7 +1270,10 @@ impl<K, V> SortedMap<K, V> {
 
 impl<K: Ord, V> SortedMap<K, V> {
     /// The map of `entries`, of distinct keys, sorted in `frame`.
-    pub(crate) fn from_entries_in(frame: &Frame, entries: impl IntoIterator<Item = (K, V)>) -> Self {
+    pub(crate) fn from_entries_in(
+        frame: &Frame,
+        entries: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
         let mut sorted = Vec::new_in(frame);
         sorted.extend(entries);
         // The keys are distinct, so an unstable sort orders them as a stable one does.
@@ -1423,9 +1440,11 @@ mod tests {
                 column.iter().map(|(k, ty)| (k.into_raw().into_u32(), ty.clone())).collect();
             assert_eq!(listed, model.into_iter().collect::<Vec<_>>());
 
-            let reversed: Vec<(Key, StoredTy)> = arena.iter().rev().map(|(k, ty)| (k, ty.clone())).collect();
+            let reversed: Vec<(Key, StoredTy)> =
+                arena.iter().rev().map(|(k, ty)| (k, ty.clone())).collect();
             assert!(TyColumn::from_entries(reversed) == column);
-            let again = TyColumn::<Key>::from_parts(column.at().into(), column.tys().into()).unwrap();
+            let again =
+                TyColumn::<Key>::from_parts(column.at().into(), column.tys().into()).unwrap();
             assert!(again == column);
         }
         let swapped = TyColumn::<Key>::from_parts(
@@ -1471,15 +1490,20 @@ mod tests {
                         }
                     }
                     for k in 0..40 {
-                        assert_eq!(builder.get(&key(k)).map(|it| it.to_vec()), model.get(&k).cloned());
+                        assert_eq!(
+                            builder.get(&key(k)).map(|it| it.to_vec()),
+                            model.get(&k).cloned()
+                        );
                         assert_eq!(builder.len_of(&key(k)), model.get(&k).map_or(0, Vec::len));
                     }
                 }
                 let mut doubled = builder.clone();
                 doubled.values_mut().flatten().for_each(|it| *it *= 2);
                 let frozen = builder.freeze();
-                let listed: Vec<(u32, Vec<u32>)> =
-                    frozen.iter().map(|(k, items)| (k.into_raw().into_u32(), items.to_vec())).collect();
+                let listed: Vec<(u32, Vec<u32>)> = frozen
+                    .iter()
+                    .map(|(k, items)| (k.into_raw().into_u32(), items.to_vec()))
+                    .collect();
                 assert_eq!(listed, model.clone().into_iter().collect::<Vec<_>>());
                 for k in 0..40 {
                     assert_eq!(frozen.contains_key(&key(k)), model.contains_key(&k));
@@ -1510,7 +1534,8 @@ mod tests {
                 assert_eq!(present.place(k as usize), naive);
             }
             let listed: Vec<(usize, usize)> = present.keys().collect();
-            let model: Vec<(usize, usize)> = keys.iter().enumerate().map(|(at, &k)| (k as usize, at)).collect();
+            let model: Vec<(usize, usize)> =
+                keys.iter().enumerate().map(|(at, &k)| (k as usize, at)).collect();
             assert_eq!(listed, model);
             let backward: Vec<(usize, usize)> = present.keys().rev().collect();
             assert_eq!(backward, model.into_iter().rev().collect::<Vec<_>>());
@@ -1546,11 +1571,14 @@ mod tests {
             let (forward, backward) = (forward.freeze(), backward.freeze());
             assert!(forward == backward);
             assert_eq!(backward.present(), &[1 << 1]);
-            let trailing = Csr::<Key, u32>::from_parts(vec![1 << 1, 0], Box::new([1]), Box::new([1]));
+            let trailing =
+                Csr::<Key, u32>::from_parts(vec![1 << 1, 0], Box::new([1]), Box::new([1]));
             assert!(trailing.is_err());
-            let uncovered = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([1]), Box::new([1, 2]));
+            let uncovered =
+                Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([1]), Box::new([1, 2]));
             assert!(uncovered.is_err());
-            let backwards = Csr::<Key, u32>::from_parts(vec![0b110], Box::new([2, 1]), Box::new([1, 2]));
+            let backwards =
+                Csr::<Key, u32>::from_parts(vec![0b110], Box::new([2, 1]), Box::new([1, 2]));
             assert!(backwards.is_err());
             let extra = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([0, 1]), Box::new([1]));
             assert!(extra.is_err());
@@ -1560,7 +1588,10 @@ mod tests {
     #[test]
     fn a_column_ending_in_a_key_without_a_value_is_refused() {
         let types = &crate::next_solver::default_types().types;
-        assert!(TyColumn::<Key>::from_parts(Box::new([0, NONE]), Box::new([types.i32.store()])).is_err());
+        assert!(
+            TyColumn::<Key>::from_parts(Box::new([0, NONE]), Box::new([types.i32.store()]))
+                .is_err()
+        );
         assert!(IndexColumn::<Key, u32>::from_parts(vec![1, 0], Box::new([5])).is_err());
         assert!(ModeColumn::<Key>::from_codes(Box::new([0, MODE_NONE])).is_err());
         assert!(ModeColumn::<Key>::from_codes(Box::new([MODE_NONE, 3])).is_ok());
@@ -1569,7 +1600,9 @@ mod tests {
     #[test]
     fn index_column_takes_back_its_parts_and_refuses_others() {
         let column = IndexColumn::from_entries([(key(4), 40u32), (key(1), 10), (key(9), 90)]);
-        let again = IndexColumn::<Key, u32>::from_parts(column.present().to_vec(), column.rows().into()).unwrap();
+        let again =
+            IndexColumn::<Key, u32>::from_parts(column.present().to_vec(), column.rows().into())
+                .unwrap();
         assert!(again == column);
         assert_eq!(column.present(), &[1 << 1 | 1 << 4 | 1 << 9]);
         assert_eq!(column.rows(), &[10, 40, 90]);
@@ -1586,7 +1619,8 @@ mod tests {
             parent: hir_def::StructId::from_id(id(3)).into(),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),
         };
-        let tuple_field = |tuple: u32, index: u32| TupleFieldId { tuple: hir_def::TupleId(tuple), index };
+        let tuple_field =
+            |tuple: u32, index: u32| TupleFieldId { tuple: hir_def::TupleId(tuple), index };
         let expr = |index: u32| -> ExprId { Idx::from_raw(RawIdx::from_u32(index)) };
         let column = FieldColumn::from_entries([
             (expr(5), either::Either::Left(field(2))),
@@ -1648,8 +1682,11 @@ mod tests {
 
     #[test]
     fn mode_column_round_trips_every_mode() {
-        let modes: Vec<(Key, BindingMode)> =
-            BINDING_MODES.iter().enumerate().map(|(at, &mode)| (key(at as u32 * 2), mode)).collect();
+        let modes: Vec<(Key, BindingMode)> = BINDING_MODES
+            .iter()
+            .enumerate()
+            .map(|(at, &mode)| (key(at as u32 * 2), mode))
+            .collect();
         let column = ModeColumn::from_entries(modes.iter().copied());
         for (k, mode) in &modes {
             assert_eq!(column.get(*k), Some(mode));
@@ -1708,7 +1745,9 @@ mod tests {
             dense
         }
 
-        pub(super) fn ty_column<K: DenseKey>(entries: impl IntoIterator<Item = (K, StoredTy)>) -> TyColumn<K> {
+        pub(super) fn ty_column<K: DenseKey>(
+            entries: impl IntoIterator<Item = (K, StoredTy)>,
+        ) -> TyColumn<K> {
             let mut by_ty: HashMap<StoredTy, u32, Global> = HashMap::new_in(Global);
             let mut tys = Vec::new();
             let at = dense(entries)
@@ -1724,7 +1763,9 @@ mod tests {
             TyColumn { at, tys: tys.into_boxed_slice(), key: PhantomData }
         }
 
-        pub(super) fn index_column<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> IndexColumn<K, V> {
+        pub(super) fn index_column<K: DenseKey, V>(
+            entries: impl IntoIterator<Item = (K, V)>,
+        ) -> IndexColumn<K, V> {
             let (mut words, mut rows) = (BitSet::<usize>::default(), Vec::new());
             for (index, row) in dense(entries).into_iter().enumerate() {
                 if let Some(row) = row {
@@ -1736,7 +1777,9 @@ mod tests {
             IndexColumn { present, rows: rows.into_boxed_slice(), key: PhantomData }
         }
 
-        pub(super) fn mode_column<K: DenseKey>(entries: impl IntoIterator<Item = (K, BindingMode)>) -> ModeColumn<K> {
+        pub(super) fn mode_column<K: DenseKey>(
+            entries: impl IntoIterator<Item = (K, BindingMode)>,
+        ) -> ModeColumn<K> {
             let codes = dense(entries).into_iter().map(|mode| mode.map_or(MODE_NONE, mode_code));
             ModeColumn { codes: codes.collect(), key: PhantomData }
         }
@@ -1758,10 +1801,17 @@ mod tests {
                 flat.extend(items[range.slice()].iter().cloned());
             }
             let present = Presence::new(words.into_words()).unwrap();
-            Csr { present, ends: ends.into_boxed_slice(), items: flat.into_boxed_slice(), key: PhantomData }
+            Csr {
+                present,
+                ends: ends.into_boxed_slice(),
+                items: flat.into_boxed_slice(),
+                key: PhantomData,
+            }
         }
 
-        pub(super) fn sorted_map<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> SortedMap<K, V> {
+        pub(super) fn sorted_map<K: Ord, V>(
+            entries: impl IntoIterator<Item = (K, V)>,
+        ) -> SortedMap<K, V> {
             let mut entries: Vec<(K, V)> = entries.into_iter().collect();
             entries.sort_by(|(a, _), (b, _)| a.cmp(b));
             SortedMap { entries: entries.into_boxed_slice() }
@@ -1797,15 +1847,22 @@ mod tests {
                     assert_eq!(dense_rows.get(key(k)), rows.get(key(k)));
                     assert_eq!(dense_rows.contains_idx(key(k)), rows.contains_idx(key(k)));
                 }
-                assert!(dense_rows.iter().map(|(k, &v)| (k, v)).eq(rows.iter().map(|(k, &v)| (k, v))));
+                assert!(
+                    dense_rows.iter().map(|(k, &v)| (k, v)).eq(rows.iter().map(|(k, &v)| (k, v)))
+                );
                 *dense_rows.get_mut(key(7)).unwrap_or(&mut 0) += 1;
                 if let Some(row) = rows.get_mut(key(7)) {
                     *row += 1;
                 }
-                let drained: Vec<(Key, u32)> = DenseMap::<Key, u32>::drain(&mut dense_rows.clone_for_test()).collect();
+                let drained: Vec<(Key, u32)> =
+                    DenseMap::<Key, u32>::drain(&mut dense_rows.clone_for_test()).collect();
                 assert_eq!(drained, rows.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>());
-                assert!(IndexColumn::from_dense(dense_rows.slots_mut()) == before::index_column(rows));
-                assert!(TyColumn::from_dense(frame, dense_tys.slots_mut()) == before::ty_column(tys));
+                assert!(
+                    IndexColumn::from_dense(dense_rows.slots_mut()) == before::index_column(rows)
+                );
+                assert!(
+                    TyColumn::from_dense(frame, dense_tys.slots_mut()) == before::ty_column(tys)
+                );
                 assert!(ModeColumn::from_dense(dense_modes.slots()) == before::mode_column(modes));
 
                 let mut builder = CsrBuilder::<Key, u32>::new_in(frame);
@@ -1828,9 +1885,16 @@ mod tests {
                 let words = frozen.words.into_words();
                 assert_eq!(words.len(), words.capacity(), "made at its length");
 
-                let entries: Vec<(u32, u32)> =
-                    writes(seed, 100, 1000, 1000).into_iter().collect::<BTreeMap<_, _>>().into_iter().rev().collect();
-                assert!(SortedMap::from_entries_in(frame, entries.iter().copied()) == before::sorted_map(entries.clone()));
+                let entries: Vec<(u32, u32)> = writes(seed, 100, 1000, 1000)
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                assert!(
+                    SortedMap::from_entries_in(frame, entries.iter().copied())
+                        == before::sorted_map(entries.clone())
+                );
             });
         }
     }

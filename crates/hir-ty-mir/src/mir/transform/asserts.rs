@@ -57,8 +57,7 @@ pub(super) fn add_asserts<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, fram
     };
     let mut unwinds = framed::map_in(frame);
     unwinds.reserve(body.panic_unwinds.len());
-    unwinds
-        .extend(body.panic_unwinds.drain(..).map(|(block, at, unwind)| ((block, at), unwind)));
+    unwinds.extend(body.panic_unwinds.drain(..).map(|(block, at, unwind)| ((block, at), unwind)));
     let index_spans = index_spans(body, frame);
     let mut pending: Vec<Statement, &Frame> = Vec::new_in(frame);
     let mut checks: Checks<'_> = Vec::new_in(frame);
@@ -274,7 +273,7 @@ fn binary_op<'db>(
                     expected: false,
                     // clone: a `BinOp` tag, kept in the panic as in the operation
                     // clone: a `BinOp` tag, kept in the panic as in the operation
-                msg: AssertKind::Overflow(op.clone(), copy(&a), copy(&b)),
+                    msg: AssertKind::Overflow(op.clone(), copy(&a), copy(&b)),
                     span,
                 });
             }

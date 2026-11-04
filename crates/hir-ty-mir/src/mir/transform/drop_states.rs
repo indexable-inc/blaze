@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     Ctx,
-    move_paths::{InitAnalysis, InitState, Lookup, MoveData, live_blocks, Effects},
+    move_paths::{Effects, InitAnalysis, InitState, Lookup, MoveData, live_blocks},
 };
 
 /// A drop of a built body, with what may be held there of the paths below the place it drops.
@@ -110,7 +110,9 @@ pub fn drop_states<'db>(
                                 .position(|&above| {
                                     data.paths[above].children.iter().any(|&(_, c)| c == it)
                                 })
-                                .expect("a path below the dropped one has its parent in the subtree");
+                                .expect(
+                                    "a path below the dropped one has its parent in the subtree",
+                                );
                             parent as u32
                         });
                         let (maybe_init, maybe_uninit) = state.of(it);

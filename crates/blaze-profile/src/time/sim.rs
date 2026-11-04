@@ -174,7 +174,14 @@ impl Transcript {
                 .filter(|&(s, it)| it != j && model.lanes[s].begin_ns() <= given);
             let release = match spawner {
                 Some((s, by)) => {
-                    triggers.push((by, Trigger { progress_ns: progress(model.lanes[s].accrued(given)), job: j, sets: Sets::Start }));
+                    triggers.push((
+                        by,
+                        Trigger {
+                            progress_ns: progress(model.lanes[s].accrued(given)),
+                            job: j,
+                            sets: Sets::Start,
+                        },
+                    ));
                     it.spawned += 1;
                     Release::Spawned
                 }
@@ -217,7 +224,9 @@ impl Transcript {
                     Waker::Ready { lane } | Waker::Awaited { lane } => Some(lane),
                     _ => None,
                 };
-                let waker = waker.and_then(|it| job_of[it].map(|job| (it, job))).filter(|&(_, job)| job != j);
+                let waker = waker
+                    .and_then(|it| job_of[it].map(|job| (it, job)))
+                    .filter(|&(_, job)| job != j);
                 let woke_at = match wait.waker {
                     Waker::Ready { .. } => wait.ready_ns,
                     _ => None,
@@ -229,13 +238,18 @@ impl Transcript {
                     }
                     (_, Some((waker, by))) => {
                         let waker = &model.lanes[waker];
-                        let progress_ns = progress(woke_at.map_or_else(|| waker.totals(), |t| waker.accrued(t)));
-                        triggers.push((by, Trigger { progress_ns, job: j, sets: Sets::Wake(number) }));
+                        let progress_ns =
+                            progress(woke_at.map_or_else(|| waker.totals(), |t| waker.accrued(t)));
+                        triggers
+                            .push((by, Trigger { progress_ns, job: j, sets: Sets::Wake(number) }));
                         it.woken += 1;
                         Ends::Woken
                     }
                     (_, None) => {
-                        let end = wait.ready_ns.or(wait.resumed_ns).unwrap_or(lane.intervals[next].from_ns);
+                        let end = wait
+                            .ready_ns
+                            .or(wait.resumed_ns)
+                            .unwrap_or(lane.intervals[next].from_ns);
                         it.timed += 1;
                         Ends::After { ns: (end - lane.intervals[at].from_ns).max(0) }
                     }
@@ -262,7 +276,8 @@ impl Transcript {
             .flat_map(|worker| worker.idle.iter())
             .map(|&(from, to)| (to.min(last) - from.max(start)).max(0))
             .sum();
-        triggers.sort_by_key(|(on, t)| (*on, t.progress_ns, t.job, matches!(t.sets, Sets::Wake(_))));
+        triggers
+            .sort_by_key(|(on, t)| (*on, t.progress_ns, t.job, matches!(t.sets, Sets::Wake(_))));
         for (on, trigger) in triggers {
             it.jobs[on as usize].triggers.push(trigger);
         }
@@ -436,7 +451,12 @@ impl<'a> Replay<'a> {
     /// The bound of events: each job's release, each trigger, each run's end and each timed
     /// wait's end is one event, and none comes twice.
     fn fuel(&self) -> usize {
-        self.transcript.jobs.iter().map(|it| 2 + it.segments.len() + it.triggers.len()).sum::<usize>() + 16
+        self.transcript
+            .jobs
+            .iter()
+            .map(|it| 2 + it.segments.len() + it.triggers.len())
+            .sum::<usize>()
+            + 16
     }
 
     fn push(&mut self, t: i64, ev: Ev) {
@@ -504,7 +524,10 @@ impl<'a> Replay<'a> {
             && trigger.progress_ns <= to_ns
         {
             self.states[j as usize].fired += 1;
-            self.push(t + (trigger.progress_ns - from_ns).max(0), Ev::Set(trigger.job, trigger.sets));
+            self.push(
+                t + (trigger.progress_ns - from_ns).max(0),
+                Ev::Set(trigger.job, trigger.sets),
+            );
         }
     }
 

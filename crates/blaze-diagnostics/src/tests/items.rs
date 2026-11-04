@@ -27,7 +27,9 @@ use crate::{
 /// (`crates/test-utils/src/minicore.rs`), and core is in the prelude as std is for rustc. The
 /// file's lines are the source's, as the `.stderr` counts them.
 pub(crate) fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"))
+    ui_fixture(&format!(
+        "//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"
+    ))
 }
 
 /// [`crate::tests::ui`] of a UI test rustc builds as a binary (its default), named `krate` as

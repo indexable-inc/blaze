@@ -42,7 +42,10 @@ fn two_mutable_borrows_at_once() {
 trait Fake { fn use_mut(&mut self) { } fn use_ref(&self) { }  }
 impl<T> Fake for T { }
 "#;
-    assert_eq!(errors(None, source), ["E0499 4:17 cannot borrow `i` as mutable more than once at a time"]);
+    assert_eq!(
+        errors(None, source),
+        ["E0499 4:17 cannot borrow `i` as mutable more than once at a time"]
+    );
     // tests/ui/error-codes/E0499.stderr
     let stderr = r#"error[E0499]: cannot borrow `i` as mutable more than once at a time
   --> $DIR/E0499.rs:4:17
@@ -226,7 +229,12 @@ fn main() {
     assert_eq!(errors.len(), expected.len(), "{errors:?}");
     for (error, (at, place)) in errors.iter().zip(expected) {
         // The bindings copy an `i32`: a use, not a move.
-        assert!(error.contains(&format!(" {at} ")) && error.contains(place) && error.contains("cannot use"), "{at} {place}: {errors:?}");
+        assert!(
+            error.contains(&format!(" {at} "))
+                && error.contains(place)
+                && error.contains("cannot use"),
+            "{at} {place}: {errors:?}"
+        );
     }
 }
 
@@ -457,8 +465,9 @@ fn main() {{}}
         .collect();
     assert_eq!(refused, Vec::<&str>::new(), "every diagnostic: {messages:?}");
     assert!(
-        messages
-            .contains(&"calls to `std::mem::drop` with a value that implements `Copy` does nothing"),
+        messages.contains(
+            &"calls to `std::mem::drop` with a value that implements `Copy` does nothing"
+        ),
         "`dropping_copy_types` sees `F::Type: Copy`: {messages:?}"
     );
 }

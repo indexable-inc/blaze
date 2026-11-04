@@ -2,7 +2,9 @@
 //! ([`CompiledFunction`]): every relocation at a target of the build, and the function's own
 //! data by content, each object pointing only at the ones before it.
 
-use blaze_codegen::{Arch, CompiledFunction, Data, InstanceKey, Line, RelocKind, Relocation, Relocs, Target};
+use blaze_codegen::{
+    Arch, CompiledFunction, Data, InstanceKey, Line, RelocKind, Relocation, Relocs, Target,
+};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_mem::Frame;
@@ -113,7 +115,9 @@ pub(crate) fn function(
                 None => reloc_kind(reloc.kind)?,
             };
             let (target, addend) = match reloc.name {
-                RelocName::Own(offset) => (RelocName::Own(0), own_addend(offset, reloc.addend, size)?),
+                RelocName::Own(offset) => {
+                    (RelocName::Own(0), own_addend(offset, reloc.addend, size)?)
+                }
                 name => (name, reloc.addend),
             };
             // alloc: an error
@@ -126,7 +130,9 @@ pub(crate) fn function(
         _ => None,
     });
     let datas = own.requests(frame, requests, resolve, named)?;
-    let relocs = names.view().try_map_in(frame, |&name| reloc_target(key, name, requests, &datas, resolve))?;
+    let relocs = names
+        .view()
+        .try_map_in(frame, |&name| reloc_target(key, name, requests, &datas, resolve))?;
     let unwind = match &code.unwind {
         Some(unwind) => {
             let personality = || resolve.symbol(PERSONALITY);
@@ -224,13 +230,16 @@ fn called_names(func: &cranelift_codegen::ir::Function) -> Vec<bool> {
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let data = &func.dfg.insts[inst];
-            let func_ref = match data.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
-                CallInfo::Direct(func_ref, _) | CallInfo::DirectWithSig(func_ref, ..) => Some(func_ref),
-                _ => match *data {
-                    InstructionData::FuncAddr { func_ref, .. } => Some(func_ref),
-                    _ => None,
-                },
-            };
+            let func_ref =
+                match data.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
+                    CallInfo::Direct(func_ref, _) | CallInfo::DirectWithSig(func_ref, ..) => {
+                        Some(func_ref)
+                    }
+                    _ => match *data {
+                        InstructionData::FuncAddr { func_ref, .. } => Some(func_ref),
+                        _ => None,
+                    },
+                };
             if let Some(func_ref) = func_ref
                 && let ExternalName::User(name) = func.dfg.ext_funcs[func_ref].name
             {
@@ -272,9 +281,13 @@ pub(crate) struct Word {
 /// its slot in the table.
 pub(crate) fn word(arch: Arch) -> Word {
     match arch {
-        Arch::X86_64 | Arch::Aarch64 => Word { size: 8, data: RelocKind::Abs64, func: RelocKind::Abs64 },
+        Arch::X86_64 | Arch::Aarch64 => {
+            Word { size: 8, data: RelocKind::Abs64, func: RelocKind::Abs64 }
+        }
         Arch::Wasm32 => Word { size: 4, data: RelocKind::WasmMemory, func: RelocKind::WasmTable },
-        Arch::Wasm64 => Word { size: 8, data: RelocKind::WasmMemory64, func: RelocKind::WasmTable64 },
+        Arch::Wasm64 => {
+            Word { size: 8, data: RelocKind::WasmMemory64, func: RelocKind::WasmTable64 }
+        }
     }
 }
 
@@ -491,23 +504,31 @@ fn reloc_target(
         RelocName::User { namespace: crate::llvm::pgo::COUNTER_RELOCS, index } => match index {
             0 => Ok(Target::ProfileCounters),
             // alloc: an error
-            _ => Err(format!("a relocation at PGO counters {index}, where a function has only its own (0)")),
+            _ => Err(format!(
+                "a relocation at PGO counters {index}, where a function has only its own (0)"
+            )),
         },
         // Stencil code's and counting Cranelift code's (`blaze_stencil::tier::instrument`):
         // the instance's own cells, the cell by the addend.
-        RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index: 0 } => Ok(Target::Counter(key)),
+        RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index: 0 } => {
+            Ok(Target::Counter(key))
+        }
         RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index } => {
             // alloc: an error
-            Err(format!("a relocation at tier counter cells {index}, where a function has only its own (0)"))
+            Err(format!(
+                "a relocation at tier counter cells {index}, where a function has only its own (0)"
+            ))
         }
         // A metered function's calls of the fuel runtime (`blaze_stencil::fuel`), outside
         // symbols of the program's std.
-        RelocName::User { namespace: blaze_stencil::fuel::NAMESPACE, index } => match blaze_stencil::fuel::symbol(index) {
-            // alloc: the target's name
-            Some(name) => Ok(Target::Extern(name.to_owned())),
-            // alloc: an error
-            None => Err(format!("a relocation at fuel runtime function {index}, of 2")),
-        },
+        RelocName::User { namespace: blaze_stencil::fuel::NAMESPACE, index } => {
+            match blaze_stencil::fuel::symbol(index) {
+                // alloc: the target's name
+                Some(name) => Ok(Target::Extern(name.to_owned())),
+                // alloc: an error
+                None => Err(format!("a relocation at fuel runtime function {index}, of 2")),
+            }
+        }
         RelocName::User { namespace, .. } => {
             // alloc: an error
             Err(format!("a relocation in the unknown namespace {namespace}"))
@@ -521,7 +542,9 @@ fn reloc_target(
         RelocName::Own(0) => Ok(Target::Direct(key)),
         RelocName::Own(offset) => {
             // alloc: an error
-            Err(format!("a relocation at offset {offset} of the function itself, not moved into its addend"))
+            Err(format!(
+                "a relocation at offset {offset} of the function itself, not moved into its addend"
+            ))
         }
     }
 }
@@ -531,7 +554,9 @@ fn reloc_target(
 fn own_addend(offset: u32, addend: i64, size: usize) -> Result<i64, String> {
     if offset as usize > size {
         // alloc: an error
-        return Err(format!("a relocation at offset {offset} of the function itself, which has {size} bytes"));
+        return Err(format!(
+            "a relocation at offset {offset} of the function itself, which has {size} bytes"
+        ));
     }
     addend.checked_add(i64::from(offset)).ok_or_else(|| {
         // alloc: an error
@@ -596,7 +621,9 @@ pub(crate) fn elf_kind(elf: u32) -> Result<RelocKind, String> {
         elf::R_AARCH64_TLSLE_ADD_TPREL_HI12 => RelocKind::TpHi12,
         elf::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => RelocKind::TpLo12,
         // alloc: an error
-        other => return Err(format!("a relocation of ELF type {}, which v2 has no kind for", other.0)),
+        other => {
+            return Err(format!("a relocation of ELF type {}, which v2 has no kind for", other.0));
+        }
     })
 }
 

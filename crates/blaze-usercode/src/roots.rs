@@ -88,7 +88,8 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [Role::Package, Role::OutDir, Role::Target, Role::Workspace, Role::Tools, Role::Launcher];
+    pub const ALL: [Role; 6] =
+        [Role::Package, Role::OutDir, Role::Target, Role::Workspace, Role::Tools, Role::Launcher];
 
     /// The byte after `\0` in its placeholder.
     pub fn tag(self) -> u8 {
@@ -279,7 +280,9 @@ fn spellings(root: &str, resolved: Option<&str>) -> Vec<String> {
         add(&mut plain, base);
         if let Some(rest) = base.strip_prefix("/private").filter(|it| it.starts_with('/')) {
             add(&mut plain, rest);
-        } else if ["/var", "/tmp"].iter().any(|dir| base.strip_prefix(dir).is_some_and(|it| it.is_empty() || it.starts_with('/'))) {
+        } else if ["/var", "/tmp"].iter().any(|dir| {
+            base.strip_prefix(dir).is_some_and(|it| it.is_empty() || it.starts_with('/'))
+        }) {
             add(&mut plain, &format!("/private{base}"));
         }
     }
@@ -296,7 +299,9 @@ fn escaped(path: &str) -> String {
     let mut out = String::with_capacity(path.len()); // alloc: setup, a root's spelling
     for byte in path.bytes() {
         match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(char::from(byte)),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(char::from(byte))
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -309,7 +314,10 @@ fn trim(path: &str) -> &str {
 }
 
 fn usable(path: &str) -> bool {
-    !cfg!(windows) && !path.is_empty() && Path::new(path).is_absolute() && !path.as_bytes().contains(&MARK)
+    !cfg!(windows)
+        && !path.is_empty()
+        && Path::new(path).is_absolute()
+        && !path.as_bytes().contains(&MARK)
 }
 
 /// Whether `byte` is one of a path's: a name's or a separator.
@@ -331,7 +339,11 @@ fn separator(byte: Option<u8>) -> bool {
 fn word_end(byte: Option<u8>) -> bool {
     match byte {
         None => true,
-        Some(it) => !(it.is_ascii_alphanumeric() || matches!(it, b'.' | b'_' | b'-' | b'+' | b'~' | b'@') || it >= 0x80),
+        Some(it) => {
+            !(it.is_ascii_alphanumeric()
+                || matches!(it, b'.' | b'_' | b'-' | b'+' | b'~' | b'@')
+                || it >= 0x80)
+        }
     }
 }
 
@@ -474,7 +486,9 @@ impl<'a> Roots<'a> {
     fn at(&self, bytes: &[u8], ends: fn(Option<u8>) -> bool) -> Option<(Role, usize)> {
         self.roots[..self.len]
             .iter()
-            .find(|(_, root)| bytes.starts_with(root.as_bytes()) && ends(bytes.get(root.len()).copied()))
+            .find(|(_, root)| {
+                bytes.starts_with(root.as_bytes()) && ends(bytes.get(root.len()).copied())
+            })
             .map(|(role, root)| (*role, root.len()))
     }
 
@@ -582,7 +596,9 @@ impl<'a> Roots<'a> {
             Cow::Borrowed(_) => Cow::Borrowed(value),
             // A ported string is cut only at `\0` and at roots, which start with an ASCII byte
             // and are whole strings, and its placeholders are ASCII: it is UTF-8.
-            Cow::Owned(bytes) => Cow::Owned(OsString::from(String::from_utf8(bytes).expect("a UTF-8 string ported is UTF-8"))),
+            Cow::Owned(bytes) => Cow::Owned(OsString::from(
+                String::from_utf8(bytes).expect("a UTF-8 string ported is UTF-8"),
+            )),
         }
     }
 
@@ -610,8 +626,11 @@ impl<'a> Roots<'a> {
         if bytes.first() != Some(&MARK) {
             return Ok(Cow::Borrowed(path));
         }
-        let bad = |why: &'static str| NoRoot { what: String::from_utf8_lossy(bytes).into_owned(), why }; // alloc: error path
-        let text = path.to_str().ok_or_else(|| bad("a path written against a root is UTF-8, and this is not"))?;
+        let bad =
+            |why: &'static str| NoRoot { what: String::from_utf8_lossy(bytes).into_owned(), why }; // alloc: error path
+        let text = path
+            .to_str()
+            .ok_or_else(|| bad("a path written against a root is UTF-8, and this is not"))?;
         let root = self.root_of(bytes.get(1).copied().unwrap_or(MARK), bytes)?;
         let rest = text.get(2..).ok_or_else(|| bad("a root's placeholder is cut short"))?;
         if !separator(rest.as_bytes().first().copied()) {
@@ -627,14 +646,24 @@ impl<'a> Roots<'a> {
     pub fn traced(&self, traced: &Traced) -> Traced {
         let mut ported = Traced {
             // alloc: the trace a run is kept under, once per run kept
-            files: traced.files.iter().map(|(path, hash)| (self.path(path).into_owned(), *hash)).collect(),
+            files: traced
+                .files
+                .iter()
+                .map(|(path, hash)| (self.path(path).into_owned(), *hash))
+                .collect(),
             // alloc: as above
-            dirs: traced.dirs.iter().map(|(path, hash)| (self.path(path).into_owned(), *hash)).collect(),
+            dirs: traced
+                .dirs
+                .iter()
+                .map(|(path, hash)| (self.path(path).into_owned(), *hash))
+                .collect(),
             env: traced
                 .env
                 .iter()
                 // clone: as above, the names the kept trace owns
-                .map(|(name, value)| (name.clone(), value.as_deref().map(|it| self.os(it).into_owned())))
+                .map(|(name, value)| {
+                    (name.clone(), value.as_deref().map(|it| self.os(it).into_owned()))
+                })
                 .collect(), // alloc: as above
             untraceable: traced.untraceable.clone(), // clone: as above
         };
@@ -666,7 +695,9 @@ impl<'a> Roots<'a> {
         let mut found = RoleSet::default();
         for &(role, root) in &self.roots[..self.len] {
             let aliased = self.aliases.iter().filter(|it| it.0 == role).map(|it| it.1.as_str());
-            if std::iter::once(root).chain(aliased).any(|it| spelled_in(bytes, it.as_bytes())) || utf16_in(bytes, root) {
+            if std::iter::once(root).chain(aliased).any(|it| spelled_in(bytes, it.as_bytes()))
+                || utf16_in(bytes, root)
+            {
                 found.insert(role);
             }
         }
@@ -700,7 +731,12 @@ impl<'a> Roots<'a> {
     fn outside(&self, path: &Path) -> bool {
         let bytes = path.as_os_str().as_encoded_bytes();
         let checkout = [Role::Package, Role::OutDir, Role::Target, Role::Workspace];
-        let holds_root = |dir: &Path| checkout.iter().filter_map(|role| self.get(*role)).any(|root| Path::new(root).starts_with(dir));
+        let holds_root = |dir: &Path| {
+            checkout
+                .iter()
+                .filter_map(|role| self.get(*role))
+                .any(|root| Path::new(root).starts_with(dir))
+        };
         let wide = |dir: &Path| path.starts_with(dir) && !holds_root(dir);
         bytes.first() != Some(&MARK)
             && !MACHINE.iter().any(|dir| wide(Path::new(dir)))
@@ -717,7 +753,9 @@ impl<'a> Roots<'a> {
     /// ([`RootMap::set`], read again here as a run is kept): the spellings its output was
     /// scanned for may not be the ones it saw.
     pub fn relinked(&self) -> bool {
-        self.resolved.iter().any(|(role, then)| self.get(*role).is_some_and(|root| resolve(root) != *then))
+        self.resolved
+            .iter()
+            .any(|(role, then)| self.get(*role).is_some_and(|root| resolve(root) != *then))
     }
 
     /// `traced`, what a run read, and `value`, what it gave, as they are kept: the trace
@@ -725,7 +763,11 @@ impl<'a> Roots<'a> {
     /// its roots' strings (below), without them, for another checkout to verify
     /// ([`Marked::shared`], [`verify`]); and the value's output ported ([`Roots::stored`]).
     /// An error when the scan of the files it wrote could not be made ([`Roots::stored`]).
-    pub fn kept(&self, traced: &Traced, value: &Value) -> Result<(Marked, Value), aho_corasick::BuildError> {
+    pub fn kept(
+        &self,
+        traced: &Traced,
+        value: &Value,
+    ) -> Result<(Marked, Value), aho_corasick::BuildError> {
         let (stored, left) = self.stored(value)?;
         Ok((self.kept_trace(traced, left), stored))
     }
@@ -786,7 +828,9 @@ impl<'a> Roots<'a> {
         if left.is_empty() && !stored.files.is_empty() && !self.is_empty() {
             let scan = Scan::of(self)?;
             for file in &stored.files {
-                let found = scan.first(file.path.as_bytes()).or_else(|| file.bytes.as_deref().and_then(|it| scan.first(it)));
+                let found = scan
+                    .first(file.path.as_bytes())
+                    .or_else(|| file.bytes.as_deref().and_then(|it| scan.first(it)));
                 if let Some(roles) = found {
                     left = roles;
                     break;
@@ -841,7 +885,8 @@ impl Scan {
             set.insert(role);
             set
         };
-        let (mut paths, mut path_roles, mut wide, mut wide_roles) = (Vec::new(), Vec::new(), Vec::new(), Vec::new()); // alloc: once per run kept that wrote files, its patterns
+        let (mut paths, mut path_roles, mut wide, mut wide_roles) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new()); // alloc: once per run kept that wrote files, its patterns
         for &(role, root) in &roots.roots[..roots.len] {
             let aliased = roots.aliases.iter().filter(|it| it.0 == role).map(|it| it.1.as_str());
             for spelling in std::iter::once(root).chain(aliased) {
@@ -864,7 +909,8 @@ impl Scan {
                 if from == to || roots.top(from) == roots.top(to) {
                     continue;
                 }
-                let folded = separators_folded(relative(from_root, to_root).as_bytes()).into_owned(); // alloc: as above
+                let folded =
+                    separators_folded(relative(from_root, to_root).as_bytes()).into_owned(); // alloc: as above
                 if !folded.is_empty() {
                     paths.push(folded);
                     path_roles.push(one(from).union(one(to)));
@@ -875,7 +921,9 @@ impl Scan {
         // dozen spellings never near) is an error the run's keep names (`KeepError::Scan`),
         // never a scan taken as done or a guess at what it would have found.
         let built = |patterns: &[Vec<u8>], fold: bool| {
-            (!patterns.is_empty()).then(|| AhoCorasick::builder().ascii_case_insensitive(fold).build(patterns)).transpose()
+            (!patterns.is_empty())
+                .then(|| AhoCorasick::builder().ascii_case_insensitive(fold).build(patterns))
+                .transpose()
         };
         let (paths, wide) = (built(&paths, true)?, built(&wide, false)?);
         Ok(Scan { paths, path_roles, wide, wide_roles })
@@ -904,7 +952,8 @@ impl Scan {
 /// compares in. Borrowed when it is already in that form.
 fn separators_folded(bytes: &[u8]) -> Cow<'_, [u8]> {
     let sep = |it: u8| it == b'/' || it == b'\\';
-    let folded = memchr::memchr(b'\\', bytes).is_none() && memchr::memmem::find(bytes, b"//").is_none();
+    let folded =
+        memchr::memchr(b'\\', bytes).is_none() && memchr::memmem::find(bytes, b"//").is_none();
     if folded {
         return Cow::Borrowed(bytes);
     }
@@ -928,30 +977,34 @@ fn spelled_in(hay: &[u8], needle: &[u8]) -> bool {
     let sep = |it: u8| it == b'/' || it == b'\\';
     // An empty needle names no path.
     let Some(&first) = needle.first() else { return false };
-    (0..hay.len()).filter(|&at| sep(hay[at]) == sep(first) && (sep(first) || hay[at].eq_ignore_ascii_case(&first))).any(|start| {
-        let (mut i, mut j) = (0, start);
-        while i < needle.len() {
-            let Some(&got) = hay.get(j) else { return false };
-            if sep(needle[i]) {
-                if !sep(got) {
-                    return false;
-                }
-                while i < needle.len() && sep(needle[i]) {
+    (0..hay.len())
+        .filter(|&at| {
+            sep(hay[at]) == sep(first) && (sep(first) || hay[at].eq_ignore_ascii_case(&first))
+        })
+        .any(|start| {
+            let (mut i, mut j) = (0, start);
+            while i < needle.len() {
+                let Some(&got) = hay.get(j) else { return false };
+                if sep(needle[i]) {
+                    if !sep(got) {
+                        return false;
+                    }
+                    while i < needle.len() && sep(needle[i]) {
+                        i += 1;
+                    }
+                    while hay.get(j).copied().is_some_and(sep) {
+                        j += 1;
+                    }
+                } else {
+                    if !got.eq_ignore_ascii_case(&needle[i]) {
+                        return false;
+                    }
                     i += 1;
-                }
-                while hay.get(j).copied().is_some_and(sep) {
                     j += 1;
                 }
-            } else {
-                if !got.eq_ignore_ascii_case(&needle[i]) {
-                    return false;
-                }
-                i += 1;
-                j += 1;
             }
-        }
-        true
-    })
+            true
+        })
 }
 
 /// The path from the directory `from` to `to`, both absolute: a `..` for each of `from`'s
@@ -1097,7 +1150,10 @@ where
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
         let Rooted { roots, inner, all, .. } = self;
-        let touched = inner.env_all().iter().any(|(_, value)| value.to_str().is_some_and(|it| roots.touches(it.as_bytes())));
+        let touched = inner
+            .env_all()
+            .iter()
+            .any(|(_, value)| value.to_str().is_some_and(|it| roots.touches(it.as_bytes())));
         if !touched {
             return inner.env_all();
         }

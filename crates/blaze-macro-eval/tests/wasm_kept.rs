@@ -37,14 +37,24 @@ fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
 }
 
 /// The workspace built with [`KRATE`]'s macros in its module and every other on the evaluator.
-fn build(config: &Corpus, macros: &Arc<blaze_macro_eval::Macros>, modules: &blaze_macro_eval::Modules, module: &[u8]) -> load::Workspace {
-    let workspace = load::lower_with(&config.workspace, &config.cargo_home, config.homes(), |db, krate, toolchain, name| {
-        let loaded = match name {
-            KRATE => blaze_macro_eval::load_wasm(db, krate, toolchain, macros, modules, module),
-            _ => blaze_macro_eval::load(db, krate, toolchain, macros),
-        };
-        loaded.map_err(|error| format!("loading `{name}`: {error}"))
-    })
+fn build(
+    config: &Corpus,
+    macros: &Arc<blaze_macro_eval::Macros>,
+    modules: &blaze_macro_eval::Modules,
+    module: &[u8],
+) -> load::Workspace {
+    let workspace = load::lower_with(
+        &config.workspace,
+        &config.cargo_home,
+        config.homes(),
+        |db, krate, toolchain, name| {
+            let loaded = match name {
+                KRATE => blaze_macro_eval::load_wasm(db, krate, toolchain, macros, modules, module),
+                _ => blaze_macro_eval::load(db, krate, toolchain, macros),
+            };
+            loaded.map_err(|error| format!("loading `{name}`: {error}"))
+        },
+    )
     .unwrap_or_else(|why| panic!("{why}"));
     let calls = workspace.krate("corpus-calls").unwrap_or_else(|why| panic!("{why}"));
     crate_def_map(workspace.lowered.db(), calls);
@@ -59,13 +69,21 @@ fn of<'a>(puts: &'a [Put], prefix: &str) -> Vec<&'a str> {
 #[ignore = "needs BLAZE_MACRO_CORPUS with `wasm` naming serde_derive's module, built by blaze for wasm32-wasip1"]
 fn a_modules_expansion_and_machine_code_are_found_by_the_next_build() {
     let config = Corpus::read().unwrap_or_else(|why| panic!("{why}"));
-    let path = config.wasm.as_ref().and_then(|it| it.get(KRATE)).unwrap_or_else(|| panic!("no `wasm` module of `{KRATE}`"));
+    let path = config
+        .wasm
+        .as_ref()
+        .and_then(|it| it.get(KRATE))
+        .unwrap_or_else(|| panic!("no `wasm` module of `{KRATE}`"));
     let module = std::fs::read(path).unwrap_or_else(|error| panic!("{path}: {error}"));
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
     let mut sim = Sim::new(5, Faults::default());
     let mut store = kept_in(&mut sim);
-    let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
-        .unwrap_or_else(|why| panic!("{why}"));
+    let keeping = kept::Keeping::new(Expansions {
+        store: store.reader(),
+        toolchain,
+        environment: Arc::new(Environment::default()),
+    })
+    .unwrap_or_else(|why| panic!("{why}"));
     let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
 
     let modules = blaze_macro_eval::Modules::new().unwrap_or_else(|why| panic!("{why}"));
@@ -88,6 +106,10 @@ fn a_modules_expansion_and_machine_code_are_found_by_the_next_build() {
     let second = build(&config, &macros, &modules, &module);
     assert_eq!(modules.loads().compiled, 1, "the second build compiled the module again");
     let puts = kept::take_puts();
-    assert!(of(&puts, derives).is_empty(), "the second build ran what the first kept: {:?}", of(&puts, ""));
+    assert!(
+        of(&puts, derives).is_empty(),
+        "the second build ran what the first kept: {:?}",
+        of(&puts, "")
+    );
     drop(second);
 }

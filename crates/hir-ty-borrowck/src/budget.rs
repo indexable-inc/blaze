@@ -11,8 +11,8 @@ use blaze_alloc_count::{assert_at_most, measure};
 use blaze_ids::rng::SplitMix64;
 use blaze_mem::{Tag, frame};
 use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
-use hir_ty_mir as _;
 use hir_expand::fixture;
+use hir_ty_mir as _;
 
 use crate::{
     BorrowckResult, PartSpan, borrowck, borrowck_in_mode,
@@ -38,10 +38,15 @@ fn owned_blocks(result: &BorrowckResult) -> u64 {
                     + room(it.children.capacity())
                     + it.children
                         .iter()
-                        .map(|it| text(&it.message) + room(it.spans.capacity()) + labels(&it.labels))
+                        .map(|it| {
+                            text(&it.message) + room(it.spans.capacity()) + labels(&it.labels)
+                        })
                         .sum::<u64>()
                     + room(it.suggestions.capacity())
-                    + it.suggestions.iter().map(|it| text(&it.message) + labels(&it.parts)).sum::<u64>()
+                    + it.suggestions
+                        .iter()
+                        .map(|it| text(&it.message) + labels(&it.parts))
+                        .sum::<u64>()
             })
             .sum::<u64>()
 }

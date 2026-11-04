@@ -249,7 +249,10 @@ mod tests {
     use super::*;
 
     #[derive(PartialEq, Eq, Hash, Debug)]
-    #[cfg_attr(blaze_check, allow(dead_code, reason = "made only by a normal build's threaded test"))]
+    #[cfg_attr(
+        blaze_check,
+        allow(dead_code, reason = "made only by a normal build's threaded test")
+    )]
     struct Name(u32);
     impl_internable!(Name);
 
@@ -385,7 +388,8 @@ mod tests {
     #[test]
     fn interning_agrees_with_a_map_model() {
         let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
-        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed, Global> = blaze_hash::HashMap::new_in(Global); // alloc: a test's model
+        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed, Global> =
+            blaze_hash::HashMap::new_in(Global); // alloc: a test's model
         for _ in 0..20_000 {
             let len = rng.index(24);
             let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();
@@ -429,7 +433,10 @@ mod tests {
 /// the first intern's of each value, every other copy is dropped once, and equal values get one
 /// handle.
 #[cfg(all(test, blaze_check))]
-#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
+#[allow(
+    unsafe_code,
+    reason = "each execution's storage is reached through a pointer the test sets and clears"
+)]
 mod model {
     use std::sync::{
         Arc,

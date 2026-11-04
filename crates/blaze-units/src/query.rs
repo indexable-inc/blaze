@@ -295,7 +295,12 @@ impl EnvReads {
     /// The variable `name` of `env`, noted read by `by` (what a person is told read it: "the
     /// item store's mode"). A name read before with another value is an error naming it: what
     /// is kept would be made from two values of one variable, and its key would hold one.
-    pub fn var<'e>(&mut self, env: &'e [(String, String)], name: &str, by: &'static str) -> Result<Option<&'e str>, String> {
+    pub fn var<'e>(
+        &mut self,
+        env: &'e [(String, String)],
+        name: &str,
+        by: &'static str,
+    ) -> Result<Option<&'e str>, String> {
         let value = env_var(env, name);
         match self.read.binary_search_by(|it| it.0.as_str().cmp(name)) {
             Ok(at) if self.read[at].1.as_deref() == value => Ok(value),
@@ -319,9 +324,9 @@ impl EnvReads {
         self.read.iter().find_map(|(name, was, by)| {
             let value = env_var(now, name);
             (value != was.as_deref()).then(|| EnvMoved {
-                name: name.clone(),       // clone: a reason, once per front end let go
-                by: (*by).to_owned(),     // alloc: as above
-                was: was.clone(),         // clone: as above
+                name: name.clone(),            // clone: a reason, once per front end let go
+                by: (*by).to_owned(),          // alloc: as above
+                was: was.clone(),              // clone: as above
                 now: value.map(str::to_owned), // alloc: as above
             })
         })
@@ -336,7 +341,9 @@ impl EnvReads {
 /// Never the values: a variable may hold a secret.
 impl std::fmt::Debug for EnvReads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.read.iter().map(|(name, value, by)| (name, value.is_some(), by))).finish()
+        f.debug_list()
+            .entries(self.read.iter().map(|(name, value, by)| (name, value.is_some(), by)))
+            .finish()
     }
 }
 
@@ -512,7 +519,10 @@ impl Units {
     /// is primary ([`Units::is_primary`]): how a record's reads, which name a crate by its
     /// package's manifest, are valued with no front end.
     pub fn is_primary_manifest(&self, manifest_path: &str) -> bool {
-        self.packages.iter().find(|it| it.manifest_path == manifest_path).is_some_and(|it| self.primary_package(&it.id))
+        self.packages
+            .iter()
+            .find(|it| it.manifest_path == manifest_path)
+            .is_some_and(|it| self.primary_package(&it.id))
     }
 
     fn primary_package(&self, pkg_id: &str) -> bool {
@@ -789,20 +799,45 @@ mod tests {
     fn env_reads_move_only_with_a_variable_read() {
         let first = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "1"), ("SECRET", "hunter2")]);
         let mut reads = EnvReads::default();
-        assert_eq!(reads.var(&first, "BLAZE_ITEM_STORE", "the item store's mode"), Ok(Some("verify")));
+        assert_eq!(
+            reads.var(&first, "BLAZE_ITEM_STORE", "the item store's mode"),
+            Ok(Some("verify"))
+        );
         assert_eq!(reads.var(&first, "BLAZE_DEP_IMAGES", "the dependency images' mode"), Ok(None));
-        let unrelated = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "3"), ("INVOCATION_ID", "9f"), ("OLDPWD", "/x")]);
+        let unrelated = env(&[
+            ("BLAZE_ITEM_STORE", "verify"),
+            ("SHLVL", "3"),
+            ("INVOCATION_ID", "9f"),
+            ("OLDPWD", "/x"),
+        ]);
         assert_eq!(reads.moved(&unrelated), None);
         let other = env(&[("BLAZE_ITEM_STORE", "off"), ("SECRET", "hunter3")]);
         let moved = reads.moved(&other).expect("a variable read has another value");
-        assert_eq!((moved.name.as_str(), moved.by.as_str()), ("BLAZE_ITEM_STORE", "the item store's mode"));
+        assert_eq!(
+            (moved.name.as_str(), moved.by.as_str()),
+            ("BLAZE_ITEM_STORE", "the item store's mode")
+        );
         let said = format!("{moved} {moved:?} {reads:?}");
-        assert!(said.contains("has another value now") && !said.contains("verify") && !said.contains("off"), "{said}");
+        assert!(
+            said.contains("has another value now")
+                && !said.contains("verify")
+                && !said.contains("off"),
+            "{said}"
+        );
         let set = env(&[("BLAZE_ITEM_STORE", "verify"), ("BLAZE_DEP_IMAGES", "check")]);
-        assert_eq!(reads.moved(&set).map(|it| it.name), Some("BLAZE_DEP_IMAGES".to_owned()), "set where it was unset");
+        assert_eq!(
+            reads.moved(&set).map(|it| it.name),
+            Some("BLAZE_DEP_IMAGES".to_owned()),
+            "set where it was unset"
+        );
         assert!(reads.moved(&env(&[])).is_some_and(|it| it.to_string().contains("is unset now")));
-        let refused = reads.var(&other, "BLAZE_ITEM_STORE", "a later serve").expect_err("two values of one variable");
-        assert!(refused.contains("`BLAZE_ITEM_STORE`") && refused.contains("the item store's mode"), "{refused}");
+        let refused = reads
+            .var(&other, "BLAZE_ITEM_STORE", "a later serve")
+            .expect_err("two values of one variable");
+        assert!(
+            refused.contains("`BLAZE_ITEM_STORE`") && refused.contains("the item store's mode"),
+            "{refused}"
+        );
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -860,7 +895,11 @@ mod tests {
                 files: vec![("/home/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())],
             },
             mounts: vec![
-                Mount { at: "/rustc/0123/library".to_owned(), origin: Origin::Root(ContentId([7; 32])), under: String::new() },
+                Mount {
+                    at: "/rustc/0123/library".to_owned(),
+                    origin: Origin::Root(ContentId([7; 32])),
+                    under: String::new(),
+                },
                 Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
             ],
             host: "aarch64-unknown-linux-gnu".to_owned(),
@@ -877,7 +916,11 @@ mod tests {
     #[test]
     fn std_keys_differ_by_what_they_ask() {
         let key = StdKey {
-            library: Mount { at: "/rustc/0123/library".to_owned(), origin: Origin::Root(ContentId([7; 32])), under: String::new() },
+            library: Mount {
+                at: "/rustc/0123/library".to_owned(),
+                origin: Origin::Root(ContentId([7; 32])),
+                under: String::new(),
+            },
             triple: "x86_64-unknown-linux-gnu".to_owned(),
             profile: "dev".to_owned(),
             panic: "unwind".to_owned(),

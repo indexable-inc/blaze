@@ -58,7 +58,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedFunction<'db>) -> Ve
             {
                 "struct"
             }
-            PathResolution::Def(hir::ModuleDef::EnumVariant(it)) if it.kind(cx.db) == hir::StructKind::Unit => {
+            PathResolution::Def(hir::ModuleDef::EnumVariant(it))
+                if it.kind(cx.db) == hir::StructKind::Unit =>
+            {
                 "enum variant"
             }
             _ => return None,
@@ -132,13 +134,23 @@ fn defined_here<'db>(
         }
         PathResolution::Def(def) => {
             let node = match def {
-                hir::ModuleDef::EnumVariant(it) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
-                hir::ModuleDef::Adt(hir::Adt::Struct(it)) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
-                hir::ModuleDef::Adt(hir::Adt::Union(it)) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
-                hir::ModuleDef::Adt(hir::Adt::Enum(it)) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
+                hir::ModuleDef::EnumVariant(it) => {
+                    cx.vsema.source(*it)?.map(|it| def_range(it.syntax()))
+                }
+                hir::ModuleDef::Adt(hir::Adt::Struct(it)) => {
+                    cx.vsema.source(*it)?.map(|it| def_range(it.syntax()))
+                }
+                hir::ModuleDef::Adt(hir::Adt::Union(it)) => {
+                    cx.vsema.source(*it)?.map(|it| def_range(it.syntax()))
+                }
+                hir::ModuleDef::Adt(hir::Adt::Enum(it)) => {
+                    cx.vsema.source(*it)?.map(|it| def_range(it.syntax()))
+                }
                 hir::ModuleDef::Function(it) => cx.vsema.source(*it)?.map(signature_range),
                 hir::ModuleDef::Const(it) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
-                hir::ModuleDef::Static(it) => cx.vsema.source(*it)?.map(|it| def_range(it.syntax())),
+                hir::ModuleDef::Static(it) => {
+                    cx.vsema.source(*it)?.map(|it| def_range(it.syntax()))
+                }
                 _ => return None,
             };
             cx.span(node)
@@ -162,7 +174,7 @@ fn defined_here<'db>(
                 | hir::ModuleDef::Const(_)
                 | hir::ModuleDef::Static(_)),
             ) => format!("`{}` defined here", cx.def_path(*def)), // alloc: the error's label
-            _ => format!("`{ty}` defined here"),                  // alloc: the error's label
+            _ => format!("`{ty}` defined here"), // alloc: the error's label
         }
     };
     Some((span, label))

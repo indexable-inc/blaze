@@ -34,11 +34,12 @@ use inkwell::{
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
-    INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
+    INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind,
+    emitted, link,
     lower::{Debug, Defined, Lowering},
     mark_features, mark_hint,
     pgo::{self, Counted},
@@ -141,7 +142,12 @@ fn llvm(e: inkwell::support::LLVMString) -> Unhandled {
 
 /// Runs `passes` over `module` through the passes kept for `machine`; `vectorize` as rustc
 /// vectorizes straight-line code at `-O2` and `-O3`.
-fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) -> Result<(), Unhandled> {
+fn run(
+    module: &Module<'_>,
+    passes: &str,
+    machine: &Machinery,
+    vectorize: bool,
+) -> Result<(), Unhandled> {
     Tally::global().time(Phase::Optimize, || machine.run(module, passes, vectorize))
 }
 
@@ -171,84 +177,93 @@ pub(crate) fn prelink(
     frame_pointers: bool,
 ) -> Result<Prelinked, Unhandled> {
     let tally = Tally::global();
-    Machine::with_pgo(wants.target, optimization, pgo.map(|it| it.0), features, |context, machine| {
-        // The counts are the thread's machinery's, which an earlier compile that returned
-        // between its run and its take may have left set: this function's start from none.
-        let _ = (machine.take_mismatched(), machine.take_applied());
-        let module = context.create_module("blaze");
-        module.set_triple(&machine.get_triple());
-        module.set_data_layout(&machine.get_target_data().get_data_layout());
-        // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: HashMap<u32, &[u8], Global> = wants.constants().collect();
-        // alloc: once per module, as `constants`
-        let statics: HashSet<u32, Global> = wants.statics().collect();
-        // alloc: once per module, as `constants`
-        let readonly: HashMap<u32, &crate::ConstBlob, Global> = wants.readonly().collect();
-        let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
-        told_constants(context, &module, &readonly, pointer);
-        let lines = if debug || report { Debug::of(&module, wants.target, report)? } else { None };
-        let own = Defined {
-            name: OWN,
-            func,
-            pointees: &wants.pointees,
-            named: if debug { named } else { &[] },
-            weights: None,
-            marked: debug || report,
-        };
-        let blocks_asm = wants.asm_blocks();
-        let shown = HashMap::new_in(Global);
-        let function = tally.time(Phase::Lower, || {
-            let function = Lowering::add(context, &module, wants.target, &own, frame_pointers)?;
-            mark_hint(context, function, hint);
-            mark_features(context, function, wants.target, features)?;
-            sanitize::mark(context, function, sanitize, unsanitized);
-            Lowering::define(
-                context,
-                &module,
-                wants.target,
-                function,
-                &own,
-                &constants,
-                &statics,
-                wants.resume(),
-                wants.memcmp(),
-                &blocks_asm,
-                &shown,
-                lines.as_ref(),
-            )?;
-            Ok::<_, Unhandled>(function)
-        })?;
-        told_functions(context, &module, wants, pointer)?;
-        // The builder of the line table goes before the module is changed or let go of.
-        let lined = lines.inspect(Debug::finish).is_some();
-        tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
-        let renamed = pgo.map(|(wanted, name)| pgo::instrumented(context, &module, function, wanted, name));
-        if let Some(passes) = prelink_passes(optimization) {
-            run(&module, passes, machine, true)?;
-        }
-        if pgo.is_some() && !pgo::in_pipeline(optimization) {
-            tally.time(Phase::Optimize, || machine.run_pgo(&module))?;
-        }
-        let mismatched = machine.take_mismatched() > 0;
-        let applied = machine.take_applied() > 0;
-        if let Some(renamed) = renamed {
-            renamed.restore();
-        }
-        let size = function.get_basic_blocks().iter().map(|it| it.get_instructions().count()).sum();
-        let mut facts = facts(&module, function, instances);
-        let own: Arc<[u8]> = module.write_bitcode_to_memory().as_slice().into();
-        // The module is written: what follows changes it in place rather than a copy.
-        let export = match lined {
-            true => {
-                module.strip_debug_info();
-                module.write_bitcode_to_memory().as_slice().into()
+    Machine::with_pgo(
+        wants.target,
+        optimization,
+        pgo.map(|it| it.0),
+        features,
+        |context, machine| {
+            // The counts are the thread's machinery's, which an earlier compile that returned
+            // between its run and its take may have left set: this function's start from none.
+            let _ = (machine.take_mismatched(), machine.take_applied());
+            let module = context.create_module("blaze");
+            module.set_triple(&machine.get_triple());
+            module.set_data_layout(&machine.get_target_data().get_data_layout());
+            // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
+            let constants: HashMap<u32, &[u8], Global> = wants.constants().collect();
+            // alloc: once per module, as `constants`
+            let statics: HashSet<u32, Global> = wants.statics().collect();
+            // alloc: once per module, as `constants`
+            let readonly: HashMap<u32, &crate::ConstBlob, Global> = wants.readonly().collect();
+            let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
+            told_constants(context, &module, &readonly, pointer);
+            let lines =
+                if debug || report { Debug::of(&module, wants.target, report)? } else { None };
+            let own = Defined {
+                name: OWN,
+                func,
+                pointees: &wants.pointees,
+                named: if debug { named } else { &[] },
+                weights: None,
+                marked: debug || report,
+            };
+            let blocks_asm = wants.asm_blocks();
+            let shown = HashMap::new_in(Global);
+            let function = tally.time(Phase::Lower, || {
+                let function = Lowering::add(context, &module, wants.target, &own, frame_pointers)?;
+                mark_hint(context, function, hint);
+                mark_features(context, function, wants.target, features)?;
+                sanitize::mark(context, function, sanitize, unsanitized);
+                Lowering::define(
+                    context,
+                    &module,
+                    wants.target,
+                    function,
+                    &own,
+                    &constants,
+                    &statics,
+                    wants.resume(),
+                    wants.memcmp(),
+                    &blocks_asm,
+                    &shown,
+                    lines.as_ref(),
+                )?;
+                Ok::<_, Unhandled>(function)
+            })?;
+            told_functions(context, &module, wants, pointer)?;
+            // The builder of the line table goes before the module is changed or let go of.
+            let lined = lines.inspect(Debug::finish).is_some();
+            tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
+            let renamed = pgo
+                .map(|(wanted, name)| pgo::instrumented(context, &module, function, wanted, name));
+            if let Some(passes) = prelink_passes(optimization) {
+                run(&module, passes, machine, true)?;
             }
-            false => Arc::clone(&own),
-        };
-        let body = optimistic(context, module, function, instances, machine)?;
-        facts.body = Attrs { noreturn: facts.attrs.noreturn, ..body };
-        Ok(Prelinked { own, export, size, facts, mismatched, applied })
-    })
+            if pgo.is_some() && !pgo::in_pipeline(optimization) {
+                tally.time(Phase::Optimize, || machine.run_pgo(&module))?;
+            }
+            let mismatched = machine.take_mismatched() > 0;
+            let applied = machine.take_applied() > 0;
+            if let Some(renamed) = renamed {
+                renamed.restore();
+            }
+            let size =
+                function.get_basic_blocks().iter().map(|it| it.get_instructions().count()).sum();
+            let mut facts = facts(&module, function, instances);
+            let own: Arc<[u8]> = module.write_bitcode_to_memory().as_slice().into();
+            // The module is written: what follows changes it in place rather than a copy.
+            let export = match lined {
+                true => {
+                    module.strip_debug_info();
+                    module.write_bitcode_to_memory().as_slice().into()
+                }
+                false => Arc::clone(&own),
+            };
+            let body = optimistic(context, module, function, instances, machine)?;
+            facts.body = Attrs { noreturn: facts.attrs.noreturn, ..body };
+            Ok(Prelinked { own, export, size, facts, mismatched, applied })
+        },
+    )
 }
 
 /// LLVM's attributes `memory(read)` stands for nothing of an object's state but this: a
@@ -257,7 +272,8 @@ const MOD: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 
 /// What LLVM says of `function` in its attributes.
 fn attrs_of(function: FunctionValue<'_>) -> Attrs {
-    let has = |name| function.get_enum_attribute(AttributeLoc::Function, attribute_kind(name)).is_some();
+    let has =
+        |name| function.get_enum_attribute(AttributeLoc::Function, attribute_kind(name)).is_some();
     let memory = function
         .get_enum_attribute(AttributeLoc::Function, attribute_kind("memory"))
         .map(|it| it.get_enum_value());
@@ -302,8 +318,14 @@ fn told_functions<'ctx>(
         let mut addresses = blob
             .relocs
             .iter()
-            .map(|&(offset, target, addend)| (offset as usize, Symbol::Data(target.as_u32()), addend))
-            .chain(blob.fn_relocs.iter().map(|&(offset, target)| (offset as usize, Symbol::Func(target.as_u32()), 0)))
+            .map(|&(offset, target, addend)| {
+                (offset as usize, Symbol::Data(target.as_u32()), addend)
+            })
+            .chain(
+                blob.fn_relocs
+                    .iter()
+                    .map(|&(offset, target)| (offset as usize, Symbol::Func(target.as_u32()), 0)),
+            )
             .collect::<SmallVec<[(usize, Symbol, i64); 8]>>();
         blaze_ids::radix::sort_copy_by_key(&mut addresses, |it| it.0);
         let fits = addresses.windows(2).all(|it| it[0].0 + pointer <= it[1].0)
@@ -333,11 +355,9 @@ fn told_functions<'ctx>(
                     let function = match module.get_function(&name) {
                         Some(known) => known,
                         None => {
-                            let request = wants
-                                .requests
-                                .funcs
-                                .get(target as usize)
-                                .ok_or(Unhandled::Shape("an object naming a function nobody asked for"))?;
+                            let request = wants.requests.funcs.get(target as usize).ok_or(
+                                Unhandled::Shape("an object naming a function nobody asked for"),
+                            )?;
                             let ty = Lowering::function_type(context, wants.target, &request.sig)?;
                             module.add_function(&name, ty, Some(Linkage::External))
                         }
@@ -350,7 +370,12 @@ fn told_functions<'ctx>(
                 // SAFETY: `address` is a global of `module` and the index an `i64` constant of
                 // `context`, so this builds a constant expression owned by `context`; not
                 // `inbounds`, so any `addend` is defined.
-                _ => unsafe { address.const_gep(context.i8_type(), &[context.i64_type().const_int(addend as u64, true)]) },
+                _ => unsafe {
+                    address.const_gep(
+                        context.i8_type(),
+                        &[context.i64_type().const_int(addend as u64, true)],
+                    )
+                },
             };
             fields.push(address.into());
             at = offset + pointer;
@@ -479,7 +504,11 @@ unsafe fn arg_of(value: LLVMValueRef) -> Arg {
 
 /// What `function`, alone in `module` after the pre-link pipeline, says of itself. Its
 /// `body` is its `attrs` until [`optimistic`] says more.
-fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &impl Fn(u32) -> bool) -> Facts {
+fn facts<'ctx>(
+    module: &Module<'ctx>,
+    function: FunctionValue<'ctx>,
+    instances: &impl Fn(u32) -> bool,
+) -> Facts {
     let params = function.count_params();
     let unused = function
         .get_param_iter()
@@ -497,7 +526,10 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
     let mut calls: Vec<Called> = Vec::new();
     for block in function.get_basic_block_iter() {
         for instruction in block.get_instructions() {
-            if !matches!(instruction.get_opcode(), InstructionOpcode::Call | InstructionOpcode::Invoke) {
+            if !matches!(
+                instruction.get_opcode(),
+                InstructionOpcode::Call | InstructionOpcode::Invoke
+            ) {
                 continue;
             }
             let at = instruction.as_value_ref();
@@ -644,7 +676,8 @@ pub(crate) fn compile(
             Ok::<_, Unhandled>(())
         })?;
         told_functions(context, &module, wants, pointer)?;
-        let function = module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
+        let function =
+            module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
         apply(context, &module, function, given, pointer as u32 * 8)?;
         if wrapped {
             function.as_global_value().set_name(INNER);
@@ -674,8 +707,9 @@ pub(crate) fn compile(
                 let ((), found) = machine.reported(|| {
                     passes()?;
                     // The function by name: one built into its wrapper is gone (`INNER`).
-                    let function =
-                        module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
+                    let function = module
+                        .get_function(OWN)
+                        .ok_or(Unhandled::Shape("a module without its function"))?;
                     Ok(((), function))
                 })?;
                 if report == Asked::Unlined {
@@ -696,8 +730,9 @@ pub(crate) fn compile(
         let own = (OWN, signature);
         if let Some(counted) = counted {
             let covered = sanitize.coverage.is_on();
-            let (code, coverage, bytes) =
-                tally.time(Phase::Read, || emitted::read_profiled(object.as_slice(), own, wants, covered))?;
+            let (code, coverage, bytes) = tally.time(Phase::Read, || {
+                emitted::read_profiled(object.as_slice(), own, wants, covered)
+            })?;
             if u64::from(bytes) != u64::from(counted.counters) * 8 {
                 return Err(Unhandled::Shape("PGO counters of another size than the record says"));
             }
@@ -708,7 +743,8 @@ pub(crate) fn compile(
                 tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants))?;
             return Ok((code, coverage, None, found));
         }
-        let mut codes = tally.time(Phase::Read, || emitted::read(object.as_slice(), &[own], wants))?;
+        let mut codes =
+            tally.time(Phase::Read, || emitted::read(object.as_slice(), &[own], wants))?;
         let code = codes.pop().ok_or(Unhandled::Shape("an object without the function"))??;
         Ok((code, Covered::default(), None, found))
     })
@@ -737,7 +773,9 @@ fn apply<'ctx>(
             BasicTypeEnum::PointerType(ty) if u32::from(bits) == pointer => {
                 let int = std::num::NonZero::new(u32::from(bits))
                     .and_then(|bits| context.custom_width_int_type(bits).ok())
-                    .ok_or(Unhandled::Shape("a pointer constant of a width LLVM has no integer of"))?;
+                    .ok_or(Unhandled::Shape(
+                        "a pointer constant of a width LLVM has no integer of",
+                    ))?;
                 int.const_int(value, false).const_to_pointer(ty).into()
             }
             _ => return Err(Unhandled::Shape("a constant of another type than its parameter")),
@@ -772,10 +810,15 @@ fn apply<'ctx>(
         };
         if let Some(assumed) = assumed {
             // What the declaration says already holds too: the two are met.
-            let had = callee.get_enum_attribute(AttributeLoc::Function, memory).map(|it| it.get_enum_value());
+            let had = callee
+                .get_enum_attribute(AttributeLoc::Function, memory)
+                .map(|it| it.get_enum_value());
             let value = had.map_or(assumed, |had| had & assumed);
             callee.remove_enum_attribute(AttributeLoc::Function, memory);
-            callee.add_attribute(AttributeLoc::Function, context.create_enum_attribute(memory, value));
+            callee.add_attribute(
+                AttributeLoc::Function,
+                context.create_enum_attribute(memory, value),
+            );
         }
     }
     for (request, params) in &given.dead {
@@ -881,10 +924,14 @@ define i32 @"blaze.own"() {
 }
 "#,
         );
-        let mut wants = Wants::new(crate::Target::x86_64_linux(), &**crate::isa_for(crate::Target::x86_64_linux()).unwrap());
+        let mut wants = Wants::new(
+            crate::Target::x86_64_linux(),
+            &**crate::isa_for(crate::Target::x86_64_linux()).unwrap(),
+        );
         let mut signature = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
         signature.returns.push(AbiParam::new(types::I32));
-        let method = wants.func(crate::fragment::FuncTarget::Symbol("method".to_owned()), &signature);
+        let method =
+            wants.func(crate::fragment::FuncTarget::Symbol("method".to_owned()), &signature);
         let vtable = crate::ConstBlob {
             bytes: vec![0; 16],
             fn_relocs: vec![(8, method)],
@@ -1034,7 +1081,12 @@ define i32 @"blaze.own"(i32 %n) {
             size: 2,
             hint: Hint::None,
         };
-        let import = Import { export: std::sync::Arc::new(export), id: 1, funcs: vec![1], datas: Vec::new() };
+        let import = Import {
+            export: std::sync::Arc::new(export),
+            id: 1,
+            funcs: vec![1],
+            datas: Vec::new(),
+        };
         let into = context.create_module("blaze");
         into.link_in_module(module).unwrap();
         link(&context, &into, std::slice::from_ref(&import), Linkage::AvailableExternally).unwrap();

@@ -50,14 +50,18 @@ impl LintOptions {
                 return Err("Option 'cap-lints' given more than once".to_owned());
             }
             // alloc: an error's text
-            self.cap = Some(Level::of_cap(cap).ok_or_else(|| format!("unknown lint level: `{cap}`"))?);
+            self.cap =
+                Some(Level::of_cap(cap).ok_or_else(|| format!("unknown lint level: `{cap}`"))?);
             return Ok(true);
         }
         for (flag, level) in LEVEL_FLAGS {
             let Some(name) = args.value(arg, flag)? else { continue };
             if name == "help" {
                 // alloc: an error's text
-                return Err(format!("`{} help` asks for rustc's list of lints, which blaze does not write", level.to_cmd_flag()));
+                return Err(format!(
+                    "`{} help` asks for rustc's list of lints, which blaze does not write",
+                    level.to_cmd_flag()
+                ));
             }
             // alloc: setup, the command line read once per crate
             self.opts.push((name.replace('-', "_"), level));
@@ -90,7 +94,9 @@ impl<'a> Args<'a> {
             return match self.arg() {
                 Some(next) => Ok(Some(next)),
                 // alloc: an error's text
-                None => Err(format!("Argument to option '{}' missing", flag.trim_start_matches('-'))),
+                None => {
+                    Err(format!("Argument to option '{}' missing", flag.trim_start_matches('-')))
+                }
             };
         }
         let rest = arg.strip_prefix(flag);

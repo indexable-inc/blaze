@@ -38,7 +38,11 @@ const TARGET: Target = Target {
 
 fn check(data: &[u8]) {
     let (most, got) = blaze_fuzz::largest_allocation(|| Shape::decode(data));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "decoding {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "decoding {} bytes asked for {most} at once",
+        data.len()
+    );
     if let Ok(shape) = got {
         assert_eq!(shape.encode(), data, "a shape decoded is the bytes it encodes to: {shape:?}");
     }
@@ -47,8 +51,14 @@ fn check(data: &[u8]) {
 /// Shapes of what runs read, as `Shape::of` makes them.
 fn seeds() -> Vec<Vec<u8>> {
     let traced = Traced {
-        files: vec![(PathBuf::from("/p/foo/build.rs"), Some([7; 32])), (PathBuf::from("/p/foo/missing"), None)],
-        dirs: vec![(PathBuf::from("/p/foo/src"), [9; 32]), (PathBuf::from("/p/foo").join(trace::PACKAGE), [1; 32])],
+        files: vec![
+            (PathBuf::from("/p/foo/build.rs"), Some([7; 32])),
+            (PathBuf::from("/p/foo/missing"), None),
+        ],
+        dirs: vec![
+            (PathBuf::from("/p/foo/src"), [9; 32]),
+            (PathBuf::from("/p/foo").join(trace::PACKAGE), [1; 32]),
+        ],
         env: vec![
             (OsString::from("CC"), Some(OsString::from("cc"))),
             (OsString::from(trace::ALL_ENV_NAME), Some(OsString::from("00"))),

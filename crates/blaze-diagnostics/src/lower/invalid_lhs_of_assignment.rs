@@ -71,7 +71,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidLhsOfAssignment) -> V
         && let Some(lhs_deref) = deref_once_mutably(cx, lhs_ty)
     {
         if compound {
-            let trait_ = op.and_then(lang_item).and_then(|it| hir::Trait::lang(cx.db, cx.krate, it));
+            let trait_ =
+                op.and_then(lang_item).and_then(|it| hir::Trait::lang(cx.db, cx.krate, it));
             if let Some(trait_) = trait_
                 && lhs_deref.impls_trait(cx.db, trait_, std::slice::from_ref(rhs_ty))
             {

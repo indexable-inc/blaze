@@ -102,7 +102,10 @@ LL |             unsafe { /* unnecessary */ }
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui_std("unused-unsafe-in-nested-fn-lint.rs", "2015", "sized", ("", std_items), source), stderr);
+    assert_eq!(
+        ui_std("unused-unsafe-in-nested-fn-lint.rs", "2015", "sized", ("", std_items), source),
+        stderr
+    );
 }
 
 #[test]
@@ -195,7 +198,13 @@ fn main() {
 }
 "##;
     assert_reports(
-        &ui_std("rfc-2585-unsafe_op_in_unsafe_fn.rs", "2015", "sized, copy", ("", std_items), source),
+        &ui_std(
+            "rfc-2585-unsafe_op_in_unsafe_fn.rs",
+            "2015",
+            "sized, copy",
+            ("", std_items),
+            source,
+        ),
         &[
             error(9, &["`unsf`"]),
             error(11, &[]),

@@ -25,30 +25,61 @@ pub struct Target {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Edit {
     /// The `{ .. }` of a function, impl, trait or module, braces included.
-    ReplaceBody { body: String, item: Target },
+    ReplaceBody {
+        body: String,
+        item: Target,
+    },
     /// Everything of the item from its first token after its attributes to its body or `;`.
-    ReplaceSignature { item: Target, signature: String },
+    ReplaceSignature {
+        item: Target,
+        signature: String,
+    },
     /// The whole item, or one field or variant.
-    ReplaceItem { item: Target, text: String },
+    ReplaceItem {
+        item: Target,
+        text: String,
+    },
     /// `field` (`pub x: f32`, or `f32` for a tuple struct) after the last field of a struct,
     /// union or variant.
-    AddField { field: String, strukt: Target },
-    RemoveField { field: String, strukt: Target },
+    AddField {
+        field: String,
+        strukt: Target,
+    },
+    RemoveField {
+        field: String,
+        strukt: Target,
+    },
     /// At the end of the file, or of the module, impl or trait `into` names.
-    AddItem { file: String, into: Option<String>, text: String },
+    AddItem {
+        file: String,
+        into: Option<String>,
+        text: String,
+    },
     /// An item, field or variant, with its line.
-    RemoveItem { item: Target },
+    RemoveItem {
+        item: Target,
+    },
     /// `use path;` after the file's or the module's last use, or before its first item.
-    AddUse { file: String, into: Option<String>, path: String },
+    AddUse {
+        file: String,
+        into: Option<String>,
+        path: String,
+    },
     /// The item and every reference to it, as the front end resolves them in the crates that
     /// can name it; an out-of-line module's file moves with it.
-    Rename { to: String, item: Target },
+    Rename {
+        to: String,
+        item: Target,
+    },
     /// Every reference that resolves to the item `from` names, retargeted to the item `to`
     /// names, each a def path from a crate's name (`std::sync::Mutex`,
     /// `parking_lot::Mutex`), in the view's crates that can name `from`: a `use` of it imports
     /// `to` instead, a path that qualifies it is rewritten, and a path through one of the
     /// view's own imports stays, as that import moves.
-    Replace { to: String, from: String },
+    Replace {
+        to: String,
+        from: String,
+    },
 }
 
 /// What an edit request did: the ops it commits, and each item they touched.

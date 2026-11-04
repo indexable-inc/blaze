@@ -18,9 +18,13 @@ use std::time::Duration;
 
 use blaze_codegen::{
     Arch, Covered, Line, ProfileRecord, Profiled, RelocKind, Relocation, Relocs,
-    blob::{decode, decode_masked, decode_static, decode_view, encode, encode_masked, encode_static},
+    blob::{
+        decode, decode_masked, decode_static, decode_view, encode, encode_masked, encode_static,
+    },
     fold::{Constant, Masked},
-    template::{Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateUnwind, TemplateView},
+    template::{
+        Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateUnwind, TemplateView,
+    },
     wasm::{Import, Signature, ValType},
 };
 use blaze_format::SpanRef;
@@ -47,19 +51,29 @@ const TARGET: Target = Target {
 
 fn check(data: &[u8]) {
     let decoded = decode(data);
-    let viewed = frame::task(Tag::Codegen, |frame| decode_view(data, frame).map(TemplateView::owned));
+    let viewed =
+        frame::task(Tag::Codegen, |frame| decode_view(data, frame).map(TemplateView::owned));
     assert!(viewed == decoded, "decode_view: {viewed:?} where decode gives {decoded:?}");
     if let Ok(template) = decoded {
         let again = decode(&encode(&template));
-        assert!(again.as_ref() == Ok(&template), "round trip: a template read and written reads as {again:?}");
+        assert!(
+            again.as_ref() == Ok(&template),
+            "round trip: a template read and written reads as {again:?}"
+        );
     }
     if let Ok(template) = decode_static(data) {
         let again = decode_static(&encode_static(&template));
-        assert!(again.as_ref() == Ok(&template), "round trip: a static read and written reads as {again:?}");
+        assert!(
+            again.as_ref() == Ok(&template),
+            "round trip: a static read and written reads as {again:?}"
+        );
     }
     if let Ok(masked) = decode_masked(data) {
         let again = decode_masked(&encode_masked(masked.as_ref()));
-        assert!(again.as_ref() == Ok(&masked), "round trip: a masked shape read and written reads as {again:?}");
+        assert!(
+            again.as_ref() == Ok(&masked),
+            "round trip: a masked shape read and written reads as {again:?}"
+        );
     }
 }
 
@@ -105,7 +119,12 @@ fn full() -> Template {
             relocation(Ref::Place(2), 0),
         ]
         .into(),
-        data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![relocation(Ref::Place(0), -8)].into(), writable: false }],
+        data: vec![TemplateData {
+            align: 8,
+            bytes: vec![9; 8],
+            relocs: vec![relocation(Ref::Place(0), -8)].into(),
+            writable: false,
+        }],
         inlined: Vec::new(),
         side: Some(ContentId([6; 32])),
         unwind: Some(TemplateUnwind::Dwarf {
@@ -136,7 +155,12 @@ fn statics() -> [StaticTemplate; 2] {
     let bytes = StaticTemplate {
         align: 16,
         init: TemplateInit::Bytes { bytes: vec![0; 24], relocs: vec![reloc].into() },
-        data: vec![TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new(), writable: false }],
+        data: vec![TemplateData {
+            align: 1,
+            bytes: b"hi".to_vec(),
+            relocs: Relocs::new(),
+            writable: false,
+        }],
         mutable: true,
         thread_local: true,
         section: Some("__DATA,__mod_init_func".to_owned()),
@@ -180,7 +204,8 @@ fn masked() -> Masked {
 /// What the writers make of templates, statics and masked shapes of every shape.
 fn valid() -> Vec<Vec<u8>> {
     let mut windows = full();
-    windows.unwind = Some(TemplateUnwind::Windows { info: vec![1, 2], handler: None, lsda: Some(0) });
+    windows.unwind =
+        Some(TemplateUnwind::Windows { info: vec![1, 2], handler: None, lsda: Some(0) });
     windows.profile = Some(Profiled::Used { mismatched: true, applied: false });
     let mut applied = full();
     applied.profile = Some(Profiled::Used { mismatched: false, applied: true });
@@ -220,7 +245,9 @@ mod tests {
     fn valid_blobs_read_back() {
         for bytes in super::valid() {
             assert!(
-                decode(&bytes).is_ok() || decode_static(&bytes).is_ok() || decode_masked(&bytes).is_ok(),
+                decode(&bytes).is_ok()
+                    || decode_static(&bytes).is_ok()
+                    || decode_masked(&bytes).is_ok(),
                 "a blob the writers made reads as none of them"
             );
         }

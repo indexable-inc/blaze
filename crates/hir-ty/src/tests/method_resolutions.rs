@@ -4,10 +4,7 @@
 //! blaze-lints' `hot_dyn` found only `Shape::area(s)`).
 
 use hir_def::{
-    DefWithBodyId, ModuleDefId,
-    expr_store::Body,
-    hir::Expr,
-    nameres::crate_def_map,
+    DefWithBodyId, ModuleDefId, expr_store::Body, hir::Expr, nameres::crate_def_map,
     signatures::FunctionSignature,
 };
 use hir_expand::fixture;
@@ -36,7 +33,11 @@ fn calls_on_dyn_receivers_record_their_method() {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == "hot" => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == "hot" =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .expect("the fixture's `hot`");
@@ -48,15 +49,21 @@ fn calls_on_dyn_receivers_record_their_method() {
         for (id, expr) in body.exprs() {
             match expr {
                 Expr::MethodCall { .. } => {}
-                Expr::Call { callee, .. } if !matches!(infer.expr_ty(callee).kind(), TyKind::FnDef(..)) => {}
+                Expr::Call { callee, .. }
+                    if !matches!(infer.expr_ty(callee).kind(), TyKind::FnDef(..)) => {}
                 _ => continue,
             }
-            let (_, args) = infer.method_resolution(id).unwrap_or_else(|| panic!("{expr:?} has no method"));
-            let mut self_ty = args.types().next().unwrap_or_else(|| panic!("{expr:?} has no `Self`"));
+            let (_, args) =
+                infer.method_resolution(id).unwrap_or_else(|| panic!("{expr:?} has no method"));
+            let mut self_ty =
+                args.types().next().unwrap_or_else(|| panic!("{expr:?} has no `Self`"));
             while let TyKind::Ref(_, inner, _) = self_ty.kind() {
                 self_ty = inner;
             }
-            assert!(matches!(self_ty.kind(), TyKind::Dynamic(..)), "{expr:?} has `Self` {self_ty:?}");
+            assert!(
+                matches!(self_ty.kind(), TyKind::Dynamic(..)),
+                "{expr:?} has `Self` {self_ty:?}"
+            );
             resolved += 1;
         }
         assert_eq!(resolved, 3, "`s.area()`, `f(1)` and `g()`");

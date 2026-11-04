@@ -47,7 +47,10 @@ impl Over {
         match self {
             Over::For { .. } => "this `for` loop".to_owned(), // alloc: a message's part
             Over::Closure { method, .. } => {
-                format!("the closure given to `{}`", FunctionSignature::of(db, method).name.as_str())
+                format!(
+                    "the closure given to `{}`",
+                    FunctionSignature::of(db, method).name.as_str()
+                )
             }
         }
     }
@@ -62,13 +65,22 @@ impl Over {
 }
 
 /// The innermost `for` loop or iterator closure that `call` runs once per element of.
-pub(super) fn per_item(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, parents: &Parents, call: ExprId) -> Option<Over> {
+pub(super) fn per_item(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &Parents,
+    call: ExprId,
+) -> Option<Over> {
     let body = analysis.body();
     for parent in parents.up(call, UP) {
         match body.expr(parent) {
-            Expr::Loop { source: LoopSource::ForLoop, .. } => return Some(Over::For { loop_: parent }),
+            Expr::Loop { source: LoopSource::ForLoop, .. } => {
+                return Some(Over::For { loop_: parent });
+            }
             Expr::Closure { .. } => {
-                let method = parents.of_expr(parent).and_then(|at| iterator_method(cx, analysis, at, parent))?;
+                let method = parents
+                    .of_expr(parent)
+                    .and_then(|at| iterator_method(cx, analysis, at, parent))?;
                 return Some(Over::Closure { closure: parent, method });
             }
             _ => {}
@@ -78,7 +90,12 @@ pub(super) fn per_item(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, parent
 }
 
 /// The iterator method the call `at` is, when `closure` is one of its arguments.
-fn iterator_method(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, at: ExprId, closure: ExprId) -> Option<FunctionId> {
+fn iterator_method(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    at: ExprId,
+    closure: ExprId,
+) -> Option<FunctionId> {
     let body = analysis.body();
     let args = match body.expr(at) {
         Expr::MethodCall { args, .. } | Expr::Call { args, .. } => args,
@@ -89,7 +106,9 @@ fn iterator_method(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, at: ExprId
     }
     let (f, _) = written_callee(analysis.infer(), body, at)?;
     let db = cx.db();
-    let hir::AssocItemContainer::Trait(trait_) = hir::Function::from(f).as_assoc_item(db)?.container(db) else {
+    let hir::AssocItemContainer::Trait(trait_) =
+        hir::Function::from(f).as_assoc_item(db)?.container(db)
+    else {
         return None;
     };
     let iterator = cx.lang_trait(hir::LangItem::Iterator) == Some(trait_);
@@ -136,7 +155,13 @@ pub(super) fn element_bindings(body: &Body, over: Over) -> Vec<BindingId> {
 }
 
 /// Whether `expr`, or an expression inside it, reads one of `bindings`.
-pub(super) fn mentions(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId, bindings: &[BindingId]) -> bool {
+pub(super) fn mentions(
+    db: &Db,
+    def: DefWithBodyId,
+    body: &Body,
+    expr: ExprId,
+    bindings: &[BindingId],
+) -> bool {
     let mut stack = vec![expr]; // alloc: the expressions of one argument
     while let Some(id) = stack.pop() {
         if matches!(body.expr(id), Expr::Path(_))
@@ -150,7 +175,12 @@ pub(super) fn mentions(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId, b
 }
 
 /// The local the path expression `expr` of `def`'s body names, if it names one.
-pub(super) fn local_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<BindingId> {
+pub(super) fn local_of(
+    db: &Db,
+    def: DefWithBodyId,
+    body: &Body,
+    expr: ExprId,
+) -> Option<BindingId> {
     match value_of(db, def, body, expr)? {
         ValueNs::LocalBinding(it) => Some(it),
         _ => None,
@@ -161,7 +191,11 @@ pub(super) fn local_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -
 pub(super) fn value_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<ValueNs> {
     let Expr::Path(path) = body.expr(expr) else { return None };
     let scope = ExprScopes::of(db, def).scope_for(expr);
-    resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(db, path, body.expr_path_hygiene(expr))
+    resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(
+        db,
+        path,
+        body.expr_path_hygiene(expr),
+    )
 }
 
 /// Whether `id` is a call written as one in the body's own file: not a `for` loop's desugared
@@ -169,6 +203,7 @@ pub(super) fn value_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -
 pub(super) fn written_call(analysis: &hir::BodyAnalysis<'_>, id: ExprId) -> bool {
     let file = analysis.tree().1;
     analysis.source_map().expr_syntax(id).is_ok_and(|it| {
-        it.file_id == file && matches!(it.value.kind(), SyntaxKind::CALL_EXPR | SyntaxKind::METHOD_CALL_EXPR)
+        it.file_id == file
+            && matches!(it.value.kind(), SyntaxKind::CALL_EXPR | SyntaxKind::METHOD_CALL_EXPR)
     })
 }

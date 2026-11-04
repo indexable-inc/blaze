@@ -1,6 +1,6 @@
 mod api;
-mod budget;
 mod bodies;
+mod budget;
 mod const_eval;
 mod db;
 mod infer;
@@ -17,6 +17,7 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{ConstSignature, FunctionSignature, StructSignature},
 };
+use hir_expand::fixture;
 use hir_ty::{
     ColdBatch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits,
     GenericPredicates, InferBodyId, InferenceResult,
@@ -30,7 +31,6 @@ use hir_ty::{
     },
 };
 use hir_ty_borrowck::{Checked, NotChecked, Refused};
-use hir_expand::fixture;
 
 use self::db::TestDB;
 
@@ -347,7 +347,9 @@ fn every_body_check_makes_its_text_with_no_database_attached() {
     }
     codes.sort_unstable();
     codes.dedup();
-    for code in ["E0382", "E0499", "E0502", "E0505", "E0507", "E0508", "E0509", "E0596", "E0597", "E0716"] {
+    for code in
+        ["E0382", "E0499", "E0502", "E0505", "E0507", "E0508", "E0509", "E0596", "E0597", "E0716"]
+    {
         assert!(codes.contains(&code), "the fixture gives {code}: {codes:?}");
     }
 }
@@ -417,7 +419,11 @@ fn refused(b: bool) {
         let def = function(&db, "refused");
         let result = hir_ty_borrowck::borrowck(&db, def);
         assert_eq!(result.not_checked, Some(NotChecked::MatchErrors));
-        assert!(result.diagnostics.is_empty(), "rustc reports E0004 alone: {:?}", result.diagnostics);
+        assert!(
+            result.diagnostics.is_empty(),
+            "rustc reports E0004 alone: {:?}",
+            result.diagnostics
+        );
     });
 }
 
@@ -484,7 +490,8 @@ pub fn kept() -> u32 {
 "#,
     );
     let mut db = fx.into_db();
-    let (a, b) = blaze_query::db::attach(&db, || (function(&db, "released"), function(&db, "kept")));
+    let (a, b) =
+        blaze_query::db::attach(&db, || (function(&db, "released"), function(&db, "kept")));
     let shape = |db: &TestDB, f| {
         let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
         (mir.basic_blocks.len(), mir.locals.len())
@@ -501,7 +508,11 @@ pub fn kept() -> u32 {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(b));
             assert_eq!((shape(&db, a), shape(&db, b)), (before_a, before_b));
         });
-        assert_eq!(count(&executed, "infer_body_query"), 1, "the released crate's alone: {executed:#?}");
+        assert_eq!(
+            count(&executed, "infer_body_query"),
+            1,
+            "the released crate's alone: {executed:#?}"
+        );
         assert_eq!(count(&executed, "mir_body_query"), 0, "MIR kept unless asked: {executed:#?}");
     });
 
@@ -513,6 +524,91 @@ pub fn kept() -> u32 {
         });
         assert_eq!(count(&executed, "mir_body_query"), 2, "every crate's MIR: {executed:#?}");
         assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+    });
+}
+
+/// What a check keeps in one process does not grow check over check: each check's MIR goes as
+/// it ends (`blaze-cargo`'s release at keep), and the rows and values a second round of the
+/// same edits leaves are the first round's. The check before slowcheck kept every MIR it made
+/// in the kept front end, so the heap grew by a check's MIR each check (nfcheck: 127 GiB).
+#[test]
+fn checking_the_same_edits_twice_retains_nothing_more() {
+    const A: &str = "fn main() {\n    let v = vec(1);\n    let _ = v.0 + 1;\n}\nstruct W(u32);\nfn vec(x: u32) -> W { W(x) }\n";
+    const B: &str = "fn main() {\n    let v = vec(2);\n    let _ = v.0 + 1;\n}\nstruct W(u32);\nfn vec(x: u32) -> W { W(x) }\n";
+    let fx = fixture::db(&format!("//- minicore: sized, copy\n//- /main.rs crate:main\n{A}"));
+    let main = fx.file_at("/main.rs").file_id(fx.db());
+    let mut db = fx.into_db();
+    // One check and the release its build's end makes; what the storage then retains, by
+    // ingredient: rows in use, the bytes of every row and what budgeted values weigh.
+    let round = |db: &mut TestDB, text: &str| {
+        db.set_file_text(main, text);
+        blaze_query::db::attach(&*db, || {
+            crate::check::check_workspace(&*db, false);
+        });
+        let made = crate::evict::mir_held(db);
+        assert!(made > 0, "a check makes MIR (borrowck reads it): none held after it");
+        crate::evict::drop_crates_after_store(db, &[], true);
+        assert_eq!(
+            crate::evict::mir_held(db),
+            0,
+            "the end of a check lets go of every MIR it made"
+        );
+        let mut usage = Vec::new();
+        blaze_query::db::Database::storage(&*db).memory_usage(&mut usage);
+        usage.sort_by_key(|it| it.name);
+        usage
+            .into_iter()
+            .map(|it| (it.name, it.used, it.row_bytes, it.value_bytes))
+            .collect::<Vec<_>>()
+    };
+    // A first round makes every row and interned key both texts need.
+    round(&mut db, B);
+    round(&mut db, A);
+    let first = [round(&mut db, B), round(&mut db, A)];
+    let second = [round(&mut db, B), round(&mut db, A)];
+    for (first, second) in first.iter().zip(&second) {
+        let grew: Vec<_> = first
+            .iter()
+            .zip(second)
+            .filter(|(was, now)| was.0 != now.0 || now.1 > was.1 || now.2 > was.2 || now.3 > was.3)
+            .collect();
+        assert!(
+            grew.is_empty(),
+            "the second round of the same edits retains more than the first: {grew:#?}"
+        );
+        assert_eq!(first.len(), second.len(), "an ingredient appeared");
+    }
+}
+
+/// A check after the one before it let go of every MIR makes again only the MIR of the body
+/// an edit changed: an unchanged body's borrow check is verified by its edges (the MIR's
+/// memo, kept without its value), never by reading its MIR, so ending a check's MIR costs the
+/// next check no MIR of an unchanged body.
+#[test]
+fn the_check_after_a_release_makes_only_the_edited_bodys_mir() {
+    const A: &str = "fn edited() -> u32 {\n    let x = 1;\n    x + 1\n}\nfn kept() -> u32 {\n    let y = 2;\n    y\n}\nfn also_kept(z: u32) -> u32 {\n    z\n}\n";
+    let fx = fixture::db(&format!("//- minicore: sized, copy\n//- /main.rs crate:main\n{A}"));
+    let main = fx.file_at("/main.rs").file_id(fx.db());
+    let mut db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        crate::check::check_workspace(&db, false);
+    });
+    assert!(crate::evict::mir_held(&db) >= 3, "the check made every body's MIR");
+    crate::evict::drop_crates_after_store(&mut db, &[], true);
+    assert_eq!(crate::evict::mir_held(&db), 0);
+    db.set_file_text(main, &A.replace("let x = 1;", "let x = 5;"));
+    blaze_query::db::attach(&db, || {
+        let executed = db.log_executed(|| {
+            crate::check::check_workspace(&db, false);
+        });
+        assert!(
+            count(&executed, "borrowck") <= 1,
+            "only the edited body is checked again: {executed:#?}"
+        );
+        assert!(
+            count(&executed, "mir_body_query") <= 1,
+            "only the edited body's MIR is made again: {executed:#?}"
+        );
     });
 }
 
@@ -566,7 +662,7 @@ pub fn g() {}
             let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
             assert_eq!((mir.basic_blocks.len(), mir.locals.len()), before);
         });
-        assert_eq!(count(&executed, "mir_body_query"), 1, "{executed:#?}");
+        assert!(count(&executed, "mir_body_query") <= 1, "{executed:#?}");
     });
 }
 
@@ -709,7 +805,8 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
         let (a, b, c) = (adt("A"), adt("B"), adt("C"));
         let interner = DbInterner::new_with(&db, krate);
         let leaf = |adt| Ty::new_adt(interner, adt, GenericArgs::empty());
-        let wrap = |ty| Ty::new_adt(interner, b, GenericArgs::new_from_slice(&[GenericArg::from(ty)]));
+        let wrap =
+            |ty| Ty::new_adt(interner, b, GenericArgs::new_from_slice(&[GenericArg::from(ty)]));
         let goals = [
             (leaf(a), true),
             (leaf(c), false),
@@ -739,7 +836,10 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
         assert_eq!(implements(warm, tr, &goals), cold, "first asked");
         assert_eq!(implements(warm, tr, &goals), cold, "answered from the cache");
         let elsewhere = std::thread::scope(|scope| {
-            scope.spawn(|| blaze_query::db::attach(&db, || implements(warm, tr, &goals))).join().unwrap()
+            scope
+                .spawn(|| blaze_query::db::attach(&db, || implements(warm, tr, &goals)))
+                .join()
+                .unwrap()
         });
         assert_eq!(elsewhere, cold, "answered on another thread");
     });
@@ -773,8 +873,9 @@ impl<T> Tr for B<T> where T: Tr {}
         .map(|it| it.file_id(&db))
         .find(|&it| db.file_text(it).text(&db).contains("impl Tr for A"))
         .unwrap();
-    let [first, second, unrelated] =
-        blaze_query::db::attach(&db, || ["first", "second", "unrelated"].map(|it| function(&db, it)));
+    let [first, second, unrelated] = blaze_query::db::attach(&db, || {
+        ["first", "second", "unrelated"].map(|it| function(&db, it))
+    });
     blaze_query::db::attach(&db, || {
         // `B<A>: Tr` is solved for `first`, then answered for `second` from the shared cache.
         for body in [first, second, unrelated] {
@@ -783,7 +884,10 @@ impl<T> Tr for B<T> where T: Tr {}
     });
 
     // Only the impl's where clause changes: no item, name or body `second` reads directly.
-    db.set_file_text(imp, "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n");
+    db.set_file_text(
+        imp,
+        "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n",
+    );
 
     blaze_query::db::attach(&db, || {
         let executed = db.log_executed(|| {

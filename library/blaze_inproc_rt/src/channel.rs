@@ -62,7 +62,8 @@ impl Channel {
     /// Sends one frame, whole.
     pub fn send(&mut self, kind: Kind, seq: u32, body: &[u8]) -> Result<(), Error> {
         self.out.clear();
-        frame::encode(kind, seq, body, &mut self.out).map_err(|it| Error::new(format!("sending a frame: {it}")))?;
+        frame::encode(kind, seq, body, &mut self.out)
+            .map_err(|it| Error::new(format!("sending a frame: {it}")))?;
         self.stream.write_all(&self.out)
     }
 
@@ -75,10 +76,10 @@ impl Channel {
                 Err(error) => return Err(Error::new(format!("reading the channel: {error}"))),
                 Ok(Some((_, len))) => {
                     self.last = len;
-                    let (frame, _) = frame::decode(&self.buf[self.start..self.end])
-                        .ok()
-                        .flatten()
-                        .ok_or_else(|| Error::new("a frame that decoded once did not decode again"))?;
+                    let (frame, _) =
+                        frame::decode(&self.buf[self.start..self.end]).ok().flatten().ok_or_else(
+                            || Error::new("a frame that decoded once did not decode again"),
+                        )?;
                     return Ok(frame);
                 }
                 Ok(None) => self.fill()?,

@@ -135,8 +135,12 @@ pub struct Native<'a> {
 pub enum NativeKind {
     Object,
     /// Members taken for undefined symbols, or all of them (`--whole-archive`).
-    Archive { whole: bool },
+    Archive {
+        whole: bool,
+    },
     /// A shared library, a linker script naming them, a `.tbd` stub or an import library;
     /// left out of the image's needs when none of its symbols is used and `as_needed`.
-    Shared { as_needed: bool },
+    Shared {
+        as_needed: bool,
+    },
 }

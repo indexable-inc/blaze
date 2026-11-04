@@ -127,7 +127,9 @@ fn not_initialized() -> u8 {
         DETECTED.load(core::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(test))]
-    panic!("blake3-servil: call blake3_servil::initialize() once, before any other call: it runs the startup self-test and detects the CPU")
+    panic!(
+        "blake3-servil: call blake3_servil::initialize() once, before any other call: it runs the startup self-test and detects the CPU"
+    )
 }
 
 /// x86-64's kernels for a CPU with the given features: the widest it
@@ -241,39 +243,72 @@ impl Platform {
             #[cfg(blake3_sme2)]
             Platform::SME2 => crate::sme2::DEGREE,
         };
-        debug_assert!((2..=MAX_SIMD_DEGREE).contains(&degree), "the walk (src/tree.rs) takes 2 to MAX_SIMD_DEGREE chunks a call");
+        debug_assert!(
+            (2..=MAX_SIMD_DEGREE).contains(&degree),
+            "the walk (src/tree.rs) takes 2 to MAX_SIMD_DEGREE chunks a call"
+        );
         degree
     }
 
-    pub fn compress_in_place(&self, cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) {
+    pub fn compress_in_place(
+        &self,
+        cv: &mut CVWords,
+        block: &[u8; BLOCK_LEN],
+        block_len: u8,
+        counter: u64,
+        flags: u8,
+    ) {
         match self {
             // Safe because detect() checked for platform support.
             #[cfg(blake3_sse41_ffi)]
-            Platform::SSE41 | Platform::AVX2 => unsafe { crate::sse41::compress_in_place(cv, block, block_len, counter, flags) },
+            Platform::SSE41 | Platform::AVX2 => unsafe {
+                crate::sse41::compress_in_place(cv, block, block_len, counter, flags)
+            },
             // Safe because detect() checked for platform support.
             #[cfg(blake3_avx512_ffi)]
             #[cfg(target_arch = "x86_64")]
-            Platform::AVX512 => unsafe { crate::avx512::compress_in_place(cv, block, block_len, counter, flags) },
+            Platform::AVX512 => unsafe {
+                crate::avx512::compress_in_place(cv, block, block_len, counter, flags)
+            },
             // The scalar kernel k1 keeps the state in registers; it runs on
             // every AArch64 core, so the NEON and SME2 platforms share it.
             #[cfg(blake3_neon)]
-            Platform::NEON => crate::neon_hybrid::compress_in_place(cv, block, block_len, counter, flags),
+            Platform::NEON => {
+                crate::neon_hybrid::compress_in_place(cv, block, block_len, counter, flags)
+            }
             #[cfg(blake3_sme2)]
-            Platform::SME2 => crate::neon_hybrid::compress_in_place(cv, block, block_len, counter, flags),
+            Platform::SME2 => {
+                crate::neon_hybrid::compress_in_place(cv, block, block_len, counter, flags)
+            }
         }
     }
 
     /// Compress `count` whole blocks of one chunk into `cv`: the first block
     /// with `flags | flags_start`, the rest with `flags`, all with `counter`.
     /// `blocks` holds at least `count * BLOCK_LEN` bytes; `count` is 1..=16.
-    pub fn compress_blocks(&self, cv: &mut CVWords, blocks: &[u8], count: usize, counter: u64, flags: u8, flags_start: u8) {
+    pub fn compress_blocks(
+        &self,
+        cv: &mut CVWords,
+        blocks: &[u8],
+        count: usize,
+        counter: u64,
+        flags: u8,
+        flags_start: u8,
+    ) {
         assert!((1..=16).contains(&count));
         assert!(blocks.len() >= count * BLOCK_LEN);
         // The integer-only kernel runs on every AArch64 core.
         #[cfg(blake3_neon)]
         {
             unsafe {
-                crate::neon_hybrid::compress_blocks(cv, blocks.as_ptr(), count, counter, flags, flags_start);
+                crate::neon_hybrid::compress_blocks(
+                    cv,
+                    blocks.as_ptr(),
+                    count,
+                    counter,
+                    flags,
+                    flags_start,
+                );
             }
             return;
         }
@@ -281,21 +316,38 @@ impl Platform {
         {
             let mut block_flags = flags | flags_start;
             for block in blocks[..count * BLOCK_LEN].chunks_exact(BLOCK_LEN) {
-                self.compress_in_place(cv, block.try_into().unwrap(), BLOCK_LEN as u8, counter, block_flags);
+                self.compress_in_place(
+                    cv,
+                    block.try_into().unwrap(),
+                    BLOCK_LEN as u8,
+                    counter,
+                    block_flags,
+                );
                 block_flags = flags;
             }
         }
     }
 
-    pub fn compress_xof(&self, cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) -> [u8; 64] {
+    pub fn compress_xof(
+        &self,
+        cv: &CVWords,
+        block: &[u8; BLOCK_LEN],
+        block_len: u8,
+        counter: u64,
+        flags: u8,
+    ) -> [u8; 64] {
         match self {
             // Safe because detect() checked for platform support.
             #[cfg(blake3_sse41_ffi)]
-            Platform::SSE41 | Platform::AVX2 => unsafe { crate::sse41::compress_xof(cv, block, block_len, counter, flags) },
+            Platform::SSE41 | Platform::AVX2 => unsafe {
+                crate::sse41::compress_xof(cv, block, block_len, counter, flags)
+            },
             // Safe because detect() checked for platform support.
             #[cfg(blake3_avx512_ffi)]
             #[cfg(target_arch = "x86_64")]
-            Platform::AVX512 => unsafe { crate::avx512::compress_xof(cv, block, block_len, counter, flags) },
+            Platform::AVX512 => unsafe {
+                crate::avx512::compress_xof(cv, block, block_len, counter, flags)
+            },
             // The one-block extended-output kernel (neon_hybrid::xof_block).
             #[cfg(blake3_neon)]
             Platform::NEON => crate::neon_hybrid::xof_block(cv, block, block_len, counter, flags),
@@ -337,24 +389,87 @@ impl Platform {
         match self {
             // Safe because detect() checked for platform support.
             #[cfg(blake3_sse41_ffi)]
-            Platform::SSE41 => unsafe { crate::sse41::hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out) },
+            Platform::SSE41 => unsafe {
+                crate::sse41::hash_many(
+                    inputs,
+                    key,
+                    counter,
+                    increment_counter,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out,
+                )
+            },
             // Safe because detect() checked for platform support.
             #[cfg(blake3_avx2_ffi)]
-            Platform::AVX2 => unsafe { crate::avx2::hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out) },
+            Platform::AVX2 => unsafe {
+                crate::avx2::hash_many(
+                    inputs,
+                    key,
+                    counter,
+                    increment_counter,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out,
+                )
+            },
             // Safe because detect() checked for platform support.
             #[cfg(blake3_avx512_ffi)]
             #[cfg(target_arch = "x86_64")]
-            Platform::AVX512 => unsafe { crate::avx512::hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out) },
+            Platform::AVX512 => unsafe {
+                crate::avx512::hash_many(
+                    inputs,
+                    key,
+                    counter,
+                    increment_counter,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out,
+                )
+            },
             // Assumed to be safe if the "neon" feature is on.
             #[cfg(blake3_neon)]
-            Platform::NEON => unsafe { crate::neon_hybrid::hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out) },
+            Platform::NEON => unsafe {
+                crate::neon_hybrid::hash_many(
+                    inputs,
+                    key,
+                    counter,
+                    increment_counter,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out,
+                )
+            },
             // Safe because detect() checked for SME2 with a 512-bit vector length.
             #[cfg(blake3_sme2)]
-            Platform::SME2 => unsafe { crate::sme2::hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out) },
+            Platform::SME2 => unsafe {
+                crate::sme2::hash_many(
+                    inputs,
+                    key,
+                    counter,
+                    increment_counter,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out,
+                )
+            },
         }
     }
 
-    pub fn xof_many(&self, cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, mut counter: u64, flags: u8, out: &mut [u8]) {
+    pub fn xof_many(
+        &self,
+        cv: &CVWords,
+        block: &[u8; BLOCK_LEN],
+        block_len: u8,
+        mut counter: u64,
+        flags: u8,
+        out: &mut [u8],
+    ) {
         debug_assert_eq!(0, out.len() % BLOCK_LEN, "whole blocks only");
         if out.is_empty() {
             // The current assembly implementation always outputs at least 1 block.
@@ -365,7 +480,9 @@ impl Platform {
             #[cfg(blake3_avx512_ffi)]
             #[cfg(unix)]
             #[cfg(target_arch = "x86_64")]
-            Platform::AVX512 => unsafe { crate::avx512::xof_many(cv, block, block_len, counter, flags, out) },
+            Platform::AVX512 => unsafe {
+                crate::avx512::xof_many(cv, block, block_len, counter, flags, out)
+            },
             _ => {
                 // On SME2, whole groups of sixteen blocks on the extended-
                 // output kernel, under the process's turn; the rest below.
@@ -386,9 +503,17 @@ impl Platform {
                 // blocks after them (neon_hybrid::xof_tail).
                 #[cfg(blake3_neon)]
                 {
-                    let done = crate::neon_hybrid::xof_many(cv, block, block_len, counter, flags, out);
+                    let done =
+                        crate::neon_hybrid::xof_many(cv, block, block_len, counter, flags, out);
                     if done < out.len() {
-                        crate::neon_hybrid::xof_tail(cv, block, block_len, counter.wrapping_add((done / BLOCK_LEN) as u64), flags, &mut out[done..]);
+                        crate::neon_hybrid::xof_tail(
+                            cv,
+                            block,
+                            block_len,
+                            counter.wrapping_add((done / BLOCK_LEN) as u64),
+                            flags,
+                            &mut out[done..],
+                        );
                     }
                 }
                 // SSE4.1 and AVX2, without an xof_many kernel: block by block.
@@ -610,7 +735,9 @@ pub(crate) fn counter() -> u64 {
     let now: u64;
     // Sound: readable at EL0 on every AArch64 OS this crate builds the
     // hybrids for (Linux, macOS).
-    unsafe { core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack, preserves_flags))
+    };
     now
 }
 
@@ -627,7 +754,9 @@ pub(crate) fn ticks_in_100_us() -> u64 {
     }
     let per_second: u64;
     // Sound: as counter().
-    unsafe { core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) per_second, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) per_second, options(nomem, nostack, preserves_flags))
+    };
     let ticks = (per_second / 10_000).max(1);
     TICKS.store(ticks, core::sync::atomic::Ordering::Relaxed);
     ticks
@@ -708,7 +837,16 @@ fn sme2_detect_uncached() -> bool {
 
     // Vector length check: the kernel reports it without doing any work
     // when asked for zero groups.
-    let lanes = unsafe { crate::sme2::ffi::blake3_servil_sme2_hash16_chunks_512(core::ptr::null(), core::ptr::null(), 0, 0, core::ptr::null_mut(), 0) };
+    let lanes = unsafe {
+        crate::sme2::ffi::blake3_servil_sme2_hash16_chunks_512(
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
     lanes == crate::sme2::GROUP as u64
 }
 
@@ -716,8 +854,15 @@ fn sme2_detect_uncached() -> bool {
 fn sme2_reported() -> bool {
     let mut value: u32 = 0;
     let mut size = core::mem::size_of::<u32>();
-    let rc =
-        unsafe { libc::sysctlbyname(c"hw.optional.arm.FEAT_SME2".as_ptr(), &mut value as *mut u32 as *mut libc::c_void, &mut size, core::ptr::null_mut(), 0) };
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.optional.arm.FEAT_SME2".as_ptr(),
+            &mut value as *mut u32 as *mut libc::c_void,
+            &mut size,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
     rc == 0 && value != 0
 }
 
@@ -741,7 +886,9 @@ mod x86_degree_test {
     /// hash correctly, more slowly.
     #[test]
     fn test_detected_degree_is_the_widest_kernel() {
-        let expected = if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl") {
+        let expected = if std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vl")
+        {
             if cfg!(target_os = "linux") { 32 } else { 16 }
         } else if std::is_x86_feature_detected!("avx2") {
             8
@@ -763,7 +910,10 @@ mod x86_features_test {
         assert_eq!(features & READ, READ);
         assert_eq!(features & SSE41 != 0, std::is_x86_feature_detected!("sse4.1"));
         assert_eq!(features & AVX2 != 0, std::is_x86_feature_detected!("avx2"));
-        assert_eq!(features & AVX512 != 0, std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl"));
+        assert_eq!(
+            features & AVX512 != 0,
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl")
+        );
     }
 
     /// The wide kernels' CPUs: AMD from family 0x1A (Zen 5), from leaf 1's
@@ -773,9 +923,19 @@ mod x86_features_test {
         let eax = |base: u32, ext: u32| (ext << 20) | (base << 8);
         assert_eq!(super::family(eax(0xF, 0x0B)), 0x1A, "Zen 5");
         assert_eq!(super::family(eax(0xF, 0x0A)), 0x19, "Zen 4");
-        assert_eq!(super::family(eax(0x6, 0x0F)), 0x6, "Intel: the extended family counts only with base 0xF");
-        for (amd, family, wide) in [(true, 0x1A, true), (true, 0x1B, true), (true, 0x19, false), (true, 0x17, false), (false, 0x1A, false), (false, 0x6, false)]
-        {
+        assert_eq!(
+            super::family(eax(0x6, 0x0F)),
+            0x6,
+            "Intel: the extended family counts only with base 0xF"
+        );
+        for (amd, family, wide) in [
+            (true, 0x1A, true),
+            (true, 0x1B, true),
+            (true, 0x19, false),
+            (true, 0x17, false),
+            (false, 0x1A, false),
+            (false, 0x6, false),
+        ] {
             assert_eq!(super::wide_cpu(amd, family), wide, "amd {amd}, family {family:#x}");
         }
     }
@@ -788,7 +948,13 @@ mod x86_features_test {
         use super::x86_bits::*;
         let features = super::read_x86_features();
         let info = std::fs::read_to_string("/proc/cpuinfo").expect("/proc/cpuinfo");
-        let field = |name: &str| info.lines().find(|l| l.starts_with(name)).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).expect(name);
+        let field = |name: &str| {
+            info.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim().to_string())
+                .expect(name)
+        };
         let amd = field("vendor_id") == "AuthenticAMD";
         let family: u32 = field("cpu family").parse().expect("cpu family");
         let want = features & AVX512 != 0 && amd && family >= 0x1A;
@@ -805,10 +971,18 @@ mod x86_features_test {
     /// guard-page tests' platform lists come from these same functions.
     #[test]
     fn test_x86_detection_matches_std() {
-        assert_eq!(super::sse41_detected(), std::is_x86_feature_detected!("sse4.1"), "sse41_detected");
+        assert_eq!(
+            super::sse41_detected(),
+            std::is_x86_feature_detected!("sse4.1"),
+            "sse41_detected"
+        );
         assert_eq!(super::avx2_detected(), std::is_x86_feature_detected!("avx2"), "avx2_detected");
         #[cfg(blake3_avx512_ffi)]
-        assert_eq!(super::avx512_detected(), std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl"), "avx512_detected");
+        assert_eq!(
+            super::avx512_detected(),
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl"),
+            "avx512_detected"
+        );
     }
     /// Each CPU runs the widest kernel it has; a CPU without SSE4.1 gets
     /// none, and the process stops (the stop itself: unsupported).
@@ -823,7 +997,11 @@ mod x86_features_test {
             (false, false, true, Some(Platform::SSE41)),
             (false, false, false, None),
         ] {
-            assert_eq!(x86_platform(avx512, avx2, sse41), want, "avx512 {avx512}, avx2 {avx2}, sse41 {sse41}");
+            assert_eq!(
+                x86_platform(avx512, avx2, sse41),
+                want,
+                "avx512 {avx512}, avx2 {avx2}, sse41 {sse41}"
+            );
         }
     }
 }

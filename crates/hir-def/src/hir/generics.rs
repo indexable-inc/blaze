@@ -252,10 +252,16 @@ pub enum WherePredicate {
         target: TypeRefId,
         bound: TypeBound,
     },
-    Lifetime { target: LifetimeRefId, bound: LifetimeRefId },
+    Lifetime {
+        target: LifetimeRefId,
+        bound: LifetimeRefId,
+    },
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one empty generic parameter set: callers share a static empty value")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one empty generic parameter set: callers share a static empty value"
+)]
 static EMPTY: std::sync::LazyLock<GenericParams> = std::sync::LazyLock::new(|| GenericParams {
     type_or_consts: Arena::default(),
     lifetimes: Arena::default(),
@@ -270,7 +276,10 @@ impl GenericParams {
         LocalTypeOrConstParamId::from_raw(RawIdx::from_u32(0));
 
     #[inline]
-    #[expect(clippy::disallowed_types, reason = "the process's one empty generic parameter set: callers share a static empty value")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one empty generic parameter set: callers share a static empty value"
+    )]
     pub fn empty() -> &'static GenericParams {
         std::sync::LazyLock::force(&EMPTY)
     }
@@ -279,10 +288,7 @@ impl GenericParams {
         Self::with_store(db, def).0
     }
 
-    pub fn with_store(
-        db: &Db,
-        def: GenericDefId,
-    ) -> (&GenericParams, &ExpressionStore) {
+    pub fn with_store(db: &Db, def: GenericDefId) -> (&GenericParams, &ExpressionStore) {
         match def {
             GenericDefId::AdtId(AdtId::EnumId(id)) => {
                 let sig = EnumSignature::of(db, id);
@@ -425,7 +431,9 @@ impl GenericParams {
     }
 
     /// Every binder parameter of every where predicate.
-    pub fn iter_binder_params(&self) -> impl Iterator<Item = (LocalBinderParamId, &BinderParamData)> {
+    pub fn iter_binder_params(
+        &self,
+    ) -> impl Iterator<Item = (LocalBinderParamId, &BinderParamData)> {
         self.binder_params.iter()
     }
 

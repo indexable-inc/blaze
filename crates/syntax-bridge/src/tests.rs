@@ -164,8 +164,12 @@ fn leaves(tree: &tt::TopSubtree) -> Vec<String> {
                 out.push(format!("{:?} {}{}", lit.kind, lit.text(), lit.suffix()))
             }
             Some(tt::TokenTree::Leaf(Leaf::Punct(punct))) => out.push(punct.char.to_string()),
-            Some(tt::TokenTree::Leaf(Leaf::Ident(ident))) => out.push(ident.sym.as_str().to_owned()),
-            Some(tt::TokenTree::Subtree(subtree)) => out.push(format!("{:?}", subtree.delimiter.kind)),
+            Some(tt::TokenTree::Leaf(Leaf::Ident(ident))) => {
+                out.push(ident.sym.as_str().to_owned())
+            }
+            Some(tt::TokenTree::Subtree(subtree)) => {
+                out.push(format!("{:?}", subtree.delimiter.kind))
+            }
             None => out.push("end".to_owned()),
         }
         cursor.bump_or_end();
@@ -190,7 +194,10 @@ fn an_integer_then_a_dot_stay_two_tokens_through_a_parse() {
     let again = token_tree(sunk.root());
     assert_eq!(leaves(&again), leaves(&tree));
     let written = sunk.root().text();
-    assert!(written.contains("x.0.1;y.1.e;z.1..2;"), "only an integer and a `.` that glue move: {written}");
+    assert!(
+        written.contains("x.0.1;y.1.e;z.1..2;"),
+        "only an integer and a `.` that glue move: {written}"
+    );
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -283,9 +290,12 @@ fn an_outline_has_the_token_trees_of_a_full_parse() {
         let tree = outline.file();
         let lazies: Vec<u32> = tree.lazies().collect();
         for &at in &lazies {
-            let body = view::Node::at(outline.shared_file(), view::NodeId { part: view::NodeId::FILE, at })
-                .into_node()
-                .expect("a lazy element is a node");
+            let body = view::Node::at(
+                outline.shared_file(),
+                view::NodeId { part: view::NodeId::FILE, at },
+            )
+            .into_node()
+            .expect("a lazy element is a node");
             assert!(body.is_lazy(), "{path}: {body:?} was parsed before it was asked about");
             assert_eq!(token_tree(body), token_tree(in_full(body)), "{path}: {body:?}");
             assert!(tree.is_parsed(at), "{path}: {body:?}");
@@ -370,9 +380,9 @@ fn a_views_call_input_is_the_cursors_token_tree() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = full_nodes
-                    .get(&(view.kind(), range))
-                    .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
+                let node = full_nodes.get(&(view.kind(), range)).unwrap_or_else(|| {
+                    panic!("{path}: no {:?} of {range:?} in the full parse", view.kind())
+                });
                 for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
                     let new = crate::call_input(view, DummyTestSpanMap, DUMMY, mode);
                     let cursor = syntax_node_to_token_tree_modified(
@@ -429,9 +439,9 @@ fn a_views_modified_input_is_the_cursors() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = full_nodes
-                    .get(&(view.kind(), range))
-                    .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
+                let node = full_nodes.get(&(view.kind(), range)).unwrap_or_else(|| {
+                    panic!("{path}: no {:?} of {range:?} in the full parse", view.kind())
+                });
                 let mut rng = SplitMix64::new(seed);
                 let (mut remove, mut view_remove) =
                     (Removed::<_, Global>::default(), Removed::<_, Global>::default());
@@ -647,7 +657,8 @@ fn assert_words_same_as_reference(
     edition: &mut impl FnMut(span::SyntaxContext) -> Edition,
     what: &impl Fn() -> String,
 ) {
-    let whole_panics = caught(|| reference::to_matcher_input(tree.as_token_trees(), &mut *edition)).is_none();
+    let whole_panics =
+        caught(|| reference::to_matcher_input(tree.as_token_trees(), &mut *edition)).is_none();
     let mut copy = parser::Input::with_capacity(0);
     for view in every_view(tree) {
         for fragments in [true, false] {
@@ -662,7 +673,12 @@ fn assert_words_same_as_reference(
             match (new, old) {
                 (Some(new), Some(old)) => {
                     let old = (0..old.len()).map(|i| old.token(i)).collect::<Vec<_>>();
-                    assert_eq!(new, old, "{}: the words of {view:?}, fragments {fragments}", what());
+                    assert_eq!(
+                        new,
+                        old,
+                        "{}: the words of {view:?}, fragments {fragments}",
+                        what()
+                    );
                 }
                 (None, _) => assert!(whole_panics, "{}: the words of {view:?} panicked", what()),
                 (Some(_), None) => panic!("{}: only the reference panicked on {view:?}", what()),
@@ -742,8 +758,8 @@ fn parser_input_is_the_old_conversions() {
         let path = path.display();
         let full = ast::SourceFile::parse_shared(text, Edition::CURRENT);
         let root = full.root();
-        let nodes =
-            std::iter::once(root).chain(root.descendants().filter(|it| it.kind() == syntax::SyntaxKind::FN));
+        let nodes = std::iter::once(root)
+            .chain(root.descendants().filter(|it| it.kind() == syntax::SyntaxKind::FN));
         for (idx, node) in nodes.enumerate() {
             for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
                 let tree = call_input(node, DummyTestSpanMap, DUMMY, mode);
@@ -821,11 +837,10 @@ fn lexing_then_parsing_gives_the_files_tree() {
         if has_docs {
             continue;
         }
-        let (parse, _) = token_tree_to_syntax_node(
-            lexed.view(),
-            parser::TopEntryPoint::SourceFile,
-            &mut |_| Edition::CURRENT,
-        );
+        let (parse, _) =
+            token_tree_to_syntax_node(lexed.view(), parser::TopEntryPoint::SourceFile, &mut |_| {
+                Edition::CURRENT
+            });
         assert_eq!(structure(parse.root()), structure(full), "{path}");
         parsed += 1;
     }
@@ -846,7 +861,11 @@ fn identifiers_interned_by_the_lexers_hash_are_interned_text() {
         while !cursor.eof() {
             while let Some(token_tree) = cursor.token_tree() {
                 if let tt::TokenTree::Leaf(Leaf::Ident(ident)) = token_tree {
-                    assert_eq!(ident.sym, intern::Symbol::intern(ident.sym.as_str()), "{edition:?}");
+                    assert_eq!(
+                        ident.sym,
+                        intern::Symbol::intern(ident.sym.as_str()),
+                        "{edition:?}"
+                    );
                     names += 1;
                 }
                 cursor.bump();
@@ -885,4 +904,3 @@ fn a_reused_input_converts_without_allocating() {
     });
     assert_eq!(input.len(), tokens);
 }
-

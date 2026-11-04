@@ -8,8 +8,8 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::db::FromId;
+use std::alloc::Global;
 
 use super::{Loaded, check_db, module_path};
 use crate::nameres::{
@@ -63,7 +63,8 @@ const ROUND_QUERIES: &[&str] = &[
 
 /// The resolver queries keyed by a module's `DeclKey`: a write runs them for the modules whose
 /// round-0 log it changed alone.
-const DECL_QUERIES: &[&str] = &["module_decls", "legacy_exports", "subtree_macro_exports", "decl_handle"];
+const DECL_QUERIES: &[&str] =
+    &["module_decls", "legacy_exports", "subtree_macro_exports", "decl_handle"];
 
 /// The queries `f` executed: each ingredient's name and its key's id.
 fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, blaze_query::db::Id)> {
@@ -71,7 +72,9 @@ fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, blaze_query::d
         .into_iter()
         .filter_map(|event| match event.kind {
             blaze_query::db::EventKind::WillExecute { database_key } => Some((
-                blaze_query::db::Database::storage(&*db).ingredient_name(database_key.ingredient_index()).to_owned(),
+                blaze_query::db::Database::storage(&*db)
+                    .ingredient_name(database_key.ingredient_index())
+                    .to_owned(),
                 database_key.key_index(),
             )),
             _ => None,
@@ -124,7 +127,11 @@ fn set(paths: &[&str]) -> HashSet<String, Global> {
 /// Whether a read of the crate's def map after the write ran `crate_local_def_map` again.
 fn def_map_reran(loaded: &Loaded) -> bool {
     let krate = loaded.krate();
-    loaded.db.log_executed(|| _ = crate_def_map(&loaded.db, krate)).iter().any(|it| it == "crate_local_def_map")
+    loaded
+        .db
+        .log_executed(|| _ = crate_def_map(&loaded.db, krate))
+        .iter()
+        .any(|it| it == "crate_local_def_map")
 }
 
 fn check(loaded: &Loaded, what: &str) {
@@ -135,7 +142,8 @@ fn check(loaded: &Loaded, what: &str) {
 
 #[test]
 fn an_item_added_reruns_only_its_module() {
-    let (mut loaded, events) = write("/a.rs", "pub struct A;\npub fn helper() { let _ = 0; }\npub fn foo() {}\n");
+    let (mut loaded, events) =
+        write("/a.rs", "pub struct A;\npub fn helper() { let _ = 0; }\npub fn foo() {}\n");
     assert_eq!(decl_modules(&loaded.db, &events), set(&["crate::a"]), "{events:?}");
     assert!(round_queries(&events).is_empty(), "round queries ran: {events:?}");
     assert!(!def_map_reran(&loaded), "an item added leaves the crate's resolution as it was");
@@ -170,7 +178,9 @@ fn an_edit_inside_a_body_reruns_no_resolver_query() {
     let (mut loaded, events) = write("/a.rs", "pub struct A;\npub fn helper() { let _ = 1; }\n");
     let resolver: Vec<&(String, blaze_query::db::Id)> = events
         .iter()
-        .filter(|(name, _)| DECL_QUERIES.contains(&name.as_str()) || ROUND_QUERIES.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            DECL_QUERIES.contains(&name.as_str()) || ROUND_QUERIES.contains(&name.as_str())
+        })
         .collect();
     assert!(resolver.is_empty(), "resolver queries ran: {resolver:?}");
     assert!(!def_map_reran(&loaded));
@@ -190,7 +200,8 @@ fn editing_a_reader_reruns_only_the_reader() {
 
 #[test]
 fn a_module_added_changes_the_root_and_the_module() {
-    let (mut loaded, events) = write("/lib.rs", "mod a;\nmod b;\nmod c;\nmod d;\nmod e;\nmod y;\npub mod z {}\n");
+    let (mut loaded, events) =
+        write("/lib.rs", "mod a;\nmod b;\nmod c;\nmod d;\nmod e;\nmod y;\npub mod z {}\n");
     assert!(decl_modules(&loaded.db, &events).contains("crate"), "{events:?}");
     assert!(round_queries(&events).is_empty(), "round queries ran: {events:?}");
     // The module tree is read through the published modules, which the def map only holds.

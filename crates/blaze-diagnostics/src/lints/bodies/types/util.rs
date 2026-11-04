@@ -54,7 +54,10 @@ pub(crate) fn called_fn(b: &BodyCx<'_, '_, '_>, call: ExprId) -> Option<(Functio
 }
 
 /// The diagnostic item of the function `call` calls through a path, with its arguments.
-pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_, '_>, call: ExprId) -> Option<(Symbol, &'a [ExprId])> {
+pub(crate) fn called_item<'a>(
+    b: &'a BodyCx<'_, '_, '_>,
+    call: ExprId,
+) -> Option<(Symbol, &'a [ExprId])> {
     let (def, _) = called_fn(b, call)?;
     let name = fn_item(b.db(), def)?;
     Some((name, call_args(b, call)?))

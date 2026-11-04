@@ -11,8 +11,8 @@
 use blaze_mem::Frame;
 
 use crate::mir::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, OperandKind, ProjectionElem, Rvalue,
-    StatementKind, TerminatorKind,
+    BasicBlock, BasicBlockId, LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind,
+    TerminatorKind,
     framed::{Bits, bits_in, block_index, local_index},
     return_slot,
 };

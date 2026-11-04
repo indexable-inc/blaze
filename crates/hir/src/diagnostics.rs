@@ -10,7 +10,8 @@ use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, GenericDefId,
-    GenericParamId, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId, SyntheticSyntax, TraitId,
+    GenericParamId, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
+    SyntheticSyntax, TraitId,
     attrs::AttrFlags,
     expr_store::{
         Body, ExprOrPatPtr, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
@@ -40,8 +41,7 @@ use hir_expand::{
 use hir_ty::{
     CastError, ElidedLifetimeSite, ExplicitDropMethodUseKind, InferBodyId, InferenceDiagnostic,
     InferenceResult, ParamEnvAndCrate, PathGenericsSource, PathLoweringDiagnostic,
-    TyLoweringDiagnostic,
-    check_orphan_rules,
+    TyLoweringDiagnostic, check_orphan_rules,
     db::{AnonConstId, HirDatabase, signature_anon_consts_and_diagnostics},
     diagnostics::BodyValidationDiagnostic,
     display::{DisplayTarget, HirDisplay},
@@ -76,15 +76,14 @@ pub use hir_def::{
     hir::UnsafeBinderCastKind,
 };
 pub use hir_expand::BuiltinChild;
+pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
     AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
-    MissingLifetimeKind,
-    PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
+    MissingLifetimeKind, PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
     diagnostics::{CaseType, IdentType, IncorrectCase},
 };
-pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 
 #[derive(Debug, Clone)]
 pub enum SpanAst {
@@ -644,8 +643,8 @@ fn borrowck_parts(
     diagnostic: &hir_ty_borrowck::BorrowckDiagnostic,
     node_of: &impl Fn(hir_ty_mir::mir::MirSpan) -> Option<InFile<SyntaxNodePtr>>,
 ) -> BorrowckParts {
-    use hir_ty_mir::mir::MirSpan;
     use hir_ty_borrowck::PartSpan;
+    use hir_ty_mir::mir::MirSpan;
     let syntax = |node: InFile<SyntaxNodePtr>| {
         let root = node.file_id.root(db);
         node.map(|it| view::to_node(it, root))
@@ -1170,7 +1169,11 @@ pub enum ObligationCauseCode {
     /// trait impl's type for it must satisfy: rustc's "required by a bound in
     /// `Trait::method::{anon_assoc#0}`" (`WhereClause` of the trait's RPITIT item). `bound`, the
     /// bound's syntax, or the `impl Trait`'s.
-    ImplTraitInTraitBound { trait_method: Function, impl_trait: u32, bound: Option<InFile<SyntaxNodePtr>> },
+    ImplTraitInTraitBound {
+        trait_method: Function,
+        impl_trait: u32,
+        bound: Option<InFile<SyntaxNodePtr>>,
+    },
 }
 
 impl From<hir_ty::next_solver::infer::traits::ObligationCauseCode> for ObligationCauseCode {
@@ -1465,24 +1468,47 @@ pub enum SolverGoal<'db> {
     /// `T: Trait` or `T: !Trait`.
     Trait(crate::TraitClause<'db>),
     /// `T: [const] Trait` (`maybe_const`) or `T: const Trait`.
-    HostEffect { trait_ref: crate::TraitRef<'db>, maybe_const: bool },
+    HostEffect {
+        trait_ref: crate::TraitRef<'db>,
+        maybe_const: bool,
+    },
     /// `alias == term`: `<T as Trait>::Assoc == U`.
-    Projection { alias: Either<Type<'db>, String>, term: Either<Type<'db>, String> },
+    Projection {
+        alias: Either<Type<'db>, String>,
+        term: Either<Type<'db>, String>,
+    },
     /// What `alias` normalizes to: rustc's "cannot normalize `alias`".
-    NormalizesTo { alias: Either<Type<'db>, String> },
+    NormalizesTo {
+        alias: Either<Type<'db>, String>,
+    },
     WellFormed(Either<Type<'db>, String>),
     /// `a <: b`.
-    Subtype { a: Type<'db>, b: Type<'db> },
+    Subtype {
+        a: Type<'db>,
+        b: Type<'db>,
+    },
     /// `a` coerces to `b`.
-    Coerce { a: Type<'db>, b: Type<'db> },
+    Coerce {
+        a: Type<'db>,
+        b: Type<'db>,
+    },
     ConstEvaluatable(String),
-    ConstArgHasType { ct: String, ty: Type<'db> },
-    ConstEquate { a: String, b: String },
+    ConstArgHasType {
+        ct: String,
+        ty: Type<'db>,
+    },
+    ConstEquate {
+        a: String,
+        b: String,
+    },
     DynCompatible(Trait),
     /// An impl's `#[unstable_feature_bound(feature)]`.
     UnstableFeature(intern::Symbol),
     /// `a: b`: a type, or a region printed as rustc prints it, outlives the region `b`.
-    Outlives { a: Either<Type<'db>, String>, b: String },
+    Outlives {
+        a: Either<Type<'db>, String>,
+        b: String,
+    },
     Ambiguous,
 }
 
@@ -1645,7 +1671,7 @@ pub struct QueryCycle {
 impl QueryCycle {
     pub(crate) fn new(db: &Db, def: GenericDefId, query: CycleQuery) -> QueryCycle {
         let item = GenericDef::from(def).name(db).map_or_else(
-            || "impl".to_owned(), // alloc: error path, a reported diagnostic's text
+            || "impl".to_owned(),        // alloc: error path, a reported diagnostic's text
             |it| it.as_str().to_owned(), // alloc: as above
         );
         QueryCycle { node: signature_owner(db, def), item, query }
@@ -1771,13 +1797,14 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         type_ref::TypeBound,
     };
     use hir_ty::PredicateSource;
-    let sources = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
-        hir_ty::predicate_sources(db, def)
-    });
+    let sources =
+        blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| hir_ty::predicate_sources(db, def));
     Some(match *sources.get(bound_index as usize)? {
         PredicateSource::ImpliedTrait(id) => BoundSource::ImpliedTrait(Trait { id }),
         PredicateSource::ImplicitSized(id) => BoundSource::ImplicitSized(crate::TypeParam { id }),
-        PredicateSource::ConstParamType(id) => BoundSource::ConstParamType(crate::ConstParam { id }),
+        PredicateSource::ConstParamType(id) => {
+            BoundSource::ConstParamType(crate::ConstParam { id })
+        }
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {
@@ -1799,7 +1826,9 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
                         it.to_view(root).syntax().ancestors().find_map(view::TypeBound::cast)
                     })
                 }
-                WherePredicate::TypeBound { bound: TypeBound::Use(_) | TypeBound::Error, .. } => {
+                WherePredicate::TypeBound {
+                    bound: TypeBound::Use(_) | TypeBound::Error, ..
+                } => {
                     return None;
                 }
             };
@@ -1816,7 +1845,10 @@ pub enum DynCompatibilitySite {
     /// The `index`th item bound of an associated type (its own, then those the trait's where
     /// clauses put on it). hir can't point at one yet: the bounds are lowered with no record of
     /// which written bound each came from.
-    AssocTypeBound { alias: TypeAlias, index: u32 },
+    AssocTypeBound {
+        alias: TypeAlias,
+        index: u32,
+    },
 }
 
 impl Trait {
@@ -1883,7 +1915,8 @@ fn assoc_item_name(db: &Db, item: AssocItemId) -> Option<InFile<SyntaxNodePtr>> 
 /// for a `self` with no type written, the parameter.
 fn param_syntax(db: &Db, function: FunctionId, index: u32) -> Option<InFile<SyntaxNodePtr>> {
     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-    let typed = signature.params.get(index as usize).and_then(|&ty| source_map.type_syntax(ty).ok());
+    let typed =
+        signature.params.get(index as usize).and_then(|&ty| source_map.type_syntax(ty).ok());
     if let Some(typed) = typed {
         return Some(typed.map(|it| it.syntax_node_ptr()));
     }
@@ -2415,9 +2448,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                         .start();
             }
             let (code, also_at, children) = builtin_parts(self.db, err.kind());
-            self.acc.push(
-                MacroError { range, message, error, kind, code, also_at, children }.into(),
-            );
+            self.acc
+                .push(MacroError { range, message, error, kind, code, also_at, children }.into());
         }
 
         if !parse_errors.is_empty() {
@@ -2531,8 +2563,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         bodies: &'a F,
     ) {
         let edition = krate.data(db).edition;
-        let mut this =
-            DiagnosticsCollector { db, krate, edition, style_lints: false, acc, bodies, deferred: None };
+        let mut this = DiagnosticsCollector {
+            db,
+            krate,
+            edition,
+            style_lints: false,
+            acc,
+            bodies,
+            deferred: None,
+        };
         for (module, _) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
             this.collect_module_expansions(module);
         }
@@ -2550,10 +2589,19 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     ) {
         let krate = hir_def::HasModule::krate(&def, db);
         let edition = krate.data(db).edition;
-        let mut this =
-            DiagnosticsCollector { db, krate, edition, style_lints: false, acc, bodies, deferred: None };
+        let mut this = DiagnosticsCollector {
+            db,
+            krate,
+            edition,
+            style_lints: false,
+            acc,
+            bodies,
+            deferred: None,
+        };
         let body = Body::of(db, def);
-        if !Body::unmoved_source_map(db, def).diagnostics().is_empty() || store_macro_failed(db, body) {
+        if !Body::unmoved_source_map(db, def).diagnostics().is_empty()
+            || store_macro_failed(db, body)
+        {
             this.collect_store_diagnostics(Body::source_map(db, def));
         }
         for (_, block_def_map) in body.blocks(db) {
@@ -2641,8 +2689,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             // rustc's walker decides (blaze-diagnostics' `trait_impl_orphan`), not hir's
             // `check_orphan_rules`, which refuses impls rustc accepts.
             let foreign = db.impl_trait(impl_).is_some_and(|trait_ref| {
-                hir_def::HasModule::krate(&trait_ref.instantiate_identity().skip_norm_wip().def_id.0, db)
-                    != self.krate
+                hir_def::HasModule::krate(
+                    &trait_ref.instantiate_identity().skip_norm_wip().def_id.0,
+                    db,
+                ) != self.krate
             });
             if foreign {
                 foreign_impls.push(ForeignTraitImpl { impl_: ast(), file_id });
@@ -2669,15 +2719,18 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             use syntax::view::HasVisibility as _;
             let db = self.db;
             match item {
-                AssocItemId::FunctionId(it) => {
-                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
-                }
-                AssocItemId::ConstId(it) => {
-                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
-                }
-                AssocItemId::TypeAliasId(it) => {
-                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
-                }
+                AssocItemId::FunctionId(it) => self.collect_visibility(
+                    it,
+                    it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ),
+                AssocItemId::ConstId(it) => self.collect_visibility(
+                    it,
+                    it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ),
+                AssocItemId::TypeAliasId(it) => self.collect_visibility(
+                    it,
+                    it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ),
             }
         }
 
@@ -2702,9 +2755,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         // `#![blaze::specialization]` (hir-ty-specialization).
         for error in hir_ty_specialization::check_impl(self.db, def) {
             // E0520 is at the overriding item's name, the rest at the impl.
-            let node = error.item.and_then(|it| assoc_item_name(self.db, it)).unwrap_or_else(|| {
-                InFile::new(file_id, ast_id_map.get(loc.id.value).syntax_node_ptr())
-            });
+            let node =
+                error.item.and_then(|it| assoc_item_name(self.db, it)).unwrap_or_else(|| {
+                    InFile::new(file_id, ast_id_map.get(loc.id.value).syntax_node_ptr())
+                });
             let children = error
                 .note
                 .into_iter()
@@ -2798,7 +2852,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             impl_assoc_items_scratch.extend(impl_items.0.items.iter().cloned());
             // Whether the impl's item implements the trait's: the same kind, and
             // `def_site::implements` (rustc's `check_trait_item`, hygienic).
-            let implements = |impl_name: Name, impl_item: AssocItemId, name: Name, id: AssocItemId| {
+            let implements = |impl_name: Name,
+                              impl_item: AssocItemId,
+                              name: Name,
+                              id: AssocItemId| {
                 discriminant(&impl_item) == discriminant(&id)
                     && hir_def::nameres::implements(self.db, trait_, impl_item, impl_name, id, name)
             };
@@ -2824,9 +2881,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
 
             let implemented_here = |name: &Name, id: &AssocItemId| {
-                impl_assoc_items_scratch.iter().any(|&(impl_name, impl_item)| {
-                    implements(impl_name, impl_item, *name, *id)
-                })
+                impl_assoc_items_scratch
+                    .iter()
+                    .any(|&(impl_name, impl_item)| implements(impl_name, impl_item, *name, *id))
             };
             let mut missing: Vec<_> = required_items
                 .filter(|(name, id)| !implemented_here(name, id))
@@ -2922,8 +2979,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             if !missing.is_empty() {
                 if hir_ty::specialization_mode(self.db, self.krate).may_specialize() {
                     missing.retain(|(assoc_name, assoc_item)| {
-                        let AssocItem::Function(Function { id: AnyFunctionId::FunctionId(trait_fn), .. }) =
-                            *assoc_item
+                        let AssocItem::Function(Function {
+                            id: AnyFunctionId::FunctionId(trait_fn),
+                            ..
+                        }) = *assoc_item
                         else {
                             return true;
                         };
@@ -2969,7 +3028,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_module(&mut self, def: ModuleId) {
-        let _p = tracing::info_span!(target: "blaze", "diagnostics", name = ?def.name(self.db)).entered();
+        let _p = tracing::info_span!(target: "blaze", "diagnostics", name = ?def.name(self.db))
+            .entered();
 
         let def_map = def.def_map(self.db);
         let scope = def_map.module(self.db, def).scope(self.db);
@@ -3020,9 +3080,13 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         let db = self.db;
         for def in scope.declarations().chain(scope.unnamed_consts().map(ModuleDefId::ConstId)) {
             let vis = match def {
-                ModuleDefId::FunctionId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::FunctionId(it) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
                 ModuleDefId::ConstId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
-                ModuleDefId::StaticId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::StaticId(it) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
                 ModuleDefId::TypeAliasId(it) => {
                     it.lookup(db).source_view(db).map(|it| it.visibility())
                 }
@@ -3052,10 +3116,16 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             self.collect_visibility(module, vis);
         }
         for it in scope.use_decls() {
-            self.collect_visibility(module, it.lookup(db).source_view(db).map(|it| it.visibility()));
+            self.collect_visibility(
+                module,
+                it.lookup(db).source_view(db).map(|it| it.visibility()),
+            );
         }
         for it in scope.extern_crate_decls() {
-            self.collect_visibility(module, it.lookup(db).source_view(db).map(|it| it.visibility()));
+            self.collect_visibility(
+                module,
+                it.lookup(db).source_view(db).map(|it| it.visibility()),
+            );
         }
     }
 
@@ -3070,7 +3140,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         else {
             return;
         };
-        self.acc.push(InvalidVisibility { node: InFile::new(file_id, AstPtr::of(node)), error }.into());
+        self.acc
+            .push(InvalidVisibility { node: InFile::new(file_id, AstPtr::of(node)), error }.into());
     }
 
     fn collect_macro_def(&mut self, def: MacroId) {
@@ -3157,10 +3228,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             Error::NonSupportedType(ty) => {
                 ValTreeErrorKind::NonSupportedType(Type::new(self.db, owner, ty.as_ref()))
             }
-            Error::Unreadable { ty, what } => ValTreeErrorKind::Unreadable {
-                ty: Type::new(self.db, owner, ty.as_ref()),
-                what,
-            },
+            Error::Unreadable { ty, what } => {
+                ValTreeErrorKind::Unreadable { ty: Type::new(self.db, owner, ty.as_ref()), what }
+            }
         };
         self.acc.push(
             ValTreeError { at: at.map(|it| it.syntax_node_ptr()), konst: None, error }.into(),
@@ -3266,14 +3336,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         anon_consts.iter().for_each(|&anon_const| self.collect_anon_const(source_map, anon_const));
 
         for diag in diagnostics {
-            let placed = AnyDiagnostic::ty_diagnostic(diag, source_map, self.db).unwrap_or_else(|| {
-                UnplacedDiagnostic {
-                    owner: owner(),
-                    // alloc: error path, a lowering diagnostic no node places
-                    what: Unplaced::Lowering(format!("{diag:?}")),
-                }
-                .into()
-            });
+            let placed =
+                AnyDiagnostic::ty_diagnostic(diag, source_map, self.db).unwrap_or_else(|| {
+                    UnplacedDiagnostic {
+                        owner: owner(),
+                        // alloc: error path, a lowering diagnostic no node places
+                        what: Unplaced::Lowering(format!("{diag:?}")),
+                    }
+                    .into()
+                });
             self.acc.push(placed);
         }
     }
@@ -3289,16 +3360,18 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         let reports = signature_store_has_diagnostics(db, def)
             || store_macro_failed(db, store)
             || lowered.iter().any(|&(anon_consts, diagnostics)| {
-                !diagnostics.is_empty()
-                    || anon_consts.iter().any(|&it| self.anon_const_reports(it))
+                !diagnostics.is_empty() || anon_consts.iter().any(|&it| self.anon_const_reports(it))
             });
         if reports {
             let (_, source_map) = ExpressionStore::with_source_map(db, def.into());
             self.collect_store_diagnostics(source_map);
             for (anon_consts, diagnostics) in lowered {
-                self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics, || {
-                    signature_owner(db, def)
-                });
+                self.collect_anon_consts_and_ty_diagnostics(
+                    source_map,
+                    anon_consts,
+                    diagnostics,
+                    || signature_owner(db, def),
+                );
             }
         }
         // A trait whose supertraits have it as their own: its supertrait list is no lowering
@@ -3315,7 +3388,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     fn anon_const_reports(&self, def: AnonConstId<'db>) -> bool {
         let db = self.db;
         !InferenceResult::of(db, def).diagnostics().is_empty()
-            || !hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into()).is_empty()
+            || !hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into())
+                .is_empty()
             || !hir_ty_borrowck::borrowck_anon_const(db, def).diagnostics.is_empty()
             || !hir_ty_mir::mir::const_check::anon_const_check(db, def).diagnostics.is_empty()
             || hir_ty::const_valtree::anon_const_valtree_error(db, def).is_some()
@@ -3771,10 +3845,13 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             let found = match placed {
                 Some(it) => it,
                 None => {
-                    let target = DisplayTarget::from_crate_and_edition(self.db, self.krate, self.edition);
+                    let target =
+                        DisplayTarget::from_crate_and_edition(self.db, self.krate, self.edition);
                     UnplacedDiagnostic {
                         owner: unplaced_owner(self.db, def, source_map),
-                        what: Unplaced::Inference(unplaced_inference_text(self.db, target, def, diag)),
+                        what: Unplaced::Inference(unplaced_inference_text(
+                            self.db, target, def, diag,
+                        )),
                     }
                     .into()
                 }
@@ -3889,17 +3966,21 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 .into(),
                 rustc_type_ir::ClauseKind::Projection(projection) => {
                     let owner = TypeOwnerId::GenericDefId(function.into());
-                    let alias = Type {
-                        owner,
-                        ty: EarlyBinder::bind(
-                            interner,
-                            <hir_ty::next_solver::Ty<'db> as rustc_type_ir::inherent::Ty<_>>::new_alias(
-                                interner,
-                                rustc_type_ir::IsRigid::No,
-                                projection.projection_term.expect_ty(),
-                            ),
-                        ),
-                    };
+                    let alias =
+                        Type {
+                            owner,
+                            ty:
+                                EarlyBinder::bind(
+                                    interner,
+                                    <hir_ty::next_solver::Ty<'db> as rustc_type_ir::inherent::Ty<
+                                        _,
+                                    >>::new_alias(
+                                        interner,
+                                        rustc_type_ir::IsRigid::No,
+                                        projection.projection_term.expect_ty(),
+                                    ),
+                                ),
+                        };
                     let term = match projection.term.kind() {
                         rustc_type_ir::TermKind::Ty(ty) => {
                             Either::Left(Type { owner, ty: EarlyBinder::bind(interner, ty) })
@@ -4450,14 +4531,22 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr = expr_syntax(*expr)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
                 // alloc: error path, a reported diagnostic's type as rustc prints it
-                let at_error = at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
+                let at_error =
+                    at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
                 CannotBeDereferenced { expr, found: new_ty(found.as_ref()), at_error }.into()
             }
-            InferenceDiagnostic::UnaryOperatorCannotBeApplied { expr, op, found, at_error, unmet } => {
+            InferenceDiagnostic::UnaryOperatorCannotBeApplied {
+                expr,
+                op,
+                found,
+                at_error,
+                unmet,
+            } => {
                 let expr = expr_syntax(*expr)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
                 // alloc: error path, a reported diagnostic's type as rustc prints it
-                let at_error = at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
+                let at_error =
+                    at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
                 let unmet =
                     // alloc: error path, a reported diagnostic's unmet goals
                     unmet.iter().map(|it| Self::solver_goal(db, it, type_owner, target)).collect();
@@ -4503,7 +4592,8 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr = expr_syntax(*expr)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
                 // alloc: error path, a reported diagnostic's type as rustc prints it
-                let at_error = at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
+                let at_error =
+                    at_error.as_ref().map(|it| it.as_ref().display(db, target).to_string());
                 CannotIndexInto { expr, found: new_ty(found.as_ref()), at_error }.into()
             }
             InferenceDiagnostic::TyDiagnostic { diag } => {
@@ -4560,7 +4650,8 @@ impl<'db> AnyDiagnostic<'db> {
                 let syntax =
                     syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_view(db);
                 let generic_args = syntax.generic_arg_list()?;
-                let provided_arg = hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
+                let provided_arg =
+                    hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
                 let provided_arg = InFile::new(file_id, AstPtr::of(provided_arg));
                 let expected_kind = GenericArgKind::from_id(param_id);
                 IncorrectGenericsOrder { provided_arg, expected_kind, param: param_id.into() }
@@ -4876,11 +4967,16 @@ impl<'db> AnyDiagnostic<'db> {
                     suggest_increasing_limit: *suggest_increasing_limit,
                 })
             }
-            &SolverDiagnosticKind::ProjectionMismatch { goal: ref projection, ref normalized, impl_ } => {
+            &SolverDiagnosticKind::ProjectionMismatch {
+                goal: ref projection,
+                ref normalized,
+                impl_,
+            } => {
                 let normalized = normalized.as_ref().map(|arg| match arg.as_ref().kind() {
-                    rustc_type_ir::GenericArgKind::Type(it) => {
-                        Either::Left(Type { owner: type_owner, ty: EarlyBinder::bind(interner, it) })
-                    }
+                    rustc_type_ir::GenericArgKind::Type(it) => Either::Left(Type {
+                        owner: type_owner,
+                        ty: EarlyBinder::bind(interner, it),
+                    }),
                     // alloc: error path, a reported diagnostic's const as rustc prints it
                     _ => Either::Right(arg.as_ref().display(db, target).to_string()),
                 });
@@ -4891,7 +4987,10 @@ impl<'db> AnyDiagnostic<'db> {
                 })
             }
             SolverDiagnosticKind::TypesDiffer { expected, found } => {
-                error(TraitSolverErrorKind::TypesDiffer { expected: ty(expected), found: ty(found) })
+                error(TraitSolverErrorKind::TypesDiffer {
+                    expected: ty(expected),
+                    found: ty(found),
+                })
             }
             SolverDiagnosticKind::ConstArgHasWrongType { ct, ct_ty, expected_ty } => {
                 error(TraitSolverErrorKind::ConstArgHasWrongType {
@@ -4911,7 +5010,10 @@ impl<'db> AnyDiagnostic<'db> {
                 let inner = Self::solver_diagnostic(db, inner, span, cause, type_owner, target)?;
                 let member = match *member {
                     hir_ty::comptime::ReflectedMember::Field(field) => {
-                        ReflectedMember::Field(Field { parent: field.parent.into(), id: field.local_id })
+                        ReflectedMember::Field(Field {
+                            parent: field.parent.into(),
+                            id: field.local_id,
+                        })
                     }
                     hir_ty::comptime::ReflectedMember::TupleField(index) => {
                         ReflectedMember::TupleField(index)
@@ -4969,7 +5071,12 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
-            &SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, ref closure } => {
+            &SolverDiagnosticKind::ClosureKindMismatch {
+                expected,
+                found,
+                is_async,
+                ref closure,
+            } => {
                 let fn_trait = |kind| match (kind, is_async) {
                     (rustc_type_ir::ClosureKind::Fn, false) => crate::FnTrait::Fn,
                     (rustc_type_ir::ClosureKind::FnMut, false) => crate::FnTrait::FnMut,
@@ -5000,7 +5107,8 @@ impl<'db> AnyDiagnostic<'db> {
             TyKind::CoroutineClosure(id, _) => id.0.loc(db),
             _ => return None,
         };
-        let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+        let (_, source_map) =
+            ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
         let ptr = source_map.expr_syntax(expr).ok()?;
         Some(ptr.with_value(ptr.value.cast::<ast::ClosureExpr>()?))
     }
@@ -5051,19 +5159,21 @@ impl<'db> AnyDiagnostic<'db> {
             arg.as_ref().display(db, target).to_string()
         };
         let term = |arg: &'db hir_ty::next_solver::StoredGenericArg| match arg.as_ref().kind() {
-            rustc_type_ir::GenericArgKind::Type(it) => Either::Left(Type {
-                owner: type_owner,
-                ty: EarlyBinder::bind(interner, it),
-            }),
+            rustc_type_ir::GenericArgKind::Type(it) => {
+                Either::Left(Type { owner: type_owner, ty: EarlyBinder::bind(interner, it) })
+            }
             _ => Either::Right(text(arg)),
         };
-        let trait_ref = |trait_: hir_def::TraitId, args: &'db hir_ty::next_solver::StoredGenericArgs| {
-            hir_ty::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
-        };
+        let trait_ref =
+            |trait_: hir_def::TraitId, args: &'db hir_ty::next_solver::StoredGenericArgs| {
+                hir_ty::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
+            };
         match goal {
             &StoredGoal::Trait { trait_, ref args, polarity } => {
-                let clause =
-                    hir_ty::next_solver::TraitClause { trait_ref: trait_ref(trait_, args), polarity };
+                let clause = hir_ty::next_solver::TraitClause {
+                    trait_ref: trait_ref(trait_, args),
+                    polarity,
+                };
                 SolverGoal::Trait(crate::TraitClause::new(interner, type_owner, clause))
             }
             &StoredGoal::HostEffect { trait_, ref args, maybe_const } => SolverGoal::HostEffect {
@@ -5084,7 +5194,9 @@ impl<'db> AnyDiagnostic<'db> {
                 SolverGoal::ConstArgHasType { ct: text(ct), ty: ty(of) }
             }
             StoredGoal::ConstEquate { a, b } => SolverGoal::ConstEquate { a: text(a), b: text(b) },
-            &StoredGoal::DynCompatible { trait_ } => SolverGoal::DynCompatible(Trait { id: trait_ }),
+            &StoredGoal::DynCompatible { trait_ } => {
+                SolverGoal::DynCompatible(Trait { id: trait_ })
+            }
             StoredGoal::UnstableFeature { feature } => SolverGoal::UnstableFeature(*feature),
             StoredGoal::Outlives { a, b } => SolverGoal::Outlives { a: term(a), b: text(b) },
             StoredGoal::Ambiguous => SolverGoal::Ambiguous,
@@ -5140,8 +5252,7 @@ impl<'db> AnyDiagnostic<'db> {
                 kind,
                 def,
             } => {
-                let generics_or_segment =
-                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path_generics_source_to_ast(path.value, generics_source)?;
                 let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 IncorrectGenericsLen {
                     generics_or_segment,
@@ -5160,7 +5271,8 @@ impl<'db> AnyDiagnostic<'db> {
             } => {
                 let generic_args =
                     path_generics_source_to_ast(path.value, generics_source)?.left()?;
-                let provided_arg = hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
+                let provided_arg =
+                    hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
                 let provided_arg = path.with_value(AstPtr::of(provided_arg));
                 let expected_kind = GenericArgKind::from_id(param_id);
                 IncorrectGenericsOrder { provided_arg, expected_kind, param: param_id.into() }
@@ -5168,8 +5280,7 @@ impl<'db> AnyDiagnostic<'db> {
             }
             PathLoweringDiagnostic::MissingLifetime { generics_source, expected_count, def }
             | PathLoweringDiagnostic::ElisionFailure { generics_source, expected_count, def } => {
-                let generics_or_segment =
-                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path_generics_source_to_ast(path.value, generics_source)?;
                 let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 let kind = match diag {
                     PathLoweringDiagnostic::ElisionFailure { .. } => {
@@ -5186,8 +5297,7 @@ impl<'db> AnyDiagnostic<'db> {
                 .into()
             }
             PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source, def, hard_error } => {
-                let generics_or_segment =
-                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path_generics_source_to_ast(path.value, generics_source)?;
                 let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 LateBoundLifetimeArgs { generics_or_segment, def: def.into(), hard_error }.into()
             }
@@ -5211,8 +5321,7 @@ impl<'db> AnyDiagnostic<'db> {
                 def,
                 hard_error,
             } => {
-                let generics_or_segment =
-                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path_generics_source_to_ast(path.value, generics_source)?;
                 let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 ElidedLifetimesInPath {
                     generics_or_segment,
@@ -5352,8 +5461,11 @@ impl<'db> AnyDiagnostic<'db> {
             }
             .into(),
             TyLoweringDiagnostic::PatternTypeNotLowered { source, reason } => {
-                PatternTypeNotLowered { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
-                    .into()
+                PatternTypeNotLowered {
+                    ty: Self::type_syntax(*source, source_map)?,
+                    reason: *reason,
+                }
+                .into()
             }
             TyLoweringDiagnostic::QueryCycle { def, query } => {
                 QueryCycle::new(db, *def, *query).into()
@@ -5397,7 +5509,10 @@ impl<'db> AnyDiagnostic<'db> {
 struct Placing<'db> {
     db: &'db Db,
     def: DefWithBodyId,
-    #[expect(clippy::disallowed_types, reason = "body source map, set once per diagnostic placement: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "body source map, set once per diagnostic placement: not global"
+    )]
     map: std::cell::OnceCell<&'db hir_def::expr_store::BodySourceMap>,
 }
 
@@ -5534,7 +5649,9 @@ fn const_eval_failure<'db>(
             "reached the configured maximum number of stack frames".to_owned(),
         ),
         // alloc: error path, a reported diagnostic's message
-        MirEvalError::Panic(message) => ConstEvalFailure::Failed(format!("evaluation panicked: {message}")),
+        MirEvalError::Panic(message) => {
+            ConstEvalFailure::Failed(format!("evaluation panicked: {message}"))
+        }
         MirEvalError::Aborted(message) => ConstEvalFailure::Failed(
             // alloc: error path, a reported diagnostic's message
             format!("the evaluated program aborted execution: {message}"),
@@ -5556,7 +5673,8 @@ fn const_eval_failure<'db>(
         }
         MirEvalError::HeapInValue { of_const_allocate: true } => ConstEvalFailure::Failed(
             // alloc: error path, a reported diagnostic's message
-            "encountered `const_allocate` pointer in final value that was not made global".to_owned(),
+            "encountered `const_allocate` pointer in final value that was not made global"
+                .to_owned(),
         ),
         MirEvalError::HeapInValue { of_const_allocate: false } => ConstEvalFailure::Failed(
             // alloc: error path, a reported diagnostic's message
@@ -5568,7 +5686,9 @@ fn const_eval_failure<'db>(
             match failure {
                 ConstEvalFailure::Failed(reason) => {
                     // alloc: error path, a reported diagnostic's message
-                    ConstEvalFailure::Failed(format!("evaluation of constant `{name}` failed: {reason}"))
+                    ConstEvalFailure::Failed(format!(
+                        "evaluation of constant `{name}` failed: {reason}"
+                    ))
                 }
                 ConstEvalFailure::Cycle => ConstEvalFailure::Cycle,
                 ConstEvalFailure::Unsupported(reason) => {
@@ -5609,7 +5729,9 @@ fn unplaced_inference_text<'db>(
     d: &'db InferenceDiagnostic,
 ) -> String {
     let ty = |ty: &'db StoredTy| ty.as_ref().display(db, target).to_string();
-    let seen = |found: &'db StoredTy, at_error: &'db Option<StoredTy>| ty(at_error.as_ref().unwrap_or(found));
+    let seen = |found: &'db StoredTy, at_error: &'db Option<StoredTy>| {
+        ty(at_error.as_ref().unwrap_or(found))
+    };
     let fn_name = |f: FunctionId| FunctionSignature::of(db, f).name.as_str().to_owned();
     // alloc: each arm, error path, the error's text
     let what = match d {
@@ -5811,7 +5933,9 @@ fn unplaced_inference_text<'db>(
                 _ => None,
             };
             match (binding, ObligationCauseCode::from(it.cause)) {
-                (Some(name), ObligationCauseCode::SizedArgumentType) => format!(", for the parameter `{name}`"),
+                (Some(name), ObligationCauseCode::SizedArgumentType) => {
+                    format!(", for the parameter `{name}`")
+                }
                 (_, ObligationCauseCode::SizedReturnType) => ", for the return type".to_owned(),
                 (Some(name), _) => format!(", for the binding `{name}`"),
                 (None, _) => String::new(),
@@ -5839,7 +5963,9 @@ fn solver_text<'db>(
             let pred = trait_predicate.get(interner);
             let krate = hir_def::HasModule::krate(&def, db);
             let sized = hir_def::lang_item::lang_items(db, krate).Sized;
-            if sized == Some(pred.def_id().0) && pred.polarity == rustc_type_ir::ClausePolarity::Positive {
+            if sized == Some(pred.def_id().0)
+                && pred.polarity == rustc_type_ir::ClausePolarity::Positive
+            {
                 // `Sized`'s `#[rustc_on_unimplemented]` message.
                 format!(
                     "E0277: the size for values of type `{}` cannot be known at compilation time (`{}`)",
@@ -5868,7 +5994,11 @@ fn solver_text<'db>(
             format!("E0308: mismatched types: expected `{}`, found `{}`", ty(expected), ty(found))
         }
         SolverDiagnosticKind::ConstArgHasWrongType { ct, expected_ty, .. } => {
-            format!("the constant `{}` is not of type `{}`", ct.as_ref().display(db, target), ty(expected_ty))
+            format!(
+                "the constant `{}` is not of type `{}`",
+                ct.as_ref().display(db, target),
+                ty(expected_ty)
+            )
         }
         SolverDiagnosticKind::HigherRankedOutlives => {
             "higher-ranked lifetime bound could not be satisfied".to_owned()
@@ -5877,9 +6007,15 @@ fn solver_text<'db>(
             let what = match code {
                 solver_errors::UnreportedSolverError::Cycle => "a cycle",
                 solver_errors::UnreportedSolverError::SignatureMismatch => "a signature mismatch",
-                solver_errors::UnreportedSolverError::TraitDynIncompatible => "a trait that is not dyn compatible",
-                solver_errors::UnreportedSolverError::NotConstEvaluatable => "a constant that cannot be evaluated",
-                solver_errors::UnreportedSolverError::SelectionOverflow => "an overflow in selection",
+                solver_errors::UnreportedSolverError::TraitDynIncompatible => {
+                    "a trait that is not dyn compatible"
+                }
+                solver_errors::UnreportedSolverError::NotConstEvaluatable => {
+                    "a constant that cannot be evaluated"
+                }
+                solver_errors::UnreportedSolverError::SelectionOverflow => {
+                    "an overflow in selection"
+                }
                 solver_errors::UnreportedSolverError::ConstEquate => "constants that differ",
             };
             format!("the trait solver found {what}, which only rustc's old solver reports")
@@ -5907,7 +6043,9 @@ fn solver_text<'db>(
 /// `goal` as rustc prints a predicate.
 fn goal_text<'db>(db: &'db Db, target: DisplayTarget, goal: &'db StoredGoal) -> String {
     let interner = DbInterner::new_no_crate(db);
-    let arg = |arg: &'db hir_ty::next_solver::StoredGenericArg| arg.as_ref().display(db, target).to_string();
+    let arg = |arg: &'db hir_ty::next_solver::StoredGenericArg| {
+        arg.as_ref().display(db, target).to_string()
+    };
     let ty = |ty: &'db StoredTy| ty.as_ref().display(db, target).to_string();
     let trait_ref = |trait_: TraitId, args: &'db hir_ty::next_solver::StoredGenericArgs| {
         hir_ty::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
@@ -5931,11 +6069,19 @@ fn goal_text<'db>(db: &'db Db, target: DisplayTarget, goal: &'db StoredGoal) -> 
         StoredGoal::WellFormed { term } => format!("{} well-formed", arg(term)),
         StoredGoal::Subtype { a, b } => format!("{} <: {}", ty(a), ty(b)),
         StoredGoal::Coerce { a, b } => format!("{} coerces to {}", ty(a), ty(b)),
-        StoredGoal::ConstEvaluatable { ct } => format!("the constant `{}` can be evaluated", arg(ct)),
-        StoredGoal::ConstArgHasType { ct, ty: of } => format!("the constant `{}` has type `{}`", arg(ct), ty(of)),
+        StoredGoal::ConstEvaluatable { ct } => {
+            format!("the constant `{}` can be evaluated", arg(ct))
+        }
+        StoredGoal::ConstArgHasType { ct, ty: of } => {
+            format!("the constant `{}` has type `{}`", arg(ct), ty(of))
+        }
         StoredGoal::ConstEquate { a, b } => format!("{} == {}", arg(a), arg(b)),
-        &StoredGoal::DynCompatible { trait_ } => format!("the trait `{}` is dyn compatible", trait_name(trait_)),
-        StoredGoal::UnstableFeature { feature } => format!("the feature `{}` is enabled", feature.as_str()),
+        &StoredGoal::DynCompatible { trait_ } => {
+            format!("the trait `{}` is dyn compatible", trait_name(trait_))
+        }
+        StoredGoal::UnstableFeature { feature } => {
+            format!("the feature `{}` is enabled", feature.as_str())
+        }
         StoredGoal::Outlives { a, b } => format!("{}: {}", arg(a), arg(b)),
         StoredGoal::Ambiguous => "an ambiguous goal".to_owned(),
     }
@@ -5951,7 +6097,10 @@ fn body_item_text(db: &Db, target: DisplayTarget, def: InferBodyId<'_>) -> Strin
             return match konst.loc(db).owner {
                 ExpressionStoreOwnerId::Body(def) => {
                     // alloc: error path, the error's text
-                    format!("a constant in {}", body_item_text(db, target, InferBodyId::DefWithBodyId(def)))
+                    format!(
+                        "a constant in {}",
+                        body_item_text(db, target, InferBodyId::DefWithBodyId(def))
+                    )
                 }
                 ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => {
                     "a constant in the signature or fields of the item it is placed at".to_owned()
@@ -5964,12 +6113,16 @@ fn body_item_text(db: &Db, target: DisplayTarget, def: InferBodyId<'_>) -> Strin
         DefWithBodyId::FunctionId(f) => {
             let name = FunctionSignature::of(db, f).name.as_str().to_owned();
             match f.lookup(db).container {
-                ItemContainerId::TraitId(t) => format!("`{}::{name}`", TraitSignature::of(db, t).name.as_str()),
+                ItemContainerId::TraitId(t) => {
+                    format!("`{}::{name}`", TraitSignature::of(db, t).name.as_str())
+                }
                 ItemContainerId::ImplId(i) => format!(
                     "`<{}>::{name}`",
                     db.impl_self_ty(i).instantiate_identity().skip_norm_wip().display(db, target)
                 ),
-                ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => format!("`{name}`"),
+                ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+                    format!("`{name}`")
+                }
             }
         }
         _ => match crate::DefWithBody::from(def).name(db) {

@@ -10,9 +10,14 @@ fn a_warm_find_allocates_nothing() {
         "mod m {\n    pub struct S(u8, u16);\n    impl Clone for S {\n        fn clone(&self) -> S { S(self.0, self.1) }\n    }\n    impl S {}\n    impl S {}\n}\nfn f() {}\n",
     );
     let root = file.parse.root();
-    for wanted in
-        ["f", "m::S::1", "m::<S as Clone>::clone", "m::struct S", "m::< S as  Clone >::clone", "m::<S>@1"]
-    {
+    for wanted in [
+        "f",
+        "m::S::1",
+        "m::<S as Clone>::clone",
+        "m::struct S",
+        "m::< S as  Clone >::clone",
+        "m::<S>@1",
+    ] {
         let first = path::find(root, wanted).unwrap_or_else(|error| panic!("{wanted}: {error}"));
         let (again, used) = blaze_alloc_count::measure(|| path::find(root, wanted).unwrap());
         assert_eq!(again, first);

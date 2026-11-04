@@ -9,8 +9,8 @@
 //! `compiler/rustc_expand/src/diagnostics.rs` (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::TextRange;
 
 use super::{
@@ -168,7 +168,9 @@ impl<'t> Checker<'t> {
         let m = self.m;
         match *m.at(rhs) {
             Mtt::Token(_) | Mtt::MetaVarDecl { .. } => {}
-            Mtt::MetaVar { range, name } => self.ops_is_prefix_of(macros, binders, ops, range, name),
+            Mtt::MetaVar { range, name } => {
+                self.ops_is_prefix_of(macros, binders, ops, range, name)
+            }
             Mtt::MetaVarExpr { range, vars } => {
                 for &var in &m.vars[vars.start as usize..vars.end as usize] {
                     self.ops_is_prefix_of(macros, binders, ops, range, var);
@@ -197,22 +199,31 @@ impl<'t> Checker<'t> {
         let mut nested_binders = Binders::default();
         for tt in tts.iter() {
             match (state, *m.at(tt)) {
-                (Nested::Empty, Mtt::Token(token)) if token.kind == (Kind::Ident { raw: false }) => {
+                (Nested::Empty, Mtt::Token(token))
+                    if token.kind == (Kind::Ident { raw: false }) =>
+                {
                     match tokens.text(token.range) {
                         "macro_rules" => state = Nested::MacroRules,
                         "macro" => state = Nested::Macro,
                         _ => {}
                     }
                 }
-                (Nested::MacroRules, Mtt::Token(token)) if token.is(Punct::Bang) => state = Nested::MacroRulesBang,
-                (Nested::MacroRulesBang, Mtt::Token(token)) if matches!(token.kind, Kind::Ident { .. }) => {
+                (Nested::MacroRules, Mtt::Token(token)) if token.is(Punct::Bang) => {
+                    state = Nested::MacroRulesBang
+                }
+                (Nested::MacroRulesBang, Mtt::Token(token))
+                    if matches!(token.kind, Kind::Ident { .. }) =>
+                {
                     state = Nested::MacroRulesBangName;
                 }
                 (Nested::MacroRulesBang, Mtt::MetaVar { .. }) => {
                     state = Nested::MacroRulesBangName;
                     self.occurrences(tt, macros, binders, ops);
                 }
-                (Nested::MacroRulesBangName | Nested::MacroName, Mtt::Delimited { delim: Delim::Brace, tts: body, .. }) => {
+                (
+                    Nested::MacroRulesBangName | Nested::MacroName,
+                    Mtt::Delimited { delim: Delim::Brace, tts: body, .. },
+                ) => {
                     let macro_rules = state == Nested::MacroRulesBangName;
                     state = Nested::Empty;
                     let rest = self.nested_macro(macro_rules, body, &nested_macros);
@@ -244,7 +255,12 @@ impl<'t> Checker<'t> {
 
     /// rustc's `check_nested_macro`: the rules `(lhs) => {rhs}` of a macro a transcriber
     /// defines, as long as `tts` reads as them; how many token trees were read.
-    fn nested_macro(&mut self, macro_rules: bool, tts: Ids, macros: &Stack<'_, MacroState<'_, 't>>) -> usize {
+    fn nested_macro(
+        &mut self,
+        macro_rules: bool,
+        tts: Ids,
+        macros: &Stack<'_, MacroState<'_, 't>>,
+    ) -> usize {
         let m = self.m;
         let n = tts.len();
         let separator = if macro_rules { Punct::Semi } else { Punct::Comma };
@@ -253,7 +269,11 @@ impl<'t> Checker<'t> {
         let is = |tt: &Mtt, punct| matches!(tt, Mtt::Token(it) if it.is(punct));
         let mut i = 0;
         loop {
-            if i + 2 >= n || !is_delimited(at(i)) || !is(at(i + 1), Punct::FatArrow) || !is_delimited(at(i + 2)) {
+            if i + 2 >= n
+                || !is_delimited(at(i))
+                || !is(at(i + 1), Punct::FatArrow)
+                || !is_delimited(at(i + 2))
+            {
                 break;
             }
             let (lhs, rhs) = (tts.start + i as u32, tts.start + i as u32 + 2);
@@ -287,7 +307,8 @@ impl<'t> Checker<'t> {
             acc.push(&state.ops);
             if let Some(binder) = state.binders.get(key) {
                 // alloc: inline, a `SmallVec` of two allocates nothing below three levels of repetition
-                let occurrence: SmallVec<[Kleene; 2]> = acc.iter().rev().flat_map(|it| it.iter().copied()).collect();
+                let occurrence: SmallVec<[Kleene; 2]> =
+                    acc.iter().rev().flat_map(|it| it.iter().copied()).collect();
                 if let Some(misuse) = ops_is_prefix(span, name, &binder.ops, &occurrence) {
                     self.misuses.push(misuse);
                 }
@@ -309,13 +330,22 @@ fn binder_info<'a, 't>(
 
 /// rustc's `ops_is_prefix`: a use need only be under its binder's repetitions, outermost
 /// first, and maybe more.
-fn ops_is_prefix(span: TextRange, name: Token, binder: &[Kleene], occurrence: &[Kleene]) -> Option<Misuse> {
+fn ops_is_prefix(
+    span: TextRange,
+    name: Token,
+    binder: &[Kleene],
+    occurrence: &[Kleene],
+) -> Option<Misuse> {
     for (i, binder) in binder.iter().enumerate() {
         let Some(occurrence) = occurrence.get(i) else {
             return Some(Misuse::StillRepeating { span, binder: binder.range, name });
         };
         if occurrence.op != binder.op {
-            return Some(Misuse::WrongOperator { span, binder: binder.range, occurrence: occurrence.range });
+            return Some(Misuse::WrongOperator {
+                span,
+                binder: binder.range,
+                occurrence: occurrence.range,
+            });
         }
     }
     None
@@ -363,7 +393,9 @@ mod tests {
             .map(|it| match *it {
                 Misuse::Duplicate { span, prev } => format!("duplicate {} {}", at(span), at(prev)),
                 Misuse::Unknown { span, .. } => format!("unknown {}", at(span)),
-                Misuse::StillRepeating { span, binder, .. } => format!("repeating {} {}", at(span), at(binder)),
+                Misuse::StillRepeating { span, binder, .. } => {
+                    format!("repeating {} {}", at(span), at(binder))
+                }
                 Misuse::WrongOperator { span, binder, occurrence } => {
                     format!("operator {} {} {}", at(span), at(binder), at(occurrence))
                 }
@@ -373,20 +405,24 @@ mod tests {
 
     #[test]
     fn a_use_must_be_bound_and_repeat_as_its_binder() {
-        assert_eq!(misuses("macro_rules! m { ($($i:ident)*) => { $k $i $($i)+ $($($i)*)* }; }"), [
-            "unknown $k",
-            "repeating $i *",
-            "operator $i * +",
-        ]);
+        assert_eq!(
+            misuses("macro_rules! m { ($($i:ident)*) => { $k $i $($i)+ $($($i)*)* }; }"),
+            ["unknown $k", "repeating $i *", "operator $i * +",]
+        );
     }
 
     #[test]
     fn binders_reach_into_a_macro_a_transcriber_defines() {
         assert_eq!(
-            misuses("macro_rules! m { ($($i:ident)*) => { $(macro_rules! $i { ($x:tt $x:tt) => { $x $y $i }; })* }; }"),
+            misuses(
+                "macro_rules! m { ($($i:ident)*) => { $(macro_rules! $i { ($x:tt $x:tt) => { $x $y $i }; })* }; }"
+            ),
             ["duplicate $x $x", "unknown $y"],
         );
-        assert_eq!(misuses("macro_rules! m { ($x:tt) => { macro_rules! n { ($x:tt) => { $x }; } }; }"), Vec::<String>::new());
+        assert_eq!(
+            misuses("macro_rules! m { ($x:tt) => { macro_rules! n { ($x:tt) => { $x }; } }; }"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

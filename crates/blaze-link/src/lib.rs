@@ -65,10 +65,10 @@ use std::path::PathBuf;
 use blaze_codegen::{CompiledFunction, InstanceKey, Made, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use blaze_mem::Frame;
+use std::alloc::Global;
 
 pub use layout::Heat;
 pub use lazy::{LazyPlacer, Slots};
@@ -336,24 +336,45 @@ impl Image {
     /// up to their alignment, and its references resolved against `outside` as a whole link
     /// of both would resolve them. Staged only with [`Image::stage_beside`], against the
     /// same `outside`.
-    pub fn beside<O: Outside>(to: FileName, output: Output, outside: &O, tls_bias: i64) -> Result<Image, LinkError> {
+    pub fn beside<O: Outside>(
+        to: FileName,
+        output: Output,
+        outside: &O,
+        tls_bias: i64,
+    ) -> Result<Image, LinkError> {
         let page = premap::page(output.format, output.arch);
-        let base = blaze_mem::align::checked_align_up_u64(outside.end(), page)
-            .ok_or_else(|| LinkError {
-                function: None,
-                // alloc: error path
-                what: format!("an image beside one ending at {:#x}", outside.end()),
-                refusal: None,
+        let base =
+            blaze_mem::align::checked_align_up_u64(outside.end(), page).ok_or_else(|| {
+                LinkError {
+                    function: None,
+                    // alloc: error path
+                    what: format!("an image beside one ending at {:#x}", outside.end()),
+                    refusal: None,
+                }
             })?;
-        let place = premap::Place { base, page, tls_bias, tls_from: outside.tls_end(), end: outside.end(), beside: true };
+        let place = premap::Place {
+            base,
+            page,
+            tls_bias,
+            tls_from: outside.tls_end(),
+            end: outside.end(),
+            beside: true,
+        };
         Image::placed(to, output, Some(place))
     }
 
-    fn placed(to: FileName, output: Output, place: Option<premap::Place>) -> Result<Image, LinkError> {
+    fn placed(
+        to: FileName,
+        output: Output,
+        place: Option<premap::Place>,
+    ) -> Result<Image, LinkError> {
         let fail = |what: String| LinkError { function: None, what, refusal: None };
         if output.tags & 0xffff_ffff != 0 {
             // alloc: error path
-            return Err(fail(format!("the effect tags {:#x} have low bits set: they are the image's", output.tags)));
+            return Err(fail(format!(
+                "the effect tags {:#x} have low bits set: they are the image's",
+                output.tags
+            )));
         }
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
@@ -473,9 +494,16 @@ impl Image {
     /// [`Image::stage`] of an image made by [`Image::beside`]: names, functions and statics
     /// the change does not define resolve against `outside`, which must be the one the image
     /// was made beside (the same end and thread-local end).
-    pub fn stage_beside<O: Outside>(&mut self, change: Change<'_>, outside: &O) -> Result<Staged, LinkError> {
+    pub fn stage_beside<O: Outside>(
+        &mut self,
+        change: Change<'_>,
+        outside: &O,
+    ) -> Result<Staged, LinkError> {
         match self.place {
-            Some(place) if place.beside && place.end == outside.end() && place.tls_from == outside.tls_end() => {}
+            Some(place)
+                if place.beside
+                    && place.end == outside.end()
+                    && place.tls_from == outside.tls_end() => {}
             Some(place) if place.beside => {
                 return Err(LinkError {
                     function: None,
@@ -502,9 +530,17 @@ impl Image {
         self.stage_with(change, outside)
     }
 
-    fn stage_with<O: Outside>(&mut self, mut change: Change<'_>, outside: &O) -> Result<Staged, LinkError> {
+    fn stage_with<O: Outside>(
+        &mut self,
+        mut change: Change<'_>,
+        outside: &O,
+    ) -> Result<Staged, LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
+            return Err(LinkError {
+                function: None,
+                what: "a commit is in flight".into(),
+                refusal: None,
+            });
         }
         change.cold.sort_unstable();
         change.cold.dedup();
@@ -610,7 +646,8 @@ impl Image {
         stage.relocate_all().map_err(|error| shape::explained(error, &layout, stage.plan.base))?;
         let base = self.state.generation;
         let image_base = stage.plan.base;
-        let finished = stage.finish().map_err(|error| shape::explained(error, &layout, image_base))?;
+        let finished =
+            stage.finish().map_err(|error| shape::explained(error, &layout, image_base))?;
         Ok(Staged {
             base,
             state: finished.state,
@@ -629,7 +666,11 @@ impl Image {
     /// old. Completions go to [`Image::complete`]. A commit with a message for running
     /// programs (a later link of a [`Output::live`] image) is refused before anything
     /// changes: its patches reach them only through the code memory ([`Image::commit_into`]).
-    pub fn commit(&mut self, mut staged: Staged, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
+    pub fn commit(
+        &mut self,
+        mut staged: Staged,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
         let full = staged.writes.full;
@@ -746,7 +787,10 @@ impl Image {
     /// ([`Image::commit_into`]): the undo's bytes written and published there, the image back
     /// at once. Gives the encoded message that switches programs running the memory back to
     /// its table (`None` without [`Output::live`]).
-    pub fn roll_back_into(&mut self, memory: &mut blaze_inproc::CodeMemory) -> Result<Option<Vec<u8>>, LinkError> {
+    pub fn roll_back_into(
+        &mut self,
+        memory: &mut blaze_inproc::CodeMemory,
+    ) -> Result<Option<Vec<u8>>, LinkError> {
         let writes = self.roll_back_writes()?;
         let cells = self.cells_in(memory)?;
         self.write_into(&writes, memory)?;
@@ -775,7 +819,8 @@ impl Image {
                 ),
             });
         }
-        let runs = if staged.writes.full { staged.writes.writes } else { file::whole(&staged.state) };
+        let runs =
+            if staged.writes.full { staged.writes.writes } else { file::whole(&staged.state) };
         // alloc: the file, which the caller owns
         let mut out = vec![0; staged.writes.len as usize];
         for (at, bytes) in &runs {
@@ -797,7 +842,10 @@ impl Image {
                 function: None,
                 refusal: None,
                 // alloc: error path
-                what: format!("{}: no committed file to give: the image is not laid out, or a commit is in flight", self.to),
+                what: format!(
+                    "{}: no committed file to give: the image is not laid out, or a commit is in flight",
+                    self.to
+                ),
             });
         }
         // alloc: the file, which the caller owns
@@ -824,8 +872,14 @@ impl Image {
     pub fn held(&self) -> u64 {
         let state = self.state.held();
         let inputs = self.state.inputs.iter().map(|it| it.bytes.len() as u64).sum::<u64>();
-        let objects = (self.objects.capacity() * (size_of::<Obj>() + size_of::<native::Read>())) as u64;
-        self.symbols.held() + self.arena.committed() as u64 + state + inputs + objects + self.scratch.capacity() as u64
+        let objects =
+            (self.objects.capacity() * (size_of::<Obj>() + size_of::<native::Read>())) as u64;
+        self.symbols.held()
+            + self.arena.committed() as u64
+            + state
+            + inputs
+            + objects
+            + self.scratch.capacity() as u64
     }
 
     /// Gives back what the image keeps only for its next stage to start warm: its stage
@@ -894,7 +948,11 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
     let file = writer
         .read(native.name, native.bytes, &native.kind)
         // alloc: error path
-        .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name), refusal: None })?;
+        .map_err(|what| LinkError {
+            function: None,
+            what: format!("{}: {what}", native.name),
+            refusal: None,
+        })?;
     // alloc: none, an empty `Vec` holds no buffer
     let NativeFile::Shared(shared) = file else { return Ok(Vec::new()) };
     let mut out = Vec::with_capacity(shared.inputs.len());
@@ -910,14 +968,23 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
 /// Reads `bytes` as a native input of `format` (for a fuzz target): whether it read. A
 /// reader returns an error, never panics, on any bytes.
 #[cfg(feature = "fuzz")]
-pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, bytes: &[u8]) -> bool {
+pub fn fuzz_read(
+    format: Format,
+    arch: blaze_codegen::Arch,
+    kind: NativeKind,
+    bytes: &[u8],
+) -> bool {
     let output = Output {
         format,
         arch,
         // alloc: a fuzz target's setup, once per input
         kind: OutputKind::Executable { entry: "_start".to_owned() },
         interpreter: None,
-        platform: (format == Format::MachO).then_some(Platform { platform: 1, minimum: 0x000b_0000, sdk: 0x000b_0000 }),
+        platform: (format == Format::MachO).then_some(Platform {
+            platform: 1,
+            minimum: 0x000b_0000,
+            sdk: 0x000b_0000,
+        }),
         incremental: false,
         debug: Debug::None,
         live: None,
@@ -929,7 +996,16 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
         sanitize: blaze_codegen::settings::Sanitize::default(),
         // alloc: a fuzz target's setup, once per input
         rpaths: Vec::new(),
-        triple: match (format, arch) { (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu", (Format::Elf, _) => "x86_64-unknown-linux-gnu", (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin", (Format::MachO, _) => "aarch64-apple-darwin", (Format::Pe, _) => "x86_64-pc-windows-msvc", (Format::Wasm, blaze_codegen::Arch::Wasm64) => "wasm64-blaze-wasip1", (Format::Wasm, _) => "wasm32-unknown-unknown" }.into(),
+        triple: match (format, arch) {
+            (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu",
+            (Format::Elf, _) => "x86_64-unknown-linux-gnu",
+            (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin",
+            (Format::MachO, _) => "aarch64-apple-darwin",
+            (Format::Pe, _) => "x86_64-pc-windows-msvc",
+            (Format::Wasm, blaze_codegen::Arch::Wasm64) => "wasm64-blaze-wasip1",
+            (Format::Wasm, _) => "wasm32-unknown-unknown",
+        }
+        .into(),
     };
     model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())
 }
@@ -940,7 +1016,11 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
 /// (`arena_is_exact`); `Err` naming both answers otherwise.
 #[cfg(feature = "fuzz")]
 #[doc(hidden)]
-pub fn fuzz_tbd_differential(text: &str, arch: blaze_codegen::Arch, platform: u32) -> Result<bool, String> {
+pub fn fuzz_tbd_differential(
+    text: &str,
+    arch: blaze_codegen::Arch,
+    platform: u32,
+) -> Result<bool, String> {
     macho::tbd_differential(text, arch, platform)
 }
 
@@ -959,15 +1039,26 @@ const ADDRESS_SPACE: u64 = 1 << 47;
 
 /// Why `output` can't be the dev run `dev_run` asks for: a shared image (only an executable
 /// has a start hook), a format with none, or reservations past a process's address space.
-fn dev_run_fits(output: &Output, dev_run: &DevRun, plan: &Plan, writer: &Formats) -> Result<(), String> {
+fn dev_run_fits(
+    output: &Output,
+    dev_run: &DevRun,
+    plan: &Plan,
+    writer: &Formats,
+) -> Result<(), String> {
     if let OutputKind::Shared { name, .. } = &output.kind {
         // alloc: error path
-        return Err(format!("a dev run of the shared image {name}: only an executable starts in the dev runtime"));
+        return Err(format!(
+            "a dev run of the shared image {name}: only an executable starts in the dev runtime"
+        ));
     }
     writer.start_hook()?;
     let mut total: u64 = 0;
-    for (what, size) in [("arena", dev_run.arena), ("cells", dev_run.cells), ("fixed maps", dev_run.fixed)] {
-        match blaze_mem::align::checked_align_up_u64(size, plan.page).and_then(|it| total.checked_add(it)) {
+    for (what, size) in
+        [("arena", dev_run.arena), ("cells", dev_run.cells), ("fixed maps", dev_run.fixed)]
+    {
+        match blaze_mem::align::checked_align_up_u64(size, plan.page)
+            .and_then(|it| total.checked_add(it))
+        {
             Some(sum) if sum <= ADDRESS_SPACE => total = sum,
             _ => {
                 // alloc: error path
@@ -1023,13 +1114,15 @@ fn lineage_order<'k, T>(items: &'k [T], key: impl Fn(&'k T) -> &'k [u8]) -> Vec<
         u64::from_be_bytes(word)
     };
     // alloc: once per image, at its first full link
-    let mut order: Vec<(u64, u32)> = items.iter().enumerate().map(|(at, it)| (prefix(key(it)), at as u32)).collect();
+    let mut order: Vec<(u64, u32)> =
+        items.iter().enumerate().map(|(at, it)| (prefix(key(it)), at as u32)).collect();
     blaze_ids::radix::sort_pairs(&mut order);
     let mut from = 0;
     while from < order.len() {
         let to = from + order[from..].iter().take_while(|it| it.0 == order[from].0).count();
         if to - from > 1 {
-            order[from..to].sort_unstable_by(|a, b| key(&items[a.1 as usize]).cmp(key(&items[b.1 as usize])));
+            order[from..to]
+                .sort_unstable_by(|a, b| key(&items[a.1 as usize]).cmp(key(&items[b.1 as usize])));
         }
         from = to;
     }

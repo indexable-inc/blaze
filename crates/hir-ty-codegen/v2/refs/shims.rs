@@ -6,12 +6,13 @@
 //! so each part is walked once: the cleanups ask for nothing the way without unwinding does
 //! not. Resuming the unwinding is `outside`'s.
 
-use hir_ty::db::HirDatabase;
+use blaze_query::db::AsId;
 use hir_def::{
     AdtId, CallableDefId, FunctionId, VariantId,
     layout::Variants,
     signatures::{StructFlags, StructSignature},
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::{
     consteval::try_const_usize,
     drop::DropGlue,
@@ -22,7 +23,6 @@ use hir_ty_mir::mir::location::track_caller;
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
-use blaze_query::db::AsId;
 
 use super::{Tys, told};
 use crate::{CodegenError, FunctionCx, InstanceDef, coroutine_instance, implemented_fn_method};
@@ -280,7 +280,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             if track_caller(db, func) {
                 return Err(
                     // alloc: the error's message
-                    "an `Fn`-trait method in a vtable that tracks its caller".to_owned()
+                    "an `Fn`-trait method in a vtable that tracks its caller".to_owned(),
                 );
             }
             let body = self.fx.body_types(def, args).map_err(told)?;

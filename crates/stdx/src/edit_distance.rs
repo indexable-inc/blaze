@@ -26,7 +26,8 @@ fn distance<T: PartialEq>(a: &[T], b: &[T], limit: usize) -> Option<usize> {
     if min_dist > limit {
         return None;
     }
-    while let (Some((a_first, a_rest)), Some((b_first, b_rest))) = (a.split_first(), b.split_first())
+    while let (Some((a_first, a_rest)), Some((b_first, b_rest))) =
+        (a.split_first(), b.split_first())
         && a_first == b_first
     {
         a = a_rest;
@@ -52,8 +53,10 @@ fn distance<T: PartialEq>(a: &[T], b: &[T], limit: usize) -> Option<usize> {
         rows[current] = i;
         for j in 1..=b.len() {
             let substitution_cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut cell =
-                cmp::min(rows[prev + j] + 1, cmp::min(rows[current + j - 1] + 1, rows[prev + j - 1] + substitution_cost));
+            let mut cell = cmp::min(
+                rows[prev + j] + 1,
+                cmp::min(rows[current + j - 1] + 1, rows[prev + j - 1] + substitution_cost),
+            );
             // `prev_prev` holds a real row whenever `i > 1`: row 0 after the first rotation.
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 cell = cmp::min(cell, rows[prev_prev + j - 2] + 1);
@@ -90,7 +93,11 @@ pub fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<u
 /// nearest within `dist` (a third of `lookup`'s length, at least one, by default; the first of
 /// equally near ones), else one with the same `_`-separated words in another order (the last
 /// such).
-pub fn find_best_match_for_name<'c, S: AsRef<str>>(candidates: &'c [S], lookup: &str, dist: Option<usize>) -> Option<&'c S> {
+pub fn find_best_match_for_name<'c, S: AsRef<str>>(
+    candidates: &'c [S],
+    lookup: &str,
+    dist: Option<usize>,
+) -> Option<&'c S> {
     find_best_match_for_name_by(candidates, as_str::<S>, lookup, dist)
 }
 
@@ -129,7 +136,9 @@ pub fn find_best_match_for_names<'c, S: AsRef<str>>(
     let candidates: Vec<&S> = candidates.iter().collect();
     lookups
         .iter()
-        .filter_map(|&lookup| Some((lookup, find_best_match(false, &candidates, &as_str::<S>, lookup, dist)?)))
+        .filter_map(|&lookup| {
+            Some((lookup, find_best_match(false, &candidates, &as_str::<S>, lookup, dist)?))
+        })
         .min_by_key(|&(lookup, found)| edit_distance(lookup, as_str(found), usize::MAX))
         .map(|(_, found)| found)
 }
@@ -178,9 +187,9 @@ fn find_best_match<'c, T: ?Sized, F: Fn(&T) -> &str>(
         return best;
     }
     let lookup_words = sort_by_words(lookup);
-    candidates
-        .iter()
-        .fold(None, |found, &candidate| if sort_by_words(name(candidate)) == lookup_words { Some(candidate) } else { found })
+    candidates.iter().fold(None, |found, &candidate| {
+        if sort_by_words(name(candidate)) == lookup_words { Some(candidate) } else { found }
+    })
 }
 
 /// `a.to_uppercase() == b.to_uppercase()` without the two strings: `str::to_uppercase` maps each
@@ -208,7 +217,10 @@ fn sort_by_words(name: &str) -> Vec<&str> {
 pub mod cargo {
     /// cargo's `edit_distance`: [`super::edit_distance`] of `a` and `b` lowercased.
     pub fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
-        if a.is_ascii() && b.is_ascii() && !a.bytes().chain(b.bytes()).any(|it| it.is_ascii_uppercase()) {
+        if a.is_ascii()
+            && b.is_ascii()
+            && !a.bytes().chain(b.bytes()).any(|it| it.is_ascii_uppercase())
+        {
             return super::edit_distance(a, b, limit);
         }
         // alloc: cargo lowercases both sides, on an error message's path.
@@ -217,12 +229,23 @@ pub mod cargo {
 
     /// cargo's `closest`: the element of `iter` nearest to `choice` within a distance of 3, the
     /// first of the nearest.
-    pub fn closest<'a, T>(choice: &str, iter: impl Iterator<Item = T>, key: impl Fn(&T) -> &'a str) -> Option<T> {
-        iter.filter_map(|e| Some((edit_distance(choice, key(&e), 3)?, e))).min_by_key(|t| t.0).map(|t| t.1)
+    pub fn closest<'a, T>(
+        choice: &str,
+        iter: impl Iterator<Item = T>,
+        key: impl Fn(&T) -> &'a str,
+    ) -> Option<T> {
+        iter.filter_map(|e| Some((edit_distance(choice, key(&e), 3)?, e)))
+            .min_by_key(|t| t.0)
+            .map(|t| t.1)
     }
 
     /// cargo's `closest_msg`: `\n\nhelp: a {kind} with a similar name exists: `x`` or nothing.
-    pub fn closest_msg<'a, T>(choice: &str, iter: impl Iterator<Item = T>, key: impl Fn(&T) -> &'a str, kind: &str) -> String {
+    pub fn closest_msg<'a, T>(
+        choice: &str,
+        iter: impl Iterator<Item = T>,
+        key: impl Fn(&T) -> &'a str,
+        kind: &str,
+    ) -> String {
         match closest(choice, iter, &key) {
             // alloc: cargo's error message, at the edge.
             Some(e) => format!("\n\nhelp: a {kind} with a similar name exists: `{}`", key(&e)),

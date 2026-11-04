@@ -7,9 +7,9 @@ mod db;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId};
 use hir_def::{DefWithBodyId, FunctionId, TypeAliasId, expr_store::Body as BodyStore};
+use hir_expand::fixture;
 use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
-use hir_expand::fixture;
 
 use super::ItemHashes;
 use crate::v2::{Body, HashSource, Hashes, by_id::ById};
@@ -43,6 +43,31 @@ fn code(db: &TestDB, name: &str) -> CodeHash {
     hashes()
         .code(db, Body::Item(function(db, name).into()))
         .unwrap_or_else(|e| panic!("the code of `{name}`: {e}"))
+}
+
+/// What the template of the function `name` is kept under where no debugger is told of its
+/// locals, as `hashes` names files: its template code with what it reads of names, as the
+/// front end folds them (`frontend::with_names`).
+#[track_caller]
+fn template_by(hashes: &ItemHashes, db: &TestDB, name: &str) -> CodeHash {
+    let body = Body::Item(function(db, name).into());
+    let code = hashes
+        .template_code(db, body)
+        .unwrap_or_else(|e| panic!("the template code of `{name}`: {e}"));
+    let (names, whole) = hashes
+        .names_read(db, body, false)
+        .unwrap_or_else(|e| panic!("the names `{name}` reads: {e}"));
+    assert!(whole, "untold, all `{name}` reads of names is keyed");
+    let mut h = blaze_ids::Hasher::new("blaze v2 test template with names 1");
+    h.id(&code.0).id(&names);
+    CodeHash(h.finish())
+}
+
+/// The template code and the code of the function `name` in a fresh database of `text`.
+#[track_caller]
+fn both(minicore: &str, text: &str, name: &str) -> (CodeHash, CodeHash) {
+    let (db, _) = fixture(minicore, text);
+    (template_by(&hashes(), &db, name), code(&db, name))
 }
 
 /// The content of the type alias `name` stands for.
@@ -116,13 +141,15 @@ pub fn callee() -> u32 { let one = 1; one }
 pub fn caller() -> u32 { callee() }
 "#;
 
+/// Debug info names a local by its binding and reads its name at link (`v2::side`), so the
+/// name is in no code.
 #[test]
-fn renaming_a_local_changes_its_functions_code_and_not_its_callers() {
+fn renaming_a_local_keeps_its_functions_code_and_its_callers() {
     let (mut db, file) = fixture("sized", LOCALS);
     let (callee, caller) = (code(&db, "callee"), code(&db, "caller"));
 
     db.set_file_text(file, &LOCALS.replace("one", "uno"));
-    assert_ne!(code(&db, "callee"), callee, "debug info names the local");
+    assert_eq!(code(&db, "callee"), callee, "a local is its binding, not its name");
     assert_eq!(code(&db, "caller"), caller, "a caller takes its callee by its interface");
 }
 
@@ -147,7 +174,10 @@ fn a_drop_impl_of_a_fields_type_is_in_the_type() {
     db.set_file_text(file, &format!("{DROPS}pub fn unrelated() {{}}\n"));
     assert_eq!(ty(&db, "Held"), held, "an item the type does not reach is not in it");
 
-    db.set_file_text(file, &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"));
+    db.set_file_text(
+        file,
+        &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"),
+    );
     assert_ne!(ty(&db, "Held"), held, "drop glue of `Outer` drops an `Inner`");
 }
 
@@ -234,7 +264,12 @@ pub fn here() -> u32 { 1 }
 fn a_function_written_alike_in_two_crates_is_two_codes() {
     let db = fixture::db(WRITTEN_TWICE).into_db();
     let main = fixture::test_crate(&db);
-    let dep = main.data(&db).dependencies.iter().map(|it| it.crate_id).find(|it| !it.data(&db).origin.is_lang());
+    let dep = main
+        .data(&db)
+        .dependencies
+        .iter()
+        .map(|it| it.crate_id)
+        .find(|it| !it.data(&db).origin.is_lang());
     let theirs = hir_def::test_items::function(&db, dep.expect("crate a"), "here");
     let ours = function(&db, "here");
     let code = |func: FunctionId| hashes().code(&db, Body::Item(func.into())).unwrap();
@@ -295,4 +330,167 @@ fn a_file_the_build_did_not_name_is_an_error() {
     assert!(error.contains(&format!("{file:?}")), "{error}");
     let named = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
     assert_eq!(named.file_name(&db, file).as_deref(), Ok("src/lib.rs"));
+}
+
+const PLACED: &str = r#"
+pub mod m {
+    pub fn callee(x: u32) -> u32 { x + 1 }
+}
+pub fn caller(x: u32) -> u32 { let one = m::callee(x); one * 2 }
+"#;
+
+/// Unison's rule (docs/v2/plan/design/name-free-identity.md): a function's template is kept
+/// under what it does, never what it or its callees are called or where they are written. Its
+/// code, which its instance key and the link name it by, keeps the key of the store it is
+/// written in, so two items written alike stay two functions, each with its own positions.
+#[test]
+fn renaming_or_moving_a_function_keeps_its_template_code() {
+    let (template, code) = both("sized", PLACED, "caller");
+    let same = |text: &str, name: &str, why: &str| {
+        let (made, owned) = both("sized", text, name);
+        assert_eq!(made, template, "{why}: its template is what it does");
+        owned
+    };
+    let renamed = PLACED.replace("fn caller", "fn renamed");
+    assert_ne!(same(&renamed, "renamed", "renamed"), code, "its instance is its store's");
+    let moved = PLACED
+        .replace("pub fn caller(x: u32) -> u32 { let one = m::callee(x); one * 2 }\n", "")
+        .replace(
+            "pub mod m {\n",
+            "pub mod m {\n    pub fn caller(x: u32) -> u32 { let one = callee(x); one * 2 }\n",
+        );
+    assert_ne!(
+        same(&moved, "caller", "moved into the callee's module"),
+        code,
+        "its instance is its store's"
+    );
+    let callee_renamed = PLACED.replace("callee", "next");
+    assert_eq!(
+        same(&callee_renamed, "caller", "its callee renamed"),
+        code,
+        "a callee is its interface"
+    );
+    let local_renamed = PLACED.replace("one", "uno");
+    assert_eq!(same(&local_renamed, "caller", "a local renamed"), code, "a local is its binding");
+}
+
+const OBSERVED: &str = r#"
+#![feature(intrinsics)]
+mod intrinsics {
+    #[rustc_intrinsic]
+    pub const fn type_name<T: ?Sized>() -> &'static str;
+}
+pub mod m { pub struct A; }
+pub fn reads() -> &'static str { intrinsics::type_name::<m::A>() }
+pub fn plain() -> u32 { 1 }
+"#;
+
+/// A name the code reads is in its template's key, and only in that code's.
+#[test]
+fn a_template_that_reads_a_name_is_keyed_by_it() {
+    let (reads, plain) = (both("sized", OBSERVED, "reads").0, both("sized", OBSERVED, "plain").0);
+    let renamed = OBSERVED.replace("struct A", "struct B").replace("m::A", "m::B");
+    assert_ne!(both("sized", &renamed, "reads").0, reads, "`type_name` prints the new name");
+    assert_eq!(both("sized", &renamed, "plain").0, plain, "what reads no name keeps its template");
+    let moved = OBSERVED.replace("pub mod m", "pub mod n").replace("m::A", "n::A");
+    assert_ne!(both("sized", &moved, "reads").0, reads, "`type_name` prints the new module");
+    assert_eq!(both("sized", &moved, "plain").0, plain, "what reads no name keeps its template");
+}
+
+/// A function reads its `line!()` from the `Location` its instance's anchors fill, so moving it
+/// to another line or module keeps its template. Where the line is a value of the code, a
+/// `#[track_caller]` function's or a promoted borrow's, a move is another template.
+#[test]
+fn a_template_that_reads_its_line_is_keyed_by_it() {
+    let names = ["here", "tracked", "borrowed"];
+    let before = names.map(|it| both("panic_location", LINED, it));
+    let down = format!("\n{LINED}");
+    let after = names.map(|it| both("panic_location", &down, it).0);
+    assert_eq!(after[0], before[0].0, "the line is read where the code runs");
+    assert_ne!(after[1], before[1].0, "a `#[track_caller]` function's line is its value");
+    assert_ne!(after[2], before[2].0, "a promoted line is its value");
+    let moved = LINED.replace(
+        "pub fn here() -> u32 { line!() }",
+        "pub mod m { pub fn here() -> u32 { line!() } }",
+    );
+    let (template, code) = both("panic_location", &moved, "here");
+    assert_eq!(template, before[0].0, "moved into a module on its own line");
+    assert_ne!(code, before[0].1, "its instance is its store's");
+}
+
+const FILED: &str = r#"
+#[rustc_builtin_macro]
+macro_rules! file {() => {}}
+pub fn named() -> &'static str { file!() }
+pub fn plain() -> u32 { 1 }
+"#;
+
+/// `file!()` bakes the file's name into the code's data: the name the build gives the file is
+/// in the template's key of the code that reads it, and in no other's.
+#[test]
+fn a_template_that_reads_its_file_is_keyed_by_its_name() {
+    let (db, _) = fixture("sized", FILED);
+    let lib = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
+    let other = ItemHashes::new(Box::new(|_| Some("src/other.rs".to_owned())));
+    assert_ne!(
+        template_by(&lib, &db, "named"),
+        template_by(&other, &db, "named"),
+        "`file!()` says the new name"
+    );
+    assert_eq!(
+        template_by(&lib, &db, "plain"),
+        template_by(&other, &db, "plain"),
+        "what reads no file keeps its template"
+    );
+}
+
+const TOLD: &str = r#"
+pub struct A(pub u32);
+pub fn holds() -> u32 { let held = A(1); held.0 }
+pub trait Tr { type Out; fn out(&self) -> Self::Out; }
+pub fn projects<T: Tr>(it: T) -> u32 { let out = it.out(); let _ = out; 1 }
+"#;
+
+/// What the function `name` of a fresh database of `text` reads of names, where a debugger is
+/// told of its locals when `told`; `None` when that is not all of it.
+#[track_caller]
+fn told_template(text: &str, name: &str, told: bool) -> Option<ContentId> {
+    let (db, _) = fixture("sized", text);
+    let (names, whole) = hashes()
+        .names_read(&db, Body::Item(function(&db, name).into()), told)
+        .unwrap_or_else(|e| panic!("the names `{name}` reads: {e}"));
+    whole.then_some(names)
+}
+
+/// Where a debugger is told of a function's locals, their types' identities are in what it
+/// reads of names, which its code and its template code both hold (`side::Told::ty` holds
+/// them): renaming the type a local is of is another key there, and the same one where none
+/// is told. Which binding is of which type counts too. A told local whose type is a
+/// projection normalizes to what neither the code nor the arguments key, so its body has no
+/// template code of its own and is kept under its code.
+#[test]
+fn a_told_locals_type_is_in_its_template_key() {
+    let renamed = TOLD.replace("struct A", "struct B").replace("A(1)", "B(1)");
+    let (told, quiet) = (told_template(TOLD, "holds", true), told_template(TOLD, "holds", false));
+    assert!(
+        told.is_some() && quiet.is_some(),
+        "a local of a type with no alias is told by its identity"
+    );
+    assert_ne!(told_template(&renamed, "holds", true), told, "the debugger names the new type");
+    assert_eq!(told_template(&renamed, "holds", false), quiet, "untold, the name is in no key");
+    let swapped = TOLD.replace(
+        "pub fn holds() -> u32 { let held = A(1); held.0 }",
+        "pub fn holds() -> u32 { let held = A(1); let n = 1u32; held.0 + n }",
+    );
+    let reordered = TOLD.replace(
+        "pub fn holds() -> u32 { let held = A(1); held.0 }",
+        "pub fn holds() -> u32 { let n = 1u32; let held = A(1); held.0 + n }",
+    );
+    assert_ne!(
+        told_template(&swapped, "holds", true),
+        told_template(&reordered, "holds", true),
+        "each binding by its own type"
+    );
+    assert_eq!(told_template(TOLD, "projects", true), None, "a told projection keeps its code");
+    assert!(told_template(TOLD, "projects", false).is_some(), "untold, the projection is no input");
 }

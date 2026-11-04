@@ -140,14 +140,19 @@ pub fn check_expansions(db: &Db, krate: Crate) -> ExpansionCheck<'_> {
     DiagnosticsCollector::collect_item_expansions(db, krate.id, &mut items, &every_body);
     // alloc: as above
     let mut bodies = Vec::new();
-    hir_def::nameres::demand::walk_bodies(db, roots, |_| true, |owner, _| {
-        // alloc: as above
-        let mut found = Vec::new();
-        DiagnosticsCollector::collect_body_expansions(db, owner, &mut found, &every_body);
-        if !found.is_empty() {
-            bodies.push((owner, found));
-        }
-    });
+    hir_def::nameres::demand::walk_bodies(
+        db,
+        roots,
+        |_| true,
+        |owner, _| {
+            // alloc: as above
+            let mut found = Vec::new();
+            DiagnosticsCollector::collect_body_expansions(db, owner, &mut found, &every_body);
+            if !found.is_empty() {
+                bodies.push((owner, found));
+            }
+        },
+    );
     ExpansionCheck { items, bodies }
 }
 
@@ -163,7 +168,14 @@ pub fn check_body(db: &Db, def: DefWithBodyId, style_lints: bool) -> Vec<AnyDiag
     };
     // alloc: the result; empty, so no allocation, unless a diagnostic is reported
     let mut acc = Vec::new();
-    DiagnosticsCollector::collect_body(db, def, TypeOwnerId::GenericDefId(owner), &mut acc, style_lints, &every_body);
+    DiagnosticsCollector::collect_body(
+        db,
+        def,
+        TypeOwnerId::GenericDefId(owner),
+        &mut acc,
+        style_lints,
+        &every_body,
+    );
     acc
 }
 
@@ -189,9 +201,6 @@ pub fn check_crates<'db>(
 }
 
 /// [`check_crates`] of [`workspace_crates`].
-pub fn check_workspace(
-    db: &Db,
-    style_lints: bool,
-) -> Vec<(Crate, Vec<AnyDiagnostic<'_>>)> {
+pub fn check_workspace(db: &Db, style_lints: bool) -> Vec<(Crate, Vec<AnyDiagnostic<'_>>)> {
     check_crates(db, &workspace_crates(db), style_lints)
 }

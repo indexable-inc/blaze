@@ -5,17 +5,37 @@ use blaze_ids::rng::SplitMix64;
 use super::{
     Executed, Failure, Finished, Outcome, Reported, Trace, fork_server, report,
     wire::{
-        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View, closed_ranges, encode_ended,
-        encode_hello, header, read_region,
+        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View,
+        closed_ranges, encode_ended, encode_hello, header, read_region,
     },
 };
 
 fn frames() -> Vec<Frame> {
     vec![
-        Frame::Hello { version: VERSION, pid: 42, fork: 51_000, tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()] },
-        Frame::Ended { id: 7, end: End::Exited(0), output: b"ok\n".to_vec(), executed: Executed::Hits { slots: 10, hits: vec![0, 3, 9] } },
-        Frame::Ended { id: u64::MAX, end: End::Exited(-1), output: Vec::new(), executed: Executed::Hits { slots: 0, hits: Vec::new() } },
-        Frame::Ended { id: 8, end: End::Signaled(9), output: vec![0, 255, 10], executed: Executed::Not("it was killed".into()) },
+        Frame::Hello {
+            version: VERSION,
+            pid: 42,
+            fork: 51_000,
+            tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()],
+        },
+        Frame::Ended {
+            id: 7,
+            end: End::Exited(0),
+            output: b"ok\n".to_vec(),
+            executed: Executed::Hits { slots: 10, hits: vec![0, 3, 9] },
+        },
+        Frame::Ended {
+            id: u64::MAX,
+            end: End::Exited(-1),
+            output: Vec::new(),
+            executed: Executed::Hits { slots: 0, hits: Vec::new() },
+        },
+        Frame::Ended {
+            id: 8,
+            end: End::Signaled(9),
+            output: vec![0, 255, 10],
+            executed: Executed::Not("it was killed".into()),
+        },
         Frame::Ended {
             id: 9,
             end: End::NotStarted("fork: no memory".into()),
@@ -83,7 +103,9 @@ fn ended_parts(frame: &Frame) -> Option<(u64, &End, &[u8], &Executed, Vec<u8>)> 
 
 fn view_of<'a>(executed: &'a Executed, bytes: &'a [u8]) -> ExecView<'a> {
     match executed {
-        Executed::Hits { slots, .. } => ExecView::Hits { slots: *slots, hits: Hits::of_bytes(bytes).unwrap() },
+        Executed::Hits { slots, .. } => {
+            ExecView::Hits { slots: *slots, hits: Hits::of_bytes(bytes).unwrap() }
+        }
         Executed::Not(why) => ExecView::Not(why),
     }
 }
@@ -110,7 +132,12 @@ fn every_frame_round_trips() {
 #[test]
 fn a_hello_from_borrowed_names_is_the_frame() {
     for names in [&[][..], &["a"][..], &["a::b", "", "ünï::cødé", "x"][..]] {
-        let frame = Frame::Hello { version: VERSION, pid: 9, fork: 48_500, tests: names.iter().map(|it| (*it).to_owned()).collect() };
+        let frame = Frame::Hello {
+            version: VERSION,
+            pid: 9,
+            fork: 48_500,
+            tests: names.iter().map(|it| (*it).to_owned()).collect(),
+        };
         let mut out = b"before".to_vec();
         encode_hello(&mut out, VERSION, 9, 48_500, names.iter().copied());
         assert_eq!(&out[..6], b"before");
@@ -165,7 +192,9 @@ fn a_steady_stream_reuses_its_buffers() {
         for frame in &frames {
             out.clear();
             match ended_parts(frame) {
-                Some((id, end, output, executed, bytes)) => encode_ended(&mut out, id, end.view(), output, view_of(executed, &bytes)),
+                Some((id, end, output, executed, bytes)) => {
+                    encode_ended(&mut out, id, end.view(), output, view_of(executed, &bytes))
+                }
                 None => frame.encode(&mut out),
             }
             for piece in out.chunks(5) {
@@ -252,8 +281,13 @@ fn a_frame_that_is_not_one_is_refused() {
     quit.push(0);
     assert!(Frame::decode(&quit).is_err());
     let run = Frame::Run { id: 1, index: 2 }.to_bytes();
-    assert_eq!(Frame::decode(&run[4..run.len() - 1]).unwrap_err(), "a frame ends early, in its test index");
-    let mut hello = Frame::Hello { version: 1, pid: 1, fork: 0, tests: vec!["ab".into()] }.to_bytes()[4..].to_vec();
+    assert_eq!(
+        Frame::decode(&run[4..run.len() - 1]).unwrap_err(),
+        "a frame ends early, in its test index"
+    );
+    let mut hello = Frame::Hello { version: 1, pid: 1, fork: 0, tests: vec!["ab".into()] }
+        .to_bytes()[4..]
+        .to_vec();
     let at = hello.len() - 1;
     hello[at] = 0xff;
     assert_eq!(Frame::decode(&hello).unwrap_err(), "the test name of a frame is not UTF-8");
@@ -271,8 +305,19 @@ fn a_frame_that_is_not_one_is_refused() {
 /// the slots, and as many as it says.
 #[test]
 fn an_execution_record_out_of_order_or_past_its_slots_is_refused() {
-    let ended = |slots: u32, hits: Vec<u32>| Frame::Ended { id: 1, end: End::Exited(0), output: Vec::new(), executed: Executed::Hits { slots, hits } };
-    for (slots, hits) in [(10, vec![3, 3]), (10, vec![4, 2]), (10, vec![10]), (0, vec![0]), (u32::MAX, vec![u32::MAX])] {
+    let ended = |slots: u32, hits: Vec<u32>| Frame::Ended {
+        id: 1,
+        end: End::Exited(0),
+        output: Vec::new(),
+        executed: Executed::Hits { slots, hits },
+    };
+    for (slots, hits) in [
+        (10, vec![3, 3]),
+        (10, vec![4, 2]),
+        (10, vec![10]),
+        (0, vec![0]),
+        (u32::MAX, vec![u32::MAX]),
+    ] {
         let bytes = ended(slots, hits.clone()).to_bytes();
         let why = Frame::decode(&bytes[4..]).unwrap_err();
         assert!(why.contains("out of order or past"), "{slots} {hits:?}: {why}");
@@ -304,9 +349,20 @@ fn region(slots: u32, set: &[u32], armed: u32) -> Vec<u8> {
     bytes
 }
 
-fn read(bytes: &[u8], mapped: u32, ended: Result<(), &str>, hits: &mut Vec<u8>) -> Result<u32, String> {
+fn read(
+    bytes: &[u8],
+    mapped: u32,
+    ended: Result<(), &str>,
+    hits: &mut Vec<u8>,
+) -> Result<u32, String> {
     let head: [u8; HEADER] = bytes[..HEADER].try_into().unwrap();
-    read_region(head, mapped, ended, |n| u64::from_le_bytes(bytes[HEADER + 8 * n..HEADER + 8 * n + 8].try_into().unwrap()), hits)
+    read_region(
+        head,
+        mapped,
+        ended,
+        |n| u64::from_le_bytes(bytes[HEADER + 8 * n..HEADER + 8 * n + 8].try_into().unwrap()),
+        hits,
+    )
 }
 
 /// Each refusal of `blaze_testsel::record::Record::of_region`, in its order: not exited,
@@ -359,7 +415,8 @@ fn a_region_reads_as_its_bytes_one_by_one() {
                 *byte = rng.next_u64() as u8 | 1;
             }
         }
-        let expected: Vec<u32> = (0..slots).filter(|&slot| bytes[HEADER + slot as usize] != 0).collect();
+        let expected: Vec<u32> =
+            (0..slots).filter(|&slot| bytes[HEADER + slot as usize] != 0).collect();
         let mapped = slots + rng.below(3) as u32;
         assert_eq!(read(&bytes, mapped, Ok(()), &mut hits), Ok(slots));
         let got = Hits::of_bytes(&hits).unwrap();
@@ -430,7 +487,8 @@ fn a_no_std_crates_harness_reaches_std_through_its_own_extern_crate_in_every_mod
     // harness module's `extern crate std`, which every module imports with its prelude.
     for record in [true, false] {
         let text = fork_server(record);
-        let code: Vec<&str> = text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
+        let code: Vec<&str> =
+            text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
         let opens = |it: &str| {
             let it = it.trim_start().trim_start_matches("pub ");
             it.starts_with("mod ") && it.ends_with('{')
@@ -441,9 +499,23 @@ fn a_no_std_crates_harness_reaches_std_through_its_own_extern_crate_in_every_mod
         let prelude = count("use self::std::prelude::rust_2021::*;");
         let macros = count("use self::std::{eprintln, format, vec};");
         assert!(modules > 1, "{modules} modules");
-        assert_eq!((std, prelude, macros), (modules, modules, modules), "each of the {modules} modules imports std, its prelude and macros");
-        let rooted: Vec<&&str> = code.iter().filter(|it| it.contains("::std::") && !it.contains("self::std::") && !it.contains("super::std::")).collect();
-        assert!(rooted.is_empty(), "lines that name `::std`, which a no_std crate lacks: {rooted:?}");
+        assert_eq!(
+            (std, prelude, macros),
+            (modules, modules, modules),
+            "each of the {modules} modules imports std, its prelude and macros"
+        );
+        let rooted: Vec<&&str> = code
+            .iter()
+            .filter(|it| {
+                it.contains("::std::")
+                    && !it.contains("self::std::")
+                    && !it.contains("super::std::")
+            })
+            .collect();
+        assert!(
+            rooted.is_empty(),
+            "lines that name `::std`, which a no_std crate lacks: {rooted:?}"
+        );
     }
 }
 
@@ -470,9 +542,13 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> !"));
         // Nothing of blaze is named in what the tested crate compiles but the runtime's
         // exports, and those only with slots.
-        let code: Vec<&str> = text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
+        let code: Vec<&str> =
+            text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
         let named = |it: &str| it.replace("__blaze_exec_slots", "").replace("__blaze_exec_arm", "");
-        assert!(code.iter().all(|it| !it.contains("crate::") && !named(it).contains("blaze_")), "{code:#?}");
+        assert!(
+            code.iter().all(|it| !it.contains("crate::") && !named(it).contains("blaze_")),
+            "{code:#?}"
+        );
         assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_slots() -> u32;")), record);
         assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_arm(")), record);
         assert_eq!(code.iter().any(|it| it.contains("MAP_SHARED | MAP_ANONYMOUS")), record);
@@ -481,7 +557,11 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         // An inner doc comment only where a module starts: the protocol's, first.
         let after_open = opened.trim_start_matches("pub mod fork_server {").trim_start();
         assert!(after_open.starts_with("//!"));
-        let past_docs: String = after_open.lines().skip_while(|it| it.starts_with("//!")).collect::<Vec<_>>().join("\n");
+        let past_docs: String = after_open
+            .lines()
+            .skip_while(|it| it.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!past_docs.contains("//!"));
         // Every unsafe block says why it is sound.
         let lines: Vec<&str> = text.lines().collect();
@@ -524,9 +604,14 @@ fn finished(outcome: Outcome) -> Finished {
 #[test]
 fn results_are_reported_as_the_api_has_them() {
     let passed = report("lib", &finished(Outcome::Passed)).unwrap();
-    assert_eq!((passed.outcome, passed.millis, passed.name.as_str()), (Reported::Passed, 1500, "a::b"));
+    assert_eq!(
+        (passed.outcome, passed.millis, passed.name.as_str()),
+        (Reported::Passed, 1500, "a::b")
+    );
     assert_eq!(passed.output, b"out");
-    let timed_out = report("lib", &finished(Outcome::Failed(Failure::TimedOut(Duration::from_secs(60))))).unwrap();
+    let timed_out =
+        report("lib", &finished(Outcome::Failed(Failure::TimedOut(Duration::from_secs(60)))))
+            .unwrap();
     assert_eq!(timed_out.outcome, Reported::Failed);
     assert!(String::from_utf8_lossy(&timed_out.output).contains("timeout"));
     let code = report("lib", &finished(Outcome::Failed(Failure::Code(1)))).unwrap();
@@ -555,8 +640,18 @@ fn the_wire_allocates_nothing_once_its_buffers_have_grown() {
         }
         assert_eq!(read(&bytes, 300, Ok(()), &mut hits), Ok(300));
         out.clear();
-        encode_ended(&mut out, 1, End::Exited(0).view(), b"ok", ExecView::Hits { slots: 300, hits: Hits::of_bytes(&hits).unwrap() });
+        encode_ended(
+            &mut out,
+            1,
+            End::Exited(0).view(),
+            b"ok",
+            ExecView::Hits { slots: 300, hits: Hits::of_bytes(&hits).unwrap() },
+        );
     };
     round();
-    blaze_alloc_count::assert_at_most(0, "frames encoded and read in place, a region read, an end encoded", &mut round);
+    blaze_alloc_count::assert_at_most(
+        0,
+        "frames encoded and read in place, a region read, an end encoded",
+        &mut round,
+    );
 }

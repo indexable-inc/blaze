@@ -623,7 +623,11 @@ pub(super) fn crate_named(db: &Db, name: &str) -> Crate {
         .iter()
         .copied()
         .find(|krate| {
-            krate.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name)
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == name)
         })
         .unwrap_or_else(|| panic!("no crate `{name}` in the fixture"))
 }

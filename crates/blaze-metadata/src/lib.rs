@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::config::RegistryConfig;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -42,6 +41,7 @@ use blaze_resolve::{
     QueryKind, Registry, ResolveVersion, RustVersion, SourceId, Summary, query_pinned,
 };
 use blaze_units::read::{self as summary, Package};
+use std::alloc::Global;
 
 pub use blaze_units::Read;
 
@@ -71,6 +71,7 @@ pub struct Asked<'a> {
 }
 
 /// The members a `cargo build` builds, as its flags select them.
+#[derive(Clone, Copy)]
 pub struct Build<'a> {
     /// `-p`: the members by name.
     pub packages: &'a [String],
@@ -81,6 +82,7 @@ pub struct Build<'a> {
     pub dev_units: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct TargetPlatform<'a> {
     pub triple: &'a str,
     pub cfg: &'a [Cfg],
@@ -222,11 +224,20 @@ pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
 /// --locked` reads one: a lock file the manifests no longer agree with is cargo's
 /// `--locked` error. The standard library's workspace in a toolchain is read so.
 pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
-    let relock =
-        Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
-    let made = resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
-        described(asked, &resolved, serialized, ids)
-    })?;
+    // `--locked` through the one decision ([`blaze_units::lock::after_resolve`]): no
+    // `--no-locked` or `BLAZE_LOCK` of the caller's lets this read write a lock file.
+    let ask = blaze_units::lock::LockAsk { flag: Some("--locked"), ..Default::default() };
+    // clone: the caller's variables, once per read of a toolchain's workspace.
+    let asked = &Asked {
+        env: asked.env.clone(),
+        lock: blaze_units::lock::Inputs { ask, ..asked.lock },
+        ..*asked
+    };
+    let relock = Relock { command: "metadata", respect_source_config: true };
+    let made =
+        resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
+            described(asked, &resolved, serialized, ids)
+        })?;
     Ok(made.json)
 }
 
@@ -561,7 +572,9 @@ fn with_lock<R>(
 
 /// The metadata of `asked`, and what of it a build of its members reads ([`Made`]).
 fn made(asked: &Asked<'_>) -> Result<Made> {
-    resolving(asked, as_asked(asked), |resolved, serialized, ids| described(asked, &resolved, serialized, ids))
+    resolving(asked, as_asked(asked), |resolved, serialized, ids| {
+        described(asked, &resolved, serialized, ids)
+    })
 }
 
 /// Resolves the workspace of `asked` again after its manifests changed, as `cargo remove`

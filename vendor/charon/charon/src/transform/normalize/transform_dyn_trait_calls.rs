@@ -124,10 +124,7 @@ fn transform_dyn_trait_call(
     };
 
     let method_field = &fields[method_field_id];
-    let method_ty = method_field
-        .ty
-        .clone()
-        .substitute(&vtable_decl_ref.generics);
+    let method_ty = method_field.ty.clone().substitute(&vtable_decl_ref.generics);
 
     // Get the receiver (first argument).
     if call.args.is_empty() {
@@ -171,11 +168,7 @@ fn transform_dyn_trait_call(
     let dyn_ty = &dyn_pred.generics.types[0];
     let PtrMetadata::VTable(receiver_vtable_ref) = dyn_ty.get_ptr_metadata(&ctx.ctx.translated)
     else {
-        raise_error!(
-            ctx.ctx,
-            ctx.span,
-            "Dyn trait receiver does not have vtable metadata"
-        );
+        raise_error!(ctx.ctx, ctx.span, "Dyn trait receiver does not have vtable metadata");
     };
 
     let receiver_vtable_ty = TyKind::Adt(receiver_vtable_ref).into_ty();
@@ -190,10 +183,8 @@ fn transform_dyn_trait_call(
         .project(ProjectionElem::Deref, receiver_vtable_ty);
 
     for clause_id in supertrait_path {
-        let current_vtable_ref = method_vtable_place
-            .ty()
-            .as_adt()
-            .expect("vtable place should have an ADT type");
+        let current_vtable_ref =
+            method_vtable_place.ty().as_adt().expect("vtable place should have an ADT type");
         let current_vtable = ctx
             .ctx
             .translated
@@ -213,10 +204,8 @@ fn transform_dyn_trait_call(
                 "Dyn trait proof uses a parent clause without a vtable"
             );
         };
-        let field_ty = fields[supertrait_field_id]
-            .ty
-            .clone()
-            .substitute(&current_vtable_ref.generics);
+        let field_ty =
+            fields[supertrait_field_id].ty.clone().substitute(&current_vtable_ref.generics);
         method_vtable_place = method_vtable_place
             .project(ProjectionElem::Field(None, supertrait_field_id), field_ty)
             .deref();
@@ -228,11 +217,7 @@ fn transform_dyn_trait_call(
         // In mono mode, the vtable contains erased function pointers, cast to `*const ()`.
         // This casts back to the expected signature.
         let is_unsafe = is_drop_glue || call.safety.is_unsafe();
-        call.safety = if is_drop_glue {
-            CallSafety::Safe
-        } else {
-            CallSafety::Inherit
-        };
+        call.safety = if is_drop_glue { CallSafety::Safe } else { CallSafety::Inherit };
         let real_sig_ty = TyKind::FnPtr(RegionBinder::empty(FunSig {
             is_unsafe,
             abi: Abi::rust(),
@@ -257,15 +242,8 @@ fn transform_dyn_trait_call(
         unreachable!("vtable method is not a function pointer")
     };
     let method_region_count = sig.regions.len();
-    let regions: RegionArgs = fn_ptr
-        .generics
-        .regions
-        .iter()
-        .rev()
-        .take(method_region_count)
-        .rev()
-        .cloned()
-        .collect();
+    let regions: RegionArgs =
+        fn_ptr.generics.regions.iter().rev().take(method_region_count).rev().cloned().collect();
 
     // Transform the original call to use the function pointer.
     call.func = FnOperand::Dynamic(Operand::Copy(fn_ptr_place), regions);

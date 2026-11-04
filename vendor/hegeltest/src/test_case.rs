@@ -397,9 +397,7 @@ impl RunOutput {
     /// Resolve the destination for a run starting now on this thread: the
     /// installed override if there is one, stderr otherwise.
     pub(crate) fn resolve() -> Self {
-        RunOutput {
-            sink: current_output_sink(),
-        }
+        RunOutput { sink: current_output_sink() }
     }
 
     /// The resolved sink, for handing to the engine and to test cases;
@@ -448,11 +446,7 @@ impl TestCase {
         };
         TestCase {
             global: Arc::new(TestCaseGlobalData { emit }),
-            local: RefCell::new(TestCaseLocalData {
-                span_depth: 0,
-                printing_depth: 0,
-                on_draw,
-            }),
+            local: RefCell::new(TestCaseLocalData { span_depth: 0, printing_depth: 0, on_draw }),
             handle: RefCell::new(handle),
             printer: RefCell::new(None),
             draw_state: Arc::new(Mutex::new(DrawState::default())),
@@ -920,9 +914,7 @@ impl TestCase {
                 }
                 Some(_) => {}
                 None => {
-                    draw_state
-                        .named_draw_repeatable
-                        .insert(name.to_string(), repeatable);
+                    draw_state.named_draw_repeatable.insert(name.to_string(), repeatable);
                 }
             }
 
@@ -1150,13 +1142,7 @@ pub struct Collection<'a> {
 impl<'a> Collection<'a> {
     /// Create a new backend-managed collection.
     pub fn new(tc: &'a TestCase, min_size: usize, max_size: Option<usize>) -> Self {
-        Collection {
-            tc,
-            min_size,
-            max_size,
-            handle: None,
-            finished: false,
-        }
+        Collection { tc, min_size, max_size, handle: None, finished: false }
     }
 
     fn ensure_initialized(&mut self) {
@@ -1213,34 +1199,16 @@ mod tests;
 pub(crate) mod full_ranges {
     use crate::ffi::sys as hegel_c;
 
-    pub(crate) const MIN_DATE: hegel_c::hegel_date_t = hegel_c::hegel_date_t {
-        year: 1,
-        month: 1,
-        day: 1,
-    };
-    pub(crate) const MAX_DATE: hegel_c::hegel_date_t = hegel_c::hegel_date_t {
-        year: 9999,
-        month: 12,
-        day: 31,
-    };
-    pub(crate) const MIDNIGHT: hegel_c::hegel_time_t = hegel_c::hegel_time_t {
-        hour: 0,
-        minute: 0,
-        second: 0,
-        nanosecond: 0,
-    };
-    pub(crate) const LAST_NANOSECOND: hegel_c::hegel_time_t = hegel_c::hegel_time_t {
-        hour: 23,
-        minute: 59,
-        second: 59,
-        nanosecond: 999_999_999,
-    };
-    pub(crate) const MIN_DATETIME: hegel_c::hegel_datetime_t = hegel_c::hegel_datetime_t {
-        date: MIN_DATE,
-        time: MIDNIGHT,
-    };
-    pub(crate) const MAX_DATETIME: hegel_c::hegel_datetime_t = hegel_c::hegel_datetime_t {
-        date: MAX_DATE,
-        time: LAST_NANOSECOND,
-    };
+    pub(crate) const MIN_DATE: hegel_c::hegel_date_t =
+        hegel_c::hegel_date_t { year: 1, month: 1, day: 1 };
+    pub(crate) const MAX_DATE: hegel_c::hegel_date_t =
+        hegel_c::hegel_date_t { year: 9999, month: 12, day: 31 };
+    pub(crate) const MIDNIGHT: hegel_c::hegel_time_t =
+        hegel_c::hegel_time_t { hour: 0, minute: 0, second: 0, nanosecond: 0 };
+    pub(crate) const LAST_NANOSECOND: hegel_c::hegel_time_t =
+        hegel_c::hegel_time_t { hour: 23, minute: 59, second: 59, nanosecond: 999_999_999 };
+    pub(crate) const MIN_DATETIME: hegel_c::hegel_datetime_t =
+        hegel_c::hegel_datetime_t { date: MIN_DATE, time: MIDNIGHT };
+    pub(crate) const MAX_DATETIME: hegel_c::hegel_datetime_t =
+        hegel_c::hegel_datetime_t { date: MAX_DATE, time: LAST_NANOSECOND };
 }

@@ -41,9 +41,7 @@ pub struct GrammarError {
 
 impl GrammarError {
     pub fn new(message: impl Into<String>) -> Self {
-        GrammarError {
-            message: message.into(),
-        }
+        GrammarError { message: message.into() }
     }
 }
 

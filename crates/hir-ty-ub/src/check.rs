@@ -282,7 +282,9 @@ impl<'db> Checker<'db> {
     ) -> MResult<Option<(AllocId, u64, Prov)>> {
         match self.mem.access_as(ptr.addr, ptr.prov, size, align, kind, msg) {
             Ok(Some((alloc, off))) => {
-                let prov = ptr.prov.expect("memory names an allocation only for a pointer with provenance");
+                let prov = ptr
+                    .prov
+                    .expect("memory names an allocation only for a pointer with provenance");
                 Ok(Some((alloc, off, prov)))
             }
             Ok(None) => Ok(None),
@@ -292,7 +294,13 @@ impl<'db> Checker<'db> {
 
     /// Miri: machine.rs, `before_memory_read` (data race, then borrow tracker).
     #[inline]
-    fn plain_access(&mut self, alloc: AllocId, prov: Prov, span: Span, kind: AccessKind) -> MResult<()> {
+    fn plain_access(
+        &mut self,
+        alloc: AllocId,
+        prov: Prov,
+        span: Span,
+        kind: AccessKind,
+    ) -> MResult<()> {
         self.loaded = None;
         let race = match kind {
             AccessKind::Read => self.races.read(alloc, span, None, self.at),
@@ -333,12 +341,21 @@ impl<'db> Checker<'db> {
         race.map_err(|e| self.fail(e.into()))
     }
 
-    fn access(&mut self, ptr: Ptr<Prov>, size: u64, align: u64, access: Access, kind: AccessKind) -> MResult<Option<(AllocId, u64)>> {
+    fn access(
+        &mut self,
+        ptr: Ptr<Prov>,
+        size: u64,
+        align: u64,
+        access: Access,
+        kind: AccessKind,
+    ) -> MResult<Option<(AllocId, u64)>> {
         let msg = match access {
             Access::Plain => AlignMsg::BasedOn,
             Access::Atomic { .. } => AlignMsg::AccessedPtr,
         };
-        let Some((alloc, off, prov)) = self.place(ptr, size, align, kind, msg)? else { return Ok(None) };
+        let Some((alloc, off, prov)) = self.place(ptr, size, align, kind, msg)? else {
+            return Ok(None);
+        };
         let span = Span::new(off, size);
         match access {
             Access::Plain => self.plain_access(alloc, prov, span, kind)?,
@@ -351,7 +368,9 @@ impl<'db> Checker<'db> {
 
     /// The allocation and offset of `size` bytes an atomic access already checked.
     fn locate(&mut self, ptr: Ptr<Prov>, size: u64) -> MResult<Option<(AllocId, u64)>> {
-        self.mem.access(ptr.addr, ptr.prov, size, 1, AccessKind::Read).map_err(|e| self.fail(e.into()))
+        self.mem
+            .access(ptr.addr, ptr.prov, size, 1, AccessKind::Read)
+            .map_err(|e| self.fail(e.into()))
     }
 
     /// An in-place argument or the return place of a call, after `call`: retagged with a strong
@@ -361,7 +380,8 @@ impl<'db> Checker<'db> {
     // `NewPermission::new` gives a protected `&mut` to a `Freeze` and `Unpin` pointee).
     fn protect_place(&mut self, place: Ptr<Prov>, size: u64) -> MResult<()> {
         let Some((alloc, off)) = self.locate(place, size)? else { return Ok(()) };
-        let prov = place.prov.expect("memory names an allocation only for a pointer with provenance");
+        let prov =
+            place.prov.expect("memory names an allocation only for a pointer with provenance");
         let span = Span::new(off, size);
         let perm = NewPermission::new(PtrKind::Mut, borrows::RetagMode::FnEntry, true, true, &[]);
         let tag = match self.borrows.retag(alloc, prov, &perm, span, self.at) {
@@ -420,7 +440,14 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: machine.rs, `init_alloc_extra`: the race detector's clocks (stack and heap memory
     // at the allocating thread's time, the rest at time zero), then the borrow tracker's tree.
-    fn alloc(&mut self, addr: u64, size: u64, align: u64, mem_kind: MemKind, zeroed: bool) -> MResult<Prov> {
+    fn alloc(
+        &mut self,
+        addr: u64,
+        size: u64,
+        align: u64,
+        mem_kind: MemKind,
+        zeroed: bool,
+    ) -> MResult<Prov> {
         let alloc = match self.mem.alloc(addr, size, align, kind(mem_kind), zeroed) {
             Ok(it) => it,
             Err(e) => return Err(self.fail(e.into())),
@@ -437,7 +464,13 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: interpret/memory.rs, `deallocate_ptr`; machine.rs, `before_memory_deallocation`
     // (data race, then borrow tracker).
-    fn free(&mut self, ptr: Ptr<Prov>, size: Option<u64>, align: Option<u64>, mem_kind: MemKind) -> MResult<()> {
+    fn free(
+        &mut self,
+        ptr: Ptr<Prov>,
+        size: Option<u64>,
+        align: Option<u64>,
+        mem_kind: MemKind,
+    ) -> MResult<()> {
         let alloc = match self.mem.free((ptr.addr, ptr.prov), size, align, kind(mem_kind)) {
             Ok(it) => it,
             Err(e) => return Err(self.fail(e.into())),
@@ -466,11 +499,19 @@ impl<'db> Machine<'db> for Checker<'db> {
     }
 
     #[inline]
-    fn write(&mut self, ptr: Ptr<Prov>, size: u64, align: u64, access: Access, shadow: &Shadow) -> MResult<()> {
+    fn write(
+        &mut self,
+        ptr: Ptr<Prov>,
+        size: u64,
+        align: u64,
+        access: Access,
+        shadow: &Shadow,
+    ) -> MResult<()> {
         debug_assert_eq!(shadow.0.len() as u64, size, "a write's shadow is its size");
         if let Some((alloc, off)) = self.access(ptr, size, align, access, AccessKind::Write)? {
             if let Access::Atomic { rmw, .. } = access {
-                self.overwrote_init = rmw || self.mem.require_init(alloc, Span::new(off, size)).is_ok();
+                self.overwrote_init =
+                    rmw || self.mem.require_init(alloc, Span::new(off, size)).is_ok();
             }
             self.mem.write(alloc, off, &shadow.0);
         }
@@ -479,13 +520,24 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: interpret/memory.rs, `mem_copy_repeatedly`: both sides checked (the source read,
     // the destination written), then each side's `before_memory_*` hook, then the overlap check.
-    fn copy(&mut self, dst: Ptr<Prov>, src: Ptr<Prov>, size: u64, align: u64, overlapping: bool) -> MResult<()> {
+    fn copy(
+        &mut self,
+        dst: Ptr<Prov>,
+        src: Ptr<Prov>,
+        size: u64,
+        align: u64,
+        overlapping: bool,
+    ) -> MResult<()> {
         let from = self.place(src, size, align, AccessKind::Read, AlignMsg::BasedOn)?;
         let to = self.place(dst, size, align, AccessKind::Write, AlignMsg::BasedOn)?;
-        let (Some((salloc, soff, sprov)), Some((dalloc, doff, dprov))) = (from, to) else { return Ok(()) };
+        let (Some((salloc, soff, sprov)), Some((dalloc, doff, dprov))) = (from, to) else {
+            return Ok(());
+        };
         self.plain_access(salloc, sprov, Span::new(soff, size), AccessKind::Read)?;
         self.plain_access(dalloc, dprov, Span::new(doff, size), AccessKind::Write)?;
-        if !overlapping && let Err(e) = self.mem.check_nonoverlapping((dalloc, doff), (salloc, soff), size) {
+        if !overlapping
+            && let Err(e) = self.mem.check_nonoverlapping((dalloc, doff), (salloc, soff), size)
+        {
             return Err(self.fail(e.into()));
         }
         self.mem.copy((dalloc, doff), (salloc, soff), size);
@@ -500,7 +552,13 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: concurrency/weak_memory.rs, `buffered_atomic_read`. A read-modify-write reads the
     // latest store (`buffered_atomic_rmw`), so only a load may read another.
-    fn atomic_load(&mut self, ptr: Ptr<Prov>, size: u64, _ord: AtomicOrd, _latest: &[u8]) -> MResult<Option<Vec<u8>>> {
+    fn atomic_load(
+        &mut self,
+        ptr: Ptr<Prov>,
+        size: u64,
+        _ord: AtomicOrd,
+        _latest: &[u8],
+    ) -> MResult<Option<Vec<u8>>> {
         let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(None) };
         let span = Span::new(off, size);
         if self.loaded.take() != Some((alloc, span)) {
@@ -514,7 +572,13 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: concurrency/weak_memory.rs, `buffered_atomic_write`: a location's first atomic
     // store keeps what it held before as the store before it (`None`: not all initialized).
-    fn atomic_store(&mut self, ptr: Ptr<Prov>, ord: AtomicOrd, bytes: &[u8], old: &[u8]) -> MResult<()> {
+    fn atomic_store(
+        &mut self,
+        ptr: Ptr<Prov>,
+        ord: AtomicOrd,
+        bytes: &[u8],
+        old: &[u8],
+    ) -> MResult<()> {
         let size = bytes.len() as u64;
         let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(()) };
         let old = self.overwrote_init.then_some(old);
@@ -531,13 +595,21 @@ impl<'db> Machine<'db> for Checker<'db> {
         Ok(())
     }
 
-    fn typed(&mut self, cx: &TypedCx<'_, 'db>, place: Ptr<Prov>, ty: Ty<'db>, bytes: &[u8], mode: RetagMode) -> MResult<()> {
-        let loc = if bytes.is_empty() {
-            None
-        } else {
-            self.locate(place, bytes.len() as u64)?
+    fn typed(
+        &mut self,
+        cx: &TypedCx<'_, 'db>,
+        place: Ptr<Prov>,
+        ty: Ty<'db>,
+        bytes: &[u8],
+        mode: RetagMode,
+    ) -> MResult<()> {
+        let loc = if bytes.is_empty() { None } else { self.locate(place, bytes.len() as u64)? };
+        let parts = valid::Parts {
+            mem: &mut self.mem,
+            borrows: &mut self.borrows,
+            races: &mut self.races,
+            site: self.at,
         };
-        let parts = valid::Parts { mem: &mut self.mem, borrows: &mut self.borrows, races: &mut self.races, site: self.at };
         match valid::typed(&mut self.plans, cx, parts, loc, ty, bytes, mode) {
             Ok(()) => Ok(()),
             Err(Fail::Ub(ub)) => Err(self.fail(ub)),
@@ -690,7 +762,12 @@ fn run_test_attached<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Out
     let ptr_size = match db.target_data_layout(krate) {
         Ok(target) => target.pointer_size().bytes(),
         // alloc: the edge: the outcome of a run.
-        Err(e) => return Outcome::Error { message: format!("no target data layout: {e:?}"), seed: config.seed },
+        Err(e) => {
+            return Outcome::Error {
+                message: format!("no target data layout: {e:?}"),
+                seed: config.seed,
+            };
+        }
     };
     let schedules = config.schedules.max(1);
     let mut plans = Plans::default();
@@ -743,7 +820,10 @@ fn outcome<'db>(
         },
         MirEvalError::UndefinedBehavior(what) => {
             // alloc: the edge: the outcome of a run.
-            Outcome::Error { message: format!("Undefined Behavior (found by the evaluator): {what}"), seed }
+            Outcome::Error {
+                message: format!("Undefined Behavior (found by the evaluator): {what}"),
+                seed,
+            }
         }
         // alloc: the edge: the outcome of a run.
         other => Outcome::Error { message: format!("{other:?}"), seed },
@@ -751,10 +831,17 @@ fn outcome<'db>(
 }
 
 /// A frame of the call stack: the function (or closure) and where in its body it was.
-pub(crate) type Frame<'db> = (either::Either<FunctionId, hir_ty::db::InternedClosureId<'db>>, MirSpan, hir_ty::InferBodyId<'db>);
+pub(crate) type Frame<'db> = (
+    either::Either<FunctionId, hir_ty::db::InternedClosureId<'db>>,
+    MirSpan,
+    hir_ty::InferBodyId<'db>,
+);
 
 /// The error under `InFunction`s, with their frames innermost first in `stack`.
-fn innermost<'e, 'db>(mut error: &'e MirEvalError<'db>, stack: &mut Vec<Frame<'db>>) -> &'e MirEvalError<'db> {
+fn innermost<'e, 'db>(
+    mut error: &'e MirEvalError<'db>,
+    stack: &mut Vec<Frame<'db>>,
+) -> &'e MirEvalError<'db> {
     // alloc: the edge: the outcome of a run.
     let mut levels = Vec::new();
     while let MirEvalError::InFunction(inner, frames) = error {

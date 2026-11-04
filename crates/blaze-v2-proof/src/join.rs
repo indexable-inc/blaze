@@ -198,7 +198,9 @@ fn start_in<A: Columns, B: Columns>(other: &A, of: &B, start: usize) -> usize {
 pub(crate) fn same_edges<A: Columns, B: Columns>(a: &A, i: usize, b: &B, j: usize) -> bool {
     let (x, y) = (a.edges_of(i), b.edges_of(j));
     x.len() == y.len()
-        && x.zip(y).all(|(ea, eb)| a.saw(ea) == b.saw(eb) && a.key(a.read(ea) as usize) == b.key(b.read(eb) as usize))
+        && x.zip(y).all(|(ea, eb)| {
+            a.saw(ea) == b.saw(eb) && a.key(a.read(ea) as usize) == b.key(b.read(eb) as usize)
+        })
 }
 
 /// The keys reachable from `roots`, the roots included; `None`, every result, when there are no
@@ -225,11 +227,20 @@ fn reachable<C: Columns>(c: &C, roots: &[QueryKey]) -> Option<BitSet<u32>> {
 }
 
 /// [`crate::under`] across cores.
-pub fn under<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[QueryKey]) -> Vec<Stale> {
+pub fn under<A: Columns, B: Columns>(
+    incremental: &A,
+    scratch: &B,
+    roots: &[QueryKey],
+) -> Vec<Stale> {
     under_in(incremental, scratch, roots, pieces(scratch.keys()))
 }
 
-fn under_in<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[QueryKey], pieces: usize) -> Vec<Stale> {
+fn under_in<A: Columns, B: Columns>(
+    incremental: &A,
+    scratch: &B,
+    roots: &[QueryKey],
+    pieces: usize,
+) -> Vec<Stale> {
     let reached = reachable(scratch, roots);
     // alloc: the answer, which stays unallocated while nothing is stale.
     let mut stale = Vec::new();
@@ -247,8 +258,9 @@ fn under_in<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[Query
                 continue;
             };
             if !incremental.ran(j) {
-                let missed =
-                    incremental.edges_of(j).find(|&e| result(incremental, incremental.read(e) as usize) != Some(incremental.saw(e)));
+                let missed = incremental.edges_of(j).find(|&e| {
+                    result(incremental, incremental.read(e) as usize) != Some(incremental.saw(e))
+                });
                 if let Some(e) = missed {
                     let read = incremental.read(e) as usize;
                     let (saw, now) = (incremental.saw(e), result(incremental, read));
@@ -292,7 +304,8 @@ fn over_in<A: Columns, B: Columns>(before: &A, after: &B, pieces: usize) -> (Wor
             let Some(now) = result(after, i).filter(|_| after.ran(i)) else { continue };
             work.ran += 1;
             let key = after.key(i);
-            match index_from(before, &mut cursor, &key).and_then(|j| Some((j, result(before, j)?))) {
+            match index_from(before, &mut cursor, &key).and_then(|j| Some((j, result(before, j)?)))
+            {
                 None => work.new += 1,
                 Some((j, was)) if was == now && same_edges(before, j, after, i) => {
                     work.needless += 1;
@@ -352,21 +365,30 @@ mod tests {
         let trace = settled(8, 3000);
         let bytes = blaze_protocol::cbor::to_vec(&trace).unwrap();
         let view = View::parse(&bytes).unwrap();
-        assert!(crate::under(&trace, &trace, &[]).is_empty(), "the settled trace agrees with itself");
+        assert!(
+            crate::under(&trace, &trace, &[]).is_empty(),
+            "the settled trace agrees with itself"
+        );
         for _ in 0..2 {
-            let stale = blaze_alloc_count::assert_at_most(0, "under, a trace and itself, owned", || {
-                under_in(&trace, &trace, &[], 1)
-            });
+            let stale =
+                blaze_alloc_count::assert_at_most(0, "under, a trace and itself, owned", || {
+                    under_in(&trace, &trace, &[], 1)
+                });
             assert!(stale.is_empty());
-            let stale = blaze_alloc_count::assert_at_most(0, "under, a trace and itself, in place", || {
-                under_in(&view, &view, &[], 1)
-            });
+            let stale =
+                blaze_alloc_count::assert_at_most(0, "under, a trace and itself, in place", || {
+                    under_in(&view, &view, &[], 1)
+                });
             assert!(stale.is_empty());
             let (work, needless) =
-                blaze_alloc_count::assert_at_most(0, "over, nothing ran, owned", || over_in(&trace, &trace, 1));
+                blaze_alloc_count::assert_at_most(0, "over, nothing ran, owned", || {
+                    over_in(&trace, &trace, 1)
+                });
             assert_eq!((work, needless.len()), (Work::default(), 0));
             let (work, needless) =
-                blaze_alloc_count::assert_at_most(0, "over, nothing ran, in place", || over_in(&view, &view, 1));
+                blaze_alloc_count::assert_at_most(0, "over, nothing ran, in place", || {
+                    over_in(&view, &view, 1)
+                });
             assert_eq!((work, needless.len()), (Work::default(), 0));
         }
     }
@@ -378,7 +400,10 @@ mod tests {
         let mut trace = base.clone();
         for i in 0..trace.keys.len() as u32 {
             match rng.below(8) {
-                0 => trace.fingerprints[i as usize] = Fingerprint(trace.fingerprints[i as usize].0 + 1),
+                0 => {
+                    trace.fingerprints[i as usize] =
+                        Fingerprint(trace.fingerprints[i as usize].0 + 1)
+                }
                 1 => trace.ran.set(i, !trace.ran.contains(i)),
                 2 if trace.has.contains(i) => {
                     trace.has.remove(i);
@@ -400,25 +425,42 @@ mod tests {
             let scratch = seeded(seed, 40 + seed * 31, 60 + seed as usize * 50);
             let incremental = edited(&scratch, seed + 100);
             let other = seeded(seed + 1000, 40 + seed * 31, 60 + seed as usize * 50);
-            let bytes = [&incremental, &scratch, &other].map(|t| blaze_protocol::cbor::to_vec(t).unwrap());
-            let [inc_view, scratch_view, other_view] = [0, 1, 2].map(|k| View::parse(&bytes[k]).unwrap());
+            let bytes =
+                [&incremental, &scratch, &other].map(|t| blaze_protocol::cbor::to_vec(t).unwrap());
+            let [inc_view, scratch_view, other_view] =
+                [0, 1, 2].map(|k| View::parse(&bytes[k]).unwrap());
             let roots: Vec<QueryKey> = scratch.keys.iter().step_by(5).copied().collect();
             for roots in [&[][..], &roots[..2.min(roots.len())]] {
-                for (inc, scr) in [(&incremental, &scratch), (&other, &scratch), (&scratch, &other)] {
+                for (inc, scr) in [(&incremental, &scratch), (&other, &scratch), (&scratch, &other)]
+                {
                     let want = crate::under(inc, scr, roots);
                     for pieces in 1..=7 {
-                        assert_eq!(under_in(inc, scr, roots, pieces), want, "seed {seed}, {pieces} pieces");
+                        assert_eq!(
+                            under_in(inc, scr, roots, pieces),
+                            want,
+                            "seed {seed}, {pieces} pieces"
+                        );
                     }
                 }
                 let want = crate::under(&incremental, &scratch, roots);
                 for pieces in 1..=7 {
-                    assert_eq!(under_in(&inc_view, &scratch_view, roots, pieces), want, "seed {seed} in place");
+                    assert_eq!(
+                        under_in(&inc_view, &scratch_view, roots, pieces),
+                        want,
+                        "seed {seed} in place"
+                    );
                 }
             }
-            for (before, after) in [(&scratch, &incremental), (&other, &incremental), (&incremental, &scratch)] {
+            for (before, after) in
+                [(&scratch, &incremental), (&other, &incremental), (&incremental, &scratch)]
+            {
                 let want = crate::over(before, after);
                 for pieces in 1..=7 {
-                    assert_eq!(over_in(before, after, pieces), want, "seed {seed}, {pieces} pieces");
+                    assert_eq!(
+                        over_in(before, after, pieces),
+                        want,
+                        "seed {seed}, {pieces} pieces"
+                    );
                 }
             }
             let want = crate::over(&other, &incremental);

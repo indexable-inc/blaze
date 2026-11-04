@@ -35,7 +35,16 @@ pub(crate) struct Ui<'a> {
 
 impl Default for Ui<'_> {
     fn default() -> Self {
-        Ui { name: "", edition: "2015", mode: Mode::Other, core: "", std: None, meta: "", flags: &[], source: "" }
+        Ui {
+            name: "",
+            edition: "2015",
+            mode: Mode::Other,
+            core: "",
+            std: None,
+            meta: "",
+            flags: &[],
+            source: "",
+        }
     }
 }
 
@@ -49,7 +58,8 @@ fn split_flag(flag: &str) -> Vec<&str> {
 
 /// compiletest's options for `ui`, its lint flags before the test's own.
 fn options(ui: &Ui<'_>) -> Options {
-    let args: Vec<String> = ui.flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
+    let args: Vec<String> =
+        ui.flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
     let own = Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() };
     compiletest(ui.mode, &own)
 }
@@ -64,19 +74,26 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
         Some((prelude, items)) => {
             assert!(!ui.core.is_empty(), "std's prelude is core's: give minicore's flags");
             // Without the feature, hir-def collects none of the crate's `#[lang]` items.
-            fixture.push_str("//- /std.rs crate:std\n#![feature(lang_items, rustc_attrs)]\npub mod prelude {\n");
+            fixture.push_str(
+                "//- /std.rs crate:std\n#![feature(lang_items, rustc_attrs)]\npub mod prelude {\n",
+            );
             for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
                 fixture.push_str(&format!(
                     "    pub mod {edition} {{ pub use core::prelude::{edition}::*; pub use crate::__prelude::*; }}\n"
                 ));
             }
-            fixture.push_str(&format!("}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}\n"));
+            fixture.push_str(&format!(
+                "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}\n"
+            ));
             " deps:std"
         }
         None => "",
     };
     let meta = if ui.meta.is_empty() { String::new() } else { format!(" {}", ui.meta) };
-    fixture.push_str(&format!("//- /{} crate:other:main edition:{}{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
+    fixture.push_str(&format!(
+        "//- /{} crate:other:main edition:{}{deps}{meta}\n{}",
+        ui.name, ui.edition, ui.source
+    ));
     let stderr = crate::tests::checked_with(&fixture, "$DIR/", &options(&ui))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)

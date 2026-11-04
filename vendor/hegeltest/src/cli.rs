@@ -126,9 +126,7 @@ where
 
 fn next_value(args: &[String], i: &mut usize, name: &str) -> Result<String, CliError> {
     *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| CliError::Parse(format!("{name} requires a value")))
+    args.get(*i).cloned().ok_or_else(|| CliError::Parse(format!("{name} requires a value")))
 }
 
 /// Extract `--profile <NAME>` from `args` before the flag loop runs, so
@@ -144,9 +142,7 @@ fn extract_profile(args: &mut Vec<String>) -> Result<Option<String>, CliError> {
     }
     let name = args.remove(pos);
     if args.iter().any(|a| a == "--profile") {
-        return Err(CliError::Parse(
-            "--profile may be given at most once".to_string(),
-        ));
+        return Err(CliError::Parse("--profile may be given at most once".to_string()));
     }
     Ok(Some(name))
 }
@@ -178,9 +174,9 @@ fn parse_backend(s: &str) -> Result<Backend, CliError> {
     match s {
         "default" => Ok(Backend::Default),
         "urandom" => Ok(Backend::Urandom),
-        other => Err(CliError::Parse(format!(
-            "--backend expects one of default|urandom, got {other:?}"
-        ))),
+        other => {
+            Err(CliError::Parse(format!("--backend expects one of default|urandom, got {other:?}")))
+        }
     }
 }
 

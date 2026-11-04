@@ -16,10 +16,7 @@ fn integers_convert_within_their_range() {
 
 #[test]
 fn integers_order_numerically() {
-    let mut values: Vec<Integer> = [3i128, -1, 0, -7, 2]
-        .into_iter()
-        .map(Integer::from)
-        .collect();
+    let mut values: Vec<Integer> = [3i128, -1, 0, -7, 2].into_iter().map(Integer::from).collect();
     values.push(Integer::from(u128::MAX));
     values.sort();
     let shown: Vec<String> = values.iter().map(Integer::to_string).collect();
@@ -149,10 +146,7 @@ fn a_malformed_report_is_an_internal_error() {
 
 #[test]
 fn a_size_past_usize_is_refused() {
-    let mut r = Reader {
-        bytes: &u64::MAX.to_le_bytes(),
-        pos: 0,
-    };
+    let mut r = Reader { bytes: &u64::MAX.to_le_bytes(), pos: 0 };
     let fits = usize::try_from(u64::MAX).is_ok();
     assert_eq!(r.size().is_some(), fits);
 }
@@ -184,10 +178,7 @@ fn a_clone_node_decodes_with_its_nested_draws_and_spans() {
         empty_tail(out);
     });
     let report = decode_report(&bytes);
-    assert_eq!(
-        report.choices(),
-        vec![Choice::Clone(vec![Choice::Boolean(true)])]
-    );
+    assert_eq!(report.choices(), vec![Choice::Clone(vec![Choice::Boolean(true)])]);
     let Draw::Clone { nodes, spans } = &report.nodes[0].draw else {
         panic!("expected a clone, got {:?}", report.nodes);
     };

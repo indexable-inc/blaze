@@ -8,7 +8,6 @@
 use std::{io::Write, path::PathBuf, sync::Arc};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_registry::{
     Context, Locked, Package, SourceConfig, Sources,
     auth::{Auth, Shell},
@@ -18,6 +17,7 @@ use blaze_registry::{
 use blaze_source::SourceId;
 use parking_lot::Mutex;
 use semver::Version;
+use std::alloc::Global;
 
 const BASE: &str = "https://private.example.com/";
 const DL: &str = "https://dl.private.example.com/";

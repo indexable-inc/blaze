@@ -264,7 +264,8 @@ pub fn table_loop(mk: &Mk) -> Family {
         let index = b.ins().ireduce(I32, low);
         let pool = &mut b.func.dfg;
         let default = pool.block_call(fallback, &[]);
-        let entries: Vec<ir::BlockCall> = arms.iter().map(|arm| pool.block_call(*arm, &[])).collect();
+        let entries: Vec<ir::BlockCall> =
+            arms.iter().map(|arm| pool.block_call(*arm, &[])).collect();
         let jt = b.create_jump_table(ir::JumpTableData::new(default, &entries));
         b.ins().br_table(index, jt);
 
@@ -334,16 +335,33 @@ fn uncounted_code_names_no_counter_cell() {
     for target in crate::tests::host::TARGETS {
         let counting = Mk::new(target);
         let plain = Mk::new(crate::Target { counts: false, ..target });
-        for (counted, uncounted) in [(loops(&counting), loops(&plain)), (table_loop(&counting), table_loop(&plain))] {
+        for (counted, uncounted) in
+            [(loops(&counting), loops(&plain)), (table_loop(&counting), table_loop(&plain))]
+        {
             for (i, (a, b)) in counted.funcs.iter().zip(&uncounted.funcs).enumerate() {
                 let compile = |func: &ir::Function, target: &crate::Target| {
-                    crate::compile(func, target).unwrap_or_else(|e| panic!("{} u0:{i} on {target:?}: {e}", counted.name))
+                    crate::compile(func, target)
+                        .unwrap_or_else(|e| panic!("{} u0:{i} on {target:?}: {e}", counted.name))
                 };
                 let (a, b) = (compile(a, &counting.target), compile(b, &plain.target));
-                let names_counter = |code: &crate::Code| code.relocs.iter().any(|it| it.name == crate::code::Name::Counter);
-                assert!(names_counter(&a), "{} u0:{i} on {target:?}: counting code counts", counted.name);
-                assert!(!names_counter(&b), "{} u0:{i} on {target:?}: code built to keep counts nothing", counted.name);
-                assert!(b.bytes.len() < a.bytes.len(), "{} u0:{i} on {target:?}: no counting code", counted.name);
+                let names_counter = |code: &crate::Code| {
+                    code.relocs.iter().any(|it| it.name == crate::code::Name::Counter)
+                };
+                assert!(
+                    names_counter(&a),
+                    "{} u0:{i} on {target:?}: counting code counts",
+                    counted.name
+                );
+                assert!(
+                    !names_counter(&b),
+                    "{} u0:{i} on {target:?}: code built to keep counts nothing",
+                    counted.name
+                );
+                assert!(
+                    b.bytes.len() < a.bytes.len(),
+                    "{} u0:{i} on {target:?}: no counting code",
+                    counted.name
+                );
             }
         }
     }
@@ -351,10 +369,7 @@ fn uncounted_code_names_no_counter_cell() {
 
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod run {
-    use cranelift_codegen::{
-        data_value::DataValue,
-        ir::immediates::Ieee64,
-    };
+    use cranelift_codegen::{data_value::DataValue, ir::immediates::Ieee64};
 
     use super::super::world::{In, Opts, check, check_counted, host_mk, i64s, random_inputs};
 
@@ -371,7 +386,11 @@ mod run {
         let family = super::blocks(&mk);
         let mut inputs = random_inputs(30, &family, 64);
         for (a, b, c) in [(-1, 2, 0), (-1, 3, 101), (-1, 3, 5), (1, 2, 0), (1, 0, 1), (0, 0, 0)] {
-            inputs.push(vec![In::V(DataValue::I64(a)), In::V(DataValue::I64(b)), In::V(DataValue::I32(c))]);
+            inputs.push(vec![
+                In::V(DataValue::I64(a)),
+                In::V(DataValue::I64(b)),
+                In::V(DataValue::I32(c)),
+            ]);
         }
         check(&mk, &family, &inputs, &Opts::interp());
     }
@@ -395,7 +414,8 @@ mod run {
     fn loops_count_their_back_edges_and_calls() {
         let Some(mk) = host_mk() else { return };
         let family = super::loops(&mk);
-        let mut inputs = vec![i64s(&[0, 0, 0]), i64s(&[1, 1, 1]), i64s(&[15, 15, 31]), i64s(&[3, 0, 2])];
+        let mut inputs =
+            vec![i64s(&[0, 0, 0]), i64s(&[1, 1, 1]), i64s(&[15, 15, 31]), i64s(&[3, 0, 2])];
         inputs.extend(random_inputs(32, &family, 16));
         check_counted(&mk, &family, &inputs, &Opts::interp(), |input| {
             super::loops_counts(int(input, 0), int(input, 1), int(input, 2))
@@ -409,7 +429,8 @@ mod run {
         let Some(mk) = host_mk() else { return };
         let mk = super::Mk::new(crate::Target { counts: false, ..mk.target });
         let family = super::loops(&mk);
-        let mut inputs = vec![i64s(&[0, 0, 0]), i64s(&[1, 1, 1]), i64s(&[15, 15, 31]), i64s(&[3, 0, 2])];
+        let mut inputs =
+            vec![i64s(&[0, 0, 0]), i64s(&[1, 1, 1]), i64s(&[15, 15, 31]), i64s(&[3, 0, 2])];
         inputs.extend(random_inputs(35, &family, 16));
         check_counted(&mk, &family, &inputs, &Opts::interp(), |_| vec![[0, 0]; 2]);
         let family = super::table_loop(&mk);
