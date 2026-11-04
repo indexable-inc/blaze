@@ -4,9 +4,10 @@ import { withHiddenPage } from "../cdp.ts";
 import { table, Table } from "../table.ts";
 import { nuon } from "../nuon.ts";
 import { tasks, task, taskValue, wait } from "../tasks.ts";
+import { agents } from "../agents.ts";
 import { sh, procs, out, err, lines, kill, ptree } from "../proc.ts";
 
-export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree };
+export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, agents };
 
 /** Shown in the MCP tool description so the model knows what it can call. */
 export const docs: Record<keyof typeof functions, string> = {
@@ -29,4 +30,6 @@ export const docs: Record<keyof typeof functions, string> = {
   lines: "lines(p, 'stdout' | 'stderr' = 'stdout', opts?): Table<{ n; text }> — same options as out(), as numbered rows.",
   kill: "kill(p, signal? = 'SIGTERM'): proc record.",
   ptree: "ptree(): Promise<Table<{ pid; ppid; depth; proc: 'p1' | null; stat; etime; command (indented by depth) }>> — live process tree of everything this REPL spawned, grandchildren included (from ps).",
+  agents:
+    "agents — the harness agent tree (sessions shown in the harness web UI). agents.self() / agents.parent(): session ids; await agents.list() / agents.tree(): Table; await agents.spawn({ kind?: 'claude'|'codex'|'shell' = 'claude', prompt?, args?, cwd? }): id of a new child agent under this one; await agents.send(id, text, { submit? = true }): type a message into it (Enter pressed); await agents.notifyParent(text); await agents.screen(id): its screen as text; await agents.waitFor(id, textOrRegex, timeoutMs?); await agents.kill(id); await agents.url(id?): web UI link.",
 };

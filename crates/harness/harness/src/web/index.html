@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>harness</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<style>
+  :root { color-scheme: dark; --bg: #1c1c1c; --fg: #d8d8d8; --muted: #888; --sel: #2d3a4a; --line: #333; }
+  body { margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--fg); font: 13px ui-monospace, Menlo, monospace; }
+  #side { width: 300px; border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  #side header { padding: 10px; border-bottom: 1px solid var(--line); display: flex; gap: 6px; align-items: center; }
+  #side header b { flex: 1; }
+  button { background: #2a2a2a; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; font: inherit; cursor: pointer; }
+  button:hover { background: #333; }
+  #tree { overflow: auto; flex: 1; padding: 4px 0; }
+  .row { padding: 4px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row:hover { background: #262626; }
+  .row.sel { background: var(--sel); }
+  .muted { color: var(--muted); }
+  .dead { opacity: .5; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #bar { padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  #bar span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #term { flex: 1; padding: 6px; overflow: hidden; min-height: 0; }
+  #empty { margin: auto; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="side">
+  <header><b>harness</b>
+    <button onclick="spawn('claude')">+ claude</button><button onclick="spawn('codex')">+ codex</button><button onclick="spawn('shell')">+ sh</button>
+  </header>
+  <div id="tree"></div>
+</div>
+<div id="main">
+  <div id="bar"><span id="title" class="muted">no session selected</span><button onclick="kill()">kill</button></div>
+  <div id="term"><div id="empty">pick a session</div></div>
+</div>
+<script>
+let sessions = [], current = null, ws = null, term = null, fitter = null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+
+function order(list) {
+  const byParent = new Map(), ids = new Set(list.map((s) => s.id)), out = [];
+  for (const s of list) { const p = ids.has(s.parent) ? s.parent : null; (byParent.get(p) ?? byParent.set(p, []).get(p)).push(s); }
+  const walk = (p, depth) => (byParent.get(p) ?? []).forEach((s) => { out.push([s, depth]); walk(s.id, depth + 1); });
+  walk(null, 0);
+  return out;
+}
+function label(s) { return s.title || s.kind; }
+async function refresh() {
+  try { sessions = (await (await fetch('/api/sessions')).json()).sessions; } catch { return; }
+  $('tree').innerHTML = order(sessions).map(([s, d]) =>
+    `<div class="row ${s.id === current ? 'sel' : ''} ${s.exit !== null ? 'dead' : ''}" style="padding-left:${10 + d * 16}px" onclick="open_(${s.id})">` +
+    `${d ? '└ ' : ''}<b>#${s.id}</b> ${esc(s.kind)} <span class="muted">${esc(s.title)}${s.exit !== null ? ' · exit ' + s.exit : ''}</span></div>`).join('');
+  const s = sessions.find((x) => x.id === current);
+  if (s) $('title').textContent = `#${s.id} ${s.kind} — ${label(s)} — ${s.cwd}`;
+}
+function open_(id) {
+  current = id; ws?.close();
+  $('term').innerHTML = '';
+  term?.dispose();
+  term = new Terminal({
+    fontFamily: '"JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace', fontSize: 13, lineHeight: 1.15,
+    theme: { background: '#1c1c1c', foreground: '#d8d8d8' }, scrollback: 10000, allowProposedApi: true,
+    cursorBlink: true, macOptionIsMeta: true, drawBoldTextInBrightColors: false, minimumContrastRatio: 1,
+  });
+  fitter = new FitAddon.FitAddon();
+  term.loadAddon(fitter);
+  term.loadAddon(new Unicode11Addon.Unicode11Addon());
+  term.unicode.activeVersion = '11';
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open($('term'));
+  try { term.loadAddon(new WebglAddon.WebglAddon()); } catch (e) { console.warn('webgl unavailable, using DOM renderer', e); }
+  location.hash = String(id);
+  ws = new WebSocket(`ws://${location.host}/ws/${id}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.cols) fit();
+      if (m.exit !== undefined) term.write(`\r\n\x1b[2m[process exited ${m.exit}]\x1b[0m\r\n`);
+    } else term.write(new Uint8Array(e.data));
+  };
+  term.onData((d) => ws?.readyState === 1 && ws.send(new TextEncoder().encode(d)));
+  term.focus();
+  refresh();
+}
+// The browser is the primary client: the session's PTY follows this window's size.
+function fit() {
+  if (!term || !fitter) return;
+  fitter.fit();
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
+}
+let fitTimer;
+window.addEventListener('resize', () => { clearTimeout(fitTimer); fitTimer = setTimeout(fit, 80); });
+async function spawn(kind) {
+  const r = await (await fetch('/api/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kind }) })).json();
+  if (r.error) return alert(r.error);
+  await refresh(); open_(r.id);
+}
+async function kill() { if (current !== null && confirm(`kill #${current}?`)) await fetch(`/api/sessions/${current}/kill`, { method: 'POST' }); refresh(); }
+refresh().then(() => { const id = Number(location.hash.slice(1)); if (location.hash && sessions.some((s) => s.id === id)) open_(id); });
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
