@@ -23,6 +23,7 @@
 //!   span its `job` span names as its `creator` (a job given by a thread on no fiber, the
 //!   daemon's loop): the critical path crosses from a job's start to it.
 
+pub mod cpu;
 pub mod html;
 pub mod load;
 pub mod path;
@@ -59,12 +60,15 @@ pub struct SwitchIn {
     pub began_as: Option<u64>,
     /// `switches.queued_ns`: how long a `started` or `ran` job waited for a core before it began.
     pub queued_ns: Option<i64>,
+    /// `switches.cpu_ns`: the thread's CPU time read at the switch ([`cpu`]); `None` when not
+    /// read.
+    pub cpu_ns: Option<i64>,
 }
 
 impl SwitchIn {
     /// A row of `event` and nothing past the switch's own columns.
     pub fn of(process: u32, thread: u32, t_ns: i64, event: Event, job: u64, fiber: u32, core: u32) -> SwitchIn {
-        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None, queued_ns: None }
+        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None, queued_ns: None, cpu_ns: None }
     }
 }
 
@@ -180,8 +184,8 @@ pub struct SpanIn {
     pub creator: Option<u64>,
     pub start_ns: i64,
     pub dur_ns: i64,
-    /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
-    /// when not counted.
+    /// `spans.self_cpu_ns`: its CPU while it was the innermost span its thread was inside
+    /// ([`cpu`]); `None` when not counted.
     pub self_cpu_ns: Option<i64>,
     /// `spans.folded_ns`: its children too short for a row each ([`crate::flight::FOLD_BELOW`]),
     /// summed; 0 when none was. They ran inside it, so its uncovered time leaves them out.
@@ -323,6 +327,7 @@ impl Input {
                     since_ns: it.since_ns,
                     began_as: it.began_as,
                     queued_ns: it.queued_ns,
+                    cpu_ns: it.cpu_ns.map(|it| it as i64),
                 })
             })
             // alloc: the dump's switches, once a dump

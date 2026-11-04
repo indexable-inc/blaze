@@ -377,6 +377,13 @@ pub(crate) struct Raised {
     open: Vec<String>,
 }
 
+impl Raised {
+    /// Its stack's addresses, innermost first.
+    pub(crate) fn pcs(&self) -> &[u64] {
+        &self.pcs
+    }
+}
+
 /// What reading slot `n` found.
 enum Found {
     Whole(Raised),
@@ -452,13 +459,16 @@ pub struct PanicRow {
     pub span_id: Option<u64>,
     pub message: Option<String>,
     pub location: Option<String>,
-    /// Outermost first, each frame named.
+    /// Outermost first, each frame named: a function and those inlined into it are a frame
+    /// each, so it can be longer than `stack_pcs`.
     pub stack: Vec<String>,
-    /// The same frames as raw return addresses, outermost first.
+    /// The stack's addresses, outermost first, one a frame of the unwind: named again after the
+    /// process is gone through the `images` row (of the same `process` and `boot`) holding each.
     pub stack_pcs: Vec<u64>,
-    /// The BLAKE3 hash of the executable the addresses are of, in hex, and where it was loaded.
-    pub image_hash: Option<String>,
-    pub image_base: Option<u64>,
+    /// The machine's boot the process ran in, as `images.boot`: with `process`, the key of its
+    /// `images` rows. `None` where it can't be read, and for a recovered fatal signal (the
+    /// machine may have restarted since; its `images` row has none either).
+    pub boot: Option<&'static str>,
     pub caught: bool,
     /// Outermost first.
     pub open_spans: Vec<String>,
@@ -472,11 +482,8 @@ pub(crate) fn rows(raised: &[Raised]) -> Vec<PanicRow> {
         // alloc: none: an empty `Vec` holds nothing
         return Vec::new();
     }
-    // alloc: a flush's addresses, once a flush with panics
-    let pcs: Vec<u64> = raised.iter().flat_map(|it| it.pcs.iter().copied()).collect();
-    let names = crate::symbols::names(&pcs);
-    let image_hash = crate::identity::binary_hash().ok().map(|it| crate::identity::hex_of(&it));
-    let image_base = ix_prof::symbols::own_load_base();
+    let frames = crate::symbols::frames(raised.iter().map(|it| it.pcs.as_slice()));
+    let boot = ix_prof::images::boot();
     let process = std::process::id();
     raised
         .iter()
@@ -494,13 +501,10 @@ pub(crate) fn rows(raised: &[Raised]) -> Vec<PanicRow> {
             message: it.message.clone(),
             // clone: a panic's row, once a flush
             location: it.location.clone(),
-            // alloc: a panic's row, once a flush
-            stack: it.pcs.iter().rev().map(|pc| names.get(pc).cloned().unwrap_or_else(|| format!("{pc:#x}"))).collect(),
+            stack: crate::symbols::stack(&it.pcs, &frames),
             // alloc: a panic's row, once a flush
             stack_pcs: it.pcs.iter().rev().copied().collect(),
-            // clone: a hash, once a row
-            image_hash: image_hash.clone(),
-            image_base,
+            boot,
             caught: it.caught,
             // clone: a panic's row, once a flush
             open_spans: it.open.clone(),
@@ -562,12 +566,11 @@ pub fn batch(rows: &[PanicRow]) -> Result<RecordBatch, ArrowError> {
         column(StringArray::from_iter(rows.iter().map(|it| it.location.as_deref()))),
         names_column("stack", rows.iter().map(|it| it.stack.as_slice())),
         column(pcs.finish()),
-        column(StringArray::from_iter(rows.iter().map(|it| it.image_hash.as_deref()))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.image_base))),
         column(UInt32Array::from_iter_values(rows.iter().map(|it| u32::from(it.caught)))),
         names_column("open_spans", rows.iter().map(|it| it.open_spans.as_slice())),
         dict(rows.iter().map(|it| it.signal)),
         column(UInt64Array::from_iter(rows.iter().map(|it| it.fault_addr))),
+        dict(rows.iter().map(|it| it.boot)),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::PANICS), columns)
 }
@@ -623,8 +626,9 @@ mod tests {
         assert_eq!(row.kind, Kind::Panic);
         assert!(row.caught);
         assert!(row.location.as_deref().is_some_and(|it| it.contains("src/panics.rs:")), "{:?}", row.location);
-        assert_eq!(row.stack.len(), row.stack_pcs.len());
+        assert!(row.stack.len() >= row.stack_pcs.len(), "a frame of the unwind is one name or more");
         assert!(row.stack.iter().any(|it| it.contains("panics_in_a_job")), "{:#?}", row.stack);
+        assert!(row.stack.iter().all(|it| !it.contains("+0x")), "named by function: {:#?}", row.stack);
         assert_eq!(row.process, std::process::id());
         let batch = batch(&rows).unwrap();
         assert_eq!(batch.num_rows(), rows.len());

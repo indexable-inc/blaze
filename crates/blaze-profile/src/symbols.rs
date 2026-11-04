@@ -5,7 +5,7 @@
 //! (`ix_prof::jit`); a shared library's by its exported symbol.
 //!
 //! Beside the names, a flush writes each code image an address of it is in, once a process
-//! ([`ImagesWritten`]): the `images` table, which names `samples.stack_pcs` after the process
+//! ([`ImagesWritten`]): the `images` table, which names `samples.stack_pcs` and `panics.stack_pcs` after the process
 //! is gone.
 
 use std::alloc::Global;
@@ -40,13 +40,56 @@ pub(crate) fn frames<'a>(stacks: impl Iterator<Item = &'a [u64]>) -> HashMap<u64
     frames
 }
 
-/// A name for each of `pcs` of another process of this same executable, loaded `slide` from its
-/// file's addresses: its code in the executable named by this one's symbols, the rest bare
-/// addresses (where its libraries were loaded is not known here).
-pub(crate) fn names_slid(pcs: &[u64], slide: u64) -> HashMap<u64, String, Global> {
-    let mut names = HashMap::new_in(Global);
-    names.extend(ix_prof::symbols::names_slid(pcs, slide));
-    names
+/// The named frames of `pcs` (innermost first, as the samplers and the panic ring keep them),
+/// outermost first, as `samples.stack` holds them: each address's function and those inlined
+/// into it, from `frames` ([`frames`]); an address it has none for, bare.
+pub(crate) fn stack(pcs: &[u64], frames: &HashMap<u64, Vec<String>, Global>) -> Vec<String> {
+    // alloc: a stack's names, once a row
+    let mut out = Vec::new();
+    for (i, pc) in pcs.iter().enumerate().rev() {
+        match frames.get(&lookup(i, *pc)) {
+            // clone: a stack's names, once a row
+            Some(named) => out.extend(named.iter().cloned()),
+            // alloc: as above
+            None => out.push(format!("{pc:#x}")),
+        }
+    }
+    out
+}
+
+/// The named frames of `pcs` (innermost first), addresses of another process of this same
+/// executable loaded `slide` from its file's addresses (a crash record's), outermost first, as
+/// [`stack`] names this process's: each address in the executable's code moved to where this
+/// process has it and named by its function and those inlined there; any other (a shared
+/// library's in that process, whose loads are not known here) bare.
+pub(crate) fn stack_slid(pcs: &[u64], slide: u64) -> Vec<String> {
+    let ours = ix_prof::images::loaded().into_iter().find(|it| it.main);
+    // alloc: a crash's addresses, once a crash recovered
+    let here: Vec<Option<u64>> = pcs
+        .iter()
+        .enumerate()
+        .map(|(i, pc)| {
+            let image = ours.as_ref()?;
+            let at = lookup(i, pc.wrapping_sub(slide).wrapping_add(image.slide));
+            image.contains(at).then_some(at)
+        })
+        .collect();
+    // alloc: as above
+    let mut asked: Vec<u64> = here.iter().flatten().copied().collect();
+    asked.sort_unstable();
+    asked.dedup();
+    let named = ix_prof::symbols::functions(&asked);
+    // alloc: a crash's names, once a crash recovered
+    let mut out = Vec::new();
+    for (pc, at) in pcs.iter().zip(here.iter().copied()).rev() {
+        match at.and_then(|at| named.get(&at)) {
+            // clone: a crash's names, once a crash recovered
+            Some(frames) => out.extend(frames.iter().cloned()),
+            // alloc: as above
+            None => out.push(format!("{pc:#x}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -187,8 +187,24 @@ fn recorder(r: &super::Recorder) -> String {
             r.spans_lost.unwrap_or(0)
         )
     };
-    match (r.folded_spans, r.folded_ns) {
+    let said = match (r.folded_spans, r.folded_ns) {
         (Some(n), Some(ns)) if n > 0 => format!("{lost}; summed {n} spans under {:?} into `folded` ({})", crate::flight::FOLD_BELOW, super::s(ns)),
         _ => lost,
+    };
+    // alloc: a line
+    format!("{said}; {}", recorder_cost(r))
+}
+
+/// What the recorder itself cost over the window, from its own measure ([`crate::flight::cost`]).
+fn recorder_cost(r: &super::Recorder) -> String {
+    match (r.cost_ns, r.spans_made, r.cpu_reads) {
+        (Some(ns), Some(spans), reads) if spans > 0 => format!(
+            "cost {} ({} ns a span over {spans} spans, {} thread-CPU reads)",
+            super::s(ns),
+            ns / spans,
+            reads.unwrap_or(0)
+        ),
+        (Some(ns), _, reads) => format!("cost {} over no spans ({} thread-CPU reads)", super::s(ns), reads.unwrap_or(0)),
+        (None, ..) => "this record has no cost counters".to_owned(),
     }
 }

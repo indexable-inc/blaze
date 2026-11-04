@@ -190,9 +190,13 @@ fn walk(state: &State, low: u64, high: u64, sample: &mut Sample) {
         true
     };
     push(state.pc);
-    // The stopped thread's stack is mapped for as long as it lives (it cannot leave: the caller
-    // holds the lock it takes to), and nothing writes it while it is stopped.
-    crate::stack::walk(state.fp, &mut |fp| fp >= low && fp.saturating_add(16) <= high, &mut push);
+    let mut read = |fp: u64| {
+        // SAFETY: the record lies inside the stopped thread's stack `[low, high)`, which is
+        // mapped for as long as it lives (it cannot leave: the caller holds the lock it takes
+        // to), and nothing writes it while it is stopped; `walk` checked its alignment.
+        (fp >= low && fp.saturating_add(16) <= high).then(|| unsafe { crate::stack::load(fp) })
+    };
+    crate::stack::walk(state.fp, &mut read, &mut push);
 }
 
 #[cfg(test)]

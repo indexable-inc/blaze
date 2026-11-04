@@ -174,12 +174,13 @@ const fn fnv_word(hash: u64, word: u64) -> u64 {
 /// refused, not misread.
 pub(crate) const ROWS_FINGERPRINT: u64 = {
     use super::{
-        ALLOCS_BITS, COL_WORDS, CPU_COL, DEPTH_BITS, EPOCHS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
+        ALLOCS_BITS, BYTES_MAX, COL_WORDS, CPU_COL, CPU_READ, CPU_ROW, CPU_VALID, CpuWhy, DEPTH_BITS, EPOCHS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
         FIELD_SLOT_SHIFT, FieldValue, FOLD_ALLOCS, FOLD_CPU,
         FOLD_PARENT_SHIFT, FOLD_ROOT, FOLD_ROW, FOLD_SPANS_MAX, FOLD_SPANS_SHIFT, FOLDED_COL, FOLDED_TICKS_COL,
         KIND_MARK, KIND_PLOT, KIND_SPAN, NO_COL, OWNERS_KEPT, Plot, QUEUED_LOW_SHIFT, RING_BITS, SITE_BITS, SLOT_BITS,
-        SPAN_COLS_ROW, SPAN_COPIED_ROW, STORE_HEAD, SWITCH_ROW, Switched, THREAD_COL, UNCOUNTED, WaitedOn,
+        SHARE_SHIFT, SPAN_COLS_ROW, SPAN_COPIED_ROW, STORE_HEAD, SWITCH_ROW, Switched, THREAD_COL, UNCOUNTED, WaitedOn,
     };
+    use crate::time::cpu::{SHARE_BITS, SHARE_COUNTED, SHARE_ONE};
     let mut hash = 0xcbf2_9ce4_8422_2325;
     let words = [
         KIND_SPAN,
@@ -224,6 +225,27 @@ pub(crate) const ROWS_FINGERPRINT: u64 = {
         // A `Sym`: 4 bits of shard, 8 of epoch, the index from 1 above.
         SHARDS as u64,
         EPOCHS as u64,
+        // A boundary's row, and a span row's CPU share above its allocated bytes.
+        CPU_ROW,
+        CPU_VALID,
+        CPU_READ,
+        SHARE_SHIFT as u64,
+        BYTES_MAX,
+        SHARE_BITS as u64,
+        SHARE_COUNTED,
+        SHARE_ONE,
+        CpuWhy::Switch as u64,
+        CpuWhy::Wait as u64,
+        CpuWhy::Gap as u64,
+        CpuWhy::Root as u64,
+        CpuWhy::Age as u64,
+        CpuWhy::Claim as u64,
+        CpuWhy::End as u64,
+        CpuWhy::Mark as u64,
+        CpuWhy::Read as u64,
+        CpuWhy::Fold as u64,
+        CpuWhy::Left as u64,
+        CpuWhy::Park as u64,
     ];
     let mut at = 0;
     while at < words.len() {
@@ -1100,6 +1122,7 @@ impl Found {
             // The row the head would be next is half written, perhaps over the oldest: both
             // left out, as a live read leaves them.
             let from = flushed.min(head).max((head + 1).saturating_sub(CAP as u64));
+            read.ring_begins();
             for i in from..head {
                 let at = super::STORE_HEAD + (i as usize & (CAP - 1)) * WORDS * 8;
                 let row: [u64; WORDS] = std::array::from_fn(|it| field(at + it * 8));
@@ -1109,6 +1132,9 @@ impl Found {
                 };
                 decode(&mut read, (by.tid, by.name), super::event_id(number, i), &row, &scale, counting_copies);
             }
+            // A span whose CPU waited on a boundary row the process died before writing reads
+            // as not counted, as a live read's at the end of a ring.
+            read.ring_ends();
         }
         self.renumber(&mut read, &names, &sites, &mut recovered)?;
         let last = [
@@ -1421,9 +1447,11 @@ mod tests {
                 std::array::from_fn(|it| word(&header, (H_CLOCK + at * 3 + it) * 8))
             },
         );
+        expected.ring_begins();
         for (i, row) in rows.iter().enumerate().skip(25) {
             decode(&mut expected, (42, worker), super::super::event_id(1, i as u64), row, &line, false);
         }
+        expected.ring_ends();
 
         let found = dead(&dir).unwrap();
         assert_eq!(found.len(), 1, "the one file of a dead process");

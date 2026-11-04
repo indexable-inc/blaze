@@ -293,7 +293,9 @@ pub(crate) fn samples(
     RecordBatch::try_new(schema, columns)
 }
 
-/// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]).
+/// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]), or
+/// a recovered crash's ([`crate::crash::Crash::image`]).
+#[derive(Debug)]
 pub(crate) struct ImageRow {
     pub(crate) path: String,
     pub(crate) build_id: Option<String>,
@@ -362,6 +364,7 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
         column(Int64Array::from_iter(switches.iter().map(|it| it.since_ns))),
         column(UInt64Array::from_iter(switches.iter().map(|it| it.began_as))),
         column(Int64Array::from_iter(switches.iter().map(|it| it.queued_ns))),
+        column(Int64Array::from_iter(switches.iter().map(|it| it.cpu_ns.map(|it| it as i64)))),
     ];
     RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
 }

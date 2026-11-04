@@ -126,7 +126,7 @@ column.
 | target | dict | its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps) |
 | start_ns | i64 | when it began |
 | dur_ns | i64 | how long it was open |
-| self_cpu_ns | i64? | the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job. A held span's (one with the field `held`, open across a state machine's steps) counts only while it is entered |
+| self_cpu_ns | i64? | the CPU its thread spent while it was the innermost span the thread was inside (`time::cpu`): a wait's is about 0, as other jobs run while it parks; a span never entered counts 0. Derived from thread CPU read at fiber switches and the other stretch boundaries, not at the span: off from per-span reads by at most its off-CPU time in the stretches it spans, a tick an enter and exit and its duration over 2^23. Null when the binary counts no CPU (`flight::count_cpu`), the span began before its thread's first CPU read, or its stretch's CPU row was never read (`flight::HOLD_MAX`) |
 | alloc_bytes | u64? | bytes its thread allocated while it was open |
 | allocs | u64? | allocations its thread made while it was open |
 | query_kind | dict? | the query it ran, for a span of a query |
@@ -207,7 +207,7 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `blaze bugs` (the process's running total of bugs it found in itself and went on past, `stdx::assert::reported`; each site is an `errors` row of kind `blaze-bug`), `profile spans lost`, `profile rows skipped` and `profile rows skipped behind` (the process's running totals of spans the recorder could not record, rows its rings wrote over before the history drained them, and of those the rows skipped while the history's backlog was full, written by the history with each build's flush and whenever they grow; `blaze slow` says them on its third line), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `blaze bugs` (the process's running total of bugs it found in itself and went on past, `stdx::assert::reported`; each site is an `errors` row of kind `blaze-bug`), `profile spans lost`, `profile rows skipped` and `profile rows skipped behind` (the process's running totals of spans the recorder could not record, rows its rings wrote over before the history drained them, and of those the rows skipped while the history's backlog was full, written by the history with each build's flush and whenever they grow; `blaze slow` says them on its third line), `profile cost ns`, `profile spans made` and `profile cpu reads` (the recorder's own measured cost, sampled 1 call in 64, the spans it covers and the thread-CPU reads it made, `flight::cost`, written with each build's flush; `blaze slow` says the cost a span on the same line), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
@@ -413,7 +413,7 @@ samples of pool workers with no `wait` span open above them, each a block that b
 | column | type | |
 |---|---|---|
 | process | u32 | the process id |
-| boot | dict? | the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one |
+| boot | dict? | the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one; null for a recovered fatal signal's executable (see `panics`) |
 | seen_ns | i64 | when it was written |
 | path | utf8 | the file it was loaded from |
 | build_id | utf8? | its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none |
@@ -496,6 +496,7 @@ No writer fills `alloc_samples` yet; its `stack_pcs` is there for the one that w
 | since_ns | i64? | for `started` and `ran`, when the job began on its fiber |
 | began_as | u64? | for `started`, its number before it joined the graph, which its `job` span and its spawned jobs' `by_job` name until then |
 | queued_ns | i64? | for `started` and `ran`, how long the job waited for a core, from its pool's submit to `since_ns`; null when the pool did not say when it was given |
+| cpu_ns | i64? | the thread's CPU clock read at the switch (`time::cpu`): the difference of two of a thread's rows is the CPU it ran between them. Null for `ready`, when the binary counts no CPU, and before 2026-11-04 |
 
 A switch costs one ring row. A job's `ended` row is of the build it last worked for, though its
 code let go of the build before it ended.
@@ -778,13 +779,18 @@ and an abort a panic led to is one row naming both.
 | job, span_id | u64? | the job running on the thread, and its innermost open span |
 | message | utf8? | the panic's text, cut at 1 KiB with `...`; a signal's name and meaning (and the fault address for SIGSEGV and SIGBUS), then the thread's last panic, if it had one |
 | location | utf8? | `file:line:column` the panic was raised at (a signal: its thread's last panic's) |
-| stack | list<dict> | the frames, outermost first, each named |
-| stack_pcs | list<u64> | the same frames as raw return addresses, outermost first, so they can be named again later |
-| image_hash, image_base | utf8?, u64? | the BLAKE3 of the executable the addresses are of, and where it was loaded: the `images` table's key |
+| stack | list<dict> | the frames, outermost first, each named by function (with those inlined there) as `samples.stack` |
+| stack_pcs | list<u64> | the stack's addresses, outermost first, one a frame of the unwind, so they can be named again later |
 | caught | u32 | 1 when a job's boundary caught it (that job failed, the build went on) |
 | open_spans | list<dict> | the spans the thread was inside, outermost first |
 | signal | dict? | `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` or `SIGABRT`; null for a panic |
 | fault_addr | u64? | the address the signal was about |
+| boot | dict? | the machine's boot the process ran in; with `process`, the key of the `images` rows that name `stack_pcs` (`base <= pc < base + size`); null for a signal |
+
+A panic's addresses are in the `images` rows its flush wrote for the process (with the samples'),
+and a recovered signal's in an `images` row its recovery writes for the dead process's executable
+(this one's file, which the record's BLAKE3 matched, at the dead process's slide, with no boot):
+join on `process`, `boot IS NOT DISTINCT FROM` and the address range.
 
 A panic is recorded by the process's one panic hook (`blaze_profile::panics::record`, which the
 daemon installs through `plane::record_panics`) into a fixed ring of 64 slots, with no
@@ -1082,7 +1088,7 @@ What the profile could not see is listed after the findings, as blind spots, nev
 
 
 Its header says the recorder's loss on a line of its own, even when it lost nothing
-(`recorder: lost no rows; summed N spans under 20us into folded (S)`), and `--json` has it as
+(`recorder: lost no rows; summed N spans under 20us into folded (S); cost C (X ns a span over N spans, R thread-CPU reads)`), and `--json` has it as
 `summary.recorder`. A total in a report whose recorder lost rows is short by what they held.
 
 The analysis is `blaze_profile::slow::analyse`. It is a pure function over the time model

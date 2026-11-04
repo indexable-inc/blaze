@@ -139,7 +139,7 @@ SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
 CREATE OR REPLACE VIEW folded AS
 SELECT * FROM read_parquet(@folded, union_by_name = true);
 
--- The code images samples' `stack_pcs` are in, one row an image a process (once it held an
+-- The code images samples' and panics' `stack_pcs` are in, one row an image a process (once it held an
 -- address a flush wrote): which file, its build id and BLAKE3, and where it was loaded.
 CREATE OR REPLACE VIEW images AS
 SELECT * FROM read_parquet(@images, union_by_name = true);

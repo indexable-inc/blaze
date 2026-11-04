@@ -1,16 +1,17 @@
-//! Walking a thread's frame pointers: the one walker the CPU sampler (macOS), the panic hook
-//! ([`crate::panics`]) and the fatal-signal handler ([`crate::crash`]) share. blaze keeps frame
-//! pointers in every frame (arm64 macOS always does; the Linux sampler's kernel call chains rely
-//! on them too), so each frame record is two words, `[fp] = caller's fp, [fp + 8] = return
-//! address`, and a walk follows them up the stack.
+//! Walking a thread's frame pointers: the one walker the CPU samplers (macOS and Linux), the
+//! panic hook ([`crate::panics`]) and the fatal-signal handler ([`crate::crash`]) share. blaze
+//! keeps frame pointers in every frame (arm64 macOS always does), so each frame record is two
+//! words, `[fp] = caller's fp, [fp + 8] = return address`, and a walk follows them up the stack.
 //!
-//! A walk reads only memory a caller's `readable` vouches for. The sampler knows the stopped
-//! thread's stack bounds; the panic hook and the signal handler do not (a job runs on a fiber's
-//! stack, a signal's handler on the thread's alternate stack), so they ask [`probe`]: the kernel
-//! copies the 16 bytes of a frame record into a pipe, and refuses with `EFAULT` where they are
-//! not readable (unmapped, or a guard page), so a wild frame pointer ends the walk instead of
-//! faulting. Every step is a system call or a plain load: async-signal-safe, no lock, no
-//! allocation.
+//! A walk reads each record through its caller's `read`, which gives the record's two words or
+//! says it is not readable. The macOS sampler knows the stopped thread's stack bounds and loads
+//! a record inside them ([`load`]); the Linux sampler's handler copies records through
+//! `process_vm_readv` (its `Window`); the panic hook and the signal handler know no bounds (a job
+//! runs on a fiber's stack, a signal's handler on the thread's alternate stack), so they ask
+//! [`probe`] first ([`probed`]): the kernel copies the 16 bytes of a frame record into a pipe,
+//! and refuses with `EFAULT` where they are not readable (unmapped, or a guard page), so a wild
+//! frame pointer ends the walk instead of faulting. Every step is a system call or a plain
+//! load: async-signal-safe, no lock, no allocation.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -33,28 +34,42 @@ const ALIGN: u64 = 8;
 const MOST: usize = 256;
 
 /// Follows the frame records from `fp` up the stack, giving each return address to `push`
-/// (masked to [`ADDRESS`]) until `push` says stop, a record is not `readable` (its 16 bytes at
-/// the address given) or misaligned, the next record is not above this one, or [`MOST`]
-/// records were read.
-pub(crate) fn walk(fp: u64, readable: &mut dyn FnMut(u64) -> bool, push: &mut dyn FnMut(u64) -> bool) {
+/// (masked to [`ADDRESS`]) until `push` says stop, `read` gives no record at an address (its
+/// two words: the caller's frame pointer, the return address), a record is misaligned, the
+/// next record is not above this one, or [`MOST`] records were read.
+pub(crate) fn walk(fp: u64, read: &mut dyn FnMut(u64) -> Option<[u64; 2]>, push: &mut dyn FnMut(u64) -> bool) {
     let mut fp = fp & ADDRESS;
     for _ in 0..MOST {
-        if fp == 0 || fp % ALIGN != 0 || !readable(fp) {
+        if fp == 0 || fp % ALIGN != 0 {
             return;
         }
-        let record = fp as *const u64;
-        // SAFETY: `readable` vouched for the record's 16 bytes at `fp`, which is aligned: the
-        // sampler's bounds are the stopped thread's mapped stack, and [`probe`] had the kernel
-        // copy them just now. A stack is not unmapped under a thread walking itself, and the
-        // sampler holds the lock a thread takes to leave.
-        let next = unsafe { record.read_volatile() } & ADDRESS;
-        // SAFETY: as above, the record's second word.
-        let ret = unsafe { record.wrapping_add(1).read_volatile() } & ADDRESS;
+        let Some([next, ret]) = read(fp) else { return };
+        let (next, ret) = (next & ADDRESS, ret & ADDRESS);
         if ret == 0 || !push(ret) || next <= fp {
             return;
         }
         fp = next;
     }
+}
+
+/// The frame record at `fp`, loaded in place.
+///
+/// # Safety
+///
+/// The 16 bytes at `fp` are mapped readable for the call, and `fp` is 8-byte aligned (as
+/// [`walk`] checks before it reads).
+pub(crate) unsafe fn load(fp: u64) -> [u64; 2] {
+    let record = fp as *const u64;
+    // SAFETY: the caller's: the record's two words are mapped readable and aligned.
+    unsafe { [record.read_volatile(), record.wrapping_add(1).read_volatile()] }
+}
+
+/// The frame record at `fp` when [`probe`] vouches for it: for a walk that knows no stack bounds.
+pub(crate) fn probed(fp: u64) -> Option<[u64; 2]> {
+    // SAFETY: [`probe`] had the kernel copy the record's 16 bytes just now, and a stack is not
+    // unmapped under the thread walking itself (the panic hook and the signal handler walk their
+    // own thread).
+    probe(fp).then(|| unsafe { load(fp) })
 }
 
 /// The calling function's frame pointer: where a walk of the calling thread begins. Inlined, so
@@ -153,7 +168,7 @@ pub(crate) fn here(pcs: &mut [u64; DEPTH]) -> usize {
     if !ready() {
         return 0;
     }
-    walk(frame_pointer(), &mut probe, &mut |pc| {
+    walk(frame_pointer(), &mut probed, &mut |pc| {
         pcs[depth] = pc;
         depth += 1;
         depth < DEPTH
@@ -183,8 +198,12 @@ mod tests {
     fn a_walk_of_this_thread_finds_its_callers() {
         let (depth, pcs) = a_caller_to_find();
         assert!(depth >= 2, "{depth} frames");
-        let names = crate::symbols::names(&pcs[..depth]);
-        assert!(pcs[..depth].iter().any(|pc| names[pc].contains("a_caller_to_find")), "{names:?}");
+        let frames = crate::symbols::frames(std::iter::once(&pcs[..depth]));
+        let found = pcs[..depth]
+            .iter()
+            .enumerate()
+            .any(|(i, pc)| frames[&crate::symbols::lookup(i, *pc)].iter().any(|it| it.contains("a_caller_to_find")));
+        assert!(found, "{frames:?}");
     }
 
     /// A frame pointer to memory that is not mapped ends the walk, with no fault.
@@ -193,7 +212,7 @@ mod tests {
     fn a_wild_frame_pointer_ends_the_walk() {
         assert!(ready());
         let mut pushed = 0;
-        walk(0x10, &mut probe, &mut |_| {
+        walk(0x10, &mut probed, &mut |_| {
             pushed += 1;
             true
         });

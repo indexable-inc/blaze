@@ -151,7 +151,7 @@ const SPAN_HEAD: [Column; 17] = [
     opt(
         "self_cpu_ns",
         Type::I64,
-        "the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job",
+        "its CPU time while it was the innermost span its thread was inside (its job's alone, less the spans under it; a wait's is about 0, as other jobs run while it parks): the thread's CPU clock is read at switches, waits and gaps between root spans and each stretch's CPU is shared among the spans by the time each was innermost in it, so it is off by at most the off-CPU time of the stretches it ran in (`time::cpu`); null when the binary counts no CPU (`flight::count_cpu`) or a read failed",
     ),
     opt("alloc_bytes", Type::U64, "bytes its thread allocated while it was open"),
     opt("allocs", Type::U64, "allocations its thread made while it was open"),
@@ -283,6 +283,11 @@ pub const SWITCHES: Table = Table {
             "queued_ns",
             Type::I64,
             "for started and ran, how long the job waited for a core: from its pool's submit to `since_ns`; null when the pool did not say when it was given",
+        ),
+        opt(
+            "cpu_ns",
+            Type::I64,
+            "the thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`) read at the switch, which ends a stretch of `spans.self_cpu_ns`: two of a thread's rows give the CPU it had between them; null for ready, when the binary counts no CPU, and in files before 2026-11-04",
         ),
     ],
 };
@@ -507,7 +512,11 @@ pub const IMAGES: Table = Table {
     doc: "one row a code image of a process that `stack_pcs` addresses are in: its file, identity and where it was loaded",
     columns: &[
         PROCESS,
-        opt("boot", Type::Dict, "the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one"),
+        opt(
+            "boot",
+            Type::Dict,
+            "the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one; null for the executable of a fatal signal recovered after its process died, as its `panics` row",
+        ),
         col("seen_ns", Type::I64, "when it was written"),
         col("path", Type::Utf8, "the file it was loaded from"),
         opt("build_id", Type::Utf8, "its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none"),
@@ -870,14 +879,16 @@ pub const PANICS: Table = Table {
             "a panic's text (cut at 1 KiB, ending in `...`), null for a payload that is no text; for a signal its name and what it means, then the thread's last panic when it had one (an abort after a panic)",
         ),
         opt("location", Type::Utf8, "a panic's `file:line:column`; for a signal, the location of the thread's last panic, if any"),
-        col("stack", Type::Stack, "the call stack, outermost first, each frame named (`function+offset`), the panic machinery's own frames included"),
+        col(
+            "stack",
+            Type::Stack,
+            "the call stack, outermost first, each frame named by function (and those inlined there) as `samples.stack`, the panic machinery's own frames included",
+        ),
         col(
             "stack_pcs",
             Type::Pcs,
-            "the same stack as raw return addresses, outermost first, for naming again with the image `image_hash` and `image_base` name",
+            "the stack's addresses, outermost first, one a frame of the unwind: named again after the process is gone through the `images` row of the same `process` and `boot` that holds each",
         ),
-        opt("image_hash", Type::Utf8, "the BLAKE3 hash of the executable the addresses are of, as `builds.blaze`; null when it could not be read"),
-        opt("image_base", Type::U64, "where that executable was loaded in the process (its first byte); addresses outside it are a shared library's"),
         col(
             "caught",
             Type::U32,
@@ -886,6 +897,11 @@ pub const PANICS: Table = Table {
         col("open_spans", Type::Stack, "the names of the spans its thread was inside, outermost first (the first 16)"),
         opt("signal", Type::Dict, "for a signal: its name (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT); null for a panic"),
         opt("fault_addr", Type::U64, "for a signal: the address it is about (`si_addr`: the faulting access for SIGSEGV and SIGBUS); null for a panic"),
+        opt(
+            "boot",
+            Type::Dict,
+            "the machine's boot the process ran in, as `images.boot`: with `process` the key of the `images` rows naming `stack_pcs`; null for a signal (recovered after the process died, perhaps after a restart) and where it can't be read",
+        ),
     ],
 };
 

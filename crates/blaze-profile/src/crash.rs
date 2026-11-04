@@ -201,10 +201,9 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
 }
 
 impl Crash {
-    /// Its `panics` row: its addresses named by this executable's symbols at its slide, which
-    /// [`read`] checked is the same executable.
+    /// Its `panics` row: its addresses named by this executable's symbols and DWARF at its
+    /// slide ([`crate::symbols::stack_slid`]), which [`read`] checked is the same executable.
     pub fn row(&self) -> PanicRow {
-        let names = crate::symbols::names_slid(&self.pcs, self.slide);
         let said = blaze_core::signal::described(self.signal).trim_start_matches(", ");
         // alloc: a row of a crash, once a file recovered
         let mut message = match said.is_empty() {
@@ -235,18 +234,35 @@ impl Crash {
             message: Some(message),
             // clone: a row of a crash
             location: self.panic.as_ref().map(|(_, at)| at.clone()).filter(|it| !it.is_empty()),
-            // alloc: a row of a crash
-            stack: self.pcs.iter().rev().map(|pc| names.get(pc).cloned().unwrap_or_else(|| format!("{pc:#x}"))).collect(),
+            stack: crate::symbols::stack_slid(&self.pcs, self.slide),
             // alloc: a row of a crash
             stack_pcs: self.pcs.iter().rev().copied().collect(),
-            image_hash: Some(crate::identity::hex_of(&self.hash)),
-            image_base: Some(self.base),
+            boot: None,
             caught: false,
             // clone: a row of a crash
             open_spans: self.open.clone(),
             signal: signal_name(self.signal),
             fault_addr: Some(self.addr),
         }
+    }
+
+    /// The `images` row of the executable its addresses are in: this one's ([`read`] checked
+    /// the dead process ran the same file), where the dead process had its code (this one's
+    /// code start moved by the two slides), with no boot, as its `panics` row has none. Its
+    /// libraries' addresses stay in no image: where it loaded them was not recorded. `None`
+    /// when this process can't list its own executable.
+    pub(crate) fn image(&self) -> Option<crate::batches::ImageRow> {
+        let ours = ix_prof::images::loaded().into_iter().find(|it| it.main)?;
+        Some(crate::batches::ImageRow {
+            base: ours.base.wrapping_sub(ours.slide).wrapping_add(self.slide),
+            size: ours.size,
+            slide: self.slide,
+            build_id: ours.build_id,
+            path: ours.path,
+            // The hash `read` matched against this executable's.
+            blake3: Ok(crate::identity::hex_of(&self.hash)),
+            names: ix_prof::symbols::names_kind(),
+        })
     }
 }
 
@@ -345,6 +361,9 @@ pub fn of_process(dir: &Path, pid: u32) -> Result<Option<PanicRow>, CrashError> 
 pub struct Recovered {
     /// A row of each crash recorded.
     pub rows: Vec<PanicRow>,
+    /// The `images` row of each crash's executable, by its process: what names its row's
+    /// `stack_pcs` ([`Crash::image`]).
+    pub(crate) images: Vec<(u32, crate::batches::ImageRow)>,
     /// Their files: deleted once their rows are written ([`Recovered::written`]).
     pub files: Vec<PathBuf>,
     /// The files refused, each renamed `crash.<pid>.refused` so it is not read again, and why.
@@ -355,6 +374,7 @@ impl Recovered {
     /// The rows were written: their files go.
     pub fn written(&mut self) -> Result<(), CrashError> {
         self.rows.clear();
+        self.images.clear();
         for path in self.files.drain(..) {
             match fs::remove_file(&path) {
                 Ok(()) => {}
@@ -411,6 +431,9 @@ pub fn recover(dir: &Path) -> Recovered {
             }
             Ok(Some(crash)) => {
                 out.rows.push(crash.row());
+                if let Some(image) = crash.image() {
+                    out.images.push((crash.pid, image));
+                }
                 out.files.push(path);
             }
             Err(refused) => {
@@ -524,7 +547,7 @@ impl Page {
             depth < PCS
         };
         if push(fault.pc & crate::stack::ADDRESS) {
-            crate::stack::walk(fault.fp, &mut crate::stack::probe, &mut push);
+            crate::stack::walk(fault.fp, &mut crate::stack::probed, &mut push);
         }
         let mut opened = 0;
         let innermost = crate::flight::open_of_thread(tid as u32, &mut |_, span| {
@@ -893,10 +916,16 @@ mod tests {
         assert_eq!(row.fault_addr, Some(0x10));
         assert!(!row.caught);
         assert!(row.message.as_deref().is_some_and(|it| it.contains("SIGSEGV") && it.contains("0x10")), "{:?}", row.message);
-        assert_eq!(row.stack.len(), row.stack_pcs.len());
+        assert!(row.stack.len() >= row.stack_pcs.len(), "a frame of the unwind is one name or more");
+        assert!(row.stack.iter().all(|it| !it.contains("+0x")), "named by function: {:#?}", row.stack);
         assert!(row.stack.last().is_some_and(|it| it.contains("faults_here")), "{:#?}", row.stack);
         assert!(row.stack.iter().any(|it| it.contains("a_crash_file_round_trips_through_recovery")), "{:#?}", row.stack);
-        assert_eq!(row.image_hash, Some(crate::identity::binary().unwrap()));
+        assert_eq!(row.boot, None);
+        let [(pid, image)] = &recovered.images[..] else { panic!("one image of the crash") };
+        assert_eq!(*pid, GONE);
+        assert_eq!(image.blake3.as_deref(), Ok(crate::identity::binary().unwrap().as_str()));
+        let inner = *row.stack_pcs.last().unwrap();
+        assert!(inner >= image.base && inner - image.base < image.size, "the faulting pc is in the image's code");
         let batch = crate::panics::batch(&recovered.rows).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert!(path.exists(), "kept until its row is written");

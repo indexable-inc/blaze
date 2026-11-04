@@ -1347,6 +1347,18 @@ impl History {
                     .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
             );
         }
+        // The recorder's own measured cost ([`flight::cost`]), with each build's flush only: it
+        // grows with every span (this flush's own), so writing it whenever it grew would give an
+        // idle daemon's timer a file each tick. A build's delta runs from the flush of the build
+        // before it, so it holds the idle stretch between them too.
+        if let Some(of) = build {
+            let cost = flight::cost();
+            let build = u32::try_from(of).unwrap_or(0);
+            self.read.counters.extend(
+                [(Plot::ProfileCostNs, cost.ns), (Plot::ProfileSpansMade, cost.spans), (Plot::ProfileCpuReads, cost.cpu_reads)]
+                    .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
+            );
+        }
         self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
         facts::take_processes(&mut self.processes);
         let written = self.write(build);
@@ -1478,8 +1490,16 @@ impl History {
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
+        // The images the samples' and this process's panics' addresses are in, and each
+        // recovered crash's executable, of its own process.
+        let seen_ns = clock::mono_ns();
         let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
-        let images = [self.images.batch(stacks, clock::mono_ns(), self.process).map_err(arrow_error(&schema::IMAGES))?];
+        let stacks = stacks.chain(self.raised.iter().map(panics::Raised::pcs));
+        let mut images = vec![self.images.batch(stacks, seen_ns, self.process).map_err(arrow_error(&schema::IMAGES))?]; // alloc: as `spans`
+        for (pid, image) in self.crashes.images.drain(..) {
+            let process = Process { pid, commit: None, ..self.process };
+            images.push(batches::images(std::slice::from_ref(&image), None, seen_ns, process).map_err(arrow_error(&schema::IMAGES))?);
+        }
         let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
         // What every thread is inside, with each flush where that changed: the last reading is
         // what a daemon that died was doing, which no `spans` row holds (they are written as

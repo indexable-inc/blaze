@@ -370,13 +370,6 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64, u64) {
     (reg(libc::REG_RIP), reg(libc::REG_RBP), reg(libc::REG_RSP))
 }
 
-/// Code addresses on aarch64 Linux are below 2^48; pointer authentication and top-byte tags
-/// sit above.
-#[cfg(target_arch = "aarch64")]
-const ADDRESS: u64 = (1 << 48) - 1;
-#[cfg(not(target_arch = "aarch64"))]
-const ADDRESS: u64 = u64::MAX;
-
 /// As above.
 ///
 /// # Safety
@@ -390,31 +383,22 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64, u64) {
 }
 
 /// The thread's frames from `pc`, `fp` and `sp`, innermost first, into `pcs`: the interrupted
-/// PC, then the return address of each frame record from the frame pointer up, each above the
-/// one before and above the stack pointer, 16-byte aligned (both ABIs keep frame records so).
-/// Every record is read through `read`, which fails instead of faulting. The count.
+/// PC, then the return address of each frame record from the frame pointer up, by the one
+/// walker ([`crate::stack::walk`]), each record at or above the stack pointer. Every record is
+/// read through `read`, which fails instead of faulting. The count.
 fn walk(pc: u64, fp: u64, sp: u64, read: impl Fn(u64) -> Option<[u64; 2]>, pcs: &mut [u64; DEPTH]) -> usize {
     let mut depth = 0;
-    let pc = pc & ADDRESS;
-    if pc == 0 {
-        return 0;
-    }
-    pcs[0] = pc;
-    depth += 1;
-    let mut fp = fp & ADDRESS;
-    while depth < DEPTH && fp >= sp && fp % 16 == 0 {
-        let Some([next, ret]) = read(fp) else { break };
-        let ret = ret & ADDRESS;
-        if ret == 0 {
-            break;
+    let mut push = |pc: u64| {
+        let pc = pc & crate::stack::ADDRESS;
+        if pc == 0 || depth == DEPTH {
+            return false;
         }
-        pcs[depth] = ret;
+        pcs[depth] = pc;
         depth += 1;
-        let next = next & ADDRESS;
-        if next <= fp {
-            break;
-        }
-        fp = next;
+        depth < DEPTH
+    };
+    if push(pc) {
+        crate::stack::walk(fp, &mut |at| if at >= sp { read(at) } else { None }, &mut push);
     }
     depth
 }
