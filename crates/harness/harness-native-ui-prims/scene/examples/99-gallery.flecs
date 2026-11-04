@@ -29,6 +29,7 @@ swiftui_gallery : ui.Column {
     fits : ex.FitsDemo {}
     matched : ex.MatchedDemo {}
     transition : ex.TransitionDemo {}
+    removal : ex.RemovalDemo {}
     animate : ex.AnimateDemo {}
   }
 }

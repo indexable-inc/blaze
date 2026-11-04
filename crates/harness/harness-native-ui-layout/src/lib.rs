@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
-    AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, FixedSize, Flex, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
+    AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
     LazyIndex, LazyRange, LayoutPriority, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollState, ShrinkFirst, Side, Size, Sizing, Viewport,
     ViewThatFits,
 };
@@ -76,19 +76,36 @@ fn read(e: EntityView<'_>) -> Item {
 }
 
 /// Gather the Node subtree under `e` into `items`, returning its index. Child order is flecs's child order, which is
-/// layout order when the container carries `OrderedChildren`.
-fn gather<'a>(e: EntityView<'a>, items: &mut Vec<Item>) -> usize {
+/// layout order when the container carries `OrderedChildren`. A `Collapse` node (placed, so a root of its own) is a
+/// stand-in here: a fixed box its laid size, `k` of it along the main axis; `ghosts` gets its index and that size.
+fn gather<'a>(e: EntityView<'a>, items: &mut Vec<Item>, ghosts: &mut Vec<(usize, Laid)>) -> usize {
     let at = items.len();
     items.push(read(e));
+    let main = usize::from(items[at].flex.axis != FlexAxis::Row);
     for c in harness_native_ui_node_api::children(e) {
-        // A placed node is a root of its own, not a part of this flow.
+        // A placed node is a root of its own, not a part of this flow; a collapsing one keeps a share of its spot.
         if c.has(Placed::id()) {
+            let (Some(k), Some(l)) = (c.try_cloned::<&Collapse>(), c.try_cloned::<&Laid>()) else { continue };
+            if c.has(Background::id()) || c.has(Overlay::id()) {
+                continue;
+            }
+            let mut size = [Sizing::fixed(l.w), Sizing::fixed(l.h)];
+            size[main] = Sizing::fixed(collapsed([l.w, l.h][main], k.k));
+            let i = items.len();
+            ghosts.push((i, l));
+            items[at].children.push(i);
+            items.push(Item { id: *c.id(), size, ..Item::default() });
             continue;
         }
-        let i = gather(c, items);
+        let i = gather(c, items, ghosts);
         items[at].children.push(i);
     }
     at
+}
+
+/// How long a collapsing node stands in its parent's flow: `k` (clamped to 0..1, a spring overshoots) of `len`.
+fn collapsed(len: f32, k: f32) -> f32 {
+    len * k.clamp(0.0, 1.0)
 }
 
 /// Fold `words` into the running hash `h`.
@@ -157,7 +174,8 @@ pub fn install(world: WorldRef<'_>) {
         let w = it.world();
         let room = w.try_get::<&Viewport>(|v| [v.w, v.h]).unwrap_or([0.0; 2]);
         let mut items = Vec::new();
-        let root = gather(e, &mut items);
+        let mut ghosts = Vec::new();
+        let root = gather(e, &mut items, &mut ghosts);
         let anchor = e.target(AnchoredTo::id(), 0).and_then(|a| a.try_cloned::<&Laid>());
         // A placed node with nothing to open against keeps the place and size it was given: its children go inside it.
         let given = e.try_cloned::<&Laid>().filter(|_| placed && anchor.is_none());
@@ -181,6 +199,11 @@ pub fn install(world: WorldRef<'_>) {
             let size = [items[root].out.w, items[root].out.h];
             let at = anchored(anchor, size, side.edge, [side.dx, side.dy], room);
             shift(&mut items, root, at[0], at[1]);
+        }
+        // A stand-in moves its node with the flow; the node keeps its own size (its own root lays its children out in it).
+        for &(i, l) in &ghosts {
+            let o = items[i].out;
+            items[i].out = Laid { x: o.x, y: o.y, w: l.w, h: l.h };
         }
         for item in &items {
             let ent = w.entity_from_id(item.id);
@@ -209,3 +232,16 @@ harness_native_api::module!(
     install,
     [harness_native_api::API_LAYOUTS, harness_native_ui_node_api::API_LAYOUTS, harness_native_ui_layout_api::API_LAYOUTS, harness_native_ui_look_api::API_LAYOUTS]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::collapsed;
+
+    /// A spring that overshoots past 0 or 1 still stands between none and all of the node.
+    #[test]
+    fn collapsed_clamps_the_share() {
+        assert_eq!(collapsed(28.0, 0.5), 14.0);
+        assert_eq!(collapsed(28.0, -0.1), 0.0);
+        assert_eq!(collapsed(28.0, 1.2), 28.0);
+    }
+}

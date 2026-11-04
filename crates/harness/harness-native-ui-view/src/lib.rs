@@ -12,9 +12,9 @@ use std::collections::HashSet;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::Action;
-use harness_native_ui_layout_api::{AnchoredTo, Lazy, LazyIndex, LazyRange};
+use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay};
 use harness_native_ui_motion_api::{Leaving, Transition};
-use harness_native_ui_node_api::{Node, Placed};
+use harness_native_ui_node_api::{Clip, Node, Placed};
 use harness_native_ui_text_api::{Icon, Text};
 
 /// A node of a view tree, by entity.
@@ -189,7 +189,8 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
 
 /// Remove a view: at once, or, when it has a `Transition`, by sending it out on it (SwiftUI's removal transition). A leaving
 /// view keeps the place it was laid out at (`Placed`), loses its name (so its key can come back as a new row while it goes)
-/// and is deleted by motion once its spring reaches 0.
+/// and is deleted by motion once its spring reaches 0. One in its parent's flow folds away as it goes (`Collapse`, clipped
+/// to what it still holds), so its neighbours slide into its space as in a SwiftUI list instead of jumping at the end.
 pub fn leave(v: View<'_>) {
     let e = v.0;
     if !e.has(Transition::id()) {
@@ -201,6 +202,11 @@ pub fn leave(v: View<'_>) {
         e.set_name(&format!("leaving_{id}"));
         e.add(Placed::id());
         e.add(Leaving::id());
+        let in_flow = e.parent().is_some_and(|p| p.has(Node::id())) && !e.has(Background::id()) && !e.has(Overlay::id());
+        if in_flow {
+            e.set(Collapse { k: 1.0 });
+            e.add(Clip::id());
+        }
     }
 }
 

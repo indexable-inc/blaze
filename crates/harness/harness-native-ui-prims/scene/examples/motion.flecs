@@ -4,6 +4,8 @@
 //   row to the third; the new pill springs from where the old one was drawn.
 // - Transition: one chip of each kind is inserted (Opacity, Slide, Scale, Move from the top) and the first chip leaves.
 // - Animate: the bar's Size, Padding and Fill are set to new values; it eases to them.
+// - Removal: the second row of a column leaves on an Opacity transition; it folds away as it fades (Collapse) and the rows
+//   below slide up into its space, as in a SwiftUI List.
 
 // The selection pill: put one under the selected row.
 prefab ex.Selection : ui.Node {
@@ -70,4 +72,22 @@ prefab ex.AnimateDemo : ex.Card {
     words : ui.Line { Text: {s: "eases"} }
   }
   after : ui.Words, Muted { Text: {s: "a sibling below moves with it"} }
+}
+
+// A list row that fades out when removed, on a plate so its fold shows.
+prefab ex.ListRow : ex.SelRow {
+  Transition: {kind: Opacity, from: Top, scale: 1, fade: false}
+  bg : ex.Plate { Background }
+}
+
+prefab ex.RemovalDemo : ex.Card {
+  label : ui.Label { Text: {s: "REMOVAL FOLDS AWAY, NEIGHBOURS SLIDE"} }
+  rows : ui.Column {
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    a : ex.ListRow { name { Text: {s: "above"} } }
+    b : ex.ListRow { name { Text: {s: "removed"} } }
+    c : ex.ListRow { name { Text: {s: "below one"} } }
+    d : ex.ListRow { name { Text: {s: "below two"} } }
+  }
 }

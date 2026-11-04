@@ -291,6 +291,15 @@ pub struct SafeAreaPadding {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct ViewThatFits;
 
+/// A `Placed` node that still holds part of its place in its parent's flow: `k` of the length it was laid out at along the
+/// parent's main axis (1 all of it, 0 none), at its spot among its siblings. Layout keeps its own size and moves it with
+/// the flow; its neighbours get the rest. SwiftUI's list removal: a row going out folds away as it fades and the rows
+/// after it slide up into the space. `harness_native_ui_view::leave` puts it on a node leaving a flow; motion eases it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Collapse {
+    pub k: f32,
+}
+
 hyperion_api_layouts::api_layouts! {
     "AlignSelf" => alias AlignSelf,
     "AlignmentGuide" => alias AlignmentGuide,
@@ -320,6 +329,7 @@ hyperion_api_layouts::api_layouts! {
     "ShrinkFirst" => alias ShrinkFirst,
     "AnchoredTo" => alias AnchoredTo,
     "Side" => alias Side,
+    "Collapse" => alias Collapse,
     FlexAxis,
     Align,
     Justify,
@@ -338,6 +348,7 @@ pub fn register(world: &World) {
     world.component::<Intrinsic>().writable();
     world.component::<Viewport>().writable();
     world.component::<ShrinkFirst>().writable();
+    world.component::<Collapse>().writable();
     world.component::<ScrollState>().writable();
     world.component::<Side>().writable();
     world.component::<AlignSelf>().writable();
