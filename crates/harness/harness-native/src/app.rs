@@ -34,7 +34,8 @@ const HARNESS: &str = include_str!("../scene/10-harness.flecs");
 
 /// The terminal's font size at zoom 1 (points), and its padding inside the main card.
 const TERM_SIZE: f32 = 13.0;
-const TERM_PAD: (f32, f32) = (14.0, 10.0);
+/// The terminal's padding inside its pane (Ghostty's window-padding), in points; the cell remainder is added on top.
+const TERM_PAD: (f32, f32) = (18.0, 16.0);
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
 /// The window's ground under the sidebar.
@@ -80,6 +81,16 @@ pub struct App {
     cache: GlyphCache,
     layouts: HashMap<(String, u32, u32, bool, bool, u32), Rc<Layout>>,
     terms: model::Terms,
+    /// The parsers of runs and stages being read, by entity id.
+    run_terms: model::Terms,
+    /// The run or stage entity whose output the link follows.
+    watching: Option<u64>,
+    /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
+    side_w: Option<f32>,
+    /// Dragging the sidebar's edge.
+    resizing: bool,
+    /// A run (and stage) to select once the runs show it.
+    pending_run: Option<(u64, Option<u32>)>,
     link: Link,
     grid: Grid,
     zoom: usize,
@@ -118,6 +129,12 @@ pub struct App {
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
     spawned: Arc<Mutex<Option<u64>>>,
+    /// The session selected when the app last ran (~/.harness/native.json), selected once the daemon's first list is in.
+    restore: Option<Option<u64>>,
+    /// What was last written to native.json.
+    saved: Option<Option<u64>>,
+    /// Remember the selected object in native.json (not for the offscreen shot).
+    pub persist: bool,
     pub focused: bool,
     pub title: String,
 }
@@ -205,12 +222,16 @@ impl App {
         });
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let host = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "This Mac".into());
-        let terms = model::install(w, &host, &crate::link::sock().display().to_string(), rx);
+        let (terms, run_terms) = model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
         let side = root.child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
+        let side_w = crate::prefs::get("sidebar_width").and_then(|v| v.as_f64()).map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
+        if let Some(w) = side_w {
+            set_side_width(side.entity(), w);
+        }
         let tree = side.child("hn.Tree");
         let main = root.child("hn.Main");
         let term = main.part("term").map_or(0, View::id);
@@ -223,6 +244,11 @@ impl App {
             cache: GlyphCache::new(ATLAS_SIZE),
             layouts: HashMap::new(),
             terms,
+            run_terms,
+            watching: None,
+            pending_run: None,
+            side_w,
+            resizing: false,
             link,
             grid,
             zoom: 4,
@@ -248,6 +274,9 @@ impl App {
             marked: None,
             tried: HashMap::new(),
             spawned: Arc::default(),
+            restore: Some(crate::saved::selected()),
+            saved: None,
+            persist: true,
             focused: true,
             title: "harness".into(),
         })
@@ -298,8 +327,51 @@ impl App {
             "exited"
         } else if t == *w.component_id::<model::Lost>() {
             "lost"
+        } else if t == *w.component_id::<model::Killed>() {
+            "killed"
+        } else if t == *w.component_id::<model::Pending>() {
+            "pending"
+        } else if t == *w.component_id::<model::Skipped>() {
+            "skipped"
         } else {
             "running"
+        }
+    }
+
+    /// A run (or stage): its number and stage index.
+    fn run_of(&self, e: u64) -> Option<(u64, Option<u32>)> {
+        let o = self.world.entity_from_id(e);
+        if let Some(r) = o.try_cloned::<&model::Run>() {
+            return Some((r.n, None));
+        }
+        let k = o.try_cloned::<&model::StageNo>()?.k;
+        Some((o.parent()?.try_cloned::<&model::Run>()?.n, Some(k)))
+    }
+
+    /// A run's or stage's right-hand words: how it ended and how long it ran (or has been running).
+    /// How long a run or stage ran, or has been running.
+    fn run_took(&self, e: u64) -> Option<String> {
+        let o = self.world.entity_from_id(e);
+        let start = o.try_cloned::<&model::Created>().map(|c| c.ms).filter(|&m| m > 0)?;
+        let end = o.try_cloned::<&model::Ended>().map(|c| c.ms);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        Some(fmt_dur(end.unwrap_or(now).saturating_sub(start)))
+    }
+
+    fn run_meta(&self, e: u64) -> String {
+        let code = self.world.entity_from_id(e).try_cloned::<&model::ExitCode>().map(|c| c.code);
+        let took = self.run_took(e);
+        let status = self.status_of(e);
+        let head = match (status, code) {
+            ("pending" | "skipped" | "lost" | "killed", _) => Some(status.to_owned()),
+            (_, Some(c)) if c != 0 => Some(format!("exit {c}")),
+            _ => None,
+        };
+        match (head, took) {
+            (Some(h), Some(t)) if status != "pending" && status != "skipped" => format!("{h} \u{00B7} {t}"),
+            (Some(h), _) => h,
+            (None, Some(t)) => t,
+            (None, None) => String::new(),
         }
     }
 
@@ -309,6 +381,7 @@ impl App {
         match self.status_of(e) {
             "running" => tone(w, "hn.ToneRunning"),
             "lost" => tone(w, "hn.ToneLost"),
+            "killed" => tone(w, "hn.ToneFailed"),
             _ if code.is_some_and(|c| c != 0) => tone(w, "hn.ToneFailed"),
             _ => tone(w, "hn.ToneExited"),
         }
@@ -332,16 +405,48 @@ impl App {
     fn sync_view(&mut self) {
         let w = self.world.world_ref();
         let rows = model::tree(w);
+        // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
+        let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
+        if up && let Some(last) = self.restore.take() {
+            if let Some(e) = last.and_then(|sid| self.entity_of(sid)) {
+                model::select(w, Some(e));
+            }
+        }
         // Nothing selected (or it went): the first running object, else the first.
-        if self.selected().is_none() && !rows.is_empty() {
+        if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
             let first = rows.iter().find(|(e, _)| self.status_of(*e) == "running").or(rows.first()).map(|(e, _)| *e);
             model::select(w, first);
         }
-        let pending = *self.spawned.lock().unwrap();
+        // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
+        let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
         if let Some(sid) = pending {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
+            }
+        }
+        if let Some((n, k)) = self.pending_run {
+            let mut found = None;
+            self.world.new_query::<&model::Run>().each_entity(|e, r| {
+                if r.n == n {
+                    found = Some(*e.id());
+                }
+            });
+            let found = match (found, k) {
+                (Some(run), Some(k)) => {
+                    let mut stage = None;
+                    w.entity_from_id(run).each_child(|c| {
+                        if c.try_cloned::<&model::StageNo>().is_some_and(|s| s.k == k) {
+                            stage = Some(*c.id());
+                        }
+                    });
+                    stage
+                }
+                (run, _) => run,
+            };
+            if found.is_some() {
+                model::select(w, found);
+                self.pending_run = None;
             }
         }
         let sel = self.selected();
@@ -367,39 +472,100 @@ impl App {
         if let Some(d) = device.part("dot") {
             set_if(d, link_tone);
         }
-        // One row per object.
+        // One row per session, run and stage, with a fold row over each session's older runs.
         let tree = View::of(w.entity_from_id(self.ids.tree));
-        let info: Vec<(String, (u64, usize, usize))> = rows.iter().enumerate().map(|(i, &(e, d))| (format!("o{e}"), (e, d, i))).collect();
+        let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
+        let info: Vec<(String, &str, model::Row)> = model::rows(w)
+            .into_iter()
+            .map(|r| match r {
+                model::Row::Obj { e, .. } if self.run_of(e).is_some() => (format!("o{e}"), "hn.RunRow", r),
+                model::Row::Obj { e, .. } if model::is_group(w, e) => (format!("o{e}"), "hn.GroupRow", r),
+                model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
+                model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
+            })
+            .collect();
         let me = &*self;
-        for_each(tree, "hn.ObjRow", info, |row, (e, depth, i), new| {
-            if new {
-                row.set(HoverAmt::default());
-            }
-            let o = w.entity_from_id(e);
-            row.action(&format!("select:{e}"));
-            set_if(row, if sel == Some(e) { chosen } else { clear });
-            let kind = model::kind_name(o);
+        // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
+        let mut fit: Vec<(u64, String, f32)> = Vec::new();
+        let indent = |row: View<'_>, depth: usize| {
             if let Some(p) = row.part("indent") {
                 let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * 14.0, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
                 if p.entity().try_cloned::<&Size>() != Some(s) {
                     p.set(s);
                 }
             }
-            if let Some(p) = row.part("glyph") {
-                p.text(kind_glyph(kind));
+        };
+        view::for_each_of(tree, info, |row, r, new| {
+            if new {
+                row.set(HoverAmt::default());
             }
-            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-            if let Some(p) = row.part("name") {
-                p.text(&clip_text(&name, (26usize).saturating_sub(depth * 2).max(8)));
+            let (e, depth) = match r {
+                model::Row::Obj { e, depth } => (e, depth),
+                model::Row::More { parent, hidden, depth, unfolded } => {
+                    row.action(&format!("fold:{parent}"));
+                    indent(row, depth);
+                    if let Some(p) = row.part("glyph") {
+                        // Pointing right while the runs are hidden, down while they show.
+                        p.text(if unfolded { "\u{25BE}" } else { "\u{25B8}" });
+                    }
+                    if let Some(p) = row.part("name") {
+                        p.text(&if unfolded { "fewer runs".to_owned() } else { format!("{hidden} more run{}", if hidden == 1 { "" } else { "s" }) });
+                    }
+                    return;
+                }
+            };
+            let o = w.entity_from_id(e);
+            if model::is_group(w, e) {
+                // A group of runs without a listed session: pressing it folds it.
+                row.action(&format!("collapse:{e}"));
+                indent(row, depth);
+                let open = !o.has(model::Collapsed::id());
+                if let Some(p) = row.part("glyph") {
+                    p.text(if open { "\u{25BE}" } else { "\u{25B8}" });
+                }
+                if let Some(p) = row.part("name") {
+                    p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
+                }
+                if let Some(p) = row.part("meta") {
+                    p.text(&model::run_count(w, e).to_string());
+                }
+                return;
+            }
+            row.action(&format!("select:{e}"));
+            set_if(row, if sel == Some(e) { chosen } else { clear });
+            indent(row, depth);
+            let kind = model::kind_name(o);
+            let run = me.run_of(e);
+            if let Some(p) = row.part("glyph") {
+                p.text(match run {
+                    Some((_, Some(_))) => "\u{2502}",
+                    Some(_) => "$",
+                    None => kind_glyph(kind),
+                });
             }
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
-            let meta = match (me.status_of(e), code) {
-                ("lost", _) => "lost".to_owned(),
-                ("exited", Some(c)) if c != 0 => format!("exit {c}"),
-                ("exited", _) => "done".to_owned(),
-                _ if i < 9 => format!("\u{2318}{}", i + 1),
-                _ => String::new(),
+            let meta = match (run, me.status_of(e), code) {
+                (Some(_), ..) => me.run_meta(e),
+                (None, "lost", _) => "lost".to_owned(),
+                (None, "exited", Some(c)) if c != 0 => format!("exit {c}"),
+                (None, "exited", _) => "done".to_owned(),
+                _ => hint.get(&e).filter(|&&i| i < 9).map(|i| format!("\u{2318}{}", i + 1)).unwrap_or_default(),
             };
+            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
+            if let Some(p) = row.part("name") {
+                match run {
+                    // A run's command on one line, cut to the room its row leaves it (measured below).
+                    Some(_) => match name_room(row) {
+                        Some(room) => fit.push((p.id(), name.split_whitespace().collect::<Vec<_>>().join(" "), room)),
+                        None => {
+                            p.text(&clip_text(&name, 14));
+                        }
+                    },
+                    None => {
+                        p.text(&clip_text(&name, (26usize).saturating_sub(depth * 2).max(8)));
+                    }
+                }
+            }
             if let Some(p) = row.part("meta") {
                 p.text(&meta);
             }
@@ -407,6 +573,12 @@ impl App {
                 set_if(p, me.dot_tone(e));
             }
         });
+        for (part, text, room) in fit {
+            let style = self.world.entity_from_id(part).try_cloned::<&TextStyle>().unwrap_or_default();
+            let cut = self.fit_text(&text, &style, room);
+            View::of(self.world.entity_from_id(part)).text(&cut);
+        }
+        let w = self.world.world_ref();
         // The main card's header.
         let main = View::of(w.entity_from_id(self.ids.main));
         let head = main.part("head");
@@ -417,15 +589,34 @@ impl App {
                 let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let t = o.try_cloned::<&model::Title>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let cwd = o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
-                let sub = if t.is_empty() || t == name { cwd } else { t };
+                // The program-set title (OSC 0/2) is kept on the entity but never names anything: agents' titles are
+                // spinner frames and "Claude Code", so only a shell's title shows, as the header's dim secondary text.
+                let sub = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
                 let e = *o.id();
-                let state = match (self.status_of(e), code) {
-                    ("exited", Some(c)) => format!("exited {c}"),
-                    (s, _) => s.to_owned(),
+                let state = match (self.run_of(e), self.status_of(e), code) {
+                    (Some(_), s, c) => {
+                        let s = if s == "exited" { format!("exited {}", c.unwrap_or(0)) } else { s.to_owned() };
+                        match self.run_took(e) {
+                            Some(t) if s != "pending" && s != "skipped" => format!("{s} \u{00B7} {t}"),
+                            _ => s,
+                        }
+                    }
+                    (None, "exited", Some(c)) => format!("exited {c}"),
+                    (None, s, _) => s.to_owned(),
                 };
-                let window = format!("{name} \u{2014} harness");
-                (kind_glyph(kind), name, clip_text(&sub, 70), state, self.dot_tone(e), window)
+                let (glyph, title, sub) = match self.run_of(e) {
+                    // A run: its id and command (one line), its directory under it.
+                    Some((n, stage)) => {
+                        let id = stage.map_or(format!("r{n}"), |k| format!("r{n}.{k}"));
+                        let cmd = name.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let cwd = o.try_cloned::<&model::Cwd>().or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>())).map(|c| tilde(c.s.as_str())).unwrap_or_default();
+                        ("$", clip_text(&format!("{id}  {cmd}"), 70), cwd)
+                    }
+                    None => (kind_glyph(kind), name.clone(), sub),
+                };
+                let window = format!("{} \u{2014} harness", clip_text(&title, 60));
+                (glyph, title, clip_text(&sub, 70), state, self.dot_tone(e), window)
             }
             None => ("", "No objects".to_owned(), "\u{2318}T new claude   \u{2318}\u{21E7}T new codex   \u{2318}K palette".to_owned(), String::new(), tone(w, "hn.ToneExited"), "harness".to_owned()),
         };
@@ -446,6 +637,47 @@ impl App {
         }
         self.title = window;
         self.sync_palette();
+        self.save_selected();
+    }
+
+    /// Write the selected object's session id to native.json when it changed.
+    fn save_selected(&mut self) {
+        if !self.persist || self.restore.is_some() {
+            return;
+        }
+        let now = self.selected().and_then(|e| self.session_of(e));
+        if self.saved != Some(now) {
+            if let Err(e) = crate::saved::set_selected(now) {
+                eprintln!("harness-native: {e}");
+            }
+            self.saved = Some(now);
+        }
+    }
+
+    /// The tree row under `(x, y)` (window points): its object.
+    pub fn object_at(&self, x: f32, y: f32) -> Option<u64> {
+        let (x, y) = (x / self.zoom(), y / self.zoom());
+        let w = self.world.world_ref();
+        let mut hit = None;
+        w.entity_from_id(self.ids.tree).each_child(|c| {
+            if hit.is_none() && c.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
+                hit = c.try_cloned::<&Action>().and_then(|a| a.name.as_str().strip_prefix("select:").and_then(|s| s.parse::<u64>().ok()));
+            }
+        });
+        hit.filter(|&e| w.entity_from_id(e).is_alive())
+    }
+
+    /// The context menu's Kill on object `e` (no asking).
+    pub fn kill_object(&mut self, e: u64) {
+        if !self.world.entity_from_id(e).is_alive() {
+            return;
+        }
+        if self.selected() == Some(e) {
+            self.kill();
+        } else if let Some(sid) = self.session_of(e) {
+            self.link.kill(sid);
+        }
+        self.poke();
     }
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
@@ -454,7 +686,8 @@ impl App {
         let mut out: Vec<(String, &'static str, String, String, Do)> = vec![
             ("new-claude".into(), kind_glyph("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
             ("new-codex".into(), kind_glyph("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
-            ("new-shell".into(), kind_glyph("shell"), "New shell".into(), String::new(), Do::New("shell")),
+            ("new-cursor".into(), kind_glyph("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
+            ("new-sh".into(), kind_glyph("shell"), "New sh".into(), String::new(), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
@@ -582,6 +815,26 @@ impl App {
         d
     }
 
+    /// `text` cut (with an ellipsis) to the longest front that the typesetter sets within `room` points.
+    fn fit_text(&mut self, text: &str, style: &TextStyle, room: f32) -> String {
+        let width = |me: &mut Self, t: &str| me.layout(t, style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max);
+        if width(self, text) <= room {
+            return text.to_owned();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let t: String = chars[..mid].iter().collect::<String>() + "\u{2026}";
+            if width(self, &t) <= room {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        chars[..lo].iter().collect::<String>().trim_end().to_owned() + "\u{2026}"
+    }
+
     /// Size every `Text` node with the typesetter; how many changed.
     fn typeset(&mut self) -> usize {
         let wanted = typeset::wanted(self.world.world_ref());
@@ -624,6 +877,10 @@ impl App {
             self.poke();
             if let Some(e) = a.strip_prefix("select:").and_then(|s| s.parse().ok()) {
                 self.select(Some(e));
+            } else if let Some(g) = a.strip_prefix("collapse:").and_then(|s| s.parse().ok()) {
+                model::toggle_collapse(self.world.world_ref(), g);
+            } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
+                model::toggle_fold(self.world.world_ref(), p);
             } else if a == "pal:close" {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
@@ -650,13 +907,43 @@ impl App {
     /// Attach the selected object's terminal, and keep its grid the size of the pane.
     fn sync_term(&mut self) {
         let Some(e) = self.selected() else { return };
-        let Some(sid) = self.session_of(e) else { return };
+        if self.watching.is_some_and(|w| w != e) {
+            // Another object took the pane: stop following the run it showed.
+            self.link.unwatch_run();
+            if let Some(w) = self.watching.take() {
+                self.run_terms.borrow_mut().remove(&w);
+            }
+        }
         let laid = self.world.entity_from_id(self.ids.term).try_cloned::<&Laid>();
         let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { return };
-        let rect = [l.x + TERM_PAD.0, l.y + TERM_PAD.1, l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1];
+        // Fit the grid inside the padding, then split what is left of a cell evenly into the padding on both sides
+        // (Ghostty's window-padding-balance), snapped to whole device pixels so every cell starts on one.
+        let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
+        let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
+        let snap = |v: f32| (v * self.grid.scale).floor() / self.grid.scale;
+        let rect = [snap(l.x + (l.w - gw) * 0.5), snap(l.y + (l.h - gh) * 0.5), gw, gh];
         self.term_rect = Some(rect);
-        let (cols, rows) = self.grid.fit(rect[2], rect[3]);
         let o = self.world.entity_from_id(e);
+        if let Some((n, stage)) = self.run_of(e) {
+            // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
+            if self.watching != Some(e) {
+                self.watching = Some(e);
+                self.run_terms.borrow_mut().remove(&e);
+                o.set(model::Term { cols, rows, scroll: 0, seq: 0 });
+                self.link.watch_run(n, stage);
+                return;
+            }
+            if let Some(mut t) = o.try_cloned::<&model::Term>().filter(|t| (t.cols, t.rows) != (cols, rows)) {
+                t.cols = cols;
+                t.rows = rows;
+                o.set(t);
+                if let Some(p) = self.run_terms.borrow_mut().get_mut(&e) {
+                    p.resize(cols, rows);
+                }
+            }
+            return;
+        }
+        let Some(sid) = self.session_of(e) else { return };
         let running = self.status_of(e) == "running";
         // Attach when it is not: a running object again a second after its last try, an ended one once (its last screen).
         let last = self.tried.get(&sid).copied();
@@ -681,10 +968,19 @@ impl App {
         }
     }
 
+    /// The selected object's parser map and key in it: a session's by its id, a run's or stage's by its entity.
+    fn parser_key(&self) -> Option<(&model::Terms, u64)> {
+        let e = self.selected()?;
+        match self.session_of(e) {
+            Some(sid) => Some((&self.terms, sid)),
+            None => self.run_of(e).map(|_| (&self.run_terms, e)),
+        }
+    }
+
     fn with_parser<R>(&self, f: impl FnOnce(&mut harness_vt::Term, u64) -> R) -> Option<R> {
-        let sid = self.selected().and_then(|e| self.session_of(e))?;
-        let mut map = self.terms.borrow_mut();
-        map.get_mut(&sid).map(|p| f(p, sid))
+        let (terms, key) = self.parser_key()?;
+        let mut map = terms.borrow_mut();
+        map.get_mut(&key).map(|p| f(p, key))
     }
 
     fn scroll(&self) -> usize {
@@ -771,11 +1067,12 @@ impl App {
 
     fn emit_term(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
         let Some(rect) = self.term_rect else { return };
-        let Some(sid) = self.selected().and_then(|e| self.session_of(e)) else { return };
+        let Some((terms, key)) = self.parser_key() else { return };
+        let terms = terms.clone();
         // A fraction of a row back: the viewport one row further back, lifted by what is left of that row.
         let want = self.scroll() + usize::from(self.scroll_frac > 0.0);
-        let mut map = self.terms.borrow_mut();
-        let Some(parser) = map.get_mut(&sid) else { return };
+        let mut map = terms.borrow_mut();
+        let Some(parser) = map.get_mut(&key) else { return };
         parser.set_scrollback(want);
         let shown = parser.scrollback();
         let snap = term::snapshot(parser, &term::DARK);
@@ -805,6 +1102,10 @@ impl App {
             for g in &mut d.glyphs[ng..] {
                 g.clip[..2].copy_from_slice(&band);
             }
+        }
+        if self.grid.animating {
+            // The cursor fades on the app clock: keep drawing.
+            self.poke();
         }
     }
 
@@ -854,6 +1155,16 @@ impl App {
     /// The pointer moved to `(x, y)` (window points).
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
         self.set_pointer(x, y);
+        if self.resizing {
+            if let Some(side) = self.sidebar() {
+                let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
+                let v = (self.pointer.x - left).clamp(SIDE_MIN, SIDE_MAX).round();
+                set_side_width(side, v);
+                self.side_w = Some(v);
+            }
+            self.poke();
+            return;
+        }
         if let Some(b) = self.report {
             self.report_mouse(b, MouseAct::Motion, m);
         } else if self.selecting {
@@ -873,6 +1184,13 @@ impl App {
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
         self.set_pointer(x, y);
         self.poke();
+        // On the sidebar's right edge: drag it wider or narrower.
+        if b == Button::Left && self.palette.is_none() && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
+            if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
+                self.resizing = true;
+                return;
+            }
+        }
         if b == Button::Left {
             self.pointer.down = true;
             self.pointer.went_down = true;
@@ -908,6 +1226,14 @@ impl App {
 
     pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
         self.set_pointer(x, y);
+        if self.resizing {
+            self.resizing = false;
+            if let Some(v) = self.side_w {
+                crate::prefs::set("sidebar_width", serde_json::json!(v));
+            }
+            self.poke();
+            return;
+        }
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
@@ -1158,8 +1484,8 @@ impl App {
             ("a", false) => self.select_all(),
             ("]", _) | ("}", _) => self.step_object(1),
             ("[", _) | ("{", _) => self.step_object(-1),
-            ("t", false) => self.spawn("claude"),
-            ("t", true) => self.spawn("codex"),
+            ("t" | "n", false) => self.spawn("claude"),
+            ("t" | "n", true) => self.spawn("codex"),
             ("w", false) => self.kill(),
             ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
@@ -1182,6 +1508,11 @@ impl App {
         true
     }
 
+    /// The sidebar node (the device row's parent).
+    fn sidebar(&self) -> Option<EntityView<'_>> {
+        self.world.entity_from_id(self.ids.device).parent()
+    }
+
     /// Command-S: fold the sidebar away (zero wide, clipped, so its rows neither draw nor take clicks; the main card
     /// takes the window) or bring it back at the scene's size.
     fn toggle_sidebar(&mut self) {
@@ -1192,7 +1523,11 @@ impl App {
         let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
         let (Some(mut size), Some(full), Some(pad)) = (side.try_cloned::<&Size>(), proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
         let show = size.w.value == 0.0;
-        size.w = if show { full.w } else { Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 } };
+        size.w = match (show, self.side_w) {
+            (true, Some(v)) => Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 },
+            (true, None) => full.w,
+            (false, _) => Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 },
+        };
         side.set(size);
         side.set(if show { pad } else { Padding::default() });
         if show {
@@ -1213,7 +1548,7 @@ impl App {
         }
         let at = self.selected().and_then(|s| objs.iter().position(|&e| e == s)).map_or(0, |i| i as i64);
         let n = objs.len() as i64;
-        self.select(Some(objs[((at + by) % n + n) as usize % objs.len()]));
+        self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
 
     pub fn step_zoom(&mut self, by: i32) {
@@ -1266,10 +1601,62 @@ impl App {
         *self.spawned.lock().unwrap() = Some(sid);
     }
 
+    /// Select run `r{n}` (or its stage `k`) once the runs show it (the shot's `HARNESS_NATIVE_SHOT_SELECT=r12[.0]`).
+    pub fn select_run(&mut self, n: u64, k: Option<u32>) {
+        self.pending_run = Some((n, k));
+    }
+
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
         self.palette = Some(Palette { query: String::new(), at: 0 });
         self.poke();
+    }
+}
+
+/// The sidebar's width range when dragged, and how near its edge a press grabs it (points).
+const SIDE_MIN: f32 = 180.0;
+const SIDE_MAX: f32 = 720.0;
+const SIDE_GRAB: f32 = 5.0;
+
+/// Set the sidebar node's width (a folded-away sidebar, zero wide, stays so).
+fn set_side_width(side: EntityView<'_>, v: f32) {
+    let Some(mut size) = side.try_cloned::<&Size>() else { return };
+    if size.w.value == 0.0 && size.w.kind == SizeKind::Fixed && side.has(harness_native_ui_node_api::Clip::id()) {
+        return;
+    }
+    size.w = Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 };
+    side.set(size);
+}
+
+/// The room (points) a run row leaves its name, from the row's last layout: its width less its padding, the gaps
+/// between its parts and every part but the name and the spacer. None before the row was laid out.
+fn name_room(row: View<'_>) -> Option<f32> {
+    use harness_native_ui_layout_api::{Flex, Padding};
+    let e = row.entity();
+    let laid = e.try_cloned::<&Laid>().filter(|l| l.w > 0.0)?;
+    let pad = e.try_cloned::<&Padding>().unwrap_or_default();
+    let gap = e.try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
+    let mut others = 0.0;
+    let mut parts = 0usize;
+    for name in ["indent", "glyph", "meta", "dot"] {
+        if let Some(p) = row.part(name) {
+            others += p.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+            parts += 1;
+        }
+    }
+    // name and spacer are the other two children: gaps sit between all of them.
+    Some((laid.w - pad.l - pad.r - others - gap * (parts + 1) as f32 - 1.0).max(24.0))
+}
+
+/// A duration for a run's row: `340ms`, `4.2s`, `38s`, `3m04s`, `2h05m`.
+fn fmt_dur(ms: u64) -> String {
+    let s = ms / 1000;
+    match ms {
+        0..1000 => format!("{ms}ms"),
+        1000..10_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        10_000..60_000 => format!("{s}s"),
+        60_000..3_600_000 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, (s / 60) % 60),
     }
 }
 

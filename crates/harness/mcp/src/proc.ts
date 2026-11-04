@@ -2,6 +2,7 @@
 // stdout/stderr are kept in memory (last maxBytes per stream, older lines dropped but still numbered).
 import { table, type Table } from "./table.ts";
 import { req, daemonPresent, DaemonUnreachable } from "./daemon.ts";
+import { REPL_ID } from "./repl.ts";
 
 type Stream = "stdout" | "stderr";
 
@@ -71,7 +72,7 @@ export class Proc {
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries({ ...process.env, ...this.opts.env })) if (v !== undefined) env[k] = v;
     const r = await req<{ id: string; pid: number }>({
-      op: "run", cmd: this.cmd, cwd: this.cwd, env, clear_env: true, session: selfSession(),
+      op: "run", cmd: this.cmd, cwd: this.cwd, env, clear_env: true, session: selfSession(), repl: REPL_ID,
       parent: process.env.HARNESS_RUN ?? null, stdin: this.opts.stdin ?? null,
     });
     this.backend = "daemon";

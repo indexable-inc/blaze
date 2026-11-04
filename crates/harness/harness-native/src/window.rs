@@ -4,6 +4,7 @@
 use crate::app::{App, KeyMods};
 use crate::term::{self, Button, KeyAction};
 use crate::gpu::{self, Dest, Renderer};
+use crate::single::{self, Ask};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -42,6 +43,8 @@ thread_local! {
     /// The key event the input method is interpreting, and whether text was being composed when it came: the
     /// NSTextInputClient calls during `interpretKeyEvents` take it when they consume it.
     static IME_KEY: RefCell<Option<(Retained<NSEvent>, bool)>> = const { RefCell::new(None) };
+    /// The session `HARNESS_NATIVE_SELECT` asked for, for the window to show once it is made.
+    static SELECT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 fn composing() -> bool {
@@ -274,6 +277,19 @@ define_class!(
             }
         }
 
+        /// A right click (or control-click) on a tree row: what can be done to its object.
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            self.context_menu(event)
+        }
+
+        #[unsafe(method(ctxKill:))]
+        fn ctx_kill(&self, sender: &NSMenuItem) {
+            let e = sender.tag() as u64;
+            with(|st| st.app.kill_object(e));
+            wake();
+        }
+
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -421,6 +437,20 @@ impl HarnessView {
         wake();
     }
 
+    fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+        let p = self.local(event);
+        let e = with(|st| st.app.object_at(p.x as f32, p.y as f32)).flatten()?;
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        let kill = item(mtm, "Kill", sel!(ctxKill:), "");
+        // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
+        unsafe { kill.setTarget(Some(self)) };
+        kill.setTag(e as isize);
+        menu.addItem(&kill);
+        Some(menu)
+    }
+
     fn sync_size(&self) {
         let points = self.bounds().size;
         let pixels = self.convertSizeToBacking(points);
@@ -498,8 +528,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
     let mut app = App::new(wake_from_any_thread())?;
-    // Open on one daemon session (scripts and end-to-end checks), as the shot's HARNESS_NATIVE_SHOT_SELECT does.
-    if let Some(sid) = std::env::var("HARNESS_NATIVE_SELECT").ok().and_then(|s| s.parse().ok()) {
+    if let Some(sid) = SELECT.with(std::cell::Cell::get) {
         app.select_session(sid);
     }
     STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new() }));
@@ -537,6 +566,11 @@ define_class!(
                 std::process::exit(1);
             }
             NSApplication::sharedApplication(mtm).activate();
+        }
+
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _note: &NSNotification) {
+            single::release();
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -578,8 +612,33 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     bar
 }
 
-pub fn run() {
+/// Another launch asked for the window (and maybe a session): bring it forward on the main thread.
+fn asked(ask: Ask) {
+    DispatchQueue::main().exec_async(move || {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        with(|st| {
+            if let Ask::Select(sid) = ask {
+                st.app.select_session(sid);
+            }
+            st.app.poke();
+            st.link.setPaused(false);
+            if st.window.isMiniaturized() {
+                st.window.deminiaturize(None);
+            }
+            st.window.makeKeyAndOrderFront(None);
+        });
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    });
+}
+
+/// The app, holding the single-instance `listener` (when it has one) and showing session `select` first.
+pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u64>) {
     let mtm = MainThreadMarker::new().expect("harness-native runs on the main thread");
+    SELECT.with(|s| s.set(select));
+    if let Some(l) = listener {
+        single::serve(l, asked);
+    }
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.setMainMenu(Some(&main_menu(mtm)));

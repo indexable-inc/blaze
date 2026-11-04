@@ -179,6 +179,11 @@ impl FontSource for Font {
         unsafe { self.0.x_height() as f32 }
     }
 
+    fn underline_thickness(&self) -> f32 {
+        // SAFETY: a plain metric getter.
+        unsafe { self.0.underline_thickness() as f32 }
+    }
+
     fn glyph(&self, ch: char) -> u16 {
         let mut units = [0u16; 2];
         let n = ch.encode_utf16(&mut units).len();
@@ -278,6 +283,116 @@ impl FontSource for Font {
         // SAFETY: one glyph and one position; the context is live.
         unsafe { self.0.draw_glyphs(NonNull::from(&mut g), NonNull::from(&mut at), 1, &ctx) };
     }
+}
+
+impl Font {
+    /// The line gap the font asks for below its descent, points.
+    pub fn leading(&self) -> f32 {
+        // SAFETY: a plain metric getter.
+        unsafe { self.0.leading() as f32 }
+    }
+
+    /// The font's table `tag`, as CoreText hands it over.
+    pub fn table_bytes(&self, tag: &[u8; 4]) -> Option<Vec<u8>> {
+        // SAFETY: a live font and a four-byte tag.
+        let data = unsafe { self.0.table(u32::from_be_bytes(*tag), CTFontTableOptions(0)) }?;
+        Some(data.to_vec())
+    }
+
+    /// `text` (one grapheme cluster) as CoreText sets it in this font: its glyphs in order. Apple Color Emoji's flag
+    /// and ZWJ sequences are joined into their one glyph this way (its `morx` as CoreText applies it).
+    pub fn ct_glyphs(&self, text: &str) -> Vec<u16> {
+        use objc2_core_foundation::CFAttributedString;
+        use objc2_core_text::{CTLine, CTRun, kCTFontAttributeName};
+        let s = CFString::from_str(text);
+        // SAFETY: a plain read of CoreText's key constant.
+        let key = unsafe { kCTFontAttributeName };
+        let attrs = CFDictionary::<CFType, CFType>::from_slices(&[cf(key)], &[cf(&*self.0)]);
+        // SAFETY: a live string and a dictionary of string attributes.
+        let Some(astr) = (unsafe { CFAttributedString::new(None, Some(&s), Some(attrs.as_opaque())) }) else { return Vec::new() };
+        // SAFETY: a live attributed string.
+        let line = unsafe { CTLine::with_attributed_string(&astr) };
+        // SAFETY: a live line; its runs array holds CTRuns.
+        let runs = unsafe { line.glyph_runs() };
+        let mut out = Vec::new();
+        for i in 0..runs.count() {
+            // SAFETY: the index is in range and every value is a CTRun.
+            let run = unsafe { &*runs.value_at_index(i).cast::<CTRun>() };
+            // SAFETY: a live run.
+            let n = unsafe { run.glyph_count() };
+            if n <= 0 {
+                continue;
+            }
+            let mut glyphs = vec![0u16; n as usize];
+            // SAFETY: the buffer holds the run's glyph count.
+            unsafe { run.glyphs(CFRange { location: 0, length: 0 }, NonNull::new_unchecked(glyphs.as_mut_ptr())) };
+            out.extend(glyphs);
+        }
+        out
+    }
+
+    /// This font at another size.
+    #[must_use]
+    pub fn sized(&self, size: f32) -> Self {
+        // SAFETY: a live font; a null matrix is the identity and no attributes change.
+        Self(unsafe { self.0.copy_with_attributes(CGFloat::from(size), std::ptr::null(), None) })
+    }
+
+    /// `glyph` drawn into `buf` (as [`FontSource::draw`]) with its outline scaled `sx` by `sy` pixels a point and its
+    /// origin at (`tx`, `ty`) pixels, the bitmap's bottom-left pixel being (`x0`, `y0`): a glyph stretched or moved into
+    /// a terminal cell.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_placed(&self, glyph: u16, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, sx: f64, sy: f64, tx: f64, ty: f64) {
+        let Some(ctx) = context(buf, w, h, if self.colour() { 4 } else { 1 }) else { return };
+        CGContext::translate_ctm(Some(&ctx), tx - f64::from(x0), ty - f64::from(y0));
+        CGContext::scale_ctm(Some(&ctx), sx, sy);
+        let mut g = glyph;
+        let mut at = CGPoint { x: 0.0, y: 0.0 };
+        // SAFETY: one glyph and one position; the context is live.
+        unsafe { self.0.draw_glyphs(NonNull::from(&mut g), NonNull::from(&mut at), 1, &ctx) };
+    }
+}
+
+/// Register the font files at `paths` for this process (`CTFontManagerRegisterFontURLs`, process scope), so CoreText
+/// finds them by name and family like installed ones. Waits for registration to finish; the files that failed, by error.
+pub fn register_fonts(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    use objc2_core_foundation::CFURL;
+    use objc2_core_text::{CTFontManagerRegisterFontURLs, CTFontManagerScope};
+    let urls: Vec<CFRetained<CFURL>> = paths.iter().filter_map(CFURL::from_file_path).collect();
+    if urls.len() != paths.len() {
+        return Err(format!("not file paths: {paths:?}"));
+    }
+    let array = CFArray::<CFURL>::from_retained_objects(&urls);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    // objc2 has no block encoding for C `bool`; `Bool` is the same one byte on Apple's targets.
+    let handler = block2::RcBlock::new(move |errors: NonNull<CFArray>, done: objc2::runtime::Bool| -> objc2::runtime::Bool {
+        let done = done.as_bool();
+        // SAFETY: CoreText hands a live array of CFErrors for the duration of the call.
+        let n = unsafe { errors.as_ref() }.count();
+        if n > 0 {
+            let _ = tx.send(Err(format!("{n} font file(s) failed to register")));
+        }
+        if done {
+            let _ = tx.send(Ok(()));
+        }
+        objc2::runtime::Bool::YES
+    });
+    // SAFETY: the same block layout and calling convention; only the declared argument types differ (Bool for bool).
+    let handler: &block2::DynBlock<dyn Fn(NonNull<CFArray>, bool) -> bool> = unsafe { &*std::ptr::from_ref(&*handler).cast() };
+    // SAFETY: an array of file URLs and a handler that only sends on a channel.
+    unsafe { CTFontManagerRegisterFontURLs(array.as_opaque(), CTFontManagerScope::Process, true, Some(&handler)) };
+    let mut errs = Vec::new();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => break,
+            Ok(Err(e)) => errs.push(e),
+            Err(e) => {
+                errs.push(format!("font registration did not finish: {e}"));
+                break;
+            }
+        }
+    }
+    if errs.is_empty() { Ok(()) } else { Err(errs.join("; ")) }
 }
 
 /// A bitmap context over `buf`, `w` by `h` pixels of `px` bytes: device RGB with premultiplied alpha
