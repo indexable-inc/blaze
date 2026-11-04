@@ -1,0 +1,13 @@
+[package]
+name = "harness-native-model"
+description = "harness-native's world: devices, objects and their terminals as flecs components and relations, and the systems that apply daemon messages"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-api = { path = "../harness-native-api" }
+harness-vt = { path = "../harness-vt" }
+serde_json = "1"

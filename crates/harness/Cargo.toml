@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/harness", "crates/harness-ghostty-config", "crates/harness-native*", "crates/harness-vt"]

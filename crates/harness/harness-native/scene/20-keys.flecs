@@ -1,0 +1,256 @@
+// harness-native's keyboard: every binding is an entity (src/keys.rs reads them, src/app/keys.rs runs them). The menu bar
+// (and its key equivalents), the palette's hints and the sidebar's cmd+1-9 hints are made from these same entities, so
+// they cannot drift from what the keys do.
+//
+// A binding:  key.<name> { Keybind: {key, cmd, shift, opt, ctrl}  (Does, act.<Action>)  [(When, ctx.<Context>)] }
+//   key: a character as typed without modifiers ("n", "[", "=") or a named key (left right up down return enter tab
+//   space backspace delete escape home end pageup pagedown f1..f12). Modifiers are 0 or 1 and must match exactly.
+//   No When: the binding holds everywhere (below every context). With When it holds only while that context is active;
+//   the innermost active context wins (ctx.Palette, ctx.Archive, then ctx.Tree over ctx.Terminal), then later bindings
+//   over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's search).
+// An action: act.<Name>, run by the handler registered under its name, else its base's (`act.SpawnClaude : act.Spawn`).
+//   MenuItem puts it in the menu bar (bar order is first appearance; sep: 1 draws a separator above it); Selector sends an
+//   AppKit action up the responder chain instead of a handler.
+//
+// ~/.harness/keys.flecs ($HARNESS_HOME/keys.flecs) runs after this file and wins: set Keybind on an existing key.<name> to
+// remap it, or add a key.<name> of your own (a later binding on the same keys and context shadows this file's).
+// It is reloaded when it changes.
+
+ctx.Terminal {}
+ctx.Tree {}
+ctx.Palette {}
+ctx.Archive {}
+
+// ---- actions ----
+
+act.Hide { Selector: {sel: "hide:"}
+  MenuItem: {bar: "harness", title: "Hide harness"} }
+act.Quit { Selector: {sel: "terminate:"}
+  MenuItem: {bar: "harness", title: "Quit harness", sep: 1} }
+
+prefab act.Spawn
+act.SpawnShell : act.Spawn { SpawnKind: {kind: "shell"}
+  MenuItem: {bar: "File", title: "New Shell"} }
+act.SpawnClaude : act.Spawn { SpawnKind: {kind: "claude"}
+  MenuItem: {bar: "File", title: "New Claude"} }
+act.SpawnCodex : act.Spawn { SpawnKind: {kind: "codex"}
+  MenuItem: {bar: "File", title: "New Codex"} }
+act.SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor"} }
+act.Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
+
+act.Copy { Selector: {sel: "copy:"}
+  MenuItem: {bar: "Edit", title: "Copy"} }
+act.Paste { Selector: {sel: "paste:"}
+  MenuItem: {bar: "Edit", title: "Paste"} }
+act.SelectAll { MenuItem: {bar: "Edit", title: "Select All"} }
+act.EmojiPicker { Selector: {sel: "orderFrontCharacterPalette:"}
+  MenuItem: {bar: "Edit", title: "Emoji & Symbols", sep: 1} }
+
+act.ToggleSidebar { MenuItem: {bar: "View", title: "Toggle Sidebar"} }
+act.Palette { MenuItem: {bar: "View", title: "Command Palette"} }
+prefab act.Zoom
+act.ZoomIn : act.Zoom { ZoomStep: {step: 1}
+  MenuItem: {bar: "View", title: "Zoom In", sep: 1} }
+act.ZoomOut : act.Zoom { ZoomStep: {step: -1}
+  MenuItem: {bar: "View", title: "Zoom Out"} }
+act.ZoomReset { MenuItem: {bar: "View", title: "Actual Size"} }
+// F3's debug overlay (src/app/stats.rs), kept across launches in native.json `stats`.
+act.ToggleStats { MenuItem: {bar: "View", title: "Debug Stats", sep: 1} }
+
+// Back to the Archive after opening something from it, else the previous object.
+act.PrevObject { MenuItem: {bar: "Go", title: "Previous Object"} }
+act.NextObject { MenuItem: {bar: "Go", title: "Next Object"} }
+prefab act.SelectIndex
+act.Select1 : act.SelectIndex { SelectN: {n: 1} }
+act.Select2 : act.SelectIndex { SelectN: {n: 2} }
+act.Select3 : act.SelectIndex { SelectN: {n: 3} }
+act.Select4 : act.SelectIndex { SelectN: {n: 4} }
+act.Select5 : act.SelectIndex { SelectN: {n: 5} }
+act.Select6 : act.SelectIndex { SelectN: {n: 6} }
+act.Select7 : act.SelectIndex { SelectN: {n: 7} }
+act.Select8 : act.SelectIndex { SelectN: {n: 8} }
+act.Select9 : act.SelectIndex { SelectN: {n: 9} }
+
+act.Minimize { Selector: {sel: "performMiniaturize:"}
+  MenuItem: {bar: "Window", title: "Minimize"} }
+
+// The tree, while it has the keyboard (a row was pressed): Finder's and Xcode's arrows.
+act.TreeUp {}
+act.TreeDown {}
+// Fold the selected row (or go to its parent); with Option, its siblings too.
+act.TreeFold {}
+act.TreeUnfold {}
+// Hand the keyboard back to the terminal.
+act.TreeLeave {}
+
+act.PaletteClose {}
+act.PaletteUp {}
+act.PaletteDown {}
+act.PaletteRun {}
+act.PaletteErase {}
+
+act.SearchClear {}
+act.SearchErase {}
+act.ArchiveOpenFirst {}
+
+// Natural text editing (iTerm2's and Ghostty's preset), whatever the program's keyboard mode. Bytes are in caret
+// notation: ^[ is escape, ^? is DEL, ^A..^_ are the control characters.
+prefab act.SendBytes
+act.WordLeft : act.SendBytes { Bytes: {bytes: "^[b"} }
+act.WordRight : act.SendBytes { Bytes: {bytes: "^[f"} }
+act.WordErase : act.SendBytes { Bytes: {bytes: "^[^?"} }
+act.WordDelete : act.SendBytes { Bytes: {bytes: "^[d"} }
+act.LineStart : act.SendBytes { Bytes: {bytes: "^A"} }
+act.LineEnd : act.SendBytes { Bytes: {bytes: "^E"} }
+act.LineErase : act.SendBytes { Bytes: {bytes: "^U"} }
+act.Undo : act.SendBytes { Bytes: {bytes: "^_"} }
+
+// ---- bindings ----
+
+key.hide { Keybind: {key: "h", cmd: 1}
+  (Does, act.Hide) }
+key.quit { Keybind: {key: "q", cmd: 1}
+  (Does, act.Quit) }
+
+key.new_shell { Keybind: {key: "n", cmd: 1}
+  (Does, act.SpawnShell) }
+key.new_claude { Keybind: {key: "t", cmd: 1}
+  (Does, act.SpawnClaude) }
+key.new_codex { Keybind: {key: "t", cmd: 1, shift: 1}
+  (Does, act.SpawnCodex) }
+key.archive { Keybind: {key: "w", cmd: 1}
+  (Does, act.Archive) }
+
+key.copy { Keybind: {key: "c", cmd: 1}
+  (Does, act.Copy) }
+key.paste { Keybind: {key: "v", cmd: 1}
+  (Does, act.Paste) }
+key.select_all { Keybind: {key: "a", cmd: 1}
+  (Does, act.SelectAll) }
+key.emoji { Keybind: {key: "space", cmd: 1, ctrl: 1}
+  (Does, act.EmojiPicker) }
+
+key.sidebar { Keybind: {key: "s", cmd: 1}
+  (Does, act.ToggleSidebar) }
+key.palette { Keybind: {key: "k", cmd: 1}
+  (Does, act.Palette) }
+key.zoom_in { Keybind: {key: "=", cmd: 1}
+  (Does, act.ZoomIn) }
+// cmd+plus as most keyboards type it.
+key.zoom_in_plus { Keybind: {key: "=", cmd: 1, shift: 1}
+  (Does, act.ZoomIn) }
+key.zoom_out { Keybind: {key: "-", cmd: 1}
+  (Does, act.ZoomOut) }
+key.zoom_reset { Keybind: {key: "0", cmd: 1}
+  (Does, act.ZoomReset) }
+// Global (no When): it holds while the terminal has the keyboard too, and F3 never reaches the program.
+key.stats { Keybind: {key: "f3"}
+  (Does, act.ToggleStats) }
+
+key.prev { Keybind: {key: "[", cmd: 1}
+  (Does, act.PrevObject) }
+key.next { Keybind: {key: "]", cmd: 1}
+  (Does, act.NextObject) }
+key.select_1 { Keybind: {key: "1", cmd: 1}
+  (Does, act.Select1) }
+key.select_2 { Keybind: {key: "2", cmd: 1}
+  (Does, act.Select2) }
+key.select_3 { Keybind: {key: "3", cmd: 1}
+  (Does, act.Select3) }
+key.select_4 { Keybind: {key: "4", cmd: 1}
+  (Does, act.Select4) }
+key.select_5 { Keybind: {key: "5", cmd: 1}
+  (Does, act.Select5) }
+key.select_6 { Keybind: {key: "6", cmd: 1}
+  (Does, act.Select6) }
+key.select_7 { Keybind: {key: "7", cmd: 1}
+  (Does, act.Select7) }
+key.select_8 { Keybind: {key: "8", cmd: 1}
+  (Does, act.Select8) }
+key.select_9 { Keybind: {key: "9", cmd: 1}
+  (Does, act.Select9) }
+
+key.minimize { Keybind: {key: "m", cmd: 1}
+  (Does, act.Minimize) }
+
+key.tree_up { Keybind: {key: "up"}
+  (Does, act.TreeUp)
+  (When, ctx.Tree) }
+key.tree_down { Keybind: {key: "down"}
+  (Does, act.TreeDown)
+  (When, ctx.Tree) }
+key.tree_fold { Keybind: {key: "left"}
+  (Does, act.TreeFold)
+  (When, ctx.Tree) }
+key.tree_fold_siblings { Keybind: {key: "left", opt: 1}
+  (Does, act.TreeFold)
+  (When, ctx.Tree) }
+key.tree_unfold { Keybind: {key: "right"}
+  (Does, act.TreeUnfold)
+  (When, ctx.Tree) }
+key.tree_unfold_siblings { Keybind: {key: "right", opt: 1}
+  (Does, act.TreeUnfold)
+  (When, ctx.Tree) }
+key.tree_return { Keybind: {key: "return"}
+  (Does, act.TreeLeave)
+  (When, ctx.Tree) }
+key.tree_escape { Keybind: {key: "escape"}
+  (Does, act.TreeLeave)
+  (When, ctx.Tree) }
+
+key.palette_escape { Keybind: {key: "escape"}
+  (Does, act.PaletteClose)
+  (When, ctx.Palette) }
+key.palette_up { Keybind: {key: "up"}
+  (Does, act.PaletteUp)
+  (When, ctx.Palette) }
+key.palette_down { Keybind: {key: "down"}
+  (Does, act.PaletteDown)
+  (When, ctx.Palette) }
+key.palette_return { Keybind: {key: "return"}
+  (Does, act.PaletteRun)
+  (When, ctx.Palette) }
+key.palette_enter { Keybind: {key: "enter"}
+  (Does, act.PaletteRun)
+  (When, ctx.Palette) }
+key.palette_backspace { Keybind: {key: "backspace"}
+  (Does, act.PaletteErase)
+  (When, ctx.Palette) }
+
+key.archive_escape { Keybind: {key: "escape"}
+  (Does, act.SearchClear)
+  (When, ctx.Archive) }
+key.archive_backspace { Keybind: {key: "backspace"}
+  (Does, act.SearchErase)
+  (When, ctx.Archive) }
+key.archive_return { Keybind: {key: "return"}
+  (Does, act.ArchiveOpenFirst)
+  (When, ctx.Archive) }
+key.archive_enter { Keybind: {key: "enter"}
+  (Does, act.ArchiveOpenFirst)
+  (When, ctx.Archive) }
+
+key.word_left { Keybind: {key: "left", opt: 1}
+  (Does, act.WordLeft)
+  (When, ctx.Terminal) }
+key.word_right { Keybind: {key: "right", opt: 1}
+  (Does, act.WordRight)
+  (When, ctx.Terminal) }
+key.word_erase { Keybind: {key: "backspace", opt: 1}
+  (Does, act.WordErase)
+  (When, ctx.Terminal) }
+key.word_delete { Keybind: {key: "delete", opt: 1}
+  (Does, act.WordDelete)
+  (When, ctx.Terminal) }
+key.line_start { Keybind: {key: "left", cmd: 1}
+  (Does, act.LineStart)
+  (When, ctx.Terminal) }
+key.line_end { Keybind: {key: "right", cmd: 1}
+  (Does, act.LineEnd)
+  (When, ctx.Terminal) }
+key.line_erase { Keybind: {key: "backspace", cmd: 1}
+  (Does, act.LineErase)
+  (When, ctx.Terminal) }
+key.undo { Keybind: {key: "z", cmd: 1}
+  (Does, act.Undo)
+  (When, ctx.Terminal) }

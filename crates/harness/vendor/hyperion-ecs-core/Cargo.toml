@@ -1,0 +1,12 @@
+[package]
+name = "hyperion-ecs-core"
+description = "Component identity for module code (world name plus layout hash, cached per image) and the module scope, from hyperion."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+hyperion-ecs = { path = "../hyperion-ecs" }
+hyperion-layout = { path = "../hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-api-layouts = { path = "../hyperion-api-layouts" }

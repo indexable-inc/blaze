@@ -1,0 +1,3 @@
+Symbols Nerd Font Mono (SymbolsNerdFontMono-Regular.ttf), Nerd Fonts 3.5.1, from the official release
+https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.5.1 (NerdFontsSymbolsOnly.zip).
+Licences of the font and the icon sets in it: see LICENSE.

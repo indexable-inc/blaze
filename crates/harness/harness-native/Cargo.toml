@@ -1,0 +1,62 @@
+[package]
+name = "harness-native"
+description = "Native macOS app for the harness: AppKit + Metal, Slang shaders, atlas text, a flecs world of devices and objects (den-native's stack, copied from github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "harness-native"
+path = "src/main.rs"
+
+[dependencies]
+harness-native-model = { path = "../harness-native-model" }
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-ecs = { path = "../harness-native-ecs" }
+harness-native-api = { path = "../harness-native-api" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-layout = { path = "../harness-native-ui-layout" }
+harness-native-scroll-physics = { path = "../harness-native-scroll-physics" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
+harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
+harness-native-ui-input = { path = "../harness-native-ui-input" }
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-motion = { path = "../harness-native-ui-motion" }
+harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
+harness-native-ui-state-api = { path = "../harness-native-ui-state-api" }
+harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
+harness-native-ui-draw = { path = "../harness-native-ui-draw" }
+harness-native-ui-prims = { path = "../harness-native-ui-prims" }
+harness-native-ui-view = { path = "../harness-native-ui-view" }
+hyperion-flecs-c = { path = "../../vendor/hyperion-flecs-c", features = ["pipeline", "script"] }
+harness-vt = { path = "../harness-vt" }
+harness-ghostty-config = { path = "../harness-ghostty-config" }
+serde_json = "1"
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+libc = "0.2"
+# den's typesetter: HarfRust shapes, read-fonts reads, ICU4X breaks, unicode-bidi orders. Pinned exactly as den pins them.
+harfrust = "=0.14.0"
+read-fonts = "=0.45.0"
+icu_segmenter = "=2.3.0"
+icu_properties = "=2.3.0"
+unicode-bidi = "=0.3.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+objc2-core-text = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
+
+[lints.rust]
+unsafe_code = "allow"

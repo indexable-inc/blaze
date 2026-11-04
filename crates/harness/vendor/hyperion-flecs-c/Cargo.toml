@@ -1,0 +1,19 @@
+[package]
+name = "hyperion-flecs-c"
+description = "Compiles the vendored flecs v4.1.6 amalgamation (vendor/flecs, custom build: core plus log, addons by feature) with cc, -O2, for the host and for wasm32-unknown-unknown (with the small C library in wasm-libc/)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+links = "denflecs"
+build = "build.rs"
+
+[features]
+system = []
+pipeline = ["system"]
+meta = []
+script = ["meta"]
+json = ["meta"]
+
+[build-dependencies]
+cc = "1"

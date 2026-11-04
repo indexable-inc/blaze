@@ -1,0 +1,79 @@
+// The primitives gallery: one of every primitive, composed only of primitives. It is a root Node tree filling the window;
+// the test in den-native (native_ui.rs) lays it out and paints it, and `DEN_SHOT_ONLY=gallery` draws it.
+// Loaded after prims.flecs.
+
+gallery : ui.Column, Plate {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 24, r: 24, t: 24, b: 24}
+
+  title : ui.Words, Strong {
+    Text: {s: "Primitives"}
+    TextStyle: {size: $size_h2, line: 28, role: 0, bold: 1}
+  }
+  rule : ui.Divider {}
+
+  rows_label : ui.Label { Text: {s: "ROW, SPACER, ICON, TEXT"} }
+  rows : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    orb : ui.Symbol { Icon: {glyph: "orb"} }
+    name : ui.Words { Text: {s: "A row: icon, words, then a spacer"} }
+    pad : ui.Spacer {}
+    close : ui.Symbol { Icon: {glyph: "close"} }
+  }
+
+  column_label : ui.Label { Text: {s: "COLUMN, BOX"} }
+  box : ui.Box {
+    Flex: {axis: Column, gap: 4, align: Start, justify: Start, wrap: false}
+    one : ui.Words { Text: {s: "A box is a column on a plate."} }
+    two : ui.Words, Muted { Text: {s: "Its children keep the order they are declared in."} }
+  }
+
+  stack_label : ui.Label { Text: {s: "ZSTACK, IMAGE"} }
+  stack : ui.ZStack {
+    Size: {w: {kind: Fixed, value: 96, min: 0, max: 0}, h: {kind: Fixed, value: 96, min: 0, max: 0}}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    picture : ui.Image {
+      Picture: {handle: "gallery"}
+      Size: {w: {kind: Fixed, value: 96, min: 0, max: 0}, h: {kind: Fixed, value: 96, min: 0, max: 0}}
+    }
+    badge : ui.Symbol, Accent { Icon: {glyph: "check"} }
+  }
+
+  controls_label : ui.Label { Text: {s: "BUTTON, TOGGLE, FIELD"} }
+  controls : ui.Row {
+    Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+    ok : ui.Button {
+      Action: {name: "gallery.ok"}
+      go : ui.Words { Text: {s: "Continue"} }
+    }
+    sw : ui.Toggle {
+      (On, Set)
+      Action: {name: "gallery.toggle"}
+      knob : ui.Words { Text: {s: "On"} }
+    }
+    field : ui.Field {
+      Placeholder: {text: "Ask anything", follow: ""}
+    }
+  }
+
+  list_label : ui.Label { Text: {s: "SCROLL, LIST"} }
+  scroll : ui.Scroll {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 96, min: 0, max: 0}}
+    items : ui.List {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+      a : ui.Words { Text: {s: "First row"} }
+      b : ui.Words { Text: {s: "Second row"} }
+      c : ui.Words { Text: {s: "Third row"} }
+      d : ui.Words { Text: {s: "Fourth row, past the clip"} }
+      e : ui.Words { Text: {s: "Fifth row, past the clip"} }
+    }
+  }
+}
+
+// An overlay anchored under the toggle: a tip that opens on its bottom side.
+gallery_tip : ui.Overlay {
+  (AnchoredTo, gallery.controls.sw)
+  Side: {edge: Bottom, dx: 0, dy: 6}
+  words : ui.Words { Text: {s: "Overlay, anchored to the toggle"} }
+}

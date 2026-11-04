@@ -1,0 +1,618 @@
+// harness-native's views, composites of den's primitives (prims.flecs). The world's objects become rows of these by key
+// (src/view.rs, harness_native_ui_view::for_each); layout, drawing and hit testing are the generic passes'.
+
+// The window, clear over the sidebar's vibrancy (src/window.rs): the sidebar full height beside the main card, which
+// runs to the window's top, right and bottom edges. The title-bar strip lies over both (hn.TitleBar).
+prefab hn.Window : ui.Row {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+}
+
+// The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar. The traffic lights sit on the sidebar's
+// vibrancy; the selected object's title sits on the main card's terminal ground, starting at the terminal's text inset.
+// The host sets its height and left inset (src/app.rs lay_chrome).
+prefab hn.TitleBar : ui.Row {
+  Clip
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  Padding: {l: 0, r: 16, t: 0, b: 0}
+  // Back to the Archive (after an object was opened from it; cmd+[ too). Zero wide while there is nowhere to go back to.
+  back : ui.Symbol {
+    Pressable
+    Action: {name: "nav:back"}
+    Fill: $tone_term_muted
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  title : ui.Words {
+    Fill: $tone_term_ink
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
+  }
+  // The shown object's directory and state, muted after its name (src/app.rs); dimmed with the title while the window is
+  // not key.
+  sub : ui.Words {
+    Fill: $tone_term_muted
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+}
+
+// The hairline between the sidebar and the main card: the only seam (no shadow, same ground on both sides).
+prefab hn.Seam : ui.Node {
+  Fill: $tone_seam
+  Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+}
+
+// The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
+// full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
+// width. The main card's left edge follows the clip's right edge.
+prefab hn.SideClip : ui.Column {
+  Clip
+  Fill: $tone_side_tint
+  Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+}
+
+// The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
+// title-bar strip; SafeAreaPadding adds the strip (the window's SafeAreaInset, set by the host in lay_chrome).
+// Its left margin is its children's (side_inset): the tree's clip runs to the sidebar's edge so a chevron can hang there.
+prefab hn.Sidebar : ui.Column {
+  Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: 0, r: $side_inset, t: 4, b: 10}
+  SafeAreaPadding: {l: false, r: false, t: true, b: false}
+}
+
+// The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
+// device row and the Archive pinned under it, and clips what does not fit.
+prefab hn.Tree : ui.Scroll {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+}
+
+// The sidebar's foot (the Archive row), in from its left edge by the margin the tree pads itself with.
+prefab hn.SideFoot : ui.Column {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+}
+
+// The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
+// springs from where the last one was drawn.
+prefab hn.Selection : ui.Node {
+  Background
+  MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
+  Fill: $tone_select
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  Motion: {omega: $pill_omega, zeta: $pill_zeta}
+}
+
+// The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a chevron on hover;
+// pressed, the Archive pane (hn.ArchivePane) takes the main card.
+prefab hn.ArchiveRow : ui.IconButton {
+  Action: {name: "archive:open"}
+  Tooltip: {text: "Archive"}
+  Fill: $tone_clear
+  // On the row's hover the box rises and grows (on the row's HoverAmt spring); when an object is archived it bounces.
+  icon : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+    HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
+  }
+}
+
+// A status dot: clear unless the host tints it (running breathes in the accent, lost is amber).
+prefab hn.Dot : ui.Node {
+  Fill: $tone_clear
+  Size: {w: {kind: Fixed, value: $dot_size, min: 0, max: 0}, h: {kind: Fixed, value: $dot_size, min: 0, max: 0}}
+  Shape: {radius: $dot_radius, n: 2, border: 0, feather: 0}
+}
+
+// A failure's badge: the exit code, small and red on a red wash. Clear, empty and unpadded otherwise.
+prefab hn.Badge : ui.Row {
+  Fill: $tone_clear
+  Shape: {radius: $badge_radius, n: 4, border: 0, feather: 0}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  code : ui.Line {
+    Fill: $tone_failed
+    TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
+  }
+}
+
+// A section label over the tree: the device's name (11 semibold, tertiary), how many objects, and a dot only while the
+// daemon is offline or connecting.
+prefab hn.DeviceRow : ui.Row {
+  Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+  Padding: {l: $label_inset, r: $row_pad, t: 0, b: 0}
+  name : ui.Lead, Faint {
+    TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+  }
+  dot : hn.Dot {}
+  spacer : ui.Spacer {}
+  count : ui.Line, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// A tree row's disclosure, Finder's: a chevron left of the row's icon that folds what is under the row, its hit target
+// the full slot (wider and taller than the glyph). The host gives it the chevron and the press only when the row has
+// rows under it (src/app/fold.rs); else it is an empty slot that keeps the icons in line.
+prefab hn.Disclosure : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  icon : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+  }
+}
+
+// A tree row's hanging disclosure: a layer over the whole row (out of its flow), padded so its slot ends at the row's
+// icon (the host sets the padding by depth: row_pad + depth * indent_step - disclose_w, negative at depth 0, where the
+// chevron hangs in the sidebar's margin).
+prefab hn.Hang : ui.Row {
+  Overlay
+  Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  disclose : hn.Disclosure {}
+}
+
+// A session (padded in by its depth, its disclosure hanging left of its icon): its kind's icon in the kind's colour, its name (13 medium), and on the right its shortcut (on
+// hover), a failure's badge and a running dot.
+prefab hn.ObjRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  hang : hn.Hang {}
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  name : ui.Lead, Ink {
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
+  }
+  spacer : ui.Spacer {}
+  // Room goes by priority: the hover-only shortcut gives way first, then the name (ui.Lead, -1); the badge never does.
+  meta : ui.Line, Faint {
+    LayoutPriority: {value: -2}
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+  badge : hn.Badge { LayoutPriority: {value: 1} }
+}
+
+// A shell run (or one of its pipeline stages) under its session (padded in by depth): a small dot tinted by how it went, its command
+// (12 regular Inter, secondary), and on the right how long it took (on hover, or always for a failure).
+prefab hn.RunRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $run_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  hang : hn.Hang {}
+  glyph : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  name : ui.Lead, Muted {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  // Room goes as on a session row: how long it took gives way first, then the command (ui.Lead, -1).
+  meta : ui.Line, Faint {
+    LayoutPriority: {value: -2}
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// The fold of a session's older runs: a quiet "Show 5 more" (or "Show fewer"), lined up with the runs' commands.
+prefab hn.MoreRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $more_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  hang : hn.Hang {}
+  glyph : ui.Node {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  name : ui.Lead, Faint {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+  }
+}
+
+// The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
+// bottom edges (the window's corners round it). The title-bar strip lies over its top (the host pads the card down by
+// the strip's height); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
+// per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
+// a split is a second node.
+prefab hn.Main : ui.Row, Plate {
+  Fill: $tone_term_ground
+  Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+  Shape: {radius: 0, n: 4, border: 0, feather: 0}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+  SafeAreaPadding: {l: false, r: false, t: true, b: false}
+}
+
+// A pane: clear on the card's terminal ground, no header (the title bar names what it shows).
+prefab hn.Pane : ui.Column {
+  PaneNode
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+}
+
+// The terminal primitive: the host draws its grid into this node's rect (src/term.rs) from its own components
+// (TermGrid, TermCursor, TermSelection, TermScroll, MarkedText, TermFocus; src/pane.rs). Its cells are GPU instances,
+// not entities.
+prefab hn.Terminal : ui.Node {
+  TermNode
+  Fill: $tone_clear
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+}
+
+// A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane.
+prefab hn.TermPane : hn.Pane {
+  term : hn.Terminal {}
+}
+
+// A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
+// they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
+prefab hn.RunPane : hn.Pane {
+  info : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 18, r: 18, t: 8, b: 0}
+    stages : ui.List {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    }
+  }
+  term : hn.Terminal {}
+}
+
+// A row of a pane's list (a run's stages, a group's runs): status dot, its id, its command in the code face, and on the
+// right how it ended and how long it ran. Pressed, it selects that run or stage.
+prefab hn.PaneRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+  Padding: {l: 8, r: 8, t: 0, b: 0}
+  dot : hn.Dot {}
+  id : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+  }
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  meta : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// The Archive (src/app/archive.rs): everything out of the live tree (the title bar names it and counts it). A search line (typed into while
+// the pane has the keyboard), the filter chips, then a scrolling list by day (Today, Yesterday, This week, Older):
+// sessions with their runs folded under them, runs, and at its foot the next page of older runs from the daemon.
+prefab hn.ArchivePane : hn.Pane {
+  head : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 18, r: 18, t: 14, b: 6}
+    search : ui.Row, Wash {
+      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $field_h, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 0, b: 0}
+      icon : ui.Symbol, Faint {
+        Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      }
+      text : ui.Lead, Muted {
+        TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+      }
+    }
+    chips : ui.List {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    }
+  }
+  // Lazy (SwiftUI's LazyVStack in a ScrollView): only the rows in view exist, recycled as they scroll; every row is
+  // $row_h tall (headings, items, the note and the foot alike).
+  list : ui.Scroll {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 10, r: 10, t: 0, b: 12}
+    rows : ui.LazyColumn {
+      Lazy: {count: 0, row: $row_h, overscan: 6}
+      Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+    }
+  }
+}
+
+// A filter chip over the Archive's list (All, Sessions, Runs, Failed): lit (the selection's pill tone, strong ink) when on.
+prefab hn.Chip : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $chip_radius, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chip_h, min: 0, max: 0}}
+  Padding: {l: 10, r: 10, t: 0, b: 0}
+  label : ui.Line, Muted {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0, weight: $weight_row}
+  }
+}
+
+// A day's heading in the Archive's list.
+prefab hn.ArchSection : ui.Row {
+  Flex: {axis: Row, gap: 0, align: End, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 5}
+  label : ui.Line, Faint {
+    TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+  }
+}
+
+// An archived session or run: indent, a disclosure (a session with runs under it), its kind's icon (a run's dot tinted by
+// how it went), its name or command on one line, where it ran (a run's session) or how many runs it holds, then its
+// status badge, how long it ran and when, in columns. Pressed, it opens in the main card (back returns here).
+prefab hn.ArchRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: 2, r: $row_pad, t: 0, b: 0}
+  indent : ui.Node {
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  disclose : hn.Disclosure {}
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  name : ui.Lead, Ink {
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
+  }
+  // Room goes by priority: where it ran gives way first, then the name (ui.Lead, -1); the status badge never does.
+  under : ui.Lead, Faint {
+    LayoutPriority: {value: -2}
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  status : hn.Badge { LayoutPriority: {value: 1} }
+  took : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Fixed, value: $arch_took_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    text : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  time : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Fixed, value: $arch_time_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    text : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+}
+
+// The Archive list's foot: the next page of older runs (pressed, or on its own once it scrolls into view).
+prefab hn.ArchMore : ui.Row {
+  Pressable
+  Action: {name: "arch:more"}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  label : ui.Line, Muted {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+  }
+}
+
+// The Archive's list when nothing is in it (or nothing matches).
+prefab hn.ArchNote : ui.Row {
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  label : ui.Line, Faint {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+}
+
+// The command palette (cmd+K): a card near the top of the window over everything.
+prefab hn.Palette : ui.Column {
+  Layer: {level: Overlay}
+  // A press beside the card closes it; the window dims under it.
+  Pressable
+  Action: {name: "pal:close"}
+  Fill: $tone_scrim
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 96, b: 0}
+  card : ui.Column, Plate {
+    Hoverable
+    Fill: $tone_card
+    Lift: {blur: 24, alpha: 0.5, dy: 8}
+    Shape: {radius: 12, n: 4, border: 1, feather: 0}
+    Size: {w: {kind: Fixed, value: 560, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 6, r: 6, t: 6, b: 6}
+    query : ui.Row {
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 38, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 0, b: 0}
+      text : ui.Words, Strong {
+        TextStyle: {size: 15, line: 20, role: 0, bold: 0}
+      }
+    }
+    rule : ui.Divider {}
+    items : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 4, b: 0}
+    }
+  }
+}
+
+// One palette entry.
+prefab hn.PalRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
+  Padding: {l: 10, r: 10, t: 0, b: 0}
+  // The entry's kind mark or command glyph (src/app.rs PalGlyph), in a 16 point box.
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  name : ui.Words, Ink {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  hint : ui.Words, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// Each kind's mark, what its session shows on a tree row, an Archive row and a palette entry (src/look.rs `kind_mark`
+// copies the kind's Mark or Icon and its Fill onto the row's glyph): Claude's starburst, OpenAI's blossom for Codex and
+// Cursor's cube as vector outlines (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
+prefab hn.Kind {
+  claude : ui.Icon {
+    Mark: {name: "claude"}
+    Fill: $tone_mark_claude
+  }
+  codex : ui.Icon {
+    Mark: {name: "openai"}
+    Fill: $tone_mark_ink
+  }
+  cursor : ui.Icon {
+    Mark: {name: "cursor"}
+    Fill: $tone_mark_ink
+  }
+  shell : ui.Symbol {
+    Icon: {glyph: ""}
+    Fill: $tone_kind_shell
+  }
+}
+
+// The theme: every tone, size and spring the host reads by role (src/look.rs `role`, `hn.Theme.<role>`), one child
+// each, valued from the tokens (00-tokens.flecs). Another look is another hn.Theme.
+prefab hn.Theme {
+  // Status: a dot's or an icon's.
+  running { Fill: $tone_running }
+  exited { Fill: $tone_exited }
+  failed { Fill: $tone_failed }
+  failed_wash { Fill: $tone_failed_wash }
+  lost { Fill: $tone_lost }
+  // Rows: the selected row's pill, nothing, the accent (a running dot), the tertiary and quaternary inks.
+  selected { Fill: $tone_select }
+  clear { Fill: $tone_clear }
+  accent { Fill: $tone_accent }
+  strong { Fill: $tone_ink_1 }
+  muted { Fill: $tone_ink_3 }
+  faint { Fill: $tone_ink_4 }
+  // The cute touch: a small warm colour per kind on its icon.
+  kind_claude { Fill: $tone_kind_claude }
+  kind_codex { Fill: $tone_kind_codex }
+  kind_cursor { Fill: $tone_kind_cursor }
+  kind_shell { Fill: $tone_kind_shell }
+  // Offscreen shots' stand-in for the vibrancy (src/shot.rs).
+  shot_ground { Fill: $tone_shot_ground }
+  // How long after it ended a finished run with no session leaves the tree for the Archive (seconds, as a width).
+  archive_after {
+    Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  // A tree level's indent, and a failure badge's padding while it shows.
+  indent {
+    Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  // A sidebar row's padding before its icon at depth 0, and the disclosure slot hanging left of the icon.
+  row_inset {
+    Size: {w: {kind: Fixed, value: $row_pad, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  disclose {
+    Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  badge_on {
+    Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
+  }
+  // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the sidebar's fold (the selection
+  // pill's is on hn.Selection).
+  breath {
+    Motion: {omega: $breath_omega, zeta: $breath_zeta}
+    Reveal: {alpha0: $breath_floor, dx: 0, dy: 0, scale0: 1}
+  }
+  turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
+  sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
+  lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+  // A tree row folding in or away (its height and opacity).
+  tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
+  // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), how far
+  // an edge with more beyond it fades, and the overlay knob shown while it moves.
+  tree_scroll {
+    Motion: {omega: $tree_glide_omega, zeta: $tree_glide_zeta}
+    Size: {w: {kind: Fixed, value: $tree_reveal_margin, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  tree_fade {
+    Size: {w: {kind: Fixed, value: $tree_fade_len, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  knob {
+    Fill: $tone_knob
+    Size: {w: {kind: Fixed, value: $knob_width, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+}
+
+// F3's debug overlay (src/app/stats.rs), Minecraft's: a layer over the main card (out of its flow), its plate in the top-right
+// corner under the title-bar strip. A monospace caption the host rewrites at about 4 Hz, then a 120-frame frame-time
+// sparkline the host draws as panels into `spark`'s rect (its Fill the bars, `hot`'s a frame over budget). Nothing in it
+// is Hoverable or Pressable, so it never takes the pointer.
+prefab hn.Stats : ui.Column {
+  Overlay
+  Flex: {axis: Column, gap: 0, align: End, justify: Start, wrap: false}
+  Padding: {l: 0, r: 10, t: 8, b: 0}
+  plate : ui.Column {
+    Fill: $tone_stats_plate
+    Shape: {radius: $radius_stats, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 6, align: Start, justify: Start, wrap: false}
+    Padding: {l: 9, r: 9, t: 7, b: 8}
+    text : ui.Words {
+      Fill: $tone_stats_ink
+      TextStyle: {size: $size_stats, line: $line_stats, role: 9, bold: 0}
+    }
+    spark : ui.Node {
+      StatsSpark: {budget_ms: 16.67}
+      Fill: $tone_stats_bar
+      Size: {w: {kind: Fixed, value: 240, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+      hot { Fill: $tone_stats_hot }
+    }
+  }
+}

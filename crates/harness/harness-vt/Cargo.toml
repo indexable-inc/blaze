@@ -1,0 +1,13 @@
+[package]
+name = "harness-vt"
+description = "The harness terminal state machine: Ghostty's libghostty-vt (its terminal core, over the C API) behind the small API the daemon and the native app use"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Safe bindings over libghostty-vt's C API. Its sys crate builds Ghostty from source with zig at the commit it pins
+# (ghostty-org/ghostty 521cf2c5d30bd48028ca61546c64e7913764073d, 2026-10-21); zig comes from scripts/zig (.cargo/config.toml).
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4" }
+harness-ghostty-config = { path = "../harness-ghostty-config" }
