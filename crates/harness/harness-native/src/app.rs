@@ -22,7 +22,7 @@ use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
 use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::{Icon, OneLine, Text, Truncate, TruncateMode};
+use harness_native_ui_text_api::{Icon, Mark, OneLine, Text, Truncate, TruncateMode};
 use harness_native_ui_view::{self as view, View, for_each};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -205,15 +205,11 @@ fn script_error(e: EntityView<'_>) -> Option<String> {
     .flatten()
 }
 
-fn kind_glyph(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "\u{2733}",
-        "codex" => "\u{25C6}",
-        "cursor" => "\u{25B2}",
-        "shell" => "\u{276F}",
-        "stage" => "\u{25C7}",
-        _ => "\u{2022}",
-    }
+/// A palette entry's glyph: a kind's mark (`look::kind_mark`), or a character in the muted ink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PalGlyph {
+    Kind(&'static str),
+    Char(&'static str),
 }
 
 fn clip_text(s: &str, n: usize) -> String {
@@ -627,7 +623,7 @@ impl App {
                 looks.session(me, row, e, hint.get(&e).filter(|&&i| i < 9).map(|i| format!("\u{2318}{}", i + 1)).unwrap_or_default());
             } else if let Some(p) = row.part("glyph") {
                 // A run: a small dot tinted by how it went, breathing while it runs.
-                p.icon(crate::look::RUN_ICON);
+                crate::look::show_glyph(p.entity(), crate::look::RUN_ICON);
                 set_if(p, match status {
                     "running" => looks.accent,
                     "lost" => looks.lost,
@@ -924,23 +920,24 @@ impl App {
     }
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
-    fn entries(&self) -> Vec<(String, &'static str, String, String, Do)> {
+    fn entries(&self) -> Vec<(String, PalGlyph, String, String, Do)> {
         let w = self.world.world_ref();
-        let mut out: Vec<(String, &'static str, String, String, Do)> = vec![
-            ("new-claude".into(), kind_glyph("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
-            ("new-codex".into(), kind_glyph("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
-            ("new-cursor".into(), kind_glyph("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
-            ("new-sh".into(), kind_glyph("shell"), "New sh".into(), String::new(), Do::New("shell")),
+        let mut out: Vec<(String, PalGlyph, String, String, Do)> = vec![
+            // cmd+N, cmd+T and cmd+shift+T's kinds.
+            ("new-claude".into(), PalGlyph::Kind("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
+            ("new-codex".into(), PalGlyph::Kind("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
+            ("new-cursor".into(), PalGlyph::Kind("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
+            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), "\u{2318}N".into(), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             let hint = if i < 9 { format!("\u{2318}{}", i + 1) } else { String::new() };
-            out.push((format!("obj{e}"), kind_glyph(model::kind_name(o)), name, hint, Do::Select(e)));
+            out.push((format!("obj{e}"), PalGlyph::Kind(model::kind_name(o)), name, hint, Do::Select(e)));
         }
         // The Archive, then what is in it (newest first; a run by its id and command).
         let view = model::archive_view(w);
-        out.push(("archive".into(), "\u{2630}", "Open Archive".into(), String::new(), Do::Select(view)));
+        out.push(("archive".into(), PalGlyph::Char(crate::look::ARCHIVE_ICON), "Open Archive".into(), String::new(), Do::Select(view)));
         for e in model::archived(w).into_iter().rev() {
             let o = w.entity_from_id(e);
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
@@ -948,7 +945,7 @@ impl App {
                 Some((n, _)) => format!("r{n}  {name}"),
                 None => name,
             };
-            out.push((format!("arc{e}"), kind_glyph(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
+            out.push((format!("arc{e}"), PalGlyph::Kind(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
         }
         // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
         // the daemon's search), newest first.
@@ -964,12 +961,12 @@ impl App {
             for (n, e) in runs {
                 let o = w.entity_from_id(e);
                 let cmd = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
-                out.push((format!("run{e}"), kind_glyph("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
+                out.push((format!("run{e}"), PalGlyph::Kind("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
             }
         }
-        out.push(("kill".into(), "\u{2715}", "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
-        out.push(("zoom-in".into(), "+", "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
-        out.push(("zoom-out".into(), "\u{2212}", "Zoom out".into(), "\u{2318}\u{2212}".into(), Do::Zoom(-1)));
+        out.push(("kill".into(), PalGlyph::Char("\u{2715}"), "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
+        out.push(("zoom-in".into(), PalGlyph::Char("+"), "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
+        out.push(("zoom-out".into(), PalGlyph::Char("\u{2212}"), "Zoom out".into(), "\u{2318}\u{2212}".into(), Do::Zoom(-1)));
         let q = self.palette.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
         out.retain(|(_, _, name, _, _)| fuzzy(&name.to_lowercase(), &q));
         out
@@ -1025,7 +1022,13 @@ impl App {
                         row.action(&format!("pal:{i}"));
                         set_if(row, if i == at { chosen } else { clear });
                         if let Some(p) = row.part("glyph") {
-                            p.text(g);
+                            match g {
+                                PalGlyph::Kind(k) => crate::look::kind_mark(w, p.entity(), k),
+                                PalGlyph::Char(c) => {
+                                    crate::look::show_glyph(p.entity(), c);
+                                    set_if(p, tone(w, "muted"));
+                                }
+                            }
                         }
                         if let Some(p) = row.part("name") {
                             p.text(&n);
@@ -1093,7 +1096,7 @@ impl App {
         }
         self.sync_terms();
         let mut d = Draw {
-            frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: f32::from(u8::from(self.dark)), live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0; 4] },
+            frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: f32::from(u8::from(self.dark)), live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0, 1.0, 1.0, 0.0] },
             // Clear: the window's vibrancy shows through everywhere the scene paints nothing.
             clear: [0.0; 4],
             ..Draw::default()
@@ -1405,6 +1408,15 @@ impl App {
                         }
                     }
                 }
+                PaintKind::Mark => {
+                    // A ui.Icon: its vector mark (icons.rs) drawn from its outline, optically sized in its box.
+                    let Some(mark) = e.try_cloned::<&Mark>().and_then(|m| crate::icons::mark(m.name.as_str())) else { continue };
+                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
+                    let side = laid.w.min(laid.h);
+                    let (r, uv) = crate::icons::place(mark, laid.x + (laid.w - side) * 0.5, laid.y + (laid.h - side) * 0.5, side);
+                    let col = [ink[0], ink[1], ink[2], ink[3] * p.alpha];
+                    d.glyph(GlyphInst { rect: r, uv, col_d: col, col_l: col, anim: [-1.0e9, 30.0, 0.0, 1.0], kind: [0.0, 0.0, 0.0, 1.0], band: mark.band, gdata: mark.gdata, ..GlyphInst::default() });
+                }
                 PaintKind::Picture | PaintKind::Ribbon => {}
             }
             // A HoverLift node: its glyphs risen and scaled about its centre by its row's hover and its bump.
@@ -1704,8 +1716,7 @@ impl RowLooks {
         let status = me.status_of(e);
         let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
         if let Some(p) = row.part("glyph") {
-            p.icon(crate::look::kind_icon(kind));
-            set_if(p, crate::look::tone(w, crate::look::kind_tone(kind)));
+            crate::look::kind_mark(w, p.entity(), kind);
         }
         if let Some(p) = row.part("meta") {
             p.text(&hint);

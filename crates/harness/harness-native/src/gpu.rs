@@ -1,8 +1,9 @@
 //! The Metal renderer: pipelines from the Slang metallib, instance rings, one pass.
 //!
 //! Copied from den-native's gpu.rs (github.com/andrewgazelka/den) and stripped to what harness draws: panels, glyphs and
-//! lines in paint order over a clear colour. den's backdrop blur chain, Apple glass, art cache, live textures, image atlas,
-//! outline glyphs, shader elements, mascots and 3D scenes are gone. Per-frame CPU-written buffers are rings of [`FRAMES`]
+//! lines in paint order over a clear colour, plus den's outline glyphs (Slug) for the brand marks (icons.rs), whose curves
+//! and bands are one static pair of buffers. den's backdrop blur chain, Apple glass, art cache, live textures, image atlas,
+//! shader elements, mascots and 3D scenes are gone. Per-frame CPU-written buffers are rings of [`FRAMES`]
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
 use objc2_quartz_core::CAMetalDrawable as _;
@@ -53,6 +54,9 @@ pub struct Renderer {
     sprite: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     pub atlas: Tex,
+    /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
+    curves: Buf,
+    bands: Buf,
     rings: [Option<Ring>; 4],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
@@ -94,6 +98,15 @@ impl Renderer {
         let ad = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA8Unorm, ATLAS_SIZE as usize, ATLAS_SIZE as usize, false) };
         ad.setUsage(MTLTextureUsage::ShaderRead);
         let atlas = dev.newTextureWithDescriptor(&ad).expect("atlas");
+        let marks = crate::icons::marks();
+        let fixed = |bytes: &[u8]| {
+            let b = dev.newBufferWithLength_options(bytes.len().max(256), MTLResourceOptions::StorageModeShared).expect("outline buffer");
+            // SAFETY: the buffer holds at least bytes.len() bytes of CPU-visible memory no GPU work uses yet.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr().cast::<u8>(), bytes.len()) };
+            b
+        };
+        let curves = fixed(bytemuck::cast_slice(&marks.curves));
+        let bands = fixed(bytemuck::cast_slice(&marks.bands));
         Self {
             panel: pipeline(&dev, &lib, "panel_vs", "panel_fs"),
             glyph: pipeline(&dev, &lib, "glyph_vs", "glyph_fs"),
@@ -103,6 +116,8 @@ impl Renderer {
             queue,
             sampler,
             atlas,
+            curves,
+            bands,
             rings: [None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
@@ -197,6 +212,8 @@ impl Renderer {
                         SegKind::Glyph => {
                             enc.setFragmentTexture_atIndex(Some(&self.atlas), slot(fs, "atlas"));
                             enc.setFragmentSamplerState_atIndex(Some(&self.sampler), slot(fs, "smp"));
+                            enc.setFragmentBuffer_offset_atIndex(Some(&self.curves), 0, slot(fs, "curves"));
+                            enc.setFragmentBuffer_offset_atIndex(Some(&self.bands), 0, slot(fs, "bands"));
                         }
                     }
                     enc.drawPrimitives_vertexStart_vertexCount_instanceCount(MTLPrimitiveType::TriangleStrip, 0, 4, sg.count as usize);

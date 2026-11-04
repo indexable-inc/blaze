@@ -502,8 +502,9 @@ prefab hn.PalRow : ui.Row {
   Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
   Padding: {l: 10, r: 10, t: 0, b: 0}
-  glyph : ui.Words, Muted {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  // The entry's kind mark or command glyph (src/app.rs PalGlyph), in a 16 point box.
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Ink {
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
@@ -511,6 +512,28 @@ prefab hn.PalRow : ui.Row {
   spacer : ui.Spacer {}
   hint : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// Each kind's mark, what its session shows on a tree row, an Archive row and a palette entry (src/look.rs `kind_mark`
+// copies the kind's Mark or Icon and its Fill onto the row's glyph): Claude's starburst, OpenAI's blossom for Codex and
+// Cursor's cube as vector outlines (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
+prefab hn.Kind {
+  claude : ui.Icon {
+    Mark: {name: "claude"}
+    Fill: $tone_mark_claude
+  }
+  codex : ui.Icon {
+    Mark: {name: "openai"}
+    Fill: $tone_mark_ink
+  }
+  cursor : ui.Icon {
+    Mark: {name: "cursor"}
+    Fill: $tone_mark_ink
+  }
+  shell : ui.Symbol {
+    Icon: {glyph: ""}
+    Fill: $tone_kind_shell
   }
 }
 

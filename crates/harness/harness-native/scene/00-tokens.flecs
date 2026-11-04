@@ -147,6 +147,11 @@ export const tone_kind_codex = Fill: {dark: {0.306, 0.792, 0.741, 1}, light: {0.
 export const tone_kind_cursor = Fill: {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
 export const tone_kind_shell = Fill: {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
 
+// The brand marks' fills (hn.Kind): Claude's orange (#D97757, its brand hex) in both appearances; OpenAI's and Cursor's
+// marks are monochrome, in the strong ink, so they turn with the appearance.
+export const tone_mark_claude = Fill: {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
+export const tone_mark_ink = Fill: {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+
 prefab Strong {
   Fill: $tone_ink_1
 }

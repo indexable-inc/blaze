@@ -10,7 +10,7 @@ use harness_native_ui_look_api::{Edge, Fill, Ribbon};
 use harness_native_ui_layout_api::{Background, Overlay};
 use harness_native_ui_motion_api::{Drawn, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
-use harness_native_ui_text_api::{Icon, Picture, Text};
+use harness_native_ui_text_api::{Icon, Mark, Picture, Text};
 
 /// A clip rectangle in window points.
 #[derive(Clone, Copy)]
@@ -113,6 +113,8 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
     let kids_affine = mine.then(Affine { s: 1.0, tx: frame.x - laid.x, ty: frame.y - laid.y });
     let kind = if e.has(Text::id()) {
         Some(PaintKind::Glyphs)
+    } else if e.has(Mark::id()) {
+        Some(PaintKind::Mark)
     } else if e.has(Icon::id()) {
         Some(PaintKind::Icon)
     } else if e.has(Picture::id()) {

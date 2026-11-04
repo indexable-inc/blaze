@@ -9,6 +9,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
 use harness_native_ui_look_api::Fill;
 use harness_native_ui_motion_api::{Motion, Reveal};
+use harness_native_ui_text_api::{Icon, Mark};
 use harness_native_ui_view as view;
 
 /// A running status dot's breath: a spring chasing 0 and 1 in turn (`up` its current target).
@@ -158,13 +159,41 @@ pub fn kind_icon(kind: &str) -> &'static str {
     }
 }
 
-/// A kind's icon tone (a theme role): a small warm colour each.
-pub fn kind_tone(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "kind_claude",
-        "codex" => "kind_codex",
-        "cursor" => "kind_cursor",
-        _ => "kind_shell",
+/// Show kind `kind`'s mark on `part` (a row's glyph, a 16 point box): what the kind's prefab `hn.Kind.<kind>` holds, a
+/// vector `Mark` (ui.Icon: Claude, Codex, Cursor) or a Nerd Font `Icon` (ui.Symbol: a shell), in the prefab's Fill. A
+/// kind with no prefab (a pipeline stage, a process) gets [`kind_icon`] in the shell's tone. Written only on change.
+pub fn kind_mark(w: WorldRef<'_>, part: EntityView<'_>, kind: &str) {
+    let pre = view::prefab(w, &format!("hn.Kind.{kind}"));
+    let fill = pre.and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| tone(w, "kind_shell"));
+    match pre.and_then(|p| p.try_cloned::<&Mark>()) {
+        Some(m) => show_mark(part, m),
+        None => {
+            let icon = pre.and_then(|p| p.try_cloned::<&Icon>()).filter(|i| !i.glyph.as_str().is_empty());
+            show_glyph(part, icon.as_ref().map_or(kind_icon(kind), |i| i.glyph.as_str()));
+        }
+    }
+    if part.try_cloned::<&Fill>() != Some(fill) {
+        part.set(fill);
+    }
+}
+
+/// `part` drawn as vector mark `m` (its `Icon`, if any, no longer drawn).
+fn show_mark(part: EntityView<'_>, m: Mark) {
+    if part.try_cloned::<&Mark>().as_ref() != Some(&m) {
+        part.set(m);
+    }
+    if part.has(Icon::id()) {
+        part.remove(Icon::id());
+    }
+}
+
+/// `part` drawn as `glyph` set in type (a Nerd Font icon, or a character), its `Mark`, if any, gone.
+pub fn show_glyph(part: EntityView<'_>, glyph: &str) {
+    if part.has(Mark::id()) {
+        part.remove(Mark::id());
+    }
+    if part.try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != glyph) {
+        part.set(Icon { glyph: glyph.into() });
     }
 }
 
