@@ -268,13 +268,15 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let precise = event.hasPreciseScrollingDeltas();
-            let dy = event.scrollingDeltaY() as f32;
+            let ev = crate::app::Wheel {
+                dx: event.scrollingDeltaX() as f32,
+                dy: event.scrollingDeltaY() as f32,
+                precise: event.hasPreciseScrollingDeltas(),
+                phase: event.phase().0 as usize,
+                momentum: event.momentumPhase().0 as usize,
+            };
             let m = mods_of(event.modifierFlags());
-            with(|st| {
-                let z = st.app.zoom();
-                st.app.wheel(if precise { dy / z } else { dy }, precise, m);
-            });
+            with(|st| st.app.scroll_wheel(ev, m));
             wake();
         }
 

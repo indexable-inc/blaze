@@ -48,6 +48,12 @@ export const turn_zeta = 0.78
 export const pill_omega = 32
 export const pill_zeta = 0.86
 export const sidebar_omega = 24
+// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
+export const tree_glide_omega = 22
+export const tree_glide_zeta = 1
+export const tree_reveal_margin = 8
+export const tree_fade_len = 22
+export const knob_width = 6
 export const sidebar_zeta = 1
 // The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
 export const lights_omega = 26
@@ -78,6 +84,7 @@ export const tone_wash = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.045}}
 export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
+export const tone_knob = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_select = Fill: {dark: {0.580, 0.600, 1.0, 0.16}, light: {0.369, 0.384, 0.902, 0.13}}
 // Nothing: a node that paints no fill.
 export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}

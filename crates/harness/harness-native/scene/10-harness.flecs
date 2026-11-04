@@ -49,8 +49,7 @@ prefab hn.Sidebar : ui.Column {
 
 // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
 // device row and the Archive pinned under it, and clips what does not fit.
-prefab hn.Tree : ui.Column {
-  Clip
+prefab hn.Tree : ui.Scroll {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
@@ -438,4 +437,17 @@ prefab hn.Theme {
   pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
   sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
   lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+  // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), how far
+  // an edge with more beyond it fades, and the overlay knob shown while it moves.
+  tree_scroll {
+    Motion: {omega: $tree_glide_omega, zeta: $tree_glide_zeta}
+    Size: {w: {kind: Fixed, value: $tree_reveal_margin, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  tree_fade {
+    Size: {w: {kind: Fixed, value: $tree_fade_len, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  knob {
+    Fill: $tone_knob
+    Size: {w: {kind: Fixed, value: $knob_width, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
 }

@@ -29,7 +29,7 @@ struct PanelInst
     float4 fx2;      // shadow dy, opacity, kind parameter, corner mask (bits 1 TL, 2 TR, 4 BR, 8 BL: square corner)
     float4 lens;     // liquid glass: bevel (points, 0 none), magnify, dispersion, rim light; a caret's clip rect
     float4 fx3;      // frosted plate: sheen (the inner highlight's alpha), saturation (0: the frame's); image: 0, 0, peak, headroom
-    float4 clip;     // the band it shows in: top, foot (points, y down; a foot of 0 is none), 0, 0
+    float4 clip;     // the band it shows in: top, foot (points, y down; a foot of 0 is none), then how far it fades in from each (points; 0: a hard cut)
 };
 
 
@@ -54,6 +54,7 @@ struct GlyphInst
     float4 band;     // outline: band scale x, scale y, offset x, offset y
     uint4 gdata;     // outline: band header start in `bands`, greatest vertical (x) band, greatest horizontal (y) band, 0
     float4 fx;       // expressive text: its motion's start (frame time), code (motion | 16 glow | place << 5), swell x (points right of rect.x), em (points)
+    float4 fade;     // how far it fades in from its band's top and foot (points; 0: a hard cut), 0, 0
 };
 
 
@@ -128,11 +129,20 @@ float4 pick(float dark, float4 d, float4 l)
 }
 
 // How much of a pixel at `y` (points) is inside the band `clip` (top, foot; a foot of 0 is none): a cut across, its edge
-// antialiased on the pixel grid, that leaves what it keeps as it was.
-float in_band(float y, float4 clip, float scale)
+// antialiased on the pixel grid, that leaves what it keeps as it was. `fade` (top, foot; points) softens each cut into a
+// ramp that long, where a scroll has more beyond that edge.
+float in_band(float y, float4 clip, float2 fade, float scale)
 {
     float a = saturate((y - clip.x) * scale + 0.5);
-    return clip.y > 0.0 ? a * saturate((clip.y - y) * scale + 0.5) : a;
+    if (fade.x > 0.0)
+        a *= smoothstep(0.0, 1.0, saturate((y - clip.x) / fade.x));
+    if (clip.y > 0.0)
+    {
+        a *= saturate((clip.y - y) * scale + 0.5);
+        if (fade.y > 0.0)
+            a *= smoothstep(0.0, 1.0, saturate((clip.y - y) / fade.y));
+    }
+    return a;
 }
 
 // ---- panels --------------------------------------------------------------------------------------------------
@@ -165,7 +175,7 @@ float4 panel_fs(PanelV v, ConstantBuffer<Frame> frame, StructuredBuffer<PanelIns
 {
     PanelInst p = insts[v.inst];
     float y = p.rect.y + p.rect.w * 0.5 + v.local.y;
-    return panel_shade(v, frame, p) * in_band(y, p.clip, frame.scale);
+    return panel_shade(v, frame, p) * in_band(y, p.clip, p.clip.zw, frame.scale);
 }
 
 float4 panel_shade(PanelV v, ConstantBuffer<Frame> frame, PanelInst p)
@@ -732,6 +742,7 @@ struct GlyphV
     float colour : TEXCOORD3;
     nointerpolation float4 clip : TEXCOORD4;
     float y : TEXCOORD5;
+    nointerpolation float2 fade : TEXCOORD6;
 };
 
 [shader("vertex")]
@@ -756,6 +767,7 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     o.dark = frame.dark;
     o.colour = g.kind.x;
     o.clip = g.clip;
+    o.fade = g.fade.xy;
     float2 pt = g.rect.xy + c * g.rect.zw + float2(0, rise);
     o.pos = float4(to_ndc(pt, frame.view), 0, 1);
     o.uv = lerp(g.uv.xy, g.uv.zw, c);
@@ -767,7 +779,7 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
 float4 glyph_fs(GlyphV v, ConstantBuffer<Frame> frame, Texture2D<float4> atlas, SamplerState smp)
 {
     // The atlas is premultiplied RGBA: a colour glyph's own pixels, or a plain glyph's coverage as white.
-    float4 t = atlas.SampleLevel(smp, v.uv, 0) * in_band(v.y, v.clip, frame.scale);
+    float4 t = atlas.SampleLevel(smp, v.uv, 0) * in_band(v.y, v.clip, v.fade, frame.scale);
     if (v.colour > 0.5)
         return t * v.color.a;
     // Coverage is gamma-adjusted per appearance: light text on dark reads thin and is boosted, dark on light is thinned.

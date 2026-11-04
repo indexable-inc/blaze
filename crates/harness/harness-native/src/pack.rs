@@ -52,8 +52,9 @@ pub struct PanelInst {
     /// 0, 0. Image (kind 6): 0, 0, an HDR picture's peak (linear, 0 or 1 for SDR), the display's headroom. Meter ring
     /// (kind 3): where its arc starts in turns past twelve (a spinner moves it), 1 for round ends (0 square), 0, 0.
     pub fx3: [f32; 4],
-    /// The band it shows in, cut across at the pixel: top, foot (view points; a foot of 0 is none), 0, 0. What it keeps
-    /// is drawn as it would be whole (a card going under the title bar keeps its sides, not a new rounded top).
+    /// The band it shows in, cut across at the pixel: top, foot (view points; a foot of 0 is none), then how far it fades
+    /// in from each (points; 0 a hard cut: a scroll's edge with more beyond it fades). What it keeps is drawn as it would
+    /// be whole (a card going under the title bar keeps its sides, not a new rounded top).
     pub clip: [f32; 4],
 }
 
@@ -146,5 +147,7 @@ pub struct GlyphInst {
     /// for glow, its place in its words from 32 up), where its words swell from (x, points right of `rect.x`), and its
     /// em (points). All 0 for plain text.
     pub fx: [f32; 4],
+    /// How far it fades in from its band's top and foot (points; 0: a hard cut), 0, 0.
+    pub fade: [f32; 4],
 }
 

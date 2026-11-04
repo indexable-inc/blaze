@@ -29,6 +29,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 mod panes;
+mod sidebar;
+pub use sidebar::Wheel;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
@@ -157,6 +159,8 @@ pub struct App {
     pub dark: bool,
     /// The selection pill's spring between rows.
     pill: crate::look::Pill,
+    /// The sidebar tree's scroll (src/app/sidebar.rs).
+    tree: sidebar::TreeScroll,
     /// The sidebar's fold (cmd+S): open or not, and its spring (0 folded away to 1 open); the traffic lights fade with it.
     side_open: bool,
     side_x: harness_native_api::spring::Spring,
@@ -323,6 +327,7 @@ impl App {
             chrome_laid: None,
             dark: true,
             pill: crate::look::Pill::default(),
+            tree: sidebar::TreeScroll::default(),
             side_open: true,
             side_x: harness_native_api::spring::Spring::at(1.0),
             corner_x: harness_native_api::spring::Spring::at(0.0),
@@ -951,6 +956,7 @@ impl App {
         self.pill.dt = dt;
         self.step_sidebar(dt);
         self.lay_chrome(z);
+        self.step_tree_scroll(dt);
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
@@ -1306,9 +1312,19 @@ impl App {
                 for glyph in &mut d.glyphs[ng..] {
                     glyph.clip[..2].copy_from_slice(&band);
                 }
+                // Cut to the tree's band: soft at an edge with more of the tree beyond it.
+                if let Some(fade) = self.tree_fade(&p) {
+                    for panel in &mut d.panels[np..] {
+                        panel.clip[2..].copy_from_slice(&fade);
+                    }
+                    for glyph in &mut d.glyphs[ng..] {
+                        glyph.fade[..2].copy_from_slice(&fade);
+                    }
+                }
             }
             let _ = Level::Base;
         }
+        self.emit_tree_knob(d);
         if !lit {
             self.pill.lost();
         }
