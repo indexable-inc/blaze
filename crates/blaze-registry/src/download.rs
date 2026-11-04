@@ -265,7 +265,19 @@ fn is_unpacked(dst: &Path) -> anyhow::Result<bool> {
                 .with_context(|| format!("failed to remove `{}`", dst.display()))?;
             Ok(false)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        // No `.cargo-ok`: either nothing is there, or an unpacking that stopped (a Ctrl-C, a
+        // crash, a refused archive, a cargo killed mid-unpack in a shared registry) left files,
+        // which are removed so the unpacking, whose files are each created new, starts clean.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(dst) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(dst),
+                Ok(_) => std::fs::remove_file(dst),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+            .with_context(|| format!("failed to remove `{}`, an unpacking that did not finish", dst.display()))?;
+            Ok(false)
+        }
         Err(e) => bail!("unable to read .cargo-ok file at {ok:?}: {e}"),
     }
 }
@@ -326,18 +338,20 @@ fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow
     #[cfg(not(unix))]
     let mask = 0;
     let rules = blaze_fetch::unpack::Rules {
-        top: Some(prefix),
+        names: blaze_fetch::unpack::NameRules {
+            top: Some(prefix),
+            fold: false,
+            twice: blaze_fetch::unpack::Twice::Replace,
+            reserved: &[],
+            most_path: usize::MAX,
+        },
         links: false,
-        fold: false,
-        twice: blaze_fetch::unpack::Twice::Replace,
         modes: blaze_fetch::unpack::Modes::Cargo { mask },
-        reserved: &[],
         skip: &[PACKAGE_SOURCE_LOCK],
         include: &include,
         sync: false,
         most_entries: u64::MAX,
         most_bytes: u64::MAX,
-        most_path: usize::MAX,
     };
     match blaze_fetch::unpack::unpack(LimitErrorReader { inner: gz, left: limit }, dst, &rules) {
         Ok(unpacked) => Ok(unpacked.bytes),

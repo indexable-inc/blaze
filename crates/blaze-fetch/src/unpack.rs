@@ -10,8 +10,9 @@
 //!   [`Rules::most_path`]; no top-level name [`Rules::reserved`] holds, compared as a
 //!   case-insensitive disk compares;
 //! - no two entries that are one name on the disk, nor an entry under a file or link: equal
-//!   spellings, and with [`Rules::fold`] spellings a case- and normalization-insensitive disk
-//!   (APFS) takes as one ([`crate::tree::fold`]); with [`Twice::Replace`] a file listed again
+//!   spellings, and with [`Rules::fold`] spellings that Unicode's canonical caseless match
+//!   (NFD, full case folding, NFD; [`crate::tree::fold`]) takes as one, meant to cover what a
+//!   case- and normalization-insensitive disk (APFS) takes as one; with [`Twice::Replace`] a file listed again
 //!   replaces the first, as tar does;
 //! - regular files and directories, and with [`Rules::links`] symbolic links whose target stays
 //!   inside and passes through no other link of the archive (names compared as above), and hard
@@ -39,20 +40,30 @@ use crate::{
     tree::{Entry, Kind, fold},
 };
 
-/// What [`unpack`] holds an archive to, as the module says.
-pub struct Rules<'a> {
+/// The rules of an archive's names, which [`Names`] holds each entry to with no IO: the one
+/// home of them, for [`unpack`] and for a reader that keeps the files in memory (blaze-cargo's
+/// `serve/fetch/archive.rs`).
+#[derive(Clone, Copy)]
+pub struct NameRules<'a> {
     /// The top directory every entry is under, or none to take the first entry's.
     pub top: Option<&'a str>,
-    /// Whether symbolic and hard links are kept (else refused).
-    pub links: bool,
-    /// Whether names are compared as a case- and normalization-insensitive disk does.
+    /// Whether names are compared folded ([`crate::tree::fold`]).
     pub fold: bool,
     /// What a file listed twice is.
     pub twice: Twice,
-    /// The modes (and times) written.
-    pub modes: Modes,
     /// Top-level names refused (compared folded), such as a mark the caller writes beside.
     pub reserved: &'a [&'a str],
+    /// The longest name or link target, in bytes.
+    pub most_path: usize,
+}
+
+/// What [`unpack`] holds an archive to, as the module says.
+pub struct Rules<'a> {
+    pub names: NameRules<'a>,
+    /// Whether symbolic and hard links are kept (else refused).
+    pub links: bool,
+    /// The modes (and times) written.
+    pub modes: Modes,
     /// File names dropped wherever they are (a `.crate`'s `.cargo-ok`).
     pub skip: &'a [&'a str],
     /// Whether an entry, by its path under the top, is unpacked; one left out is skipped.
@@ -61,7 +72,6 @@ pub struct Rules<'a> {
     pub sync: bool,
     pub most_entries: u64,
     pub most_bytes: u64,
-    pub most_path: usize,
 }
 
 /// What a file listed twice is.
@@ -128,10 +138,9 @@ pub fn unpack(from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacke
     let mut state = State {
         into,
         rules,
-        top: None,
+        names: Names::new(rules.names),
         entries: 0,
         bytes: 0,
-        names: BTreeMap::new(),
         dirs: BTreeSet::new(),
         modes: Vec::new(),
         out: BTreeMap::new(),
@@ -150,12 +159,9 @@ pub fn unpack(from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacke
 struct State<'r, 'a> {
     into: &'r Path,
     rules: &'r Rules<'a>,
-    top: Option<String>,
+    names: Names<'a>,
     entries: u64,
     bytes: u64,
-    /// Every name the archive makes on disk, an entry or a directory one is under, by its key
-    /// ([`State::key`]): how it is spelled, and whether it is a directory.
-    names: BTreeMap<String, (String, bool)>,
     /// Every directory under the root made or found, as spelled: each checked once.
     dirs: BTreeSet<String>,
     /// The directories the archive lists with [`Modes::Cargo`]: each one's mode, set at the end.
@@ -164,14 +170,32 @@ struct State<'r, 'a> {
     out: BTreeMap<String, Entry>,
     /// Links, made once every entry is in.
     links: Vec<(String, String)>,
-    /// Every link's key, for [`State::stays_in`].
+    /// Every link's key ([`Names::key`]), for [`State::stays_in`].
     link_keys: BTreeSet<String>,
     buffer: Vec<u8>,
 }
 
-impl State<'_, '_> {
+/// The names an archive's entries take, held to [`NameRules`] as each comes, with no IO.
+pub struct Names<'a> {
+    rules: NameRules<'a>,
+    top: Option<String>,
+    /// Every name the archive makes, an entry or a directory one is under, by its key
+    /// ([`Names::key`]): how it is spelled, and whether it is a directory.
+    names: BTreeMap<String, (String, bool)>,
+}
+
+impl<'a> Names<'a> {
+    pub fn new(rules: NameRules<'a>) -> Names<'a> {
+        Names { rules, top: None, names: BTreeMap::new() }
+    }
+
+    /// How `path`, a name claimed before, is spelled in the archive, if it was.
+    pub fn spelled(&self, path: &str) -> Option<&str> {
+        self.names.get(&self.key(path)).map(|(spelled, _)| spelled.as_str())
+    }
+
     /// `path` as the disk compares it.
-    fn key(&self, path: &str) -> String {
+    pub fn key(&self, path: &str) -> String {
         match self.rules.fold {
             true => fold(path),
             false => path.to_owned(), // alloc: once a name compared
@@ -180,7 +204,7 @@ impl State<'_, '_> {
 
     /// `name`, an entry's path in the archive, as a path under the root: its top directory
     /// taken off. None for the top directory itself.
-    fn under_top(&mut self, name: &[u8]) -> Result<Option<String>, UnpackRefused> {
+    pub fn under_top(&mut self, name: &[u8]) -> Result<Option<String>, UnpackRefused> {
         let shown = || String::from_utf8_lossy(name).into_owned();
         if name.len() > self.rules.most_path {
             return Err(at(&shown(), format!("is {} bytes, more than {}", name.len(), self.rules.most_path)));
@@ -216,7 +240,7 @@ impl State<'_, '_> {
 
     /// `path` taken as a name the archive makes, a directory when `dir`, and every directory
     /// it is under: whether it replaces a file listed before ([`Twice::Replace`]).
-    fn claim(&mut self, path: &str, dir: bool) -> Result<bool, UnpackRefused> {
+    pub fn claim(&mut self, path: &str, dir: bool) -> Result<bool, UnpackRefused> {
         for (end, _) in path.match_indices('/') {
             self.name(&path[..end], true)?;
         }
@@ -239,7 +263,16 @@ impl State<'_, '_> {
             _ => Err(at(spelled, "is in the archive as a directory and as a file or link (something is under a file or link)")),
         }
     }
+}
 
+/// Whether an entry is a directory: its type says so, or, as tar reads an old (pre-ustar) or
+/// GNU header, its name ends in `/` and it is no link.
+pub fn is_dir_entry(header: &tar::Header, name: &[u8]) -> bool {
+    let kind = header.entry_type();
+    kind.is_dir() || (!kind.is_hard_link() && !kind.is_symlink() && header.as_ustar().is_none() && name.ends_with(b"/"))
+}
+
+impl State<'_, '_> {
     /// Each directory of `dir` (a path under the root, or empty for the root) made, or checked
     /// to be one: never a link, as none is made before every directory is.
     fn make_dirs(&mut self, dir: &str) -> Result<(), UnpackRefused> {
@@ -274,13 +307,14 @@ impl State<'_, '_> {
         if kind.is_pax_global_extensions() {
             return Ok(());
         }
+        let is_dir = is_dir_entry(entry.header(), &entry.path_bytes());
         self.entries += 1;
         if self.entries > self.rules.most_entries {
             return Err(whole(format!("the archive has more than {} entries", self.rules.most_entries)));
         }
         let name = entry.path_bytes().into_owned(); // alloc: an entry's name, once an entry
-        let Some(path) = self.under_top(&name)? else {
-            if kind.is_dir() {
+        let Some(path) = self.names.under_top(&name)? else {
+            if is_dir {
                 return Ok(());
             }
             return Err(at(&String::from_utf8_lossy(&name), "is the top of the archive, and no directory"));
@@ -292,8 +326,8 @@ impl State<'_, '_> {
             return Ok(());
         }
         let header_mode = entry.header().mode().map_err(|e| at(&path, format!("has no mode: {e}")))?;
-        if kind.is_dir() {
-            self.claim(&path, true)?;
+        if is_dir {
+            self.names.claim(&path, true)?;
             self.make_dirs(&path)?;
             if let Modes::Cargo { .. } = self.rules.modes {
                 self.modes.push((path, header_mode));
@@ -304,7 +338,7 @@ impl State<'_, '_> {
         if !is_file && !(self.rules.links && (kind.is_hard_link() || kind.is_symlink())) {
             return Err(at(&path, format!("is a {kind:?} entry, which this archive may not hold")));
         }
-        let replaces = self.claim(&path, false)?;
+        let replaces = self.names.claim(&path, false)?;
         self.make_dirs(Self::parent(&path))?;
         let dest = self.into.join(&path);
         if replaces {
@@ -324,8 +358,8 @@ impl State<'_, '_> {
             self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
         } else if kind.is_hard_link() {
             let target = entry.link_name_bytes().ok_or_else(|| at(&path, "is a hard link to nothing"))?;
-            let Some(from) = self.under_top(&target)? else { return Err(at(&path, "is a hard link to the top directory")) };
-            let source = self.names.get(&self.key(&from)).map(|(spelled, _)| spelled.as_str()).and_then(|it| self.out.get(it));
+            let Some(from) = self.names.under_top(&target)? else { return Err(at(&path, "is a hard link to the top directory")) };
+            let source = self.names.spelled(&from).and_then(|it| self.out.get(it));
             let Some(source) = source.filter(|it| it.kind != Kind::Link) else {
                 return Err(at(&path, format!("is a hard link to `{from}`, which is no file the archive wrote before it")));
             };
@@ -341,7 +375,7 @@ impl State<'_, '_> {
         } else {
             let target = entry.link_name_bytes().ok_or_else(|| at(&path, "is a link to nothing"))?;
             let target = String::from_utf8(target.into_owned()).map_err(|_| at(&path, "is a link whose target is not UTF-8"))?;
-            self.link_keys.insert(self.key(&path));
+            self.link_keys.insert(self.names.key(&path));
             self.links.push((path, target));
         }
         Ok(())
@@ -358,7 +392,16 @@ impl State<'_, '_> {
     /// `from` written to `dest`, a new file, hashed as it goes; its mode (and time) set as
     /// [`Rules::modes`] says, and synced when [`Rules::sync`]: its BLAKE3 and length.
     fn write_new(&mut self, dest: &Path, from: &mut impl Read, exec: bool, mode: u32, mtime: Option<u64>) -> Result<(Blake3, u64), String> {
-        let mut out = OpenOptions::new().write(true).create_new(true).open(dest).map_err(|e| format!("can't be made: {e}"))?;
+        let open = || OpenOptions::new().write(true).create_new(true).open(dest);
+        let mut out = match open() {
+            // Another spelling of one name on a case-insensitive disk (`README` and `readme` on
+            // APFS), which names alone don't fold under these rules: the later replaces it, as
+            // tar writes it.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && self.rules.names.twice == Twice::Replace => {
+                fs::remove_file(dest).and_then(|()| open()).map_err(|e| format!("is another spelling of a file before it, which can't be replaced: {e}"))?
+            }
+            opened => opened.map_err(|e| format!("can't be made: {e}"))?,
+        };
         let mut hasher = blaze_ids::b3::Hasher::new();
         let mut len = 0u64;
         loop {
@@ -389,47 +432,55 @@ impl State<'_, '_> {
         Ok((Blake3(hasher.finalize()), len))
     }
 
-    /// Whether `target`, the link's at `path`, stays under the root when resolved from its
-    /// directory, passing through no other link of the archive on the way (names compared as
-    /// [`State::key`] does): a link through a link could climb out by a `..` the first hides.
-    fn stays_in(&self, path: &str, target: &str) -> bool {
-        if target.is_empty() || target.len() > self.rules.most_path || target.contains(['\\', '\0']) || target.starts_with('/') {
-            return false;
+    /// Where `target`, the link's at `path`, lands under the root when resolved from its
+    /// directory by its text, as a path under the root ("" for the root): none when it climbs
+    /// out, or passes through another link of the archive on the way (names compared as
+    /// [`Names::key`] does), as a link through a link could climb out by a `..` the first hides.
+    fn stays_in(&self, path: &str, target: &str) -> Option<String> {
+        if target.is_empty() || target.len() > self.rules.names.most_path || target.contains(['\\', '\0']) || target.starts_with('/') {
+            return None;
         }
         let mut now: Vec<&str> = path.split('/').collect(); // alloc: once a link
         now.pop();
         let parts: Vec<&str> = target.split('/').filter(|it| !it.is_empty() && *it != ".").collect(); // alloc: as above
         for (i, part) in parts.iter().enumerate() {
             if *part == ".." {
-                if now.pop().is_none() {
-                    return false;
-                }
+                now.pop()?;
                 continue;
             }
             now.push(part);
-            if i + 1 < parts.len() && self.link_keys.contains(&self.key(&now.join("/"))) {
-                return false;
+            if i + 1 < parts.len() && self.link_keys.contains(&self.names.key(&now.join("/"))) {
+                return None;
             }
         }
-        true
+        Some(now.join("/"))
     }
 
     fn finish(mut self) -> Result<Unpacked, UnpackRefused> {
         let links = std::mem::take(&mut self.links);
+        let mut lands: Vec<String> = Vec::with_capacity(links.len()); // alloc: once an archive
         for (path, target) in &links {
-            if !self.stays_in(path, target) {
+            let Some(land) = self.stays_in(path, target) else {
                 return Err(at(path, format!("is a link to `{target}`, which is not inside the archive or goes through another link")));
-            }
+            };
             symlink(target, &self.into.join(path)).map_err(|e| at(path, format!("can't be linked to `{target}`: {e}")))?;
+            lands.push(land);
         }
-        // Each link resolved by the system, which must land under the root.
+        // Each link resolved by the system, which must land where its text says: the root
+        // joined with that, or, when that is itself a link of the archive (checked as its own),
+        // somewhere under the root.
         if !links.is_empty() {
             let root = fs::canonicalize(self.into).map_err(|e| whole(format!("resolving {}: {e}", self.into.display())))?;
-            for (path, target) in &links {
+            for ((path, target), land) in links.iter().zip(&lands) {
+                let to_link = self.link_keys.contains(&self.names.key(land));
                 match fs::canonicalize(self.into.join(path)) {
-                    Ok(real) if real.starts_with(&root) => {}
+                    Ok(real) if real == root.join(land) => {}
+                    Ok(real) if to_link && real.starts_with(&root) => {}
                     Ok(real) => {
-                        return Err(at(path, format!("is a link to `{target}`, which the disk resolves to {}, outside the archive", real.display())));
+                        return Err(at(
+                            path,
+                            format!("is a link to `{target}`, which the disk resolves to {}, not `{land}` under the archive", real.display()),
+                        ));
                     }
                     Err(e) => return Err(at(path, format!("is a link to `{target}`, which resolves to nothing in the archive: {e}"))),
                 }
@@ -701,31 +752,28 @@ mod tests {
 
     fn layout_rules() -> Rules<'static> {
         Rules {
-            top: None,
+            names: NameRules { top: None, fold: true, twice: Twice::Refuse, reserved: &[".blaze-native"], most_path: 4096 },
             links: true,
-            fold: true,
-            twice: Twice::Refuse,
             modes: Modes::ReadOnly,
-            reserved: &[".blaze-native"],
             skip: &[],
             include: &every,
             sync: false,
             most_entries: 1 << 20,
             most_bytes: 1 << 30,
-            most_path: 4096,
         }
     }
 
     /// An entry that climbs out with `..`, one that is absolute, a link out of the root
     /// (directly, through another link, or through a link spelled in another case, as an
-    /// APFS disk finds it), an entry under a link, and an entry named as the caller's mark in
-    /// another case are each refused, and nothing is written outside.
+    /// APFS disk finds it), an entry under a link, an entry named as the caller's mark in
+    /// another case, and two names one under full case folding (`ſ` and `s`, `ß` and `ss`, `ﬀ`
+    /// and `ff`) are each refused, and nothing is written outside.
     #[cfg(unix)] // Its well-formed archive has a link, which only Unix lays out.
     #[test]
     fn unpack_refuses_paths_out_of_the_root() {
         use tar::EntryType::{Directory, Regular, Symlink};
         let ok = || raw(Regular, "top/bin/tool", "", b"ok");
-        let hostile: [(&str, Vec<(tar::Header, Vec<u8>)>); 8] = [
+        let hostile: [(&str, Vec<(tar::Header, Vec<u8>)>); 11] = [
             ("`..`", vec![raw(Directory, "top/", "", b""), raw(Regular, "top/../escaped", "", b"x")]),
             ("absolute", vec![raw(Regular, "/tmp/escaped", "", b"x")]),
             ("link out", vec![ok(), raw(Symlink, "top/lib/out", "../../..", b"")]),
@@ -741,6 +789,9 @@ mod tests {
             ("under a link", vec![raw(Symlink, "top/l", ".", b""), raw(Regular, "top/l/x", "", b"x")]),
             ("one name in two cases", vec![raw(Regular, "top/d/x", "", b"x"), raw(Symlink, "top/D", "..", b"")]),
             ("the mark in another case", vec![ok(), raw(Symlink, "top/.Blaze-Native", "bin/tool", b"")]),
+            ("`ſ` as `s`", vec![raw(Regular, "top/s/x", "", b"x"), raw(Symlink, "top/\u{17f}", "..", b"")]),
+            ("`ß` as `ss`", vec![raw(Regular, "top/ss", "", b"x"), raw(Regular, "top/\u{df}", "", b"y")]),
+            ("`ﬀ` as `ff`", vec![raw(Regular, "top/ff", "", b"x"), raw(Regular, "top/\u{fb00}", "", b"y")]),
         ];
         for (what, entries) in hostile {
             let scratch = tempfile::tempdir().unwrap();

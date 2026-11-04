@@ -274,6 +274,14 @@ fn fetches_into_cargos_directories_and_the_store() {
     std::fs::write(src.join(".cargo-ok"), b"").unwrap();
     registry.fetch_one(&package).unwrap();
     assert!(src.join("src/lib.rs").is_file());
+    // A directory with files and no `.cargo-ok` at all (an unpacking killed midway) is removed
+    // and unpacked again, never failing on the files it left.
+    std::fs::remove_file(src.join(".cargo-ok")).unwrap();
+    std::fs::write(src.join("stray"), b"").unwrap();
+    registry.fetch_one(&package).unwrap();
+    assert!(src.join("src/lib.rs").is_file());
+    assert!(!src.join("stray").exists());
+    assert_eq!(std::fs::read_to_string(src.join(".cargo-ok")).unwrap(), r#"{"v":1}"#);
 }
 
 #[test]

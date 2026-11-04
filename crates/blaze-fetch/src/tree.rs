@@ -113,18 +113,25 @@ fn bad_path(path: &str) -> Option<&'static str> {
     })
 }
 
-/// `path` as a case- and normalization-insensitive disk (APFS, NTFS, a default macOS volume)
-/// sees it: every character lower-cased by Unicode's rules (final `ς` as `σ`), then in
-/// Unicode's canonical decomposition (NFD), so `É`, `é` and `e` + U+0301 are one name.
-/// Folding is per character, so a `/` stays where it was and a folded path's directories are
-/// the folded directories.
+/// `path` folded for a caseless, normalization-insensitive compare: Unicode's canonical
+/// caseless match (Unicode 16, section 3.13, D145): the path in canonical decomposition (NFD),
+/// each character then replaced by its full case folding (statuses C and F of
+/// CaseFolding.txt, [`crate::casefold`]: `ſ` and `s`, `ß`, `ẞ` and `ss`, `ﬀ` and `ff`, `ς`
+/// and `σ` are one), then in NFD again. Two names this folds equal are taken as one name on
+/// a case-insensitive disk (APFS, NTFS). APFS compares by its own tables, which are not proven
+/// equal to this; the aim is to fold at least as much as it does, so a pair it takes as one
+/// is refused here. Folding is per character, so a `/` stays where it was and a folded path's
+/// directories are the folded directories.
 pub(crate) fn fold(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
-    path.chars()
-        .flat_map(char::to_lowercase)
-        .map(|it| if it == 'ς' { 'σ' } else { it })
-        .nfd()
-        .collect() // alloc: once a path compared
+    let mut folded = String::with_capacity(path.len()); // alloc: once a path compared
+    for it in path.nfd() {
+        match crate::casefold::FOLD.binary_search_by_key(&it, |row| row.0) {
+            Ok(at) => folded.push_str(crate::casefold::FOLD[at].1),
+            Err(_) => folded.push(it),
+        }
+    }
+    folded.nfd().collect() // alloc: as above
 }
 
 /// Every rule of a tree over `entries`, sorted by path: no bad path, no two paths that are one
