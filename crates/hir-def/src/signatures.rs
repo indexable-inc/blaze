@@ -161,11 +161,11 @@ macro_rules! signature_queries {
 
             /// The signature with where each part of it is written in its file.
             #[blaze_query::tracked(
-                                returns(ref),
-                                lru,
-                                weigh = with_source_map_bytes,
-                                mem_tag = Nameres
-                            )]
+                                        returns(ref),
+                                        lru,
+                                        weigh = with_source_map_bytes,
+                                        mem_tag = Nameres
+                                    )]
             pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
                 match Self::relative(db, id) {
                     Some((it, map)) => {
