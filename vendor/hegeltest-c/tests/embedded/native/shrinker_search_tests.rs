@@ -161,10 +161,7 @@ fn bin_search_down_matches_reference_on_monotone_thresholds() {
             let expected = reference_bin_search_down(lo, hi, |v| v >= threshold, &mut ref_probes);
             let actual = drive_bin_search_down(lo, hi, |v| v >= threshold, &mut new_probes);
             assert_eq!(actual, expected, "lo {lo} hi {hi} threshold {threshold}");
-            assert_eq!(
-                new_probes, ref_probes,
-                "lo {lo} hi {hi} threshold {threshold}"
-            );
+            assert_eq!(new_probes, ref_probes, "lo {lo} hi {hi} threshold {threshold}");
         }
     }
 }
@@ -181,10 +178,7 @@ fn bin_search_down_matches_reference_near_the_upper_bound() {
 
 #[test]
 fn bin_search_down_step_probes_before_convergence() {
-    assert!(matches!(
-        BinSearchDown::new(0, 10).step(),
-        SearchStep::Probe(0)
-    ));
+    assert!(matches!(BinSearchDown::new(0, 10).step(), SearchStep::Probe(0)));
 }
 
 #[test]
@@ -268,10 +262,7 @@ fn bin_search_down_big_matches_reference_on_monotone_thresholds() {
                 &mut new_probes,
             );
             assert_eq!(actual, expected, "lo {lo} hi {hi} threshold {threshold}");
-            assert_eq!(
-                new_probes, ref_probes,
-                "lo {lo} hi {hi} threshold {threshold}"
-            );
+            assert_eq!(new_probes, ref_probes, "lo {lo} hi {hi} threshold {threshold}");
         }
     }
 }

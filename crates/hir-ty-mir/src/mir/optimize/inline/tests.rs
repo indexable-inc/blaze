@@ -3,11 +3,11 @@
 //! What it inlines from fixtures is `fixtures.rs`, an integration test.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_def::hir::ExprId;
 use la_arena::RawIdx;
 use rustc_abi::ExternAbi;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     intrinsic::Intrinsic,
@@ -21,11 +21,7 @@ use super::{
 };
 
 /// The walk over `graph`, a node's callees by its index, every node with MIR and its own body.
-fn walk_from(
-    graph: &[&[u32]],
-    root: u32,
-    local: impl Fn(u32) -> bool,
-) -> Option<Walked<u32>> {
+fn walk_from(graph: &[&[u32]], root: u32, local: impl Fn(u32) -> bool) -> Option<Walked<u32>> {
     let callees = |node: u32| -> SmallVec<[(u32, bool); 8]> {
         graph[node as usize].iter().map(|&it| (it, true)).collect()
     };

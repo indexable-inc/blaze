@@ -20,6 +20,7 @@ use std::{any::TypeId, iter, ops::Range, sync};
 
 use base_db::Db;
 use expect_test::Expect;
+use hir_expand::fixture;
 use hir_expand::{
     AstId, ExpansionInfo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind,
     builtin::quote::quote,
@@ -44,7 +45,6 @@ use syntax::{
     view::{self as ast, AstNode},
 };
 use syntax_bridge::token_tree_to_syntax_node;
-use hir_expand::fixture;
 use tt::{TextRange, TextSize};
 
 use crate::{
@@ -473,7 +473,10 @@ impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
             &mut |_| span::Edition::CURRENT,
         );
         if parse.errors().is_empty() {
-            Ok(Expanded::untraced(subtree.copy(), "a test's proc macro, which traces nothing of what it read"))
+            Ok(Expanded::untraced(
+                subtree.copy(),
+                "a test's proc macro, which traces nothing of what it read",
+            ))
         } else {
             panic!("got invalid macro input: {:?}", parse.errors());
         }

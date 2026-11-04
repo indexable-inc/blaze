@@ -111,7 +111,10 @@ pub(super) fn run(hz: u32) {
             batch.clear();
             kept = Instant::now();
         }
-        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here"
+        )]
         std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
 }
@@ -152,7 +155,8 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
         return None;
     }
     let at = Instant::now();
-    let mut sample = Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
+    let mut sample =
+        Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
     // SAFETY: the port of a live thread that is not this one (the sampler holds no ring).
     if unsafe { thread_suspend(thread.port) } != libc::KERN_SUCCESS {
         return None;
@@ -218,7 +222,15 @@ mod tests {
         stack[at(8)] = 0x10;
         stack[at(9)] = 0x1003;
         let state = State { fp: aligned, pc: 0x1000, ..State::default() };
-        let mut sample = Sample { at: Instant::now(), tid: 1, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
+        let mut sample = Sample {
+            at: Instant::now(),
+            tid: 1,
+            depth: 0,
+            pcs: [0; DEPTH],
+            span: 0,
+            build: 0,
+            on_cpu: true,
+        };
         walk(&state, base, high, &mut sample);
         assert_eq!(&sample.pcs[..usize::from(sample.depth)], &[0x1000, 0x1001, 0x1002, 0x1003]);
     }

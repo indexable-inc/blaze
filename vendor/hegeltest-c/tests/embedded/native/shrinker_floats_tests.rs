@@ -31,10 +31,7 @@ fn int_node(value: i128, min: i128, max: i128) -> ChoiceNode {
 
 #[test]
 fn redistribute_pair_below_shrink_target_uses_raise_left_direction() {
-    let initial = vec![
-        float_node(-3.0, -100.0, 100.0),
-        float_node(5.0, -100.0, 100.0),
-    ];
+    let initial = vec![float_node(-3.0, -100.0, 100.0), float_node(5.0, -100.0, 100.0)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             crate::native::shrinker::ShrinkRun::Full(nodes) => (true, nodes.to_vec(), Spans::new()),
@@ -44,10 +41,7 @@ fn redistribute_pair_below_shrink_target_uses_raise_left_direction() {
         Spans::new(),
     );
     drive_no_yield(shrinker.redistribute_numeric_pairs()).unwrap();
-    let (a, b) = match (
-        &shrinker.current_nodes[0].value(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    let (a, b) = match (&shrinker.current_nodes[0].value(), &shrinker.current_nodes[1].value()) {
         (ChoiceValue::Float(a), ChoiceValue::Float(b)) => (*a, *b),
         _ => unreachable!(),
     };
@@ -67,10 +61,7 @@ fn redistribute_pair_bails_when_int_candidate_leaves_validate_range() {
         Spans::new(),
     );
     drive_no_yield(shrinker.redistribute_numeric_pairs()).unwrap();
-    match (
-        &shrinker.current_nodes[0].value(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    match (&shrinker.current_nodes[0].value(), &shrinker.current_nodes[1].value()) {
         (ChoiceValue::Float(_), ChoiceValue::Integer(n)) => {
             assert!((1..=10).contains(&i128::try_from(n).unwrap()));
         }
@@ -246,10 +237,7 @@ fn float_at(nodes: &[ChoiceNode], i: usize) -> f64 {
 #[test]
 fn scale_numeric_pairs_raises_the_later_integer_to_its_bound_keeping_the_product() {
     let mut shrinker = scaling_shrinker(
-        vec![
-            int_node(425_000, 0, 1_000_000_000_000),
-            int_node(425, -1000, 1000),
-        ],
+        vec![int_node(425_000, 0, 1_000_000_000_000), int_node(425, -1000, 1000)],
         |nodes| int_at(nodes, 0) * int_at(nodes, 1) >= 180_625_000,
     );
     drive_no_yield(shrinker.scale_numeric_pairs()).unwrap();
@@ -260,10 +248,7 @@ fn scale_numeric_pairs_raises_the_later_integer_to_its_bound_keeping_the_product
 #[test]
 fn scale_numeric_pairs_doubles_the_later_integer_when_its_bound_is_rejected() {
     let mut shrinker = scaling_shrinker(
-        vec![
-            int_node(425_000, 0, 1_000_000_000_000),
-            int_node(425, -1000, 1000),
-        ],
+        vec![int_node(425_000, 0, 1_000_000_000_000), int_node(425, -1000, 1000)],
         |nodes| int_at(nodes, 0) * int_at(nodes, 1) >= 180_625_000 && int_at(nodes, 1) <= 900,
     );
     drive_no_yield(shrinker.scale_numeric_pairs()).unwrap();
@@ -297,10 +282,7 @@ fn scale_numeric_pairs_raises_the_later_float_to_its_bound() {
     let from = 2f64.powi(1001);
     let to = -(f64::MAX - 2f64.powi(1000));
     let mut shrinker = scaling_shrinker(
-        vec![
-            float_node(from, -f64::MAX, f64::MAX),
-            float_node(to, -f64::MAX, f64::MAX),
-        ],
+        vec![float_node(from, -f64::MAX, f64::MAX), float_node(to, -f64::MAX, f64::MAX)],
         |nodes| (float_at(nodes, 0) - float_at(nodes, 1)).is_infinite(),
     );
     drive_no_yield(shrinker.scale_numeric_pairs()).unwrap();
@@ -310,10 +292,10 @@ fn scale_numeric_pairs_raises_the_later_float_to_its_bound() {
 
 #[test]
 fn scale_numeric_pairs_doubles_the_later_float_when_its_bound_is_rejected() {
-    let mut shrinker = scaling_shrinker(
-        vec![float_node(8.0, -1e6, 1e6), float_node(2.0, -1e6, 1e6)],
-        |nodes| float_at(nodes, 0) * float_at(nodes, 1) >= 15.9 && float_at(nodes, 1) <= 5.0,
-    );
+    let mut shrinker =
+        scaling_shrinker(vec![float_node(8.0, -1e6, 1e6), float_node(2.0, -1e6, 1e6)], |nodes| {
+            float_at(nodes, 0) * float_at(nodes, 1) >= 15.9 && float_at(nodes, 1) <= 5.0
+        });
     drive_no_yield(shrinker.scale_numeric_pairs()).unwrap();
     assert_eq!(float_at(&shrinker.current_nodes, 0), 4.0);
     assert_eq!(float_at(&shrinker.current_nodes, 1), 4.0);
@@ -321,10 +303,10 @@ fn scale_numeric_pairs_doubles_the_later_float_when_its_bound_is_rejected() {
 
 #[test]
 fn scale_numeric_pairs_mirrors_a_negative_earlier_float() {
-    let mut shrinker = scaling_shrinker(
-        vec![float_node(-8.0, -1e6, 1e6), float_node(2.0, -1e6, 1e6)],
-        |nodes| float_at(nodes, 0) * float_at(nodes, 1) == -16.0 && float_at(nodes, 1).abs() <= 5.0,
-    );
+    let mut shrinker =
+        scaling_shrinker(vec![float_node(-8.0, -1e6, 1e6), float_node(2.0, -1e6, 1e6)], |nodes| {
+            float_at(nodes, 0) * float_at(nodes, 1) == -16.0 && float_at(nodes, 1).abs() <= 5.0
+        });
     drive_no_yield(shrinker.scale_numeric_pairs()).unwrap();
     assert_eq!(float_at(&shrinker.current_nodes, 0), 4.0);
     assert_eq!(float_at(&shrinker.current_nodes, 1), -4.0);

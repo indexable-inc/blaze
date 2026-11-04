@@ -38,12 +38,13 @@ use smallvec::SmallVec;
 
 use super::coff::ImportName;
 use super::{
-    DEBUG, EDATA, GRANULE, IDATA, OBJ_PDATA, PAGE, PDATA, Pe, RELOC, RSRC, START_HOOK, Segment, TLS_DIR, TLS_INDEX,
-    error, place,
+    DEBUG, EDATA, GRANULE, IDATA, OBJ_PDATA, PAGE, PDATA, Pe, RELOC, RSRC, START_HOOK, Segment,
+    TLS_DIR, TLS_INDEX, error, place,
 };
 use crate::cow::CowBytes;
 use crate::model::{
-    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind, reserved, zeroed,
+    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind,
+    View, WindowsUnwind, reserved, zeroed,
 };
 use crate::{LinkError, OutputKind};
 
@@ -154,11 +155,18 @@ impl<'a> Image<'a> {
     /// A function's `RUNTIME_FUNCTION`.
     fn entry(self, function: &Function, windows: WindowsUnwind) -> Result<Entry, LinkError> {
         let entry = (|| {
-            Some((self.rva_of(function.addr)?, self.rva_of(function.addr + function.size)?, self.rva_of(windows.info)?))
+            Some((
+                self.rva_of(function.addr)?,
+                self.rva_of(function.addr + function.size)?,
+                self.rva_of(windows.info)?,
+            ))
         })();
         entry.ok_or_else(|| {
             let name = function.name.as_deref().unwrap_or("a function");
-            error(format_args!("{name} at {:#x} or its unwind info is outside the image", function.addr))
+            error(format_args!(
+                "{name} at {:#x} or its unwind info is outside the image",
+                function.addr
+            ))
         })
     }
 
@@ -173,9 +181,10 @@ impl<'a> Image<'a> {
     /// in the file, and not in a dev run's code.
     fn rebased(self, region: Option<&Region>, addr: u64) -> Result<(), LinkError> {
         match region {
-            Some(it) if it.addr <= addr && zeroed(&it.class) => {
-                Err(error(format_args!("a rebased address at {addr:#x} in {:?}, which is not in the file", it.class)))
-            }
+            Some(it) if it.addr <= addr && zeroed(&it.class) => Err(error(format_args!(
+                "a rebased address at {addr:#x} in {:?}, which is not in the file",
+                it.class
+            ))),
             Some(it) if it.addr <= addr && it.prot.exec && self.dev_run => {
                 let what = match self.code_at(addr) {
                     // alloc: error path
@@ -203,8 +212,9 @@ impl<'a> Image<'a> {
     fn code_at(self, addr: u64) -> Option<(&'a str, u64)> {
         let index = self.functions.partition_point(|it| it.addr <= addr).checked_sub(1)?;
         let function = &self.functions[index];
-        (addr < function.addr + function.size.max(1))
-            .then(|| (function.name.as_deref().unwrap_or("a function with no name"), addr - function.addr))
+        (addr < function.addr + function.size.max(1)).then(|| {
+            (function.name.as_deref().unwrap_or("a function with no name"), addr - function.addr)
+        })
     }
 
     fn rva_of(self, addr: u64) -> Option<u32> {
@@ -212,7 +222,8 @@ impl<'a> Image<'a> {
     }
 
     fn rva(self, addr: u64, what: &str) -> Result<u32, LinkError> {
-        self.rva_of(addr).ok_or_else(|| error(format_args!("{what} at {addr:#x} is outside the image")))
+        self.rva_of(addr)
+            .ok_or_else(|| error(format_args!("{what} at {addr:#x} is outside the image")))
     }
 }
 
@@ -224,11 +235,17 @@ fn stamp(placed: &Placed<'_>) -> u32 {
 }
 
 /// The `N` bytes of the image at `addr`, across a page of its region or not.
-fn bytes_at<const N: usize>(placed: &Placed<'_>, addr: u64, what: &str) -> Result<[u8; N], LinkError> {
+fn bytes_at<const N: usize>(
+    placed: &Placed<'_>,
+    addr: u64,
+    what: &str,
+) -> Result<[u8; N], LinkError> {
     let index = placed.regions.partition_point(|it| it.addr <= addr);
     index
         .checked_sub(1)
-        .and_then(|index| placed.view(index).array(usize::try_from(addr - placed.regions[index].addr).ok()?))
+        .and_then(|index| {
+            placed.view(index).array(usize::try_from(addr - placed.regions[index].addr).ok()?)
+        })
         .ok_or_else(|| error(format_args!("{what} at {addr:#x} is not in the image's bytes")))
 }
 
@@ -254,7 +271,10 @@ pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
     regions.push((Class::Synthetic(TLS_DIR), TLS_DIRECTORY + if dev_run { 16 } else { 8 }));
     regions.push((Class::Synthetic(TLS_INDEX), 8));
     if counts.functions + counts.unwind > 0 {
-        regions.push((Class::Synthetic(PDATA), counts.functions * RUNTIME_FUNCTION as u64 + counts.unwind));
+        regions.push((
+            Class::Synthetic(PDATA),
+            counts.functions * RUNTIME_FUNCTION as u64 + counts.unwind,
+        ));
     }
     // Every rebased address and the four of a TLS directory the writer makes (five with a dev
     // run's start hook); a block (its header and a pad) per page that has one.
@@ -264,7 +284,10 @@ pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
     regions
 }
 
-pub(super) fn synthesize(pe: &Pe, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
+pub(super) fn synthesize(
+    pe: &Pe,
+    placed: &Placed<'_>,
+) -> Result<Vec<(Class, CowBytes)>, LinkError> {
     Ok(Tables::of(pe, placed)?.regions)
 }
 
@@ -346,7 +369,9 @@ impl Tables {
         // when one may differ.
         let checked = match (last.as_deref(), placed.delta) {
             (Some(last), Some(delta)) => {
-                last.idata.synthesis != 0 && delta.from == last.idata.synthesis && same_imports(delta)
+                last.idata.synthesis != 0
+                    && delta.from == last.idata.synthesis
+                    && same_imports(delta)
             }
             _ => false,
         };
@@ -359,7 +384,8 @@ impl Tables {
             )));
         }
         if !checked
-            && let Some(cell) = placed.got.iter().find(|it| !matches!(it.holds, Holds::Local(_) | Holds::Import(_)))
+            && let Some(cell) =
+                placed.got.iter().find(|it| !matches!(it.holds, Holds::Local(_) | Holds::Import(_)))
         {
             return Err(error(format_args!(
                 "the GOT cell at {:#x} holds {:?}: Windows reaches thread-locals through \
@@ -386,14 +412,20 @@ impl Tables {
         match placed.region(&Class::Synthetic(IDATA)) {
             Some((_, region)) => {
                 let bytes = match last.as_deref_mut() {
-                    Some(last) => {
-                        last.idata.of(placed, region, |it, _| same_imports(it), |_| {}, || imports(placed, region))?
-                    }
+                    Some(last) => last.idata.of(
+                        placed,
+                        region,
+                        |it, _| same_imports(it),
+                        |_| {},
+                        || imports(placed, region),
+                    )?,
                     None => CowBytes::from_vec(imports(placed, region)?),
                 };
                 tables.push_cow(placed, IDATA, bytes)?;
             }
-            None if !checked && placed.got.iter().any(|it| matches!(it.holds, Holds::Import(_))) => {
+            None if !checked
+                && placed.got.iter().any(|it| matches!(it.holds, Holds::Import(_))) =>
+            {
                 return Err(error("an image with imports and no import directory region"));
             }
             None => {}
@@ -441,7 +473,10 @@ impl Tables {
             }
             None => par::join(
                 || pdata(image, None).map(CowBytes::from_vec),
-                || relocations(image, &extra, reloc_piece(image.rebase.len())).map(CowBytes::from_vec),
+                || {
+                    relocations(image, &extra, reloc_piece(image.rebase.len()))
+                        .map(CowBytes::from_vec)
+                },
             ),
         };
         drop(last);
@@ -462,16 +497,30 @@ impl Tables {
         Ok(tables)
     }
 
-    fn push(&mut self, placed: &Placed<'_>, name: &'static str, bytes: Vec<u8>) -> Result<(), LinkError> {
+    fn push(
+        &mut self,
+        placed: &Placed<'_>,
+        name: &'static str,
+        bytes: Vec<u8>,
+    ) -> Result<(), LinkError> {
         self.push_cow(placed, name, CowBytes::from_vec(bytes))
     }
 
-    fn push_cow(&mut self, placed: &Placed<'_>, name: &'static str, bytes: CowBytes) -> Result<(), LinkError> {
+    fn push_cow(
+        &mut self,
+        placed: &Placed<'_>,
+        name: &'static str,
+        bytes: CowBytes,
+    ) -> Result<(), LinkError> {
         let class = Class::Synthetic(name);
-        let (_, region) =
-            placed.region(&class).ok_or_else(|| error(format_args!("the {name} region was not placed")))?;
+        let (_, region) = placed
+            .region(&class)
+            .ok_or_else(|| error(format_args!("the {name} region was not placed")))?;
         if !region.addr.is_multiple_of(8) {
-            return Err(error(format_args!("the {name} region at {:#x} is not 8-aligned", region.addr)));
+            return Err(error(format_args!(
+                "the {name} region at {:#x} is not 8-aligned",
+                region.addr
+            )));
         }
         let room = region.capacity.max(region.size);
         if bytes.len() as u64 > room {
@@ -545,9 +594,11 @@ fn tls_directory(placed: &Placed<'_>) -> Result<TlsDirectory, LinkError> {
             }
             Ok(TlsDirectory::Crt(addr))
         }
-        _ if used.is_some() || placed.tls.is_some() || placed.output.dev_run.is_some() => ours
-            .map(TlsDirectory::Ours)
-            .ok_or_else(|| error("an image with thread-locals or a start hook and no TLS directory region")),
+        _ if used.is_some() || placed.tls.is_some() || placed.output.dev_run.is_some() => {
+            ours.map(TlsDirectory::Ours).ok_or_else(|| {
+                error("an image with thread-locals or a start hook and no TLS directory region")
+            })
+        }
         _ => Ok(TlsDirectory::None),
     }
 }
@@ -555,7 +606,11 @@ fn tls_directory(placed: &Placed<'_>) -> Result<TlsDirectory, LinkError> {
 /// The writer's TLS directory at `addr`, and its four addresses the loader rebases. Its
 /// callbacks are the CRT's run after `__xl_a` when there is one; with none, a dev run's list
 /// is the start hook and its terminator (a fifth address to rebase), and any other's is empty.
-fn own_tls(placed: &Placed<'_>, addr: u64, extra: &mut SmallVec<[u64; 5]>) -> Result<Vec<u8>, LinkError> {
+fn own_tls(
+    placed: &Placed<'_>,
+    addr: u64,
+    extra: &mut SmallVec<[u64; 5]>,
+) -> Result<Vec<u8>, LinkError> {
     let index = (placed.symbol)("_tls_index")
         .or_else(|| placed.region(&Class::Synthetic(TLS_INDEX)).map(|(_, it)| it.addr))
         .ok_or_else(|| error("an image with thread-locals and no `_tls_index`"))?;
@@ -569,8 +624,8 @@ fn own_tls(placed: &Placed<'_>, addr: u64, extra: &mut SmallVec<[u64; 5]>) -> Re
         Some(tls) => (tls.addr, tls.addr + tls.init, tls.size - tls.init, tls.align),
         None => (0, 0, 0, 1),
     };
-    let zero_fill =
-        u32::try_from(zero_fill).map_err(|_| error(format_args!("{zero_fill:#x} bytes of zeroed thread-locals")))?;
+    let zero_fill = u32::try_from(zero_fill)
+        .map_err(|_| error(format_args!("{zero_fill:#x} bytes of zeroed thread-locals")))?;
     let mut bytes = Buf::with_capacity((TLS_DIRECTORY + 16) as usize);
     bytes.put_u64(start);
     bytes.put_u64(end);
@@ -607,7 +662,10 @@ fn start_hook(placed: &Placed<'_>) -> Result<u64, LinkError> {
 /// cell, or the writer's own list holds it.
 fn check_start_hook(placed: &Placed<'_>, directory: u64) -> Result<(), LinkError> {
     let hook = start_hook(placed)?;
-    let callbacks = u64_of(&bytes_at::<{ TLS_DIRECTORY as usize }>(placed, directory, "the TLS directory")?, 24);
+    let callbacks = u64_of(
+        &bytes_at::<{ TLS_DIRECTORY as usize }>(placed, directory, "the TLS directory")?,
+        24,
+    );
     let first = u64_of(&bytes_at::<8>(placed, callbacks, "the TLS callback list")?, 0);
     if first != hook {
         return Err(error(format_args!(
@@ -629,7 +687,8 @@ fn check_no_guard(placed: &Placed<'_>) -> Result<(), LinkError> {
         return Ok(());
     }
     let config = bytes_at::<{ GUARD_FLAGS + 4 }>(placed, addr, what)?;
-    let (table, count, flags) = (u64_of(&config, GUARD_TABLE), u64_of(&config, GUARD_COUNT), u32_of(&config, GUARD_FLAGS));
+    let (table, count, flags) =
+        (u64_of(&config, GUARD_TABLE), u64_of(&config, GUARD_COUNT), u32_of(&config, GUARD_FLAGS));
     if table != 0 || count != 0 || flags & GUARD_CF_INSTRUMENTED != 0 {
         return Err(error(format_args!(
             "{what} at {addr:#x} asks for control-flow guard (a table of {count} functions at {table:#x}, flags \
@@ -667,11 +726,19 @@ fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
     for cell in placed.got {
         let Holds::Import(import) = cell.holds else { continue };
         let it = placed.imports.get(import as usize).ok_or_else(|| {
-            error(format_args!("the GOT cell at {:#x} holds import {import}, which there isn't", cell.addr))
+            error(format_args!(
+                "the GOT cell at {:#x} holds import {import}, which there isn't",
+                cell.addr
+            ))
         })?;
-        let library = it.library.ok_or_else(|| error(format_args!("`{}` is imported from no DLL", it.name)))?;
+        let library = it
+            .library
+            .ok_or_else(|| error(format_args!("`{}` is imported from no DLL", it.name)))?;
         if placed.libraries.get(library as usize).is_none() {
-            return Err(error(format_args!("`{}` is imported from library {library}, which there isn't", it.name)));
+            return Err(error(format_args!(
+                "`{}` is imported from library {library}, which there isn't",
+                it.name
+            )));
         }
         cells.push((library, cell.addr, import));
     }
@@ -754,7 +821,9 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     for group in &groups {
         for name in &names[group.start..group.end] {
             match *name {
-                ImportName::Ordinal(ordinal) => out.put_u64(pe::IMAGE_ORDINAL_FLAG64 | u64::from(ordinal)),
+                ImportName::Ordinal(ordinal) => {
+                    out.put_u64(pe::IMAGE_ORDINAL_FLAG64 | u64::from(ordinal))
+                }
                 ImportName::Name { name, .. } => {
                     out.put_u64(u64::from(rva(placed, base + hint_at, "a hint/name entry")?));
                     hint_at += (2 + name.len() as u64 + 1).next_multiple_of(2);
@@ -787,8 +856,9 @@ fn exports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
             return Err(error(format_args!("`{}` is exported twice", pair[0].name)));
         }
     }
-    let count = u16::try_from(exports.len())
-        .map_err(|_| error(format_args!("{} exports, more than a PE export table's 65535", exports.len())))?;
+    let count = u16::try_from(exports.len()).map_err(|_| {
+        error(format_args!("{} exports, more than a PE export table's 65535", exports.len()))
+    })?;
     let n = u64::from(count);
     let base = region.addr;
     let functions = EXPORT_DIRECTORY;
@@ -818,7 +888,10 @@ fn exports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
             )));
         }
         let at = rva_of(placed, export.addr).ok_or_else(|| {
-            error(format_args!("the export `{}` at {:#x} is outside the image", export.name, export.addr))
+            error(format_args!(
+                "the export `{}` at {:#x} is outside the image",
+                export.name, export.addr
+            ))
         })?;
         out.put_u32(at);
     }
@@ -924,7 +997,8 @@ fn stage(
                 } else if entry < staged.last {
                     staged.sorted = false;
                 }
-                out[staged.count as usize * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION].copy_from_slice(&entry_bytes(entry));
+                out[staged.count as usize * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION]
+                    .copy_from_slice(&entry_bytes(entry));
                 staged.last = entry;
                 staged.count += 1;
                 staged.count - 1
@@ -989,7 +1063,10 @@ fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, 
     par::extend(
         &mut done,
         par::zip(
-            par::zip(par::chunks_mut(&mut staged, PDATA_PIECE * RUNTIME_FUNCTION), par::chunks(functions, PDATA_PIECE)),
+            par::zip(
+                par::chunks_mut(&mut staged, PDATA_PIECE * RUNTIME_FUNCTION),
+                par::chunks(functions, PDATA_PIECE),
+            ),
             chunks(slots.as_deref_mut().map(Vec::as_mut_slice), PDATA_PIECE, pieces),
         ),
         |((out, functions), slots)| stage(image, functions, out, slots),
@@ -1025,7 +1102,8 @@ fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, 
     let mut ranges = Vec::with_capacity(done.len());
     let mut end = native.len();
     for piece in done.iter().rev() {
-        let start = if piece.count == 0 { end } else { native.partition_point(|it| *it < piece.first) };
+        let start =
+            if piece.count == 0 { end } else { native.partition_point(|it| *it < piece.first) };
         ranges.push(start..end);
         end = start;
     }
@@ -1050,10 +1128,14 @@ fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, 
             jobs.push((to, staged_of(index, piece), &native[range.clone()], at, slots));
             at += len as u32;
         }
-        par::for_each(jobs, |(to, staged, native, first, slots)| merge(staged, native, to, first, slots));
+        par::for_each(jobs, |(to, staged, native, first, slots)| {
+            merge(staged, native, to, first, slots)
+        });
     }
     let read = |at: usize| read_entry(&out[at * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION]);
-    if let Some(at) = par::find_map_first(1..total, |at| (read(at).0 < read(at - 1).1).then_some(at)) {
+    if let Some(at) =
+        par::find_map_first(1..total, |at| (read(at).0 < read(at - 1).1).then_some(at))
+    {
         let ((before, before_end, _), (begin, end, _)) = (read(at - 1), read(at));
         return Err(error(format_args!(
             "the unwind entries of RVAs {before:#x}..{before_end:#x} and {begin:#x}..{end:#x} overlap"
@@ -1117,8 +1199,10 @@ impl KeptPdata {
             let end = region.addr + region.capacity.max(region.size);
             delta.written.iter().any(|&(addr, len)| addr < end && region.addr < addr + len)
         };
-        let mut objects =
-            image.regions.iter().filter(|it| matches!(&it.class, Class::Named { name, .. } if name == OBJ_PDATA));
+        let mut objects = image
+            .regions
+            .iter()
+            .filter(|it| matches!(&it.class, Class::Named { name, .. } if name == OBJ_PDATA));
         if objects.any(written) {
             return false;
         }
@@ -1127,7 +1211,9 @@ impl KeptPdata {
         for splice in delta.functions {
             let range = splice.new.start as usize..splice.new.end as usize;
             // clone: a `Range` of two `usize`s
-            let (Some(functions), Some(slots)) = (functions.get(range.clone()), self.slots.get(range)) else {
+            let (Some(functions), Some(slots)) =
+                (functions.get(range.clone()), self.slots.get(range))
+            else {
                 return false;
             };
             for (function, &slot) in functions.iter().zip(slots) {
@@ -1151,7 +1237,8 @@ impl KeptPdata {
         let after = |before: Entry, it: Entry| before < it && before.1 <= it.0;
         self.touched.iter().all(|&slot| {
             let (slot, this) = (slot as usize, read(slot as usize));
-            (slot == 0 || after(read(slot - 1), this)) && (slot + 1 >= entries || after(this, read(slot + 1)))
+            (slot == 0 || after(read(slot - 1), this))
+                && (slot + 1 >= entries || after(this, read(slot + 1)))
         })
     }
 }
@@ -1246,7 +1333,11 @@ struct RelocIndex {
 /// block never spans two pieces, so the bytes are the same whatever the number of threads or
 /// the piece size. One piece's worth allocates only its bytes (and a sorted copy when the
 /// core's addresses aren't sorted).
-pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Result<Vec<u8>, LinkError> {
+pub(super) fn relocations(
+    image: Image<'_>,
+    extra: &[u64],
+    piece: usize,
+) -> Result<Vec<u8>, LinkError> {
     build_relocations(image, extra, piece, None)
 }
 
@@ -1306,14 +1397,25 @@ fn build_relocations(
     bounds.push((from..rebase.len(), extra_from..extra.len()));
     let keep = starts.is_some();
     let mut written: Vec<Result<(Vec<u8>, Vec<u32>), LinkError>> = Vec::with_capacity(bounds.len());
-    par::extend(&mut written, par::zip(&bounds, split(slots.as_deref_mut(), &bounds)), |((addresses, extras), slots)| {
-        // alloc: one buffer a piece (and its block starts for a kept table)
-        let (mut out, mut piece_starts) = (Vec::default(), Vec::new());
-        let starts = keep.then_some(&mut piece_starts);
-        // clone: two `Range`s of two `usize`s
-        blocks(image, &rebase[addresses.clone()], &extra[extras.clone()], &mut out, slots, starts)
+    par::extend(
+        &mut written,
+        par::zip(&bounds, split(slots.as_deref_mut(), &bounds)),
+        |((addresses, extras), slots)| {
+            // alloc: one buffer a piece (and its block starts for a kept table)
+            let (mut out, mut piece_starts) = (Vec::default(), Vec::new());
+            let starts = keep.then_some(&mut piece_starts);
+            // clone: two `Range`s of two `usize`s
+            blocks(
+                image,
+                &rebase[addresses.clone()],
+                &extra[extras.clone()],
+                &mut out,
+                slots,
+                starts,
+            )
             .map(|()| (out, piece_starts))
-    });
+        },
+    );
     let mut parts = Vec::with_capacity(written.len());
     for piece in written {
         parts.push(piece?);
@@ -1326,9 +1428,11 @@ fn build_relocations(
     }
     {
         let mut jobs = Vec::with_capacity(parts.len());
-        let (mut rest, mut starts_rest) = (&mut out[..], starts.as_deref_mut().map(Vec::as_mut_slice));
+        let (mut rest, mut starts_rest) =
+            (&mut out[..], starts.as_deref_mut().map(Vec::as_mut_slice));
         let mut base = 0usize;
-        for ((bytes, piece_starts), slots) in parts.iter().zip(split(slots.as_deref_mut(), &bounds)) {
+        for ((bytes, piece_starts), slots) in parts.iter().zip(split(slots.as_deref_mut(), &bounds))
+        {
             let (to, tail) = std::mem::take(&mut rest).split_at_mut(bytes.len());
             rest = tail;
             let starts_to = starts_rest.take().map(|it| {
@@ -1420,7 +1524,12 @@ impl KeptReloc {
     /// The table for `image`: the kept one patched, when `delta` is from it, every rebase
     /// splice keeps its length and the writer's own addresses are the same; else built (and
     /// kept when the core's addresses came sorted).
-    fn of(&mut self, image: Image<'_>, delta: Option<&Delta<'_>>, extra: &[u64]) -> Result<CowBytes, LinkError> {
+    fn of(
+        &mut self,
+        image: Image<'_>,
+        delta: Option<&Delta<'_>>,
+        extra: &[u64],
+    ) -> Result<CowBytes, LinkError> {
         let last = std::mem::replace(&mut self.synthesis, 0);
         let layout = synthetic_layout(image.regions);
         if let Some(delta) = delta
@@ -1438,7 +1547,12 @@ impl KeptReloc {
             // clone: two reference counts, the table shared with the state that holds it
             return Ok(self.bytes.clone());
         }
-        let built = build_relocations(image, extra, reloc_piece(image.rebase.len()), Some(&mut self.index))?;
+        let built = build_relocations(
+            image,
+            extra,
+            reloc_piece(image.rebase.len()),
+            Some(&mut self.index),
+        )?;
         let bytes = CowBytes::from_vec(built);
         if self.index.slots.len() == image.rebase.len() {
             // clone: two reference counts, the table shared with the state that holds it
@@ -1475,7 +1589,9 @@ impl KeptReloc {
                 if slot == NONE || image.rebased(image.region_for(addr), addr).is_err() {
                     return false;
                 }
-                let Some(block) = blocks.partition_point(|&it| it <= slot).checked_sub(1) else { return false };
+                let Some(block) = blocks.partition_point(|&it| it <= slot).checked_sub(1) else {
+                    return false;
+                };
                 let mut page = [0; 4];
                 self.bytes.copy_to(blocks[block] as usize, &mut page);
                 if image.rva_of(page_of(addr)) != Some(u32::from_le_bytes(page)) {
@@ -1499,8 +1615,11 @@ impl KeptReloc {
             bytes.copy_to(start + 4, &mut size);
             let end = start + u32::from_le_bytes(size) as usize;
             let this = entry(slot) & 0xfff;
-            let next = (slot + 2 < end).then(|| entry(slot + 2)).filter(|it| (it >> 12) == pe::IMAGE_REL_BASED_DIR64.0);
-            (slot < start + 10 || (entry(slot - 2) & 0xfff) < this) && next.is_none_or(|it| this < (it & 0xfff))
+            let next = (slot + 2 < end)
+                .then(|| entry(slot + 2))
+                .filter(|it| (it >> 12) == pe::IMAGE_REL_BASED_DIR64.0);
+            (slot < start + 10 || (entry(slot - 2) & 0xfff) < this)
+                && next.is_none_or(|it| this < (it & 0xfff))
         })
     }
 }
@@ -1554,7 +1673,9 @@ fn blocks(
             continue;
         }
         last = Some(addr);
-        while region < regions.len() && regions[region].addr + regions[region].capacity.max(regions[region].size) < addr + 8 {
+        while region < regions.len()
+            && regions[region].addr + regions[region].capacity.max(regions[region].size) < addr + 8
+        {
             region += 1;
         }
         image.rebased(regions.get(region), addr)?;
@@ -1597,7 +1718,8 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
     let filled = |name: &'static str| -> Result<Option<(usize, u32, u32)>, LinkError> {
         match placed.region(&Class::Synthetic(name)) {
             Some((index, region)) if region.size > 0 => {
-                let size = u32::try_from(region.size).map_err(|_| error(format_args!("a {name} of {:#x} bytes", region.size)))?;
+                let size = u32::try_from(region.size)
+                    .map_err(|_| error(format_args!("a {name} of {:#x} bytes", region.size)))?;
                 Ok(Some((index, rva(placed, region.addr, name)?, size)))
             }
             _ => Ok(None),
@@ -1609,16 +1731,18 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
         let count = view
             .arrays::<{ DESCRIPTOR as usize }>(0, whole)
             .position(|it| it.iter().all(|byte| *byte == 0))
-            .ok_or_else(|| error("the import directory has no null descriptor: its bytes are not in place"))?;
-        directories[pe::IMAGE_DIRECTORY_ENTRY_IMPORT] = (at, (count as u32 + 1) * DESCRIPTOR as u32);
-        let bounds = placed
-            .got
-            .iter()
-            .filter(|it| matches!(it.holds, Holds::Import(_)))
-            .fold(None, |bounds: Option<(u64, u64)>, it| match bounds {
+            .ok_or_else(|| {
+                error("the import directory has no null descriptor: its bytes are not in place")
+            })?;
+        directories[pe::IMAGE_DIRECTORY_ENTRY_IMPORT] =
+            (at, (count as u32 + 1) * DESCRIPTOR as u32);
+        let bounds = placed.got.iter().filter(|it| matches!(it.holds, Holds::Import(_))).fold(
+            None,
+            |bounds: Option<(u64, u64)>, it| match bounds {
                 Some((first, last)) => Some((first.min(it.addr), last.max(it.addr))),
                 None => Some((it.addr, it.addr)),
-            });
+            },
+        );
         if let Some((first, last)) = bounds {
             directories[pe::IMAGE_DIRECTORY_ENTRY_IAT] =
                 (rva(placed, first, "the import address table")?, (last + 16 - first) as u32);
@@ -1629,13 +1753,16 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
     }
     if let Some((index, at, _)) = filled(DEBUG)? {
         if placed.view(index).u32(12) != Some(pe::IMAGE_DEBUG_TYPE_CODEVIEW.0) {
-            return Err(error("the debug directory's bytes are not in place: `file` before `synthesize`"));
+            return Err(error(
+                "the debug directory's bytes are not in place: `file` before `synthesize`",
+            ));
         }
         directories[pe::IMAGE_DIRECTORY_ENTRY_DEBUG] = (at, DEBUG_DIRECTORY as u32);
     }
     match tls_directory(placed)? {
         TlsDirectory::Crt(addr) | TlsDirectory::Ours(addr) => {
-            directories[pe::IMAGE_DIRECTORY_ENTRY_TLS] = (rva(placed, addr, "the TLS directory")?, TLS_DIRECTORY as u32);
+            directories[pe::IMAGE_DIRECTORY_ENTRY_TLS] =
+                (rva(placed, addr, "the TLS directory")?, TLS_DIRECTORY as u32);
         }
         TlsDirectory::None => {}
     }
@@ -1646,10 +1773,17 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
         directories[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC] = (at, size);
     }
     if let Some(addr) = (placed.symbol)("_load_config_used") {
-        let size = u32_of(&bytes_at::<4>(placed, addr, "the load configuration `_load_config_used`")?, 0);
-        directories[pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] = (rva(placed, addr, "the load configuration")?, size);
+        let size =
+            u32_of(&bytes_at::<4>(placed, addr, "the load configuration `_load_config_used`")?, 0);
+        directories[pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] =
+            (rva(placed, addr, "the load configuration")?, size);
     }
-    let resources = || placed.regions.iter().filter(|it| matches!(&it.class, Class::Named { name, .. } if name == RSRC));
+    let resources = || {
+        placed
+            .regions
+            .iter()
+            .filter(|it| matches!(&it.class, Class::Named { name, .. } if name == RSRC))
+    };
     if let (Some(start), Some(end)) =
         (resources().map(|it| it.addr).min(), resources().map(|it| it.addr + it.size).max())
     {
@@ -1674,7 +1808,11 @@ pub(super) struct Out {
 
 impl Out {
     fn raw(&self) -> u64 {
-        if self.file_end > self.start { (self.file_end - self.start).next_multiple_of(PAGE) } else { 0 }
+        if self.file_end > self.start {
+            (self.file_end - self.start).next_multiple_of(PAGE)
+        } else {
+            0
+        }
     }
 
     fn characteristics(&self) -> pe::SectionFlags {
@@ -1786,7 +1924,10 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
     match sections.first() {
         None => return Err(error("an image with no regions")),
         Some(first) if first.start < placed.plan.base + placed.plan.headers => {
-            return Err(error(format_args!("the first section at {:#x} is inside the headers", first.start)));
+            return Err(error(format_args!(
+                "the first section at {:#x} is inside the headers",
+                first.start
+            )));
         }
         Some(_) => {}
     }
@@ -1810,7 +1951,9 @@ fn name_of(section: &Out) -> &str {
 fn dev_run_sections(base: u64, sections: &mut [Out]) -> Result<(), LinkError> {
     let code = sections.iter().take_while(|it| it.prot.exec).count();
     if code == 0 {
-        return Err(error("a dev run's executable has no code section first: its code must start the image"));
+        return Err(error(
+            "a dev run's executable has no code section first: its code must start the image",
+        ));
     }
     for (index, section) in sections.iter().enumerate() {
         let rva = section.start - base;
@@ -1839,7 +1982,9 @@ fn dev_run_sections(base: u64, sections: &mut [Out]) -> Result<(), LinkError> {
                 "the section {name} at RVA {rva:#x} comes after a reservation: a dev run's reservations are last"
             )));
         }
-        if section.reserve && !(rva.is_multiple_of(GRANULE) && (section.end - base).is_multiple_of(GRANULE)) {
+        if section.reserve
+            && !(rva.is_multiple_of(GRANULE) && (section.end - base).is_multiple_of(GRANULE))
+        {
             return Err(error(format_args!(
                 "the reservation {name} at RVA {rva:#x}..{:#x} is not whole {GRANULE:#x}-byte granules: a dev run's \
                  reservation sizes are multiples of 64 KiB",
@@ -1880,7 +2025,9 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     if pe.dev_run() {
         match tls_directory(placed)? {
             TlsDirectory::Crt(addr) | TlsDirectory::Ours(addr) => check_start_hook(placed, addr)?,
-            TlsDirectory::None => return Err(error("a dev run's executable has no TLS directory for its start hook")),
+            TlsDirectory::None => {
+                return Err(error("a dev run's executable has no TLS directory for its start hook"));
+            }
         }
         check_no_guard(placed)?;
     }
@@ -1888,14 +2035,20 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     let size_of_headers = placed.plan.headers;
     let headers = NT + 4 + FILE_HEADER + OPTIONAL + SECTION_HEADER * sections.len();
     if headers as u64 > PAGE {
-        return Err(error(format_args!("{} sections, more than the headers' page has room for", sections.len())));
+        return Err(error(format_args!(
+            "{} sections, more than the headers' page has room for",
+            sections.len()
+        )));
     }
     let last = sections.last().map_or(base + PAGE, |it| it.end);
-    let size_of_image = u32::try_from((last - base).next_multiple_of(PAGE))
-        .map_err(|_| error(format_args!("an image of {:#x} bytes, more than PE's 4 GiB", last - base)))?;
+    let size_of_image = u32::try_from((last - base).next_multiple_of(PAGE)).map_err(|_| {
+        error(format_args!("an image of {:#x} bytes, more than PE's 4 GiB", last - base))
+    })?;
     let entry = match &pe.output.kind {
         OutputKind::Executable { entry } => {
-            let addr = placed.entry.ok_or_else(|| error(format_args!("the executable's entry `{entry}` is not placed")))?;
+            let addr = placed.entry.ok_or_else(|| {
+                error(format_args!("the executable's entry `{entry}` is not placed"))
+            })?;
             rva(placed, addr, entry)?
         }
         OutputKind::Shared { .. } => match placed.entry {
@@ -1914,7 +2067,8 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
         }
     }
     let size = |value: u64, what: &str| {
-        u32::try_from(value).map_err(|_| error(format_args!("{value:#x} bytes of {what}, more than PE's 4 GiB")))
+        u32::try_from(value)
+            .map_err(|_| error(format_args!("{value:#x} bytes of {what}, more than PE's 4 GiB")))
     };
     let base_of_code = match sections.iter().find(|it| it.prot.exec) {
         Some(section) => rva(placed, section.start, "the code")?,

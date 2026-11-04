@@ -492,7 +492,10 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<RecordBatch>, ArrowError> {
 pub enum TopError {
     Arrow(ArrowError),
     /// The batch has no column `column` of the right type for table `table`.
-    Column { table: &'static str, column: &'static str },
+    Column {
+        table: &'static str,
+        column: &'static str,
+    },
 }
 
 impl std::fmt::Display for TopError {
@@ -514,7 +517,11 @@ impl From<ArrowError> for TopError {
     }
 }
 
-fn column<'a>(batch: &'a RecordBatch, table: &'static Table, name: &'static str) -> Result<&'a ArrayRef, TopError> {
+fn column<'a>(
+    batch: &'a RecordBatch,
+    table: &'static Table,
+    name: &'static str,
+) -> Result<&'a ArrayRef, TopError> {
     let missing = || TopError::Column { table: table.name, column: name };
     let at = table.column(name).ok_or_else(missing)?;
     batch.columns().get(at).filter(|_| batch.schema().field(at).name() == name).ok_or_else(missing)
@@ -535,7 +542,8 @@ fn strings<'a>(
         .as_string_opt::<i32>()
         .ok_or(TopError::Column { table: table.name, column: name })?;
     let keys = dict.keys();
-    Ok((0..keys.len()).map(move |row| keys.is_valid(row).then(|| values.value(keys.value(row) as usize))))
+    Ok((0..keys.len())
+        .map(move |row| keys.is_valid(row).then(|| values.value(keys.value(row) as usize))))
 }
 
 /// The strings of a string column, one a row (`None` where null).
@@ -611,7 +619,8 @@ impl Top {
         }
         let mut closed = 0u64;
         for batch in spans {
-            let threads = primitive::<arrow_array::types::UInt32Type>(batch, &schema::SPANS, "thread")?;
+            let threads =
+                primitive::<arrow_array::types::UInt32Type>(batch, &schema::SPANS, "thread")?;
             let names = strings(batch, &schema::SPANS, "thread_name")?;
             for (tid, name) in threads.values().iter().zip(names) {
                 let thread = self.threads.entry(*tid).or_default();
@@ -625,7 +634,8 @@ impl Top {
         }
         for batch in counters {
             let names = strings(batch, &schema::COUNTERS, "name")?;
-            let values = primitive::<arrow_array::types::Float64Type>(batch, &schema::COUNTERS, "value")?;
+            let values =
+                primitive::<arrow_array::types::Float64Type>(batch, &schema::COUNTERS, "value")?;
             for (name, value) in names.zip(values.values().iter()) {
                 match name {
                     Some(it) if it == Plot::MemoHits.name() => self.hits = Some(*value),
@@ -639,7 +649,8 @@ impl Top {
             let tids = primitive::<arrow_array::types::UInt32Type>(batch, &schema::OPEN, "thread")?;
             let thread_names = strings(batch, &schema::OPEN, "thread_name")?;
             let names = strings(batch, &schema::OPEN, "name")?;
-            let starts = primitive::<arrow_array::types::Int64Type>(batch, &schema::OPEN, "start_ns")?;
+            let starts =
+                primitive::<arrow_array::types::Int64Type>(batch, &schema::OPEN, "start_ns")?;
             let functions = utf8s(batch, &schema::OPEN, "function")?;
             let crates = strings(batch, &schema::OPEN, "crate")?;
             for (((((tid, thread_name), name), start_ns), function), krate) in tids
@@ -665,12 +676,17 @@ impl Top {
                     _ = write!(of, " of {krate}");
                 }
                 // alloc: the view's copy of a running span, once a frame
-                thread.open.push(Running { name: name.unwrap_or("?").to_owned(), of, start_ns: *start_ns });
+                thread.open.push(Running {
+                    name: name.unwrap_or("?").to_owned(),
+                    of,
+                    start_ns: *start_ns,
+                });
                 inside = true;
             }
         }
         self.threads.retain(|_, it| !it.open.is_empty() || it.closed > 0);
-        self.rate = if self.at_ns != 0 && since > 0 { closed as f64 * 1e9 / since as f64 } else { 0.0 };
+        self.rate =
+            if self.at_ns != 0 && since > 0 { closed as f64 * 1e9 / since as f64 } else { 0.0 };
         self.last_close_ns = match (inside, closed) {
             (false, _) => None,
             (true, 0) => self.last_close_ns.or(Some(at_ns)),
@@ -721,13 +737,20 @@ impl Top {
         }
         // alloc: the view's rows, once a frame
         let mut threads: Vec<(&u32, &Thread)> = self.threads.iter().collect();
-        threads.sort_by_key(|(tid, it)| (it.open.first().map_or(i64::MAX, |it| it.start_ns), **tid));
+        threads
+            .sort_by_key(|(tid, it)| (it.open.first().map_or(i64::MAX, |it| it.start_ns), **tid));
         _ = writeln!(out, "{:<24} {:>9} {:>6}  running", "thread", "for", "closed");
         for (tid, thread) in &threads {
             let line_start = out.len();
             let name = if thread.name.is_empty() { "?" } else { thread.name.as_str() };
             let running_for = thread.open.first().map_or(0, |it| self.at_ns - it.start_ns);
-            _ = write!(out, "{:<24} {:>8.1}s {:>6}  ", truncated(name, 24), secs(running_for), thread.closed);
+            _ = write!(
+                out,
+                "{:<24} {:>8.1}s {:>6}  ",
+                truncated(name, 24),
+                secs(running_for),
+                thread.closed
+            );
             for (i, span) in thread.open.iter().enumerate() {
                 out.push_str(if i == 0 { "" } else { " > " });
                 out.push_str(&span.name);
@@ -751,7 +774,13 @@ impl Top {
         }
         for (span, thread) in longest.iter().take(10) {
             let line_start = out.len();
-            _ = write!(out, "{:>8.1}s  {}{}  ({thread})", secs(self.at_ns - span.start_ns), span.name, span.of);
+            _ = write!(
+                out,
+                "{:>8.1}s  {}{}  ({thread})",
+                secs(self.at_ns - span.start_ns),
+                span.name,
+                span.of
+            );
             cut(out, line_start, width);
             out.push('\n');
         }
@@ -1044,7 +1073,10 @@ mod tests {
         let mut text = String::new();
         top.render(200, &mut text);
         assert!(text.contains("memo hit rate 90.0%"), "{text}");
-        assert!(text.contains("worker 3") && text.contains("build > typeck_query `app::main` of app"), "{text}");
+        assert!(
+            text.contains("worker 3") && text.contains("build > typeck_query `app::main` of app"),
+            "{text}"
+        );
         assert!(text.contains("longest running"), "{text}");
         assert!(!text.contains("warning"), "{text}");
     }
@@ -1088,7 +1120,10 @@ mod tests {
             batches
                 .iter()
                 .map(|batch| {
-                    strings(batch, &schema::SPANS, "name").unwrap().filter(|it| *it == Some("live once")).count()
+                    strings(batch, &schema::SPANS, "name")
+                        .unwrap()
+                        .filter(|it| *it == Some("live once"))
+                        .count()
                 })
                 .sum()
         };

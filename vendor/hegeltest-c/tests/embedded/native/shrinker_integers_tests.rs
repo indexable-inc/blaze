@@ -17,11 +17,7 @@ use alloc::vec::Vec;
 
 fn int_node_st(value: i128, min: i128, max: i128, shrink_towards: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(min),
-            BigInt::from(max),
-            BigInt::from(shrink_towards),
-        ),
+        IntegerChoice::new(BigInt::from(min), BigInt::from(max), BigInt::from(shrink_towards)),
         BigInt::from(value),
         false,
     )
@@ -74,11 +70,7 @@ fn integer_shrink_probes_both_sides_of_target_for_nonmonotonic_predicates() {
     );
     drive_no_yield(shrinker.binary_search_integer_towards_zero()).unwrap();
     let v = int_value(&shrinker.current_nodes[0]);
-    assert_eq!(
-        (v - 100).unsigned_abs(),
-        1,
-        "expected distance 1 from target, got {v}"
-    );
+    assert_eq!((v - 100).unsigned_abs(), 1, "expected distance 1 from target, got {v}");
 }
 
 #[test]

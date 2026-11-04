@@ -64,11 +64,7 @@ fn lower_common_node_offset_collapses_zig_zag_pair() {
                     ChoiceValue::Integer(v) => i128::try_from(v).unwrap(),
                     _ => unreachable!(),
                 };
-                (
-                    m.abs_diff(n) == 1 && m >= 1 && n >= 1,
-                    nodes.to_vec(),
-                    Spans::new(),
-                )
+                (m.abs_diff(n) == 1 && m >= 1 && n >= 1, nodes.to_vec(), Spans::new())
             }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
@@ -93,10 +89,7 @@ fn bounded_int_node(value: i128, min: i128, max: i128) -> ChoiceNode {
 
 #[test]
 fn full_shrink_breaks_a_far_away_zig_zag_within_a_few_improvements() {
-    let initial = vec![
-        bounded_int_node(-977, -1000, 1000),
-        bounded_int_node(-977, -1000, 1000),
-    ];
+    let initial = vec![bounded_int_node(-977, -1000, 1000), bounded_int_node(-977, -1000, 1000)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
@@ -143,10 +136,7 @@ fn lower_common_node_offset_handles_negative_shrink_target() {
     drive_no_yield(shrinker.consider(&[int_node(-9, -10), int_node(-11, -10)])).unwrap();
     assert_eq!(shrinker.changed_nodes().len(), 2);
     drive_no_yield(shrinker.lower_common_node_offset()).unwrap();
-    let (a, b) = (
-        int_value(&shrinker.current_nodes[0]),
-        int_value(&shrinker.current_nodes[1]),
-    );
+    let (a, b) = (int_value(&shrinker.current_nodes[0]), int_value(&shrinker.current_nodes[1]));
     assert_eq!(a.abs_diff(b), 2);
     assert!(a.abs_diff(-10) <= 1);
     assert!(b.abs_diff(-10) <= 1);
@@ -201,10 +191,7 @@ fn lower_common_node_offset_skips_non_integer_nodes() {
 
 fn bytes_node(value: Vec<u8>) -> ChoiceNode {
     ChoiceNode::bytes(
-        crate::native::core::choices::BytesChoice {
-            min_size: 0,
-            max_size: 1_000_000,
-        },
+        crate::native::core::choices::BytesChoice { min_size: 0, max_size: 1_000_000 },
         value,
         false,
     )

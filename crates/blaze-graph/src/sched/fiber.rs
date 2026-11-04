@@ -30,8 +30,7 @@
 use std::{
     any::Any,
     cell::Cell,
-    fmt, io,
-    mem,
+    fmt, io, mem,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
@@ -47,7 +46,7 @@ use std::{
 use parking_lot::{Mutex, MutexGuard};
 
 use super::{
-    CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
+    CoreId, Cores, CounterId, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
     domain::{Domain, Guard, Scheduler, lock_joined, wait_cell},
     stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
 };
@@ -103,9 +102,15 @@ pub enum DriverError {
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DriverError::Stack { bytes, why } => write!(f, "mapping a fiber stack of {bytes} bytes: {why}"),
-            DriverError::Setup { core, why } => write!(f, "setting up the worker of core {}: {why}", core.0),
-            DriverError::Thread { core, why } => write!(f, "starting the worker of core {}: {why}", core.0),
+            DriverError::Stack { bytes, why } => {
+                write!(f, "mapping a fiber stack of {bytes} bytes: {why}")
+            }
+            DriverError::Setup { core, why } => {
+                write!(f, "setting up the worker of core {}: {why}", core.0)
+            }
+            DriverError::Thread { core, why } => {
+                write!(f, "starting the worker of core {}: {why}", core.0)
+            }
         }
     }
 }
@@ -182,7 +187,10 @@ struct State<W: Work> {
     live: u32,
     idle: Vec<Fiber<W::Job>>,
     /// Boxes for parked jobs' carried thread-locals, kept for the next job to park.
-    #[allow(clippy::vec_box, reason = "each box moves whole into a `Slot::Parked`, which holds it boxed to stay small")]
+    #[allow(
+        clippy::vec_box,
+        reason = "each box moves whole into a `Slot::Parked`, which holds it boxed to stay small"
+    )]
     spare_taken: Vec<Box<Taken>>,
     closing: bool,
     joiner: Option<Thread>,
@@ -198,7 +206,10 @@ struct CoreSlot {
     moving: AtomicBool,
     /// A `Wake` (or the stop) since the worker last looked.
     woken: AtomicBool,
-    #[expect(clippy::disallowed_types, reason = "no global state: its worker's handle, set once as it is spawned, read with no lock by each wake")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "no global state: its worker's handle, set once as it is spawned, read with no lock by each wake"
+    )]
     thread: std::sync::OnceLock<Thread>,
 }
 
@@ -284,7 +295,8 @@ impl<W: Work> Locked<'_, W> {
     /// This member's pending `Run` of `core`, taken.
     fn take_pending(&mut self, core: u32) -> Option<u32> {
         let member = self.member;
-        let (_, io) = self.global.io.iter_mut().find(|it| it.0 == member).expect("a running driver's wakers");
+        let (_, io) =
+            self.global.io.iter_mut().find(|it| it.0 == member).expect("a running driver's wakers");
         let job = mem::replace(&mut io.pending[core as usize], NONE);
         (job != NONE).then_some(job)
     }
@@ -381,13 +393,19 @@ fn new_fiber<W: Work>(shared: &Arc<Shared<W>>) -> Result<Fiber<W::Job>, DriverEr
     let bytes = shared.config.stack;
     #[cfg(test)]
     if shared.fail_fibers.load(Ordering::Acquire) {
-        return Err(DriverError::Stack { bytes, why: io::Error::other("a test failed the driver's next fiber") });
+        return Err(DriverError::Stack {
+            bytes,
+            why: io::Error::other("a test failed the driver's next fiber"),
+        });
     }
     let stack = Stack::new(bytes).map_err(|why| DriverError::Stack { bytes, why })?;
     let limit = stack.limit();
     let shared = Arc::clone(shared); // clone: one per fiber made, held for its life
     let number = FIBERS.fetch_add(1, Ordering::Relaxed);
-    Ok(Fiber(Stackful::new(stack, number, move |yielder, first| body(&shared, limit, yielder, first)), number))
+    Ok(Fiber(
+        Stackful::new(stack, number, move |yielder, first| body(&shared, limit, yielder, first)),
+        number,
+    ))
 }
 
 /// A fiber's life: run each job it is started with, report its end, and wait for the next.
@@ -498,7 +516,11 @@ impl<W: Work> Cx<'_, W> {
     /// For `Wait::Job` (use [`Cx::wait_job`]: a bare id may be recycled), or inside a
     /// [`NoWait`].
     pub fn wait(&self, on: Wait) -> Result<(), Cycle> {
-        assert!(!matches!(on, Wait::Job(_)), "job {} waits for a bare job id: wait for its `Handle`", self.job.0);
+        assert!(
+            !matches!(on, Wait::Job(_)),
+            "job {} waits for a bare job id: wait for its `Handle`",
+            self.job.0
+        );
         self.switch(Out::Wait(Want::On(on)))
     }
 
@@ -646,7 +668,11 @@ pub(super) fn clear() {
 #[inline(never)]
 pub(super) fn check_no_wait(job: JobId) {
     let held = HELD.get();
-    assert!(held == 0, "job {} waited inside {held} `NoWait` region(s): a lock or thread-local borrow would cross threads", job.0);
+    assert!(
+        held == 0,
+        "job {} waited inside {held} `NoWait` region(s): a lock or thread-local borrow would cross threads",
+        job.0
+    );
 }
 
 /// The job running on this thread's fiber, put in the wait graph if it is not yet (a pool's
@@ -732,8 +758,12 @@ fn forget(_: NonZeroUsize) {}
 /// The most thread-locals carried with a job.
 pub const MAX_CARRIED: usize = 32;
 
-#[expect(clippy::disallowed_types, reason = "the process's carried thread-locals: a job carries every one registered, on any thread")]
-static CARRIED: [std::sync::OnceLock<Carried>; MAX_CARRIED] = [const { std::sync::OnceLock::new() }; MAX_CARRIED];
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's carried thread-locals: a job carries every one registered, on any thread"
+)]
+static CARRIED: [std::sync::OnceLock<Carried>; MAX_CARRIED] =
+    [const { std::sync::OnceLock::new() }; MAX_CARRIED];
 static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The fiber stack limit `stdx::ensure_sufficient_stack` checks against, carried with the job
@@ -750,7 +780,11 @@ static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 pub(super) fn carry_stack_limit() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        carry(Carried { take: blaze_reclaim::park, put: blaze_reclaim::unpark, end: blaze_reclaim::end_parked });
+        carry(Carried {
+            take: blaze_reclaim::park,
+            put: blaze_reclaim::unpark,
+            end: blaze_reclaim::end_parked,
+        });
         carry(Carried::word(super::host::take_scope, super::host::put_scope));
         carry(Carried::word(blaze_mem::frame::take_current, blaze_mem::frame::put_current));
         carry(Carried::word(blaze_mem::frame::take_below, blaze_mem::frame::put_below));
@@ -839,7 +873,8 @@ fn put_carried(taken: &mut Taken) -> Option<Panic> {
     let mut failed = None;
     for (value, carried) in taken.0.iter_mut().zip(&CARRIED) {
         if let Some(value) = value.take() {
-            let carried = carried.get().expect("a carried value of a thread-local that was never registered");
+            let carried =
+                carried.get().expect("a carried value of a thread-local that was never registered");
             if let Err(panic) = panic::catch_unwind(move || (carried.put)(value)) {
                 failed.get_or_insert(panic);
             }
@@ -855,7 +890,8 @@ fn end_carried(taken: &mut Taken) -> Option<Panic> {
     let mut failed = None;
     for (value, carried) in taken.0.iter_mut().zip(&CARRIED) {
         if let Some(value) = value.take() {
-            let carried = carried.get().expect("a carried value of a thread-local that was never registered");
+            let carried =
+                carried.get().expect("a carried value of a thread-local that was never registered");
             if let Err(panic) = panic::catch_unwind(move || (carried.end)(value)) {
                 failed.get_or_insert(panic);
             }
@@ -874,7 +910,11 @@ fn end_carried(taken: &mut Taken) -> Option<Panic> {
 /// the job is resumed with: the first panic of the swap or `failed` (of its take as it parked),
 /// for it to raise.
 #[inline(never)]
-pub(super) fn come_on(worker: &mut Taken, job: Option<&mut Taken>, failed: Option<Panic>) -> Answer {
+pub(super) fn come_on(
+    worker: &mut Taken,
+    job: Option<&mut Taken>,
+    failed: Option<Panic>,
+) -> Answer {
     let mut failed = failed;
     if let Some(panic) = take_carried(worker) {
         failed.get_or_insert(panic);
@@ -951,7 +991,10 @@ pub enum SwitchEvent {
     Ran,
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every switch")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one profiler hook, set once, read with no lock at every switch"
+)]
 static OBSERVER: std::sync::OnceLock<fn(Switch)> = std::sync::OnceLock::new();
 
 /// Has `observer` told of every job's switches (the profiler's). Once a process; a second is
@@ -1013,7 +1056,10 @@ pub struct Given {
     pub creator: u64,
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one profiler hook, set once, read with no lock at every pool submit"
+)]
 static SPAWNER: std::sync::OnceLock<fn() -> Given> = std::sync::OnceLock::new();
 
 /// Has `given` say, as a pool job is given to the pool, the observer's number for the job
@@ -1050,7 +1096,10 @@ pub enum IdleReason {
     Until(u64),
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock as a worker idles")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one profiler hook, set once, read with no lock as a worker idles"
+)]
 static IDLE_OBSERVER: std::sync::OnceLock<fn(Idle)> = std::sync::OnceLock::new();
 
 /// Has `observer` told of every worker's idle stretches (the profiler's). Once a process; a
@@ -1113,9 +1162,16 @@ impl<W: Work> Driver<W> {
     ) -> Result<Driver<W>, DriverError> {
         carry_stack_limit();
         let n = cores.len();
-        #[allow(clippy::disallowed_types, reason = "no global state: each core's worker handle, set as it is spawned")]
+        #[allow(
+            clippy::disallowed_types,
+            reason = "no global state: each core's worker handle, set as it is spawned"
+        )]
         let slots: Arc<[CoreSlot]> = (0..n)
-            .map(|_| CoreSlot { moving: AtomicBool::new(false), woken: AtomicBool::new(false), thread: std::sync::OnceLock::new() })
+            .map(|_| CoreSlot {
+                moving: AtomicBool::new(false),
+                woken: AtomicBool::new(false),
+                thread: std::sync::OnceLock::new(),
+            })
             .collect(); // alloc: setup, once per driver
         let mut pending = Vec::with_capacity(n);
         pending.resize(n, NONE);
@@ -1174,15 +1230,17 @@ impl<W: Work> Driver<W> {
             let setup = Arc::clone(&setup); // clone: one per worker, at start
             let sent = sent.clone();
             // alloc: a worker's name, once per worker
-            let started = thread::Builder::new().name(format!("blaze-fiber-{core}")).spawn(move || {
-                let set = (*setup)(CoreId(core)).map_err(|why| DriverError::Setup { core: CoreId(core), why });
-                let ok = set.is_ok();
-                let _ = sent.send(set);
-                drop(sent);
-                if ok {
-                    worker(&shared, core);
-                }
-            });
+            let started =
+                thread::Builder::new().name(format!("blaze-fiber-{core}")).spawn(move || {
+                    let set = (*setup)(CoreId(core))
+                        .map_err(|why| DriverError::Setup { core: CoreId(core), why });
+                    let ok = set.is_ok();
+                    let _ = sent.send(set);
+                    drop(sent);
+                    if ok {
+                        worker(&shared, core);
+                    }
+                });
             match started {
                 Ok(handle) => threads.push(handle),
                 Err(why) => {
@@ -1473,9 +1531,8 @@ fn run<'a, W: Work>(
             Out::Wait(want) => {
                 let on = match want {
                     Want::On(on) => Some(on),
-                    Want::Job(handle) => {
-                        (st.world().generation(handle.job) == handle.generation).then_some(Wait::Job(handle.job))
-                    }
+                    Want::Job(handle) => (st.world().generation(handle.job) == handle.generation)
+                        .then_some(Wait::Job(handle.job)),
                 };
                 if let Some(Wait::Until(_)) = on {
                     st.world().advance_clock(member, shared.now());

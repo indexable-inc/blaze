@@ -177,7 +177,11 @@ pub mod reported {
 
     impl std::fmt::Display for Site {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "a blaze bug: `{}` {} at {}, {} time", self.kind, self.what, self.at, self.count)?;
+            write!(
+                f,
+                "a blaze bug: `{}` {} at {}, {} time",
+                self.kind, self.what, self.at, self.count
+            )?;
             if self.count != 1 {
                 f.write_str("s")?;
             }
@@ -278,7 +282,11 @@ pub mod reported {
         }
         use std::io::Write as _;
         let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "\nerror: this process reported {} blaze bug(s) and went on past them:", total());
+        let _ = writeln!(
+            err,
+            "\nerror: this process reported {} blaze bug(s) and went on past them:",
+            total()
+        );
         // Bounded: a thread still running at exit may hold the lock for its update.
         match SITES.try_lock_for(std::time::Duration::from_secs(1)) {
             Some(sites) => {
@@ -286,7 +294,12 @@ pub mod reported {
                     let _ = writeln!(err, "  {site}");
                 }
             }
-            None => _ = writeln!(err, "  (each site unread: another thread held their list for 1s at exit)"),
+            None => {
+                _ = writeln!(
+                    err,
+                    "  (each site unread: another thread held their list for 1s at exit)"
+                )
+            }
         }
         let _ = err.flush();
         exit_check::exit(101);
@@ -305,7 +318,9 @@ pub mod reported {
             let registered = unsafe { atexit(super::fail_exit) };
             // A process whose check can't be registered is told now, never quietly let go.
             if registered != 0 {
-                eprintln!("error: stdx::assert::reported: atexit refused the exit check ({registered})");
+                eprintln!(
+                    "error: stdx::assert::reported: atexit refused the exit check ({registered})"
+                );
             }
         }
 

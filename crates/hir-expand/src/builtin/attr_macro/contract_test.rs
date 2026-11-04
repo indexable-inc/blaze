@@ -81,8 +81,11 @@ pub(super) fn contract_test_expand<'f>(
         if is_skip {
             return ExpandResult::ok(unchanged());
         }
-        let given =
-            ::tt::stringify(args.token_trees(), &|s, t| source_joined(db, s, t), through_proc_macro(db, id));
+        let given = ::tt::stringify(
+            args.token_trees(),
+            &|s, t| source_joined(db, s, t),
+            through_proc_macro(db, id),
+        );
         // alloc: an error's message, once per refused attribute
         let msg = format!(
             "`#[blaze::contract_test(..)]` takes one argument, `skip` (leave the function out), \
@@ -228,8 +231,13 @@ fn generate(
         .and_then(|item| ast::Fn::cast(item.syntax()))
         .ok_or_else(not_fn)?;
     let name = function.name().ok_or_else(not_fn)?;
-    let mut w =
-        Writer { db, span, map: &map, through_proc_macro: through_proc_macro(db, id), users: Vec::new() };
+    let mut w = Writer {
+        db,
+        span,
+        map: &map,
+        through_proc_macro: through_proc_macro(db, id),
+        users: Vec::new(),
+    };
     let (fn_ph, fn_text) = w.user(name.syntax());
     let refuse = |why: &str| Err(format!("`#[blaze::contract_test]` on `{fn_text}`: {why}"));
 
@@ -259,7 +267,9 @@ fn generate(
         );
     }
     if function.async_token().is_some() || function.gen_token().is_some() {
-        return refuse("an `async` or `gen` function is not supported: the test calls it once and checks what it returns");
+        return refuse(
+            "an `async` or `gen` function is not supported: the test calls it once and checks what it returns",
+        );
     }
     if function.unsafe_token().is_some() {
         return refuse(
@@ -290,7 +300,9 @@ fn generate(
         }
     }
     if requires.is_empty() && ensures.is_empty() {
-        return refuse("the function has no `requires` or `ensures` clause, so there is no contract to test");
+        return refuse(
+            "the function has no `requires` or `ensures` clause, so there is no contract to test",
+        );
     }
     let ret = function.ret_type().and_then(|it| it.pat()).map(|pat| w.user(pat.syntax()));
 
@@ -326,11 +338,15 @@ fn generate(
                 ));
             }
             ast::Type::RefType(r) => {
-                let Some(inner) = r.ty() else { return refuse(&format!("argument `{shown}` has no type")) };
+                let Some(inner) = r.ty() else {
+                    return refuse(&format!("argument `{shown}` has no type"));
+                };
                 (prefix, suffix) = match inner {
                     ast::Type::PathType(p) if last_segment(p) == Some("str") => ("", ""),
                     ast::Type::SliceType(_) => ("&", ""),
-                    ast::Type::PathType(p) if last_segment(p) == Some("String") => ("&String::from(", ")"),
+                    ast::Type::PathType(p) if last_segment(p) == Some("String") => {
+                        ("&String::from(", ")")
+                    }
                     ast::Type::PathType(p) if last_segment(p) == Some("Vec") => ("&vec!", ""),
                     _ => ("&", ""),
                 };
@@ -358,7 +374,9 @@ fn generate(
 
     let template = write_template(&fn_ph, &fn_text, &args, &requires, &ensures, ret.as_ref());
     let template = syntax_bridge::parse_to_token_tree_static_span(edition, span, &template)
-        .ok_or_else(|| format!("`#[blaze::contract_test]` on `{fn_text}`: the generated test does not lex"))?;
+        .ok_or_else(|| {
+            format!("`#[blaze::contract_test]` on `{fn_text}`: the generated test does not lex")
+        })?;
     Ok(Generated { function: fn_text, template, users: w.users })
 }
 

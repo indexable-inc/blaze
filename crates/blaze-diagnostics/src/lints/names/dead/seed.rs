@@ -85,7 +85,12 @@ pub(super) struct Crate<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Crate<'c, 'a, 'db> {
-    pub(super) fn new(cx: &'c Cx<'a, 'db>, defs: &'c Defs, levels: &'c Levels<'a, 'db>, reach: &'c Reach) -> Self {
+    pub(super) fn new(
+        cx: &'c Cx<'a, 'db>,
+        defs: &'c Defs,
+        levels: &'c Levels<'a, 'db>,
+        reach: &'c Reach,
+    ) -> Self {
         Crate {
             cx,
             defs,
@@ -167,12 +172,17 @@ impl<'db> Crate<'_, '_, 'db> {
         };
         let codegen = matches!(d.kind, Kind::Fn | Kind::AssocFn { .. } | Kind::Static);
         let extern_indicator = !d.foreign
-            && (flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME | AttrFlags::HAS_EXPORT_NAME)
-                || owner.and_then(|it| AttrFlags::linkage(db, it)).is_some_and(|it| it.as_str() != "internal"));
+            && (flags.intersects(
+                AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME | AttrFlags::HAS_EXPORT_NAME,
+            ) || owner
+                .and_then(|it| AttrFlags::linkage(db, it))
+                .is_some_and(|it| it.as_str() != "internal"));
         let used_like = codegen && (extern_indicator || flags.contains(AttrFlags::USED));
         let lang = flags.contains(AttrFlags::LANG_ITEM)
             || flags.contains(AttrFlags::PANIC_HANDLER)
-            || (d.foreign && d.kind == Kind::Fn && flags.contains(AttrFlags::RUSTC_CANONICAL_SYMBOL));
+            || (d.foreign
+                && d.kind == Kind::Fn
+                && flags.contains(AttrFlags::RUSTC_CANONICAL_SYMBOL));
         if used_like || lang { LANG } else { NEITHER }
     }
 
@@ -215,7 +225,9 @@ impl<'db> Crate<'_, '_, 'db> {
         let rustc_main = self.defs.modules.iter().flat_map(|it| &it.free).copied().find(|&def| {
             let d = &self.defs[def];
             match (d.kind, d.id) {
-                (Kind::Fn, Id::Fn(id)) => AttrFlags::query(db, id.into()).contains(AttrFlags::RUSTC_MAIN),
+                (Kind::Fn, Id::Fn(id)) => {
+                    AttrFlags::query(db, id.into()).contains(AttrFlags::RUSTC_MAIN)
+                }
                 _ => false,
             }
         });
@@ -241,7 +253,9 @@ impl<'db> Crate<'_, '_, 'db> {
                 MacroDefKind::BuiltInAttr(_, it) => it.is_test() || it.is_bench(),
                 _ => false,
             };
-            if test && self.cx.syntax_view(node).value.parent().is_some_and(|it| it.parent().is_none()) {
+            if test
+                && self.cx.syntax_view(node).value.parent().is_some_and(|it| it.parent().is_none())
+            {
                 out.push(WorkItem::new(def, false));
             }
         }
@@ -267,7 +281,9 @@ fn attr_owner(id: Id) -> Option<AttrDefId> {
 /// the crate's `#![crate_type]`s (none: `bin`).
 pub(super) fn executable(cx: &Cx<'_, '_>) -> Option<bool> {
     match cx.krate.target_kind(cx.db) {
-        TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => Some(true),
+        TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => {
+            Some(true)
+        }
         TargetKind::Lib { .. } => Some(false),
         TargetKind::Example => None,
         TargetKind::Other => {
@@ -347,7 +363,11 @@ fn maybe_record_as_seed(k: &Crate<'_, '_, '_>, owner: DefIdx, seeds: &mut Seeds)
                 {
                     push(WorkItem::new(owner, comes_from_allow), seeds);
                 }
-                seeds.unsolved.push(Unsolved { def: owner, trait_def: trait_item, self_adt: k.impl_self_adt(parent) });
+                seeds.unsolved.push(Unsolved {
+                    def: owner,
+                    trait_def: trait_item,
+                    self_adt: k.impl_self_adt(parent),
+                });
             }
         }
         Kind::Impl { of_trait: true } if allow.is_none() => {
@@ -357,7 +377,11 @@ fn maybe_record_as_seed(k: &Crate<'_, '_, '_>, owner: DefIdx, seeds: &mut Seeds)
             {
                 push(WorkItem::new(owner, comes_from_allow), seeds);
             }
-            seeds.unsolved.push(Unsolved { def: owner, trait_def: trait_, self_adt: k.impl_self_adt(owner) });
+            seeds.unsolved.push(Unsolved {
+                def: owner,
+                trait_def: trait_,
+                self_adt: k.impl_self_adt(owner),
+            });
         }
         Kind::Const if d.name.as_ref().is_some_and(|it| *it.symbol() == sym::underscore) => {
             push(WorkItem::new(owner, false), seeds)

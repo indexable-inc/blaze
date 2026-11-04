@@ -1,15 +1,42 @@
 use crate::{BLOCK_LEN, CVWords, IncrementCounter, OUT_LEN};
 
 // Unsafe because this may only be called on platforms supporting AVX-512.
-pub unsafe fn compress_in_place(cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) {
-    unsafe { ffi::blake3_servil_compress_in_place_avx512(cv.as_mut_ptr(), block.as_ptr(), block_len, counter, flags) }
+pub unsafe fn compress_in_place(
+    cv: &mut CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+) {
+    unsafe {
+        ffi::blake3_servil_compress_in_place_avx512(
+            cv.as_mut_ptr(),
+            block.as_ptr(),
+            block_len,
+            counter,
+            flags,
+        )
+    }
 }
 
 // Unsafe because this may only be called on platforms supporting AVX-512.
-pub unsafe fn compress_xof(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) -> [u8; 64] {
+pub unsafe fn compress_xof(
+    cv: &CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+) -> [u8; 64] {
     unsafe {
         let mut out = [0u8; 64];
-        ffi::blake3_servil_compress_xof_avx512(cv.as_ptr(), block.as_ptr(), block_len, counter, flags, out.as_mut_ptr());
+        ffi::blake3_servil_compress_xof_avx512(
+            cv.as_ptr(),
+            block.as_ptr(),
+            block_len,
+            counter,
+            flags,
+            out.as_mut_ptr(),
+        );
         out
     }
 }
@@ -40,12 +67,18 @@ pub unsafe fn hash_many<const N: usize>(
             let done = if wide && N == crate::CHUNK_LEN {
                 // Bounded iterators own progress, rather than a mutable
                 // arithmetic cursor. Every call gets exactly one output group.
-                for (group, (batch, outputs)) in inputs.chunks_exact(32).zip(out.chunks_exact_mut(32 * OUT_LEN)).enumerate() {
+                for (group, (batch, outputs)) in
+                    inputs.chunks_exact(32).zip(out.chunks_exact_mut(32 * OUT_LEN)).enumerate()
+                {
                     let first = group * 32;
                     crate::avx512_32::hash32(
                         batch,
                         key,
-                        counter.wrapping_add(if increment_counter.yes() { first as u64 } else { 0 }),
+                        counter.wrapping_add(if increment_counter.yes() {
+                            first as u64
+                        } else {
+                            0
+                        }),
                         increment_counter,
                         flags,
                         flags_start,
@@ -61,10 +94,24 @@ pub unsafe fn hash_many<const N: usize>(
                     return;
                 }
                 done
-            } else if wide && N == BLOCK_LEN && !increment_counter.yes() && flags & crate::PARENT != 0 {
+            } else if wide
+                && N == BLOCK_LEN
+                && !increment_counter.yes()
+                && flags & crate::PARENT != 0
+            {
                 // Parent nodes only, not batches of short roots.
-                for (batch, outputs) in inputs.chunks_exact(16).zip(out.chunks_exact_mut(16 * OUT_LEN)) {
-                    crate::avx512_32::hash16(batch, key, counter, flags, flags_start, flags_end, outputs);
+                for (batch, outputs) in
+                    inputs.chunks_exact(16).zip(out.chunks_exact_mut(16 * OUT_LEN))
+                {
+                    crate::avx512_32::hash16(
+                        batch,
+                        key,
+                        counter,
+                        flags,
+                        flags_start,
+                        flags_end,
+                        outputs,
+                    );
                 }
                 let done = inputs.len() / 16 * 16;
                 if done == inputs.len() {
@@ -74,7 +121,11 @@ pub unsafe fn hash_many<const N: usize>(
             } else {
                 0
             };
-            (&inputs[done..], counter.wrapping_add(if increment_counter.yes() { done as u64 } else { 0 }), &mut out[done * OUT_LEN..])
+            (
+                &inputs[done..],
+                counter.wrapping_add(if increment_counter.yes() { done as u64 } else { 0 }),
+                &mut out[done * OUT_LEN..],
+            )
         };
         crate::ran_kernel(ffi::blake3_servil_hash_many_avx512 as *const ());
         ffi::blake3_servil_hash_many_avx512(
@@ -102,20 +153,53 @@ pub const XOF_PROVED_BLOCKS: usize = 32;
 
 // Unsafe because this may only be called on platforms supporting AVX-512.
 #[cfg(unix)]
-pub unsafe fn xof_many(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8, out: &mut [u8]) {
+pub unsafe fn xof_many(
+    cv: &CVWords,
+    block: &[u8; BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) {
     debug_assert_eq!(0, out.len() % BLOCK_LEN, "whole blocks only");
     for (i, part) in out.chunks_mut(XOF_PROVED_BLOCKS * BLOCK_LEN).enumerate() {
         let blocks = part.len() / BLOCK_LEN;
-        debug_assert!((1..=XOF_PROVED_BLOCKS).contains(&blocks), "a call within the proof's 1 to 32 blocks");
+        debug_assert!(
+            (1..=XOF_PROVED_BLOCKS).contains(&blocks),
+            "a call within the proof's 1 to 32 blocks"
+        );
         let at = counter + (i * XOF_PROVED_BLOCKS) as u64;
-        unsafe { ffi::blake3_servil_xof_many_avx512(cv.as_ptr(), block.as_ptr(), block_len, at, flags, part.as_mut_ptr(), blocks) };
+        unsafe {
+            ffi::blake3_servil_xof_many_avx512(
+                cv.as_ptr(),
+                block.as_ptr(),
+                block_len,
+                at,
+                flags,
+                part.as_mut_ptr(),
+                blocks,
+            )
+        };
     }
 }
 
 pub mod ffi {
     unsafe extern "C" {
-        pub fn blake3_servil_compress_in_place_avx512(cv: *mut u32, block: *const u8, block_len: u8, counter: u64, flags: u8);
-        pub fn blake3_servil_compress_xof_avx512(cv: *const u32, block: *const u8, block_len: u8, counter: u64, flags: u8, out: *mut u8);
+        pub fn blake3_servil_compress_in_place_avx512(
+            cv: *mut u32,
+            block: *const u8,
+            block_len: u8,
+            counter: u64,
+            flags: u8,
+        );
+        pub fn blake3_servil_compress_xof_avx512(
+            cv: *const u32,
+            block: *const u8,
+            block_len: u8,
+            counter: u64,
+            flags: u8,
+            out: *mut u8,
+        );
         pub fn blake3_servil_hash_many_avx512(
             inputs: *const *const u8,
             num_inputs: usize,
@@ -129,7 +213,15 @@ pub mod ffi {
             out: *mut u8,
         );
         #[cfg(unix)]
-        pub fn blake3_servil_xof_many_avx512(cv: *const u32, block: *const u8, block_len: u8, counter: u64, flags: u8, out: *mut u8, outblocks: usize);
+        pub fn blake3_servil_xof_many_avx512(
+            cv: *const u32,
+            block: *const u8,
+            block_len: u8,
+            counter: u64,
+            flags: u8,
+            out: *mut u8,
+            outblocks: usize,
+        );
     }
 }
 
@@ -154,7 +246,18 @@ mod test {
             for n in [0, 1, 16, 31, 32, 33, 64, 65] {
                 let mut out = std::vec![0xa5u8; n * OUT_LEN + 1];
                 crate::RAN_ENTRIES.with(|r| r.borrow_mut().clear());
-                unsafe { hash_many(&inputs[..n], key, counter, increment, crate::KEYED_HASH, crate::CHUNK_START, crate::CHUNK_END, &mut out) };
+                unsafe {
+                    hash_many(
+                        &inputs[..n],
+                        key,
+                        counter,
+                        increment,
+                        crate::KEYED_HASH,
+                        crate::CHUNK_START,
+                        crate::CHUNK_END,
+                        &mut out,
+                    )
+                };
                 let mut expected_entries = std::collections::BTreeSet::new();
                 if wide && n >= 32 {
                     let entry = crate::avx512_32::entries()[if increment.yes() { 0 } else { 1 }].1;
@@ -163,7 +266,11 @@ mod test {
                 if !wide || n % 32 != 0 {
                     expected_entries.insert(legacy);
                 }
-                assert_eq!(crate::RAN_ENTRIES.with(|r| r.borrow().clone()), expected_entries, "dispatch for {n} inputs");
+                assert_eq!(
+                    crate::RAN_ENTRIES.with(|r| r.borrow().clone()),
+                    expected_entries,
+                    "dispatch for {n} inputs"
+                );
                 for (i, &input) in inputs[..n].iter().enumerate() {
                     let mut expected = [0u8; OUT_LEN];
                     crate::platform::Platform::SSE41.hash_many(
@@ -198,7 +305,18 @@ mod test {
         let refs: std::vec::Vec<_> = blocks.iter().collect();
         let mut out = [0u8; 32 * OUT_LEN];
         crate::RAN_ENTRIES.with(|r| r.borrow_mut().clear());
-        unsafe { hash_many(&refs, key, 0, IncrementCounter::No, 0, crate::CHUNK_START, crate::CHUNK_END | crate::ROOT, &mut out) };
+        unsafe {
+            hash_many(
+                &refs,
+                key,
+                0,
+                IncrementCounter::No,
+                0,
+                crate::CHUNK_START,
+                crate::CHUNK_END | crate::ROOT,
+                &mut out,
+            )
+        };
         assert_eq!(crate::RAN_ENTRIES.with(|r| r.borrow().clone()), [legacy].into_iter().collect());
         let mut expected = [0u8; OUT_LEN];
         crate::platform::Platform::SSE41.hash_many(
@@ -232,7 +350,9 @@ mod test {
             for n in [0, 1, 15, 16, 17, 32, 33] {
                 let mut out = std::vec![0xa5u8; n * OUT_LEN + 1];
                 crate::RAN_ENTRIES.with(|r| r.borrow_mut().clear());
-                unsafe { hash_many(&inputs[..n], crate::IV, counter, increment, flags, 0, 0, &mut out) };
+                unsafe {
+                    hash_many(&inputs[..n], crate::IV, counter, increment, flags, 0, 0, &mut out)
+                };
                 let mut expected_entries = std::collections::BTreeSet::new();
                 if increment.yes() {
                     expected_entries.insert(legacy);

@@ -48,12 +48,12 @@ use cargo_platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
 use super::{CargoResult, HashMap, HashSet};
-use std::alloc::Global;
 use crate::dependency::{DepKind, Dependency};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::resolve::Resolve;
 use crate::summary::{FeatureValue, Summary};
+use std::alloc::Global;
 
 /// What the feature resolver asks of a package's targets and of the platforms built for:
 /// cargo's `PackageSet` and `RustcTargetData`.

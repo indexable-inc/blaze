@@ -1150,13 +1150,17 @@ mod tests {
     fn a_profiled_self_build_passes_the_gate() {
         let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
         let history = PathBuf::from(
-            std::env::var_os("BLAZE_PROFILE_FIXTURE").expect("BLAZE_PROFILE_FIXTURE names a profiled build's history"),
+            std::env::var_os("BLAZE_PROFILE_FIXTURE")
+                .expect("BLAZE_PROFILE_FIXTURE names a profiled build's history"),
         );
         let build = std::env::var("BLAZE_PROFILE_FIXTURE_BUILD")
             .ok()
             .map(|it| it.parse().expect("BLAZE_PROFILE_FIXTURE_BUILD is a build's number"));
         let verdict = check(&duckdb, &history, build).unwrap_or_else(|error| panic!("{error}"));
         assert!(verdict.passed(), "{verdict}");
-        assert!(verdict.tree.is_some() && verdict.blaze.is_some(), "a measurement names its tree and binary: {verdict}");
+        assert!(
+            verdict.tree.is_some() && verdict.blaze.is_some(),
+            "a measurement names its tree and binary: {verdict}"
+        );
     }
 }

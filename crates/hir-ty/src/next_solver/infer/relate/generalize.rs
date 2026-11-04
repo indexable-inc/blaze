@@ -5,7 +5,6 @@ use std::mem;
 
 use arrayvec::ArrayVec;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::{IntoKind, Term as _, Ty as _};
 use rustc_type_ir::relate::VarianceDiagInfo;
@@ -13,9 +12,11 @@ use rustc_type_ir::{
     ConstVid, InferConst, InferTy, Interner, IsRigid, RegionKind, TermKind, TyVid, TypeFlags,
     TypeVisitableExt, UniverseIndex, Variance, max_universe, max_universe_of_placeholders,
 };
+use std::alloc::Global;
 use tracing::{debug, instrument, warn};
 
 use super::{PredicateEmittingRelation, Relate, RelateResult, TypeRelation};
+use crate::Span;
 use crate::next_solver::infer::type_variable::TypeVariableValue;
 use crate::next_solver::infer::unify_key::ConstVariableValue;
 use crate::next_solver::infer::{InferCtxt, relate};
@@ -23,7 +24,6 @@ use crate::next_solver::{
     AliasTerm, Binder, Const, ConstKind, DbInterner, GenericArgs, Region, SolverDefId, Term, Ty,
     TyKind,
 };
-use crate::Span;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum TermVid {
@@ -674,9 +674,8 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
                 // If root const vids are equal, then `root_vid` and
                 // `vid` are related and we'd be inferring an infinitely
                 // deep const.
-                if TermVid::Const(
-                    self.infcx.inner.borrow_mut().const_unification_table().find(vid),
-                ) == self.root_vid
+                if TermVid::Const(self.infcx.inner.borrow_mut().const_unification_table().find(vid))
+                    == self.root_vid
                 {
                     return Err(self.cyclic_term_error());
                 }

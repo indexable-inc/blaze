@@ -45,7 +45,9 @@ fn cast_ty_span(b: &BodyCx<'_, '_, '_>, cast: ExprId) -> Option<Span> {
 fn can_be_used_for_suggestions(span: &Span) -> bool {
     match &span.expansion {
         None => true,
-        Some(it) => it.kind == MacroKind::Derive && (it.call_site.lo, it.call_site.hi) != (span.lo, span.hi),
+        Some(it) => {
+            it.kind == MacroKind::Derive && (it.call_site.lo, it.call_site.hi) != (span.lo, span.hi)
+        }
     }
 }
 

@@ -334,11 +334,17 @@ impl<'t, L: Language> Node<'t, L> {
     }
 
     #[inline]
-    pub fn siblings_with_tokens(self, direction: Direction) -> impl Iterator<Item = Element<'t, L>> {
-        iter::successors(Some(NodeOrToken::Node(self)), move |it: &Element<'t, L>| match direction {
-            Direction::Next => it.next_sibling_or_token(),
-            Direction::Prev => it.prev_sibling_or_token(),
-        })
+    pub fn siblings_with_tokens(
+        self,
+        direction: Direction,
+    ) -> impl Iterator<Item = Element<'t, L>> {
+        iter::successors(
+            Some(NodeOrToken::Node(self)),
+            move |it: &Element<'t, L>| match direction {
+                Direction::Next => it.next_sibling_or_token(),
+                Direction::Prev => it.prev_sibling_or_token(),
+            },
+        )
     }
 
     /// This node and the nodes under it, in preorder: a scan of the element numbers.
@@ -479,8 +485,10 @@ impl<'t, L: Language> Node<'t, L> {
     /// up, in steps as many as the nodes around the range no larger than it.
     pub fn descendant_at_range(self, range: TextRange, kind: L::Kind) -> Option<Node<'t, L>> {
         if range.is_empty() {
-            return iter::successors(Some(self), |it| it.child_or_token_at_range(range)?.into_node())
-                .find(|it| it.text_range() == range && it.kind() == kind);
+            return iter::successors(Some(self), |it| {
+                it.child_or_token_at_range(range)?.into_node()
+            })
+            .find(|it| it.text_range() == range && it.kind() == kind);
         }
         let raw = L::kind_to_raw(kind);
         let (place, at) = self.inner();
@@ -518,7 +526,11 @@ impl<'t, L: Language> Node<'t, L> {
         self.subtree_without_in(elided, Some(L::kind_to_raw(placeholder)))
     }
 
-    fn subtree_without_in(self, elided: &[Node<'t, L>], placeholder: Option<SyntaxKind>) -> FlatTree {
+    fn subtree_without_in(
+        self,
+        elided: &[Node<'t, L>],
+        placeholder: Option<SyntaxKind>,
+    ) -> FlatTree {
         if elided.is_empty() {
             return self.subtree();
         }
@@ -627,8 +639,12 @@ impl<'t, L: Language> Token<'t, L> {
     }
 
     #[inline]
-    pub fn siblings_with_tokens(self, direction: Direction) -> impl Iterator<Item = Element<'t, L>> {
-        iter::successors(Some(NodeOrToken::Token(self)), move |it: &Element<'t, L>| match direction {
+    pub fn siblings_with_tokens(
+        self,
+        direction: Direction,
+    ) -> impl Iterator<Item = Element<'t, L>> {
+        iter::successors(Some(NodeOrToken::Token(self)), move |it: &Element<'t, L>| match direction
+        {
             Direction::Next => it.next_sibling_or_token(),
             Direction::Prev => it.prev_sibling_or_token(),
         })
@@ -845,7 +861,8 @@ impl<L: Language> fmt::Debug for Token<'_, L> {
         if text.len() < 25 {
             return write!(f, " {text:?}");
         }
-        let cut = (21..25).find(|&it| text.is_char_boundary(it)).expect("a char is 4 bytes at most");
+        let cut =
+            (21..25).find(|&it| text.is_char_boundary(it)).expect("a char is 4 bytes at most");
         // alloc: debug output only, quoted as the cursors quote it.
         let text = format!("{} ...", &text[..cut]);
         write!(f, " {text:?}")

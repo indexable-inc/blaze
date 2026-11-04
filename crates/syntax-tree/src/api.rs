@@ -163,9 +163,11 @@ impl<L: Language> SyntaxNode<L> {
     /// tokens) at `range` replaced by copies of `with`. The new tree has its own text, its
     /// ranges starting at 0, and its lazy nodes parsed into it.
     pub fn splice_children(&self, range: Range<usize>, with: &[SyntaxElement<L>]) -> SyntaxNode<L> {
-        SyntaxNode::from(self.raw.splice_children_with(range, |builder| {
-            with.iter().for_each(|it| builder.element(it))
-        }))
+        SyntaxNode::from(
+            self.raw.splice_children_with(range, |builder| {
+                with.iter().for_each(|it| builder.element(it))
+            }),
+        )
     }
 
     pub fn kind(&self) -> L::Kind {

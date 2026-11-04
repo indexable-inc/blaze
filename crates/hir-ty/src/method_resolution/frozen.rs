@@ -10,13 +10,13 @@ use std::sync::Arc as StdArc;
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
 };
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
+use std::alloc::Global;
 
 use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
 use crate::{

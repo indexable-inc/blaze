@@ -4,9 +4,9 @@
 //! `lower_variant`) and its `FieldAlreadyDeclared::NotNested` (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::{FieldSourceView, InFile, Name};
+use std::alloc::Global;
 use syntax::{TextRange, view::AstNode as _};
 
 use crate::{

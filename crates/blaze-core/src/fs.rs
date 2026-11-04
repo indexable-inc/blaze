@@ -29,9 +29,9 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use crate::{FileName, Meta};
 #[cfg(unix)]
 use crate::{Names, Stamp};
-use crate::{FileName, Meta};
 
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -88,7 +88,11 @@ fn with_c_path<R>(path: &Path, f: impl FnOnce(&std::ffi::CStr) -> io::Result<R>)
 /// The [`FileName`] `{dir}/{name}`, or an error naming `path` where `name` is not UTF-8 or
 /// makes no name. The name is joined in the thread's string buffer, so only the `FileName` is
 /// made.
-fn child_name(dir: &FileName, name: &std::ffi::OsStr, path: impl FnOnce() -> PathBuf) -> io::Result<FileName> {
+fn child_name(
+    dir: &FileName,
+    name: &std::ffi::OsStr,
+    path: impl FnOnce() -> PathBuf,
+) -> io::Result<FileName> {
     use std::fmt::Write as _;
     let file = blaze_mem::scratch::with_string(|joined| {
         let name = name.to_str()?;
@@ -114,7 +118,10 @@ pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
 
 /// What `make` makes at `path`, asked again once `path`'s directories are made where it
 /// failed for want of one: they are looked up only when missing, not before every call.
-pub(crate) fn making_parent<T>(path: &Path, mut make: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub(crate) fn making_parent<T>(
+    path: &Path,
+    mut make: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
     match make() {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             make_parent(path)?;
@@ -133,7 +140,12 @@ pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
     making_parent(path, open)
         .and_then(|file| file.set_len(len))
         // alloc: an error path.
-        .map_err(|error| io::Error::new(error.kind(), format!("cutting {} to {len} bytes: {error}", path.display())))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cutting {} to {len} bytes: {error}", path.display()),
+            )
+        })
 }
 
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
@@ -196,11 +208,8 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     {
         let mut done = 0;
         while done < bytes.len() {
-            let n = std::os::windows::fs::FileExt::seek_write(
-                &file,
-                &bytes[done..],
-                at + done as u64,
-            )?;
+            let n =
+                std::os::windows::fs::FileExt::seek_write(&file, &bytes[done..], at + done as u64)?;
             if n == 0 {
                 return Err(io::Error::from(io::ErrorKind::WriteZero));
             }
@@ -227,8 +236,14 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     // alloc: an error path.
-    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()));
-    let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+    let named = |error: io::Error| {
+        io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()))
+    };
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
             return Err(io::Error::new(
@@ -253,7 +268,10 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
 #[cfg(unix)]
 fn not_sealed(path: &Path, kind: &str) -> io::Error {
     // alloc: an error path.
-    io::Error::new(io::ErrorKind::InvalidInput, format!("{} ({kind}) {}", path.display(), crate::SEAL_OF_NO_FILE))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} ({kind}) {}", path.display(), crate::SEAL_OF_NO_FILE),
+    )
 }
 
 /// The access and modification times of `path` (through a symbolic link) both `modified_ns`
@@ -273,8 +291,8 @@ pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
     };
     let time = crate::raw::timespec(seconds, (modified_ns % 1_000_000_000) as u32);
     with_c_path(path, |c| crate::raw::utimens(c, &[time, time]))
-    // alloc: an error path.
-    .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
 #[cfg(windows)]
@@ -330,7 +348,9 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
                 path.push(&file.as_str()[name.as_str().len() + 1..]);
             }
             // alloc: once per directory, std's handle of it.
-            std::fs::read_dir(&*path).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+            std::fs::read_dir(&*path).map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+            })
         })?;
         for entry in read {
             let entry = entry?;
@@ -353,10 +373,12 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
 /// file, the directory looked up only once its unlink fails.
 pub(crate) fn remove(path: &Path) -> io::Result<()> {
     let removed = match std::fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
-            _ => Err(error),
-        },
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
+                _ => Err(error),
+            }
+        }
         other => other,
     };
     match removed {
@@ -397,7 +419,9 @@ pub(crate) fn volume_of(path: &Path) -> String {
     use std::os::unix::fs::MetadataExt as _;
     // alloc: an error path.
     let device = match std::fs::metadata(path) {
-        Ok(meta) => format!("device {}:{}", libc::major(meta.dev() as _), libc::minor(meta.dev() as _)),
+        Ok(meta) => {
+            format!("device {}:{}", libc::major(meta.dev() as _), libc::minor(meta.dev() as _))
+        }
         Err(error) => format!("device unknown: {error}"),
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -464,20 +488,32 @@ fn refuses_sharing(_: i32) -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_source(from: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(from).map_err(|error| match error.raw_os_error() {
-        // alloc: an error path.
-        Some(libc::ELOOP) => io::Error::new(io::ErrorKind::InvalidInput, format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK)),
-        Some(code) => match no_file_after_open(from, code) {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(from)
+        .map_err(|error| match error.raw_os_error() {
             // alloc: an error path.
-            Some(kind) => io::Error::new(io::ErrorKind::InvalidInput, format!("{} ({kind}) {}", from.display(), crate::CLONE_OF_NO_FILE)),
+            Some(libc::ELOOP) => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK),
+            ),
+            Some(code) => match no_file_after_open(from, code) {
+                // alloc: an error path.
+                Some(kind) => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} ({kind}) {}", from.display(), crate::CLONE_OF_NO_FILE),
+                ),
+                None => error,
+            },
             None => error,
-        },
-        None => error,
-    })?;
+        })?;
     let kind = file
         .metadata()
         // alloc: an error path.
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: reading what it is: {error}", from.display())))?
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: reading what it is: {error}", from.display()))
+        })?
         .file_type();
     match kind.is_file() {
         true => Ok(file),
@@ -564,7 +600,10 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     if let Err(error) = made {
         _ = std::fs::remove_file(to);
         // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("{}: giving the clone a new file's mode and time: {error}", to.display())));
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{}: giving the clone a new file's mode and time: {error}", to.display()),
+        ));
     }
     Ok(())
 }
@@ -580,14 +619,22 @@ fn created_mode() -> io::Result<u32> {
         return Ok(mode);
     }
     let probe = temporary_next_to(&std::env::temp_dir().join("blaze-umask"));
-    let made = OpenOptions::new().write(true).create_new(true).open(&probe).and_then(|file| file.metadata());
+    let made = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|file| file.metadata());
     _ = std::fs::remove_file(&probe);
-    let mode = made.map_err(|error| {
-        // alloc: an error path.
-        io::Error::new(error.kind(), format!("reading the umask from {}: {error}", probe.display()))
-    })?
-    .permissions()
-    .mode()
+    let mode = made
+        .map_err(|error| {
+            // alloc: an error path.
+            io::Error::new(
+                error.kind(),
+                format!("reading the umask from {}: {error}", probe.display()),
+            )
+        })?
+        .permissions()
+        .mode()
         & 0o777;
     Ok(*MODE.get_or_init(|| mode))
 }
@@ -648,7 +695,8 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     let dir = dir.as_fd();
     // alloc: the batch's payload.
     let mut out = vec![Stamp::GONE; names.len()];
-    let threads = sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
+    let threads =
+        sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
     if threads == 1 {
         for (at, stamp) in out.iter_mut().enumerate() {
             *stamp = stamp_at(dir, names.c_str(at));
@@ -677,7 +725,8 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
     // alloc: the listing's payload.
     let mut found = Vec::new();
     // alloc: once per listing, std's handle of the directory.
-    let read = std::fs::read_dir(dir).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
     for entry in read? {
         let entry = entry?;
         // alloc: std's copy of the entry's name.
@@ -737,7 +786,10 @@ mod tests {
         // std's `mkfifo` is unstable, and this module makes no raw calls.
         assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
         let refused = seal(&fifo, 0o444).unwrap_err().to_string();
-        assert!(refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a FIFO"), "{refused}");
+        assert!(
+            refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a FIFO"),
+            "{refused}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -751,9 +803,15 @@ mod tests {
         let socket = root.join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let refused = open_source(&socket).unwrap_err().to_string();
-        assert!(refused.contains(crate::CLONE_OF_NO_FILE) && refused.contains("a socket"), "{refused}");
+        assert!(
+            refused.contains(crate::CLONE_OF_NO_FILE) && refused.contains("a socket"),
+            "{refused}"
+        );
         let refused = seal(&socket, 0o444).unwrap_err().to_string();
-        assert!(refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a socket"), "{refused}");
+        assert!(
+            refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a socket"),
+            "{refused}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -791,7 +849,9 @@ mod tests {
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert!(root.join("f").is_dir());
         let appended = root.join("g/h");
-        let opened = making_parent(&appended, || OpenOptions::new().create(true).append(true).open(&appended));
+        let opened = making_parent(&appended, || {
+            OpenOptions::new().create(true).append(true).open(&appended)
+        });
         std::io::Write::write_all(&mut opened.unwrap(), b"line").unwrap();
         assert_eq!(std::fs::read(root.join("g/h")).unwrap(), b"line");
         let under_a_file = write_atomically(&root.join("e/linked/under"), b"x").unwrap_err();

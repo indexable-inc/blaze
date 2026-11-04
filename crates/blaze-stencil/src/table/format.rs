@@ -332,7 +332,10 @@ pub const fn fits(kind: HoleKind, form: Form) -> bool {
 pub enum FormatError {
     Magic,
     /// The format or shape version it was written with, and ours.
-    Version { found: (u32, u32), ours: (u32, u32) },
+    Version {
+        found: (u32, u32),
+        ours: (u32, u32),
+    },
     Variant(u8),
     /// A count or offset out of the bytes, or a hole out of its stencil, by what it is.
     Bounds(&'static str),
@@ -415,7 +418,8 @@ impl Layout {
         let holes = stencils.checked_add((counts.stencils as usize).checked_mul(STENCIL)?)?;
         let faults = holes.checked_add((counts.holes as usize).checked_mul(HOLE)?)?;
         let pilots = faults.checked_add((counts.faults as usize).checked_mul(FAULT)?)?;
-        let slots = pilots.checked_add((counts.buckets as usize).checked_mul(2)?)?.next_multiple_of(4);
+        let slots =
+            pilots.checked_add((counts.buckets as usize).checked_mul(2)?)?.next_multiple_of(4);
         let code = slots.checked_add((counts.slots as usize).checked_mul(SLOT)?)?;
         let rodata = code.checked_add(counts.code as usize)?.next_multiple_of(ENTRY);
         let end = rodata.checked_add((counts.entries as usize).checked_mul(ENTRY)?)?;
@@ -691,11 +695,11 @@ impl Writer {
     pub fn new(variant: Variant) -> Writer {
         Writer {
             variant,
-            keys: Vec::new(), // alloc: the generator, at blaze's build time
+            keys: Vec::new(),     // alloc: the generator, at blaze's build time
             stencils: Vec::new(), // alloc: the generator, at blaze's build time
-            holes: Vec::new(), // alloc: the generator, at blaze's build time
-            code: Vec::new(), // alloc: the generator, at blaze's build time
-            rodata: Vec::new(), // alloc: the generator, at blaze's build time
+            holes: Vec::new(),    // alloc: the generator, at blaze's build time
+            code: Vec::new(),     // alloc: the generator, at blaze's build time
+            rodata: Vec::new(),   // alloc: the generator, at blaze's build time
             hole_count: 0,
             faults: Vec::new(), // alloc: the generator, at blaze's build time
         }
@@ -813,8 +817,16 @@ impl Writer {
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&crate::shape::VERSION.to_le_bytes());
         out.extend_from_slice(&[self.variant as u8, 0, 0, 0]);
-        let header =
-            [counts.stencils, counts.holes, buckets, slots, counts.code, counts.entries, seed, counts.faults];
+        let header = [
+            counts.stencils,
+            counts.holes,
+            buckets,
+            slots,
+            counts.code,
+            counts.entries,
+            seed,
+            counts.faults,
+        ];
         for it in header {
             out.extend_from_slice(&it.to_le_bytes());
         }

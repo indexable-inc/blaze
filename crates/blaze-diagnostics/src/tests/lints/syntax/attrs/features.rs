@@ -4,7 +4,10 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{LIBRARY_FEATURES, Mode, checked_with, compiletest, library_features, normalized, ui, ui_core_as},
+    tests::{
+        LIBRARY_FEATURES, Mode, checked_with, compiletest, library_features, normalized, ui,
+        ui_core_as,
+    },
 };
 
 /// [`crate::tests::ui`] of the revision of a UI test of edition 2015 that compiletest gives
@@ -12,7 +15,10 @@ use crate::{
 fn ui_revision(name: &str, revision: &str, source: &str) -> String {
     let fixture = format!("//- /{name} crate:other:main edition:2015 cfg:{revision}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
-    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+    normalized(
+        &checked_with(&fixture, "$DIR/", &options)
+            .stderr_with(Style { ui_testing: true, ..Style::default() }),
+    )
 }
 
 /// The messages of the feature lints `source` gets, with their lint names.
@@ -21,7 +27,11 @@ fn feature_lints(source: &str) -> Vec<String> {
     checked_with(&fixture, "", &Options::default())
         .messages()
         .into_iter()
-        .filter(|it| ["incomplete_features:", "internal_features:", "unstable_features:"].iter().any(|lint| it.starts_with(lint)))
+        .filter(|it| {
+            ["incomplete_features:", "internal_features:", "unstable_features:"]
+                .iter()
+                .any(|lint| it.starts_with(lint))
+        })
         .collect()
 }
 
@@ -67,7 +77,8 @@ error: aborting due to 2 previous errors
         library_features(&["panic_internals"])
     );
     let options = compiletest(Mode::Other, &Options::default());
-    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(&fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     assert_eq!(normalized(&stderr), expected);
 }
 
@@ -204,7 +215,14 @@ error: aborting due to 1 previous error
 "#;
     // A core, as rustc has std: a fixture with none takes `#![feature(no_core)]`, which the lint
     // would name too.
-    let stderr = ui_core_as(Mode::Other, "feature-gate-feature-gate.rs", "2015", "sized", source, &Options::default());
+    let stderr = ui_core_as(
+        Mode::Other,
+        "feature-gate-feature-gate.rs",
+        "2015",
+        "sized",
+        source,
+        &Options::default(),
+    );
     assert_eq!(stderr, expected);
 }
 
@@ -216,12 +234,15 @@ fn language_features_are_linted_before_library_ones() {
 fn main() {}
 "#,
     );
-    assert_eq!(lints, [
-        "incomplete_features: the feature `generic_const_exprs` is incomplete and may not be safe to use and/or cause compiler crashes",
-        "internal_features: the feature `intrinsics` is internal to the compiler or standard library",
-        "internal_features: the feature `panic_internals` is internal to the compiler or standard library",
-        "internal_features: the feature `fmt_internals` is internal to the compiler or standard library",
-    ]);
+    assert_eq!(
+        lints,
+        [
+            "incomplete_features: the feature `generic_const_exprs` is incomplete and may not be safe to use and/or cause compiler crashes",
+            "internal_features: the feature `intrinsics` is internal to the compiler or standard library",
+            "internal_features: the feature `panic_internals` is internal to the compiler or standard library",
+            "internal_features: the feature `fmt_internals` is internal to the compiler or standard library",
+        ]
+    );
 }
 
 #[test]
@@ -235,16 +256,24 @@ fn every_feature_attribute_of_the_crate_is_one_list() {
 fn main() {}
 "#,
     );
-    assert_eq!(lints, [
-        "internal_features: the feature `lang_items` is internal to the compiler or standard library",
-        "internal_features: the feature `lang_items` is internal to the compiler or standard library",
-        "internal_features: the feature `core_intrinsics` is internal to the compiler or standard library",
-    ]);
+    assert_eq!(
+        lints,
+        [
+            "internal_features: the feature `lang_items` is internal to the compiler or standard library",
+            "internal_features: the feature `lang_items` is internal to the compiler or standard library",
+            "internal_features: the feature `core_intrinsics` is internal to the compiler or standard library",
+        ]
+    );
 }
 
 #[test]
 fn stable_unstable_and_removed_features_are_neither_incomplete_nor_internal() {
-    assert_eq!(feature_lints("#![feature(min_specialization, aarch64_target_feature, let_chains)]\nfn main() {}\n"), Vec::<String>::new());
+    assert_eq!(
+        feature_lints(
+            "#![feature(min_specialization, aarch64_target_feature, let_chains)]\nfn main() {}\n"
+        ),
+        Vec::<String>::new()
+    );
     assert_eq!(feature_lints("#![feature(unsized_locals)]\nfn main() {}\n"), Vec::<String>::new());
 }
 
@@ -256,10 +285,13 @@ fn only_the_identifiers_of_a_parsed_list_are_features() {
 fn main() {}
 "#,
     );
-    assert_eq!(lints, [
-        "internal_features: the feature `prelude_import` is internal to the compiler or standard library",
-        "internal_features: the feature `custom_mir` is internal to the compiler or standard library",
-    ]);
+    assert_eq!(
+        lints,
+        [
+            "internal_features: the feature `prelude_import` is internal to the compiler or standard library",
+            "internal_features: the feature `custom_mir` is internal to the compiler or standard library",
+        ]
+    );
     assert_eq!(feature_lints("#![feature[intrinsics]]\nfn main() {}\n"), Vec::<String>::new());
     assert_eq!(feature_lints("#![feature = \"intrinsics\"]\nfn main() {}\n"), Vec::<String>::new());
     assert_eq!(feature_lints("#![feature(intrinsics, +)]\nfn main() {}\n"), Vec::<String>::new());
@@ -278,5 +310,11 @@ mod m {
 fn main() {}
 "#,
     );
-    assert_eq!(lints, ["unstable_features: use of an unstable feature", "unstable_features: use of an unstable feature"]);
+    assert_eq!(
+        lints,
+        [
+            "unstable_features: use of an unstable feature",
+            "unstable_features: use of an unstable feature"
+        ]
+    );
 }

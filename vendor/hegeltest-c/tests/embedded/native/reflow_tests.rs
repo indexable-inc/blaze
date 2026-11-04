@@ -51,26 +51,14 @@ fn flat_shapes_render_unchanged_when_they_fit() {
 fn rust_shapes_break_one_item_per_line() {
     assert_eq!(render("[100, 200]", 6), "[100,\n 200]");
     assert_eq!(render("Some([100, 200])", 12), "Some([100,\n      200])");
-    assert_eq!(
-        render("Point { x: 100, y: 200 }", 12),
-        "Point {\n    x: 100,\n    y: 200 }"
-    );
-    assert_eq!(
-        render("Outer { m: {1: 2, 3: 4} }", 18),
-        "Outer {\n    m: {1: 2,\n        3: 4} }"
-    );
-    assert_eq!(
-        render("{\"key\": [1, 2], \"other\": 3}", 20),
-        "{\"key\": [1, 2],\n \"other\": 3}"
-    );
+    assert_eq!(render("Point { x: 100, y: 200 }", 12), "Point {\n    x: 100,\n    y: 200 }");
+    assert_eq!(render("Outer { m: {1: 2, 3: 4} }", 18), "Outer {\n    m: {1: 2,\n        3: 4} }");
+    assert_eq!(render("{\"key\": [1, 2], \"other\": 3}", 20), "{\"key\": [1, 2],\n \"other\": 3}");
 }
 
 #[test]
 fn go_shapes_align_past_the_type_expression() {
-    assert_eq!(
-        render("main.Point{X:100, Y:200}", 16),
-        "main.Point{X:100,\n           Y:200}"
-    );
+    assert_eq!(render("main.Point{X:100, Y:200}", 16), "main.Point{X:100,\n           Y:200}");
     assert_eq!(render("[]int{100, 200}", 10), "[]int{100,\n      200}");
     assert_eq!(
         render("map[string]int{\"a\":1, \"b\":2}", 20),
@@ -84,20 +72,14 @@ fn go_shapes_align_past_the_type_expression() {
 
 #[test]
 fn python_shapes_break_like_rust_ones() {
-    assert_eq!(
-        render("Point(x=100, y=200)", 12),
-        "Point(x=100,\n      y=200)"
-    );
+    assert_eq!(render("Point(x=100, y=200)", 12), "Point(x=100,\n      y=200)");
     assert_eq!(render("{'a': 100, 'b': 200}", 12), "{'a': 100,\n 'b': 200}");
     assert_eq!(render("(100, 200)", 6), "(100,\n 200)");
 }
 
 #[test]
 fn padded_javascript_shapes_break_in_block_style() {
-    assert_eq!(
-        render("{ a: 100, b: 200 }", 12),
-        "{\n    a: 100,\n    b: 200 }"
-    );
+    assert_eq!(render("{ a: 100, b: 200 }", 12), "{\n    a: 100,\n    b: 200 }");
     assert_eq!(render("[ 100, 200 ]", 8), "[\n    100,\n    200 ]");
     assert_eq!(
         render("Map(2) { 'a' => 1, 'b' => 2 }", 16),
@@ -107,10 +89,7 @@ fn padded_javascript_shapes_break_in_block_style() {
 
 #[test]
 fn java_and_ocaml_shapes_break_at_their_separators() {
-    assert_eq!(
-        render("Point[x=100, y=200]", 12),
-        "Point[x=100,\n      y=200]"
-    );
+    assert_eq!(render("Point[x=100, y=200]", 12), "Point[x=100,\n      y=200]");
     assert_eq!(render("{a=100, b=200}", 10), "{a=100,\n b=200}");
     assert_eq!(render("{x = 100; y = 200}", 12), "{x = 100;\n y = 200}");
     assert_eq!(render("[100; 200; 300]", 8), "[100;\n 200;\n 300]");
@@ -119,10 +98,7 @@ fn java_and_ocaml_shapes_break_at_their_separators() {
 #[test]
 fn separators_inside_quoted_literals_do_not_split_items() {
     assert_eq!(render("[\"a, b\", \"c; d\"]", 10), "[\"a, b\",\n \"c; d\"]");
-    assert_eq!(
-        render("['x, y', \"q\\\"; r\"]", 10),
-        "['x, y',\n \"q\\\"; r\"]"
-    );
+    assert_eq!(render("['x, y', \"q\\\"; r\"]", 10), "['x, y',\n \"q\\\"; r\"]");
 }
 
 #[test]
@@ -153,13 +129,8 @@ fn multi_line_representations_are_emitted_verbatim_with_hard_breaks() {
     assert_eq!(render("multi\nline [1, 2]", 6), "multi\nline [1, 2]");
     let mut printer = Printer::new(79);
     printer.shift_indent(Target::Main, 2).unwrap();
-    reflow(
-        &mut printer,
-        Target::Main,
-        "line one\n\nline three",
-        &ReflowOptions::default(),
-    )
-    .unwrap();
+    reflow(&mut printer, Target::Main, "line one\n\nline three", &ReflowOptions::default())
+        .unwrap();
     assert_eq!(printer.value().unwrap(), "line one\n  \n  line three");
 }
 
@@ -174,18 +145,12 @@ fn shallow_groups_with_several_items_or_padding_fold_into_a_prefix() {
         render("Pair[int, string]{1, \"a\"}", 20),
         "Pair[int, string]{1,\n                  \"a\"}"
     );
-    assert_eq!(
-        render("Wrapper{ 1 }[100, 200]", 14),
-        "Wrapper{ 1 }[100,\n             200]"
-    );
+    assert_eq!(render("Wrapper{ 1 }[100, 200]", 14), "Wrapper{ 1 }[100,\n             200]");
 }
 
 #[test]
 fn a_prefix_reaches_back_to_the_last_space_of_a_flushed_leaf() {
-    assert_eq!(
-        render("key \"quoted\"[100, 200]", 12),
-        "key \"quoted\"[100,\n         200]"
-    );
+    assert_eq!(render("key \"quoted\"[100, 200]", 12), "key \"quoted\"[100,\n         200]");
 }
 
 #[test]
@@ -194,13 +159,7 @@ fn reflow_writes_to_a_deferred_slot() {
     printer.text(Target::Main, "let x = ").unwrap();
     let slot = printer.deferred(Target::Main).unwrap();
     printer.text(Target::Main, ";").unwrap();
-    reflow(
-        &mut printer,
-        Target::Slot(slot),
-        "Point { x: 1 }",
-        &ReflowOptions::default(),
-    )
-    .unwrap();
+    reflow(&mut printer, Target::Slot(slot), "Point { x: 1 }", &ReflowOptions::default()).unwrap();
     printer.resolve().unwrap();
     assert_eq!(printer.value().unwrap(), "let x = Point { x: 1 };");
 }
@@ -211,21 +170,11 @@ fn reflow_into_a_dead_slot_reports_the_dead_slot() {
     let slot = printer.deferred(Target::Main).unwrap();
     printer.resolve().unwrap();
     assert_eq!(
-        reflow(
-            &mut printer,
-            Target::Slot(slot),
-            "[1, 2]",
-            &ReflowOptions::default()
-        ),
+        reflow(&mut printer, Target::Slot(slot), "[1, 2]", &ReflowOptions::default()),
         Err(PrinterError::DeadSlot)
     );
     assert_eq!(
-        reflow(
-            &mut printer,
-            Target::Slot(slot),
-            "a\nb",
-            &ReflowOptions::default()
-        ),
+        reflow(&mut printer, Target::Slot(slot), "a\nb", &ReflowOptions::default()),
         Err(PrinterError::DeadSlot)
     );
 }

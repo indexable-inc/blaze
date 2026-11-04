@@ -96,11 +96,7 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// distinct, the process id keeps processes sharing a database distinct.
 #[cfg(not(target_family = "wasm"))]
 fn temp_path(path: &str) -> String {
-    format!(
-        "{path}.tmp.{}.{}",
-        sys::pid(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    format!("{path}.tmp.{}.{}", sys::pid(), TMP_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Write `value` to `path` atomically: write it to a uniquely named
@@ -237,12 +233,7 @@ pub(super) fn fnv1a(s: &[u8]) -> u64 {
 /// encoding one would only yield bytes that can never be read back.
 pub fn serialize_choices(choices: &[ChoiceValue]) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(4 + choices.len() * 17);
-    serialize_choice_list(
-        &mut buf,
-        choices.len(),
-        choices.iter().map(ChoiceValueRef::from),
-        0,
-    )?;
+    serialize_choice_list(&mut buf, choices.len(), choices.iter().map(ChoiceValueRef::from), 0)?;
     Some(buf)
 }
 
@@ -251,12 +242,7 @@ pub fn serialize_choices(choices: &[ChoiceValue]) -> Option<Vec<u8>> {
 /// [`serialize_choices`].
 pub(crate) fn serialize_nodes(nodes: &[crate::native::core::ChoiceNode]) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(4 + nodes.len() * 17);
-    serialize_choice_list(
-        &mut buf,
-        nodes.len(),
-        nodes.iter().map(|n| n.data.value_ref()),
-        0,
-    )?;
+    serialize_choice_list(&mut buf, nodes.len(), nodes.iter().map(|n| n.data.value_ref()), 0)?;
     Some(buf)
 }
 
@@ -468,9 +454,9 @@ fn deserialize_choice_list(
                 pos += 1;
                 let (children, new_pos) = deserialize_choice_list(bytes, pos, depth + 1)?;
                 pos = new_pos;
-                choices.push(ChoiceValue::Clone(alloc::sync::Arc::new(
-                    CloneRecord::from_values(children),
-                )));
+                choices.push(ChoiceValue::Clone(alloc::sync::Arc::new(CloneRecord::from_values(
+                    children,
+                ))));
             }
             _ => return None,
         }

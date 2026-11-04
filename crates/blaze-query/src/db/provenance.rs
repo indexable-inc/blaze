@@ -273,7 +273,8 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
     super::attach(db, || {
         // alloc: once a take (a build's end), a name a node named
         let mut names: crate::table::FxMap<u64, String> = crate::table::FxMap::default();
-        let mut name = |key: u64| names.entry(key).or_insert_with(|| node_name(storage, key)).clone(); // clone: a row's own text
+        let mut name =
+            |key: u64| names.entry(key).or_insert_with(|| node_name(storage, key)).clone(); // clone: a row's own text
         // alloc: once a take, a row an entry
         let mut rows = Vec::new();
         while let Some(entry) = log.entries.pop() {
@@ -288,12 +289,25 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
                     Some(Kind::Function) | None => "function",
                 }
             });
-            rows.push(LoggedRun { query: ingredient::name(index), key: name(entry.key), view: entry.view, why: entry.why, read, read_kind });
+            rows.push(LoggedRun {
+                query: ingredient::name(index),
+                key: name(entry.key),
+                view: entry.view,
+                why: entry.why,
+                read,
+                read_kind,
+            });
         }
         log.logged.store(0, Ordering::Relaxed);
         let dropped = log.dropped.swap(0, Ordering::Relaxed);
         rows.sort_unstable_by(|a, b| {
-            (a.query, &a.key, a.view, why_order(a.why), &a.read).cmp(&(b.query, &b.key, b.view, why_order(b.why), &b.read))
+            (a.query, &a.key, a.view, why_order(a.why), &a.read).cmp(&(
+                b.query,
+                &b.key,
+                b.view,
+                why_order(b.why),
+                &b.read,
+            ))
         });
         Taken { rows, dropped }
     })
@@ -327,7 +341,8 @@ fn node_name(storage: &Storage, key: u64) -> String {
             _ = write!(out, "`{name}.{field}`(");
             let start = out.len();
             let named = NAMER.get().is_some_and(|namer| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| namer(name, id, &mut out))).unwrap_or(false)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| namer(name, id, &mut out)))
+                    .unwrap_or(false)
             });
             if !named {
                 out.truncate(start);

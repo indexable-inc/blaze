@@ -67,15 +67,26 @@ pub struct Entry {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TreeRefused {
     /// A path with an empty, `.`, `..` or `.git` part, a newline, or a leading `/`.
-    Path { path: String, why: &'static str },
+    Path {
+        path: String,
+        why: &'static str,
+    },
     /// Two entries, or two directories entries are under, whose paths are one path to a
     /// case- and normalization-insensitive disk ([`fold`]) but are spelled differently (or the
     /// same: an entry listed twice). `path` is one spelling.
-    Twice { path: String },
+    Twice {
+        path: String,
+    },
     /// `path` is a file and `under` is listed beneath it ([`fold`]ed alike).
-    Under { path: String, under: String },
+    Under {
+        path: String,
+        under: String,
+    },
     /// A listing's line `line` (from 1) is not `<kind> <hex> <len> <path>`, or is out of order.
-    Line { line: usize, why: &'static str },
+    Line {
+        line: usize,
+        why: &'static str,
+    },
     NoHeader,
 }
 
@@ -84,13 +95,18 @@ impl fmt::Display for TreeRefused {
         match self {
             TreeRefused::Path { path, why } => write!(f, "the tree's path {path:?} {why}"),
             TreeRefused::Twice { path } => {
-                write!(f, "the tree has the path {path:?} twice, or spelled two ways that a case-insensitive disk takes for one name")
+                write!(
+                    f,
+                    "the tree has the path {path:?} twice, or spelled two ways that a case-insensitive disk takes for one name"
+                )
             }
             TreeRefused::Under { path, under } => {
                 write!(f, "the tree's {under:?} is under {path:?}, which is a file")
             }
             TreeRefused::Line { line, why } => write!(f, "line {line} of the tree's listing {why}"),
-            TreeRefused::NoHeader => write!(f, "the listing does not start `{}`", HEADER.trim_end()),
+            TreeRefused::NoHeader => {
+                write!(f, "the listing does not start `{}`", HEADER.trim_end())
+            }
         }
     }
 }
@@ -108,7 +124,9 @@ fn bad_path(path: &str) -> Option<&'static str> {
     path.split('/').find_map(|part| match part {
         "" => Some("has an empty part"),
         "." | ".." => Some("has a `.` or `..` part"),
-        _ if part.eq_ignore_ascii_case(".git") => Some("is in a `.git`, which is the repository's, not the tree's"),
+        _ if part.eq_ignore_ascii_case(".git") => {
+            Some("is in a `.git`, which is the repository's, not the tree's")
+        }
         _ => None,
     })
 }
@@ -164,7 +182,9 @@ fn check(entries: &[Entry]) -> Result<(), TreeRefused> {
         // A file and a directory of one folded name: something is listed under a file.
         if a_dir != b_dir {
             let (file, dir) = if a_dir { (b, a) } else { (a, b) };
-            let under = entries.iter().find(|it| it.path.starts_with(dir) && it.path[dir.len()..].starts_with('/'));
+            let under = entries
+                .iter()
+                .find(|it| it.path.starts_with(dir) && it.path[dir.len()..].starts_with('/'));
             return Err(TreeRefused::Under {
                 path: file.to_owned(), // alloc: error path
                 under: under.map_or_else(|| dir.to_owned(), |it| it.path.clone()), // alloc: error path
@@ -195,19 +215,27 @@ pub fn listing(entries: &mut [Entry]) -> Result<Vec<u8>, TreeRefused> {
 
 /// The entries of a listing [`listing`] wrote, in its order; anything else is refused.
 pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
-    let text = std::str::from_utf8(bytes).map_err(|_| TreeRefused::Line { line: 0, why: "is not UTF-8" })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| TreeRefused::Line { line: 0, why: "is not UTF-8" })?;
     let body = text.strip_prefix(HEADER).ok_or(TreeRefused::NoHeader)?;
     let mut entries: Vec<Entry> = Vec::new(); // alloc: once a tree read
     for (at, line) in body.split_terminator('\n').enumerate() {
         let line_no = at + 2;
         let refused = |why| TreeRefused::Line { line: line_no, why };
         let mut parts = line.splitn(3, ' ');
-        let kind = parts.next().and_then(Kind::named).ok_or(refused("has no kind of file, exec or link"))?;
+        let kind = parts
+            .next()
+            .and_then(Kind::named)
+            .ok_or(refused("has no kind of file, exec or link"))?;
         let hex = parts.next().ok_or(refused("has no BLAKE3"))?;
-        let blake3 = blaze_format::hex::decode_lower::<32>(hex).ok_or(refused("has no lower-case BLAKE3 of 64 digits"))?;
+        let blake3 = blaze_format::hex::decode_lower::<32>(hex)
+            .ok_or(refused("has no lower-case BLAKE3 of 64 digits"))?;
         let rest = parts.next().ok_or(refused("has no length"))?;
         let (len, path) = rest.split_once(' ').ok_or(refused("has no path"))?;
-        if len.is_empty() || !len.bytes().all(|it| it.is_ascii_digit()) || (len.len() > 1 && len.starts_with('0')) {
+        if len.is_empty()
+            || !len.bytes().all(|it| it.is_ascii_digit())
+            || (len.len() > 1 && len.starts_with('0'))
+        {
             return Err(refused("has no length in decimal digits with no leading zero"));
         }
         let len: u64 = len.parse().map_err(|_| refused("has a length past 64 bits"))?;
@@ -220,7 +248,10 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
         entries.push(Entry { path: path.to_owned(), kind, blake3: Blake3(blake3), len }); // alloc: once an entry
     }
     if !text.ends_with('\n') {
-        return Err(TreeRefused::Line { line: body.lines().count() + 1, why: "does not end in a newline" });
+        return Err(TreeRefused::Line {
+            line: body.lines().count() + 1,
+            why: "does not end in a newline",
+        });
     }
     // The rules a listing is written under, over what was read: a listing that is not one
     // [`listing`] could write is never written out (a file under a symlink).

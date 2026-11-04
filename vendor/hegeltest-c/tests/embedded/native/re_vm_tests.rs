@@ -62,22 +62,10 @@ fn nullable_unbounded_repeats_stay_with_the_backtracking_matcher() {
         assert_eq!(Program::compile(&parsed).err(), Some(Unsupported));
         let text = chars(text);
         let p = Program::compile_recognizer(&parsed).unwrap();
-        assert_eq!(
-            run(&p, &text, 0, None).is_some(),
-            end.is_some(),
-            "{pattern}"
-        );
-        assert_eq!(
-            run(&p, &text, 0, Some(text.len())).is_some(),
-            full,
-            "{pattern}"
-        );
+        assert_eq!(run(&p, &text, 0, None).is_some(), end.is_some(), "{pattern}");
+        assert_eq!(run(&p, &text, 0, Some(text.len())).is_some(), full, "{pattern}");
         let matcher = Matcher::new(&parsed);
-        assert_eq!(
-            matcher.match_at_touch(&text, 0).unwrap().0,
-            end,
-            "{pattern:?}"
-        );
+        assert_eq!(matcher.match_at_touch(&text, 0).unwrap().0, end, "{pattern:?}");
         assert_eq!(matcher.fullmatch(&text).unwrap(), full, "{pattern:?}");
     }
     let long = chars(&"a".repeat(5000));
@@ -180,11 +168,7 @@ fn agrees_with_the_backtracking_matcher() {
             let text = chars(text);
             for pos in 0..=text.len() {
                 let expected = matcher.match_at_touch(&text, pos).unwrap().0;
-                assert_eq!(
-                    run(&program, &text, pos, None),
-                    expected,
-                    "{pattern:?} {text:?} {pos}"
-                );
+                assert_eq!(run(&program, &text, pos, None), expected, "{pattern:?} {text:?} {pos}");
             }
             for end in 0..=text.len() {
                 let prefix = &text[..end];
@@ -209,38 +193,20 @@ fn scan_reports_the_threads_the_end_of_the_text_left_waiting() {
     assert_eq!(newlines.resume(&resume, &chars("\nx"), 0, 1).0, Some(1));
     let (end, touch, resume) = newlines.scan(&chars("\n "), 0, None);
     assert_eq!((end, touch), (Some(2), Touch::End));
-    assert_eq!(
-        newlines.resume(&resume.unwrap(), &chars("\n \n"), 0, 2).0,
-        Some(3)
-    );
+    assert_eq!(newlines.resume(&resume.unwrap(), &chars("\n \n"), 0, 2).0, Some(3));
     let closed = program("\"[^\"]*\"").unwrap();
-    assert_eq!(
-        closed.scan(&chars("\"a\""), 0, None),
-        (Some(3), Touch::Never, None)
-    );
+    assert_eq!(closed.scan(&chars("\"a\""), 0, None), (Some(3), Touch::Never, None));
     assert_eq!(closed.scan(&chars("\"a"), 0, None).2.unwrap().found, None);
     let boundary = program("\\bx").unwrap();
-    assert_eq!(
-        boundary.scan(&chars("x"), 0, None),
-        (Some(1), Touch::End, None)
-    );
+    assert_eq!(boundary.scan(&chars("x"), 0, None), (Some(1), Touch::End, None));
     let behind = program("(?<=a)b*").unwrap();
     assert_eq!(behind.scan(&chars("b"), 0, None), (None, Touch::End, None));
     assert!(behind.scan(&chars("ab"), 1, None).2.is_some());
     let ahead = program("x(?=a*)").unwrap();
-    assert_eq!(
-        ahead.scan(&chars("x"), 0, None),
-        (Some(1), Touch::End, None)
-    );
-    assert_eq!(
-        ahead.scan(&chars("xb"), 0, None),
-        (Some(1), Touch::Never, None)
-    );
+    assert_eq!(ahead.scan(&chars("x"), 0, None), (Some(1), Touch::End, None));
+    assert_eq!(ahead.scan(&chars("xb"), 0, None), (Some(1), Touch::Never, None));
     let star = program("a*").unwrap();
-    assert_eq!(
-        star.scan(&chars("a"), 0, Some(1)),
-        (Some(1), Touch::End, None)
-    );
+    assert_eq!(star.scan(&chars("a"), 0, Some(1)), (Some(1), Touch::End, None));
     assert_eq!(star.scan(&chars("a"), 5, None).0, Some(1));
 }
 
@@ -296,40 +262,20 @@ fn resume_continues_a_scan_as_a_fresh_run_would() {
             }
         }
     }
-    assert!(
-        fixed > 100 && resumed > 100 && lost > 100,
-        "{fixed} {resumed} {lost}"
-    );
+    assert!(fixed > 100 && resumed > 100 && lost > 100, "{fixed} {resumed} {lost}");
 }
 
 #[test]
 fn sets_match_beyond_ascii() {
-    assert_eq!(
-        run(&program("[α-ω]+").unwrap(), &chars("αβγ!"), 0, None),
-        Some(3)
-    );
-    assert_eq!(
-        run(&program("\\w+").unwrap(), &chars("héllo wörld"), 0, None),
-        Some(5)
-    );
-    assert_eq!(
-        run(&program("[^a]").unwrap(), &chars("é"), 0, None),
-        Some(1)
-    );
-    assert_eq!(
-        run(&program("(?i)[a-c]+").unwrap(), &chars("aBcÀ"), 0, None),
-        Some(3)
-    );
+    assert_eq!(run(&program("[α-ω]+").unwrap(), &chars("αβγ!"), 0, None), Some(3));
+    assert_eq!(run(&program("\\w+").unwrap(), &chars("héllo wörld"), 0, None), Some(5));
+    assert_eq!(run(&program("[^a]").unwrap(), &chars("é"), 0, None), Some(1));
+    assert_eq!(run(&program("(?i)[a-c]+").unwrap(), &chars("aBcÀ"), 0, None), Some(3));
 }
 
 #[test]
 fn programs_that_look_around_them_keep_no_automaton() {
-    for pattern in [
-        "a*",
-        "\\d+(?:\\.\\d+)?",
-        "(?:ab|a)(?:bc|c)?",
-        "(?i)[a-c]+x*?",
-    ] {
+    for pattern in ["a*", "\\d+(?:\\.\\d+)?", "(?:ab|a)(?:bc|c)?", "(?i)[a-c]+x*?"] {
         assert!(program(pattern).unwrap().dfa.is_some(), "{pattern}");
     }
     for pattern in ["^a*", "a*$", "\\ba", "x(?=a*)", "(?<=a)b", "(?!x)y"] {
@@ -356,11 +302,7 @@ fn the_automaton_remembers_the_states_a_run_passes_through() {
     assert_eq!(states(&p), remembered);
     let dfa = p.dfa.as_ref().unwrap().lock();
     assert!(dfa.states.iter().any(|state| !state.other.is_empty()));
-    assert!(
-        dfa.states
-            .iter()
-            .all(|state| state.waiting <= state.pcs.len())
-    );
+    assert!(dfa.states.iter().all(|state| state.waiting <= state.pcs.len()));
 }
 
 #[test]
@@ -377,10 +319,7 @@ fn the_automaton_forgets_its_states_when_there_are_too_many() {
         assert_eq!(touch, Touch::End, "{split}");
         assert_eq!(
             (end, &resume),
-            (
-                fresh.scan(&text[..split], 0, None).0,
-                &fresh.scan(&text[..split], 0, None).2
-            ),
+            (fresh.scan(&text[..split], 0, None).0, &fresh.scan(&text[..split], 0, None).2),
             "{split}"
         );
         let carried = p.resume(&resume.unwrap(), &text, 0, split);
@@ -416,9 +355,8 @@ fn characters_beyond_ascii_share_transitions_by_class() {
     assert!(folded.class('Β') == folded.class('γ') && folded.class('Β') != folded.class('À'));
     let copies = program("(?i)[^a]{70}").unwrap();
     assert!(matches!(&copies.classes, Classes::Tests(units) if units.len() == 1));
-    let distinct: alloc::string::String = (0..70)
-        .map(|i| alloc::format!("[^{}]", char::from_u32(0x100 + i).unwrap()))
-        .collect();
+    let distinct: alloc::string::String =
+        (0..70).map(|i| alloc::format!("[^{}]", char::from_u32(0x100 + i).unwrap())).collect();
     let many = program(&["(?i)", &distinct].concat()).unwrap();
     assert!(matches!(many.classes, Classes::ByChar));
     assert_eq!(many.class('α'), u64::from('α'));
@@ -480,10 +418,7 @@ fn a_full_automaton_is_forgotten_before_a_run_is_carried_on() {
     let (p, resume) = filled();
     assert_eq!(p.resume(&resume, &text, 0, split).0, Some(1201));
     assert!(states(&p) < DFA_STATES);
-    assert_eq!(
-        p.resume(&resume, &text[..split + 2], 0, split).0,
-        Some(split + 1)
-    );
+    assert_eq!(p.resume(&resume, &text[..split + 2], 0, split).0, Some(split + 1));
 }
 
 #[test]

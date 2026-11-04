@@ -11,7 +11,6 @@
 use std::{collections::VecDeque, rc::Rc};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::bits::{BitMatrix, BitSet};
 use hir_ty::mir::{
     AggregateKind, AsmOperand, BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind,
@@ -19,6 +18,7 @@ use hir_ty::mir::{
 };
 use hir_ty::next_solver::Ty;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 /// An index of a checked place: rustc's `PlaceIndex`.
 pub(super) type Index = u32;
@@ -124,7 +124,11 @@ impl<'db> Places<'db> {
 
     /// The checked place `local` with `projection` is in, and the projections past it:
     /// rustc's `PlaceSet::get`. A capture by reference is the place behind the reference.
-    fn get<'p>(&self, local: LocalId, projection: &'p [PlaceElem]) -> Option<(Index, &'p [PlaceElem])> {
+    fn get<'p>(
+        &self,
+        local: LocalId,
+        projection: &'p [PlaceElem],
+    ) -> Option<(Index, &'p [PlaceElem])> {
         if let Some(at) = self.of_local(local) {
             return match self.kinds[at as usize] {
                 Kind::Capture { by_ref: true, .. } => match projection {
@@ -138,7 +142,9 @@ impl<'db> Places<'db> {
         if *closure != local {
             return None;
         }
-        let [ProjectionElem::Deref, ProjectionElem::Field(field), rest @ ..] = projection else { return None };
+        let [ProjectionElem::Deref, ProjectionElem::Field(field), rest @ ..] = projection else {
+            return None;
+        };
         let at = *fields.get(field.0 as usize)?;
         (at != NONE).then_some((at, rest))
     }
@@ -146,7 +152,8 @@ impl<'db> Places<'db> {
     /// Whether `place` is behind a reference out of a checked place: rustc's self-assignments
     /// of one are not.
     pub(super) fn is_indirect(&self, place: &StoredPlace) -> bool {
-        self.get(place.local, place.projection.as_slice()).is_some_and(|(_, extra)| is_indirect(extra))
+        self.get(place.local, place.projection.as_slice())
+            .is_some_and(|(_, extra)| is_indirect(extra))
     }
 
     fn is_by_ref_capture(&self, at: Index) -> bool {
@@ -227,7 +234,9 @@ impl Cfg {
             let Some(terminator) = &data.terminator else { continue };
             let edges: SmallVec<[BasicBlockId; 2]> = match &terminator.kind {
                 // alloc: inline, a `SmallVec` of one allocates nothing
-                TerminatorKind::Return | TerminatorKind::UnwindResume if again => smallvec::smallvec![start],
+                TerminatorKind::Return | TerminatorKind::UnwindResume if again => {
+                    smallvec::smallvec![start]
+                }
                 TerminatorKind::FalseEdge { real_target, imaginary_target } => {
                     // alloc: inline, a `SmallVec` of two allocates nothing
                     smallvec::smallvec![*real_target, *imaginary_target]
@@ -380,7 +389,12 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn block(&self, block: BasicBlockId, state: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
+    fn block(
+        &self,
+        block: BasicBlockId,
+        state: &mut PlaceSet,
+        closures: &mut super::Liveness<'_, '_, 'db>,
+    ) {
         let data = &self.mir.basic_blocks[block];
         if let Some(terminator) = &data.terminator {
             self.terminator(&terminator.kind, state);
@@ -390,7 +404,13 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn statement(&self, kind: &StatementKind, loc: (u32, u32), live: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
+    fn statement(
+        &self,
+        kind: &StatementKind,
+        loc: (u32, u32),
+        live: &mut PlaceSet,
+        closures: &mut super::Liveness<'_, '_, 'db>,
+    ) {
         let special = self.specials.get(&loc).copied();
         if special == Some(Special::Skip) {
             return;
@@ -398,7 +418,8 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         match kind {
             StatementKind::Assign(place, rvalue) => match special {
                 Some(Special::SelfOp) => {
-                    if let Rvalue::BinaryOp(_, _, rhs) | Rvalue::CheckedBinaryOp(_, _, rhs) = rvalue {
+                    if let Rvalue::BinaryOp(_, _, rhs) | Rvalue::CheckedBinaryOp(_, _, rhs) = rvalue
+                    {
                         self.operand(rhs, live);
                     }
                 }
@@ -436,12 +457,16 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     fn terminator(&self, kind: &TerminatorKind, live: &mut PlaceSet) {
         let again = self.kind == CaptureKind::FnMut;
         match kind {
-            TerminatorKind::Return | TerminatorKind::Yield { .. } | TerminatorKind::Call { target: None, .. }
+            TerminatorKind::Return
+            | TerminatorKind::Yield { .. }
+            | TerminatorKind::Call { target: None, .. }
                 if self.kind != CaptureKind::None =>
             {
                 self.by_ref_captures(live)
             }
-            TerminatorKind::Goto { target } if *target == self.cfg.start && self.kind != CaptureKind::None => {
+            TerminatorKind::Goto { target }
+                if *target == self.cfg.start && self.kind != CaptureKind::None =>
+            {
                 self.by_ref_captures(live)
             }
             TerminatorKind::UnwindResume if again => self.by_ref_captures(live),
@@ -492,38 +517,49 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn rvalue(&self, rvalue: &Rvalue, live: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
+    fn rvalue(
+        &self,
+        rvalue: &Rvalue,
+        live: &mut PlaceSet,
+        closures: &mut super::Liveness<'_, '_, 'db>,
+    ) {
         match rvalue {
-            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) | Rvalue::UnaryOp(_, it) => {
-                self.operand(it, live)
-            }
-            Rvalue::Ref(_, place) | Rvalue::Len(place) | Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
-                self.place(place, Ctx::Use, live)
-            }
+            Rvalue::Use(it)
+            | Rvalue::Repeat(it, _)
+            | Rvalue::Cast(_, it, _)
+            | Rvalue::UnaryOp(_, it) => self.operand(it, live),
+            Rvalue::Ref(_, place)
+            | Rvalue::Len(place)
+            | Rvalue::Discriminant(place)
+            | Rvalue::CopyForDeref(place) => self.place(place, Ctx::Use, live),
             Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
                 self.operand(lhs, live);
                 self.operand(rhs, live);
             }
-            Rvalue::Aggregate(AggregateKind::Closure(ty), operands) => match closures.dead_captures(ty.as_ref()) {
-                Some(dead) => {
-                    for (operand, dead) in operands.iter().zip(dead.iter()) {
-                        if !dead {
+            Rvalue::Aggregate(AggregateKind::Closure(ty), operands) => {
+                match closures.dead_captures(ty.as_ref()) {
+                    Some(dead) => {
+                        for (operand, dead) in operands.iter().zip(dead.iter()) {
+                            if !dead {
+                                self.operand(operand, live);
+                            }
+                        }
+                    }
+                    None => {
+                        for operand in operands.iter() {
                             self.operand(operand, live);
                         }
                     }
                 }
-                None => {
-                    for operand in operands.iter() {
-                        self.operand(operand, live);
-                    }
-                }
-            },
+            }
             Rvalue::Aggregate(_, operands) => {
                 for operand in operands.iter() {
                     self.operand(operand, live);
                 }
             }
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
         }
     }
 
@@ -565,7 +601,8 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         sightings: Vec<Sighting<'m>>,
     ) -> Seen<'m> {
         let n = self.places.len();
-        let mut found = Seen { sightings, ever_live: PlaceSet::new(n), ever_dropped: PlaceSet::new(n) };
+        let mut found =
+            Seen { sightings, ever_live: PlaceSet::new(n), ever_dropped: PlaceSet::new(n) };
         let mut state = PlaceSet::new(n);
         let mir: &'m MirBody<'db> = self.mir;
         for &block in &self.cfg.postorder {
@@ -576,7 +613,8 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
             if let Some(terminator) = &data.terminator {
                 let span = terminator.span;
                 match &terminator.kind {
-                    TerminatorKind::Call { destination: place, .. } | TerminatorKind::Yield { resume_arg: place, .. } => {
+                    TerminatorKind::Call { destination: place, .. }
+                    | TerminatorKind::Yield { resume_arg: place, .. } => {
                         self.sight(&mut found, place, span, end, &state);
                         self.dropped(&mut found, place);
                     }
@@ -595,7 +633,9 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 let key = (raw(block) as u32, index as u32);
                 if self.specials.get(&key) != Some(&Special::Skip) {
                     match &statement.kind {
-                        StatementKind::Assign(place, _) => self.sight(&mut found, place, statement.span, loc, &state),
+                        StatementKind::Assign(place, _) => {
+                            self.sight(&mut found, place, statement.span, loc, &state)
+                        }
                         StatementKind::InlineAsm(asm) => {
                             for operand in &asm.operands {
                                 if let AsmOperand::Reg { output: Some(place), .. } = operand {
@@ -636,8 +676,17 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         self.mir.param_locals.iter().any(|&local| self.places.of_local(local) == Some(at))
     }
 
-    fn sight(&self, found: &mut Seen<'m>, place: &'m StoredPlace, span: MirSpan, loc: Loc, live: &PlaceSet) {
-        let Some((at, extra)) = self.places.get(place.local, place.projection.as_slice()) else { return };
+    fn sight(
+        &self,
+        found: &mut Seen<'m>,
+        place: &'m StoredPlace,
+        span: MirSpan,
+        loc: Loc,
+        live: &PlaceSet,
+    ) {
+        let Some((at, extra)) = self.places.get(place.local, place.projection.as_slice()) else {
+            return;
+        };
         if is_indirect(extra) {
             return;
         }
@@ -670,13 +719,21 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
             _ => false,
         };
         let in_rvalue = |rvalue: &Rvalue| match rvalue {
-            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) | Rvalue::UnaryOp(_, it) => in_operand(it),
-            Rvalue::Ref(_, place) | Rvalue::Len(place) | Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
-                in_place(place)
+            Rvalue::Use(it)
+            | Rvalue::Repeat(it, _)
+            | Rvalue::Cast(_, it, _)
+            | Rvalue::UnaryOp(_, it) => in_operand(it),
+            Rvalue::Ref(_, place)
+            | Rvalue::Len(place)
+            | Rvalue::Discriminant(place)
+            | Rvalue::CopyForDeref(place) => in_place(place),
+            Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                in_operand(lhs) || in_operand(rhs)
             }
-            Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => in_operand(lhs) || in_operand(rhs),
             Rvalue::Aggregate(_, operands) => operands.iter().any(in_operand),
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
         };
         self.cfg.postorder.iter().any(|&block| {
             let data = &self.mir.basic_blocks[block];
@@ -687,7 +744,8 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 StatementKind::InlineAsm(asm) => {
                     asm.operands.iter().any(|operand| match operand {
                         AsmOperand::Reg { input, output, .. } => {
-                            input.as_ref().is_some_and(in_operand) || output.as_ref().is_some_and(in_place)
+                            input.as_ref().is_some_and(in_operand)
+                                || output.as_ref().is_some_and(in_place)
                         }
                         AsmOperand::Const(it) | AsmOperand::Sym(it) => in_operand(it),
                         AsmOperand::Label => false,
@@ -699,13 +757,19 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 || data.terminator.as_ref().is_some_and(|terminator| match &terminator.kind {
                     TerminatorKind::SwitchInt { discr, .. } => in_operand(discr),
                     TerminatorKind::Drop { place, .. } => in_place(place),
-                    TerminatorKind::DropAndReplace { place, value, .. } => in_place(place) || in_operand(value),
+                    TerminatorKind::DropAndReplace { place, value, .. } => {
+                        in_place(place) || in_operand(value)
+                    }
                     TerminatorKind::Call { func, args, destination, .. } => {
                         in_operand(func) || args.iter().any(in_operand) || in_place(destination)
                     }
-                    TerminatorKind::TailCall { func, args, .. } => in_operand(func) || args.iter().any(in_operand),
+                    TerminatorKind::TailCall { func, args, .. } => {
+                        in_operand(func) || args.iter().any(in_operand)
+                    }
                     TerminatorKind::Assert { cond, .. } => in_operand(cond),
-                    TerminatorKind::Yield { value, resume_arg, .. } => in_operand(value) || in_place(resume_arg),
+                    TerminatorKind::Yield { value, resume_arg, .. } => {
+                        in_operand(value) || in_place(resume_arg)
+                    }
                     _ => false,
                 })
         })

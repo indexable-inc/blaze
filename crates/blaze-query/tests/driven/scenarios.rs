@@ -158,15 +158,25 @@ fn setup() -> (Arc<Database>, Arc<MemTree>) {
 }
 
 fn view(db: &Database, tree: &MemTree, files: &[(&str, &str)]) -> ViewId {
-    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (*path, bytes.as_bytes())).collect();
+    let files: Vec<(&str, &[u8])> =
+        files.iter().map(|(path, bytes)| (*path, bytes.as_bytes())).collect();
     db.open(View { root: tree.root(&files) })
 }
 
 /// Every scenario that holds on the seed, by name.
 pub const ON_THE_SEED: &[(&str, fn())] = &[
-    ("a_query_waiting_on_the_one_worker_frees_it_for_other_jobs", a_query_waiting_on_the_one_worker_frees_it_for_other_jobs),
-    ("a_wait_that_would_close_a_cycle_across_views_is_cancelled", a_wait_that_would_close_a_cycle_across_views_is_cancelled),
-    ("a_query_asked_again_at_once_after_giving_way_ends", a_query_asked_again_at_once_after_giving_way_ends),
+    (
+        "a_query_waiting_on_the_one_worker_frees_it_for_other_jobs",
+        a_query_waiting_on_the_one_worker_frees_it_for_other_jobs,
+    ),
+    (
+        "a_wait_that_would_close_a_cycle_across_views_is_cancelled",
+        a_wait_that_would_close_a_cycle_across_views_is_cancelled,
+    ),
+    (
+        "a_query_asked_again_at_once_after_giving_way_ends",
+        a_query_asked_again_at_once_after_giving_way_ends,
+    ),
 ];
 
 /// A query waiting inside its run parks its job and frees the pool's one worker: another job's
@@ -192,7 +202,8 @@ pub fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     let ended: Arc<Ended> = Arc::new(Mutex::new((Vec::new(), Some(all))));
     let parked = Arc::new(AtomicUsize::new(usize::MAX));
     let job = {
-        let (db, pool, ended, parked) = (Arc::clone(&db), Arc::clone(&pool), Arc::clone(&ended), Arc::clone(&parked));
+        let (db, pool, ended, parked) =
+            (Arc::clone(&db), Arc::clone(&pool), Arc::clone(&ended), Arc::clone(&parked));
         move || {
             {
                 let (db, pool_, ended) = (Arc::clone(&db), Arc::clone(&pool), Arc::clone(&ended));
@@ -200,7 +211,8 @@ pub fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
                     None,
                     move || {
                         {
-                            let (db, pool__, ended) = (Arc::clone(&db), Arc::clone(&pool_), Arc::clone(&ended));
+                            let (db, pool__, ended) =
+                                (Arc::clone(&db), Arc::clone(&pool_), Arc::clone(&ended));
                             pool_.submit(
                                 None,
                                 move || {
@@ -222,7 +234,11 @@ pub fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     };
     pool.submit(None, job, |it| it.expect("the gate job does not panic"));
     all_ended.wait().expect("a wait on an event closes no cycle");
-    assert_eq!(parked.load(Ordering::SeqCst), 2, "the gate's and its asker's jobs were parked while len ran");
+    assert_eq!(
+        parked.load(Ordering::SeqCst),
+        2,
+        "the gate's and its asker's jobs were parked while len ran"
+    );
     assert_eq!(ended.lock().0, [("len", Ok(3)), ("gate", Ok(5)), ("asks gate", Ok(6))]);
 }
 
@@ -250,7 +266,11 @@ pub fn a_wait_that_would_close_a_cycle_across_views_is_cancelled() {
     });
     let (in_x, in_y) = (in_x.expect("x ran"), in_y.expect("y ran"));
     assert!(MET.load(Ordering::SeqCst) >= 2, "both runs met");
-    assert_eq!(usize::from(in_x.is_none()) + usize::from(in_y.is_none()), 1, "exactly one gave way: x {in_x:?}, y {in_y:?}");
+    assert_eq!(
+        usize::from(in_x.is_none()) + usize::from(in_y.is_none()),
+        1,
+        "exactly one gave way: x {in_x:?}, y {in_y:?}"
+    );
     let in_x = in_x.or_else(|| ask(x, "a"));
     let in_y = in_y.or_else(|| ask(y, "b"));
     assert_eq!((in_x, in_y), (Some(1), Some(1)));
@@ -291,7 +311,9 @@ pub fn a_query_asked_again_at_once_after_giving_way_ends() {
     let (in_x, in_y) = (in_x.expect("x ran"), in_y.expect("y ran"));
     assert!(MET.load(Ordering::SeqCst) >= 2, "both runs met");
     let (Ok((x_value, x_gave)), Ok((y_value, y_gave))) = (in_x, in_y) else {
-        panic!("a job never ended: it gave way {ASKS} times, asking again at once (x {in_x:?}, y {in_y:?})");
+        panic!(
+            "a job never ended: it gave way {ASKS} times, asking again at once (x {in_x:?}, y {in_y:?})"
+        );
     };
     assert_eq!((x_value, y_value), (1, 1), "each view's chain");
     assert_eq!(x_gave + y_gave, 1, "exactly one gave way, once: x {x_gave}, y {y_gave}");

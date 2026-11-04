@@ -15,7 +15,6 @@
 use std::hash::BuildHasher;
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
 use hir::{HirFileId, InFile};
@@ -26,6 +25,7 @@ use hir_def::{
     },
 };
 use intern::{Symbol, sym};
+use std::alloc::Global;
 use syntax::{
     SyntaxNodePtr, TextRange,
     view::{AstNode as _, Node},
@@ -59,7 +59,10 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
     /// Whether `krate` is compiled with `#![feature(staged_api)]`.
     pub(super) fn staged(&mut self, krate: hir::Crate) -> bool {
         let db = self.cx.db;
-        *self.staged.entry(krate).or_insert_with(|| krate.is_unstable_feature_enabled(db, &sym::staged_api))
+        *self
+            .staged
+            .entry(krate)
+            .or_insert_with(|| krate.is_unstable_feature_enabled(db, &sym::staged_api))
     }
 
     /// `lookup_deprecation_entry` of `def`.
@@ -68,7 +71,10 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
     }
 
     /// `lookup_deprecation_entry` of the item-like of this crate at `ptr`.
-    pub(super) fn local_deprecation(&self, ptr: InFile<SyntaxNodePtr>) -> Option<DeprecationEntry<'db>> {
+    pub(super) fn local_deprecation(
+        &self,
+        ptr: InFile<SyntaxNodePtr>,
+    ) -> Option<DeprecationEntry<'db>> {
         let node = self.cx.syntax_view(ptr);
         ItemLike::at(self.cx, node)?.deprecation(self.cx.db)
     }
@@ -87,20 +93,31 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
 
     /// A macro's own `#[deprecated]` (`SyntaxExtension::deprecation`: nothing inherited).
     pub(super) fn macro_deprecation(&self, mac: hir::Macro) -> Option<&'db Deprecation> {
-        stability::own_deprecation(self.cx.db, StabilityDef::Def(AttrDefId::MacroId(MacroId::from(mac))))
+        stability::own_deprecation(
+            self.cx.db,
+            StabilityDef::Def(AttrDefId::MacroId(MacroId::from(mac))),
+        )
     }
 
     /// A macro's own stability when it is unstable (`SyntaxExtension::stability`), of a crate
     /// with `staged_api`, this one or another.
     pub(super) fn macro_stability(&self, mac: hir::Macro) -> Option<&'db Stability> {
-        stability::own_stability(self.cx.db, StabilityDef::Def(AttrDefId::MacroId(MacroId::from(mac))))
-            .filter(|it| it.is_unstable())
+        stability::own_stability(
+            self.cx.db,
+            StabilityDef::Def(AttrDefId::MacroId(MacroId::from(mac))),
+        )
+        .filter(|it| it.is_unstable())
     }
 
     /// Whether `eval_stability` denies a use at `range` in `file` of what is `stability`:
     /// unstable, its feature and the one implying it not enabled, nor allowed by the macro the
     /// use comes from. Checked cheapest first; nothing is cloned.
-    pub(super) fn denied(&mut self, stability: &Stability, file: HirFileId, range: TextRange) -> bool {
+    pub(super) fn denied(
+        &mut self,
+        stability: &Stability,
+        file: HirFileId,
+        range: TextRange,
+    ) -> bool {
         let StabilityLevel::Unstable { implied_by, .. } = &stability.level else { return false };
         let Index { cx, enabled, .. } = self;
         let cx = *cx;
@@ -112,11 +129,17 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
 
     /// `check_stability_and_deprecation`'s test of a macro's `stability`: denied unless its
     /// feature, or the one implying it, is enabled or allowed where the macro is used.
-    pub(super) fn macro_denied(&mut self, stability: &Stability, file: HirFileId, range: TextRange) -> bool {
+    pub(super) fn macro_denied(
+        &mut self,
+        stability: &Stability,
+        file: HirFileId,
+        range: TextRange,
+    ) -> bool {
         let StabilityLevel::Unstable { implied_by, .. } = &stability.level else { return false };
         let Index { cx, enabled, .. } = self;
         let cx = *cx;
-        let mut allowed = |it: &Symbol| enabled_in(cx, enabled, it) || allows_unstable(cx, file, range, it);
+        let mut allowed =
+            |it: &Symbol| enabled_in(cx, enabled, it) || allows_unstable(cx, file, range, it);
         !(allowed(&stability.feature) || implied_by.as_ref().is_some_and(|it| allowed(it)))
     }
 
@@ -127,7 +150,9 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
             return None;
         }
         match &def.stability(self.cx.db)?.level {
-            StabilityLevel::Stable { allowed_through_unstable_modules, .. } => allowed_through_unstable_modules.as_ref(),
+            StabilityLevel::Stable { allowed_through_unstable_modules, .. } => {
+                allowed_through_unstable_modules.as_ref()
+            }
             StabilityLevel::Unstable { .. } => None,
         }
     }
@@ -146,7 +171,11 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
 
 /// Whether this crate enables `feature`, kept in `enabled`. A hit clones no `Symbol` (no
 /// shared refcount written).
-fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, feature: &Symbol) -> bool {
+fn enabled_in(
+    cx: &Cx<'_, '_>,
+    enabled: &mut HashTable<(Symbol, bool), &Frame>,
+    feature: &Symbol,
+) -> bool {
     let hash = FixedState.hash_one(feature);
     if let Some((_, it)) = enabled.find(hash, |(it, _)| it == feature) {
         return *it;
@@ -188,4 +217,3 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
     };
     attr::allows_internal_unstable(node, hir::Crate::from(def.krate).cfg(db), feature)
 }
-

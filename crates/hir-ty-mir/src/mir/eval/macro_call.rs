@@ -144,8 +144,10 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
     for word in bytes.chunks(ptr_size) {
         words.push(from_bytes!(usize, ptr_size, word));
     }
-    let Some(addr) =
-        words.iter().map(|&it| Address::from_usize(it, ptr_size)).find(|it| matches!(it.at(), Heap(_)))
+    let Some(addr) = words
+        .iter()
+        .map(|&it| Address::from_usize(it, ptr_size))
+        .find(|it| matches!(it.at(), Heap(_)))
     else {
         // An empty `String` holds a dangling pointer, not one into the heap.
         return Ok(String::new()); // alloc: empty, allocates nothing
@@ -158,7 +160,8 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
         .min()
         .unwrap_or(0);
     let text = evaluator.read_memory(addr, len)?;
-    String::from_utf8(text.to_vec()).map_err(|_| { // alloc: the macro's output, returned
+    String::from_utf8(text.to_vec()).map_err(|_| {
+        // alloc: the macro's output, returned
         MirEvalError::UndefinedBehavior(
             "a const macro returned a `String` that is not UTF-8".into(),
         )

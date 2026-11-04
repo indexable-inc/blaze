@@ -14,36 +14,13 @@ fn date(year: i32, month: u8, day: u8) -> Date {
 }
 
 fn time(hour: u8, minute: u8, second: u8, nanosecond: u32) -> Time {
-    Time {
-        hour,
-        minute,
-        second,
-        nanosecond,
-    }
+    Time { hour, minute, second, nanosecond }
 }
 
-const FULL_MIN_DATE: Date = Date {
-    year: 1,
-    month: 1,
-    day: 1,
-};
-const FULL_MAX_DATE: Date = Date {
-    year: 9999,
-    month: 12,
-    day: 31,
-};
-const MIDNIGHT: Time = Time {
-    hour: 0,
-    minute: 0,
-    second: 0,
-    nanosecond: 0,
-};
-const LAST_NANOSECOND: Time = Time {
-    hour: 23,
-    minute: 59,
-    second: 59,
-    nanosecond: 999_999_999,
-};
+const FULL_MIN_DATE: Date = Date { year: 1, month: 1, day: 1 };
+const FULL_MAX_DATE: Date = Date { year: 9999, month: 12, day: 31 };
+const MIDNIGHT: Time = Time { hour: 0, minute: 0, second: 0, nanosecond: 0 };
+const LAST_NANOSECOND: Time = Time { hour: 23, minute: 59, second: 59, nanosecond: 999_999_999 };
 
 #[test]
 fn generate_date_produces_valid_dates() {
@@ -90,14 +67,8 @@ fn generate_time_covers_zero_and_nonzero_nanoseconds() {
             seen_nanosecond_nonzero = true;
         }
     }
-    assert!(
-        seen_nanosecond_zero,
-        "no zero-nanosecond times across 200 seeds"
-    );
-    assert!(
-        seen_nanosecond_nonzero,
-        "no nonzero-nanosecond times across 200 seeds"
-    );
+    assert!(seen_nanosecond_zero, "no zero-nanosecond times across 200 seeds");
+    assert!(seen_nanosecond_nonzero, "no nonzero-nanosecond times across 200 seeds");
 }
 
 #[test]
@@ -106,14 +77,8 @@ fn generate_datetime_combines_valid_parts() {
         let mut ntc = fresh_ntc(seed);
         let dt = generate_datetime(
             &mut ntc,
-            DateTime {
-                date: FULL_MIN_DATE,
-                time: MIDNIGHT,
-            },
-            DateTime {
-                date: FULL_MAX_DATE,
-                time: LAST_NANOSECOND,
-            },
+            DateTime { date: FULL_MIN_DATE, time: MIDNIGHT },
+            DateTime { date: FULL_MAX_DATE, time: LAST_NANOSECOND },
         )
         .unwrap();
         assert!((1..=9999).contains(&dt.date.year));
@@ -186,10 +151,7 @@ fn generate_ipv4_addresses_are_valid_and_hit_special_ranges() {
         let o = a.octets();
         o[0] == 192 && o[1] == 168
     });
-    assert!(
-        saw_loopback,
-        "no 127.x.x.x address in 200 draws — special-range biasing missing"
-    );
+    assert!(saw_loopback, "no 127.x.x.x address in 200 draws — special-range biasing missing");
     assert!(saw_private_10, "no 10.x.x.x address in 200 draws");
     assert!(saw_192_168, "no 192.168.x.x address in 200 draws");
 }
@@ -203,9 +165,8 @@ fn generate_ipv6_addresses_are_valid_and_hit_special_ranges() {
         })
         .collect();
 
-    let saw_loopback_or_unspecified = addrs
-        .iter()
-        .any(|a| *a == Ipv6Addr::LOCALHOST || *a == Ipv6Addr::UNSPECIFIED);
+    let saw_loopback_or_unspecified =
+        addrs.iter().any(|a| *a == Ipv6Addr::LOCALHOST || *a == Ipv6Addr::UNSPECIFIED);
     let saw_doc = addrs.iter().any(|a| {
         let s = a.segments();
         s[0] == 0x2001 && s[1] == 0x0db8
@@ -275,10 +236,7 @@ fn generate_date_rejects_invalid_arguments() {
         (date(2001, 1, 1), date(2000, 1, 1)),
     ] {
         let err = generate_date(&mut ntc, min, max).unwrap_err();
-        assert!(
-            matches!(err, EngineError::InvalidArgument(_)),
-            "{min:?}..{max:?}"
-        );
+        assert!(matches!(err, EngineError::InvalidArgument(_)), "{min:?}..{max:?}");
     }
 }
 
@@ -324,23 +282,14 @@ fn generate_time_rejects_invalid_arguments() {
         (time(1, 0, 0, 0), time(0, 59, 0, 0)),
     ] {
         let err = generate_time(&mut ntc, min, max).unwrap_err();
-        assert!(
-            matches!(err, EngineError::InvalidArgument(_)),
-            "{min:?}..{max:?}"
-        );
+        assert!(matches!(err, EngineError::InvalidArgument(_)), "{min:?}..{max:?}");
     }
 }
 
 #[test]
 fn generate_datetime_respects_time_bounds_on_boundary_dates() {
-    let min = DateTime {
-        date: date(2000, 1, 1),
-        time: time(12, 0, 0, 0),
-    };
-    let max = DateTime {
-        date: date(2000, 1, 3),
-        time: time(6, 0, 0, 0),
-    };
+    let min = DateTime { date: date(2000, 1, 1), time: time(12, 0, 0, 0) };
+    let max = DateTime { date: date(2000, 1, 3), time: time(6, 0, 0, 0) };
     let mut seen_min_date = false;
     let mut seen_max_date = false;
     for seed in 0..500 {
@@ -362,14 +311,8 @@ fn generate_datetime_respects_time_bounds_on_boundary_dates() {
 
 #[test]
 fn generate_datetime_single_day_constrains_both_ends() {
-    let min = DateTime {
-        date: date(2020, 5, 5),
-        time: time(10, 0, 0, 0),
-    };
-    let max = DateTime {
-        date: date(2020, 5, 5),
-        time: time(11, 0, 0, 0),
-    };
+    let min = DateTime { date: date(2020, 5, 5), time: time(10, 0, 0, 0) };
+    let max = DateTime { date: date(2020, 5, 5), time: time(11, 0, 0, 0) };
     for seed in 0..100 {
         let mut ntc = fresh_ntc(seed);
         let dt = generate_datetime(&mut ntc, min, max).unwrap();
@@ -382,14 +325,8 @@ fn generate_datetime_single_day_constrains_both_ends() {
 #[test]
 fn generate_datetime_rejects_inverted_bounds() {
     let mut ntc = fresh_ntc(0);
-    let lo = DateTime {
-        date: date(2020, 5, 5),
-        time: time(11, 0, 0, 0),
-    };
-    let hi = DateTime {
-        date: date(2020, 5, 5),
-        time: time(10, 0, 0, 0),
-    };
+    let lo = DateTime { date: date(2020, 5, 5), time: time(11, 0, 0, 0) };
+    let hi = DateTime { date: date(2020, 5, 5), time: time(10, 0, 0, 0) };
     let err = generate_datetime(&mut ntc, lo, hi).unwrap_err();
     assert!(matches!(err, EngineError::InvalidArgument(_)));
 }

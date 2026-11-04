@@ -190,11 +190,13 @@ struct Owner {
 
 impl Owner {
     fn new(max: usize) -> Owner {
-        let made = RegionVec::new(max, Tag::Store).and_then(|held| Ok((held, RegionVec::new(max, Tag::Store)?)));
+        let made = RegionVec::new(max, Tag::Store)
+            .and_then(|held| Ok((held, RegionVec::new(max, Tag::Store)?)));
         match made {
-            Ok((held, free)) => {
-                Owner { busy: AtomicBool::new(false), recycle: UnsafeCell::new(Recycle { held, head: 0, free }) }
-            }
+            Ok((held, free)) => Owner {
+                busy: AtomicBool::new(false),
+                recycle: UnsafeCell::new(Recycle { held, head: 0, free }),
+            },
             Err(error) => stop(&error),
         }
     }
@@ -272,7 +274,9 @@ impl<T: Keyed> Table<T> {
     pub(crate) fn new(first: usize, columns: usize) -> Table<T> {
         let first = first.next_power_of_two().max(64);
         let mut most = 1;
-        while most < LEVELS && first.checked_mul((1 << (most + 1)) - 1).is_some_and(|rows| rows <= ROWS_MOST) {
+        while most < LEVELS
+            && first.checked_mul((1 << (most + 1)) - 1).is_some_and(|rows| rows <= ROWS_MOST)
+        {
             most += 1;
         }
         let rows = first * ((1 << most) - 1);
@@ -306,7 +310,8 @@ impl<T: Keyed> Table<T> {
             stop(&MemError::Exhausted {
                 tag: Tag::Store,
                 reserved: self.base(self.most) as usize * mem::size_of::<AtomicPtr<T>>(),
-                wanted: (self.base(level) as usize + self.cap(level)) * mem::size_of::<AtomicPtr<T>>(),
+                wanted: (self.base(level) as usize + self.cap(level))
+                    * mem::size_of::<AtomicPtr<T>>(),
             });
         }
         self.levels[level].get_or_init(|| {
@@ -343,7 +348,11 @@ impl<T: Keyed> Table<T> {
 
     /// Publishes `value` unless its key is there already: then it gives `value` back with
     /// what is there. Of inserts of one key racing, exactly one lands. Any thread.
-    pub(crate) fn insert<'a>(&'a self, _held: Held<'a>, value: T) -> Result<Hit<'a, T>, (T, Hit<'a, T>)> {
+    pub(crate) fn insert<'a>(
+        &'a self,
+        _held: Held<'a>,
+        value: T,
+    ) -> Result<Hit<'a, T>, (T, Hit<'a, T>)> {
         let key = value.key();
         // Placed in a slot of its own once there is an empty slot to publish it in.
         let mut value = Some(value);
@@ -382,7 +391,12 @@ impl<T: Keyed> Table<T> {
                 }
                 (false, None) => raw,
             };
-            match slots[at].compare_exchange(ptr::null_mut(), put, Ordering::AcqRel, Ordering::Acquire) {
+            match slots[at].compare_exchange(
+                ptr::null_mut(),
+                put,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) if full => number += 1,
                 Ok(_) => {
                     level.used.fetch_add(1, Ordering::Relaxed);
@@ -425,7 +439,8 @@ impl<T: Keyed> Table<T> {
                 recycle.held.clear();
                 recycle.head = 0;
             } else if recycle.head > 0
-                && (recycle.head * 2 >= recycle.held.len() || recycle.held.len() == recycle.held.max_len())
+                && (recycle.head * 2 >= recycle.held.len()
+                    || recycle.held.len() == recycle.held.max_len())
             {
                 let live = recycle.held.len() - recycle.head;
                 recycle.held.copy_within(recycle.head.., 0);
@@ -470,7 +485,8 @@ impl<T: Keyed> Table<T> {
             self.slots_of(number).iter().enumerate().filter_map(move |(at, slot)| {
                 let found = slot.load(Ordering::Acquire);
                 // SAFETY: as in `probe`.
-                (!found.is_null() && found != seal()).then(|| (base + at as u64, unsafe { &*found }))
+                (!found.is_null() && found != seal())
+                    .then(|| (base + at as u64, unsafe { &*found }))
             })
         })
     }
@@ -515,7 +531,8 @@ impl<T: Keyed> Table<T> {
     /// Only the store calls it; a flag set meanwhile lands in one period or the other.
     pub(crate) fn rotate(&self, from: usize, to: usize) {
         for (number, _) in self.made() {
-            self.flag_column(number, from).move_into(self.flag_column(number, to), Ordering::Relaxed);
+            self.flag_column(number, from)
+                .move_into(self.flag_column(number, to), Ordering::Relaxed);
         }
     }
 }
@@ -629,7 +646,10 @@ mod tests {
                     (Err((back, (row, kept))), Some(&n)) => {
                         assert_eq!((back.n, kept.n, Some(&row)), (step, n, rows.get(&key)));
                     }
-                    (got, want) => panic!("step {step}: insert of {key} was {:?}, the model has {want:?}", got.is_ok()),
+                    (got, want) => panic!(
+                        "step {step}: insert of {key} was {:?}, the model has {want:?}",
+                        got.is_ok()
+                    ),
                 },
                 4 => match (table.replace(held, value(key, step)), model.get_mut(&key)) {
                     (Ok(old), Some(n)) => {
@@ -637,7 +657,10 @@ mod tests {
                         *n = step;
                     }
                     (Err(back), None) => assert_eq!(back.n, step),
-                    (got, want) => panic!("step {step}: replace of {key} was {:?}, the model has {want:?}", got.is_ok()),
+                    (got, want) => panic!(
+                        "step {step}: replace of {key} was {:?}, the model has {want:?}",
+                        got.is_ok()
+                    ),
                 },
                 5 => {
                     if let Some(&row) = rows.get(&key) {
@@ -654,7 +677,11 @@ mod tests {
                 }
                 _ => {
                     let got = table.get(held, &key).map(|(row, it)| (row, it.n));
-                    assert_eq!(got, model.get(&key).map(|n| (rows[&key], *n)), "step {step}: {key}");
+                    assert_eq!(
+                        got,
+                        model.get(&key).map(|n| (rows[&key], *n)),
+                        "step {step}: {key}"
+                    );
                 }
             }
             if step % 4096 == 0 {
@@ -729,7 +756,11 @@ mod tests {
                 table.collect();
                 std::thread::yield_now();
             }
-            assert_eq!(table.values.carved.load(Ordering::Relaxed), carved, "round {round} carved a slot");
+            assert_eq!(
+                table.values.carved.load(Ordering::Relaxed),
+                carved,
+                "round {round} carved a slot"
+            );
         }
         drop(table);
         assert_eq!(drops.load(Ordering::Relaxed), 20 + 10 * 20 + 20, "every value dropped once");

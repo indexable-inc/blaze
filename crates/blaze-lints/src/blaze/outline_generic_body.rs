@@ -63,8 +63,18 @@ fn rest_limit(cx: &Cx<'_, '_>) -> usize {
 
 /// The methods a parameter's one use may be: each converts it to a concrete type once.
 const CONVERSIONS: &[&str] = &[
-    "as_ref", "as_mut", "borrow", "borrow_mut", "into", "to_string", "to_owned", "as_str", "as_slice", "as_bytes",
-    "as_path", "as_os_str",
+    "as_ref",
+    "as_mut",
+    "borrow",
+    "borrow_mut",
+    "into",
+    "to_string",
+    "to_owned",
+    "as_str",
+    "as_slice",
+    "as_bytes",
+    "as_path",
+    "as_os_str",
 ];
 
 /// The name the fix gives the outlined function.
@@ -97,7 +107,11 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
     diagnostic.note(found.note);
     if let Some(part) = fix {
         // alloc: the fix's one part
-        diagnostic.multipart_suggestion("outline the body into a non-generic `fn inner`", vec![part], Applicability::MachineApplicable);
+        diagnostic.multipart_suggestion(
+            "outline the body into a non-generic `fn inner`",
+            vec![part],
+            Applicability::MachineApplicable,
+        );
     }
     diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
 }
@@ -116,7 +130,11 @@ struct Converted {
 
 fn find(cx: &Cx<'_, '_>) -> Option<Found> {
     let f = ast::Fn::cast(cx.root())?;
-    if cx.expansion().is_some() || !cx.is_written(f.syntax()) || f.async_token().is_some() || cx.is_in_test(f.syntax()) {
+    if cx.expansion().is_some()
+        || !cx.is_written(f.syntax())
+        || f.async_token().is_some()
+        || cx.is_in_test(f.syntax())
+    {
         return None;
     }
     let db = cx.db();
@@ -174,16 +192,18 @@ fn find(cx: &Cx<'_, '_>) -> Option<Found> {
     for &(index, _) in &generic {
         let pat = body.params[index].formal;
         let Pat::Bind { id: binding, subpat: None } = body.pat(pat) else { return None };
-        let mut uses = body
-            .exprs()
-            .filter(|(id, expr)| matches!(expr, Expr::Path(_)) && local_of(db, def, body, *id) == Some(binding));
+        let mut uses = body.exprs().filter(|(id, expr)| {
+            matches!(expr, Expr::Path(_)) && local_of(db, def, body, *id) == Some(binding)
+        });
         let (use_, _) = uses.next()?;
         if uses.next().is_some() {
             return None;
         }
         let conversion = conversion(db, body, infer, &parents, use_)?;
         let (statement, let_pat) = statements.iter().enumerate().find_map(|(at, it)| match it {
-            Statement::Let { pat, initializer: Some(init), else_branch: None, .. } if init == conversion => {
+            Statement::Let { pat, initializer: Some(init), else_branch: None, .. }
+                if init == conversion =>
+            {
                 Some((at, pat))
             }
             _ => None,
@@ -269,16 +289,26 @@ fn ty_of<'db>(ty: &hir::Type<'db>) -> hir_ty::next_solver::Ty<'db> {
 }
 
 /// The conversion the use `use_` of a parameter is the start of, if it is one.
-fn conversion(db: &Db, body: &Body, infer: &hir_ty::InferenceResult<'_>, parents: &Parents, use_: ExprId) -> Option<ExprId> {
+fn conversion(
+    db: &Db,
+    body: &Body,
+    infer: &hir_ty::InferenceResult<'_>,
+    parents: &Parents,
+    use_: ExprId,
+) -> Option<ExprId> {
     let parent = parents.of_expr(use_)?;
     match body.expr(parent) {
-        Expr::MethodCall { receiver, method_name, args, .. } if receiver == use_ && args.is_empty() => {
+        Expr::MethodCall { receiver, method_name, args, .. }
+            if receiver == use_ && args.is_empty() =>
+        {
             let method = method_name.as_str();
             if method == "into_iter" {
                 let up = parents.of_expr(parent)?;
                 return match body.expr(up) {
                     Expr::MethodCall { receiver, method_name, args, .. }
-                        if receiver == parent && args.is_empty() && method_name.as_str() == "collect" =>
+                        if receiver == parent
+                            && args.is_empty()
+                            && method_name.as_str() == "collect" =>
                     {
                         Some(up)
                     }
@@ -323,7 +353,11 @@ fn fix<'t>(
     if !cx.in_file() || func.as_assoc_item(db).is_some() || func.has_self_param(db) {
         return None;
     }
-    if f.const_token().is_some() || f.unsafe_token().is_some() || f.abi().is_some() || f.gen_token().is_some() {
+    if f.const_token().is_some()
+        || f.unsafe_token().is_some()
+        || f.abi().is_some()
+        || f.gen_token().is_some()
+    {
         return None;
     }
     let body = analysis.body();
@@ -342,7 +376,11 @@ fn fix<'t>(
     let ret = match f.ret_type() {
         Some(ret) => {
             let text = cx.source_of(ret.syntax());
-            if text.contains('&') || text.contains('\'') || text.contains("impl") || text.contains("Self") {
+            if text.contains('&')
+                || text.contains('\'')
+                || text.contains("impl")
+                || text.contains("Self")
+            {
                 return None;
             }
             format!(" {text}")
@@ -352,7 +390,9 @@ fn fix<'t>(
     let block = f.body()?;
     let list = block.stmt_list()?;
     let stmts: Vec<ast::Stmt<'t>> = list.statements().collect(); // alloc: the body's statements, once per fix
-    if stmts.len() != statements.len() || stmts[..n].iter().any(|it| !matches!(it, ast::Stmt::LetStmt(_))) {
+    if stmts.len() != statements.len()
+        || stmts[..n].iter().any(|it| !matches!(it, ast::Stmt::LetStmt(_)))
+    {
         return None;
     }
     let tail_present = tail.is_some();
@@ -365,7 +405,9 @@ fn fix<'t>(
         (None, Some(tail)) if tail_present => cx.range(tail.syntax())?.start(),
         _ => return None,
     };
-    if rest_start < prefix_end || !cx.snippet(TextRange::new(prefix_end, rest_start)).trim().is_empty() {
+    if rest_start < prefix_end
+        || !cx.snippet(TextRange::new(prefix_end, rest_start)).trim().is_empty()
+    {
         return None;
     }
     let module = hir_def::ModuleId::from(func.module(db));
@@ -453,8 +495,14 @@ pub fn kept<P: AsRef<Path>>(path: P) -> u32 {
     #[test]
     fn a_body_generic_only_in_its_conversion_is_found_with_a_fix() {
         let found = lint(FIXTURE.trim_start(), "-A clippy::all --warn=blaze::outline_generic_body");
-        assert!(found.contains("`fn open` is generic only in how it converts `path` at entry"), "{found}");
-        assert!(found.contains("fn inner(path: &Path) -> u32 {"), "the fix outlines the body:\n{found}");
+        assert!(
+            found.contains("`fn open` is generic only in how it converts `path` at entry"),
+            "{found}"
+        );
+        assert!(
+            found.contains("fn inner(path: &Path) -> u32 {"),
+            "the fix outlines the body:\n{found}"
+        );
         assert!(!found.contains("`fn small`"), "a small body is left alone:\n{found}");
         assert!(!found.contains("`fn kept`"), "a parameter used twice is left alone:\n{found}");
     }

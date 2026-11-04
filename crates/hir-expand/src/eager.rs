@@ -20,7 +20,7 @@
 //! See the full discussion : <https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Eager.20expansion.20of.20built-in.20macros>
 use std::alloc::Allocator;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use span::SyntaxContext;
 use syntax::{
     AstPtr, FlatTree, FlatTreeBuilder, NodeOrToken, TextSize, WalkEvent,
@@ -38,7 +38,8 @@ use crate::{
 
 /// A macro call inside an eager macro's input, expanded with it: where it is, and its ID. An
 /// eager expansion appends one per call it expands, in the order it meets them.
-pub type EagerCall = (InFile<(AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>, MacroCallId);
+pub type EagerCall =
+    (InFile<(AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>, MacroCallId);
 
 /// The resolver of the macro calls inside an eager macro's input: a call's path and the syntax
 /// context of its first segment, which def-site hygiene reads. Not a generic: that would copy
@@ -118,7 +119,8 @@ pub fn expand_eager_macro_input_view(
         Ok(it) => it,
         Err(parent) => {
             // alloc: an error's message, on the error path
-            let message = format!("blaze can't tell what a macro call in a `{parent:?}` expands to");
+            let message =
+                format!("blaze can't tell what a macro call in a `{parent:?}` expands to");
             return ExpandResult::new(None, ExpandError::other(*span, message));
         }
     };
@@ -164,7 +166,8 @@ pub fn expand_eager_macro_input_view(
         kind: MacroCallKind::FnLike {
             ast_id,
             expand_to,
-            eager: Some(Arc::new(EagerCallInfo { // alloc: the eager call's interned key, once per eager call
+            eager: Some(Arc::new(EagerCallInfo {
+                // alloc: the eager call's interned key, once per eager call
                 arg: subtree,
                 arg_id,
                 error: err.clone(), // clone: an `Option<ExpandError>`: an `Arc` count, only on error
@@ -352,7 +355,9 @@ fn eager_macro_recur_view<'db>(
                         error = Some(ExpandError::other(
                             span_map.span_at(call.syntax().text_range().start()),
                             // alloc: an error's message, on the error path
-                            format!("blaze can't tell what a macro call in a `{parent:?}` expands to"),
+                            format!(
+                                "blaze can't tell what a macro call in a `{parent:?}` expands to"
+                            ),
                         ));
                         offset += call.syntax().text_range().len();
                         continue;

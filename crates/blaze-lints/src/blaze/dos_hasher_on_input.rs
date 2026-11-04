@@ -69,7 +69,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         return found;
     }
     let Some(analysis) = cx.analysis() else { return found };
-    let Ok(def @ DefWithBodyId::FunctionId(f)) = DefWithBodyId::try_from(analysis.def()) else { return found };
+    let Ok(def @ DefWithBodyId::FunctionId(f)) = DefWithBodyId::try_from(analysis.def()) else {
+        return found;
+    };
     let function = hir::Function::from(f);
     if !matches!(function.visibility(db), hir::Visibility::Public) {
         return found;
@@ -83,7 +85,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     for (id, expr) in body.exprs() {
         let Expr::MethodCall { receiver, args, .. } = expr else { continue };
         let Some(callee) = general_facts::callee(db, analysis, id) else { continue };
-        if !(callee.name == "insert" || callee.name == "entry" || callee.name.starts_with("get_or_insert")) {
+        if !(callee.name == "insert"
+            || callee.name == "entry"
+            || callee.name.starts_with("get_or_insert"))
+        {
             continue;
         }
         let Some(adt) = callee.self_adt else { continue };
@@ -103,7 +108,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             continue;
         }
         let Some(&key) = args.first() else { continue };
-        let Some(param) = root_local(db, def, analysis, key).filter(|it| tainted.contains(it)) else { continue };
+        let Some(param) = root_local(db, def, analysis, key).filter(|it| tainted.contains(it))
+        else {
+            continue;
+        };
         let Some(range) = analysis.expr_range(id) else { continue };
         let param = body[param].name.as_str().to_owned(); // alloc: a message's part
         let message = format!(
@@ -124,9 +132,15 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 fn fixed(db: &Db, s: &hir::Type<'_>) -> bool {
     let Some(adt) = s.as_adt() else { return false };
     if general_facts::std_adt(db, adt, "hash", &["BuildHasherDefault"]) {
-        let Some(inner) = s.type_arguments().next().and_then(|it| it.as_adt()) else { return false };
-        let sip = general_facts::std_adt(db, inner, "hash", &["DefaultHasher", "SipHasher", "SipHasher13"])
-            || general_facts::std_adt(db, inner, "collections", &["DefaultHasher"]);
+        let Some(inner) = s.type_arguments().next().and_then(|it| it.as_adt()) else {
+            return false;
+        };
+        let sip = general_facts::std_adt(
+            db,
+            inner,
+            "hash",
+            &["DefaultHasher", "SipHasher", "SipHasher13"],
+        ) || general_facts::std_adt(db, inner, "collections", &["DefaultHasher"]);
         return !sip;
     }
     FIXED.iter().any(|(krate, names)| general_facts::crate_adt(db, adt, krate, names))
@@ -140,7 +154,8 @@ fn is_text(db: &Db, krate: hir::Crate, ty: &hir::Type<'_>) -> bool {
         return true;
     }
     let Some(adt) = ty.as_adt() else { return false };
-    let item = |name: &str| krate.diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+    let item =
+        |name: &str| krate.diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
     if item("String") {
         return true;
     }
@@ -155,7 +170,11 @@ fn is_text(db: &Db, krate: hir::Crate, ty: &hir::Type<'_>) -> bool {
 }
 
 /// The locals of the body of `def` that hold text from a text parameter, as the module docs say.
-fn tainted<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'db>) -> HashSet<BindingId, Global> {
+fn tainted<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    analysis: &hir::BodyAnalysis<'db>,
+) -> HashSet<BindingId, Global> {
     // alloc: the tainted locals of one body
     let mut out = HashSet::new_in(Global);
     let body = analysis.body();
@@ -180,7 +199,9 @@ fn tainted<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'d
             match expr {
                 Expr::Block { statements, .. } => {
                     for statement in statements.iter() {
-                        let Statement::Let { pat, initializer: Some(init), .. } = statement else { continue };
+                        let Statement::Let { pat, initializer: Some(init), .. } = statement else {
+                            continue;
+                        };
                         if root_local(db, def, analysis, init).is_some_and(|it| out.contains(&it)) {
                             body.walk_bindings_in_pat(pat, |it| new.push(it));
                         }
@@ -207,7 +228,11 @@ fn tainted<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'d
 
 /// The iterated expression and the element pattern of the `for` loop whose desugared `loop` is
 /// `loop_` with body `inner`.
-fn for_parts(analysis: &hir::BodyAnalysis<'_>, loop_: ExprId, inner: ExprId) -> Option<(ExprId, hir_def::hir::PatId)> {
+fn for_parts(
+    analysis: &hir::BodyAnalysis<'_>,
+    loop_: ExprId,
+    inner: ExprId,
+) -> Option<(ExprId, hir_def::hir::PatId)> {
     let body = analysis.body();
     let Expr::Block { tail: Some(tail), .. } = body.expr(inner) else { return None };
     let Expr::Match { arms, .. } = body.expr(tail) else { return None };
@@ -222,7 +247,12 @@ fn for_parts(analysis: &hir::BodyAnalysis<'_>, loop_: ExprId, inner: ExprId) -> 
 /// The local `expr` is made from: itself when it is a path to a local, else the receiver of a
 /// method call, the first argument of a call, or what a reference, a dereference, a field or an
 /// index is of, followed down at most [`DEPTH`] steps.
-fn root_local(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>, expr: ExprId) -> Option<BindingId> {
+fn root_local(
+    db: &Db,
+    def: DefWithBodyId,
+    analysis: &hir::BodyAnalysis<'_>,
+    expr: ExprId,
+) -> Option<BindingId> {
     let body = analysis.body();
     let mut at = expr;
     for _ in 0..DEPTH {
@@ -235,7 +265,9 @@ fn root_local(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>, exp
             }
             Expr::MethodCall { receiver, .. } => receiver,
             Expr::Call { args, .. } => *args.first()?,
-            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: UnaryOp::Deref } | Expr::Field { expr, .. } => expr,
+            Expr::Ref { expr, .. }
+            | Expr::UnaryOp { expr, op: UnaryOp::Deref }
+            | Expr::Field { expr, .. } => expr,
             Expr::Index { base, .. } => base,
             _ => return None,
         };

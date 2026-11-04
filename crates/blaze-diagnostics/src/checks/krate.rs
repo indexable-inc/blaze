@@ -14,9 +14,9 @@ use std::ops::ControlFlow;
 
 use base_db::{FileId, TargetKind};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir::{HirFileId, InFile, ModuleDef, Name};
 use hir_def::{Lookup, ModuleDefId, expr_store::Body, item_scope::ImportOrGlob};
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasName as _, NodeId},
@@ -85,7 +85,11 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
             && let Some(node) = cx.vsema.source(*function)
         {
             let span = cx.span(node.map(|it| def_range(it.syntax())));
-            let mut diag = Diag::error(None, "the `main` function cannot be declared in an `extern` block", span);
+            let mut diag = Diag::error(
+                None,
+                "the `main` function cannot be declared in an `extern` block",
+                span,
+            );
             diag.fact(cx.resolves_fact(root, "main"), "what `main` is in the crate root");
             diags.push(diag);
         }
@@ -128,12 +132,18 @@ fn main_def(cx: &Cx<'_, '_>, root: hir::Module) -> Option<MainDef> {
 }
 
 /// rustc's `no_main_err`.
-fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], main: Option<MainDef>) -> Diag {
+fn no_main(
+    cx: &Cx<'_, '_>,
+    root: hir::Module,
+    non_main_fns: &[&FreeItem<'_>],
+    main: Option<MainDef>,
+) -> Diag {
     // alloc: the error's message
     let message = format!("`main` function not found in crate `{}`", cx.crate_name(cx.krate));
     let file = root.as_source_file_id(cx.db).map(|it| it.file_id(cx.db));
     let filename = file.map(|it| cx.file_name(it));
-    let at = file.and_then(|file| Some(cx.span_in_file(file, TextRange::empty(crate_end(cx, file)?))));
+    let at =
+        file.and_then(|file| Some(cx.span_in_file(file, TextRange::empty(crate_end(cx, file)?))));
     let mut diag = match &at {
         // clone: the error's span
         Some(at) => Diag::error(Some("E0601"), message, at.clone()),
@@ -155,7 +165,9 @@ fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], m
         diag.help("consider moving the `main` function definitions");
         match &filename {
             // alloc: the error's label
-            Some(filename) => format!("the main function must be defined at the crate level (in `{filename}`)"),
+            Some(filename) => {
+                format!("the main function must be defined at the crate level (in `{filename}`)")
+            }
             // alloc: the error's label
             None => "the main function must be defined at the crate level".to_owned(),
         }
@@ -173,7 +185,10 @@ fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], m
     }
     diag.fact(cx.resolves_fact(root, "main"), "what `main` is in the crate root");
     for item in non_main_fns {
-        diag.fact(cx.resolves_fact(item.module, "main"), "the items named `main` below the crate root");
+        diag.fact(
+            cx.resolves_fact(item.module, "main"),
+            "the items named `main` below the crate root",
+        );
     }
     diag
 }
@@ -203,7 +218,10 @@ fn crate_end(cx: &Cx<'_, '_>, file: FileId) -> Option<TextSize> {
 fn is_rustc_trivia(token: ast::Token<'_>) -> bool {
     matches!(
         token.kind(),
-        SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER
+        SyntaxKind::WHITESPACE
+            | SyntaxKind::COMMENT
+            | SyntaxKind::SHEBANG
+            | SyntaxKind::FRONTMATTER
     )
 }
 
@@ -255,7 +273,8 @@ fn free_item_def_range(node: ast::Node<'_>) -> TextRange {
 fn free_items<'db>(cx: &Cx<'_, 'db>) -> Vec<FreeItem<'db>> {
     let root = cx.krate.root_module(cx.db);
     // alloc: setup, once per crate; `items` is empty unless there is a `#[rustc_main]` or a `main` below the root
-    let mut walk = Walk { cx, places: None, root, seen: HashSet::new_in(Global), items: Vec::new() };
+    let mut walk =
+        Walk { cx, places: None, root, seen: HashSet::new_in(Global), items: Vec::new() };
     walk.module(root);
     let mut items = walk.items;
     items.sort_by(|a, b| a.place.cmp(&b.place));
@@ -345,7 +364,9 @@ impl<'db> Walk<'_, '_, 'db> {
 /// Each body of `def`: its own, its variants' discriminants, a trait's default bodies.
 fn bodies(cx: &Cx<'_, '_>, def: ModuleDef, f: impl FnMut(hir::DefWithBody)) {
     match def {
-        ModuleDef::Adt(hir::Adt::Enum(it)) => it.variants_iter(cx.db).map(hir::DefWithBody::from).for_each(f),
+        ModuleDef::Adt(hir::Adt::Enum(it)) => {
+            it.variants_iter(cx.db).map(hir::DefWithBody::from).for_each(f)
+        }
         ModuleDef::Trait(it) => it.items_iter(cx.db).filter_map(assoc_body).for_each(f),
         _ => def.as_def_with_body().into_iter().for_each(f),
     }
@@ -383,10 +404,17 @@ fn source<'db>(cx: &Cx<'_, 'db>, def: ModuleDef) -> Option<InFile<ast::Node<'db>
 fn has_attr(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, name: &str) -> bool {
     let Some(owner) = ast::AnyHasAttrs::cast(node.value) else { return false };
     let attrs = ast::attrs_including_inner(&owner);
-    hir_expand::attrs::expand_cfg_attr_view(attrs, || cx.krate.cfg(cx.db), |meta, _| {
-        let named = meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name);
-        if named { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
-    })
+    hir_expand::attrs::expand_cfg_attr_view(
+        attrs,
+        || cx.krate.cfg(cx.db),
+        |meta, _| {
+            let named = meta
+                .path()
+                .and_then(|it| it.as_single_name_ref())
+                .is_some_and(|it| it.text() == name);
+            if named { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        },
+    )
     .is_some()
 }
 
@@ -435,7 +463,10 @@ mod tests {
         let comment = |kind: SyntaxKind| {
             matches!(
                 kind,
-                SyntaxKind::COMMENT | SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::SHEBANG
+                SyntaxKind::COMMENT
+                    | SyntaxKind::INNER_DOC_COMMENT
+                    | SyntaxKind::OUTER_DOC_COMMENT
+                    | SyntaxKind::SHEBANG
             )
         };
         let mut docs = 0;
@@ -447,14 +478,25 @@ mod tests {
             ),
             (
                 "//! inner\n/// outer\nfn f() {}\n/** block outer */\nstruct S;\n// trailing\n",
-                &[("// trailing", true), ("/** block outer */", false), ("/// outer", false), ("//! inner", false)],
+                &[
+                    ("// trailing", true),
+                    ("/** block outer */", false),
+                    ("/// outer", false),
+                    ("//! inner", false),
+                ],
             ),
-            ("/*! inner block */\nfn g() {}\n/// last\n", &[("/// last", false), ("/*! inner block */", false)]),
+            (
+                "/*! inner block */\nfn g() {}\n/// last\n",
+                &[("/// last", false), ("/*! inner block */", false)],
+            ),
             ("// only a comment\n", &[("// only a comment", true)]),
         ] {
             let parse = SourceFile::parse(text, Edition::CURRENT);
-            let mut forward: Vec<_> =
-                parse.root().descendants_with_tokens().filter_map(NodeOrToken::into_token).collect();
+            let mut forward: Vec<_> = parse
+                .root()
+                .descendants_with_tokens()
+                .filter_map(NodeOrToken::into_token)
+                .collect();
             forward.reverse();
             let mut back = Vec::new();
             let mut at = parse.root().last_token();
@@ -470,7 +512,10 @@ mod tests {
                     SyntaxKind::WHITESPACE => assert!(is_rustc_trivia(token)),
                     kind => assert!(!is_rustc_trivia(token), "{kind:?} in {text:?}"),
                 }
-                if matches!(token.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT) {
+                if matches!(
+                    token.kind(),
+                    SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT
+                ) {
                     docs += 1;
                 }
             }

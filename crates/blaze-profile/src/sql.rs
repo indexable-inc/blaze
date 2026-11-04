@@ -53,17 +53,31 @@ pub struct Query<'a> {
 #[derive(Debug)]
 pub enum SqlError {
     /// The DuckDB given is not an absolute path to a file.
-    NoDuckdb { path: PathBuf, why: String },
+    NoDuckdb {
+        path: PathBuf,
+        why: String,
+    },
     Views(ViewError),
     /// A directory the views read lacks a table's schema file that could not be written
     /// ([`history::ensure_schemas`]), or its manifest can't be read.
     History(HistoryError),
-    Io { path: PathBuf, doing: &'static str, error: io::Error },
+    Io {
+        path: PathBuf,
+        doing: &'static str,
+        error: io::Error,
+    },
     /// DuckDB refused the query: its own message, the query, and the script it ran (kept for
     /// reading).
-    Duckdb { message: String, sql: String, script: PathBuf },
+    Duckdb {
+        message: String,
+        sql: String,
+        script: PathBuf,
+    },
     /// DuckDB's answer did not read back.
-    Answer { path: PathBuf, error: String },
+    Answer {
+        path: PathBuf,
+        error: String,
+    },
     /// The caller stopped the query ([`run_with`]); DuckDB was killed.
     Stopped,
 }
@@ -89,7 +103,9 @@ impl fmt::Display for SqlError {
             ),
             SqlError::Views(error) => write!(f, "{error}"),
             SqlError::History(error) => write!(f, "{error}"),
-            SqlError::Io { path, doing, error } => write!(f, "blaze debug sql: {doing} {}: {error}", path.display()),
+            SqlError::Io { path, doing, error } => {
+                write!(f, "blaze debug sql: {doing} {}: {error}", path.display())
+            }
             SqlError::Duckdb { message, sql, script } => write!(
                 f,
                 "DuckDB refused the query: {message}\nthe query:\n{sql}\nthe script DuckDB ran: {}",
@@ -243,7 +259,8 @@ fn exit_heard(pid: u32) -> io::Result<()> {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is live for the call to write. `WNOWAIT` leaves the child unreaped, so
         // its number names it alone until its `Child` waits for it.
-        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0
+        {
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -262,7 +279,8 @@ fn exit_heard(handle: usize) -> io::Result<()> {
     };
     // SAFETY: the process handle of a `Child` that outlives this call: `ended_or_stopped` waits
     // on a scoped thread, and its `Child` is borrowed for the whole scope.
-    match unsafe { WaitForSingleObject(handle as windows_sys::Win32::Foundation::HANDLE, INFINITE) } {
+    match unsafe { WaitForSingleObject(handle as windows_sys::Win32::Foundation::HANDLE, INFINITE) }
+    {
         WAIT_OBJECT_0 => Ok(()),
         _ => Err(io::Error::last_os_error()),
     }
@@ -297,10 +315,13 @@ fn script(
         // alloc: an error
         path: spill.clone(),
         // alloc: an error
-        error: "the query's spill directory is not UTF-8, and the script DuckDB runs names it".to_owned(),
+        error: "the query's spill directory is not UTF-8, and the script DuckDB runs names it"
+            .to_owned(),
     })?;
     // alloc: the script, once a query
-    let mut out = String::with_capacity(prelude.len() + sqls.iter().map(|it| it.len() + 256).sum::<usize>() + 256);
+    let mut out = String::with_capacity(
+        prelude.len() + sqls.iter().map(|it| it.len() + 256).sum::<usize>() + 256,
+    );
     out.push_str("SET autoinstall_known_extensions = false;\nSET enable_progress_bar = false;\n");
     // Writing to a `String` does not fail.
     _ = writeln!(out, "SET threads = {THREADS};\nSET memory_limit = '{MEMORY_LIMIT}';");
@@ -389,7 +410,8 @@ fn run_in(
     // A DuckDB just written (a fresh download, a test's stand-in) can be busy for the moment a
     // process another thread forked holds the writer's copy: its exec is made again, as every
     // spawn of blaze's is.
-    let mut child = blaze_core::busy::while_busy(|| command.spawn()).map_err(io_error(duckdb, "running"))?;
+    let mut child =
+        blaze_core::busy::while_busy(|| command.spawn()).map_err(io_error(duckdb, "running"))?;
     let waited = ended_or_stopped(&mut child, stop);
     if waited.is_err() {
         // Not heard to end: killed and reaped before the pin goes, so it reads no file after.
@@ -421,7 +443,12 @@ fn run_in(
         let answer = answer_in(scratch, i);
         if !answer.exists() {
             // alloc: an error
-            return Err(refused(format!("it wrote no answer to query {} of {}, and said: {}", i + 1, sqls.len(), stderr.trim())));
+            return Err(refused(format!(
+                "it wrote no answer to query {} of {}, and said: {}",
+                i + 1,
+                sqls.len(),
+                stderr.trim()
+            )));
         }
         answers.push(read_answer(&answer)?);
     }
@@ -521,7 +548,11 @@ mod tests {
         let (stopper, stop) = crossbeam_channel::bounded::<()>(1);
         drop(stopper);
         assert!(ended_or_stopped(&mut child, &stop).unwrap().is_none());
-        assert!(started.elapsed() < Duration::from_secs(5), "stopped after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stopped after {:?}",
+            started.elapsed()
+        );
     }
 
     /// A history as a blaze from before `events` and `query_counts` left it: every schema file
@@ -570,7 +601,8 @@ mod tests {
     #[test]
     fn a_history_whose_missing_schema_files_cant_be_written_is_refused_naming_them() {
         let dir = old_history("blocked");
-        fs::create_dir(dir.join(format!(".schema.events.parquet.{}.tmp", std::process::id()))).unwrap();
+        fs::create_dir(dir.join(format!(".schema.events.parquet.{}.tmp", std::process::id())))
+            .unwrap();
         let fake = silent_duckdb(&dir);
         let error = run(&Query { duckdb: &fake, history: &dir, scope: Scope::All, sql: "SELECT 1" }).unwrap_err();
         match &error {
@@ -581,7 +613,10 @@ mod tests {
             _ => panic!("{error}"),
         }
         let said = error.to_string();
-        assert!(said.contains("events, query_counts") && said.contains(&dir.display().to_string()), "{said}");
+        assert!(
+            said.contains("events, query_counts") && said.contains(&dir.display().to_string()),
+            "{said}"
+        );
         _ = fs::remove_dir_all(&dir);
     }
 
@@ -589,7 +624,9 @@ mod tests {
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn duckdb_reads_a_table_newer_than_the_history_as_empty() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         let dir = old_history("newer");
         for table in ["events", "query_counts"] {
             let sql = format!("SELECT count(*) AS n FROM {table}");
@@ -612,13 +649,15 @@ mod tests {
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn duckdb_reads_a_flushed_history_through_every_view() {
-        let duckdb = std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI");
+        let duckdb =
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI");
         let duckdb = PathBuf::from(duckdb);
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(77);
             let _outer = tracing::info_span!(target: "blaze", "sql outer").entered();
-            let _inner = tracing::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
+            let _inner =
+                tracing::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
             flight::plot(flight::Plot::Queued, 3);
             for (job, deepest) in [(1, 40 << 10), (2, 900 << 10)] {
                 flight::fiber_stack(flight::FiberStack {
@@ -659,14 +698,32 @@ mod tests {
             let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql }).unwrap_or_else(|error| panic!("{error}"));
             batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0)
         };
-        assert!(count("SELECT count(*) AS n FROM spans WHERE build_id = 77 AND name = 'sql inner'") >= 1);
-        assert_eq!(count("SELECT count(*) AS n FROM builds WHERE build_id = 77 AND commit = 'feedbeef'"), 1);
-        assert!(count("SELECT count(*) AS n FROM passes WHERE build_id = 77 AND function = 'app::main'") >= 1);
-        assert_eq!(count("SELECT count(*) AS n FROM provenance"), 0, "an empty table reads from its schema file");
-        assert_eq!(count("SELECT count(*) AS n FROM fiber_stacks WHERE build_id = 77 AND fiber = 3"), 2);
+        assert!(
+            count("SELECT count(*) AS n FROM spans WHERE build_id = 77 AND name = 'sql inner'")
+                >= 1
+        );
+        assert_eq!(
+            count("SELECT count(*) AS n FROM builds WHERE build_id = 77 AND commit = 'feedbeef'"),
+            1
+        );
+        assert!(
+            count(
+                "SELECT count(*) AS n FROM passes WHERE build_id = 77 AND function = 'app::main'"
+            ) >= 1
+        );
+        assert_eq!(
+            count("SELECT count(*) AS n FROM provenance"),
+            0,
+            "an empty table reads from its schema file"
+        );
+        assert_eq!(
+            count("SELECT count(*) AS n FROM fiber_stacks WHERE build_id = 77 AND fiber = 3"),
+            2
+        );
         let mut build = Map::new();
         build.insert("build".into(), Value::from(77));
-        let ranked = views::render(views::find("jobs_by_stack_high_water").unwrap(), &build).unwrap();
+        let ranked =
+            views::render(views::find("jobs_by_stack_high_water").unwrap(), &build).unwrap();
         let deepest = format!("SELECT CAST(job AS BIGINT) AS job FROM ({ranked}) WHERE rank = 1");
         assert_eq!(count(&deepest), 2, "the job that went deepest ranks first");
 
@@ -684,10 +741,15 @@ mod tests {
             let sql = views::render(view, &args).unwrap();
             let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
                 .unwrap_or_else(|error| panic!("the view {} runs: {error}", view.name));
-            assert!(batches.iter().all(|it| it.num_columns() > 0 && it.column(0).len() == it.num_rows()));
+            assert!(
+                batches
+                    .iter()
+                    .all(|it| it.num_columns() > 0 && it.column(0).len() == it.num_rows())
+            );
         }
 
-        for view in views::VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
+        for view in views::VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some()))
+        {
             // alloc: a query, once a view
             let sql = format!("SELECT count(*) AS n FROM {}", view.name);
             run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
@@ -710,7 +772,9 @@ mod tests {
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn the_critical_path_crosses_from_a_wait_to_the_job_that_ran_what_it_waited_on() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         let dir = std::env::temp_dir().join(format!("blaze-sql-critical-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
@@ -746,12 +810,20 @@ mod tests {
         let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql }).unwrap_or_else(|error| panic!("{error}"));
         let mut steps = Vec::new();
         for batch in &batches {
-            let int = |at: usize| batch.column(at).as_primitive::<arrow_array::types::Int64Type>().clone();
+            let int = |at: usize| {
+                batch.column(at).as_primitive::<arrow_array::types::Int64Type>().clone()
+            };
             let text = |at: usize| batch.column(at).as_string::<i32>().clone();
             let (step, lane, what, from, to) = (int(0), text(1), text(2), int(3), int(4));
             let pct = batch.column(5).as_primitive::<arrow_array::types::Float64Type>().clone();
             for i in 0..batch.num_rows() {
-                steps.push((step.value(i), lane.value(i).to_owned(), what.value(i).to_owned(), from.value(i), to.value(i)));
+                steps.push((
+                    step.value(i),
+                    lane.value(i).to_owned(),
+                    what.value(i).to_owned(),
+                    from.value(i),
+                    to.value(i),
+                ));
                 assert!((pct.value(i) - 100.0).abs() < 0.01, "the path is the whole build");
             }
         }
@@ -774,7 +846,9 @@ mod tests {
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn a_worker_outside_every_span_run_and_idle_is_uncovered() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         let dir = std::env::temp_dir().join(format!("blaze-sql-uncovered-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
@@ -820,12 +894,21 @@ mod tests {
     #[test]
     fn the_critical_path_fixture_names_only_columns_of_the_schema() {
         for (table, columns) in [
-            (&schema::BUILDS, &["build_id", "started_ns", "dur_ns", "outcome", "workspace", "command"][..]),
+            (
+                &schema::BUILDS,
+                &["build_id", "started_ns", "dur_ns", "outcome", "workspace", "command"][..],
+            ),
             (
                 &schema::SPANS,
-                &["build_id", "process", "thread", "span_id", "depth", "name", "crate", "awaits", "owner", "start_ns", "dur_ns"],
+                &[
+                    "build_id", "process", "thread", "span_id", "depth", "name", "crate", "awaits",
+                    "owner", "start_ns", "dur_ns",
+                ],
             ),
-            (&schema::SWITCHES, &["build_id", "process", "thread", "thread_name", "t_ns", "event", "job"]),
+            (
+                &schema::SWITCHES,
+                &["build_id", "process", "thread", "thread_name", "t_ns", "event", "job"],
+            ),
         ] {
             for column in columns {
                 assert!(table.column(column).is_some(), "{}.{column}", table.name);

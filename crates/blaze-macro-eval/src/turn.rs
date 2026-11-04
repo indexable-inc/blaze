@@ -54,7 +54,9 @@ impl NoTurn {
             ),
             // alloc: error path
             NoTurn::Starved(turns) => {
-                format!("{session}: a call waited out {turns} turns of other calls and was never given its own")
+                format!(
+                    "{session}: a call waited out {turns} turns of other calls and was never given its own"
+                )
             }
         }
     }
@@ -82,7 +84,11 @@ impl Turns {
     /// [`Cancelled::WouldWaitOnItself`], and the loop running the query this call is part of
     /// runs it again, as for a query's own give-way.
     // dyn: what names the session, called only to say a wait or a hold: one shape for every caller
-    pub(crate) fn take(&self, session: Key, named: &mut dyn FnMut(&mut String)) -> Result<Turn<'_>, NoTurn> {
+    pub(crate) fn take(
+        &self,
+        session: Key,
+        named: &mut dyn FnMut(&mut String),
+    ) -> Result<Turn<'_>, NoTurn> {
         for _ in 0..MOST_TURNS_WAITED {
             match self.turns.hold_named(session, &mut *named) {
                 Ok(held) => return Ok(Turn { held: Some(held) }),

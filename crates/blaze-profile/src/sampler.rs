@@ -291,7 +291,8 @@ mod tests {
     #[test]
     fn the_ring_keeps_the_newest_samples() {
         let at = Instant::now();
-        let sample = |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
+        let sample =
+            |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
         let batch: Vec<Sample> = (0..KEPT as u64 + 10).map(sample).collect();
         // A ring of its own: the process's is the sampler's, which another test runs.
         let mut samples = Samples { ring: Vec::new(), next: 0, state: String::new() };
@@ -333,12 +334,18 @@ mod tests {
             .join()
             .unwrap();
         let mut kept = None;
-        blaze_graph::spin::SpinWait::within("the sampler to keep the spinner's samples", std::time::Duration::from_secs(10), || {
-            let (samples, state) = taken(since, &Epoch::now());
-            let named = samples.iter().any(|it| it.stack.iter().any(|name| name.contains("spins_for_the_sampler")));
-            kept = Some((samples, state));
-            named
-        });
+        blaze_graph::spin::SpinWait::within(
+            "the sampler to keep the spinner's samples",
+            std::time::Duration::from_secs(10),
+            || {
+                let (samples, state) = taken(since, &Epoch::now());
+                let named = samples
+                    .iter()
+                    .any(|it| it.stack.iter().any(|name| name.contains("spins_for_the_sampler")));
+                kept = Some((samples, state));
+                named
+            },
+        );
         let (samples, state) = kept.expect("taken at least once");
         assert!(state.starts_with("on:"), "{state}");
         assert!(!samples.is_empty(), "a thread that spun for 1.5 s at 980 Hz was not sampled");

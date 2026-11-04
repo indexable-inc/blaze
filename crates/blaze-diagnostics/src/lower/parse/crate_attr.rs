@@ -47,7 +47,12 @@ pub(super) fn lower(cx: &Cx<'_, '_>, found: &mut Vec<Found>) -> bool {
 
 /// The errors of the crate attribute of `file`, which rustc refuses for `error`, and whether
 /// rustc stops there.
-fn refused(cx: &Cx<'_, '_>, file: EditionedFileId, error: CrateAttrError, found: &mut Vec<Found>) -> bool {
+fn refused(
+    cx: &Cx<'_, '_>,
+    file: EditionedFileId,
+    error: CrateAttrError,
+    found: &mut Vec<Found>,
+) -> bool {
     let db = cx.db;
     let (file_id, edition) = file.unpack(db);
     let text = cx.file_text(file_id);
@@ -68,7 +73,10 @@ fn refused(cx: &Cx<'_, '_>, file: EditionedFileId, error: CrateAttrError, found:
         let whole = TextRange::up_to(TextSize::of(text));
         // alloc: the error's text, of a crate attribute blaze can't say why rustc refuses
         let message = format!("blaze can't say why rustc refuses this crate attribute ({error:?})");
-        found.push(Found::new(Diag::error(None, message, cx.span_in_file(file_id, whole)), Phase::Parse));
+        found.push(Found::new(
+            Diag::error(None, message, cx.span_in_file(file_id, whole)),
+            Phase::Parse,
+        ));
     }
     matches!(outcome, Outcome::Fatal)
 }

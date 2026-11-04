@@ -19,10 +19,10 @@ use blaze_api::{
     frames::{self, Frames},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use blaze_protocol::cbor;
 use blaze_vfs::{Op, View};
+use std::alloc::Global;
 
 use super::{EMPTY_HEAD, MOST_BATCH, Shared, api_error, batches, pins, said_or};
 use crate::{
@@ -31,8 +31,16 @@ use crate::{
 };
 
 pub(crate) enum Command {
-    Checkout { commit: String, fetch: Vec<String>, from: Option<Checkout>, head: Option<String> },
-    Send { run: RunId, request: Request },
+    Checkout {
+        commit: String,
+        fetch: Vec<String>,
+        from: Option<Checkout>,
+        head: Option<String>,
+    },
+    Send {
+        run: RunId,
+        request: Request,
+    },
     /// Cancel every request still running.
     Cancel,
     /// From the reader.
@@ -71,14 +79,24 @@ impl Worker {
     fn new(job: JobId, shared: Arc<Shared>, me: crossbeam_channel::Sender<Command>) -> Worker {
         let running = HashMap::new_in(Global);
         // alloc: once per job
-        Worker { job, shared, me, stream: None, next_id: 1, running, out: Outgoing::default(), ids: Vec::new() }
+        Worker {
+            job,
+            shared,
+            me,
+            stream: None,
+            next_id: 1,
+            running,
+            out: Outgoing::default(),
+            ids: Vec::new(),
+        }
     }
 
     fn run(mut self, commands: &crossbeam_channel::Receiver<Command>) {
         while let Ok(command) = commands.recv() {
             match command {
                 Command::Checkout { commit, fetch, from, head } => {
-                    let result = checkout(&self.shared, &commit, &fetch, from.as_ref(), head.as_deref());
+                    let result =
+                        checkout(&self.shared, &commit, &fetch, from.as_ref(), head.as_deref());
                     let _ = self.shared.service.send(Input::CheckedOut { job: self.job, result });
                 }
                 Command::Send { run, request } => match self.send(request) {
@@ -193,9 +211,15 @@ pub(crate) enum Sent {
 
 impl Outgoing {
     /// `request` under `id`, framed and written whole to `to`.
-    pub(crate) fn send(&mut self, to: &mut impl Write, id: u64, request: Request) -> Result<(), Sent> {
+    pub(crate) fn send(
+        &mut self,
+        to: &mut impl Write,
+        id: u64,
+        request: Request,
+    ) -> Result<(), Sent> {
         self.frame.clear();
-        frames::encode_into(&mut self.writer, &mut self.frame, &Envelope::new(id, request)).map_err(Sent::Encoding)?;
+        frames::encode_into(&mut self.writer, &mut self.frame, &Envelope::new(id, request))
+            .map_err(Sent::Encoding)?;
         to.write_all(&self.frame).map_err(Sent::Writing)
     }
 }
@@ -214,7 +238,9 @@ fn read(mut stream: UnixStream, socket: &str, to: &crossbeam_channel::Sender<Com
             Ok(_) => {}
             Err(error) => {
                 // alloc: error path
-                let _ = to.send(Command::Lost(format!("reading from the daemon at {socket} failed: {error}")));
+                let _ = to.send(Command::Lost(format!(
+                    "reading from the daemon at {socket} failed: {error}"
+                )));
                 return;
             }
         }
@@ -285,7 +311,9 @@ fn checkout(
                 .lock()
                 .token()
                 // alloc: error path
-                .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
+                .map_err(|error| {
+                    format!("minting the installation token to fetch {commit} failed: {error}")
+                })?;
             let git = shared.git.lock();
             git.fetch(fetch, Some(&token)).map_err(|error| {
                 // alloc: error path
@@ -303,7 +331,9 @@ fn checkout(
     let socket = shared.socket.display();
     let mut client = Client::unix(&shared.socket)
         // alloc: error path
-        .map_err(|error| format!("could not reach the daemon at {socket} to check out {commit}: {error}"))?;
+        .map_err(|error| {
+            format!("could not reach the daemon at {socket} to check out {commit}: {error}")
+        })?;
     let base = match from {
         Some(from) => from.root,
         // alloc: once per checkout from nothing, the request's head
@@ -311,15 +341,22 @@ fn checkout(
             // alloc: error path
             .map_err(|why| format!("opening the empty tree ({EMPTY_HEAD}) failed: {why}"))?,
     };
-    let root = apply(&mut client, &shared.socket, base, &mut cut, head.is_some()).map_err(|why| match from {
-        // alloc: error path
-        Some(from) => format!("applying the diff from {} to root {:x} failed: {why}", from.commit, from.root),
-        None => format!("writing the tree of {commit} failed: {why}"), // alloc: error path
-    })?;
+    let root = apply(&mut client, &shared.socket, base, &mut cut, head.is_some()).map_err(
+        |why| match from {
+            // alloc: error path
+            Some(from) => format!(
+                "applying the diff from {} to root {:x} failed: {why}",
+                from.commit, from.root
+            ),
+            None => format!("writing the tree of {commit} failed: {why}"), // alloc: error path
+        },
+    )?;
     // Held on the pin connection before this one ends and lets go of it.
     let root = pin(shared, ViewRef::Root(View { root }))
         // alloc: error path
-        .map_err(|why| format!("holding the tree of {commit} (root {root:x}) open failed: {why}"))?;
+        .map_err(|why| {
+            format!("holding the tree of {commit} (root {root:x}) open failed: {why}")
+        })?;
     if let Some(head) = head
         && let Err(why) = commit_head(&mut client, &shared.socket, head, commit, base, cut, root)
     {
@@ -332,7 +369,8 @@ fn checkout(
 /// [`pins::open`] on the checkout's connection.
 fn open(client: &mut Client, socket: &std::path::Path, view: ViewRef) -> Result<ContentId, String> {
     // alloc: error path
-    pins::open(client, view).map_err(|error| format!("the daemon at {}: {error}", socket.display()))?
+    pins::open(client, view)
+        .map_err(|error| format!("the daemon at {}: {error}", socket.display()))?
 }
 
 /// `batches` applied to `base` as what-ifs, one at a time, each result held on `client` until it
@@ -374,13 +412,17 @@ fn commit_head(
         let mut said = Vec::new(); // alloc: none until the daemon says an error
         let ok = client
             // alloc: once per batch, the request's head
-            .call(Request::Commit { head: head.to_owned(), base: at, ops: batch }, |response| match response {
-                Response::Committed { root, .. } => committed = Some(*root),
-                Response::Error(error) => said.push(api_error(error)),
-                _ => {}
+            .call(Request::Commit { head: head.to_owned(), base: at, ops: batch }, |response| {
+                match response {
+                    Response::Committed { root, .. } => committed = Some(*root),
+                    Response::Error(error) => said.push(api_error(error)),
+                    _ => {}
+                }
             })
             // alloc: error path
-            .map_err(|error| format!("committing {commit} to the head {head} at {socket}: {error}"))?;
+            .map_err(|error| {
+                format!("committing {commit} to the head {head} at {socket}: {error}")
+            })?;
         at = match (ok, committed) {
             (true, Some(root)) => root,
             _ => {

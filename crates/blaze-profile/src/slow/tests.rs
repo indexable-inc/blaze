@@ -14,7 +14,15 @@ fn switch(thread: u32, t: i64, event: Event, job: u64) -> SwitchIn {
     SwitchIn::of(P, thread, t * U, event, job, job as u32, thread)
 }
 
-fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start: i64, dur: i64, job: u64) -> SpanIn {
+fn span(
+    thread: u32,
+    span_id: u64,
+    parent: Option<u64>,
+    name: &str,
+    start: i64,
+    dur: i64,
+    job: u64,
+) -> SpanIn {
     SpanIn {
         process: P,
         thread,
@@ -37,7 +45,10 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start: i64, 
 }
 
 fn workers(threads: impl IntoIterator<Item = u32>) -> Facts {
-    let threads = threads.into_iter().map(|thread| ThreadName { process: P, thread, name: format!("blaze-work-{thread}") }).collect();
+    let threads = threads
+        .into_iter()
+        .map(|thread| ThreadName { process: P, thread, name: format!("blaze-work-{thread}") })
+        .collect();
     Facts { threads, ..Facts::default() }
 }
 
@@ -45,10 +56,18 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
     // The threads' CPU as `load::facts` counts it in DuckDB, over the fixture's spans.
     let mut facts = facts.clone();
     for it in &spans {
-        let at = match facts.thread_cpu.iter().position(|cpu| (cpu.process, cpu.thread) == (it.process, it.thread)) {
+        let at = match facts
+            .thread_cpu
+            .iter()
+            .position(|cpu| (cpu.process, cpu.thread) == (it.process, it.thread))
+        {
             Some(at) => at,
             None => {
-                facts.thread_cpu.push(ThreadCpu { process: it.process, thread: it.thread, ..ThreadCpu::default() });
+                facts.thread_cpu.push(ThreadCpu {
+                    process: it.process,
+                    thread: it.thread,
+                    ..ThreadCpu::default()
+                });
                 facts.thread_cpu.len() - 1
             }
         };
@@ -59,16 +78,32 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
         }
     }
     let facts = &facts;
-    let model = Model::build(Input { build: 1, build_row: Some((0, wall * U)), switches, spans, events: Vec::new() }).unwrap();
+    let model = Model::build(Input {
+        build: 1,
+        build_row: Some((0, wall * U)),
+        switches,
+        spans,
+        events: Vec::new(),
+    })
+    .unwrap();
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);
     assert_eq!(one, analyse(&model, &path, facts), "the same rows give the same report");
-    assert!(one.findings.windows(2).all(|it| it[0].saves_ns >= it[1].saves_ns || it[1].estimate == Estimate::Unknown), "ranked by saving");
+    assert!(
+        one.findings
+            .windows(2)
+            .all(|it| it[0].saves_ns >= it[1].saves_ns || it[1].estimate == Estimate::Unknown),
+        "ranked by saving"
+    );
     one
 }
 
 fn finding(report: &Report, kind: Kind) -> &Finding {
-    report.findings.iter().find(|it| it.kind == kind).unwrap_or_else(|| panic!("no {kind:?} finding in {report:#?}"))
+    report
+        .findings
+        .iter()
+        .find(|it| it.kind == kind)
+        .unwrap_or_else(|| panic!("no {kind:?} finding in {report:#?}"))
 }
 
 /// Four workers; job 1 runs alone in `impls publish` from 0 to 100 while the other three finish
@@ -78,13 +113,19 @@ fn finding(report: &Report, kind: Kind) -> &Finding {
 fn serial_work_on_the_critical_path_is_charged_its_time_times_the_idle_share_of_workers() {
     let mut switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
     for it in 2..=4 {
-        switches.extend([switch(it, 0, Event::Started, u64::from(it)), switch(it, 10, Event::Ended, u64::from(it))]);
+        switches.extend([
+            switch(it, 0, Event::Started, u64::from(it)),
+            switch(it, 10, Event::Ended, u64::from(it)),
+        ]);
     }
     let mut publish = span(1, 1, None, "impls publish", 0, 100, 1);
     publish.krate = Some("core".into());
     let it = report(switches, vec![publish], 100, &workers(1..=4));
     let serial = finding(&it, Kind::Serial);
-    assert_eq!((serial.subject.as_str(), serial.fix, serial.estimate), ("impls publish", Fix::Parallelise, Estimate::CriticalPath));
+    assert_eq!(
+        (serial.subject.as_str(), serial.fix, serial.estimate),
+        ("impls publish", Fix::Parallelise, Estimate::CriticalPath)
+    );
     assert_eq!(serial.saves_ns, 675 * U / 10);
     assert_eq!(it.summary.workers, 4);
     assert_eq!(it.summary.path_ns, 100 * U);
@@ -138,7 +179,12 @@ fn a_finding_about_a_span_carries_its_top_sampled_stacks_on_and_off_the_cpu() {
 fn a_path_span_that_got_little_cpu_for_its_running_is_starved_not_serial() {
     let mut publish = span(1, 1, None, "impls publish", 0, 100, 1);
     publish.self_cpu_ns = Some(10 * U);
-    let it = report(vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)], vec![publish], 100, &workers(1..=4));
+    let it = report(
+        vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)],
+        vec![publish],
+        100,
+        &workers(1..=4),
+    );
     let starved = finding(&it, Kind::Starved);
     assert_eq!((starved.subject.as_str(), starved.fix), ("impls publish", Fix::GiveCpu));
     assert_eq!(starved.saves_ns, 90 * U);
@@ -173,9 +219,16 @@ fn a_crossed_wait_is_charged_its_time_on_the_path_and_names_what_its_owner_was_r
     let wait = finding(&it, Kind::Wait);
     assert_eq!((wait.subject.as_str(), wait.estimate), ("key summary_in", Estimate::CriticalPath));
     assert_eq!(wait.saves_ns, 39 * U);
-    assert!(wait.evidence.iter().any(|it| it.contains("woken by: build script proof serde")), "{:?}", wait.evidence);
+    assert!(
+        wait.evidence.iter().any(|it| it.contains("woken by: build script proof serde")),
+        "{:?}",
+        wait.evidence
+    );
     let serial = finding(&it, Kind::Serial);
-    assert_eq!(serial.subject, "build script proof", "the owner's run stands on the path in the wait's place");
+    assert_eq!(
+        serial.subject, "build script proof",
+        "the owner's run stands on the path in the wait's place"
+    );
 }
 
 /// Four workers run the whole build; three count a full CPU per running second, one a tenth,
@@ -185,7 +238,10 @@ fn a_worker_given_a_fraction_of_the_others_cpu_rate_is_starved_and_charged_its_p
     let mut switches = Vec::new();
     let mut spans = Vec::new();
     for it in 1..=4u32 {
-        switches.extend([switch(it, 0, Event::Started, u64::from(it)), switch(it, 100, Event::Ended, u64::from(it))]);
+        switches.extend([
+            switch(it, 0, Event::Started, u64::from(it)),
+            switch(it, 100, Event::Ended, u64::from(it)),
+        ]);
         let mut job = span(it, u64::from(it), None, "job", 0, 100, u64::from(it));
         job.self_cpu_ns = Some(if it == 1 { 10 * U } else { 100 * U });
         spans.push(job);
@@ -207,14 +263,35 @@ fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
     for (i, &job) in jobs.iter().enumerate() {
         let thread = 10 + (i % 4) as u32;
         switches.push(switch(thread, i as i64, Event::Started, job));
-        switches.push(switch(thread, i as i64 + 1, Event::Parked { on: WaitedOn::Key, value: 9 }, job));
+        switches.push(switch(
+            thread,
+            i as i64 + 1,
+            Event::Parked { on: WaitedOn::Key, value: 9 },
+            job,
+        ));
     }
     let it = report(switches, Vec::new(), 100, &workers(10..=13));
-    let unended = it.blind_spots.iter().find(|it| it.kind == BlindKind::UnendedWait).unwrap_or_else(|| panic!("{:#?}", it.blind_spots));
+    let unended = it
+        .blind_spots
+        .iter()
+        .find(|it| it.kind == BlindKind::UnendedWait)
+        .unwrap_or_else(|| panic!("{:#?}", it.blind_spots));
     assert!(unended.title.starts_with("50 waits never end in the record"), "{}", unended.title);
-    assert!(unended.hidden_ns <= 100 * U, "the wall the waits cover, not their sum: {}", unended.hidden_ns);
-    assert!(it.findings.iter().all(|it| it.kind != Kind::Wait), "no wait class holds them: {:#?}", it.findings);
-    assert!(it.blind_spots.iter().all(|it| it.kind != BlindKind::UnnamedWait), "{:#?}", it.blind_spots);
+    assert!(
+        unended.hidden_ns <= 100 * U,
+        "the wall the waits cover, not their sum: {}",
+        unended.hidden_ns
+    );
+    assert!(
+        it.findings.iter().all(|it| it.kind != Kind::Wait),
+        "no wait class holds them: {:#?}",
+        it.findings
+    );
+    assert!(
+        it.blind_spots.iter().all(|it| it.kind != BlindKind::UnnamedWait),
+        "{:#?}",
+        it.blind_spots
+    );
 }
 
 /// The daemon of the [`a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running`]
@@ -228,7 +305,9 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     let owner = std::fs::File::create(dir.join(crate::history::OWNER)).unwrap();
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
-    let mut history = crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled()).unwrap();
+    let mut history =
+        crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+            .unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
         commit: None,
@@ -253,10 +332,12 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
             .spawn_scoped(scope, || {
                 let _build = crate::flight::building(1);
                 drop(tracing::info_span!(target: "blaze", "unit done", krate = "app").entered());
-                let _unit = tracing::info_span!(target: "blaze", "unit bodies", krate = "app").entered();
+                let _unit =
+                    tracing::info_span!(target: "blaze", "unit bodies", krate = "app").entered();
                 let awaits = crate::span::Name::of("the lock no one lets go");
                 let on = blaze_graph::wait::WaitKind::Key;
-                let _wait = crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                let _wait =
+                    crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
                 entered.wait();
                 loop {
                     std::thread::park();
@@ -290,12 +371,19 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     if let Some(dir) = std::env::var_os(CHILD) {
         killed_daemon(std::path::Path::new(&dir));
     }
-    let duckdb = std::path::PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+    let duckdb = std::path::PathBuf::from(
+        std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+    );
     let dir = std::env::temp_dir().join(format!("blaze-slow-killed-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running", "--exact", "--ignored", "--nocapture"])
+        .args([
+            "slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
         .env(CHILD, &dir)
         .spawn()
         .unwrap();
@@ -312,17 +400,28 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
     let report = load::run(&source, None).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.build.id, 1);
-    let died = report.build.died.as_ref().unwrap_or_else(|| panic!("the build is reported as ended by its daemon's death: {report:?}"));
+    let died = report.build.died.as_ref().unwrap_or_else(|| {
+        panic!("the build is reported as ended by its daemon's death: {report:?}")
+    });
     assert_eq!(died.process, pid);
     assert!(died.read_ns.is_some(), "the flush wrote what the threads were inside");
-    let stuck = died.threads.iter().find(|it| it.name.as_deref() == Some("worker stuck")).unwrap_or_else(|| panic!("{died:?}"));
+    let stuck = died
+        .threads
+        .iter()
+        .find(|it| it.name.as_deref() == Some("worker stuck"))
+        .unwrap_or_else(|| panic!("{died:?}"));
     let names: Vec<&str> = stuck.spans.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["unit bodies", "wait"], "outermost first");
     assert_eq!(stuck.spans[1].awaits.as_deref(), Some("the lock no one lets go"));
     assert_eq!(stuck.spans[1].owner, Some(7));
     let text = text(&report, 10);
     let pid_said = format!("pid {pid}");
-    for said in ["ended by the daemon's death", pid_said.as_str(), "worker stuck (tid ", ", awaiting the lock no one lets go, run by task 7 ("] {
+    for said in [
+        "ended by the daemon's death",
+        pid_said.as_str(),
+        "worker stuck (tid ",
+        ", awaiting the lock no one lets go, run by task 7 (",
+    ] {
         assert!(text.contains(said), "the report says {said:?}:\n{text}");
     }
     _ = std::fs::remove_dir_all(&dir);
@@ -333,9 +432,13 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
 fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled()).unwrap();
+    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+        .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
-    let written = std::process::Command::new(duckdb).args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture]).output().unwrap();
+    let written = std::process::Command::new(duckdb)
+        .args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture])
+        .output()
+        .unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
     crate::history::manifest::list_written(&dir);
     dir
@@ -349,7 +452,9 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
 #[test]
 #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
 fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
-    let duckdb = std::path::PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+    let duckdb = std::path::PathBuf::from(
+        std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+    );
     let builds = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
         AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n";
     let mixed = history_of(
@@ -391,11 +496,16 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     );
     let source = crate::time::load::Source { duckdb: &duckdb, history: &apart };
     let pick = crate::time::load::pick(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
-    let crate::time::load::Rows { input, process, cut } = crate::time::load::rows(&source, pick).unwrap_or_else(|error| panic!("{error}"));
+    let crate::time::load::Rows { input, process, cut } =
+        crate::time::load::rows(&source, pick).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!((cut.floor_ns, cut.read), (0, 1), "a build within the budget is read whole");
     assert_eq!(process, Some(8));
     let processes: Vec<u32> = input.spans.iter().map(|it| it.process).collect();
-    assert_eq!(processes, [8], "another process's row of no build in the window is not the build's");
+    assert_eq!(
+        processes,
+        [8],
+        "another process's row of no build in the window is not the build's"
+    );
     load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
     _ = std::fs::remove_dir_all(&apart);
 }

@@ -11,6 +11,7 @@ use hir_def::{
     resolver::ValueNs,
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
+use hir_expand::fixture;
 use hir_ty::{
     CastError, EditionLint, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable,
     UnreachableAt,
@@ -22,7 +23,6 @@ use rustc_type_ir::{
     InferTy, TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _},
 };
-use hir_expand::fixture;
 
 use super::{db::TestDB, function};
 
@@ -63,7 +63,9 @@ fn an_invalid_left_hand_side_names_its_assignment() {
             .diagnostics()
             .iter()
             .filter_map(|it| match *it {
-                InferenceDiagnostic::InvalidLhsOfAssignment { assign, op, .. } => Some((assign, op)),
+                InferenceDiagnostic::InvalidLhsOfAssignment { assign, op, .. } => {
+                    Some((assign, op))
+                }
                 _ => None,
             })
             .collect();
@@ -77,7 +79,9 @@ fn an_invalid_left_hand_side_names_its_assignment() {
             .diagnostics()
             .iter()
             .filter_map(|it| match *it {
-                InferenceDiagnostic::InvalidLhsOfAssignment { assign, op, .. } => Some((assign, op)),
+                InferenceDiagnostic::InvalidLhsOfAssignment { assign, op, .. } => {
+                    Some((assign, op))
+                }
                 _ => None,
             })
             .collect();
@@ -124,20 +128,22 @@ fn origins(db: &TestDB, name: &str) -> Vec<Option<(String, String)>> {
         .diagnostics()
         .iter()
         .filter_map(|it| match it {
-            InferenceDiagnostic::TypeMustBeKnown { origin, .. } => Some(origin.as_ref().map(|&(_, param)| {
-                let GenericParamId::TypeParamId(param) = param else {
-                    panic!("the origin is a type parameter, not {param:?}");
-                };
-                let GenericDefId::FunctionId(function) = param.parent() else {
-                    panic!("the parameter is a function's");
-                };
-                let params = GenericParams::of(db, param.parent());
-                let name = params[param.local_id()].name().map(|it| it.as_str().to_owned());
-                (
-                    FunctionSignature::of(db, function).name.as_str().to_owned(),
-                    name.expect("a named parameter"),
-                )
-            })),
+            InferenceDiagnostic::TypeMustBeKnown { origin, .. } => {
+                Some(origin.as_ref().map(|&(_, param)| {
+                    let GenericParamId::TypeParamId(param) = param else {
+                        panic!("the origin is a type parameter, not {param:?}");
+                    };
+                    let GenericDefId::FunctionId(function) = param.parent() else {
+                        panic!("the parameter is a function's");
+                    };
+                    let params = GenericParams::of(db, param.parent());
+                    let name = params[param.local_id()].name().map(|it| it.as_str().to_owned());
+                    (
+                        FunctionSignature::of(db, function).name.as_str().to_owned(),
+                        name.expect("a named parameter"),
+                    )
+                }))
+            }
             _ => None,
         })
         .collect()
@@ -237,9 +243,11 @@ fn decided() {
                 .diagnostics()
                 .iter()
                 .filter_map(|it| match it {
-                    InferenceDiagnostic::TypeMismatch { at_error, .. } => Some(
-                        at_error.as_deref().map(|(expected, found)| (expected.as_ref().kind(), found.as_ref().kind())),
-                    ),
+                    InferenceDiagnostic::TypeMismatch { at_error, .. } => {
+                        Some(at_error.as_deref().map(|(expected, found)| {
+                            (expected.as_ref().kind(), found.as_ref().kind())
+                        }))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -310,7 +318,10 @@ fn bound() {
         assert_eq!(mismatches("else_branch_expected"), [ObligationCauseCode::BlockTailExpression]);
         assert_eq!(mismatches("first_arm"), [ObligationCauseCode::BlockTailExpression]);
         // The `!` arm is no prior arm: rustc points at `1u8` alone.
-        assert_eq!(mismatches("later_arm"), [ObligationCauseCode::MatchExpressionArm { prior_arms: 1 }]);
+        assert_eq!(
+            mismatches("later_arm"),
+            [ObligationCauseCode::MatchExpressionArm { prior_arms: 1 }]
+        );
         assert_eq!(mismatches("returned"), [ObligationCauseCode::ReturnValue]);
         assert_eq!(mismatches("block_tail"), [ObligationCauseCode::BlockTailExpression]);
         // rustc's E0317 and E0069 causes, of the `()` an `if` without `else` and a bare
@@ -380,9 +391,7 @@ fn need<T: Copy + Tr>(_: T) where T: Clone {}
         let DefWithBodyId::FunctionId(need) = function(&db, "need") else { unreachable!() };
         let need = GenericDefId::FunctionId(need);
         let written = |index| match bound_source(&db, need, index) {
-            Some(BoundSource::Written(ptr)) => {
-                ptr.to_view(&db).to_string()
-            }
+            Some(BoundSource::Written(ptr)) => ptr.to_view(&db).to_string(),
             other => panic!("bound {index} is written, not {other:?}"),
         };
         assert_eq!([written(0), written(1), written(2)], ["Copy", "Tr", "Clone"]);
@@ -760,14 +769,19 @@ fn an_unlabeled_jump_in_a_labeled_block_is_e0695() {
                 .diagnostics()
                 .iter()
                 .filter_map(|it| match *it {
-                    InferenceDiagnostic::UnlabeledJumpInLabeledBlock { is_break, .. } => Some(is_break),
+                    InferenceDiagnostic::UnlabeledJumpInLabeledBlock { is_break, .. } => {
+                        Some(is_break)
+                    }
                     _ => None,
                 })
                 .collect()
         };
         let outside = |name: &str| {
             let (_, result) = infer(&db, name);
-            result.diagnostics().iter().any(|it| matches!(it, InferenceDiagnostic::BreakOutsideOfLoop { .. }))
+            result
+                .diagnostics()
+                .iter()
+                .any(|it| matches!(it, InferenceDiagnostic::BreakOutsideOfLoop { .. }))
         };
         assert_eq!(jumps("break_simple"), [true]);
         assert!(!outside("break_simple"), "only E0695, as rustc gives");
@@ -812,7 +826,9 @@ fn a_yield_in_an_async_body_is_e0727() {
                 .iter()
                 .filter_map(|it| match *it {
                     InferenceDiagnostic::AsyncCoroutinesNotSupported { expr } => Some(expr),
-                    InferenceDiagnostic::YieldOutsideCoroutine { .. } => panic!("{name}: not E0627"),
+                    InferenceDiagnostic::YieldOutsideCoroutine { .. } => {
+                        panic!("{name}: not E0627")
+                    }
                     _ => None,
                 })
                 .collect();
@@ -892,7 +908,10 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
         // "unreachable expression": the tail after `return;`.
         let (body, all) = found("tail");
         let literal = find_expr(&body, |it| matches!(it, Expr::Literal(_)));
-        assert_eq!(all.iter().map(|it| it.what).collect::<Vec<_>>(), [UnreachableAt::Expr(literal)]);
+        assert_eq!(
+            all.iter().map(|it| it.what).collect::<Vec<_>>(),
+            [UnreachableAt::Expr(literal)]
+        );
         assert!(after_return(&body, &all[0]));
         assert_eq!(all[0].note, None);
 
@@ -988,7 +1007,9 @@ fn an_operator_error_carries_its_unmet_goals() {
                     let trait_ = TraitSignature::of(&db, *trait_).name.as_str().to_owned();
                     let self_ty = match args.as_ref().type_at(0).kind() {
                         TyKind::Adt(adt, _) => match adt.def_id() {
-                            AdtId::StructId(it) => StructSignature::of(&db, it).name.as_str().to_owned(),
+                            AdtId::StructId(it) => {
+                                StructSignature::of(&db, it).name.as_str().to_owned()
+                            }
                             it => panic!("the self type is a struct, not {it:?}"),
                         },
                         it => panic!("the self type is an ADT, not {it:?}"),
@@ -1003,9 +1024,9 @@ fn an_operator_error_carries_its_unmet_goals() {
                 .diagnostics()
                 .iter()
                 .filter_map(|it| match it {
-                    InferenceDiagnostic::BinaryOperatorCannotBeApplied { unmet, output, .. } => {
-                        Some((names(unmet), output.as_ref().map(|it| it.as_ref().kind())))
-                    }
+                    InferenceDiagnostic::BinaryOperatorCannotBeApplied {
+                        unmet, output, ..
+                    } => Some((names(unmet), output.as_ref().map(|it| it.as_ref().kind()))),
                     _ => None,
                 })
                 .collect();
@@ -1028,7 +1049,9 @@ fn an_operator_error_carries_its_unmet_goals() {
             .diagnostics()
             .iter()
             .filter_map(|it| match it {
-                InferenceDiagnostic::UnaryOperatorCannotBeApplied { unmet, .. } => Some(names(unmet)),
+                InferenceDiagnostic::UnaryOperatorCannotBeApplied { unmet, .. } => {
+                    Some(names(unmet))
+                }
                 _ => None,
             })
             .collect();
@@ -1265,7 +1288,10 @@ fn pattern_errors_carry_what_rustc_reports() {
         );
         let both = ranges("both_bad");
         assert_eq!(both.len(), 1);
-        assert_eq!((both[0].0.as_ref().map(|(_, fail)| *fail), both[0].1), (Some(true), Some(true)));
+        assert_eq!(
+            (both[0].0.as_ref().map(|(_, fail)| *fail), both[0].1),
+            (Some(true), Some(true))
+        );
 
         let counts = |name: &str| -> Vec<bool> {
             let (_, result) = infer(&db, name);
@@ -1309,8 +1335,11 @@ fn inference_records_the_value_each_path_resolved_to() {
             .filter(|(_, it)| matches!(it, Expr::Path(_)))
             .map(|(id, _)| result.value_resolution(id.into()))
             .collect();
-        let [Some(ValueNs::StaticId(_)), Some(ValueNs::LocalBinding(local)), Some(ValueNs::ConstId(_))] =
-            values[..]
+        let [
+            Some(ValueNs::StaticId(_)),
+            Some(ValueNs::LocalBinding(local)),
+            Some(ValueNs::ConstId(_)),
+        ] = values[..]
         else {
             panic!("`STATIC_MUT`, `local` and `C` resolve through inference, not {values:?}");
         };
@@ -1350,7 +1379,11 @@ fn a_sized_bound_on_a_trait_object_carries_the_pick() {
             .iter()
             .filter_map(|it| match it {
                 InferenceDiagnostic::MethodCallIllegalSizedBound {
-                    method, bound, needs_mut, candidates, ..
+                    method,
+                    bound,
+                    needs_mut,
+                    candidates,
+                    ..
                 } => Some((*method, *bound, *needs_mut, candidates.clone())),
                 _ => None,
             })
@@ -1364,7 +1397,11 @@ fn a_sized_bound_on_a_trait_object_carries_the_pick() {
         assert_eq!(TraitSignature::of(&db, future).name.as_str(), "Future");
         assert_eq!(bound, Some(method.into()), "the bound is in `wait`'s where clause");
         assert!(!needs_mut);
-        assert_eq!(&candidates[..], [future], "a probe of every trait picks `Future`'s `wait` for `B`");
+        assert_eq!(
+            &candidates[..],
+            [future],
+            "a probe of every trait picks `Future`'s `wait` for `B`"
+        );
     });
 }
 
@@ -1402,7 +1439,8 @@ fn a_probe_records_the_unstable_items_it_passed_over() {
     blaze_query::db::attach(&db, || {
         for name in ["call", "path"] {
             let (body, result) = infer(&db, name);
-            let call = find_expr(&body, |it| matches!(it, Expr::MethodCall { .. } | Expr::Call { .. }));
+            let call =
+                find_expr(&body, |it| matches!(it, Expr::MethodCall { .. } | Expr::Call { .. }));
             let node = match body.expr(call) {
                 Expr::Call { callee, .. } => callee,
                 _ => call,
@@ -1515,8 +1553,12 @@ fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
         };
 
         let path = lints("old_path");
-        let [InferenceDiagnostic::FullyQualifiedCallFrom2018 { item: CandidateId::FunctionId(_), .. }] =
-            path[..]
+        let [
+            InferenceDiagnostic::FullyQualifiedCallFrom2018 {
+                item: CandidateId::FunctionId(_),
+                ..
+            },
+        ] = path[..]
         else {
             panic!("`u8::try_from` is linted as a 2021 prelude collision, not {path:?}");
         };
@@ -1570,7 +1612,11 @@ fn a_path_that_names_nothing_reports_its_first_failing_segment() {
         assert_eq!(segments("last"), [1], "the last segment is E0425");
         assert_eq!(segments("found"), Vec::<u32>::new());
         assert_eq!(segments("assoc"), Vec::<u32>::new(), "an unknown associated item is E0599's");
-        assert_eq!(segments("other_namespace"), Vec::<u32>::new(), "a struct used as a value is E0423's");
+        assert_eq!(
+            segments("other_namespace"),
+            Vec::<u32>::new(),
+            "a struct used as a value is E0423's"
+        );
         assert_eq!(segments("literal"), [1]);
         assert_eq!(segments("literal_found"), Vec::<u32>::new());
         assert_eq!(segments("single_literal"), [0]);

@@ -20,10 +20,7 @@ mod loading {
             Some(PathBuf::from("/exe")),
             "/baked",
         );
-        assert_eq!(
-            paths,
-            vec![PathBuf::from("/env").join(loader::LIB_FILE_NAME)]
-        );
+        assert_eq!(paths, vec![PathBuf::from("/env").join(loader::LIB_FILE_NAME)]);
     }
 
     #[test]
@@ -61,10 +58,7 @@ mod loading {
         for path in &paths {
             assert!(err.contains(&path.display().to_string()), "{err}");
         }
-        assert!(
-            err.contains("hegel_no_such_engine_library (system library search)"),
-            "{err}"
-        );
+        assert!(err.contains("hegel_no_such_engine_library (system library search)"), "{err}");
         assert!(err.contains("HEGEL_C_LIB_DIR"), "{err}");
         assert!(err.contains("static-engine"), "{err}");
     }
@@ -81,10 +75,7 @@ mod loading {
     #[test]
     fn the_loaded_library_reports_the_expected_version() {
         let lib = loader::load_library();
-        assert_eq!(
-            loader::engine_version(&lib),
-            env!("HEGEL_C_EXPECTED_VERSION")
-        );
+        assert_eq!(loader::engine_version(&lib), env!("HEGEL_C_EXPECTED_VERSION"));
     }
 
     #[test]

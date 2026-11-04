@@ -43,11 +43,17 @@ impl World for Facts {
     fn hash(&self, read: Read<'_>) -> Result<Seen, WorldError> {
         match read.kind {
             FACT => {
-                let &[key] = read.key else { return Err(WorldError::new(read, "a fact's key is one byte")) };
+                let &[key] = read.key else {
+                    return Err(WorldError::new(read, "a fact's key is one byte"));
+                };
                 if self.failing == Some(key) {
                     return Err(WorldError::new(read, "the test fails it"));
                 }
-                let salt = if self.drifting == Some(key) { self.drift.replace(self.drift.get() + 1) } else { 0 };
+                let salt = if self.drifting == Some(key) {
+                    self.drift.replace(self.drift.get() + 1)
+                } else {
+                    0
+                };
                 Ok(match self.facts.get(&key) {
                     Some(value) => Seen::Is(ContentId::of(HASHED, &[*value, salt])),
                     None => Seen::Gone,
@@ -96,7 +102,10 @@ impl Fact<Facts> for Dial {
 }
 
 fn subject(input: u8) -> Subject {
-    Subject { of: ContentId::of("blaze v2 kernel test input 1", &[input]), flags: ContentId::default() }
+    Subject {
+        of: ContentId::of("blaze v2 kernel test input 1", &[input]),
+        flags: ContentId::default(),
+    }
 }
 
 /// Follows facts from its input, at most four hops: its reads depend on what it read.
@@ -260,7 +269,9 @@ impl Get for Memory {
 impl Put for Memory {
     fn put(&mut self, key: Key, _: Kind, bytes: Vec<u8>) -> Result<(), Mismatch> {
         match self.values.get(&key) {
-            Some(kept) if *kept != bytes => Err(Mismatch { key, kept: content_of(kept), given: content_of(&bytes) }),
+            Some(kept) if *kept != bytes => {
+                Err(Mismatch { key, kept: content_of(kept), given: content_of(&bytes) })
+            }
             Some(_) => Ok(()),
             None => {
                 self.values.insert(key, bytes);
@@ -284,7 +295,11 @@ fn a_kept_entry_comes_back_after_a_restart() {
         let chased = kernel.get::<Chase, _>(driven.store(), &world, &1, &Setting::OFF).unwrap();
         assert!(!chased.is_hit());
         let chased = chased.value().to_vec();
-        let constant = kernel.get::<Constant, _>(driven.store(), &world, &7, &Setting::OFF).unwrap().value().to_vec();
+        let constant = kernel
+            .get::<Constant, _>(driven.store(), &world, &7, &Setting::OFF)
+            .unwrap()
+            .value()
+            .to_vec();
         driven.flush().unwrap();
         (chased, constant)
     };
@@ -309,7 +324,8 @@ fn two_values_under_one_identity_and_reads_are_refused() {
     let kernel = kernel();
     let mut store = Memory::default();
     let world = Facts::of(&[(5, 1)]);
-    let first = kernel.get::<Salted, _>(&mut store, &world, &5, &Setting::OFF).unwrap().value().to_vec();
+    let first =
+        kernel.get::<Salted, _>(&mut store, &world, &5, &Setting::OFF).unwrap().value().to_vec();
     SALT.with(|it| it.set(1));
     store.blind = true;
     let refused = kernel.get::<Salted, _>(&mut store, &world, &5, &Setting::OFF).unwrap_err();
@@ -320,7 +336,10 @@ fn two_values_under_one_identity_and_reads_are_refused() {
     }
     store.blind = false;
     SALT.with(|it| it.set(0));
-    assert_eq!(kernel.get::<Salted, _>(&mut store, &world, &5, &Setting::OFF).unwrap().value(), first);
+    assert_eq!(
+        kernel.get::<Salted, _>(&mut store, &world, &5, &Setting::OFF).unwrap().value(),
+        first
+    );
 }
 
 /// A run whose read failed, or whose read saw two hashes, keeps nothing.
@@ -389,7 +408,9 @@ fn the_chain_of_shapes_is_bounded() {
         let mut ctx = Reads::new(&world);
         Wide::compute(&mut ctx, &0).unwrap();
         let Ok(trace) = ctx.finish() else { panic!("the wide step's reads") };
-        store.put(shape_slot(&identity, n), Kind::Query, entry::encode_shape(&identity, &trace)).unwrap();
+        store
+            .put(shape_slot(&identity, n), Kind::Query, entry::encode_shape(&identity, &trace))
+            .unwrap();
     }
     world.dial = MOST_SHAPES as u16;
     let refused = kernel.get::<Wide, _>(&mut store, &world, &0, &Setting::OFF).unwrap_err();
@@ -413,8 +434,14 @@ fn one_number_and_one_name_are_one_step() {
         }
     }
     let mut kernel = kernel();
-    assert!(matches!(kernel.register::<Chase>(CodeId(ContentId([9; 32]))), Err(KernelError::Twice { .. })));
-    assert!(matches!(kernel.register::<Impostor>(CodeId(ContentId([9; 32]))), Err(KernelError::Twice { .. })));
+    assert!(matches!(
+        kernel.register::<Chase>(CodeId(ContentId([9; 32]))),
+        Err(KernelError::Twice { .. })
+    ));
+    assert!(matches!(
+        kernel.register::<Impostor>(CodeId(ContentId([9; 32]))),
+        Err(KernelError::Twice { .. })
+    ));
     assert!(matches!(
         Kernel::new().identity::<Chase>(&1),
         Err(KernelError::Unregistered { holder: None, .. })
@@ -461,7 +488,12 @@ fn any_edits_and_gets_give_what_a_fresh_run_gives(tc: TestCase) {
 }
 
 /// The key a get computed and kept its entry under; a hit is a failure.
-fn computed<S: Compute<Input = u8, World = Facts>>(kernel: &Kernel, store: &mut Memory, world: &Facts, input: u8) -> Key {
+fn computed<S: Compute<Input = u8, World = Facts>>(
+    kernel: &Kernel,
+    store: &mut Memory,
+    world: &Facts,
+    input: u8,
+) -> Key {
     match kernel.get::<S, _>(store, world, &input, &Setting::OFF).unwrap() {
         Got::Computed { key, .. } => key,
         Got::Hit(_) => panic!("{} of {input} hit", S::NAME),
@@ -486,7 +518,14 @@ fn a_miss_names_the_one_narrow_read_that_changed() {
     let kept = store.values.len();
     assert_eq!(
         kernel.why::<Chase, _>(&store, &world, &1, Some(last)).unwrap(),
-        Missed::Read { read: "fact [2] of kind 1".to_owned(), names: None, was, now, changed: 1, reads: 2 }
+        Missed::Read {
+            read: "fact [2] of kind 1".to_owned(),
+            names: None,
+            was,
+            now,
+            changed: 1,
+            reads: 2
+        }
     );
     assert_eq!(store.values.len(), kept, "asking why wrote to the store");
 }

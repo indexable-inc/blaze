@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
     deps::{Held as _, ImageBuf, body_key},
     expr_store::Body,
 };
+use std::alloc::Global;
 
 pub(crate) use self::ids::{IdRefused, Relocate, id_bits, id_of, in_scope, outside};
 use self::{
@@ -42,7 +42,10 @@ static DOMAIN: Domain = Domain::new(BODIES_DOMAIN);
 
 /// What makes the parts: the schema of their bytes, which covers every encoding in them, so a
 /// part of another encoding is never found.
-#[expect(clippy::disallowed_types, reason = "the process's one producer content ID: all body parts use the same schema")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one producer content ID: all body parts use the same schema"
+)]
 pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|| {
     let mut hasher = Hasher::of(&DOMAIN);
     hasher.part(b"producer").id(&part::SCHEMA.0);
@@ -95,7 +98,9 @@ pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf, Global>) {
     if let Some(it) = current {
         let now = &it.parts(&*db).0;
         let same = now.len() == parts.len()
-            && parts.iter().all(|(krate, buf)| now.get(krate).is_some_and(|it| Arc::ptr_eq(it, buf)));
+            && parts
+                .iter()
+                .all(|(krate, buf)| now.get(krate).is_some_and(|it| Arc::ptr_eq(it, buf)));
         if same {
             return;
         }

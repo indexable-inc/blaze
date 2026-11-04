@@ -224,31 +224,41 @@ struct Columns<'a> {
 impl<'a> Columns<'a> {
     fn get(&self, name: &str) -> Result<&'a ArrayRef, String> {
         // alloc: an error
-        self.batch.column_by_name(name).ok_or_else(|| format!("{}: no column `{name}`", self.path.display()))
+        self.batch
+            .column_by_name(name)
+            .ok_or_else(|| format!("{}: no column `{name}`", self.path.display()))
     }
 
     fn text(&self, name: &str) -> Result<&'a StringArray, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_string_opt::<i32>().ok_or_else(|| format!("{}: `{name}` is {}, not text", self.path.display(), it.data_type()))
+        it.as_string_opt::<i32>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not text", self.path.display(), it.data_type())
+        })
     }
 
     fn u32(&self, name: &str) -> Result<&'a UInt32Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt32Type>().ok_or_else(|| format!("{}: `{name}` is {}, not u32", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<UInt32Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not u32", self.path.display(), it.data_type())
+        })
     }
 
     fn u64(&self, name: &str) -> Result<&'a UInt64Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt64Type>().ok_or_else(|| format!("{}: `{name}` is {}, not u64", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not u64", self.path.display(), it.data_type())
+        })
     }
 
     fn i64(&self, name: &str) -> Result<&'a Int64Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<Int64Type>().ok_or_else(|| format!("{}: `{name}` is {}, not i64", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not i64", self.path.display(), it.data_type())
+        })
     }
 
     /// A column no row may leave empty: an empty one is a damaged file, named.

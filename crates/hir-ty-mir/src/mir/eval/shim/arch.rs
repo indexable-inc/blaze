@@ -367,9 +367,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             "aarch64.crypto.aese" => {
                 Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), false), &SBOX))
             }
-            "aarch64.crypto.aesd" => {
-                Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), true), &INV_SBOX))
-            }
+            "aarch64.crypto.aesd" => Bytes::from_slice(&sub_bytes(
+                shift_rows(xor(state(0)?, state(1)?), true),
+                &INV_SBOX,
+            )),
             "aarch64.crypto.aesmc" => Bytes::from_slice(&mix_columns(state(0)?, false)),
             "aarch64.crypto.aesimc" => Bytes::from_slice(&mix_columns(state(0)?, true)),
             "aarch64.crc32b" | "aarch64.crc32h" | "aarch64.crc32w" | "aarch64.crc32x"
@@ -384,9 +385,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     "w" => 4,
                     _ => 8,
                 };
-                Bytes::from_slice(&crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes())
+                Bytes::from_slice(
+                    &crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes(),
+                )
             }
-            "aarch64.neon.pmull64" => Bytes::from_slice(&clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes()),
+            "aarch64.neon.pmull64" => {
+                Bytes::from_slice(&clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes())
+            }
             "aarch64.crypto.sha1c" | "aarch64.crypto.sha1p" | "aarch64.crypto.sha1m" => {
                 let f: fn(u32, u32, u32) -> u32 = match name {
                     "aarch64.crypto.sha1c" => ch,
@@ -396,7 +401,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let e = int(arg(1)?) as u32;
                 from_words(arm_sha1_hash(words(&state(0)?), e, words(&state(2)?), f))
             }
-            "aarch64.crypto.sha1h" => Bytes::from_slice(&(int(arg(0)?) as u32).rotate_left(30).to_le_bytes()),
+            "aarch64.crypto.sha1h" => {
+                Bytes::from_slice(&(int(arg(0)?) as u32).rotate_left(30).to_le_bytes())
+            }
             "aarch64.crypto.sha1su0" => {
                 let (x, y, z) = (words(&state(0)?), words(&state(1)?), words(&state(2)?));
                 let t = [x[2], x[3], y[0], y[1]];

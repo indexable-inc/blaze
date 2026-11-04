@@ -45,14 +45,7 @@ fn values(nodes: &[ChoiceNode]) -> Vec<ChoiceValue> {
 }
 
 fn span(start: usize, end: usize) -> Span {
-    Span {
-        start,
-        end,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { start, end, label: 1, depth: 0, parent: None, discarded: false }
 }
 
 /// `one_of(tuple(bool, bool), bool)` where the interesting values are any
@@ -101,17 +94,12 @@ fn one_of_shrinker(initial: Vec<ChoiceNode>, spans: Spans) -> Shrinker<'static> 
 
 #[test]
 fn switches_to_a_shorter_branch_by_raising_the_selector_and_dropping_a_stale_node() {
-    let mut shrinker = one_of_shrinker(
-        vec![selector(0), bool_node(false), bool_node(true)],
-        Spans::new(),
-    );
+    let mut shrinker =
+        one_of_shrinker(vec![selector(0), bool_node(false), bool_node(true)], Spans::new());
     drive_no_yield(shrinker.try_shortening_via_increment()).unwrap();
     assert_eq!(
         values(&shrinker.current_nodes),
-        vec![
-            ChoiceValue::Integer(BigInt::from(1)),
-            ChoiceValue::Boolean(true)
-        ]
+        vec![ChoiceValue::Integer(BigInt::from(1)), ChoiceValue::Boolean(true)]
     );
 }
 
@@ -127,18 +115,13 @@ fn deletes_a_span_after_the_raised_node_before_single_nodes() {
 
 #[test]
 fn accepts_a_probe_that_realises_a_shorter_interesting_run() {
-    let mut shrinker = one_of_shrinker(
-        vec![selector(0), bool_node(true), bool_node(true)],
-        Spans::new(),
-    );
+    let mut shrinker =
+        one_of_shrinker(vec![selector(0), bool_node(true), bool_node(true)], Spans::new());
     drive_no_yield(shrinker.try_shortening_via_increment()).unwrap();
     assert_eq!(shrinker.calls, 1);
     assert_eq!(
         values(&shrinker.current_nodes),
-        vec![
-            ChoiceValue::Integer(BigInt::from(1)),
-            ChoiceValue::Boolean(true)
-        ]
+        vec![ChoiceValue::Integer(BigInt::from(1)), ChoiceValue::Boolean(true)]
     );
 }
 
@@ -213,10 +196,8 @@ fn only_deletes_within_the_window_after_the_raised_node() {
 }
 
 fn shrinker_after_one_improvement() -> Shrinker<'static> {
-    let mut shrinker = one_of_shrinker(
-        vec![selector(0), bool_node(true), bool_node(true)],
-        Spans::new(),
-    );
+    let mut shrinker =
+        one_of_shrinker(vec![selector(0), bool_node(true), bool_node(true)], Spans::new());
     drive_no_yield(shrinker.consider(&[selector(0), bool_node(false), bool_node(true)])).unwrap();
     assert_eq!(shrinker.improvements, 1);
     shrinker
@@ -242,10 +223,8 @@ fn stops_when_the_stall_guard_gates_a_deletion_attempt() {
 
 #[test]
 fn propagates_the_improvement_cap() {
-    let mut shrinker = one_of_shrinker(
-        vec![selector(0), bool_node(false), bool_node(true)],
-        Spans::new(),
-    );
+    let mut shrinker =
+        one_of_shrinker(vec![selector(0), bool_node(false), bool_node(true)], Spans::new());
     shrinker.max_improvements = 0;
     let halt = drive_no_yield(shrinker.try_shortening_via_increment()).unwrap_err();
     assert_eq!(halt, ShrinkHalt::Stop);
@@ -296,10 +275,7 @@ fn gate_then_pick_shrinker() -> Shrinker<'static> {
 }
 
 fn int_values(shrinker: &Shrinker<'_>) -> Vec<i128> {
-    values(&shrinker.current_nodes)
-        .iter()
-        .map(int_value)
-        .collect()
+    values(&shrinker.current_nodes).iter().map(int_value).collect()
 }
 
 #[test]

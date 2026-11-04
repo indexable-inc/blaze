@@ -31,15 +31,18 @@
 //! the outcome of a crate read from no image ([`Refused::NoImage`]): frontend-deps refused the
 //! image, for a reason `hir_def::deps::Stored::refused` gives, and the same reason holds here.
 
-#[expect(clippy::disallowed_types, reason = "OnceLock: one result slot per crate of a call, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceLock: one result slot per crate of a call, not global state"
+)]
 use std::sync::{Arc, OnceLock};
 
 use base_db::{Crate, Db};
 use blaze_format::cursor::{self, Put as _, Reader};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use hir_def::deps::{Held, ImageBuf, ImageStore, absolute};
 use hir_ty_borrowck::Mode;
-use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 
 use crate::{
@@ -209,11 +212,15 @@ pub enum Refused {
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refused::NoImage => f.write_str("it is read from no dependency image, whose key its outcome is filed by"),
+            Refused::NoImage => f.write_str(
+                "it is read from no dependency image, whose key its outcome is filed by",
+            ),
             Refused::MachinePath { path } => {
                 write!(f, "its diagnostics hold the path {path}, outside its package and `OUT_DIR`")
             }
-            Refused::NoPath { file } => write!(f, "a diagnostic of it is in {file}, which has no path"),
+            Refused::NoPath { file } => {
+                write!(f, "a diagnostic of it is in {file}, which has no path")
+            }
             Refused::Nul => f.write_str("a diagnostic of it holds a NUL"),
             Refused::Encode { why } => write!(f, "its diagnostics do not encode: {why}"),
             Refused::Reads(why) => write!(f, "what its bodies read: {why}"),
@@ -355,9 +362,14 @@ fn replaced(text: &str, path: &str, marker: &str) -> Result<String, Refused> {
     let mut rest = text;
     while let Some(at) = rest.find(path) {
         let after = &rest[at + path.len()..];
-        let ends = after.chars().next().is_none_or(|it| !(it.is_alphanumeric() || matches!(it, '-' | '_' | '.')));
+        let ends = after
+            .chars()
+            .next()
+            .is_none_or(|it| !(it.is_alphanumeric() || matches!(it, '-' | '_' | '.')));
         if !ends {
-            let end = after.find(|it: char| it.is_whitespace() || matches!(it, '`' | '\'' | '"')).unwrap_or(after.len());
+            let end = after
+                .find(|it: char| it.is_whitespace() || matches!(it, '`' | '\'' | '"'))
+                .unwrap_or(after.len());
             // alloc: why an outcome is refused, once per refused crate
             return Err(Refused::MachinePath { path: format!("{path}{}", &after[..end]) });
         }
@@ -379,7 +391,10 @@ enum Field {
 }
 
 /// Calls `f` on every string of `diag` that can hold a path, in one order.
-fn walk<E>(diag: &mut Diag, f: &mut impl FnMut(Field, &mut String) -> Result<(), E>) -> Result<(), E> {
+fn walk<E>(
+    diag: &mut Diag,
+    f: &mut impl FnMut(Field, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
     f(Field::Text, &mut diag.message)?;
     walk_multi(&mut diag.span, f)?;
     for child in &mut diag.children {
@@ -401,7 +416,10 @@ fn walk<E>(diag: &mut Diag, f: &mut impl FnMut(Field, &mut String) -> Result<(),
     Ok(())
 }
 
-fn walk_multi<E>(spans: &mut MultiSpan, f: &mut impl FnMut(Field, &mut String) -> Result<(), E>) -> Result<(), E> {
+fn walk_multi<E>(
+    spans: &mut MultiSpan,
+    f: &mut impl FnMut(Field, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
     for span in &mut spans.primary {
         walk_span(span, f)?;
     }
@@ -412,7 +430,10 @@ fn walk_multi<E>(spans: &mut MultiSpan, f: &mut impl FnMut(Field, &mut String) -
     Ok(())
 }
 
-fn walk_span<E>(span: &mut Span, f: &mut impl FnMut(Field, &mut String) -> Result<(), E>) -> Result<(), E> {
+fn walk_span<E>(
+    span: &mut Span,
+    f: &mut impl FnMut(Field, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
     f(Field::File, &mut span.file)?;
     if let Some(expansion) = &mut span.expansion {
         walk_span(&mut expansion.call_site, f)?;
@@ -427,7 +448,12 @@ fn walk_span<E>(span: &mut Span, f: &mut impl FnMut(Field, &mut String) -> Resul
 /// The outcome `diags` of a crate whose paths are `paths`, its items broken when
 /// `items_broken` ([`crate::CrateCheck::items_broken`]), its spans' files named from `root`
 /// ([`Files`]'s root), as the store keeps it.
-pub fn encode(diags: &[Diag], items_broken: bool, paths: &Paths, root: &str) -> Result<Vec<u8>, Refused> {
+pub fn encode(
+    diags: &[Diag],
+    items_broken: bool,
+    paths: &Paths,
+    root: &str,
+) -> Result<Vec<u8>, Refused> {
     // clone: an outcome is written once per crate checked, its strings rewritten in a copy
     let mut portable: Vec<Diag> = diags.to_vec();
     for diag in &mut portable {
@@ -437,7 +463,8 @@ pub fn encode(diags: &[Diag], items_broken: bool, paths: &Paths, root: &str) -> 
         })?;
     }
     // alloc: the outcome's bytes, once per crate kept
-    let body = serde_json::to_vec(&portable).map_err(|why| Refused::Encode { why: why.to_string() })?;
+    let body =
+        serde_json::to_vec(&portable).map_err(|why| Refused::Encode { why: why.to_string() })?;
     // alloc: error text
     let too_big = || Refused::Encode { why: "an outcome of 4 GiB or more".to_owned() };
     let count = u32::try_from(diags.len()).map_err(|_| too_big())?;
@@ -474,7 +501,9 @@ fn header(bytes: &[u8]) -> Result<(bool, bool, u32), &'static str> {
     }
     match (flags & FAILED != 0, flags & (ITEMS_BROKEN | ITEMS_SOUND)) {
         (true, ITEMS_BROKEN | ITEMS_SOUND) | (false, 0) => {}
-        (true, _) => return Err("a failed check that says not whether its items are broken, or says both"),
+        (true, _) => {
+            return Err("a failed check that says not whether its items are broken, or says both");
+        }
         (false, _) => return Err("its items' state in a check that did not fail"),
     }
     let (count, len) = (read.u32().map_err(short)?, read.u32().map_err(short)?);
@@ -507,7 +536,8 @@ pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result
         return Ok(Outcome { failed, items_broken, diags: Vec::new() });
     }
     // alloc: an outcome with diagnostics, read once per crate per build
-    let mut diags: Vec<Diag> = serde_json::from_slice(&bytes[HEADER..]).map_err(|why| format!("its body: {why}"))?;
+    let mut diags: Vec<Diag> =
+        serde_json::from_slice(&bytes[HEADER..]).map_err(|why| format!("its body: {why}"))?;
     if diags.len() != count as usize {
         // alloc: error text
         return Err(format!("{} diagnostics where its header says {count}", diags.len()));
@@ -616,7 +646,11 @@ fn layers(
 
 /// The check keys of `krate`'s dependencies, in its dependency list's order, `None` when one has
 /// none.
-fn dep_keys(db: &Db, krate: Crate, keys: &HashMap<Crate, ContentId, Global>) -> Option<Vec<ContentId>> {
+fn dep_keys(
+    db: &Db,
+    krate: Crate,
+    keys: &HashMap<Crate, ContentId, Global>,
+) -> Option<Vec<ContentId>> {
     // alloc: once per crate per session
     krate.data(db).dependencies.iter().map(|dep| keys.get(&dep.crate_id).copied()).collect()
 }
@@ -645,7 +679,10 @@ type Fetched = Result<Option<(ContentId, ImageBuf, Option<ImageBuf>)>, String>;
 /// A value under its key that does not open is an error naming the crate and the key, never a
 /// crate checked instead: the key covers what the value was made from and the store checked
 /// its bytes, so such a value is a bug in the key or the encoding.
-#[expect(clippy::disallowed_types, reason = "OnceLock: one result slot per crate of this call, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceLock: one result slot per crate of this call, not global state"
+)]
 pub fn serve(
     db: &mut Db,
     crates: &[(Crate, Inputs<'_>)],
@@ -733,12 +770,20 @@ fn forget(served: &mut Served, krate: Crate) -> bool {
 /// The bodies part of `krate` filed by `base` and its bodies' reads as they are now, and the
 /// outcome under the check key it is filed by, each opened.
 // dyn: the driver's store, one call per crate per session
-fn fetch(db: &Db, krate: Crate, base: ContentId, inputs: &Inputs<'_>, store: &dyn ImageStore) -> Fetched {
+fn fetch(
+    db: &Db,
+    krate: Crate,
+    base: ContentId,
+    inputs: &Inputs<'_>,
+    store: &dyn ImageStore,
+) -> Fetched {
     let get = |key: ContentId, what: &str| {
         store
             .get(&key)
             // alloc: error text
-            .map_err(|why| format!("reading the {what} of crate {} (key {key:?}): {why}", krate.named(db)))
+            .map_err(|why| {
+                format!("reading the {what} of crate {} (key {key:?}): {why}", krate.named(db))
+            })
     };
     let found = hir_def::deps::find_by_reads(db, krate, base, store, |at| {
         let Some(bytes) = get(at, "checked bodies")? else { return Ok(None) };
@@ -818,7 +863,10 @@ type Made = Result<Result<(ContentId, Option<Refused>), Refused>, String>;
 /// them. A crate one of whose dependencies has no check key is refused
 /// ([`Refused::Dependency`]), as is one whose reads or bodies do not keep. A store that will not
 /// keep a value is an error naming the crate.
-#[expect(clippy::disallowed_types, reason = "OnceLock: one result slot per crate of this call, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceLock: one result slot per crate of this call, not global state"
+)]
 pub fn store(
     db: &Db,
     checked: &[Checked<'_>],
@@ -829,7 +877,8 @@ pub fn store(
 ) -> Result<Stored, String> {
     let mut stored = Stored::default();
     // alloc: setup: once per session
-    let by_crate: HashMap<Crate, &Checked<'_>, Global> = checked.iter().map(|it| (it.krate, it)).collect();
+    let by_crate: HashMap<Crate, &Checked<'_>, Global> =
+        checked.iter().map(|it| (it.krate, it)).collect();
     let (layers, left) = layers(db, by_crate.keys().copied(), &served.keys);
     for (krate, dep) in left {
         // alloc: why, once per crate refused
@@ -860,7 +909,10 @@ pub fn store(
         });
         for ((check, _), made) in asked.iter().zip(made) {
             let made = made.into_inner().unwrap_or_else(|| {
-                panic!("`ImageStore::for_each` did not run the task of crate {}", check.krate.named(db))
+                panic!(
+                    "`ImageStore::for_each` did not run the task of crate {}",
+                    check.krate.named(db)
+                )
             });
             match made? {
                 Ok((key, outcome)) => {
@@ -880,7 +932,13 @@ pub fn store(
 /// Keeps the bodies part and the outcome of `check`, whose dependencies' check keys are `deps`:
 /// one task of [`store`].
 // dyn: the driver's store, one call per crate per session
-fn keep(db: &Db, check: &Checked<'_>, deps: &[ContentId], root: &str, store: &dyn ImageStore) -> Made {
+fn keep(
+    db: &Db,
+    check: &Checked<'_>,
+    deps: &[ContentId],
+    root: &str,
+    store: &dyn ImageStore,
+) -> Made {
     let krate = check.krate;
     let put = |at: ContentId, what: &str, bytes: Vec<u8>| {
         store.put(at, bytes).map_err(|why| {

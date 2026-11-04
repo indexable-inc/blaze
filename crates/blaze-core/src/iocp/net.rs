@@ -17,13 +17,13 @@ use std::{
 
 use windows_sys::Win32::{
     Networking::WinSock::{
-        AF_INET, AF_INET6, AF_UNIX, AcceptEx, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IPPROTO_TCP,
-        LPFN_CONNECTEX, SD_BOTH, SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_ACCEPT_CONTEXT,
-        SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
-        SOCKADDR_STORAGE, SOCKADDR_UN, SOCKET, SOL_SOCKET, TCP_NODELAY, WSA_FLAG_NO_HANDLE_INHERIT,
-        WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF, WSADATA, WSAENOTCONN, WSAGetLastError, WSAID_CONNECTEX,
-        WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, bind, connect, getsockname, setsockopt,
-        shutdown,
+        AF_INET, AF_INET6, AF_UNIX, AcceptEx, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
+        INVALID_SOCKET, IPPROTO_TCP, LPFN_CONNECTEX, SD_BOTH, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+        SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKADDR_UN, SOCKET, SOL_SOCKET,
+        TCP_NODELAY, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
+        WSADATA, WSAENOTCONN, WSAGetLastError, WSAID_CONNECTEX, WSAIoctl, WSARecv, WSASend,
+        WSASocketW, WSAStartup, bind, connect, getsockname, setsockopt, shutdown,
     },
     System::IO::OVERLAPPED,
 };
@@ -104,7 +104,10 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             let path = std::path::absolute(root.join(name.as_str()))?;
             let text = path.to_str().ok_or_else(|| {
                 // alloc: an error path.
-                io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not Unicode", path.display()))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: not Unicode", path.display()),
+                )
             })?;
             // SAFETY: `SOCKADDR_STORAGE` is large and aligned enough for any address.
             let un = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_UN>() };
@@ -125,7 +128,9 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 // alloc: an error path.
-                format!("the socket {at} passed as fd {fd}: socket activation is systemd's and launchd's, and Windows has neither"),
+                format!(
+                    "the socket {at} passed as fd {fd}: socket activation is systemd's and launchd's, and Windows has neither"
+                ),
             ));
         }
         Address::Tcp(SocketAddr::V4(address)) => {
@@ -133,7 +138,8 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             let in4 = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN>() };
             in4.sin_family = AF_INET;
             in4.sin_port = address.port().to_be();
-            in4.sin_addr = IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(address.ip().octets()) } };
+            in4.sin_addr =
+                IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(address.ip().octets()) } };
             (size_of::<SOCKADDR_IN>(), AF_INET)
         }
         Address::Tcp(SocketAddr::V6(address)) => {
@@ -231,7 +237,9 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
     // The most Winsock takes (`SOMAXCONN` of winsock2.h).
     // SAFETY: a bound socket.
     // Winsock's `listen`, by path: this module's own `listen` above takes the name.
-    if unsafe { windows_sys::Win32::Networking::WinSock::listen(raw(&listener.socket), i32::MAX) } != 0 {
+    if unsafe { windows_sys::Win32::Networking::WinSock::listen(raw(&listener.socket), i32::MAX) }
+        != 0
+    {
         return Err(last());
     }
     Ok(listener)
@@ -249,7 +257,12 @@ pub(super) struct Accepting {
 
 impl Accepting {
     pub(super) fn new(listener: Listener) -> Accepting {
-        Accepting { listener, accepted: None, addresses: UnsafeCell::new([0; 2 * ADDRESS]), stopping: false }
+        Accepting {
+            listener,
+            accepted: None,
+            addresses: UnsafeCell::new([0; 2 * ADDRESS]),
+            stopping: false,
+        }
     }
 
     /// Asks for the next connection, completing through `overlapped`.
@@ -390,7 +403,10 @@ impl Connecting {
         let socket = self.socket.expect("a connect completed was asked for");
         // So the socket is connected in every call that asks (shutdown, its names).
         // SAFETY: a connected socket; the option takes no value.
-        if unsafe { setsockopt(raw(&socket), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0) } != 0 {
+        if unsafe {
+            setsockopt(raw(&socket), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0)
+        } != 0
+        {
             return Err(last());
         }
         nodelay(&socket)?;
@@ -483,8 +499,13 @@ pub(super) unsafe fn recv(
 /// `bytes` and `overlapped` (the request's head, made ready for this step) stay where they
 /// are, alive and unwritten, until the completion is dequeued: Winsock reads the bytes after
 /// this returns, past the borrow. `socket` is open.
-pub(super) unsafe fn send(socket: SOCKET, bytes: &[u8], overlapped: *mut OVERLAPPED) -> io::Result<()> {
-    let buffer = WSABUF { len: bytes.len().min(u32::MAX as usize) as u32, buf: bytes.as_ptr().cast_mut() };
+pub(super) unsafe fn send(
+    socket: SOCKET,
+    bytes: &[u8],
+    overlapped: *mut OVERLAPPED,
+) -> io::Result<()> {
+    let buffer =
+        WSABUF { len: bytes.len().min(u32::MAX as usize) as u32, buf: bytes.as_ptr().cast_mut() };
     // SAFETY: as in `recv`; the bytes are only read.
     let ok = unsafe { WSASend(socket, &buffer, 1, std::ptr::null_mut(), 0, overlapped, None) };
     pending(ok == 0)

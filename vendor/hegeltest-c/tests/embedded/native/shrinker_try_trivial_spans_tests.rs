@@ -11,11 +11,7 @@ use alloc::vec::Vec;
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -28,14 +24,7 @@ fn forced_int_node(value: i128) -> ChoiceNode {
 }
 
 fn span(start: usize, end: usize) -> Span {
-    Span {
-        start,
-        end,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { start, end, label: 1, depth: 0, parent: None, discarded: false }
 }
 
 #[test]
@@ -186,10 +175,7 @@ fn try_trivial_spans_retries_with_realised_span_content() {
     drive_no_yield(shrinker.try_trivial_spans()).unwrap();
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
     assert_eq!(shrinker.current_nodes.len(), 2);
-    match (
-        &shrinker.current_nodes[0].value(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    match (&shrinker.current_nodes[0].value(), &shrinker.current_nodes[1].value()) {
         (ChoiceValue::Integer(a), ChoiceValue::Integer(b)) => {
             assert_eq!(i128::try_from(a.clone()).unwrap(), 2);
             assert_eq!(i128::try_from(b.clone()).unwrap(), 7);

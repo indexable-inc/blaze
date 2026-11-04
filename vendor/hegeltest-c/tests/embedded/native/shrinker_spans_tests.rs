@@ -21,11 +21,7 @@ use alloc::vec::Vec;
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -36,14 +32,7 @@ fn bool_node(value: bool) -> ChoiceNode {
 }
 
 fn span(start: usize, end: usize, label: u64) -> Span {
-    Span {
-        start,
-        end,
-        label,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { start, end, label, depth: 0, parent: None, discarded: false }
 }
 
 #[test]
@@ -191,10 +180,7 @@ fn forced_nodes_survive_every_shrinker_pass() {
             "minimize_individual_choices",
             Box::new(|sh| boxed_pass(sh.minimize_individual_choices())),
         ),
-        ShrinkPass::new(
-            "shrink_duplicates",
-            Box::new(|sh| boxed_pass(sh.shrink_duplicates())),
-        ),
+        ShrinkPass::new("shrink_duplicates", Box::new(|sh| boxed_pass(sh.shrink_duplicates()))),
     ];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     let value = match &shrinker.current_nodes[snapshot_forced_idx].value() {

@@ -283,18 +283,28 @@ impl<T> RwLock<T> {
 }
 
 impl<T: ?Sized> RwLock<T> {
-    fn reader<'a>(&'a self, guard: std::sync::RwLockReadGuard<'a, T>, model: bool) -> RwLockReadGuard<'a, T> {
+    fn reader<'a>(
+        &'a self,
+        guard: std::sync::RwLockReadGuard<'a, T>,
+        model: bool,
+    ) -> RwLockReadGuard<'a, T> {
         RwLockReadGuard { rwlock: self, guard: Some(guard), model }
     }
 
-    fn writer<'a>(&'a self, guard: std::sync::RwLockWriteGuard<'a, T>, model: bool) -> RwLockWriteGuard<'a, T> {
+    fn writer<'a>(
+        &'a self,
+        guard: std::sync::RwLockWriteGuard<'a, T>,
+        model: bool,
+    ) -> RwLockWriteGuard<'a, T> {
         RwLockWriteGuard { rwlock: self, guard: Some(guard), model }
     }
 
     fn held_read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
         match self.lock.try_read() {
             Ok(guard) => Ok(self.reader(guard, true)),
-            Err(TryLockError::Poisoned(poison)) => Err(PoisonError::new(self.reader(poison.into_inner(), true))),
+            Err(TryLockError::Poisoned(poison)) => {
+                Err(PoisonError::new(self.reader(poison.into_inner(), true)))
+            }
             Err(TryLockError::WouldBlock) => uncontended(),
         }
     }
@@ -302,7 +312,9 @@ impl<T: ?Sized> RwLock<T> {
     fn held_write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
         match self.lock.try_write() {
             Ok(guard) => Ok(self.writer(guard, true)),
-            Err(TryLockError::Poisoned(poison)) => Err(PoisonError::new(self.writer(poison.into_inner(), true))),
+            Err(TryLockError::Poisoned(poison)) => {
+                Err(PoisonError::new(self.writer(poison.into_inner(), true)))
+            }
             Err(TryLockError::WouldBlock) => uncontended(),
         }
     }
@@ -542,7 +554,9 @@ impl Condvar {
             let timed_out = self.model_wait(&mut guard, Location::caller(), true);
             return match poisoned(guard) {
                 Ok(guard) => Ok((guard, WaitTimeoutResult(timed_out))),
-                Err(poison) => Err(PoisonError::new((poison.into_inner(), WaitTimeoutResult(timed_out)))),
+                Err(poison) => {
+                    Err(PoisonError::new((poison.into_inner(), WaitTimeoutResult(timed_out))))
+                }
             };
         }
         let mutex = guard.mutex;
@@ -552,7 +566,10 @@ impl Condvar {
             Ok((inner, out)) => Ok((mutex.guard(inner, false), WaitTimeoutResult(out.timed_out()))),
             Err(poison) => {
                 let (inner, out) = poison.into_inner();
-                Err(PoisonError::new((mutex.guard(inner, false), WaitTimeoutResult(out.timed_out()))))
+                Err(PoisonError::new((
+                    mutex.guard(inner, false),
+                    WaitTimeoutResult(out.timed_out()),
+                )))
             }
         }
     }

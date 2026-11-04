@@ -417,7 +417,12 @@ pub trait Prepare: Sync {
 
     /// #1292: the prepared IR with its constants masked, for [`crate::fold::groups`]; `None`
     /// for one that can't be folded (a backend or a function that has no thunk).
-    fn masked(&self, unit: &Unit, prepared: &Self::Prepared, refs: &Refs) -> Option<crate::fold::Masked>;
+    fn masked(
+        &self,
+        unit: &Unit,
+        prepared: &Self::Prepared,
+        refs: &Refs,
+    ) -> Option<crate::fold::Masked>;
 
     /// Compiles a group's one body, taking the constants that differ as parameters, and a
     /// thunk for each member, which calls it with the member's constants. `members` are in

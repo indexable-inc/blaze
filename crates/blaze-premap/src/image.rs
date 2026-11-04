@@ -97,12 +97,18 @@ pub(crate) struct Pieces<'a> {
 
 /// `prelink` and its `pieces`, as one value: the segments' bytes written into it by the
 /// prelink, once.
-pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) -> Result<Vec<u8>, PremapError> {
+pub(crate) fn encode(
+    meta: &Meta,
+    prelink: &impl Placed,
+    pieces: &Pieces<'_>,
+) -> Result<Vec<u8>, PremapError> {
     let linked = prelink.linked();
     let mut strings = Vec::new(); // alloc: once per image made: its names, of sizes known only as they come
     let mut string = |text: &str| -> Result<(u32, u32), PremapError> {
-        let at = u32::try_from(strings.len()).map_err(|_| PremapError::of(format_args!("the image's names pass 4 GiB")))?;
-        let len = u32::try_from(text.len()).map_err(|_| PremapError::of(format_args!("a name of 4 GiB")))?;
+        let at = u32::try_from(strings.len())
+            .map_err(|_| PremapError::of(format_args!("the image's names pass 4 GiB")))?;
+        let len = u32::try_from(text.len())
+            .map_err(|_| PremapError::of(format_args!("a name of 4 GiB")))?;
         strings.extend_from_slice(text.as_bytes());
         Ok((at, len))
     };
@@ -111,7 +117,8 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
     let mut binds = Vec::with_capacity(linked.binds.len() * BIND);
     for Bind { place, name, addend, kind, weak } in &linked.binds {
         let own = match table.slot_of(&SymbolId::name(name)) {
-            Some(at) => u32::try_from(at + 1).map_err(|_| PremapError::of(format_args!("a table of 4 Gi slots")))?,
+            Some(at) => u32::try_from(at + 1)
+                .map_err(|_| PremapError::of(format_args!("a table of 4 Gi slots")))?,
             None => 0,
         };
         let (at, len) = string(name)?;
@@ -177,7 +184,9 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
         debug.extend_from_slice(&digest.0);
     }
     if !pieces.statics.is_sorted_by(|a, b| a.0 < b.0) {
-        return Err(PremapError::of(format_args!("the image's statics are not sorted by item and instance, each once")));
+        return Err(PremapError::of(format_args!(
+            "the image's statics are not sorted by item and instance, each once"
+        )));
     }
     let mut statics = Vec::with_capacity(pieces.statics.len() * STATIC_RECORD);
     for ((item, instance), definition) in pieces.statics {
@@ -186,8 +195,21 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
         statics.extend_from_slice(&definition.0);
     }
 
-    let small: [&[u8]; STATICS + 1] =
-        [&[], pieces.table, &binds, &libraries, &init, &fini, &tls, &unwind, &strings, &thread_vars, &contents, &debug, &statics];
+    let small: [&[u8]; STATICS + 1] = [
+        &[],
+        pieces.table,
+        &binds,
+        &libraries,
+        &init,
+        &fini,
+        &tls,
+        &unwind,
+        &strings,
+        &thread_vars,
+        &contents,
+        &debug,
+        &statics,
+    ];
     let mut at = HEADER;
     let mut directory = [(0u64, 0u64); SECTIONS];
     // The segment records come first, and their size is known before the bytes' offsets are.
@@ -236,9 +258,15 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
     let head = out;
     // Zeroed by the allocator's fresh pages, not a pass of its own: only the bytes copied in are written.
     let mut out = vec![0u8; end]; // alloc: once per image made: its value
-    par::for_each(par::zip(par::chunks_mut(&mut out[..head.len()], COPY_PIECE), par::chunks(&head, COPY_PIECE)), |(into, from)| {
-        into.copy_from_slice(from);
-    });
+    par::for_each(
+        par::zip(
+            par::chunks_mut(&mut out[..head.len()], COPY_PIECE),
+            par::chunks(&head, COPY_PIECE),
+        ),
+        |(into, from)| {
+            into.copy_from_slice(from);
+        },
+    );
     prelink.write_into(&mut out, &placed)?;
     Ok(out)
 }
@@ -291,12 +319,17 @@ impl<'a> View<'a> {
     /// Checks `bytes` are an image of `key` and that every reference in them stays inside
     /// them; a store value that is not is refused, naming what is wrong.
     pub fn parse(bytes: &'a [u8], key: ImageKey) -> Result<View<'a>, PremapError> {
-        let bad = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the dependency image {:?} {what}", key.0)));
+        let bad = |what: std::fmt::Arguments<'_>| {
+            Err(PremapError::of(format_args!("the dependency image {:?} {what}", key.0)))
+        };
         if bytes.len() < HEADER || bytes[..8] != MAGIC {
             return bad(format_args!("is not one: no header"));
         }
         if u32_at(bytes, 8) != VERSION {
-            return bad(format_args!("is of version {}, and this blaze reads {VERSION}", u32_at(bytes, 8)));
+            return bad(format_args!(
+                "is of version {}, and this blaze reads {VERSION}",
+                u32_at(bytes, 8)
+            ));
         }
         let (Some(format), Some(arch)) = (format_of(bytes[12]), arch_of(bytes[13])) else {
             return bad(format_args!("names no format or target there is"));
@@ -353,7 +386,9 @@ impl<'a> View<'a> {
         )?;
         let names = u64_at(bytes, NAMES);
         if names > table.len() as u64 {
-            return bad(format_args!("says it defines {names} Rust names, more than its table has"));
+            return bad(format_args!(
+                "says it defines {names} Rust names, more than its table has"
+            ));
         }
         let meta = Meta { key, format, arch, base, page };
         let view = View { bytes, meta, names, directory, table };
@@ -362,12 +397,15 @@ impl<'a> View<'a> {
         let (from, len) = directory[BYTES];
         for at in 0..directory[SEGMENTS].1 / SEGMENT {
             let record = view.record(SEGMENTS, SEGMENT, at);
-            let (addr, size, offset, file) = (u64_at(record, 0), u64_at(record, 8), u64_at(record, 16), u64_at(record, 24));
+            let (addr, size, offset, file) =
+                (u64_at(record, 0), u64_at(record, 8), u64_at(record, 16), u64_at(record, 24));
             if prot_of(record[32]).is_none() || record[33..40] != [0; 7] {
                 return bad(format_args!("has segment {at} of no protection there is"));
             }
             if addr % page != 0 || addr < end || size == 0 || file > size {
-                return bad(format_args!("has segment {at} at {addr:#x} out of order or of no size"));
+                return bad(format_args!(
+                    "has segment {at} at {addr:#x} out of order or of no size"
+                ));
             }
             let inside = offset >= from as u64
                 && offset % page == 0
@@ -377,7 +415,9 @@ impl<'a> View<'a> {
             }
             end = match addr.checked_add(size) {
                 Some(end) => end,
-                None => return bad(format_args!("has segment {at} past the end of the address space")),
+                None => {
+                    return bad(format_args!("has segment {at} past the end of the address space"));
+                }
             };
         }
         let strings = view.section(STRINGS);
@@ -386,7 +426,11 @@ impl<'a> View<'a> {
             std::str::from_utf8(range).ok()
         };
         let statics = view.section(STATICS);
-        if statics.chunks_exact(STATIC_RECORD).zip(statics.chunks_exact(STATIC_RECORD).skip(1)).any(|(a, b)| a[..64] >= b[..64]) {
+        if statics
+            .chunks_exact(STATIC_RECORD)
+            .zip(statics.chunks_exact(STATIC_RECORD).skip(1))
+            .any(|(a, b)| a[..64] >= b[..64])
+        {
             return bad(format_args!("has statics not sorted by item and instance, each once"));
         }
         for at in 0..directory[BINDS].1 / BIND {
@@ -398,16 +442,25 @@ impl<'a> View<'a> {
             if !matches!(record[24], 1 | 2) || record[25] > 1 || record[26..28] != [0; 2] {
                 return bad(format_args!("has bind {at} that is not one"));
             }
-            if table.slot_of(&SymbolId::name(text)).map_or(0, |it| it as u64 + 1) != u64::from(u32_at(record, 28)) {
-                return bad(format_args!("has bind {at} naming another slot than its own definition of `{text}`"));
+            if table.slot_of(&SymbolId::name(text)).map_or(0, |it| it as u64 + 1)
+                != u64::from(u32_at(record, 28))
+            {
+                return bad(format_args!(
+                    "has bind {at} naming another slot than its own definition of `{text}`"
+                ));
             }
             if place % 8 != 0 || !view.inside(place, 8, true) {
-                return bad(format_args!("binds a cell at {place:#x}, outside its writable segments"));
+                return bad(format_args!(
+                    "binds a cell at {place:#x}, outside its writable segments"
+                ));
             }
         }
         for at in 0..directory[LIBRARIES].1 / LIBRARY {
             let record = view.record(LIBRARIES, LIBRARY, at);
-            if name(u32_at(record, 0), u32_at(record, 4)).is_none() || record[12] > 1 || record[13..16] != [0; 3] {
+            if name(u32_at(record, 0), u32_at(record, 4)).is_none()
+                || record[12] > 1
+                || record[13..16] != [0; 3]
+            {
                 return bad(format_args!("has library {at} that is not one"));
             }
         }
@@ -415,24 +468,36 @@ impl<'a> View<'a> {
             for at in 0..directory[section].1 / ENTRY {
                 let record = view.record(section, ENTRY, at);
                 let (cell, count) = (u64_at(record, 80), u32_at(record, 88));
-                if record[92..96] != [0; 4] || cell % 8 != 0 || !view.inside(cell, u64::from(count) * 8, false) {
-                    return bad(format_args!("has an init or fini piece at {cell:#x} outside its segments"));
+                if record[92..96] != [0; 4]
+                    || cell % 8 != 0
+                    || !view.inside(cell, u64::from(count) * 8, false)
+                {
+                    return bad(format_args!(
+                        "has an init or fini piece at {cell:#x} outside its segments"
+                    ));
                 }
             }
         }
         if let Some(tls) = view.tls() {
-            if tls.init > tls.size || !tls.align.is_power_of_two() || (tls.init > 0 && !view.inside(tls.template, tls.init, false)) {
+            if tls.init > tls.size
+                || !tls.align.is_power_of_two()
+                || (tls.init > 0 && !view.inside(tls.template, tls.init, false))
+            {
                 return bad(format_args!("has a thread-local template that is not one"));
             }
         }
         for (addr, len) in view.unwind() {
             if !view.inside(addr, len, false) {
-                return bad(format_args!("has call frame information at {addr:#x} outside its segments"));
+                return bad(format_args!(
+                    "has call frame information at {addr:#x} outside its segments"
+                ));
             }
         }
         for (addr, len) in view.thread_vars() {
             if addr % 8 != 0 || len % 24 != 0 || !view.inside(addr, len, true) {
-                return bad(format_args!("has thread-local descriptors at {addr:#x} outside its writable segments"));
+                return bad(format_args!(
+                    "has thread-local descriptors at {addr:#x} outside its writable segments"
+                ));
             }
         }
         Ok(view)
@@ -529,7 +594,10 @@ impl<'a> View<'a> {
                 prot: prot_of(record[32]).expect("checked by parse"),
                 // The metadata alone holds no segment bytes.
                 bytes: match whole {
-                    true => view.bytes.get(offset as usize..(offset + len) as usize).expect("checked by parse"),
+                    true => view
+                        .bytes
+                        .get(offset as usize..(offset + len) as usize)
+                        .expect("checked by parse"),
                     false => &[],
                 },
                 offset,
@@ -624,13 +692,16 @@ impl<'a> View<'a> {
 
     fn string(&self, at: u32, len: u32) -> &'a str {
         let strings = self.section(STRINGS);
-        std::str::from_utf8(&strings[at as usize..at as usize + len as usize]).expect("checked by parse")
+        std::str::from_utf8(&strings[at as usize..at as usize + len as usize])
+            .expect("checked by parse")
     }
 
     /// Whether `[addr, addr + len)` is inside one segment (a writable one when `writable`).
     fn inside(&self, addr: u64, len: u64, writable: bool) -> bool {
         self.segments().any(|it| {
-            addr >= it.addr && addr.checked_add(len).is_some_and(|end| end <= it.addr + it.size) && (!writable || it.prot == Prot::Data)
+            addr >= it.addr
+                && addr.checked_add(len).is_some_and(|end| end <= it.addr + it.size)
+                && (!writable || it.prot == Prot::Data)
         })
     }
 
@@ -650,7 +721,11 @@ impl blaze_link::Outside for View<'_> {
         self.get(&SymbolId::function(key)).map(|it| it.value)
     }
 
-    fn static_at(&self, item: &ItemKey, instance: &ContentId) -> Option<blaze_link::premap::StaticAt> {
+    fn static_at(
+        &self,
+        item: &ItemKey,
+        instance: &ContentId,
+    ) -> Option<blaze_link::premap::StaticAt> {
         self.get(&SymbolId::of_static(item, instance)).map(|it| match it.kind {
             Kind::ThreadLocal => blaze_link::premap::StaticAt::ThreadLocal(it.value),
             Kind::Function | Kind::Data => blaze_link::premap::StaticAt::Addr(it.value),
@@ -692,5 +767,7 @@ fn prot_of(tag: u8) -> Option<Prot> {
 }
 
 fn format_of(tag: u8) -> Option<Format> {
-    [Format::Elf, Format::MachO, Format::Pe, Format::Wasm].into_iter().find(|it| format_tag(*it) == tag)
+    [Format::Elf, Format::MachO, Format::Pe, Format::Wasm]
+        .into_iter()
+        .find(|it| format_tag(*it) == tag)
 }

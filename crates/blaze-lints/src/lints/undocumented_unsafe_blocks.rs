@@ -105,8 +105,7 @@ fn comment_start_before_item(cx: &Cx<'_, '_>, item: ast::Node<'_>) -> Option<Tex
     } else {
         return None;
     };
-    let previous =
-        item.siblings(Direction::Prev).skip(1).find(|it| ast::Item::can_cast(it.kind()));
+    let previous = item.siblings(Direction::Prev).skip(1).find(|it| ast::Item::can_cast(it.kind()));
     match previous {
         Some(previous) => cx.range(previous).map(|it| it.end()),
         None => Some(module_start),

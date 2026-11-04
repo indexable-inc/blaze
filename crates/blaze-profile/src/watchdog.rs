@@ -252,7 +252,12 @@ impl fmt::Display for SpanSaid<'_> {
 }
 
 /// A thread's line ([`threads`]): `name (tid 7): a > b`, of any spans said as [`SpanSaid`].
-pub fn thread_said<'a>(f: &mut impl fmt::Write, name: &str, tid: u64, spans: impl IntoIterator<Item = SpanSaid<'a>>) -> fmt::Result {
+pub fn thread_said<'a>(
+    f: &mut impl fmt::Write,
+    name: &str,
+    tid: u64,
+    spans: impl IntoIterator<Item = SpanSaid<'a>>,
+) -> fmt::Result {
     write!(f, "{name} (tid {tid}):")?;
     for (i, span) in spans.into_iter().enumerate() {
         f.write_str(if i == 0 { " " } else { " > " })?;
@@ -401,7 +406,9 @@ mod tests {
         let mut done = Done(Some(lost));
         let (tx, rx) = crossbeam_channel::unbounded::<()>();
         pool.submit(None, move || _ = sched::wait(Wait::Key(lost)), move |_| _ = tx.send(()));
-        blaze_graph::spin::SpinWait::within("the job to park", Duration::from_secs(60), || pool.parked() == 1);
+        blaze_graph::spin::SpinWait::within("the job to park", Duration::from_secs(60), || {
+            pool.parked() == 1
+        });
         let bound = Duration::from_secs(10);
         let (mut by_jobs, mut by_spans) = (Watchdog::new(bound), Watchdog::new(bound));
         let (spans_before, mut now, mut said) = (flight::progress(), 0, None);
@@ -417,7 +424,8 @@ mod tests {
             assert!(rx.recv_timeout(Duration::from_millis(25)).is_err(), "the parked job ended");
         }
         assert!(flight::progress() > spans_before, "housekeeping spans closed throughout");
-        let quiet = said.expect("the stall is said within the bound, though housekeeping spans close on");
+        let quiet =
+            said.expect("the stall is said within the bound, though housekeeping spans close on");
         assert_eq!(quiet.for_ns, bound.as_nanos() as u64, "said at the bound: {quiet:?}");
         if let Some(key) = done.0.take() {
             sched::key_done(key);
@@ -476,13 +484,18 @@ mod tests {
         // Then nothing moves: said at the bound, with the counts where they stayed.
         assert_eq!(watchdog.tick(909 * SEC, progress, true), None);
         let quiet = watchdog.tick(910 * SEC, progress, true).expect("said at the bound");
-        assert_eq!(quiet, Quiet { since_ns: 900 * SEC, for_ns: 10 * SEC, at: progress, bound_ns: 10 * SEC });
+        assert_eq!(
+            quiet,
+            Quiet { since_ns: 900 * SEC, for_ns: 10 * SEC, at: progress, bound_ns: 10 * SEC }
+        );
     }
 
     #[test]
     fn a_stall_is_said_once_a_quiet_stretch_and_again_after_progress() {
         let at = |jobs| Progress { jobs, queries: 0, steps: 0, working: 0 };
-        let quiet = |since_ns, jobs| Some(Quiet { since_ns, for_ns: 10 * SEC, at: at(jobs), bound_ns: 10 * SEC });
+        let quiet = |since_ns, jobs| {
+            Some(Quiet { since_ns, for_ns: 10 * SEC, at: at(jobs), bound_ns: 10 * SEC })
+        };
         let mut watchdog = Watchdog::new(Duration::from_secs(10));
         assert_eq!(watchdog.bound(), Duration::from_secs(10));
         assert_eq!(watchdog.tick(0, at(5), true), None);
@@ -505,7 +518,9 @@ mod tests {
             std::thread::Builder::new()
                 .name("worker running".to_owned())
                 .spawn_scoped(scope, || {
-                    let _unit = tracing::info_span!(target: "blaze", "unit bodies", krate = "sonic-rs").entered();
+                    let _unit =
+                        tracing::info_span!(target: "blaze", "unit bodies", krate = "sonic-rs")
+                            .entered();
                     let _query = tracing::info_span!(
                         target: "blaze",
                         "infer_query",
@@ -515,7 +530,8 @@ mod tests {
                     .entered();
                     let awaits = crate::span::Name::of("trait_solve `T: Sized`");
                     let on = blaze_graph::wait::WaitKind::Key;
-                    let _wait = crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                    let _wait =
+                        crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
                     ready.wait();
                     let (released, cv) = &gate;
                     let mut released = released.lock();
@@ -529,7 +545,10 @@ mod tests {
             let text = running.to_string();
             *gate.0.lock() = true;
             gate.1.notify_all();
-            let line = text.lines().find(|it| it.contains("worker running")).unwrap_or_else(|| panic!("{text}"));
+            let line = text
+                .lines()
+                .find(|it| it.contains("worker running"))
+                .unwrap_or_else(|| panic!("{text}"));
             for said in [
                 "unit bodies of sonic-rs (",
                 "infer_query `sonic_rs::serde::de::Deserializer::parse`, unit sonic_rs.3 (",

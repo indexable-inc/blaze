@@ -5,7 +5,6 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::{Database as _, Setter as _};
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
@@ -18,6 +17,7 @@ use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode, AstToken, Element, Node},
@@ -48,7 +48,10 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
 #[blaze_query::tracked(returns(ref))]
-pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> HashMap<ExprId, HirFileId, Global> {
+pub fn location_macros<'db>(
+    db: &'db Db,
+    owner: DefWithBodyId,
+) -> HashMap<ExprId, HirFileId, Global> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
         return HashMap::new_in(Global);
@@ -125,11 +128,14 @@ pub fn location_caller(db: &Db, location: hir_def::StructId) -> Option<FunctionI
 /// The code generator makes such a constant itself and never builds its MIR; compile identity
 /// reads the same answer, so the two skip one set.
 pub fn mentions_location(db: &Db, owner: DefWithBodyId, expr: ExprId) -> bool {
-    if location_macros(db, owner).contains_key(&expr) || located_concats(db, owner).contains_key(&expr) {
+    if location_macros(db, owner).contains_key(&expr)
+        || located_concats(db, owner).contains_key(&expr)
+    {
         return true;
     }
     let mut found = false;
-    Body::of(db, owner).walk_child_exprs(expr, |child| found |= mentions_location(db, owner, child));
+    Body::of(db, owner)
+        .walk_child_exprs(expr, |child| found |= mentions_location(db, owner, child));
     found
 }
 
@@ -215,16 +221,26 @@ pub fn name_sources(
 
 /// What the build calls `file` in the code of `krate`, as `file!()` and `Location::file` say:
 /// none when the evaluator was not told ([`name_sources`]).
-pub fn source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileId) -> Option<&'db str> {
+pub fn source_path<'db>(
+    db: &'db Db,
+    krate: base_db::Crate,
+    file: base_db::FileId,
+) -> Option<&'db str> {
     file_source_path(db, krate, db.file_text(file))
 }
 
 #[blaze_query::tracked(returns(as_deref))]
-fn file_source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileText) -> Option<String> {
+fn file_source_path<'db>(
+    db: &'db Db,
+    krate: base_db::Crate,
+    file: base_db::FileText,
+) -> Option<String> {
     let Some(names) = SourceNames::try_get(db) else {
         blaze_query::db::report_untracked_read(
             db,
-            blaze_query::db::Untracked { what: "the absence of the `SourceNames` singleton (`name_sources` not told yet)" },
+            blaze_query::db::Untracked {
+                what: "the absence of the `SourceNames` singleton (`name_sources` not told yet)",
+            },
         );
         return None;
     };
@@ -252,13 +268,18 @@ fn named(db: &Db, krate: base_db::Crate, file: base_db::FileId) -> Result<&str, 
     )
 }
 
-fn placed_concat(db: &Db, krate: base_db::Crate, file_id: HirFileId) -> Result<String, &'static str> {
+fn placed_concat(
+    db: &Db,
+    krate: base_db::Crate,
+    file_id: HirFileId,
+) -> Result<String, &'static str> {
     use std::fmt::Write;
     let call = file_id.macro_file().ok_or("a `concat!` of `file!()` not in a macro file")?;
     let call = call.loc(db).to_node_view(db);
     // alloc: the value of the `concat!`, made only where one of a place is evaluated
     let mut text = String::new();
-    let parts = concat_parts(call.value).ok_or("a `concat!` of `file!()` whose arguments do not parse")?;
+    let parts =
+        concat_parts(call.value).ok_or("a `concat!` of `file!()` whose arguments do not parse")?;
     for part in parts {
         match part {
             ConcatPart::Text(part) => text.push_str(&part),
@@ -277,7 +298,8 @@ fn placed_concat(db: &Db, krate: base_db::Crate, file_id: HirFileId) -> Result<S
 }
 
 fn placed_file(db: &Db, krate: base_db::Crate, file_id: HirFileId) -> Result<String, &'static str> {
-    let site = written_call(db, file_id).ok_or("a `file!()` whose call is not written in the source")?;
+    let site =
+        written_call(db, file_id).ok_or("a `file!()` whose call is not written in the source")?;
     let range = InFile::new(site.file_id, written_range(site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
     let (file, _, _) = macro_location_of(db, file_id.into(), range)
@@ -412,7 +434,9 @@ pub fn files_read(db: &Db, owner: DefWithBodyId) -> Vec<base_db::FileId> {
         files.extend(location_macro_file(db, file_id));
     }
     for &file_id in located_concats(db, owner).values() {
-        let Some(call) = file_id.macro_file().map(|it| it.loc(db).to_node_view(db)) else { continue };
+        let Some(call) = file_id.macro_file().map(|it| it.loc(db).to_node_view(db)) else {
+            continue;
+        };
         for part in concat_parts(call.value).into_iter().flatten() {
             if let ConcatPart::Location(_, range) = part
                 && let Some((file, _, _)) = macro_location_of(db, call.file_id, range)
@@ -468,8 +492,9 @@ fn reported_file_range(db: &Db, file_id: HirFileId, range: TextRange) -> FileRan
     let own_tokens = file_id.macro_file().is_some()
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     match written_call(db, file_id) {
-        Some(call) if own_tokens => InFile::new(call.file_id, written_range(call.value))
-            .original_node_file_range_rooted(db),
+        Some(call) if own_tokens => {
+            InFile::new(call.file_id, written_range(call.value)).original_node_file_range_rooted(db)
+        }
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     }
 }
@@ -489,7 +514,11 @@ pub fn line_and_column(
 /// The file and range of a place in a body as rustc reports it (the range whose start
 /// [`source_location_in_file`] gives the line and column of), in the file it is written in,
 /// not a macro's expansion.
-pub fn source_file_range(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<(base_db::FileId, TextRange)> {
+pub fn source_file_range(
+    db: &Db,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(base_db::FileId, TextRange)> {
     let (file_id, range) = source_range(db, owner, span)?;
     let FileRange { file_id, range } = reported_file_range(db, file_id, range);
     Some((file_id.file_id(db), range))
@@ -658,7 +687,8 @@ mod tests {
         let read = ["a\n", "12", "c", "true"].map(|it| Ok(it.to_owned()));
         assert_eq!(parts(text).unwrap(), read);
         let text = r#"const C: &str = concat!("x", line!(), file! ( ));"#;
-        let read = vec![Ok("x".to_owned()), Err(range(text, "line!()")), Err(range(text, "file! ( )"))];
+        let read =
+            vec![Ok("x".to_owned()), Err(range(text, "line!()")), Err(range(text, "file! ( )"))];
         assert_eq!(parts(text), Some(read));
         assert_eq!(parts("const C: &str = concat!();"), Some(Vec::new()));
         assert_eq!(parts("const C: &str = concat!(,,);"), Some(Vec::new()));

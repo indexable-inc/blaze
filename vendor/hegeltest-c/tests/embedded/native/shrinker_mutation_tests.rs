@@ -30,25 +30,14 @@ fn int_value(node: &ChoiceNode) -> i128 {
 fn mutate_invests_random_attempts_when_a_late_branch_switch_is_realised() {
     let switched_probes = Arc::new(AtomicUsize::new(0));
     let switched_c = switched_probes.clone();
-    let initial = vec![
-        ranged_int_node(0, 1, 1),
-        ranged_int_node(0, 255, 0),
-        ranged_int_node(0, 7, 3),
-    ];
+    let initial =
+        vec![ranged_int_node(0, 1, 1), ranged_int_node(0, 255, 0), ranged_int_node(0, 7, 3)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(move |run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
                 let switched = int_value(&nodes[0]) == 0;
-                let last = if switched {
-                    ranged_int_node(0, 9999, 9999)
-                } else {
-                    nodes[2].clone()
-                };
-                (
-                    false,
-                    vec![nodes[0].clone(), nodes[1].clone(), last],
-                    Spans::new(),
-                )
+                let last = if switched { ranged_int_node(0, 9999, 9999) } else { nodes[2].clone() };
+                (false, vec![nodes[0].clone(), nodes[1].clone(), last], Spans::new())
             }
             ShrinkRun::Probe { prefix, .. } => {
                 if prefix.first() == Some(&ChoiceValue::Integer(BigInt::from(0))) {
@@ -101,11 +90,9 @@ fn mutate_observing_replay_accepts_an_interesting_smaller_run() {
     let initial = vec![ranged_int_node(0, 7, 3), ranged_int_node(0, 7, 7)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(move |run: ShrinkRun<'_>| match run {
-            ShrinkRun::Full(_) => (
-                true,
-                vec![ranged_int_node(0, 7, 0), ranged_int_node(0, 7, 0)],
-                Spans::new(),
-            ),
+            ShrinkRun::Full(_) => {
+                (true, vec![ranged_int_node(0, 7, 0), ranged_int_node(0, 7, 0)], Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
         initial,
@@ -166,16 +153,10 @@ fn the_observing_replay_stall_guard_yields_to_the_confirmation_sweep() {
     let snapshot = shrinker.current_nodes.clone();
     let new_val = ChoiceValue::Integer(BigInt::from(3));
     drive_no_yield(shrinker.replay_observing_divergence(&snapshot, &new_val, 0)).unwrap();
-    assert_eq!(
-        shrinker.calls, 0,
-        "a latched stall guard drops the fast-sweep observing replay"
-    );
+    assert_eq!(shrinker.calls, 0, "a latched stall guard drops the fast-sweep observing replay");
     shrinker.sweep = SweepMode::Confirm;
     drive_no_yield(shrinker.replay_observing_divergence(&snapshot, &new_val, 0)).unwrap();
-    assert_eq!(
-        shrinker.calls, 1,
-        "the confirmation sweep must execute the observing replay"
-    );
+    assert_eq!(shrinker.calls, 1, "the confirmation sweep must execute the observing replay");
 }
 
 #[test]

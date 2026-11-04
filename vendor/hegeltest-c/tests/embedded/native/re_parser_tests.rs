@@ -57,13 +57,7 @@ fn any_dot() {
 fn at_beginning_end() {
     assert_eq!(
         parsed("^abc$").data,
-        vec![
-            OpCode::At(AtCode::Beginning),
-            lit(97),
-            lit(98),
-            lit(99),
-            OpCode::At(AtCode::End),
-        ]
+        vec![OpCode::At(AtCode::Beginning), lit(97), lit(98), lit(99), OpCode::At(AtCode::End),]
     );
 }
 
@@ -71,10 +65,7 @@ fn at_beginning_end() {
 fn at_beginning_end_string() {
     assert_eq!(
         parsed("\\A\\Z").data,
-        vec![
-            OpCode::At(AtCode::BeginningString),
-            OpCode::At(AtCode::EndString),
-        ]
+        vec![OpCode::At(AtCode::BeginningString), OpCode::At(AtCode::EndString),]
     );
 }
 
@@ -82,10 +73,7 @@ fn at_beginning_end_string() {
 fn at_boundary() {
     assert_eq!(
         parsed("\\b\\B").data,
-        vec![
-            OpCode::At(AtCode::Boundary),
-            OpCode::At(AtCode::NonBoundary),
-        ]
+        vec![OpCode::At(AtCode::Boundary), OpCode::At(AtCode::NonBoundary),]
     );
 }
 
@@ -93,44 +81,25 @@ fn at_boundary() {
 fn char_class_literal_set() {
     assert_eq!(
         parsed("[abc]").data,
-        vec![OpCode::In(vec![
-            SetItem::Literal(97),
-            SetItem::Literal(98),
-            SetItem::Literal(99),
-        ])]
+        vec![OpCode::In(vec![SetItem::Literal(97), SetItem::Literal(98), SetItem::Literal(99),])]
     );
 }
 
 #[test]
 fn char_class_range() {
-    assert_eq!(
-        parsed("[a-z]").data,
-        vec![OpCode::In(vec![SetItem::Range(97, 122)])]
-    );
+    assert_eq!(parsed("[a-z]").data, vec![OpCode::In(vec![SetItem::Range(97, 122)])]);
 }
 
 #[test]
 fn char_class_range_with_escaped_endpoints() {
-    assert_eq!(
-        parsed(r"[\x41-Z]").data,
-        vec![OpCode::In(vec![SetItem::Range(0x41, 0x5A)])]
-    );
-    assert_eq!(
-        parsed(r"[\x00-\x1f]").data,
-        vec![OpCode::In(vec![SetItem::Range(0x00, 0x1F)])]
-    );
-    assert_eq!(
-        parsed(r"[\101-\172]").data,
-        vec![OpCode::In(vec![SetItem::Range(0o101, 0o172)])]
-    );
+    assert_eq!(parsed(r"[\x41-Z]").data, vec![OpCode::In(vec![SetItem::Range(0x41, 0x5A)])]);
+    assert_eq!(parsed(r"[\x00-\x1f]").data, vec![OpCode::In(vec![SetItem::Range(0x00, 0x1F)])]);
+    assert_eq!(parsed(r"[\101-\172]").data, vec![OpCode::In(vec![SetItem::Range(0o101, 0o172)])]);
     assert_eq!(
         parsed(r"[\--/]").data,
         vec![OpCode::In(vec![SetItem::Range(b'-' as u32, b'/' as u32)])]
     );
-    assert_eq!(
-        parsed(r"[a-￿]").data,
-        vec![OpCode::In(vec![SetItem::Range(97, 0xFFFF)])]
-    );
+    assert_eq!(parsed(r"[a-￿]").data, vec![OpCode::In(vec![SetItem::Range(97, 0xFFFF)])]);
 }
 
 #[test]
@@ -170,10 +139,7 @@ fn char_class_mixed_ranges() {
 fn char_class_with_category() {
     assert_eq!(
         parsed("[\\d\\s]").data,
-        vec![OpCode::In(vec![
-            SetItem::Category(ChCode::Digit),
-            SetItem::Category(ChCode::Space),
-        ])]
+        vec![OpCode::In(vec![SetItem::Category(ChCode::Digit), SetItem::Category(ChCode::Space),])]
     );
 }
 
@@ -194,11 +160,7 @@ fn char_class_leading_dash_literal() {
 fn char_class_escaped_dash() {
     assert_eq!(
         parsed("[a\\-z]").data,
-        vec![OpCode::In(vec![
-            SetItem::Literal(97),
-            SetItem::Literal(45),
-            SetItem::Literal(122),
-        ])]
+        vec![OpCode::In(vec![SetItem::Literal(97), SetItem::Literal(45), SetItem::Literal(122),])]
     );
 }
 
@@ -219,18 +181,12 @@ fn char_class_single_literal_negated() {
 
 #[test]
 fn digit_shortcut() {
-    assert_eq!(
-        parsed("\\d").data,
-        vec![OpCode::In(vec![SetItem::Category(ChCode::Digit)])]
-    );
+    assert_eq!(parsed("\\d").data, vec![OpCode::In(vec![SetItem::Category(ChCode::Digit)])]);
 }
 
 #[test]
 fn word_and_space_shortcuts() {
-    assert_eq!(
-        parsed("\\w").data,
-        vec![OpCode::In(vec![SetItem::Category(ChCode::Word)])]
-    );
+    assert_eq!(parsed("\\w").data, vec![OpCode::In(vec![SetItem::Category(ChCode::Word)])]);
     assert_eq!(
         parsed("\\s\\S").data,
         vec![
@@ -244,13 +200,7 @@ fn word_and_space_shortcuts() {
 fn max_repeat_plus() {
     assert_eq!(
         parsed("a+").data,
-        vec![OpCode::MaxRepeat {
-            min: 1,
-            max: u32::MAX,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 1, max: u32::MAX, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -258,13 +208,7 @@ fn max_repeat_plus() {
 fn max_repeat_star() {
     assert_eq!(
         parsed("a*").data,
-        vec![OpCode::MaxRepeat {
-            min: 0,
-            max: u32::MAX,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 0, max: u32::MAX, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -272,13 +216,7 @@ fn max_repeat_star() {
 fn max_repeat_question() {
     assert_eq!(
         parsed("a?").data,
-        vec![OpCode::MaxRepeat {
-            min: 0,
-            max: 1,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 0, max: 1, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -286,13 +224,7 @@ fn max_repeat_question() {
 fn max_repeat_braces_fixed() {
     assert_eq!(
         parsed("a{3}").data,
-        vec![OpCode::MaxRepeat {
-            min: 3,
-            max: 3,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 3, max: 3, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -300,13 +232,7 @@ fn max_repeat_braces_fixed() {
 fn max_repeat_braces_range() {
     assert_eq!(
         parsed("a{2,5}").data,
-        vec![OpCode::MaxRepeat {
-            min: 2,
-            max: 5,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 2, max: 5, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -314,13 +240,7 @@ fn max_repeat_braces_range() {
 fn max_repeat_braces_open_upper() {
     assert_eq!(
         parsed("a{3,}").data,
-        vec![OpCode::MaxRepeat {
-            min: 3,
-            max: u32::MAX,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 3, max: u32::MAX, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -328,13 +248,7 @@ fn max_repeat_braces_open_upper() {
 fn max_repeat_braces_open_lower() {
     assert_eq!(
         parsed("a{,5}").data,
-        vec![OpCode::MaxRepeat {
-            min: 0,
-            max: 5,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MaxRepeat { min: 0, max: 5, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -342,13 +256,7 @@ fn max_repeat_braces_open_lower() {
 fn min_repeat_plus_question() {
     assert_eq!(
         parsed("a+?").data,
-        vec![OpCode::MinRepeat {
-            min: 1,
-            max: u32::MAX,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
-        }]
+        vec![OpCode::MinRepeat { min: 1, max: u32::MAX, item: SubPattern { data: vec![lit(97)] } }]
     );
 }
 
@@ -359,9 +267,7 @@ fn possessive_repeat_double_plus() {
         vec![OpCode::PossessiveRepeat {
             min: 1,
             max: u32::MAX,
-            item: SubPattern {
-                data: vec![lit(97)]
-            },
+            item: SubPattern { data: vec![lit(97)] },
         }]
     );
 }
@@ -379,9 +285,7 @@ fn subpattern_capturing() {
             group: Some(1),
             add_flags: 0,
             del_flags: 0,
-            p: SubPattern {
-                data: vec![lit(97)]
-            },
+            p: SubPattern { data: vec![lit(97)] },
         }]
     );
 }
@@ -400,9 +304,7 @@ fn subpattern_named_group() {
             group: Some(1),
             add_flags: 0,
             del_flags: 0,
-            p: SubPattern {
-                data: vec![lit(97)]
-            },
+            p: SubPattern { data: vec![lit(97)] },
         }]
     );
 }
@@ -415,9 +317,7 @@ fn subpattern_inline_flags_scoped() {
             group: None,
             add_flags: 2,
             del_flags: 0,
-            p: SubPattern {
-                data: vec![lit(97), lit(98), lit(99)]
-            },
+            p: SubPattern { data: vec![lit(97), lit(98), lit(99)] },
         }]
     );
 }
@@ -430,9 +330,7 @@ fn subpattern_inline_flags_add_and_del() {
             group: None,
             add_flags: 2,
             del_flags: 16,
-            p: SubPattern {
-                data: vec![lit(97), lit(98), lit(99)]
-            },
+            p: SubPattern { data: vec![lit(97), lit(98), lit(99)] },
         }]
     );
 }
@@ -453,9 +351,7 @@ fn groupref_decimal() {
                 group: Some(1),
                 add_flags: 0,
                 del_flags: 0,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
+                p: SubPattern { data: vec![lit(97)] },
             },
             OpCode::GroupRef(1),
         ]
@@ -471,9 +367,7 @@ fn groupref_named() {
                 group: Some(1),
                 add_flags: 0,
                 del_flags: 0,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
+                p: SubPattern { data: vec![lit(97)] },
             },
             OpCode::GroupRef(1),
         ]
@@ -495,18 +389,12 @@ fn groupref_exists() {
                 group: Some(1),
                 add_flags: 0,
                 del_flags: 0,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
+                p: SubPattern { data: vec![lit(97)] },
             },
             OpCode::GroupRefExists {
                 cond_group: 1,
-                yes: SubPattern {
-                    data: vec![lit(98)]
-                },
-                no: Some(SubPattern {
-                    data: vec![lit(99)]
-                }),
+                yes: SubPattern { data: vec![lit(98)] },
+                no: Some(SubPattern { data: vec![lit(99)] }),
             },
         ]
     );
@@ -516,15 +404,7 @@ fn groupref_exists() {
 fn assert_lookahead() {
     assert_eq!(
         parsed("(?=a)b").data,
-        vec![
-            OpCode::Assert {
-                direction: 1,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
-            },
-            lit(98),
-        ]
+        vec![OpCode::Assert { direction: 1, p: SubPattern { data: vec![lit(97)] } }, lit(98),]
     );
 }
 
@@ -532,15 +412,7 @@ fn assert_lookahead() {
 fn assert_not_lookahead() {
     assert_eq!(
         parsed("(?!a)b").data,
-        vec![
-            OpCode::AssertNot {
-                direction: 1,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
-            },
-            lit(98),
-        ]
+        vec![OpCode::AssertNot { direction: 1, p: SubPattern { data: vec![lit(97)] } }, lit(98),]
     );
 }
 
@@ -548,15 +420,7 @@ fn assert_not_lookahead() {
 fn assert_lookbehind() {
     assert_eq!(
         parsed("(?<=a)b").data,
-        vec![
-            OpCode::Assert {
-                direction: -1,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
-            },
-            lit(98),
-        ]
+        vec![OpCode::Assert { direction: -1, p: SubPattern { data: vec![lit(97)] } }, lit(98),]
     );
 }
 
@@ -564,26 +428,13 @@ fn assert_lookbehind() {
 fn assert_not_lookbehind() {
     assert_eq!(
         parsed("(?<!a)b").data,
-        vec![
-            OpCode::AssertNot {
-                direction: -1,
-                p: SubPattern {
-                    data: vec![lit(97)]
-                },
-            },
-            lit(98),
-        ]
+        vec![OpCode::AssertNot { direction: -1, p: SubPattern { data: vec![lit(97)] } }, lit(98),]
     );
 }
 
 #[test]
 fn atomic_group() {
-    assert_eq!(
-        parsed("(?>a)").data,
-        vec![OpCode::AtomicGroup(SubPattern {
-            data: vec![lit(97)]
-        })]
-    );
+    assert_eq!(parsed("(?>a)").data, vec![OpCode::AtomicGroup(SubPattern { data: vec![lit(97)] })]);
 }
 
 #[test]
@@ -591,15 +442,9 @@ fn branch_three_way() {
     assert_eq!(
         parsed("ab|cd|ef").data,
         vec![OpCode::Branch(vec![
-            SubPattern {
-                data: vec![lit(97), lit(98)]
-            },
-            SubPattern {
-                data: vec![lit(99), lit(100)]
-            },
-            SubPattern {
-                data: vec![lit(101), lit(102)]
-            },
+            SubPattern { data: vec![lit(97), lit(98)] },
+            SubPattern { data: vec![lit(99), lit(100)] },
+            SubPattern { data: vec![lit(101), lit(102)] },
         ])]
     );
 }
@@ -608,11 +453,7 @@ fn branch_three_way() {
 fn branch_single_letters_collapse_to_set() {
     assert_eq!(
         parsed("a|b|c").data,
-        vec![OpCode::In(vec![
-            SetItem::Literal(97),
-            SetItem::Literal(98),
-            SetItem::Literal(99),
-        ])]
+        vec![OpCode::In(vec![SetItem::Literal(97), SetItem::Literal(98), SetItem::Literal(99),])]
     );
 }
 
@@ -620,11 +461,7 @@ fn branch_single_letters_collapse_to_set() {
 fn branch_shared_prefix_moved_out() {
     assert_eq!(
         parsed("abc|abd").data,
-        vec![
-            lit(97),
-            lit(98),
-            OpCode::In(vec![SetItem::Literal(99), SetItem::Literal(100),]),
-        ]
+        vec![lit(97), lit(98), OpCode::In(vec![SetItem::Literal(99), SetItem::Literal(100),]),]
     );
 }
 
@@ -675,11 +512,7 @@ fn err_unbalanced_close_paren() {
 #[test]
 fn err_unterminated_character_set() {
     let err = parse_err("[abc");
-    assert!(
-        err.msg.contains("unterminated character set"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("unterminated character set"), "{}", err.msg);
 }
 
 #[test]
@@ -691,11 +524,7 @@ fn err_bad_character_range() {
 #[test]
 fn err_min_repeat_greater_than_max() {
     let err = parse_err("a{5,2}");
-    assert!(
-        err.msg.contains("min repeat greater than max repeat"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("min repeat greater than max repeat"), "{}", err.msg);
 }
 
 #[test]
@@ -719,21 +548,13 @@ fn err_unknown_named_group() {
 #[test]
 fn err_redefinition_of_group_name() {
     let err = parse_err("(?P<foo>a)(?P<foo>b)");
-    assert!(
-        err.msg.contains("redefinition of group name"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("redefinition of group name"), "{}", err.msg);
 }
 
 #[test]
 fn err_bad_character_in_group_name() {
     let err = parse_err("(?P<1foo>a)");
-    assert!(
-        err.msg.contains("bad character in group name"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("bad character in group name"), "{}", err.msg);
 }
 
 #[test]
@@ -765,10 +586,7 @@ fn err_variable_width_lookbehind() {
         "(a*)(?<=\\1)b",
     ] {
         let err = parse_err(pattern);
-        assert_eq!(
-            err.msg, "look-behind requires fixed-width pattern",
-            "{pattern}"
-        );
+        assert_eq!(err.msg, "look-behind requires fixed-width pattern", "{pattern}");
         assert_eq!(err.pos, pattern.find("(?<").unwrap(), "{pattern}");
     }
     for pattern in [
@@ -801,11 +619,7 @@ fn err_unterminated_comment() {
 #[test]
 fn err_global_flags_not_at_start() {
     let err = parse_err("a(?i)b");
-    assert!(
-        err.msg.contains("global flags not at the start"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("global flags not at the start"), "{}", err.msg);
 }
 
 #[test]
@@ -841,12 +655,7 @@ fn err_unknown_p_extension_eof() {
 #[test]
 fn err_conditional_too_many_branches() {
     let err = parse_err("(?(1)a|b|c)");
-    assert!(
-        err.msg
-            .contains("conditional backref with more than two branches"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("conditional backref with more than two branches"), "{}", err.msg);
 }
 
 #[test]
@@ -859,21 +668,13 @@ fn err_too_many_groups() {
 #[test]
 fn err_open_group_self_reference() {
     let err = parse_err(r"(a\1)");
-    assert!(
-        err.msg.contains("cannot refer to an open group"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("cannot refer to an open group"), "{}", err.msg);
 }
 
 #[test]
 fn err_repeat_overflow() {
     let err = parse_err("a{99999999999}");
-    assert!(
-        err.msg.contains("the repetition number is too large"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("the repetition number is too large"), "{}", err.msg);
 }
 
 #[test]
@@ -921,11 +722,7 @@ fn err_class_bad_escape() {
 #[test]
 fn err_class_named_unicode_escape_not_supported() {
     let err = parse_err(r"[\N{LATIN SMALL LETTER A}]");
-    assert!(
-        err.msg.contains("named unicode escapes not yet supported"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("named unicode escapes not yet supported"), "{}", err.msg);
 }
 
 #[test]
@@ -1027,8 +824,7 @@ fn parses_verbose_mode() {
 fn err_lookbehind_refers_to_group_in_same_lookbehind() {
     let err = parse_err(r"(?<=(a)\1)");
     assert!(
-        err.msg
-            .contains("cannot refer to group defined in the same lookbehind"),
+        err.msg.contains("cannot refer to group defined in the same lookbehind"),
         "{}",
         err.msg
     );
@@ -1073,21 +869,13 @@ fn err_class_hex_escape_incomplete() {
 #[test]
 fn err_unterminated_class_bracket_only() {
     let err = parse_err("[");
-    assert!(
-        err.msg.contains("unterminated character set"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("unterminated character set"), "{}", err.msg);
 }
 
 #[test]
 fn err_unterminated_class_after_dash() {
     let err = parse_err("[a-");
-    assert!(
-        err.msg.contains("unterminated character set"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("unterminated character set"), "{}", err.msg);
 }
 
 #[test]
@@ -1230,11 +1018,7 @@ fn err_inline_flag_unknown_in_dash_group() {
 #[test]
 fn err_inline_flag_missing_colon_after_minus() {
     let err = parse_err("(?-i)");
-    assert!(
-        err.msg.contains("missing :") || err.msg.contains("missing -, : or )"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("missing :") || err.msg.contains("missing -, : or )"), "{}", err.msg);
 }
 
 #[test]
@@ -1247,42 +1031,26 @@ fn err_inline_flag_eof_after_qmark() {
 fn err_external_flag_locale_with_str() {
     use crate::native::re::constants::SRE_FLAG_LOCALE;
     let err = parse_pattern("abc", SRE_FLAG_LOCALE).unwrap_err();
-    assert!(
-        err.msg.contains("LOCALE flag with a str pattern"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("LOCALE flag with a str pattern"), "{}", err.msg);
 }
 
 #[test]
 fn err_external_flag_ascii_and_unicode() {
     use crate::native::re::constants::{SRE_FLAG_ASCII, SRE_FLAG_UNICODE};
     let err = parse_pattern("abc", SRE_FLAG_ASCII | SRE_FLAG_UNICODE).unwrap_err();
-    assert!(
-        err.msg.contains("ASCII and UNICODE flags are incompatible"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("ASCII and UNICODE flags are incompatible"), "{}", err.msg);
 }
 
 #[test]
 fn err_inline_flag_type_flag_conflict_global() {
     let err = parse_err("(?au)abc");
-    assert!(
-        err.msg.contains("flags 'a', 'u' and 'L' are incompatible"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("flags 'a', 'u' and 'L' are incompatible"), "{}", err.msg);
 }
 
 #[test]
 fn err_inline_flag_type_flag_conflict_scoped() {
     let err = parse_err("(?au:abc)");
-    assert!(
-        err.msg.contains("flags 'a', 'u' and 'L' are incompatible"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("flags 'a', 'u' and 'L' are incompatible"), "{}", err.msg);
 }
 
 #[test]
@@ -1294,11 +1062,7 @@ fn err_inline_flag_non_letter_after_first() {
 #[test]
 fn err_lookbehind_conditional_open_group() {
     let err = parse_err("((?<=(?(1)a|b)))");
-    assert!(
-        err.msg.contains("cannot refer to an open group"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("cannot refer to an open group"), "{}", err.msg);
 }
 
 #[test]
@@ -1328,11 +1092,7 @@ fn err_groupref_decimal_overflow() {
 #[test]
 fn err_decimal_backref_to_open_group_from_named() {
     let err = parse_err(r"(?P<foo>(?P=foo))");
-    assert!(
-        err.msg.contains("cannot refer to an open group"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("cannot refer to an open group"), "{}", err.msg);
 }
 
 #[test]
@@ -1344,11 +1104,7 @@ fn err_inline_flag_no_terminator() {
 #[test]
 fn err_repetition_too_large_braces() {
     let err = parse_err("a{9999999999999999999999}");
-    assert!(
-        err.msg.contains("repetition number is too large"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("repetition number is too large"), "{}", err.msg);
 }
 
 #[test]
@@ -1389,11 +1145,7 @@ fn err_inline_flag_global_unknown() {
 #[test]
 fn err_brace_repeat_overflow_lower() {
     let err = parse_err("a{99999999999999999999,5}");
-    assert!(
-        err.msg.contains("repetition number is too large"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("repetition number is too large"), "{}", err.msg);
 }
 
 #[test]
@@ -1410,11 +1162,7 @@ fn parses_verbose_global_flag_in_subpattern() {
 #[test]
 fn err_brace_repeat_max_overflow() {
     let err = parse_err("a{1,99999999999999999999}");
-    assert!(
-        err.msg.contains("repetition number is too large"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("repetition number is too large"), "{}", err.msg);
 }
 
 #[test]
@@ -1457,11 +1205,7 @@ fn parses_class_category_then_literal() {
 #[test]
 fn err_repeat_brace_max_exact_maxrepeat() {
     let err = parse_err("a{1,4294967295}");
-    assert!(
-        err.msg.contains("repetition number is too large"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("repetition number is too large"), "{}", err.msg);
 }
 
 #[test]
@@ -1533,9 +1277,7 @@ fn err_groupref_in_lookbehind_open_via_named_path() {
     let err = parse_err(r"(?<=(?P<foo>(?P=foo)))");
     assert!(
         err.msg.contains("cannot refer to an open group")
-            || err
-                .msg
-                .contains("cannot refer to group defined in the same lookbehind"),
+            || err.msg.contains("cannot refer to group defined in the same lookbehind"),
         "{}",
         err.msg
     );
@@ -1555,11 +1297,7 @@ fn err_conditional_named_unknown_named_after_first_group() {
 #[test]
 fn err_inline_flag_global_in_subgroup_via_partial_parse() {
     let err = parse_err("(?u)abc(?i)def");
-    assert!(
-        err.msg.contains("global flags not at the start"),
-        "{}",
-        err.msg
-    );
+    assert!(err.msg.contains("global flags not at the start"), "{}", err.msg);
 }
 
 #[test]
@@ -1614,17 +1352,10 @@ fn internal_error_converts_to_parse_error_with_bug_report_framing() {
 
 #[test]
 fn into_subpattern_extracts_only_subpattern_ops() {
-    let p = SubPattern {
-        data: vec![lit(97)],
-    };
+    let p = SubPattern { data: vec![lit(97)] };
     assert_eq!(
-        OpCode::Subpattern {
-            group: None,
-            add_flags: 0,
-            del_flags: 0,
-            p: p.clone()
-        }
-        .into_subpattern(),
+        OpCode::Subpattern { group: None, add_flags: 0, del_flags: 0, p: p.clone() }
+            .into_subpattern(),
         Some(p)
     );
     assert_eq!(lit(97).into_subpattern(), None);

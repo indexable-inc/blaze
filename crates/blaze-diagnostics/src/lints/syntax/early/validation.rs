@@ -60,7 +60,14 @@ impl Validation {
     }
 
     /// `node` of `tree`, the `index`th tree of the walk.
-    pub(super) fn node(&mut self, cx: &Cx<'_, '_>, tree: &Tree<'_>, index: u32, node: ast::Node<'_>, out: &mut Vec<Emitted>) {
+    pub(super) fn node(
+        &mut self,
+        cx: &Cx<'_, '_>,
+        tree: &Tree<'_>,
+        index: u32,
+        node: ast::Node<'_>,
+        out: &mut Vec<Emitted>,
+    ) {
         validate(cx, tree, node, out);
         self.parsed.check(cx, tree, index, node);
     }
@@ -72,7 +79,9 @@ impl Validation {
         for root in unseen.clone() {
             let range = root.text_range();
             // clone: a chain of two slice iterators, no allocation
-            let nested = unseen.clone().any(|it| it.text_range() != range && it.text_range().contains_range(range));
+            let nested = unseen
+                .clone()
+                .any(|it| it.text_range() != range && it.text_range().contains_range(range));
             if nested {
                 continue;
             }
@@ -93,7 +102,9 @@ fn validate(cx: &Cx<'_, '_>, tree: &Tree<'_>, node: ast::Node<'_>, out: &mut Vec
     match node.kind() {
         SyntaxKind::EXTERN_BLOCK => {
             let Some(block) = ast::ExternBlock::cast(node) else { return };
-            if block.unsafe_token().is_none() && cx.lint_may_fire(LintId::named("missing_unsafe_on_extern")) {
+            if block.unsafe_token().is_none()
+                && cx.lint_may_fire(LintId::named("missing_unsafe_on_extern"))
+            {
                 missing_unsafe_on_extern(cx, tree, node, out);
             }
             if let Some(abi) = block.abi() {
@@ -178,14 +189,20 @@ fn span(cx: &Cx<'_, '_>, tree: &Tree<'_>, range: TextRange) -> Span {
 
 /// `missing_unsafe_on_extern`: an `extern` block not marked `unsafe`, before Rust 2024 (in
 /// 2024 it is the error `extern blocks must be unsafe`).
-fn missing_unsafe_on_extern(cx: &Cx<'_, '_>, tree: &Tree<'_>, node: ast::Node<'_>, out: &mut Vec<Emitted>) {
+fn missing_unsafe_on_extern(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    node: ast::Node<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let range = item_range_view(node);
     if edition_at(cx, tree.file, range.start()).at_least_2024() {
         return;
     }
     let span = span(cx, tree, range);
     // clone: a lint's span, for a lint found
-    let mut diag = Diag::lint("missing_unsafe_on_extern", "extern blocks should be unsafe", span.clone());
+    let mut diag =
+        Diag::lint("missing_unsafe_on_extern", "extern blocks should be unsafe", span.clone());
     diag.suggestion(
         span.shrink_to_lo(),
         "needs `unsafe` before the extern keyword",
@@ -197,7 +214,13 @@ fn missing_unsafe_on_extern(cx: &Cx<'_, '_>, tree: &Tree<'_>, node: ast::Node<'_
 
 /// `missing_abi`: `extern` with no ABI, on an `extern` block, a function or a function pointer
 /// type `at`. rustc skips an `extern` whose span is an attribute's (a proc macro's tokens).
-fn missing_abi(cx: &Cx<'_, '_>, tree: &Tree<'_>, abi: ast::Abi<'_>, at: ast::Node<'_>, out: &mut Vec<Emitted>) {
+fn missing_abi(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    abi: ast::Abi<'_>,
+    at: ast::Node<'_>,
+    out: &mut Vec<Emitted>,
+) {
     if abi.string_token().is_some() {
         return;
     }
@@ -209,13 +232,23 @@ fn missing_abi(cx: &Cx<'_, '_>, tree: &Tree<'_>, abi: ast::Abi<'_>, at: ast::Nod
     let mut diag =
         // clone: a lint's span, for a lint found
         Diag::lint("missing_abi", "`extern` declarations without an explicit ABI are deprecated", span.clone());
-    diag.suggestion(span, "explicitly specify the \"C\" ABI", "extern \"C\"", Applicability::MachineApplicable);
+    diag.suggestion(
+        span,
+        "explicitly specify the \"C\" ABI",
+        "extern \"C\"",
+        Applicability::MachineApplicable,
+    );
     emit(cx, diag, Pass::Buffered, tree.ptr(at), tree.ptr(at), out);
 }
 
 /// `patterns_in_fns_without_body`: a `mut x` parameter of an associated function without a
 /// body (any other pattern there is the error E0642, of a foreign function E0130).
-fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree<'_>, item: ast::Fn<'_>, out: &mut Vec<Emitted>) {
+fn patterns_without_body(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    item: ast::Fn<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let Some(params) = item.param_list() else { return };
     let at = tree.ptr(item.syntax());
     let mut lint = |range: TextRange, name: ast::Name<'_>| {
@@ -226,7 +259,12 @@ fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree<'_>, item: ast::Fn<'_>, ou
             Diag::lint("patterns_in_fns_without_body", "patterns aren't allowed in functions without bodies", span.clone());
         let mut bare = String::with_capacity(name.text().len() + 2);
         pretty::push_ident(&mut bare, name.text(), edition);
-        diag.suggestion(span, "remove `mut` from the parameter", bare, Applicability::MachineApplicable);
+        diag.suggestion(
+            span,
+            "remove `mut` from the parameter",
+            bare,
+            Applicability::MachineApplicable,
+        );
         emit(cx, diag, Pass::Buffered, at, at, out);
     };
     if let Some(it) = params.self_param()
@@ -247,18 +285,27 @@ fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree<'_>, item: ast::Fn<'_>, ou
 
 /// `unused_visibilities`: a visibility on `const _`, when it and the `_` are of one syntax
 /// context (rustc's `eq_ctxt`: not a `pub` of a macro on a `_` its caller gave).
-fn unused_visibility(cx: &Cx<'_, '_>, tree: &Tree<'_>, item: ast::Const<'_>, out: &mut Vec<Emitted>) {
+fn unused_visibility(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    item: ast::Const<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let Some(underscore) = item.underscore_token() else { return };
     let Some(vis) = item.visibility() else { return };
     let vis_range = vis.syntax().text_range();
-    if ctxt_at(cx, tree.file, underscore.text_range().start()) != ctxt_at(cx, tree.file, vis_range.start()) {
+    if ctxt_at(cx, tree.file, underscore.text_range().start())
+        != ctxt_at(cx, tree.file, vis_range.start())
+    {
         return;
     }
     let span = span(cx, tree, vis_range);
     let mut diag =
         // clone: a lint's span, for a lint found
         Diag::lint("unused_visibilities", "visibility qualifiers have no effect on `const _` declarations", span.clone());
-    diag.note("`const _` does not declare a name, so there is nothing for the qualifier to apply to");
+    diag.note(
+        "`const _` does not declare a name, so there is nothing for the qualifier to apply to",
+    );
     diag.suggestion_with_style(
         // alloc: the lint's text, for a lint found
         vec![(span, String::new())],
@@ -272,7 +319,12 @@ fn unused_visibility(cx: &Cx<'_, '_>, tree: &Tree<'_>, item: ast::Const<'_>, out
 /// `deprecated_where_clause_location`: an associated type with a `where` clause before its
 /// `= Type`, with rustc's suggestion to move its predicates after the type (or, when there are
 /// none and a `where` is already there, to remove it).
-fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree<'_>, alias: ast::TypeAlias<'_>, out: &mut Vec<Emitted>) {
+fn where_clause_location(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    alias: ast::TypeAlias<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let mut clauses = alias.syntax().children().filter(|it| it.kind() == SyntaxKind::WHERE_CLAUSE);
     let Some(before) = clauses.next() else { return };
     let (Some(eq), Some(ty)) = (alias.eq_token(), alias.ty()) else { return };
@@ -285,8 +337,14 @@ fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree<'_>, alias: ast::TypeAlias
     let after = clauses.next().and_then(ast::WhereClause::cast);
     let span = span(cx, tree, range);
     // clone: a lint's span, for a lint found
-    let mut diag = Diag::lint("deprecated_where_clause_location", "where clause not allowed here", span.clone());
-    diag.note("see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information");
+    let mut diag = Diag::lint(
+        "deprecated_where_clause_location",
+        "where clause not allowed here",
+        span.clone(),
+    );
+    diag.note(
+        "see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information",
+    );
     let has_predicates = before.predicates().next().is_some();
     if has_predicates || after.is_none() {
         let edition = edition_at(cx, tree.file, range.start());
@@ -334,7 +392,12 @@ fn extended_back_over_white_space(cx: &Cx<'_, '_>, span: &Span) -> Span {
 
 /// `non_camel_case_types` of a type parameter, which rustc checks as its early lint pass comes
 /// to it (`check_generic_param`), its level decided by the parameter's attributes.
-fn type_param_case(cx: &Cx<'_, '_>, tree: &Tree<'_>, param: ast::TypeParam<'_>, out: &mut Vec<Emitted>) {
+fn type_param_case(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    param: ast::TypeParam<'_>,
+    out: &mut Vec<Emitted>,
+) {
     let Some(name) = param.name() else { return };
     let written = name.text();
     let name_str = written.strip_prefix("r#").unwrap_or(written);
@@ -351,7 +414,12 @@ fn type_param_case(cx: &Cx<'_, '_>, tree: &Tree<'_>, param: ast::TypeParam<'_>, 
     );
     let camel = to_upper_camel_case(name_str);
     if camel != name_str {
-        diag.suggestion(span, "convert the identifier to upper camel case", camel, Applicability::MaybeIncorrect);
+        diag.suggestion(
+            span,
+            "convert the identifier to upper camel case",
+            camel,
+            Applicability::MaybeIncorrect,
+        );
     } else {
         diag.span_label(span, "should have an UpperCamelCase name");
     }

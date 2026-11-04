@@ -59,7 +59,8 @@ impl ScopeLevels {
 
     /// The level of `lint` here: rustc's `reveal_actual_level`, with `warnings` and the cap.
     pub fn level(&self, lint: LintId) -> Level {
-        reveal(lint.lint(), self.raw(lint), self.raw(LintId::WARNINGS), self.edition, self.cap).level
+        reveal(lint.lint(), self.raw(lint), self.raw(LintId::WARNINGS), self.edition, self.cap)
+            .level
     }
 }
 
@@ -118,7 +119,10 @@ impl std::fmt::Display for LevelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LevelError::NoSyntax { owner, expr } => {
-                write!(f, "no lint level at {expr:?} of {owner:?}: the expression is desugared and has no syntax")
+                write!(
+                    f,
+                    "no lint level at {expr:?} of {owner:?}: the expression is desugared and has no syntax"
+                )
             }
         }
     }
@@ -134,9 +138,16 @@ impl std::error::Error for LevelError {}
 /// none has any (nearly always), this is [`lint_levels_on`] of the item. A desugared `expr`,
 /// which has no syntax, is [`LevelError::NoSyntax`], never the item's level: an attribute
 /// between them would be missed.
-pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId>, lint: LintId) -> Result<Level, LevelError> {
+pub fn lint_level_at(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: Option<ExprId>,
+    lint: LintId,
+) -> Result<Level, LevelError> {
     let Some(expr) = expr else { return Ok(lint_levels_on(db, owner, ()).level(lint)) };
-    let Some(node) = expr_node(db, owner, expr) else { return Err(LevelError::NoSyntax { owner, expr }) };
+    let Some(node) = expr_node(db, owner, expr) else {
+        return Err(LevelError::NoSyntax { owner, expr });
+    };
     let krate = owner.krate(db);
     let item = attrs::key(owner_node(db, owner));
     let cfg = krate.cfg_options(db);
@@ -147,7 +158,9 @@ pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId
         if attrs::key(here) == item {
             break;
         }
-        if attrs::owner(here.value, false).is_some_and(|it| !attrs::read(it, cfg, edition).is_empty()) {
+        if attrs::owner(here.value, false)
+            .is_some_and(|it| !attrs::read(it, cfg, edition).is_empty())
+        {
             attributed = true;
             break;
         }
@@ -163,7 +176,11 @@ pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId
 }
 
 /// The node of `expr` of `owner`'s store, none for a desugared one.
-fn expr_node(db: &Db, owner: ExpressionStoreOwnerId, expr: ExprId) -> Option<InFile<ast::Node<'_>>> {
+fn expr_node(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> Option<InFile<ast::Node<'_>>> {
     let (_, map) = ExpressionStore::with_source_map(db, owner);
     let source = map.expr_syntax(expr).ok()?;
     let ptr = SyntaxNodePtr::from(source.value);

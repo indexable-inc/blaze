@@ -290,7 +290,11 @@ pub fn in_place() -> Box<[u8; 8192]> { Box::new([0; 8192]) }
 pub fn small() -> Box<[u8; 64]> { Box::new([0; 64]) }
 "#,
     );
-    assert_eq!(found.matches("built on the stack, then copied into the heap").count(), 1, "{found}");
+    assert_eq!(
+        found.matches("built on the stack, then copied into the heap").count(),
+        1,
+        "{found}"
+    );
     assert!(found.contains("(8192 bytes)"), "{found}");
     assert!(found.contains("new_uninit"), "{found}");
 }
@@ -309,7 +313,11 @@ struct Flagged { x: f32, on: bool }
 impl serde::Serialize for Flagged {}
 "#,
     );
-    assert_eq!(found.matches("goes through serde's `Serialize` field by field").count(), 1, "{found}");
+    assert_eq!(
+        found.matches("goes through serde's `Serialize` field by field").count(),
+        1,
+        "{found}"
+    );
     assert!(found.contains("`Point` is `#[repr(C)]`"), "{found}");
 }
 
@@ -351,7 +359,10 @@ pub fn unmarked(v: &[u32], i: usize) -> u32 {
 "#,
     );
     assert_eq!(found.matches("is `#[blaze::checkfree]`").count(), 1, "{found}");
-    assert!(found.contains("`pick` is `#[blaze::checkfree]`, but a bounds check at `v[i]` stays"), "{found}");
+    assert!(
+        found.contains("`pick` is `#[blaze::checkfree]`, but a bounds check at `v[i]` stays"),
+        "{found}"
+    );
     assert!(found.contains("src/lib.rs:3:"), "the index's line:\n{found}");
 }
 

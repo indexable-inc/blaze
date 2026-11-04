@@ -191,9 +191,7 @@ impl Arena {
         let reserved = region.reserved();
         // SAFETY: the region is fresh, committed for `bytes >= size_of::<Large>()` and
         // page-aligned, so its start holds a `Large`; nothing else knows of it yet.
-        unsafe {
-            node.write(Large { next: ptr::null_mut(), region: ManuallyDrop::new(region) })
-        };
+        unsafe { node.write(Large { next: ptr::null_mut(), region: ManuallyDrop::new(region) }) };
         let mut head = self.large.load(Ordering::Relaxed);
         loop {
             // SAFETY: `node` is ours until the swap below publishes it.
@@ -374,7 +372,11 @@ impl<'a> ArenaLocal<'a> {
 
     #[inline]
     #[track_caller]
-    pub fn alloc_slice_fill_with<T>(&self, len: usize, mut f: impl FnMut(usize) -> T) -> &'a mut [T] {
+    pub fn alloc_slice_fill_with<T>(
+        &self,
+        len: usize,
+        mut f: impl FnMut(usize) -> T,
+    ) -> &'a mut [T] {
         let slots = self.alloc_uninit_slice::<T>(len);
         for (i, slot) in slots.iter_mut().enumerate() {
             slot.write(f(i));

@@ -1928,13 +1928,19 @@ impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
         &self,
         _: &Db,
         hir_expand::proc_macro::ProcMacroCall { call_site, .. }: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError>
+    {
         let text = format!(
             "macro_rules! ignore {{ ($($t:tt)*) => {{}}; }} ignore! {{ {} }} pub struct Big;",
             "0 ".repeat(2_200_000)
         );
-        let tree = syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call_site, &text).unwrap();
-        Ok(hir_expand::proc_macro::Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
+        let tree =
+            syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call_site, &text)
+                .unwrap();
+        Ok(hir_expand::proc_macro::Expanded::untraced(
+            tree,
+            "a test's proc macro, which traces nothing of what it read",
+        ))
     }
 
     // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
@@ -1991,7 +1997,8 @@ fn include_of_a_file_outside_every_source_root_is_read_from_disk() {
     let dir = std::env::temp_dir().join(format!("blaze-include-outside-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("the temporary directory");
     let code = dir.join("code.rs");
-    std::fs::write(&code, "pub fn far() {}\npub mod inner { include!(\"nested.rs\"); }\n").expect("code.rs");
+    std::fs::write(&code, "pub fn far() {}\npub mod inner { include!(\"nested.rs\"); }\n")
+        .expect("code.rs");
     std::fs::write(dir.join("nested.rs"), "pub struct Nested;\n").expect("nested.rs");
     let path = code.to_str().expect("a UTF-8 temporary path");
     let text = format!(

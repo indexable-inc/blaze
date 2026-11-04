@@ -37,15 +37,10 @@ fn every_move_on_a_nested_list_is_a_copy_between_start_nodes_or_a_duplicated_ite
     let moves: Vec<Move> = (0..all.len()).map(|k| all.get(k)).collect();
     let distinct: HashSet<Move> = moves.iter().copied().collect();
     assert_eq!(distinct.len(), moves.len());
-    let texts: HashSet<String> = moves
-        .into_iter()
-        .map(|mv| text_of(&apply(&layout, &text, mv)))
-        .collect();
+    let texts: HashSet<String> =
+        moves.into_iter().map(|mv| text_of(&apply(&layout, &text, mv))).collect();
     for expected in ["[x,[x],[x]]", "[x,[xx]]", "x", "[x,[x,[x]]]", "[[x],[x]]"] {
-        assert!(
-            texts.contains(expected),
-            "{expected} missing from {texts:?}"
-        );
+        assert!(texts.contains(expected), "{expected} missing from {texts:?}");
     }
 }
 
@@ -68,10 +63,8 @@ fn a_duplicated_repetition_keeps_the_text_separating_it_from_its_neighbour() {
 fn a_lone_repetition_is_duplicated_as_it_is() {
     let (_, layout, text) = laid_out(WORDS, "ab");
     let all = Moves::of(&layout);
-    let grown: Vec<String> = (0..all.len())
-        .map(|k| all.get(k))
-        .map(|mv| text_of(&apply(&layout, &text, mv)))
-        .collect();
+    let grown: Vec<String> =
+        (0..all.len()).map(|k| all.get(k)).map(|mv| text_of(&apply(&layout, &text, mv))).collect();
     assert_eq!(grown, ["abab"]);
 }
 
@@ -93,10 +86,7 @@ fn growing_proposes_a_changed_text_or_nothing() {
     assert!(none > 0, "copying one x over the other changes nothing");
     assert!(seen.len() >= 5, "{seen:?}");
     assert!(seen.iter().any(|s| constraint.accepts(&cps(s))));
-    assert!(
-        seen.iter().any(|s| !constraint.accepts(&cps(s))),
-        "{seen:?}"
-    );
+    assert!(seen.iter().any(|s| !constraint.accepts(&cps(s))), "{seen:?}");
 
     let (_, layout, text) = laid_out("start: \"x\"\n", "x");
     assert_eq!(grow(&layout, &text, &mut rng), None);

@@ -15,11 +15,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
-pub use super::unix::{
-    Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
-};
 use super::Rights;
 use super::unix::protection;
+pub use super::unix::{
+    Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize,
+    wait_answer,
+};
 use crate::channel::Channel;
 use crate::frame::{self, kinds};
 use crate::handshake::Overlay;
@@ -40,7 +41,9 @@ fn ctr() -> u64 {
     let ctr: u64;
     // SAFETY: Linux lets EL0 read CTR_EL0 (SCTLR_EL1.UCT, or it traps and emulates it); the
     // read touches no memory.
-    unsafe { std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags))
+    };
     ctr
 }
 
@@ -69,7 +72,9 @@ pub fn check_icache() -> Result<(), Error> {
                 page()
             )));
         }
-        Err(Error::new(format!("CTR_EL0 {ctr:#x} reports an instruction cache policy {l1ip:#b} with aliases")))
+        Err(Error::new(format!(
+            "CTR_EL0 {ctr:#x} reports an instruction cache policy {l1ip:#b} with aliases"
+        )))
     }
     #[cfg(target_arch = "x86_64")]
     Ok(())
@@ -80,7 +85,9 @@ pub fn check_icache() -> Result<(), Error> {
 fn icache_way() -> Result<u64, String> {
     for index in 0..8 {
         let dir = format!("/sys/devices/system/cpu/cpu0/cache/index{index}");
-        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}")).map(|it| it.trim().to_owned());
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("{dir}/{name}")).map(|it| it.trim().to_owned())
+        };
         let Ok(kind) = read("type") else { break };
         if kind != "Instruction" || !read("level").is_ok_and(|it| it == "1") {
             continue;
@@ -91,7 +98,10 @@ fn icache_way() -> Result<u64, String> {
             .map(|it| it.parse::<u64>().map(|it| it << 10))
             .unwrap_or_else(|| size.parse())
             .map_err(|_| format!("{dir}/size is {size}"))?;
-        let ways: u64 = read("ways_of_associativity").map_err(|it| it.to_string())?.parse().map_err(|_| format!("{dir}/ways_of_associativity"))?;
+        let ways: u64 = read("ways_of_associativity")
+            .map_err(|it| it.to_string())?
+            .parse()
+            .map_err(|_| format!("{dir}/ways_of_associativity"))?;
         if ways == 0 {
             return Err(format!("{dir} has no ways"));
         }
@@ -107,23 +117,34 @@ pub struct Object {
 
 impl Object {
     pub fn create(name: &str, len: u64) -> Result<Object, Error> {
-        let name = CString::new(format!("blaze-inproc:{name}")).map_err(|_| Error::new(format!("a memory object named {name:?}")))?;
+        let name = CString::new(format!("blaze-inproc:{name}"))
+            .map_err(|_| Error::new(format!("a memory object named {name:?}")))?;
         // SAFETY: `name` is a NUL-terminated string live for the call.
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
         if fd < 0 {
             let error = std::io::Error::last_os_error();
-            let hint = if error.raw_os_error() == Some(libc::EACCES) { " (vm.memfd_noexec is 2?)" } else { "" };
+            let hint = if error.raw_os_error() == Some(libc::EACCES) {
+                " (vm.memfd_noexec is 2?)"
+            } else {
+                ""
+            };
             return Err(Error::new(format!("memfd_create: {error}{hint}")));
         }
         // SAFETY: `fd` was just made and is owned by nothing else.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let size = libc::off_t::try_from(len).map_err(|_| Error::new(format!("a memory object of {len} bytes")))?;
+        let size = libc::off_t::try_from(len)
+            .map_err(|_| Error::new(format!("a memory object of {len} bytes")))?;
         // SAFETY: `fd` is an open memfd.
         if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
             return Err(os(&format!("sizing a memory object to {len:#x} bytes")));
         }
         // SAFETY: `fd` is an open memfd made with MFD_ALLOW_SEALING.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW) } != 0 {
+        if unsafe {
+            libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW)
+        } != 0
+        {
             return Err(os("sealing a memory object's size"));
         }
         Ok(Object { fd, len })
@@ -134,7 +155,10 @@ impl Object {
     }
 
     pub fn duplicate(&self) -> Result<Object, Error> {
-        let fd = self.fd.try_clone().map_err(|it| Error::new(format!("duplicating a memory object: {it}")))?;
+        let fd = self
+            .fd
+            .try_clone()
+            .map_err(|it| Error::new(format!("duplicating a memory object: {it}")))?;
         Ok(Object { fd, len: self.len })
     }
 
@@ -144,7 +168,8 @@ impl Object {
 
     /// A descriptor of the object opened read-only: what maps it can't write it shared.
     fn read_only(&self) -> Result<OwnedFd, Error> {
-        let path = CString::new(format!("/proc/self/fd/{}", self.fd.as_raw_fd())).map_err(|_| Error::new("a /proc path"))?;
+        let path = CString::new(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+            .map_err(|_| Error::new("a /proc path"))?;
         // SAFETY: `path` is a NUL-terminated string live for the call.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
@@ -213,18 +238,28 @@ impl View {
         }
         // SAFETY: as for `bytes`, and `&mut self` makes this the only borrow; the mapping is
         // writable (checked above).
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.at.add(range.start), range.end - range.start) })
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(self.at.add(range.start), range.end - range.start)
+        })
     }
 
     pub fn word(&self, at: usize) -> &AtomicU64 {
-        assert!(at.is_multiple_of(8) && at + 8 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
+        assert!(
+            at.is_multiple_of(8) && at + 8 <= self.len,
+            "a word at {at:#x} of a view of {:#x}",
+            self.len
+        );
         // SAFETY: `at` is 8-aligned and in the mapping (asserted), page-aligned itself, so the
         // word is aligned; every access to the word, in this process and others, is atomic.
         unsafe { AtomicU64::from_ptr(self.at.add(at).cast()) }
     }
 
     pub fn word32(&self, at: usize) -> &AtomicU32 {
-        assert!(at.is_multiple_of(4) && at + 4 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
+        assert!(
+            at.is_multiple_of(4) && at + 4 <= self.len,
+            "a word at {at:#x} of a view of {:#x}",
+            self.len
+        );
         // SAFETY: as for `word`, 4-aligned.
         unsafe { AtomicU32::from_ptr(self.at.add(at).cast()) }
     }
@@ -258,7 +293,9 @@ unsafe fn sync_icache(start: usize, end: usize) {
             while at < end {
                 // SAFETY: `at` is in `start..end` rounded down to a line that starts in it,
                 // mapped (the caller's contract); `dc cvau` cleans the line and changes no value.
-                unsafe { std::arch::asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags)) };
+                unsafe {
+                    std::arch::asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags))
+                };
                 at += dline;
             }
         }
@@ -269,7 +306,9 @@ unsafe fn sync_icache(start: usize, end: usize) {
             while at < end {
                 // SAFETY: as above; `ic ivau` invalidates instruction cache lines for the
                 // physical memory of `at`, which every view of it shares.
-                unsafe { std::arch::asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags)) };
+                unsafe {
+                    std::arch::asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags))
+                };
                 at += iline;
             }
             // SAFETY: a barrier, as above.
@@ -309,7 +348,11 @@ impl Drop for Exec {
 }
 
 impl Exec {
-    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(
+        code: usize,
+        data: usize,
+        write: impl FnOnce(&mut [u8], &mut [u8]),
+    ) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let len = code_pages + data.next_multiple_of(page);
@@ -332,12 +375,19 @@ impl Exec {
         // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
         // disjoint and in it. `write` can't keep them past its return (they borrow for the call).
         let (code_bytes, data_bytes) = unsafe {
-            (std::slice::from_raw_parts_mut(exec.at, code), std::slice::from_raw_parts_mut(exec.at.add(code_pages), data))
+            (
+                std::slice::from_raw_parts_mut(exec.at, code),
+                std::slice::from_raw_parts_mut(exec.at.add(code_pages), data),
+            )
         };
         write(code_bytes, data_bytes);
         // SAFETY: the code's pages of the mapping above, which nothing writes from here on.
-        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
-            return Err(os(&format!("mprotect of {code_pages:#x} bytes of code to read and execute")));
+        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) }
+            != 0
+        {
+            return Err(os(&format!(
+                "mprotect of {code_pages:#x} bytes of code to read and execute"
+            )));
         }
         // SAFETY: the code's pages, mapped readable.
         unsafe { sync_icache(exec.at as usize, exec.at as usize + code) };
@@ -369,10 +419,15 @@ fn mapping(access: Access) -> c_int {
 /// The first `len` bytes of `fd` mapped wherever the kernel finds room, for the rest of the
 /// mapping's owner.
 fn map_anywhere(fd: RawFd, len: u64, access: Access) -> Result<u64, Error> {
-    let len_usize = usize::try_from(len).ok().filter(|it| *it != 0).ok_or_else(|| Error::new(format!("a map of {len:#x} bytes")))?;
+    let len_usize = usize::try_from(len)
+        .ok()
+        .filter(|it| *it != 0)
+        .ok_or_else(|| Error::new(format!("a map of {len:#x} bytes")))?;
     // SAFETY: `fd` is an open memory object; with no address the kernel picks free space, so
     // nothing of this process is replaced.
-    let mapped = unsafe { libc::mmap(std::ptr::null_mut(), len_usize, protection(access), mapping(access), fd, 0) };
+    let mapped = unsafe {
+        libc::mmap(std::ptr::null_mut(), len_usize, protection(access), mapping(access), fd, 0)
+    };
     if mapped == libc::MAP_FAILED {
         return Err(os(&format!("mmap of {len:#x} bytes")));
     }
@@ -397,17 +452,27 @@ impl Remote {
     }
 
     pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
-        Err(Error::new(format!("a start hook asked the daemon to map object {object}: on Linux the hook maps it")))
+        Err(Error::new(format!(
+            "a start hook asked the daemon to map object {object}: on Linux the hook maps it"
+        )))
     }
 
     pub fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
-        Err(Error::new("a start hook asked the daemon to lay its overlays: on Linux the hook lays them"))
+        Err(Error::new(
+            "a start hook asked the daemon to lay its overlays: on Linux the hook lays them",
+        ))
     }
 
     pub fn kill(&self) -> Result<(), Error> {
         // SAFETY: `process` is an open pidfd; no siginfo, no flags.
         let sent = unsafe {
-            libc::syscall(libc::SYS_pidfd_send_signal, self.process.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0u32)
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.process.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
         };
         if sent != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             return Err(os("pidfd_send_signal"));
@@ -427,27 +492,54 @@ pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     // low half on these little-endian targets, which the kernel reads atomically; `time` is
     // live for the call; FUTEX_WAIT reads nothing else.
     let got = unsafe {
-        libc::syscall(libc::SYS_futex, word.as_ptr().cast::<u32>(), libc::FUTEX_WAIT, expected, &raw const time, 0usize, 0u32)
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr().cast::<u32>(),
+            libc::FUTEX_WAIT,
+            expected,
+            &raw const time,
+            0usize,
+            0u32,
+        )
     };
     got == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ETIMEDOUT)
 }
 
 pub fn wake(word: &AtomicU64) {
     // SAFETY: as in `wait`; FUTEX_WAKE reads nothing of the word.
-    unsafe { libc::syscall(libc::SYS_futex, word.as_ptr().cast::<u32>(), libc::FUTEX_WAKE, i32::MAX, 0usize, 0usize, 0u32) };
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr().cast::<u32>(),
+            libc::FUTEX_WAKE,
+            i32::MAX,
+            0usize,
+            0usize,
+            0u32,
+        )
+    };
 }
 
-pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+pub fn send_objects(
+    channel: &mut Channel,
+    pid: u32,
+    grant: &[u8],
+    objects: &[(&Object, Rights)],
+) -> Result<Remote, Error> {
     let remote = Remote::of(pid)?;
     let mut fds: Vec<OwnedFd> = Vec::with_capacity(objects.len());
     for (object, rights) in objects {
         fds.push(match rights {
             Rights::Code => object.read_only()?,
-            Rights::Words => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
+            Rights::Words => object
+                .fd
+                .try_clone()
+                .map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
         });
     }
     let mut bytes = Vec::with_capacity(frame::HEADER + grant.len());
-    frame::encode(kinds::GRANT, 0, grant, &mut bytes).map_err(|it| Error::new(format!("the grant: {it}")))?;
+    frame::encode(kinds::GRANT, 0, grant, &mut bytes)
+        .map_err(|it| Error::new(format!("the grant: {it}")))?;
     let raw: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
     if raw.len() > super::unix::MOST_FDS {
         return Err(Error::new(format!(
@@ -468,10 +560,9 @@ pub struct Granted {
 pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error> {
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
-        let fd = channel
-            .stream()
-            .take_fd()
-            .ok_or_else(|| Error::new(format!("the grant came with {index} descriptors of {count}")))?;
+        let fd = channel.stream().take_fd().ok_or_else(|| {
+            Error::new(format!("the grant came with {index} descriptors of {count}"))
+        })?;
         // SAFETY: a zeroed `stat` is a valid one: plain integers.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is open; `stat` is live and writable.
@@ -501,16 +592,24 @@ impl Granted {
 pub fn granted(object: &Object, rights: Rights) -> Result<Granted, Error> {
     let fd = match rights {
         Rights::Code => object.read_only()?,
-        Rights::Words => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
+        Rights::Words => object
+            .fd
+            .try_clone()
+            .map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
     };
     Ok(Granted { fd, len: object.len })
 }
 
-pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+pub fn overlay(
+    _: &mut Channel,
+    objects: &[Granted],
+    overlays: &[Overlay],
+    slide: u64,
+) -> Result<(), Error> {
     for overlay in overlays {
-        let object = objects
-            .get(overlay.object as usize)
-            .ok_or_else(|| Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len())))?;
+        let object = objects.get(overlay.object as usize).ok_or_else(|| {
+            Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len()))
+        })?;
         if overlay.offset.checked_add(overlay.len).is_none_or(|end| end > object.len) {
             return Err(Error::new(format!(
                 "an overlay of {:#x} bytes at offset {:#x} of an object of {:#x}",
@@ -518,7 +617,8 @@ pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide
             )));
         }
         let at = overlay.at.wrapping_add(slide);
-        let len = usize::try_from(overlay.len).map_err(|_| Error::new(format!("an overlay of {:#x} bytes", overlay.len)))?;
+        let len = usize::try_from(overlay.len)
+            .map_err(|_| Error::new(format!("an overlay of {:#x} bytes", overlay.len)))?;
         let offset = libc::off_t::try_from(overlay.offset)
             .map_err(|_| Error::new(format!("an overlay at offset {:#x}", overlay.offset)))?;
         // SAFETY: `at..at + len` is, by `Grant::check` against the headers the system loader
@@ -538,7 +638,10 @@ pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide
             )
         };
         if mapped == libc::MAP_FAILED {
-            return Err(os(&format!("mmap of {len:#x} bytes of object {} over {at:#x}", overlay.object)));
+            return Err(os(&format!(
+                "mmap of {len:#x} bytes of object {} over {at:#x}",
+                overlay.object
+            )));
         }
     }
     Ok(())
@@ -546,7 +649,11 @@ pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide
 
 pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
     /// The executable's first `PT_LOAD`'s address and its bytes from the file.
-    unsafe extern "C" fn first(info: *mut libc::dl_phdr_info, _: usize, data: *mut c_void) -> c_int {
+    unsafe extern "C" fn first(
+        info: *mut libc::dl_phdr_info,
+        _: usize,
+        data: *mut c_void,
+    ) -> c_int {
         // SAFETY: the dynamic linker passes its own record of an object, live for the call,
         // and `data` is the `Option` `own_image` passed, borrowed by nothing else meanwhile.
         let (info, found) = unsafe { (&*info, &mut *data.cast::<Option<(u64, u64)>>()) };
@@ -554,7 +661,10 @@ pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
             // SAFETY: `dlpi_phdr` points at `dlpi_phnum` program headers of the object, mapped.
             let header = unsafe { &*info.dlpi_phdr.add(index) };
             if header.p_type == libc::PT_LOAD && header.p_offset == 0 {
-                *found = Some((info.dlpi_addr.wrapping_add(header.p_vaddr), header.p_filesz.min(header.p_memsz)));
+                *found = Some((
+                    info.dlpi_addr.wrapping_add(header.p_vaddr),
+                    header.p_filesz.min(header.p_memsz),
+                ));
                 break;
             }
         }
@@ -564,8 +674,9 @@ pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
     let mut found: Option<(u64, u64)> = None;
     // SAFETY: `first` is a callback of the signature asked, given `found`, live for the call.
     unsafe { libc::dl_iterate_phdr(Some(first), (&raw mut found).cast()) };
-    let (header, mapped) =
-        found.ok_or_else(|| Error::new("the executable has no PT_LOAD of file offset 0: its headers are not mapped"))?;
+    let (header, mapped) = found.ok_or_else(|| {
+        Error::new("the executable has no PT_LOAD of file offset 0: its headers are not mapped")
+    })?;
     let read = |len: u64| -> Result<&'static [u8], Error> {
         if len > mapped {
             return Err(Error::new(format!(
@@ -586,7 +697,11 @@ pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
 pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     let fail = |path: &Path, it: std::io::Error| Error::new(format!("{}: {it}", path.display()));
     let source = std::fs::File::open(from).map_err(|it| fail(from, it))?;
-    let target = std::fs::OpenOptions::new().write(true).create_new(true).open(to).map_err(|it| fail(to, it))?;
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .map_err(|it| fail(to, it))?;
     // SAFETY: both descriptors are open, the target writable and empty; FICLONE only shares
     // the source's blocks into it.
     if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
@@ -596,7 +711,9 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     drop(target);
     std::fs::remove_file(to).map_err(|it| fail(to, it))?;
     match error.raw_os_error() {
-        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => Ok(false),
+        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
+            Ok(false)
+        }
         _ => Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display()))),
     }
 }

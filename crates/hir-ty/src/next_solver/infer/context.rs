@@ -295,19 +295,27 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         self.commit_if_ok(|_| f())
     }
 
-    fn sub_regions(&self, sub: Region<'db>, sup: Region<'db>, vis: VisibleForLeakCheck, _span: Span) {
+    fn sub_regions(
+        &self,
+        sub: Region<'db>,
+        sup: Region<'db>,
+        vis: VisibleForLeakCheck,
+        _span: Span,
+    ) {
         self.inner.borrow_mut().unwrap_region_constraints().make_subregion(sub, sup, vis);
     }
 
-    fn equate_regions(&self, a: Region<'db>, b: Region<'db>, vis: VisibleForLeakCheck, _span: Span) {
+    fn equate_regions(
+        &self,
+        a: Region<'db>,
+        b: Region<'db>,
+        vis: VisibleForLeakCheck,
+        _span: Span,
+    ) {
         self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(a, b, vis);
     }
 
-    fn register_solver_region_constraint(
-        &self,
-        c: RegionConstraint<DbInterner<'db>>,
-        span: Span,
-    ) {
+    fn register_solver_region_constraint(&self, c: RegionConstraint<DbInterner<'db>>, span: Span) {
         self.register_solver_region_constraint(c.with_spans(span));
     }
 
@@ -518,8 +526,7 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for LowerUniverseFolder<'a, 'db> {
                         .infcx
                         .const_var_span(vid)
                         .expect("an unresolved const variable has a span");
-                    let new_var_id =
-                        self.infcx.next_const_vid_in_universe(self.for_universe, span);
+                    let new_var_id = self.infcx.next_const_vid_in_universe(self.for_universe, span);
                     self.infcx.inner.borrow_mut().const_unification_table().union(vid, new_var_id);
                     Const::new_var(self.infcx.interner, new_var_id)
                 }

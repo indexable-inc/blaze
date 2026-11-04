@@ -138,7 +138,8 @@ fn words_only_keep_their_bytes() {
 
 #[test]
 fn colour_styles_spans_not_lines() {
-    let report = Report::error(Text::new().words("run ").code("nix develop").words(" in ").path("/w/a b"));
+    let report =
+        Report::error(Text::new().words("run ").code("nix develop").words(" in ").path("/w/a b"));
     let caps = Caps { color: true, links: true, width: None };
     assert_eq!(
         render(&report, caps, &ROOTS),
@@ -201,7 +202,10 @@ fn script_says_its_report() {
     assert_eq!(said.rule.as_deref(), Some("llvm:pin"));
     assert_eq!(said.facts.len(), 1);
     assert_eq!(said.facts[0].text, Text::new().code("LLVM_SYS_231_PREFIX").words(" is not set"));
-    assert_eq!(said.fixes, vec![Fix::run(&["nix develop"]), Fix::run(&["python3 fetch", "export A=b"])]);
+    assert_eq!(
+        said.fixes,
+        vec![Fix::run(&["nix develop"]), Fix::run(&["python3 fetch", "export A=b"])]
+    );
     assert_eq!(said.unread, vec!["cargo:blaze-report=bogus=1".to_owned()]);
     assert_eq!(script::read("cargo::error=x\n"), None);
 }
@@ -214,7 +218,12 @@ fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 
 #[test]
 fn terminals() {
     let config = Config::DEFAULT;
-    let ghostty = terminal::detect(&config, env(&[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.2.3")]), true, Some(100));
+    let ghostty = terminal::detect(
+        &config,
+        env(&[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.2.3")]),
+        true,
+        Some(100),
+    );
     assert_eq!(ghostty.caps, Caps { color: true, links: true, width: Some(100) });
     assert!(ghostty.progress);
     assert_eq!(ghostty.notifier, Some(Notifier::Osc777));
@@ -239,7 +248,11 @@ fn terminals() {
     assert!(!terminal::detect(&config, env(&[("NO_COLOR", "1")]), true, None).caps.color);
 
     // Behind tmux: nothing but colour, unless its passthrough is said to be on.
-    let tmux = [("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.2.0"), ("TMUX", "/tmp/tmux-1/default,1,0")];
+    let tmux = [
+        ("TERM_PROGRAM", "ghostty"),
+        ("TERM_PROGRAM_VERSION", "1.2.0"),
+        ("TMUX", "/tmp/tmux-1/default,1,0"),
+    ];
     let behind = terminal::detect(&config, env(&tmux), true, None);
     assert!(!behind.progress && behind.notifier.is_none() && !behind.caps.links);
     let mut through = Config::DEFAULT;
@@ -252,12 +265,20 @@ fn terminals() {
 
 #[test]
 fn escapes() {
-    let ghostty = terminal::detect(&Config::DEFAULT, env(&[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.2.0")]), true, None);
+    let ghostty = terminal::detect(
+        &Config::DEFAULT,
+        env(&[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.2.0")]),
+        true,
+        None,
+    );
     let mut out = String::new();
     ghostty.progress_into(&mut out, Progress::Error(130));
     ghostty.progress_into(&mut out, Progress::Clear);
     ghostty.notify_into(&mut out, "blaze test; failed", "1 failed\n");
-    assert_eq!(out, "\x1b]9;4;2;100\x07\x1b]9;4;0;0\x07\x1b]777;notify;blaze test  failed;1 failed \x07");
+    assert_eq!(
+        out,
+        "\x1b]9;4;2;100\x07\x1b]9;4;0;0\x07\x1b]777;notify;blaze test  failed;1 failed \x07"
+    );
     assert!(ghostty.notifies(true, 0));
     assert!(!ghostty.notifies(false, 3600));
     let mut always = Config::DEFAULT;
@@ -269,10 +290,15 @@ fn escapes() {
 #[test]
 fn config() {
     assert_eq!(Config::from_toml("[update]\nchannel = \"main\"\n"), Ok(Config::DEFAULT));
-    let config = Config::from_toml("[terminal]\ncolor = \"never\"\nnotify = \"off\"\nnotify_after_secs = 30\n").unwrap();
+    let config = Config::from_toml(
+        "[terminal]\ncolor = \"never\"\nnotify = \"off\"\nnotify_after_secs = 30\n",
+    )
+    .unwrap();
     assert_eq!(config.color, terminal::Color::Never);
     assert_eq!(config.notify, terminal::Notify::Off);
     assert_eq!(config.notify_after_secs, 30);
-    assert!(Config::from_toml("[terminal]\ncolor = \"blue\"\n").unwrap_err().contains("terminal.color"));
+    assert!(
+        Config::from_toml("[terminal]\ncolor = \"blue\"\n").unwrap_err().contains("terminal.color")
+    );
     assert!(Config::from_toml("[terminal]\nbeep = true\n").unwrap_err().contains("`beep`"));
 }

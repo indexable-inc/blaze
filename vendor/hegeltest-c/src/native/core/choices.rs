@@ -93,10 +93,7 @@ impl IntegerChoice {
     pub(crate) fn clamped_shrink_towards(&self) -> BigInt {
         match &self.0 {
             Bounds::Small { min, max, towards } => BigInt::from((*towards).clamp(*min, *max)),
-            Bounds::Wide(wide) => wide
-                .towards
-                .clone()
-                .clamp(wide.min.clone(), wide.max.clone()),
+            Bounds::Wide(wide) => wide.towards.clone().clamp(wide.min.clone(), wide.max.clone()),
         }
     }
 
@@ -186,11 +183,7 @@ impl IntegerChoice {
     }
 
     pub fn value_from_bigint(&self, v: &BigInt) -> Option<BigInt> {
-        if self.validate(v) {
-            Some(v.clone())
-        } else {
-            None
-        }
+        if self.validate(v) { Some(v.clone()) } else { None }
     }
 }
 
@@ -359,9 +352,7 @@ pub struct Drawn {
 
 impl Default for Drawn {
     fn default() -> Drawn {
-        Drawn {
-            strings: Mutex::new((HashSet::default(), 0)),
-        }
+        Drawn { strings: Mutex::new((HashSet::default(), 0)) }
     }
 }
 
@@ -438,8 +429,7 @@ impl StringChoice {
     /// Position of `codepoint` in the alphabet's shrink-preferred ordering.
     /// Panics if `codepoint` is not in the alphabet.
     pub fn codepoint_key(&self, codepoint: u32) -> u32 {
-        self.intervals
-            .index_from_codepoint_in_shrink_order(codepoint) as u32
+        self.intervals.index_from_codepoint_in_shrink_order(codepoint) as u32
     }
 
     /// Codepoint at shrink-order position `key`, or `None` if `key` is past
@@ -795,11 +785,7 @@ impl FloatChoice {
         let Some(value) = float_from_global_rank(raw) else {
             return Ok(None);
         };
-        Ok(if self.validate(value) {
-            Some(value)
-        } else {
-            None
-        })
+        Ok(if self.validate(value) { Some(value) } else { None })
     }
 }
 
@@ -938,11 +924,7 @@ impl RealizedStream {
     /// structure recorded alongside them.
     pub fn new(nodes: Vec<ChoiceNode>, spans: Vec<Span>) -> Self {
         let flat_len = flattened_len(&nodes);
-        RealizedStream {
-            nodes,
-            spans,
-            flat_len,
-        }
+        RealizedStream { nodes, spans, flat_len }
     }
 
     /// The empty stream: a clone that drew nothing.
@@ -981,10 +963,7 @@ impl RealizedStream {
 /// the realized stream of an execution.
 #[derive(Clone, Debug)]
 enum CloneChildren {
-    Values {
-        values: Vec<ChoiceValue>,
-        flat_len: usize,
-    },
+    Values { values: Vec<ChoiceValue>, flat_len: usize },
     Realized(Arc<RealizedStream>),
 }
 
@@ -1008,17 +987,13 @@ impl CloneRecord {
     /// hand-built replay prefix). Carries no realized info.
     pub fn from_values(values: Vec<ChoiceValue>) -> Self {
         let flat_len = flattened_len_of_values(values.iter());
-        CloneRecord {
-            children: CloneChildren::Values { values, flat_len },
-        }
+        CloneRecord { children: CloneChildren::Values { values, flat_len } }
     }
 
     /// A record wrapping an already-realized stream, sharing it rather than
     /// copying its nodes.
     pub fn from_stream(stream: Arc<RealizedStream>) -> Self {
-        CloneRecord {
-            children: CloneChildren::Realized(stream),
-        }
+        CloneRecord { children: CloneChildren::Realized(stream) }
     }
 
     /// A record from an executed stream: its realized nodes plus the span
@@ -1509,9 +1484,9 @@ impl ChoiceData {
             (ChoiceData::Clone(_), ChoiceValue::Clone(r)) => {
                 r.realized().map(|rs| ChoiceData::Clone(Arc::clone(rs)))
             }
-            (ChoiceData::String(sc, _), ChoiceValue::String(v)) => sc
-                .validate(v)
-                .then(|| ChoiceData::String(Arc::clone(sc), v.clone())),
+            (ChoiceData::String(sc, _), ChoiceValue::String(v)) => {
+                sc.validate(v).then(|| ChoiceData::String(Arc::clone(sc), v.clone()))
+            }
             _ => self.kind().resolve(value),
         }
     }
@@ -1622,10 +1597,7 @@ impl ChoiceTemplate {
         if let Some(n) = count {
             hegel_internal_assert!(n > 0, "ChoiceTemplate count must be positive (got 0)");
         }
-        Ok(Self {
-            kind: ChoiceTemplateKind::Simplest,
-            count,
-        })
+        Ok(Self { kind: ChoiceTemplateKind::Simplest, count })
     }
 }
 
@@ -1691,18 +1663,12 @@ impl ChoiceNode {
     /// This node with `value` in place of its current value, when the value
     /// fits the node's constraint; see [`ChoiceData::with_value`].
     pub fn with_value(&self, value: &ChoiceValue) -> Option<ChoiceNode> {
-        self.data.with_value(value).map(|data| ChoiceNode {
-            data,
-            was_forced: self.was_forced,
-        })
+        self.data.with_value(value).map(|data| ChoiceNode { data, was_forced: self.was_forced })
     }
 
     /// This node with its constraint's simplest value.
     pub fn with_simplest(&self) -> Result<ChoiceNode, InternalError> {
-        Ok(ChoiceNode {
-            data: self.data.with_simplest()?,
-            was_forced: self.was_forced,
-        })
+        Ok(ChoiceNode { data: self.data.with_simplest()?, was_forced: self.was_forced })
     }
 }
 

@@ -14,7 +14,8 @@ use crate::{
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::AsyncCoroutinesNotSupported) -> Vec<Found> {
     let at = d.expr.map(|it| it.syntax_node_ptr());
-    let mut diag = Diag::error(Some("E0727"), "`async` coroutines are not yet supported", cx.span_of(at));
+    let mut diag =
+        Diag::error(Some("E0727"), "`async` coroutines are not yet supported", cx.span_of(at));
     code_fact(cx, &mut diag, at);
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Lower)]

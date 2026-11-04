@@ -8,7 +8,10 @@
 //! `InvalidPattern`, `TypeNotStructural`, `SuggestEq`, `TypeNotPartialEq`, `NaNPattern`) (MIT
 //! or Apache-2.0). Which constants are refused, and why, is match checking's.
 
-use hir::{AsAssocItem as _, AssocItemContainer, ConstPatternError, InFile, LangItem, ModuleDef, PathResolution, Type};
+use hir::{
+    AsAssocItem as _, AssocItemContainer, ConstPatternError, InFile, LangItem, ModuleDef,
+    PathResolution, Type,
+};
 use hir_def::attrs::AttrFlags;
 use syntax::{
     AstPtr, SyntaxKind, ast as tag,
@@ -32,7 +35,9 @@ const POINTER: &str = "function pointers and raw pointers not derived from integ
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstPatternRefused<'db>) -> Vec<Found> {
     let span = cx.span_of_ptr(d.pat);
     let mut diag = match &d.error {
-        ConstPatternError::Union => refused(span, "cannot use unions in constant patterns", "can't use a `union` here"),
+        ConstPatternError::Union => {
+            refused(span, "cannot use unions in constant patterns", "can't use a `union` here")
+        }
         ConstPatternError::Pointer => {
             let mut diag = refused(span, POINTER, "can't be used in patterns");
             diag.note("see https://github.com/rust-lang/rust/issues/70861 for details");
@@ -54,7 +59,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstPatternRefused<'db>) ->
             diag
         }
         ConstPatternError::NaN => {
-            let mut diag = refused(span, "cannot use NaN in patterns", "evaluates to `NaN`, which is not allowed in patterns");
+            let mut diag = refused(
+                span,
+                "cannot use NaN in patterns",
+                "evaluates to `NaN`, which is not allowed in patterns",
+            );
             diag.note("NaNs compare inequal to everything, even themselves, so this pattern would never match");
             diag.help("try using the `is_nan` method instead");
             diag
@@ -130,7 +139,9 @@ fn not_structural<'db>(
         let def = cx.span(source.map(|it| def_span(it.syntax())));
         let label = match is_local {
             // alloc: the error's label, the edge
-            true => format!("`{printed}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns"),
+            true => format!(
+                "`{printed}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns"
+            ),
             false => format!("`{printed}` is not usable in patterns"), // alloc: as above
         };
         diag.span_label(def, label);
@@ -163,8 +174,12 @@ fn not_partial_eq<'db>(
 ) {
     for &it in local_manual {
         let source = match it {
-            hir::ManualPartialEq::Impl(it) => cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax()))),
-            hir::ManualPartialEq::Adt(it) => cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax()))),
+            hir::ManualPartialEq::Impl(it) => {
+                cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax())))
+            }
+            hir::ManualPartialEq::Adt(it) => {
+                cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax())))
+            }
         };
         if let Some(at) = source {
             diag.span_note(cx.span(at), MUST_BE_DERIVED);
@@ -173,7 +188,10 @@ fn not_partial_eq<'db>(
     for &adt in local_without {
         if let Some(source) = cx.vsema.source(adt) {
             let at = cx.span(source.map(|it| def_span(it.syntax())));
-            diag.span_label(at, "must be annotated with `#[derive(PartialEq)]` to be usable in patterns");
+            diag.span_label(
+                at,
+                "must be annotated with `#[derive(PartialEq)]` to be usable in patterns",
+            );
         }
     }
     let sorted = |tys: &[Type<'db>]| {
@@ -188,7 +206,9 @@ fn not_partial_eq<'db>(
         ));
     }
     for ty in sorted(without) {
-        diag.note(format!("`{ty}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns")); // alloc: as above
+        diag.note(format!(
+            "`{ty}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns"
+        )); // alloc: as above
     }
 }
 
@@ -250,7 +270,10 @@ fn suggest_eq(
             match arm.guard().and_then(|it| it.condition()) {
                 None => {
                     let add = part(outer.shrink_to_hi(), &format!(" if binding == {name}")); // alloc: as above
-                    ("add a condition to the match arm checking for equality", [binding, add].into())
+                    (
+                        "add a condition to the match arm checking for equality",
+                        [binding, add].into(),
+                    )
                 }
                 Some(guard) => (
                     "add a check for equality to the condition of the match arm",
@@ -268,7 +291,10 @@ fn suggest_eq(
                 if init.expansion.is_some() {
                     return;
                 }
-                let parts = [part(whole.with_hi(span.lo), ""), part(span.shrink_to_hi().with_hi(init.lo), " == ")];
+                let parts = [
+                    part(whole.with_hi(span.lo), ""),
+                    part(span.shrink_to_hi().with_hi(init.lo), " == "),
+                ];
                 ("check for equality instead of pattern matching", parts.into())
             } else if cx.edition.at_least_2024() {
                 let parts = [binding, part(whole.shrink_to_hi(), &compare)];
@@ -279,7 +305,9 @@ fn suggest_eq(
         }
         SyntaxKind::LET_STMT => {
             let Some(stmt) = ast::LetStmt::cast(parent.value) else { return };
-            let (Some(init), Some(els)) = (stmt.initializer(), stmt.let_else().and_then(|it| it.block_expr())) else {
+            let (Some(init), Some(els)) =
+                (stmt.initializer(), stmt.let_else().and_then(|it| it.block_expr()))
+            else {
                 return;
             };
             let (init, els) = (range(init.syntax()), range(els.syntax()));

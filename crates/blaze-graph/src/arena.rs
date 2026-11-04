@@ -261,7 +261,13 @@ mod global {
         /// # Safety
         ///
         /// [`GlobalAlloc::realloc`]'s contract.
-        unsafe fn realloc_for(&self, into: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8;
+        unsafe fn realloc_for(
+            &self,
+            into: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8;
     }
 
     /// std's allocator keeps no blocks apart: its bytes are counted, not named.
@@ -282,7 +288,13 @@ mod global {
             None
         }
 
-        unsafe fn realloc_for(&self, _: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe fn realloc_for(
+            &self,
+            _: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
             // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
             unsafe { self.realloc(ptr, layout, new_size) }
         }
@@ -417,7 +429,8 @@ struct Slot {
 /// charges reach it with an acquire load and no lock. A segment is taken from the system
 /// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]: making one charges
 /// no account and never reenters a charge.
-static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] = [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
+static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
 
 /// The slots closed accounts freed, for the next open: the table grows only to the most
 /// accounts open at once.
@@ -467,11 +480,17 @@ fn make_slot(index: usize) -> &'static Slot {
     let (segment, at) = segment_of(index);
     let layout = segment_layout(segment);
     // SAFETY: `layout` has a non-zero size (a slot is 64 bytes, a segment holds at least one).
-    let made = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }.cast::<Slot>();
+    let made = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+        .cast::<Slot>();
     if made.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    let base = match SEGMENTS[segment].compare_exchange(std::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
+    let base = match SEGMENTS[segment].compare_exchange(
+        std::ptr::null_mut(),
+        made,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
         Ok(_) => made,
         Err(theirs) => {
             // Another open made it first: ours was never published.
@@ -556,7 +575,8 @@ fn switch(account: Account) -> Account {
 /// It never fails and never waits: the table grows to the most accounts open at once
 /// ([`SEGMENTS`]), and accounts nest as deep as the work does.
 fn open(parent: Account) -> Account {
-    let depth = parent.slot().map_or(0, |slot| slot.depth.load(Ordering::Relaxed).saturating_add(1));
+    let depth =
+        parent.slot().map_or(0, |slot| slot.depth.load(Ordering::Relaxed).saturating_add(1));
     let index = FREE_SLOTS.pop().unwrap_or_else(|| MADE_SLOTS.fetch_add(1, Ordering::Relaxed));
     let slot = make_slot(index);
     slot.net.store(0, Ordering::Relaxed);
@@ -1104,7 +1124,11 @@ fn least(
     match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
         Some(left) if left > 0 => {
             // alloc: the budget's name, once per daemon start
-            Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)), kept_back: bytes - left })
+            Ok(Budget {
+                bytes: left,
+                from: format!("{from}, {}, less {taken}", gb(bytes)),
+                kept_back: bytes - left,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1147,7 +1171,13 @@ mod tests {
             None
         }
 
-        unsafe fn realloc_for(&self, _: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe fn realloc_for(
+            &self,
+            _: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
             // SAFETY: the caller upholds `realloc`'s contract.
             unsafe { self.realloc(ptr, layout, new_size) }
         }
@@ -1222,7 +1252,13 @@ mod tests {
 
             /// Every realloc here moves the block, as a large one does under mimalloc: it is
             /// labelled `into`'s.
-            unsafe fn realloc_for(&self, into: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe fn realloc_for(
+                &self,
+                into: Option<Tag>,
+                ptr: *mut u8,
+                layout: Layout,
+                new_size: usize,
+            ) -> *mut u8 {
                 // SAFETY: std's block, grown whole, label and all; the new label's byte is in it.
                 unsafe {
                     let block = System.realloc(ptr.sub(LABEL), labelled(layout), new_size + LABEL);
@@ -1266,7 +1302,8 @@ mod tests {
         assert_eq!(heap(Tag::Fuzz), fuzz + 8 * MB as u64);
         // Grown, and moved, in a task of another tag: the grower's now, all of it.
         // SAFETY: `block` is live, made with `small`.
-        let block = blaze_mem::frame::task(Tag::Api, |_| unsafe { TAGGED.realloc(block, small, 12 * MB) });
+        let block =
+            blaze_mem::frame::task(Tag::Api, |_| unsafe { TAGGED.realloc(block, small, 12 * MB) });
         assert_eq!(heap(Tag::Fuzz), fuzz, "a block that moves leaves its maker");
         assert_eq!(heap(Tag::Api), api + 12 * MB as u64, "and is the grower's");
         let sent = Sent(block);
@@ -1332,7 +1369,10 @@ mod tests {
             let after = std::hint::black_box(vec![1u8; 7 * MB]);
             drop(after);
         });
-        assert!(outer >= 7 * MB as u64, "the outer account charged nothing after the panic: {outer}");
+        assert!(
+            outer >= 7 * MB as u64,
+            "the outer account charged nothing after the panic: {outer}"
+        );
         assert_eq!(current(), Account::NONE, "every account closed");
     }
 
@@ -1374,7 +1414,10 @@ mod tests {
             .and_then(|it| it.join().map_err(|_| io::Error::other("the nested accounts panicked")))
             .unwrap();
         assert!(peak >= 2 * MB as u64, "the outermost of {deepest} saw {peak}");
-        assert!(MADE_SLOTS.load(Ordering::Relaxed) > deepest, "every level held its own slot at once");
+        assert!(
+            MADE_SLOTS.load(Ordering::Relaxed) > deepest,
+            "every level held its own slot at once"
+        );
         assert!(slot_at(deepest).is_some(), "a later segment was made");
         assert_eq!(segment_of(0), (0, 0));
         assert_eq!(segment_of(FIRST_SLOTS - 1), (0, FIRST_SLOTS - 1));
@@ -1773,11 +1816,7 @@ mod tests {
         assert!(why.contains("vm.max_memory_mib of `lots`"), "{why}");
         let tree = Tree::new(
             "bad-iomem",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/iomem", "garbage\n"),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
+            &[("proc/meminfo", GROWN), ("proc/iomem", "garbage\n"), ("proc/self/cgroup", "0::/\n")],
         );
         assert!(linux_limits(&tree.0).unwrap_err().to_string().contains("a line `garbage`"));
     }
@@ -1792,14 +1831,24 @@ mod tests {
         let told = Some((1 << 30, "BLAZE_DAEMON_MEMORY_GB=1".to_owned()));
         match machine_budget(1 << 20, told) {
             Ok(budget) => {
-                assert!(budget.from.starts_with("BLAZE_DAEMON_MEMORY_GB=1, 1.00 GB"), "{}", budget.from);
+                assert!(
+                    budget.from.starts_with("BLAZE_DAEMON_MEMORY_GB=1, 1.00 GB"),
+                    "{}",
+                    budget.from
+                );
                 assert!(budget.bytes < 1 << 30, "{}", budget.bytes);
             }
-            Err(error) => assert!(error.to_string().contains("of BLAZE_DAEMON_MEMORY_GB=1"), "{error}"),
+            Err(error) => {
+                assert!(error.to_string().contains("of BLAZE_DAEMON_MEMORY_GB=1"), "{error}")
+            }
         }
         let over = Some((u64::MAX / 2, "blaze serve --memory-gb".to_owned()));
         let budget = machine_budget(1 << 20, over).unwrap();
-        assert!(!budget.from.contains("--memory-gb"), "the machine's is the least: {}", budget.from);
+        assert!(
+            !budget.from.contains("--memory-gb"),
+            "the machine's is the least: {}",
+            budget.from
+        );
     }
 
     #[test]

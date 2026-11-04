@@ -37,21 +37,15 @@ fn terminal_sizes_are_their_shortest_match() {
     assert_eq!(alt.max_size, Some(3));
     assert!(!alt.growing());
     assert_eq!(alt.items[0].min_size, 2);
-    assert_eq!(
-        alt.items[1].kind,
-        NodeKind::Terminal(g.terminal_id("NUM").unwrap())
-    );
+    assert_eq!(alt.items[1].kind, NodeKind::Terminal(g.terminal_id("NUM").unwrap()));
 }
 
 #[test]
 fn alternatives_sort_by_size_then_growth() {
     let (g, a) = analyzed("start: start \"x\" | \"a\" | \"bc\" | \"y\" start\n");
     let start = rule(&g, &a, "start");
-    let sizes: Vec<(u64, bool)> = start
-        .alternatives
-        .iter()
-        .map(|alt| (alt.min_size, alt.growing()))
-        .collect();
+    let sizes: Vec<(u64, bool)> =
+        start.alternatives.iter().map(|alt| (alt.min_size, alt.growing())).collect();
     assert_eq!(sizes, vec![(1, false), (2, false), (2, true), (2, true)]);
     assert_eq!(start.min_size, 1);
 }
@@ -200,12 +194,7 @@ fn bounds_saturate_instead_of_overflowing() {
 fn rules_are_visited_after_the_rules_they_use() {
     let (g, _) = analyzed("start: a b\na: b | a \"x\"\nb: c\nc: \"c\"\n");
     let order = dependency_order(&g);
-    let position = |name: &str| {
-        order
-            .iter()
-            .position(|&r| r == g.rule_id(name).unwrap())
-            .unwrap()
-    };
+    let position = |name: &str| order.iter().position(|&r| r == g.rule_id(name).unwrap()).unwrap();
     assert_eq!(order.len(), 4);
     assert!(position("c") < position("b"));
     assert!(position("b") < position("a"));
@@ -220,10 +209,7 @@ fn a_long_chain_defined_from_the_top_down_is_analysed_in_one_round() {
     }
     text.push_str("r3000: \"a\"\n");
     let (g, a) = analyzed(&text);
-    assert_eq!(
-        dependency_order(&g).last(),
-        Some(&g.rule_id("start").unwrap())
-    );
+    assert_eq!(dependency_order(&g).last(), Some(&g.rule_id("start").unwrap()));
     let start = rule(&g, &a, "start");
     assert_eq!(start.min_size, 1);
     assert_eq!(start.min_depth, 3002);

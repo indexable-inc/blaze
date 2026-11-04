@@ -72,7 +72,11 @@ impl Narrow {
     /// `raw` wrapped to N bits and extended back, as the type holds it: what `raw as uN` is.
     pub(super) fn normalize(self, raw: i128) -> i128 {
         let shift = 128 - self.bits;
-        if self.signed { (raw << shift) >> shift } else { (((raw as u128) << shift) >> shift) as i128 }
+        if self.signed {
+            (raw << shift) >> shift
+        } else {
+            (((raw as u128) << shift) >> shift) as i128
+        }
     }
 
     /// The N-bit pattern of `value`, below 2^N.
@@ -87,7 +91,10 @@ impl Narrow {
         if self.normalize(value) != value {
             return Err(MirEvalError::UndefinedBehavior(
                 // alloc: error path
-                format!("{value:#x} is not a value of `{}`: its bits above {} are set", self.name, self.bits),
+                format!(
+                    "{value:#x} is not a value of `{}`: its bits above {} are set",
+                    self.name, self.bits
+                ),
             ));
         }
         Ok(value)
@@ -178,7 +185,9 @@ impl Narrow {
             BinOp::Shl => "shift left",
             BinOp::Shr => "shift right",
             // alloc: error path
-            _ => return format!("attempt to compute `{op:?}` with overflow at type `{}`", self.name),
+            _ => {
+                return format!("attempt to compute `{op:?}` with overflow at type `{}`", self.name);
+            }
         };
         format!("attempt to {what} with overflow at type `{}`", self.name) // alloc: error path
     }
@@ -309,7 +318,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let value = exact.map_or(n.max(), |it| it.clamp(n.min(), n.max()));
                 Narrow::bytes(value, size)
             }
-            Intrinsic::AddWithOverflow | Intrinsic::SubWithOverflow | Intrinsic::MulWithOverflow => {
+            Intrinsic::AddWithOverflow
+            | Intrinsic::SubWithOverflow
+            | Intrinsic::MulWithOverflow => {
                 let (l, r) = (operand(self, 0)?, operand(self, 1)?);
                 let (value, overflowed) = match intrinsic {
                     Intrinsic::AddWithOverflow => n.add(l, r),
@@ -349,7 +360,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 match n.arith(&op, l, r) {
                     Arith::Value(_, true) => {
                         // alloc: error path
-                        return ub(format!("arithmetic overflow in `{intrinsic}` at type `{}`", n.name));
+                        return ub(format!(
+                            "arithmetic overflow in `{intrinsic}` at type `{}`",
+                            n.name
+                        ));
                     }
                     Arith::Value(_, false) if intrinsic == Intrinsic::ExactDiv && l % r != 0 => {
                         // alloc: error path
@@ -418,7 +432,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 // A rotation is by its amount mod N, as rustc's is mod BITS.
                 let left = (amount % u128::from(n.bits)) as u32;
-                let left = if intrinsic == Intrinsic::RotateLeft { left } else { (n.bits - left) % n.bits };
+                let left = if intrinsic == Intrinsic::RotateLeft {
+                    left
+                } else {
+                    (n.bits - left) % n.bits
+                };
                 let rotated = match left {
                     0 => pattern,
                     left => ((pattern << left) | (pattern >> (n.bits - left))) & n.mask(),
@@ -429,7 +447,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::CarrylessMul
             | Intrinsic::UncheckedFunnelShl
             | Intrinsic::UncheckedFunnelShr => {
-                not_supported!("intrinsic `{intrinsic}` on the arbitrary-width integer `{}`", n.name);
+                not_supported!(
+                    "intrinsic `{intrinsic}` on the arbitrary-width integer `{}`",
+                    n.name
+                );
             }
             _ => return Ok(false),
         };
@@ -461,7 +482,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => None,
         };
         let (Some(from_signed), Some(_)) = (signed(from), signed(to)) else {
-            not_supported!("intrinsic `blaze_int_cast` from `{from:?}` to `{to:?}`, which are not both integers");
+            not_supported!(
+                "intrinsic `blaze_int_cast` from `{from:?}` to `{to:?}`, which are not both integers"
+            );
         };
         let bytes = arg.get(self)?;
         let value = match Narrow::of(from) {

@@ -73,7 +73,8 @@ pub(super) fn write_shape(
     words: &[u32],
     facts: &[FactRef],
 ) {
-    let words_len = u32::try_from(words.len()).expect("a goal's stable form is at most `MAX_WORDS` words");
+    let words_len =
+        u32::try_from(words.len()).expect("a goal's stable form is at most `MAX_WORDS` words");
     let facts_len = u32::try_from(facts.len()).expect("a goal reads fewer than 2^32 facts");
     // alloc: the thread's pending buffer, of a capped size, reused from build to build
     out.reserve(shape_len(words.len(), facts.len()));
@@ -117,7 +118,9 @@ fn read_fact(bytes: &[u8]) -> Result<FactRef, &'static str> {
     }
     let object = match bytes[2] {
         0 if rest_zero(36) => FactObject::None,
-        1 if rest_zero(40) => FactObject::Field(u32::from_le_bytes(bytes[36..40].try_into().expect("4 bytes"))),
+        1 if rest_zero(40) => {
+            FactObject::Field(u32::from_le_bytes(bytes[36..40].try_into().expect("4 bytes")))
+        }
         2 => FactObject::Id(id(36)),
         0 | 1 => return Err("a fact's object has bytes past its end"),
         _ => return Err("a fact's object has an unknown tag"),
@@ -134,7 +137,11 @@ pub(super) struct ShapeRef<'a> {
 
 impl<'a> ShapeRef<'a> {
     /// The shape in `bytes`, checked to be one of `goal` under `version` and to be whole.
-    pub(super) fn open(bytes: &'a [u8], goal: &ContentId, version: &ContentId) -> Result<ShapeRef<'a>, &'static str> {
+    pub(super) fn open(
+        bytes: &'a [u8],
+        goal: &ContentId,
+        version: &ContentId,
+    ) -> Result<ShapeRef<'a>, &'static str> {
         let rest = bytes.strip_prefix(&SHAPE_MAGIC).ok_or("not a goal shape")?;
         let (kept_goal, rest) = rest.split_at_checked(32).ok_or("cut short")?;
         if kept_goal != goal.0 {

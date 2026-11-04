@@ -16,7 +16,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
 use hir_def::{AdtId, CallableDefId, HasModule};
@@ -36,6 +35,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{Unshared, code};
 
@@ -515,11 +515,14 @@ impl<'db> Spell<'db> {
             }
         };
         // alloc: error path
-        let allocation = allocation.map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
+        let allocation =
+            allocation.map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
         Const::new_from_allocation(DbInterner::new_with(db, krate), &allocation, env)
             // alloc: error path
-            .map_err(|error| no_content(format!("the constant `{konst:?}` has no value tree: {error:?}")))
+            .map_err(|error| {
+                no_content(format!("the constant `{konst:?}` has no value tree: {error:?}"))
+            })
     }
 
     fn valtree(&mut self, value: ValTree<'db>) -> Result<(), Unshared> {

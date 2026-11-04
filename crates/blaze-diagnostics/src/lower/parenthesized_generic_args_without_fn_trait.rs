@@ -17,7 +17,10 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ParenthesizedGenericArgsWithoutFnTrait) -> Vec<Found> {
+pub(crate) fn lower(
+    cx: &Cx<'_, '_>,
+    d: &hir::ParenthesizedGenericArgsWithoutFnTrait,
+) -> Vec<Found> {
     let args = cx.node_view(d.args);
     let file = args.file_id;
     let span = |range: TextRange| cx.span(InFile::new(file, range));

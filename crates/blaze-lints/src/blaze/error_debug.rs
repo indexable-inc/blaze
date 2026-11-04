@@ -74,7 +74,10 @@ struct Traits {
 }
 
 fn traits(cx: &Cx<'_, '_>) -> Option<Traits> {
-    Some(Traits { error: cx.std_trait(&["core", "error", "Error"])?, display: cx.std_trait(&["core", "fmt", "Display"])? })
+    Some(Traits {
+        error: cx.std_trait(&["core", "error", "Error"])?,
+        display: cx.std_trait(&["core", "fmt", "Display"])?,
+    })
 }
 
 fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
@@ -105,12 +108,14 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         for Formatted { value, debug, ty } in formatted {
             // A name captured from the template has no syntax of its own: the finding is at
             // the `format_args!`, or the macro call that wrote it.
-            let range = value.and_then(|it| analysis.expr_range(it)).or_else(|| analysis.expr_range(id));
+            let range =
+                value.and_then(|it| analysis.expr_range(it)).or_else(|| analysis.expr_range(id));
             let Some(range) = range else { continue };
             let ty = analysis.ty(ty);
             let shown = ty.display(db, target).to_string();
             if debug {
-                let message = format!("the message of error `{error_name}` formats `{shown}` with `{{:?}}`");
+                let message =
+                    format!("the message of error `{error_name}` formats `{shown}` with `{{:?}}`");
                 let note = "an error says what it is about in words: name the item, the key or the file \
                             with `Display`, which needs nothing the error outlives";
                 facts::push(&mut found, Lint::ErrorDebug, range, message, Some(note.to_owned()));
@@ -173,10 +178,11 @@ fn formatted<'db>(
             continue;
         }
         let Expr::Field { name: field, .. } = body.expr(*arg) else { return None };
-        let value = field.as_tuple_index().and_then(|it| written.get(it)).map(|&it| match body.expr(it) {
-            Expr::Ref { expr, .. } => expr,
-            _ => it,
-        });
+        let value =
+            field.as_tuple_index().and_then(|it| written.get(it)).map(|&it| match body.expr(it) {
+                Expr::Ref { expr, .. } => expr,
+                _ => it,
+            });
         let ty = args.types().next()?;
         formatted.push(Formatted { value, debug: *name == sym::new_debug, ty });
     }
@@ -227,7 +233,13 @@ fn message_of<'db>(
 
 /// Whether the `format_args!` `id` is inside a closure handed to `blaze_query::db::attach` or
 /// `blaze_query::db::with_attached_db`.
-fn is_attached(db: &Db, body: &Body, infer: &InferenceResult<'_>, parents: &Parents, id: ExprId) -> bool {
+fn is_attached(
+    db: &Db,
+    body: &Body,
+    infer: &InferenceResult<'_>,
+    parents: &Parents,
+    id: ExprId,
+) -> bool {
     let mut closure = None;
     for up in parents.up(id, ATTACH_DEPTH) {
         if let Some(inner) = closure.take()
@@ -259,7 +271,12 @@ pub(super) fn needs_db(db: &Db, ty: &hir::Type<'_>) -> Option<hir::Adt> {
     needs_db_in(db, ty, FIELD_DEPTH, &mut seen)
 }
 
-fn needs_db_in(db: &Db, ty: &hir::Type<'_>, depth: u32, seen: &mut Vec<hir::Adt>) -> Option<hir::Adt> {
+fn needs_db_in(
+    db: &Db,
+    ty: &hir::Type<'_>,
+    depth: u32,
+    seen: &mut Vec<hir::Adt>,
+) -> Option<hir::Adt> {
     // alloc: the ADTs of one type's walk, a few
     let mut adts = Vec::new();
     ty.walk(db, |it| adts.extend(it.as_adt()));
@@ -313,7 +330,11 @@ pub(super) fn check_attrs<'t>(cx: &mut Cx<'_, 't>, adt: ast::Adt<'t>) {
             let variants = it.variants(db);
             for variant in written.variant_list().into_iter().flat_map(|it| it.variants()) {
                 let Some(name) = variant.name() else { continue };
-                let Some(hir_variant) = variants.iter().find(|it| it.name(db).as_str() == name.text()) else { continue };
+                let Some(hir_variant) =
+                    variants.iter().find(|it| it.name(db).as_str() == name.text())
+                else {
+                    continue;
+                };
                 let fields = hir_variant.fields(db);
                 let named = format!("{error_name}::{}", name.text());
                 check_owner(cx, variant.attrs(), &fields, &named);
@@ -337,7 +358,8 @@ fn check_owner<'t>(
     let target = cx.krate().to_display_target(db);
     for attr in attrs {
         let Some(ast::Meta::TokenTreeMeta(meta)) = attr.meta() else { continue };
-        if meta.path().and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "error") {
+        if meta.path().and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "error")
+        {
             continue;
         }
         let Some(tt) = meta.token_tree() else { continue };
@@ -358,15 +380,21 @@ fn check_owner<'t>(
         let field_at = |arg: Arg<'_>| -> Option<&hir::Field> {
             match arg {
                 Arg::Index(_) if extra => None,
-                Arg::Index(index) => fields.iter().find(|it| it.name(db).as_tuple_index() == Some(index)),
+                Arg::Index(index) => {
+                    fields.iter().find(|it| it.name(db).as_tuple_index() == Some(index))
+                }
                 Arg::Captured(name) => fields.iter().find(|it| it.name(db).as_str() == name),
             }
         };
         for placeholder in Placeholders::new(&text, |_| None) {
             let field = field_at(placeholder.arg);
             if placeholder.format_trait == Trait::Debug {
-                let what = field.map_or_else(|| "a value".to_owned(), |it| format!("field `{}`", it.name(db).as_str()));
-                let message = format!("the message of error `{error_name}` formats {what} with `{{:?}}`");
+                let what = field.map_or_else(
+                    || "a value".to_owned(),
+                    |it| format!("field `{}`", it.name(db).as_str()),
+                );
+                let message =
+                    format!("the message of error `{error_name}` formats {what} with `{{:?}}`");
                 let span = cx.span(range);
                 cx.blaze(Lint::ErrorDebug, attr.syntax(), span, message)
                     .note("an error says what it is about in words: name the item, the key or the file with `Display`, which needs nothing the error outlives")

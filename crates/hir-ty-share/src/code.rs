@@ -172,16 +172,25 @@ pub fn told_names(db: &Db, body: &MirBody<'_>) -> Result<Option<ContentId>, Unsh
             let Some(ty) = arg.ty() else { continue };
             match ty.kind() {
                 TyKind::Adt(def, _) => {
-                    parts.push((0, *crate::identity::adt(db, def.def_id()).as_ref().map_err(Clone::clone)?));
+                    parts.push((
+                        0,
+                        *crate::identity::adt(db, def.def_id()).as_ref().map_err(Clone::clone)?,
+                    ));
                 }
                 TyKind::Foreign(it) => parts.push((1, item_key(db, ItemId::Alias(it.0)).0)),
-                TyKind::FnDef(def, _) => parts.push((2, match def.0 {
-                    CallableDefId::FunctionId(it) => item_key(db, ItemId::Function(it)),
-                    CallableDefId::StructId(it) => item_key(db, ItemId::Adt(it.into())),
-                    CallableDefId::EnumVariantId(it) => key::variant_key(db, it),
-                }.0)),
+                TyKind::FnDef(def, _) => parts.push((
+                    2,
+                    match def.0 {
+                        CallableDefId::FunctionId(it) => item_key(db, ItemId::Function(it)),
+                        CallableDefId::StructId(it) => item_key(db, ItemId::Adt(it.into())),
+                        CallableDefId::EnumVariantId(it) => key::variant_key(db, it),
+                    }
+                    .0,
+                )),
                 TyKind::Closure(id, _) => parts.push((3, key::closure_key(db, id.0).0)),
-                TyKind::CoroutineClosure(id, _) => parts.push((4, key::coroutine_closure_key(db, id.0).0)),
+                TyKind::CoroutineClosure(id, _) => {
+                    parts.push((4, key::coroutine_closure_key(db, id.0).0))
+                }
                 TyKind::Coroutine(id, args) => {
                     let by_move = is_by_move_coroutine(db, id.0, args.as_coroutine());
                     parts.push((5, key::coroutine_key(db, id.0).0));
@@ -194,8 +203,12 @@ pub fn told_names(db: &Db, body: &MirBody<'_>) -> Result<Option<ContentId>, Unsh
                 TyKind::Dynamic(predicates, _) => {
                     for predicate in predicates.iter() {
                         let key = match predicate.skip_binder() {
-                            ExistentialPredicate::Trait(it) => item_key(db, ItemId::Trait(it.def_id.0)),
-                            ExistentialPredicate::AutoTrait(it) => item_key(db, ItemId::Trait(it.0)),
+                            ExistentialPredicate::Trait(it) => {
+                                item_key(db, ItemId::Trait(it.def_id.0))
+                            }
+                            ExistentialPredicate::AutoTrait(it) => {
+                                item_key(db, ItemId::Trait(it.0))
+                            }
                             ExistentialPredicate::Projection(it) => match it.def_id.0 {
                                 TermId::TypeAliasId(alias) => item_key(db, ItemId::Alias(alias)),
                                 TermId::ConstId(konst) => item_key(db, ItemId::Const(konst)),
@@ -243,7 +256,8 @@ pub fn of_item(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unshared> {
             match code_hash(db, item).map_err(unhashable(db))? {
                 Some(code) => code.0,
                 None => {
-                    return Err(Unshared::NoMir(format!( // alloc: error path
+                    return Err(Unshared::NoMir(format!(
+                        // alloc: error path
                         "blaze-items: {:?} `{}` has no body to compile",
                         item.kind(),
                         key::path(db, item)
@@ -257,7 +271,10 @@ pub fn of_item(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unshared> {
 }
 
 #[blaze_query::tracked(returns(ref))]
-pub fn of_closure<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Result<ContentId, Unshared> {
+pub fn of_closure<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+) -> Result<ContentId, Unshared> {
     let code = closure_code(db, closure).map_err(unhashable(db))?;
     let body = db.mir_body_for_closure(closure).map_err(|it| no_mir(closure, it))?;
     Ok(with_spans(CLOSURE, &[code.0], body))
@@ -287,7 +304,8 @@ pub fn of_coroutine_by_move<'db>(
     let closure = match InferenceResult::of(db, loc.owner).expr_ty(closure).kind() {
         TyKind::CoroutineClosure(id, _) => id.0.as_closure(db),
         other => {
-            return Err(Unshared::NoMir(format!( // alloc: error path
+            return Err(Unshared::NoMir(format!(
+                // alloc: error path
                 "the coroutine {coroutine:?}, run by move, is of no `async` closure but of {other:?}"
             )));
         }
@@ -295,7 +313,6 @@ pub fn of_coroutine_by_move<'db>(
     // A closure's captures are its own body's, the same for every crate that asks: its own.
     let captures = blaze_items::value(db, loc.owner.krate(db), &blaze_items::captures(db, closure))
         .map_err(unhashable(db))?;
-    let body =
-        db.mir_body_for_coroutine_by_move(coroutine).map_err(|it| no_mir(coroutine, it))?;
+    let body = db.mir_body_for_coroutine_by_move(coroutine).map_err(|it| no_mir(coroutine, it))?;
     Ok(with_spans(BY_MOVE, &[code.0, captures], body))
 }

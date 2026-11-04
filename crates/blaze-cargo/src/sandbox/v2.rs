@@ -218,9 +218,11 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
 /// too, which outlive the run nowhere. One that can't be removed is an error.
 pub fn read_spec(file: &Path) -> Result<confine::Spec, String> {
     // alloc: the error, once, and nothing runs.
-    let text = std::fs::read(file).map_err(|error| format!("the spec {}: {error}", file.display()))?;
+    let text =
+        std::fs::read(file).map_err(|error| format!("the spec {}: {error}", file.display()))?;
     // alloc: the error, once, and nothing runs.
-    std::fs::remove_file(file).map_err(|error| format!("removing the spec {} once read: {error}", file.display()))?;
+    std::fs::remove_file(file)
+        .map_err(|error| format!("removing the spec {} once read: {error}", file.display()))?;
     // alloc: the error, once, and nothing runs.
     serde_json::from_slice(&text).map_err(|error| format!("the spec {}: {error}", file.display()))
 }
@@ -236,7 +238,9 @@ pub fn available() -> Result<(), String> {
 /// starts `blaze sandbox --v2 SPEC_FILE` for each run.
 pub fn serve(mut args: impl Iterator<Item = OsString>) -> ! {
     if args.next().is_some() {
-        eprintln!("blaze sandbox: --v2-serve takes nothing after it: its runs come on its standard input");
+        eprintln!(
+            "blaze sandbox: --v2-serve takes nothing after it: its runs come on its standard input"
+        );
         std::process::exit(Exit::CouldNot.code());
     }
     #[cfg(windows)]
@@ -259,7 +263,10 @@ pub fn launch(spec: &confine::Spec) -> i32 {
 
 /// [`launch`], with `run` running the program in its sandbox: the warm launcher's runs are given
 /// the driver's handles (`windows::Given`).
-pub(super) fn launch_with(spec: &confine::Spec, run: impl FnOnce(&confine::Spec, &Live) -> Result<i32, String>) -> i32 {
+pub(super) fn launch_with(
+    spec: &confine::Spec,
+    run: impl FnOnce(&confine::Spec, &Live) -> Result<i32, String>,
+) -> i32 {
     let live = match begin(spec) {
         Ok(live) => live,
         Err(why) => return not_made(spec, &why),
@@ -311,7 +318,10 @@ fn begin(spec: &confine::Spec) -> Result<Live, String> {
             // not: a value set later is one they read.
             #[cfg(unix)]
             first.extend(
-                READ_BY_THE_SANDBOX.iter().chain(READ_BY_THE_C_LIBRARY).map(|name| trace::Line::new(Seen::Env, "", name)),
+                READ_BY_THE_SANDBOX
+                    .iter()
+                    .chain(READ_BY_THE_C_LIBRARY)
+                    .map(|name| trace::Line::new(Seen::Env, "", name)),
             );
         } else {
             first.push(trace::Line::new(Seen::Env, "", trace::ALL_ENV));
@@ -360,7 +370,12 @@ fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
     program.push(spec.program.clone().into_os_string());
     program.extend(spec.args.iter().cloned());
     let env = program_env(spec);
-    let also = super::Also { network: spec.network, live: Some(live), env: Some(&*env), services: &spec.services };
+    let also = super::Also {
+        network: spec.network,
+        live: Some(live),
+        env: Some(&*env),
+        services: &spec.services,
+    };
     super::backend(&made, Some(&program), also)
 }
 
@@ -377,7 +392,9 @@ fn program_env(spec: &confine::Spec) -> std::borrow::Cow<'_, [(OsString, OsStrin
     // Once per run, as the sandbox is set up.
     let mut env = Vec::with_capacity(spec.env.len() + 1);
     for (name, value) in &spec.env {
-        let visible = name.to_str().is_some_and(|it| ours().any(|ours| ours == it) || given.iter().any(|given| given == it));
+        let visible = name.to_str().is_some_and(|it| {
+            ours().any(|ours| ours == it) || given.iter().any(|given| given == it)
+        });
         match visible {
             // clone: as above.
             true => env.push((name.clone(), value.clone())),
@@ -454,7 +471,10 @@ fn backend_spec(spec: &confine::Spec) -> Result<super::Spec, String> {
 fn finish(spec: &confine::Spec, live: &Live) -> Result<Report, String> {
     if let Some(why) = live.failed.borrow().as_deref() {
         // alloc: the error, once, and no report.
-        return Err(format!("a line could not be added to the live record {}: {why}", live.path.display()));
+        return Err(format!(
+            "a line could not be added to the live record {}: {why}",
+            live.path.display()
+        ));
     }
     if !spec.trace {
         return Ok(Report::Ran(None));
@@ -557,7 +577,10 @@ mod tests {
         let mut value = serde_json::to_value(spec(&dir, "/bin/true", &[], true)).unwrap();
         std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(super::read_spec(&file).is_ok());
-        assert!(!file.exists(), "a spec, which holds the program's environment, is removed once read");
+        assert!(
+            !file.exists(),
+            "a spec, which holds the program's environment, is removed once read"
+        );
         assert!(super::read_spec(&file).unwrap_err().contains("spec"), "read once");
         value["extra"] = serde_json::Value::Bool(true);
         std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -574,7 +597,8 @@ mod tests {
         let report = Report::NotMade("no".into());
         super::write_report(&file, &report).unwrap();
         assert_eq!(trace::decode(&std::fs::read(&file).unwrap()), Ok(report));
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|it| it.file_name()).collect();
+        let left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|it| it.file_name()).collect();
         assert_eq!(left, ["report"], "nothing is left beside it");
         assert!(super::write_report(&dir.join("missing/report"), &Report::Ran(None)).is_err());
         _ = std::fs::remove_dir_all(&dir);
@@ -604,8 +628,14 @@ mod tests {
         let Report::Ran(Some(traced)) = report else { panic!("{report:?}") };
         // Every variable it was given, and the names' hash: a variable added is one it sees.
         let names: Vec<_> = traced.env.iter().map(|it| it.0.clone()).collect();
-        assert_eq!(names, [std::ffi::OsString::from(trace::ALL_ENV_NAME), "OUT".into(), "PATH".into()]);
-        assert!(!traced.files.iter().any(|it| it.0.as_path() == Path::new("/x")), "not this run's line");
+        assert_eq!(
+            names,
+            [std::ffi::OsString::from(trace::ALL_ENV_NAME), "OUT".into(), "PATH".into()]
+        );
+        assert!(
+            !traced.files.iter().any(|it| it.0.as_path() == Path::new("/x")),
+            "not this run's line"
+        );
         let untraced = self::spec(&dir, "/bin/true", &[], false);
         std::fs::write(&untraced.live, "").unwrap();
         let live = super::begin(&untraced).unwrap();
@@ -644,21 +674,37 @@ mod tests {
         let (name, visible) = &env[env.len() - 1];
         assert_eq!(name, super::VISIBLE);
         let visible: Vec<_> = visible.to_str().unwrap().split('=').collect();
-        assert!(["OUT", "PATH", "TZ", "LANG", "LC_ALL", "TMPDIR", "LD_PRELOAD"].iter().all(|it| visible.contains(it)));
+        assert!(
+            ["OUT", "PATH", "TZ", "LANG", "LC_ALL", "TMPDIR", "LD_PRELOAD"]
+                .iter()
+                .all(|it| visible.contains(it))
+        );
         assert!(!visible.contains(&"OLDPWD"));
         let live = super::begin(&spec).unwrap();
         let text = std::fs::read_to_string(&spec.live).unwrap();
         let (lines, _) = trace::parse(&text[live.start as usize..]).unwrap();
-        assert!(!lines.iter().any(|it| it.seen == Seen::Env && trace::whole_env(&it.what)), "{text}");
+        assert!(
+            !lines.iter().any(|it| it.seen == Seen::Env && trace::whole_env(&it.what)),
+            "{text}"
+        );
         let report = super::finish(&spec, &live).unwrap();
         let Report::Ran(Some(traced)) = report else { panic!("{report:?}") };
         // The sandbox's and the C library's variables, set or not, and no other.
-        let mut ours: Vec<&str> = super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY).copied().collect();
+        let mut ours: Vec<&str> = super::READ_BY_THE_SANDBOX
+            .iter()
+            .chain(super::READ_BY_THE_C_LIBRARY)
+            .copied()
+            .collect();
         ours.sort_unstable();
         ours.dedup();
         let read: Vec<_> = traced.env.iter().map(|it| it.0.to_str().unwrap()).collect();
         assert_eq!(read, ours);
-        let set: Vec<_> = traced.env.iter().filter(|it| it.1.is_some()).map(|it| it.0.to_str().unwrap()).collect();
+        let set: Vec<_> = traced
+            .env
+            .iter()
+            .filter(|it| it.1.is_some())
+            .map(|it| it.0.to_str().unwrap())
+            .collect();
         assert_eq!(set, ["LANG", "LD_PRELOAD", "PATH"]);
         // Untraced, or naming nothing, it is given its environment as it is.
         spec.given = None;
@@ -711,7 +757,10 @@ mod tests {
     fn a_sandbox_that_cannot_be_made_is_a_report_that_says_why() {
         let dir = scratch("not-made");
         let mut spec = spec(&dir, "/bin/true", &[], true);
-        spec.env.push(("TMPDIR".into(), <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/tmp/\xff").into()));
+        spec.env.push((
+            "TMPDIR".into(),
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/tmp/\xff").into(),
+        ));
         assert_eq!(super::launch(&spec), blaze_core::exit::Exit::CouldNot.code());
         let report = trace::decode(&std::fs::read(&spec.report).unwrap()).unwrap();
         let Report::NotMade(why) = report else { panic!("{report:?}") };

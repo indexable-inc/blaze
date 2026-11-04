@@ -220,7 +220,8 @@ pub(crate) struct Counted {
 /// counters and the raw profile's version. LLVM's record is a struct whose first two fields
 /// are the name's MD5 and the hash.
 pub(super) fn counted(module: &Module<'_>, name: &str) -> Result<Counted, Unhandled> {
-    const SHAPE: Unhandled = Unhandled::Shape("an instrumented module whose PGO record is not read");
+    const SHAPE: Unhandled =
+        Unhandled::Shape("an instrumented module whose PGO record is not read");
     let mut record = None;
     let mut counters = None;
     for global in module.get_globals() {
@@ -239,7 +240,9 @@ pub(super) fn counted(module: &Module<'_>, name: &str) -> Result<Counted, Unhand
     let (Some(record), Some(counters)) = (record, counters) else {
         return Err(Unhandled::Shape("an instrumented function without its PGO record"));
     };
-    let Some(BasicValueEnum::StructValue(fields)) = record.get_initializer() else { return Err(SHAPE) };
+    let Some(BasicValueEnum::StructValue(fields)) = record.get_initializer() else {
+        return Err(SHAPE);
+    };
     let field = |at| match fields.get_field_at_index(at) {
         Some(BasicValueEnum::IntValue(it)) => it.get_zero_extended_constant().ok_or(SHAPE),
         _ => Err(SHAPE),
@@ -248,7 +251,9 @@ pub(super) fn counted(module: &Module<'_>, name: &str) -> Result<Counted, Unhand
     let AnyTypeEnum::ArrayType(array) = counters.get_value_type() else { return Err(SHAPE) };
     let version = match module.get_global(RAW_VERSION).and_then(|it| it.get_initializer()) {
         Some(BasicValueEnum::IntValue(it)) => it.get_zero_extended_constant().ok_or(SHAPE)?,
-        _ => return Err(Unhandled::Shape("an instrumented module without its raw profile version")),
+        _ => {
+            return Err(Unhandled::Shape("an instrumented module without its raw profile version"));
+        }
     };
     // alloc: once per instrumented function, its name for the link
     Ok(Counted { name: name.to_owned(), name_ref, hash, counters: array.len(), version })
@@ -394,7 +399,9 @@ store:
         let counts = code
             .relocs
             .iter()
-            .filter(|it| it.name == crate::fragment::RelocName::User { namespace: COUNTER_RELOCS, index: 0 })
+            .filter(|it| {
+                it.name == crate::fragment::RelocName::User { namespace: COUNTER_RELOCS, index: 0 }
+            })
             .count();
         assert!(counts >= 1, "{:?}", code.relocs);
         // Read without PGO, the same object is refused.

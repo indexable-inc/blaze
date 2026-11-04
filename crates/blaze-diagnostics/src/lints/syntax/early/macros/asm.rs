@@ -105,12 +105,20 @@ impl Args {
 /// x86 or x86_64: elsewhere the crate's `asm!`, `global_asm!` and `naked_asm!` calls give no
 /// lint.
 pub(super) fn x86(walk: &Walk<'_>) -> bool {
-    walk.cfg.get_cfg_values("target_arch").next().is_some_and(|arch| matches!(arch.as_str(), "x86" | "x86_64"))
+    walk.cfg
+        .get_cfg_values("target_arch")
+        .next()
+        .is_some_and(|arch| matches!(arch.as_str(), "x86" | "x86_64"))
 }
 
 /// The lints of `tree`, the expansion of `call`, a call of `asm!`, `global_asm!` or
 /// `naked_asm!` on x86 ([`x86`]).
-pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, tree: &Tree<'db>, call: MacroCallId, out: &mut Vec<Emitted>) {
+pub(super) fn lints<'db>(
+    cx: &Cx<'_, 'db>,
+    tree: &Tree<'db>,
+    call: MacroCallId,
+    out: &mut Vec<Emitted>,
+) {
     let asm = tree.of_kind(|kind| kind == SyntaxKind::ASM_EXPR).next();
     let Some(asm) = asm.and_then(ast::AsmExpr::cast) else { return };
     asm_lints(cx, tree, call, asm, out);
@@ -142,7 +150,10 @@ fn asm_lints<'db>(
         let Some((value, style)) = string_of(cx, expr) else { return };
         for (needle, message) in [
             (".intel_syntax", "avoid using `.intel_syntax`, Intel syntax is the default"),
-            (".att_syntax", "avoid using `.att_syntax`, prefer using `options(att_syntax)` instead"),
+            (
+                ".att_syntax",
+                "avoid using `.att_syntax`, prefer using `options(att_syntax)` instead",
+            ),
         ] {
             if !value.contains(needle) {
                 continue;

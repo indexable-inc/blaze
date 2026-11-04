@@ -13,9 +13,9 @@ use std::{
 use libc::{c_int, c_long, c_uint, c_ulong, gid_t, pid_t, uid_t};
 
 use super::{
-    IfReq, MountAttr, Notif, NotifResp, SECCOMP_FILTER_FLAG_NEW_LISTENER,
-    SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS,
-    SECCOMP_SET_MODE_FILTER, SYS_MOUNT_SETATTR, SYS_PIDFD_OPEN,
+    IfReq, MountAttr, Notif, NotifResp, SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_IOCTL_NOTIF_RECV,
+    SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS, SECCOMP_SET_MODE_FILTER,
+    SYS_MOUNT_SETATTR, SYS_PIDFD_OPEN,
     landlock::{self, PathBeneath, RulesetAttr},
 };
 
@@ -265,7 +265,12 @@ pub(super) fn stream_pair() -> Option<[OwnedFd; 2]> {
     let mut sockets = [0; 2];
     // SAFETY: `sockets` is a live, exclusive array of the two `c_int`s the call writes.
     let made = unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sockets.as_mut_ptr())
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
     };
     if made < 0 {
         return None;
@@ -324,7 +329,8 @@ pub(super) fn landlock_ruleset(attr: &RulesetAttr, size: usize) -> Option<OwnedF
     assert!(size <= size_of::<RulesetAttr>(), "a ruleset attribute of {size} bytes");
     // SAFETY: `attr` is a `struct landlock_ruleset_attr` (`repr(C)`, checked above) borrowed
     // for the call, which reads its first `size` bytes, no more than it has (asserted).
-    let fd = unsafe { libc::syscall(landlock::CREATE_RULESET, attr as *const RulesetAttr, size, 0) };
+    let fd =
+        unsafe { libc::syscall(landlock::CREATE_RULESET, attr as *const RulesetAttr, size, 0) };
     if fd < 0 {
         return None;
     }
@@ -512,9 +518,8 @@ pub(super) fn read_memory_into(pid: pid_t, remote: &[libc::iovec], into: &mut Ve
     // SAFETY: `local` is the spare capacity of `into`, exclusive for the call, which writes at
     // most `spare.len()` bytes there. `remote` only names addresses of the other process,
     // which the kernel checks against that process's mappings.
-    let read = unsafe {
-        libc::process_vm_readv(pid, &local, 1, remote.as_ptr(), remote.len() as _, 0)
-    };
+    let read =
+        unsafe { libc::process_vm_readv(pid, &local, 1, remote.as_ptr(), remote.len() as _, 0) };
     if read > 0 {
         let len = into.len() + read as usize;
         // SAFETY: the kernel wrote the first `read` bytes of the spare capacity, no more than

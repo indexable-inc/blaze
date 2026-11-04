@@ -16,8 +16,8 @@
 use std::{fmt, hash::Hash, sync::Arc};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use intern::{Interned, Symbol, impl_internable};
+use std::alloc::Global;
 
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, Variant};
 
@@ -401,7 +401,11 @@ impl PartialEq for TypeSet {
     /// Whether the two tell the same: types made of each other are the same where nothing
     /// else tells them apart.
     fn eq(&self, other: &Self) -> bool {
-        fn same(one: &TypeSet, other: &TypeSet, assumed: &mut HashSet<(usize, usize), Global>) -> bool {
+        fn same(
+            one: &TypeSet,
+            other: &TypeSet,
+            assumed: &mut HashSet<(usize, usize), Global>,
+        ) -> bool {
             if one.at() == other.at() || !assumed.insert((one.at(), other.at())) {
                 return true;
             }
@@ -707,7 +711,10 @@ mod tests {
 
     /// Types by their names, each made of the ones it names.
     #[derive(Default)]
-    struct Named(Vec<(&'static str, Vec<&'static str>)>, HashMap<&'static str, Option<TypeSet>, Global>);
+    struct Named(
+        Vec<(&'static str, Vec<&'static str>)>,
+        HashMap<&'static str, Option<TypeSet>, Global>,
+    );
 
     impl Found for Named {
         type Key = &'static str;

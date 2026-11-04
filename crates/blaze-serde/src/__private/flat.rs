@@ -57,7 +57,11 @@ impl<'a, 'de, E: de::Error> Deserializer<'de> for FlatMapDeserializer<'a, 'de, E
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
-        visitor.visit_map(FlatMapAccess { entries: self.entries.iter(), value: None, error: PhantomData })
+        visitor.visit_map(FlatMapAccess {
+            entries: self.entries.iter(),
+            value: None,
+            error: PhantomData,
+        })
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -66,7 +70,12 @@ impl<'a, 'de, E: de::Error> Deserializer<'de> for FlatMapDeserializer<'a, 'de, E
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, E> {
-        visitor.visit_map(FlatStructAccess { entries: self.entries.iter_mut(), fields, value: None, error: PhantomData })
+        visitor.visit_map(FlatStructAccess {
+            entries: self.entries.iter_mut(),
+            fields,
+            value: None,
+            error: PhantomData,
+        })
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
@@ -77,11 +86,19 @@ impl<'a, 'de, E: de::Error> Deserializer<'de> for FlatMapDeserializer<'a, 'de, E
         visitor.visit_unit()
     }
 
-    fn deserialize_unit_struct<V: Visitor<'de>>(self, _name: &'static str, visitor: V) -> Result<V::Value, E> {
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, E> {
         visitor.visit_unit()
     }
 
-    fn deserialize_newtype_struct<V: Visitor<'de>>(self, _name: &'static str, visitor: V) -> Result<V::Value, E> {
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, E> {
         visitor.visit_newtype_struct(self)
     }
 
@@ -272,11 +289,20 @@ impl<'a, M: SerializeMap + 'a> Serializer for FlatMapSerializer<'a, M> {
         Ok(())
     }
 
-    fn serialize_unit_variant(self, _name: &'static str, _index: u32, variant: &'static str) -> Result<(), M::Error> {
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+    ) -> Result<(), M::Error> {
         self.0.serialize_entry(variant, &())
     }
 
-    fn serialize_newtype_struct<T: Serialize + ?Sized>(self, _name: &'static str, value: &T) -> Result<(), M::Error> {
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<(), M::Error> {
         value.serialize(self)
     }
 
@@ -298,7 +324,11 @@ impl<'a, M: SerializeMap + 'a> Serializer for FlatMapSerializer<'a, M> {
         Err(cannot_flatten("a tuple"))
     }
 
-    fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeTupleStruct, M::Error> {
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, M::Error> {
         Err(cannot_flatten("a tuple struct"))
     }
 
@@ -316,7 +346,11 @@ impl<'a, M: SerializeMap + 'a> Serializer for FlatMapSerializer<'a, M> {
         Ok(FlatMapSerializeMap(self.0))
     }
 
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct, M::Error> {
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStruct, M::Error> {
         Ok(FlatMapSerializeStruct(self.0))
     }
 
@@ -345,7 +379,11 @@ impl<'a, M: SerializeMap + 'a> SerializeMap for FlatMapSerializeMap<'a, M> {
         self.0.serialize_value(value)
     }
 
-    fn serialize_entry<K: Serialize + ?Sized, V: Serialize + ?Sized>(&mut self, key: &K, value: &V) -> Result<(), M::Error> {
+    fn serialize_entry<K: Serialize + ?Sized, V: Serialize + ?Sized>(
+        &mut self,
+        key: &K,
+        value: &V,
+    ) -> Result<(), M::Error> {
         self.0.serialize_entry(key, value)
     }
 
@@ -360,7 +398,11 @@ impl<'a, M: SerializeMap + 'a> SerializeStruct for FlatMapSerializeStruct<'a, M>
     type Ok = ();
     type Error = M::Error;
 
-    fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), M::Error> {
+    fn serialize_field<T: Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), M::Error> {
         self.0.serialize_entry(key, value)
     }
 

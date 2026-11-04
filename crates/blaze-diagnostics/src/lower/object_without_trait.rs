@@ -22,7 +22,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ObjectWithoutTrait) -> Vec<Found> 
         .find(|it| it.kind() == SyntaxKind::DYN_TRAIT_TYPE)
         .unwrap_or(bound.value.syntax());
     let span = cx.span(bound.with_value(object.text_range()));
-    let diag = Diag::error(Some("E0224"), "at least one trait is required for an object type", span);
+    let diag =
+        Diag::error(Some("E0224"), "at least one trait is required for an object type", span);
     // alloc: one error, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }

@@ -26,15 +26,14 @@ use crate::nameres::{
 /// A generated crate of `count` modules: the root and `count - 1` file modules below it, each
 /// with a struct, a function and an import of the one before it. The last module is a leaf.
 fn generated_crate(count: usize) -> Model {
-    let root = Module { parent: None, name: "", inline: false, macro_use: false, items: Vec::new() };
+    let root =
+        Module { parent: None, name: "", inline: false, macro_use: false, items: Vec::new() };
     let mut model = Model { edition: "2021", modules: vec![root], macros: Vec::new() };
     for at in 1..count {
         // alloc: test setup, a module name the model keeps for the test
         let name: &'static str = Box::leak(format!("m{at}").into_boxed_str());
-        let mut items = vec![
-            Gen::Struct { name: "S", vis: Vis::Pub },
-            Gen::Fn { name: "f", vis: Vis::Pub },
-        ];
+        let mut items =
+            vec![Gen::Struct { name: "S", vis: Vis::Pub }, Gen::Fn { name: "f", vis: Vis::Pub }];
         if at > 1 {
             items.push(Gen::Use {
                 vis: Vis::Private,
@@ -42,7 +41,13 @@ fn generated_crate(count: usize) -> Model {
                 tail: UseTail::Alias("S", "T"),
             });
         }
-        model.modules.push(Module { parent: Some(0), name, inline: false, macro_use: false, items });
+        model.modules.push(Module {
+            parent: Some(0),
+            name,
+            inline: false,
+            macro_use: false,
+            items,
+        });
         model.modules[0].items.push(Gen::Mod(at));
     }
     model
@@ -95,7 +100,9 @@ fn adding_an_impl_costs_its_fact() {
 
 #[test]
 fn an_impl_added_before_another_keeps_their_order() {
-    let mut loaded = Loaded::new(&generated_crate(10).render().replace("pub fn f() {}\n", "pub fn f() {}\nimpl S {}\n"));
+    let mut loaded = Loaded::new(
+        &generated_crate(10).render().replace("pub fn f() {}\n", "pub fn f() {}\nimpl S {}\n"),
+    );
     let krate = loaded.krate();
     let leaf = loaded.file("/m9.rs");
     // `T` is the leaf's alias of `m8::S`: a self type of another name keeps the old impl's id.
@@ -120,15 +127,21 @@ fn a_body_edit_costs_nothing() {
 /// The `Work` of adding `mod extra;` after every other module of a generated crate of `count`
 /// modules, each with an impl, and the weights of the impls the write hands over.
 fn adding_a_module(count: usize) -> (Loaded, Work, Vec<Weight>) {
-    let fixture = generated_crate(count).render().replace("pub struct S;\n", "pub struct S;\nimpl S {}\n")
-        + "//- /extra.rs\npub struct X;\nimpl X {}\n";
+    let fixture =
+        generated_crate(count).render().replace("pub struct S;\n", "pub struct S;\nimpl S {}\n")
+            + "//- /extra.rs\npub struct X;\nimpl X {}\n";
     let mut loaded = Loaded::new(&fixture);
     let krate = loaded.krate();
     let lib = loaded.file("/lib.rs");
     let text = loaded.text(lib) + "mod extra;\n";
     let work = work_of(&mut loaded.db, krate, |db| db.set_file_text(lib, &text));
     let impls = loaded.db.with_state::<LastWrite, _>(|_, last| {
-        last.crates.iter().filter(|it| it.krate == krate).flat_map(|it| &it.impls).map(|&(_, _, weight)| weight).collect()
+        last.crates
+            .iter()
+            .filter(|it| it.krate == krate)
+            .flat_map(|it| &it.impls)
+            .map(|&(_, _, weight)| weight)
+            .collect()
     });
     (loaded, work, impls)
 }
@@ -173,7 +186,9 @@ fn a_name_added(count: usize) -> (Loaded, Work) {
     let mut loaded = Loaded::new(&with_filler(GLOBBED, count, "use crate::a::A;"));
     let krate = loaded.krate();
     let a = loaded.file("/a.rs");
-    let work = work_of(&mut loaded.db, krate, |db| db.set_file_text(a, "pub struct A;\npub fn foo() {}\n"));
+    let work = work_of(&mut loaded.db, krate, |db| {
+        db.set_file_text(a, "pub struct A;\npub fn foo() {}\n")
+    });
     (loaded, work)
 }
 
@@ -192,7 +207,13 @@ fn a_name_added_wakes_the_globs_that_read_it() {
     for module in ["a", "b", "c", "d"] {
         let id = module_at(&loaded.db, krate, &[module]);
         let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
-        assert!(map.module(&loaded.db, id).name_in_scope(&loaded.db, &name("foo")).take_values().is_some(), "`{module}::foo`");
+        assert!(
+            map.module(&loaded.db, id)
+                .name_in_scope(&loaded.db, &name("foo"))
+                .take_values()
+                .is_some(),
+            "`{module}::foo`"
+        );
     }
     let mut failures = String::new();
     check_db(&loaded.db, "a name added", &Exempt::NONE, false, &mut failures);
@@ -227,7 +248,13 @@ fn deleting_shared(count: usize) -> (Loaded, Work) {
     for module in ["p", "q", "r"] {
         let id = module_at(&loaded.db, krate, &[module]);
         let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
-        assert!(map.module(&loaded.db, id).name_in_scope(&loaded.db, &name("Shared")).take_types().is_some(), "`{module}::Shared` before");
+        assert!(
+            map.module(&loaded.db, id)
+                .name_in_scope(&loaded.db, &name("Shared"))
+                .take_types()
+                .is_some(),
+            "`{module}::Shared` before"
+        );
     }
     let p = loaded.file("/p.rs");
     let work = work_of(&mut loaded.db, krate, |db| db.set_file_text(p, "pub use crate::q::*;\n"));
@@ -248,7 +275,10 @@ fn deleting_what_a_glob_cycle_shares_runs_the_cycle() {
     for module in ["p", "q", "r"] {
         let id = module_at(&loaded.db, krate, &[module]);
         let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
-        assert!(map.module(&loaded.db, id).name_in_scope(&loaded.db, &name("Shared")).is_none(), "`{module}::Shared` after");
+        assert!(
+            map.module(&loaded.db, id).name_in_scope(&loaded.db, &name("Shared")).is_none(),
+            "`{module}::Shared` after"
+        );
     }
     let mut failures = String::new();
     check_db(&loaded.db, "glob cycle deletion", &Exempt::NONE, false, &mut failures);

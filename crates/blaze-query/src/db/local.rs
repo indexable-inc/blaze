@@ -381,12 +381,12 @@ impl Local {
     const fn empty() -> Local {
         Local {
             // Each buffer is empty and grows once per thread to its high-water mark.
-            frames: Vec::new(), // alloc: none, empty
-            edges: Vec::new(), // alloc: none, empty
-            captures: Vec::new(), // alloc: none, empty
-            members: Vec::new(), // alloc: none, empty
+            frames: Vec::new(),      // alloc: none, empty
+            edges: Vec::new(),       // alloc: none, empty
+            captures: Vec::new(),    // alloc: none, empty
+            members: Vec::new(),     // alloc: none, empty
             cycle_edges: Vec::new(), // alloc: none, empty
-            pending: Vec::new(), // alloc: none, empty
+            pending: Vec::new(),     // alloc: none, empty
             pending_at: hashbrown::HashMap::with_hasher(FixedState),
             walk: Vec::new(), // alloc: none, empty
             bloom: [0; BLOOM],
@@ -394,8 +394,8 @@ impl Local {
             occurrences: hashbrown::HashMap::with_hasher(FixedState),
             seen: hashbrown::HashSet::with_hasher(FixedState),
             segments: Vec::new(), // alloc: none, empty
-            entries: Vec::new(), // alloc: none, empty
-            spans: Vec::new(), // alloc: none, empty
+            entries: Vec::new(),  // alloc: none, empty
+            spans: Vec::new(),    // alloc: none, empty
             walked: hashbrown::HashSet::with_hasher(FixedState),
             attached: None,
             fuel: None,
@@ -525,10 +525,16 @@ impl Local {
     pub(crate) fn steps(&mut self, given: u64) -> Option<Steps> {
         let walls = self.walls;
         let given = match &self.steps {
-            Some(outer) if outer.walls == walls => given.min(outer.given.saturating_sub(outer.seen.len() as u64)),
+            Some(outer) if outer.walls == walls => {
+                given.min(outer.given.saturating_sub(outer.seen.len() as u64))
+            }
             _ => given,
         };
-        self.steps.replace(Steps { given, seen: hashbrown::HashSet::with_hasher(FixedState), walls })
+        self.steps.replace(Steps {
+            given,
+            seen: hashbrown::HashSet::with_hasher(FixedState),
+            walls,
+        })
     }
 
     /// Takes the task's step bound away, `outer` (what [`Local::steps`] gave back) in its place:
@@ -681,7 +687,8 @@ impl Local {
         let pending =
             self.pending.get(at as usize).filter(|it| it.header == header && it.word == word)?;
         let frame = self.frames.get(pending.head as usize)?;
-        (frame.serial == pending.head_serial && self.may_assume(pending.head)).then_some(pending.head)
+        (frame.serial == pending.head_serial && self.may_assume(pending.head))
+            .then_some(pending.head)
     }
 }
 
@@ -830,7 +837,9 @@ pub(crate) fn next_dedup(start: usize, kept: usize) -> u32 {
 /// new mark, for the caller to name the run ([`super::noted`]). A load first, so a run that
 /// sets no mark writes no shared line.
 fn most_reads(held: u64) -> Note {
-    if MOST_RUN_READS.load(Ordering::Relaxed) < held && MOST_RUN_READS.fetch_max(held, Ordering::Relaxed) < held {
+    if MOST_RUN_READS.load(Ordering::Relaxed) < held
+        && MOST_RUN_READS.fetch_max(held, Ordering::Relaxed) < held
+    {
         Note::Most(held)
     } else {
         Note::Fine
@@ -853,7 +862,13 @@ impl Local {
     /// does next, once it has let go of the stack ([`super::noted`]): [`Note::Runaway`], and
     /// the read not recorded, when that run recorded more reads than [`RUN_READS`].
     #[inline(always)]
-    pub(crate) fn read(&mut self, storage: *const Storage, node: u32, durability: u8, changed: u32) -> Note {
+    pub(crate) fn read(
+        &mut self,
+        storage: *const Storage,
+        node: u32,
+        durability: u8,
+        changed: u32,
+    ) -> Note {
         let edges_len = self.edges.len() as u32;
         let last = self.edges.last().copied();
         let Some(frame) = self.recording(storage) else { return Note::Fine };
@@ -957,7 +972,11 @@ impl Local {
         self.drop_segments_from(start);
         if capture != 0 && self.edges.len() > start {
             // alloc: none once warm: the segment list grows to its high-water mark once per thread
-            self.segments.push(Segment { start: start as u32, end: self.edges.len() as u32, capture });
+            self.segments.push(Segment {
+                start: start as u32,
+                end: self.edges.len() as u32,
+                capture,
+            });
         }
     }
 

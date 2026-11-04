@@ -35,14 +35,8 @@ fn node_program_one_deletes_single_node_at_a_time() {
 
 #[test]
 fn node_program_two_deletes_pairs_adaptively() {
-    let initial = vec![
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(5),
-        int_node(6),
-    ];
+    let initial =
+        vec![int_node(1), int_node(2), int_node(3), int_node(4), int_node(5), int_node(6)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => (true, nodes.to_vec(), Spans::new()),
@@ -69,13 +63,7 @@ fn node_program_left_extension_accumulates_across_accepted_steps() {
             })
             .collect()
     }
-    let initial = vec![
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(42),
-    ];
+    let initial = vec![int_node(1), int_node(2), int_node(3), int_node(4), int_node(42)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
@@ -99,14 +87,8 @@ fn node_program_left_extension_accumulates_across_accepted_steps() {
 
 #[test]
 fn node_program_respects_predicate_rejecting_partial_deletes() {
-    let initial = vec![
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(5),
-        int_node(6),
-    ];
+    let initial =
+        vec![int_node(1), int_node(2), int_node(3), int_node(4), int_node(5), int_node(6)];
 
     {
         let mut shrinker = Shrinker::with_probe(
@@ -227,9 +209,8 @@ fn initial_node_count() -> usize {
 /// to a single `true` within a tight call budget.
 #[test]
 fn node_program_adaptively_deletes_long_false_run() {
-    let mut initial: Vec<ChoiceNode> = (0..1000)
-        .map(|_| ChoiceNode::boolean(BooleanChoice { p: 0.5 }, false, false))
-        .collect();
+    let mut initial: Vec<ChoiceNode> =
+        (0..1000).map(|_| ChoiceNode::boolean(BooleanChoice { p: 0.5 }, false, false)).collect();
     initial.push(ChoiceNode::boolean(BooleanChoice { p: 0.5 }, true, false));
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {

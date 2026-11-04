@@ -68,8 +68,9 @@ fn check_case(data: &[u8], case: usize) {
         || data.starts_with(&macho::FAT_MAGIC.to_be_bytes())
         || data.starts_with(&macho::FAT_MAGIC_64.to_be_bytes());
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::MachO, arch, SHARED, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -121,13 +122,26 @@ fn seeds() -> Vec<Vec<u8>> {
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
     let x86 = with_trie(macho::CPU_TYPE_X86_64.0, &sample_trie());
     let arm = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
-    let both = fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
+    let both =
+        fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
     vec![
         ("an AArch64 dylib with an LC_DYLD_INFO_ONLY trie", Arch::Aarch64, arm),
         ("an x86-64 dylib with an LC_DYLD_INFO_ONLY trie", Arch::X86_64, x86),
-        ("an x86-64 dylib with an LC_DYLD_EXPORTS_TRIE", Arch::X86_64, exports_trie(macho::CPU_TYPE_X86_64.0)),
-        ("an AArch64 dylib of a symbol table", Arch::Aarch64, symtab(macho::CPU_TYPE_ARM64.0, macho::MH_DYLIB.0)),
-        ("an x86-64 dylib stub of a symbol table", Arch::X86_64, symtab(macho::CPU_TYPE_X86_64.0, macho::MH_DYLIB_STUB.0)),
+        (
+            "an x86-64 dylib with an LC_DYLD_EXPORTS_TRIE",
+            Arch::X86_64,
+            exports_trie(macho::CPU_TYPE_X86_64.0),
+        ),
+        (
+            "an AArch64 dylib of a symbol table",
+            Arch::Aarch64,
+            symtab(macho::CPU_TYPE_ARM64.0, macho::MH_DYLIB.0),
+        ),
+        (
+            "an x86-64 dylib stub of a symbol table",
+            Arch::X86_64,
+            symtab(macho::CPU_TYPE_X86_64.0, macho::MH_DYLIB_STUB.0),
+        ),
         ("a universal dylib, its x86-64 slice", Arch::X86_64, both.clone()),
         ("a universal dylib, its AArch64 slice", Arch::Aarch64, both),
     ]
@@ -147,7 +161,13 @@ fn name16(out: &mut Vec<u8>, name: &str) {
     out.extend_from_slice(&field);
 }
 
-fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
+fn segment(
+    name: &str,
+    vmaddr: u64,
+    fileoff: u64,
+    filesize: u64,
+    sections: &[(&str, u64, u64, u32)],
+) -> Vec<u8> {
     let mut out = Vec::new();
     u32le(&mut out, macho::LC_SEGMENT_64.0);
     u32le(&mut out, 72 + 80 * sections.len() as u32);
@@ -204,7 +224,9 @@ fn file(cpu: u32, filetype: u32, commands: impl Fn(u32) -> Vec<Vec<u8>>, tail: &
     let offset = (32 + sizeofcmds).next_multiple_of(8);
     let commands = commands(offset as u32);
     let mut out = Vec::new();
-    for value in [macho::MH_MAGIC_64, cpu, 0, filetype, commands.len() as u32, sizeofcmds as u32, 0, 0] {
+    for value in
+        [macho::MH_MAGIC_64, cpu, 0, filetype, commands.len() as u32, sizeofcmds as u32, 0, 0]
+    {
         u32le(&mut out, value);
     }
     for command in commands {
@@ -226,7 +248,10 @@ fn segments(len: u64) -> Vec<Vec<u8>> {
             0x4000,
             0x4000,
             0,
-            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
+            &[
+                ("__data", 0x4000, 0x100, 0),
+                ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0),
+            ],
         ),
     ]
 }
@@ -406,14 +431,20 @@ fn reexport(flags: u64, ordinal: u64, import: &str) -> Vec<u8> {
 fn sample_trie() -> Vec<u8> {
     let foo = Node {
         terminal: info(0, &[0x1010]),
-        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
+        children: vec![(
+            "bar",
+            leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])),
+        )],
     };
     let fo = Node {
         terminal: Vec::new(),
         children: vec![
             ("o", foo),
             ("b", leaf(reexport(0, 1, "_bob"))),
-            ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
+            (
+                "_tls",
+                leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100])),
+            ),
         ],
     };
     let underscore = Node {
@@ -471,7 +502,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, arch, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::MachO, arch, SHARED, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::MachO, arch, SHARED, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

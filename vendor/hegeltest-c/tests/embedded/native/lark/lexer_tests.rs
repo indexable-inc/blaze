@@ -21,24 +21,14 @@ fn term(s: &str) -> Tok {
 }
 
 fn string(body: &str) -> Tok {
-    Tok::Str {
-        body: body.to_string(),
-        flags: String::new(),
-    }
+    Tok::Str { body: body.to_string(), flags: String::new() }
 }
 
 #[test]
 fn simple_rule() {
     assert_eq!(
         toks("start: a B \"x\""),
-        vec![
-            rule("start"),
-            Tok::Colon,
-            rule("a"),
-            term("B"),
-            string("x"),
-            Tok::Nl
-        ]
+        vec![rule("start"), Tok::Colon, rule("a"), term("B"), string("x"), Tok::Nl]
     );
 }
 
@@ -143,14 +133,7 @@ fn priorities_and_dots() {
 fn plus_before_digit_is_a_number() {
     assert_eq!(
         toks("a: b ~ +3"),
-        vec![
-            rule("a"),
-            Tok::Colon,
-            rule("b"),
-            Tok::Tilde,
-            Tok::Number(3),
-            Tok::Nl
-        ]
+        vec![rule("a"), Tok::Colon, rule("b"), Tok::Tilde, Tok::Number(3), Tok::Nl]
     );
 }
 
@@ -172,10 +155,7 @@ fn strings_with_escapes_and_flags() {
             term("A"),
             Tok::Colon,
             string(r#"a\"b\\"#),
-            Tok::Str {
-                body: "c".to_string(),
-                flags: "i".to_string()
-            },
+            Tok::Str { body: "c".to_string(), flags: "i".to_string() },
             Tok::Nl,
         ]
     );
@@ -199,14 +179,8 @@ fn regexps_with_escapes_and_flags() {
         vec![
             term("A"),
             Tok::Colon,
-            Tok::Regexp {
-                body: r"a\/b\\c".to_string(),
-                flags: "ims".to_string()
-            },
-            Tok::Regexp {
-                body: "d".to_string(),
-                flags: String::new()
-            },
+            Tok::Regexp { body: r"a\/b\\c".to_string(), flags: "ims".to_string() },
+            Tok::Regexp { body: "d".to_string(), flags: String::new() },
             Tok::Nl,
         ]
     );
@@ -216,10 +190,7 @@ fn regexps_with_escapes_and_flags() {
 fn regexp_may_span_lines() {
     assert_eq!(
         toks("A: /a\nb/x")[2],
-        Tok::Regexp {
-            body: "a\nb".to_string(),
-            flags: "x".to_string()
-        }
+        Tok::Regexp { body: "a\nb".to_string(), flags: "x".to_string() }
     );
 }
 
@@ -232,16 +203,7 @@ fn unterminated_regexp() {
 fn double_slash_is_a_comment_not_a_regexp() {
     assert_eq!(
         toks("a: b // c\nd: e"),
-        vec![
-            rule("a"),
-            Tok::Colon,
-            rule("b"),
-            Tok::Nl,
-            rule("d"),
-            Tok::Colon,
-            rule("e"),
-            Tok::Nl
-        ]
+        vec![rule("a"), Tok::Colon, rule("b"), Tok::Nl, rule("d"), Tok::Colon, rule("e"), Tok::Nl]
     );
 }
 
@@ -249,15 +211,7 @@ fn double_slash_is_a_comment_not_a_regexp() {
 fn hash_comments_and_comment_only_lines() {
     assert_eq!(
         toks("# heading\na: b # trailing\n   // indented comment\n  | c\n"),
-        vec![
-            Tok::Nl,
-            rule("a"),
-            Tok::Colon,
-            rule("b"),
-            Tok::NlOr,
-            rule("c"),
-            Tok::Nl
-        ]
+        vec![Tok::Nl, rule("a"), Tok::Colon, rule("b"), Tok::NlOr, rule("c"), Tok::Nl]
     );
 }
 
@@ -287,25 +241,13 @@ fn a_newline_swallows_any_unicode_whitespace_after_it() {
 fn newline_or_continuation() {
     assert_eq!(
         toks("a: b\n  | c\n\n  | d\n"),
-        vec![
-            rule("a"),
-            Tok::Colon,
-            rule("b"),
-            Tok::NlOr,
-            rule("c"),
-            Tok::NlOr,
-            rule("d"),
-            Tok::Nl
-        ]
+        vec![rule("a"), Tok::Colon, rule("b"), Tok::NlOr, rule("c"), Tok::NlOr, rule("d"), Tok::Nl]
     );
 }
 
 #[test]
 fn backslash_continues_a_line() {
-    assert_eq!(
-        toks("a: b \\  \n   c"),
-        vec![rule("a"), Tok::Colon, rule("b"), rule("c"), Tok::Nl]
-    );
+    assert_eq!(toks("a: b \\  \n   c"), vec![rule("a"), Tok::Colon, rule("b"), rule("c"), Tok::Nl]);
 }
 
 #[test]
@@ -368,10 +310,7 @@ fn lone_underscore_is_an_error() {
 #[test]
 fn unexpected_character() {
     let message = err("a: b @");
-    assert!(
-        message.contains("Unexpected input at line 1 column 6"),
-        "{message}"
-    );
+    assert!(message.contains("Unexpected input at line 1 column 6"), "{message}");
     assert!(message.contains("a: b @"), "{message}");
 }
 
@@ -379,19 +318,7 @@ fn unexpected_character() {
 fn positions_track_lines_and_columns() {
     let tokens = tokenize("a: b\n  c: d").unwrap();
     let positions: Vec<(u32, u32)> = tokens.iter().map(|t| (t.pos.line, t.pos.column)).collect();
-    assert_eq!(
-        positions,
-        vec![
-            (1, 1),
-            (1, 2),
-            (1, 4),
-            (1, 5),
-            (2, 3),
-            (2, 4),
-            (2, 6),
-            (2, 7)
-        ]
-    );
+    assert_eq!(positions, vec![(1, 1), (1, 2), (1, 4), (1, 5), (2, 3), (2, 4), (2, 6), (2, 7)]);
 }
 
 #[test]
@@ -404,15 +331,6 @@ fn empty_input_is_a_single_newline() {
 fn carriage_returns_are_newlines() {
     assert_eq!(
         toks("a: b\r\nc: d"),
-        vec![
-            rule("a"),
-            Tok::Colon,
-            rule("b"),
-            Tok::Nl,
-            rule("c"),
-            Tok::Colon,
-            rule("d"),
-            Tok::Nl
-        ]
+        vec![rule("a"), Tok::Colon, rule("b"), Tok::Nl, rule("c"), Tok::Colon, rule("d"), Tok::Nl]
     );
 }

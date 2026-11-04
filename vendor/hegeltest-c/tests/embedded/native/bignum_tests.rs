@@ -75,14 +75,8 @@ fn signed_bytes_le_roundtrip() {
 fn signed_bytes_le_is_minimal_at_negative_boundaries() {
     assert_eq!(i(-128).to_signed_bytes_le(), vec![0x80]);
     assert_eq!(i(-32768).to_signed_bytes_le(), vec![0x00, 0x80]);
-    assert_eq!(
-        BigInt::from(i64::MIN).to_signed_bytes_le(),
-        i64::MIN.to_le_bytes().to_vec()
-    );
-    assert_eq!(
-        BigInt::from(i128::MIN).to_signed_bytes_le(),
-        i128::MIN.to_le_bytes().to_vec()
-    );
+    assert_eq!(BigInt::from(i64::MIN).to_signed_bytes_le(), i64::MIN.to_le_bytes().to_vec());
+    assert_eq!(BigInt::from(i128::MIN).to_signed_bytes_le(), i128::MIN.to_le_bytes().to_vec());
     assert_eq!(i(-127).to_signed_bytes_le(), vec![0x81]);
     assert_eq!(i(-129).to_signed_bytes_le(), vec![0x7F, 0xFF]);
     assert_eq!(i(-255).to_signed_bytes_le(), vec![0x01, 0xFF]);
@@ -275,15 +269,7 @@ fn display_matches_value() {
 
 #[test]
 fn values_of_at_most_two_words_are_inline() {
-    for v in [
-        0,
-        1,
-        -1,
-        i64::MAX as i128,
-        i64::MIN as i128,
-        i128::MAX,
-        i128::MIN,
-    ] {
+    for v in [0, 1, -1, i64::MAX as i128, i64::MIN as i128, i128::MAX, i128::MIN] {
         assert!(i(v).is_inline(), "{v}");
     }
     assert!(BigInt::from(u128::MAX).is_inline());

@@ -33,7 +33,9 @@ type Reader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 pub fn demangle(name: &str) -> String {
     match rustc_demangle::try_demangle(name) {
         Ok(it) => format!("{it:#}"),
-        Err(_) => name.strip_prefix('_').filter(|_| cfg!(target_os = "macos")).unwrap_or(name).to_owned(),
+        Err(_) => {
+            name.strip_prefix('_').filter(|_| cfg!(target_os = "macos")).unwrap_or(name).to_owned()
+        }
     }
 }
 
@@ -121,7 +123,9 @@ impl Table {
             })
             .collect();
         let name = |it: &(u64, u32, u32, u32)| &data[it.2 as usize..][..it.3 as usize];
-        symbols.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| name(a).cmp(name(b))));
+        symbols.sort_unstable_by(|a, b| {
+            (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| name(a).cmp(name(b)))
+        });
         symbols.dedup_by_key(|it| it.0);
         // alloc: the table's starts, once a process
         let starts = symbols.iter().map(|it| it.0).collect();
@@ -141,7 +145,9 @@ impl Table {
         let stubs = object
             .sections()
             .find(|it| matches!(it.name(), Ok(live::STUBS_SECTION_MACHO | live::STUBS_SECTION_ELF)))
-            .and_then(|it| Some((it.address()..it.address().saturating_add(it.size()), it.file_range()?.0)));
+            .and_then(|it| {
+                Some((it.address()..it.address().saturating_add(it.size()), it.file_range()?.0))
+            });
         Ok(Table {
             path: path.to_string_lossy().into_owned(),
             data,
@@ -159,8 +165,11 @@ impl Table {
     fn dwarf(&self) -> Option<addr2line::Context<Reader>> {
         use object::{Object, ObjectSection};
         let object = object::File::parse(self.data).ok()?;
-        let endian =
-            if object.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+        let endian = if object.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
         if object.section_by_name(".debug_info").is_some_and(|s| s.size() > 0)
             && let Some(dwarf) = load_dwarf(&object, endian)
         {
@@ -213,7 +222,8 @@ impl Table {
         }
         let i = self.starts.partition_point(|&it| it <= at).checked_sub(1)?;
         let (start, size) = (self.starts[i], self.rest[i].0);
-        (start >= section.start && (size == 0 || at < start.saturating_add(u64::from(size)))).then_some(i)
+        (start >= section.start && (size == 0 || at < start.saturating_add(u64::from(size))))
+            .then_some(i)
     }
 
     /// What `at` (a file address) is when it is in a live image's slot stubs, with the image
@@ -233,14 +243,15 @@ impl Table {
         let from = usize::try_from(file + (start - range.start)).ok()?;
         let bytes = self.data.get(from..from.checked_add(usize::try_from(size).ok()?)?)?;
         // The section's start is slot 0's stub: the stub there says it is this slot's.
-        let slot = u32::try_from(slot).ok().filter(|&it| live::stub_slot(HOST_ARCH, bytes) == Some(it))?;
+        let slot =
+            u32::try_from(slot).ok().filter(|&it| live::stub_slot(HOST_ARCH, bytes) == Some(it))?;
         let target = live::log::Header::this().map(|it| it.target(slot));
         let code = match target {
             Ok(Some(target)) => match target.checked_sub(slide).and_then(|it| self.symbol(it)) {
                 Some(i) => Code::Symbol(i),
                 None => Code::Unnamed(target),
             },
-            Ok(None) => Code::Unread(format!("slot {slot} is past the jump table")),  // alloc: a stub's name, once an address
+            Ok(None) => Code::Unread(format!("slot {slot} is past the jump table")), // alloc: a stub's name, once an address
             Err(why) => Code::Unread(why),
         };
         Some(Stub { slot, offset: at - start, code })
@@ -268,7 +279,8 @@ impl Table {
         let mut demangled = self.demangled.lock();
         let key = u32::try_from(i).unwrap_or(u32::MAX);
         // alloc: a function's demangled name, once a process a function named
-        let name = demangled.entry(key).or_insert_with(|| demangle(self.mangled(i)).into_boxed_str());
+        let name =
+            demangled.entry(key).or_insert_with(|| demangle(self.mangled(i)).into_boxed_str());
         f(name)
     }
 }
@@ -297,7 +309,9 @@ impl Stub {
         let slot = self.slot;
         match &self.code {
             Code::Symbol(i) => table.demangled(*i, |name| format!("stub of {name}")),
-            Code::Unnamed(at) => format!("stub of slot {slot}, whose code at {at:#x} no symbol names"),
+            Code::Unnamed(at) => {
+                format!("stub of slot {slot}, whose code at {at:#x} no symbol names")
+            }
             Code::Unread(why) => format!("stub of slot {slot} (its jump table unread: {why})"),
         }
     }
@@ -307,16 +321,28 @@ impl Stub {
 #[cfg(unix)]
 fn map(path: &Path) -> Result<&'static [u8], String> {
     use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
-    let len = file.metadata().map_err(|error| format!("reading the size of {}: {error}", path.display()))?.len();
-    let len = usize::try_from(len).map_err(|_| format!("{} is {len} bytes, past the address space", path.display()))?;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("reading the size of {}: {error}", path.display()))?
+        .len();
+    let len = usize::try_from(len)
+        .map_err(|_| format!("{} is {len} bytes, past the address space", path.display()))?;
     if len == 0 {
         return Err(format!("{} is empty", path.display()));
     }
     // SAFETY: a new read-only private mapping of `len` bytes of a file opened above; the
     // mapping outlives the descriptor, which closes as `file` drops.
     let at = unsafe {
-        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
     };
     if at == libc::MAP_FAILED {
         return Err(format!("mapping {}: {}", path.display(), std::io::Error::last_os_error()));
@@ -333,7 +359,8 @@ fn map(path: &Path) -> Result<&'static [u8], String> {
 #[cfg(not(unix))]
 fn map(path: &Path) -> Result<&'static [u8], String> {
     // alloc: the executable's bytes, once a process
-    let bytes = std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
     Ok(bytes.leak())
 }
 
@@ -423,7 +450,9 @@ impl Image {
             }
         }
         if out.is_empty() {
-            out.push(base(symbol.map_or_else(|| format!("{at:#x}"), |i| table.demangled(i, str::to_owned))));
+            out.push(base(
+                symbol.map_or_else(|| format!("{at:#x}"), |i| table.demangled(i, str::to_owned)),
+            ));
         }
         // addr2line gives the innermost first.
         out.reverse();
@@ -431,7 +460,8 @@ impl Image {
         for (i, f) in out.iter_mut().enumerate() {
             f.inline_depth = i as u16;
             if i == 0 {
-                f.system_name = symbol.map(|it| table.mangled(it).to_owned()).filter(|it| *it != f.function);
+                f.system_name =
+                    symbol.map(|it| table.mangled(it).to_owned()).filter(|it| *it != f.function);
             }
         }
         debug_assert_eq!(depth, out.len());
@@ -722,7 +752,8 @@ fn loaded(pc: u64) -> Option<(u64, Option<String>, Option<String>, u64)> {
     let text = |ptr: *const libc::c_char| {
         // SAFETY: `dladdr` set it to a NUL-terminated string the loader keeps for the
         // object's life, or left it null.
-        (!ptr.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        (!ptr.is_null())
+            .then(|| unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
     };
     Some((info.dli_fbase as u64, text(info.dli_fname), text(info.dli_sname), info.dli_saddr as u64))
 }

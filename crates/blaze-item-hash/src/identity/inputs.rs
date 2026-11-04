@@ -3,12 +3,12 @@
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
+use blaze_query::db::{Database as _, Setter as _};
 use hir_def::{
     lang_item::{LangItemEnum, LangItemTarget, lang_items},
     nameres::crate_def_map,
 };
 use hir_ty::next_solver::goal_store::{GoalFacts, solver_version};
-use blaze_query::db::{Database as _, Setter as _};
 
 use super::item::{Part, item_part, variant_part};
 
@@ -49,7 +49,9 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
         None => {
             blaze_query::db::report_untracked_read(
                 db,
-                blaze_query::db::Untracked { what: "the absence of the `FrontEnd` singleton (`set_build` not told yet)" },
+                blaze_query::db::Untracked {
+                    what: "the absence of the `FrontEnd` singleton (`set_build` not told yet)",
+                },
             );
             None
         }

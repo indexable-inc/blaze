@@ -21,14 +21,17 @@ use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use base_db::{ContentId, Crate, Db};
 use hir_def::nameres::crate_def_map;
-use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError};
+use hir_expand::proc_macro::{
+    Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+};
 use parking_lot::Mutex;
 use tt::TopSubtree;
 
 use config::Corpus;
 
 /// The crates each call of which is expanded both ways, and their macros.
-const COMPARED: &[(&str, &[&str])] = &[("serde_derive", &["Serialize", "Deserialize"]), ("thiserror_impl", &["Error"])];
+const COMPARED: &[(&str, &[&str])] =
+    &[("serde_derive", &["Serialize", "Deserialize"]), ("thiserror_impl", &["Error"])];
 
 /// One call both ways: which macro, and the first difference of the module's output from the
 /// evaluator's, if any.
@@ -62,23 +65,34 @@ fn outcome(result: &Result<Expanded, ProcMacroExpansionError>) -> Result<&TopSub
 impl Twin {
     /// The evaluator's expansion, its reads and state as it stated them, compared with the
     /// module's.
-    fn run(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn run(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let evaluated = self.evaluated.expand_in(db, calling, call);
         let module = self.module.expand_in(db, calling, call);
         let difference = match (outcome(&evaluated), outcome(&module)) {
             (Ok(ours), Ok(theirs)) => difference::difference(theirs, ours),
-            (ours, theirs) => {
-                (ours.as_ref().err() != theirs.as_ref().err()).then(|| format!("the evaluator gave {ours:?}, the module {theirs:?}"))
-            }
+            (ours, theirs) => (ours.as_ref().err() != theirs.as_ref().err())
+                .then(|| format!("the evaluator gave {ours:?}, the module {theirs:?}")),
         };
-        self.compared.lock().push(Compared { krate: self.krate.clone(), name: self.name.clone(), difference });
+        self.compared.lock().push(Compared {
+            krate: self.krate.clone(),
+            name: self.name.clone(),
+            difference,
+        });
         evaluated
     }
 }
 
 impl fmt::Debug for Twin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Twin").field("krate", &self.krate).field("name", &self.name).finish_non_exhaustive()
+        f.debug_struct("Twin")
+            .field("krate", &self.krate)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -91,18 +105,31 @@ impl ProcMacroExpander for Twin {
         self.evaluated.code()
     }
 
-    fn expand(&self, _db: &Db, _call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
-        Err(ProcMacroExpansionError::System("the corpus calls every macro from a calling crate".to_owned()))
+    fn expand(
+        &self,
+        _db: &Db,
+        _call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        Err(ProcMacroExpansionError::System(
+            "the corpus calls every macro from a calling crate".to_owned(),
+        ))
     }
 
-    fn expand_in(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand_in(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, calling, call)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any)
-            .downcast_ref::<Twin>()
-            .is_some_and(|other| Arc::ptr_eq(&self.compared, &other.compared) && self.krate == other.krate && self.name == other.name)
+        (other as &dyn Any).downcast_ref::<Twin>().is_some_and(|other| {
+            Arc::ptr_eq(&self.compared, &other.compared)
+                && self.krate == other.krate
+                && self.name == other.name
+        })
     }
 }
 
@@ -116,15 +143,25 @@ struct Loading<'a> {
 }
 
 /// The macros of `krate`, named `name`: each a [`Twin`] when the crate is [`COMPARED`].
-fn twins(db: &Db, krate: Crate, toolchain: ContentId, name: &str, loading: &Loading<'_>) -> Result<Vec<ProcMacro>, String> {
+fn twins(
+    db: &Db,
+    krate: Crate,
+    toolchain: ContentId,
+    name: &str,
+    loading: &Loading<'_>,
+) -> Result<Vec<ProcMacro>, String> {
     let Loading { modules, macros, loaded, compared } = *loading;
-    let evaluated = blaze_macro_eval::load(db, krate, toolchain, macros).map_err(|error| format!("load of `{name}`: {error}"))?;
+    let evaluated = blaze_macro_eval::load(db, krate, toolchain, macros)
+        .map_err(|error| format!("load of `{name}`: {error}"))?;
     if !COMPARED.iter().any(|(it, _)| *it == name) {
         return Ok(evaluated);
     }
-    let path = modules.get(name).ok_or_else(|| format!("the corpus config's `wasm` has no module of `{name}`"))?;
+    let path = modules
+        .get(name)
+        .ok_or_else(|| format!("the corpus config's `wasm` has no module of `{name}`"))?;
     let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
-    let modules = blaze_macro_eval::load_wasm(db, krate, toolchain, macros, loaded, &bytes).map_err(|error| format!("load_wasm of `{name}`: {error}"))?;
+    let modules = blaze_macro_eval::load_wasm(db, krate, toolchain, macros, loaded, &bytes)
+        .map_err(|error| format!("load_wasm of `{name}`: {error}"))?;
     let mut twins = Vec::new();
     for eval in evaluated {
         let module = modules
@@ -138,7 +175,12 @@ fn twins(db: &Db, krate: Crate, toolchain: ContentId, name: &str, loading: &Load
             module: module.expander.clone(),
             compared: compared.clone(),
         };
-        twins.push(ProcMacro { name: eval.name, kind: eval.kind, expander: Arc::new(twin), disabled: eval.disabled });
+        twins.push(ProcMacro {
+            name: eval.name,
+            kind: eval.kind,
+            expander: Arc::new(twin),
+            disabled: eval.disabled,
+        });
     }
     Ok(twins)
 }
@@ -147,15 +189,20 @@ fn twins(db: &Db, krate: Crate, toolchain: ContentId, name: &str, loading: &Load
 #[ignore = "needs BLAZE_MACRO_CORPUS with `wasm`: each compared crate built by blaze for wasm32-wasip1"]
 fn a_modules_expansion_is_the_evaluators_in_every_token() {
     let config = Corpus::read().unwrap_or_else(|why| panic!("{why}"));
-    let modules = config.wasm.clone().unwrap_or_else(|| panic!("{}: no `wasm` modules", config::VAR));
+    let modules =
+        config.wasm.clone().unwrap_or_else(|| panic!("{}: no `wasm` modules", config::VAR));
     let compared = Comparisons::default();
     let loaded = blaze_macro_eval::Modules::new().unwrap_or_else(|why| panic!("{why}"));
     // Each call runs on both engines to compare them, so none is kept or found.
     let macros = blaze_macro_eval::Macros::nothing("each call is compared on both engines");
-    let loading = Loading { modules: &modules, macros: &macros, loaded: &loaded, compared: &compared };
-    let workspace = load::lower_with(&config.workspace, &config.cargo_home, config.homes(), |db, krate, toolchain, name| {
-        twins(db, krate, toolchain, name, &loading)
-    })
+    let loading =
+        Loading { modules: &modules, macros: &macros, loaded: &loaded, compared: &compared };
+    let workspace = load::lower_with(
+        &config.workspace,
+        &config.cargo_home,
+        config.homes(),
+        |db, krate, toolchain, name| twins(db, krate, toolchain, name, &loading),
+    )
     .unwrap_or_else(|why| panic!("{why}"));
     let calls = workspace.krate("corpus-calls").unwrap_or_else(|why| panic!("{why}"));
     crate_def_map(workspace.lowered.db(), calls);
@@ -163,13 +210,22 @@ fn a_modules_expansion_is_the_evaluators_in_every_token() {
     let compared = std::mem::take(&mut *compared.lock());
     for (krate, names) in COMPARED {
         for name in *names {
-            let calls = compared.iter().filter(|it| &*it.krate == *krate && &*it.name == *name).count();
+            let calls =
+                compared.iter().filter(|it| &*it.krate == *krate && &*it.name == *name).count();
             assert!(calls > 0, "no call of `{krate}::{name}` was expanded both ways");
         }
     }
     let differences: Vec<String> = compared
         .iter()
-        .filter_map(|it| it.difference.as_ref().map(|why| format!("`{}::{}`: {why}", it.krate, it.name)))
+        .filter_map(|it| {
+            it.difference.as_ref().map(|why| format!("`{}::{}`: {why}", it.krate, it.name))
+        })
         .collect();
-    assert!(differences.is_empty(), "{} of {} calls differ:\n{}", differences.len(), compared.len(), differences.join("\n"));
+    assert!(
+        differences.is_empty(),
+        "{} of {} calls differ:\n{}",
+        differences.len(),
+        compared.len(),
+        differences.join("\n")
+    );
 }

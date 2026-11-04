@@ -116,7 +116,8 @@ impl<T> Shard<T> {
     /// The node whose fingerprint is `key`'s, taking no lock.
     fn find(&self, key: &Key) -> Option<&Node<T>> {
         let is = |local: u32| {
-            self.node(local).expect("an index entry before its node").content.fingerprint() == key.fingerprint
+            self.node(local).expect("an index entry before its node").content.fingerprint()
+                == key.fingerprint
         };
         self.node(self.index.find(key.hash, is)?)
     }
@@ -175,7 +176,13 @@ impl<T: Consed> HashCons<T> {
 
     /// Appends a node to `shard`'s arena and publishes its entry. Called with the shard
     /// locked and `key` absent from its index.
-    fn append<'s>(&self, shard: &'s Shard<T>, key: &Key, content: ContentId, value: T) -> &'s Node<T> {
+    fn append<'s>(
+        &self,
+        shard: &'s Shard<T>,
+        key: &Key,
+        content: ContentId,
+        value: T,
+    ) -> &'s Node<T> {
         let local = shard.len.load(Ordering::Relaxed);
         assert!(
             local < u32::MAX >> self.shift,
@@ -184,13 +191,15 @@ impl<T: Consed> HashCons<T> {
         );
         let raw = (local << self.shift) | key.shard as u32;
         let (chunk, at) = chunk_of(local);
-        let nodes = shard.nodes[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
+        let nodes = shard.nodes[chunk]
+            .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
         if nodes[at].set(Node { content, raw, value }).is_err() {
             unreachable!("index {raw} handed out twice");
         }
         let node = nodes[at].get().expect("a node just set");
         let hash_of = |local: u32| {
-            (shard.node(local).expect("an index entry before its node").content.fingerprint().0 >> 64) as u64
+            (shard.node(local).expect("an index entry before its node").content.fingerprint().0
+                >> 64) as u64
         };
         shard.index.insert(local as usize, key.hash, local, hash_of);
         shard.len.store(local + 1, Ordering::Release);
@@ -230,7 +239,8 @@ impl<T: Consed> HashCons<T> {
 
     /// Above every index handed out so far: what a column indexed by [`Idx`] is sized to.
     pub fn end(&self) -> usize {
-        let longest = self.shards.iter().map(|shard| shard.len.load(Ordering::Acquire)).max().unwrap_or(0);
+        let longest =
+            self.shards.iter().map(|shard| shard.len.load(Ordering::Acquire)).max().unwrap_or(0);
         (longest as usize) << self.shift
     }
 

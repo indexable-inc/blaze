@@ -162,15 +162,28 @@ pub(crate) enum DeclOp {
     /// The round-0 subtree of `child` (declared by the op before) defines, in the crate root,
     /// the ops of [`super::queries::subtree_macro_exports`] of `key`, at this point of the
     /// root's order. Only the root's unit reads it.
-    Splice { child: ModuleId, key: super::queries::DeclKey },
+    Splice {
+        child: ModuleId,
+        key: super::queries::DeclKey,
+    },
     /// `parent` has the child `child` named `name` (`children_mut().insert`). Replacing one wakes
     /// every import, as a path can read whether a module is its parent's test harness.
-    PushChild { parent: ModuleId, name: Name, child: ModuleId },
+    PushChild {
+        parent: ModuleId,
+        name: Name,
+        child: ModuleId,
+    },
     /// The directory `mod` declarations of `module` resolve in (`mod_dirs.insert`).
-    SetModDir { module: ModuleId, dir: ModDir },
+    SetModDir {
+        module: ModuleId,
+        dir: ModDir,
+    },
 
     // The scope of `module`, one op per `ItemScope` method.
-    Declare { module: ModuleId, def: ModuleDefId },
+    Declare {
+        module: ModuleId,
+        def: ModuleDefId,
+    },
     /// `DefCollector::update`: push each resolution with `vis`, then propagate it to the
     /// module's glob importers.
     Update {
@@ -179,16 +192,48 @@ pub(crate) enum DeclOp {
         vis: Visibility,
         import: Option<ImportOrExternCrate>,
     },
-    DefineImpl { module: ModuleId, imp: ImplId, is_trait_impl: bool, is_reservation: bool },
-    DefineBuiltinDeriveImpl { module: ModuleId, imp: BuiltinDeriveImplId },
-    DefineExternBlock { module: ModuleId, id: ExternBlockId },
-    DefineExternCrateDecl { module: ModuleId, id: ExternCrateId },
-    DefineUseDecl { module: ModuleId, id: UseId },
-    DefineUnnamedConst { module: ModuleId, id: ConstId },
+    DefineImpl {
+        module: ModuleId,
+        imp: ImplId,
+        is_trait_impl: bool,
+        is_reservation: bool,
+    },
+    DefineBuiltinDeriveImpl {
+        module: ModuleId,
+        imp: BuiltinDeriveImplId,
+    },
+    DefineExternBlock {
+        module: ModuleId,
+        id: ExternBlockId,
+    },
+    DefineExternCrateDecl {
+        module: ModuleId,
+        id: ExternCrateId,
+    },
+    DefineUseDecl {
+        module: ModuleId,
+        id: UseId,
+    },
+    DefineUnnamedConst {
+        module: ModuleId,
+        id: ConstId,
+    },
     /// Defines `mac` in the textual scope of `module` and wakes the imports that read `name` there.
-    DefineLegacyMacro { module: ModuleId, name: Name, mac: MacroId },
-    AddMacroInvoc { module: ModuleId, call: AstId<ast::MacroCall>, id: MacroCallId },
-    AddAttrMacroInvoc { module: ModuleId, item: AstId<ast::Item>, id: MacroCallId },
+    DefineLegacyMacro {
+        module: ModuleId,
+        name: Name,
+        mac: MacroId,
+    },
+    AddMacroInvoc {
+        module: ModuleId,
+        call: AstId<ast::MacroCall>,
+        id: MacroCallId,
+    },
+    AddAttrMacroInvoc {
+        module: ModuleId,
+        item: AstId<ast::Item>,
+        id: MacroCallId,
+    },
     SetDeriveMacroInvoc {
         module: ModuleId,
         adt: AstId<ast::Adt>,
@@ -210,12 +255,31 @@ pub(crate) enum DeclOp {
 
     // Crate-level, made by the root's collection only.
     /// The std prelude `inject_prelude` found (the `#[prelude_import]` one is the unit's).
-    Prelude { module: ModuleId, import: Option<UseId> },
-    ExternPrelude { name: Name, root: ModuleId, extern_crate: Option<ExternCrateId> },
-    UnresolvedExternCrate { name: Name },
-    MacroUsePrelude { name: Name, mac: MacroId, extern_crate: Option<ExternCrateId> },
-    ExportedDerive { mac: MacroId, helpers: Box<[Name]> },
-    ProcMacroFn { func: FunctionId, mac: ProcMacroId },
+    Prelude {
+        module: ModuleId,
+        import: Option<UseId>,
+    },
+    ExternPrelude {
+        name: Name,
+        root: ModuleId,
+        extern_crate: Option<ExternCrateId>,
+    },
+    UnresolvedExternCrate {
+        name: Name,
+    },
+    MacroUsePrelude {
+        name: Name,
+        mac: MacroId,
+        extern_crate: Option<ExternCrateId>,
+    },
+    ExportedDerive {
+        mac: MacroId,
+        helpers: Box<[Name]>,
+    },
+    ProcMacroFn {
+        func: FunctionId,
+        mac: ProcMacroId,
+    },
 
     /// An `extern crate` of the root naming a crate the extern prelude has from the
     /// dependencies anyway (the old `not_introducing`).
@@ -313,7 +377,9 @@ impl DeclOp {
             &DeclOp::DefineLegacyMacro { module, name, mac } => {
                 DeclOp::DefineLegacyMacro { module, name, mac }
             }
-            &DeclOp::AddMacroInvoc { module, call, id } => DeclOp::AddMacroInvoc { module, call, id },
+            &DeclOp::AddMacroInvoc { module, call, id } => {
+                DeclOp::AddMacroInvoc { module, call, id }
+            }
             &DeclOp::AddAttrMacroInvoc { module, item, id } => {
                 DeclOp::AddAttrMacroInvoc { module, item, id }
             }

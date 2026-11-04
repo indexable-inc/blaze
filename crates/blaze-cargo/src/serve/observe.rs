@@ -47,15 +47,16 @@ pub fn duckdb(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, Stri
     let Some(value) = value else { return Ok(None) };
     let path = PathBuf::from(value);
     if !path.is_absolute() {
-        return Err(format!(  // alloc: error path
+        return Err(format!(
+            // alloc: error path
             "{DUCKDB}={} is not an absolute path: it names the DuckDB `nix run .#duckdb` pins",
             path.display()
         ));
     }
     match fs::metadata(&path) {
         Ok(meta) if meta.is_file() => Ok(Some(path)),
-        Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())),  // alloc: error path
-        Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())),  // alloc: error path
+        Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())), // alloc: error path
+        Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())), // alloc: error path
     }
 }
 
@@ -65,26 +66,31 @@ pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiEr
     use blaze_api::{HotFunction, HotKey, HotSince, HotWait, HotWaitKind};
     use blaze_graph::wait::WaitKind;
     use blaze_profile::hot;
-    let read = hot::read(top as usize, match since {
-        HotSince::Start => hot::Since::Start,
-        HotSince::LastBuild => hot::Since::LastBuild,
-    })
+    let read = hot::read(
+        top as usize,
+        match since {
+            HotSince::Start => hot::Since::Start,
+            HotSince::LastBuild => hot::Since::LastBuild,
+        },
+    )
     // alloc: error path
-    .map_err(|error| ApiError::new(error.to_string(), Some("blaze debug hot --last-build".to_owned())))?;
+    .map_err(|error| {
+        ApiError::new(error.to_string(), Some("blaze debug hot --last-build".to_owned()))
+    })?;
     let keys = read
         .keys
         .into_iter()
         .map(|it| HotKey {
-            span: it.span.to_owned(),  // alloc: the answer's copy, once a request
+            span: it.span.to_owned(), // alloc: the answer's copy, once a request
             function: match it.function {
                 hot::Function::None => HotFunction::None,
-                hot::Function::Named(name) => HotFunction::Named(name.as_ref().to_owned()),  // alloc: as above
+                hot::Function::Named(name) => HotFunction::Named(name.as_ref().to_owned()), // alloc: as above
                 hot::Function::Forgotten(sym) => HotFunction::Forgotten(sym),
             },
             lower_ns: it.lower_ns,
             upper_ns: it.upper_ns,
         })
-        .collect();  // alloc: the answer's rows, once a request
+        .collect(); // alloc: the answer's rows, once a request
     let waits = read
         .waits
         .iter()
@@ -103,7 +109,7 @@ pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiEr
             p90_ns: it.p90_ns,
             p99_ns: it.p99_ns,
         })
-        .collect();  // alloc: the answer's rows, once a request
+        .collect(); // alloc: the answer's rows, once a request
     Ok(blaze_api::Hot {
         keys,
         torn: read.torn,
@@ -124,13 +130,13 @@ pub fn bugs() -> Vec<blaze_api::Bug> {
     sites
         .into_iter()
         .map(|it| blaze_api::Bug {
-            kind: it.kind.to_owned(),  // alloc: the answer's copy, once a Status a site
-            what: it.what.to_owned(),  // alloc: as above
-            at: it.at.to_string(),  // alloc: as above
+            kind: it.kind.to_owned(), // alloc: the answer's copy, once a Status a site
+            what: it.what.to_owned(), // alloc: as above
+            at: it.at.to_string(),    // alloc: as above
             count: it.count,
-            thread: it.thread.as_deref().map(str::to_owned),  // alloc: as above
+            thread: it.thread.as_deref().map(str::to_owned), // alloc: as above
         })
-        .collect()  // alloc: the answer's rows; none for none
+        .collect() // alloc: the answer's rows; none for none
 }
 
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
@@ -202,19 +208,28 @@ impl Doing {
             Step::FlushingFull,
             Step::FlushingAsked,
         ]
-            .into_iter()
-            .find(|step| *step as u64 == it >> 56);
+        .into_iter()
+        .find(|step| *step as u64 == it >> 56);
         match step {
             Some(Step::Opening) => "opening the profile history".to_owned(),
             Some(Step::Restoring) => "restoring blaze why's ledger".to_owned(),
             Some(Step::Waiting) => "waiting for a build to end".to_owned(),
             Some(Step::Explaining) => format!("explaining build {build}'s misses"),
-            Some(Step::Appending) => format!("appending build {build}'s record to blaze why's ledger"),
-            Some(Step::Flushing) if build == 0 => "flushing the profile history on its timer".to_owned(),
+            Some(Step::Appending) => {
+                format!("appending build {build}'s record to blaze why's ledger")
+            }
+            Some(Step::Flushing) if build == 0 => {
+                "flushing the profile history on its timer".to_owned()
+            }
             Some(Step::Flushing) => format!("flushing the profile history for build {build}"),
-            Some(Step::Closing) => "writing blaze why's ledger whole as the daemon stops".to_owned(),
+            Some(Step::Closing) => {
+                "writing blaze why's ledger whole as the daemon stops".to_owned()
+            }
             Some(Step::FlushingFull) => {
-                format!("flushing the profile history: its drain took over {} rows", history::FLUSH_ROWS)
+                format!(
+                    "flushing the profile history: its drain took over {} rows",
+                    history::FLUSH_ROWS
+                )
             }
             Some(Step::FlushingAsked) => "flushing the profile history for a reader that asked".to_owned(),
             None => format!("in step {}, which this blaze does not know", it >> 56),
@@ -318,7 +333,17 @@ fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceR
         }
         Logged::UntrackedRead(what) => (RunOutcome::UntrackedRead, None, Some(what)),
     };
-    ProvenanceRow { build_id, query_key: key, kind: query, outcome, cause, view, cause_key: read, cause_kind: read_kind, what }
+    ProvenanceRow {
+        build_id,
+        query_key: key,
+        kind: query,
+        outcome,
+        cause,
+        view,
+        cause_key: read,
+        cause_kind: read_kind,
+        what,
+    }
 }
 
 /// The parts of the key of each thing `build` computed again, a row a part (one with no part
@@ -331,11 +356,11 @@ fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyPartRow> {
         let row = |part: Option<&blaze_kernel::Part>| KeyPartRow {
             build_id,
             step: miss.step,
-            item: miss.item.clone(), // clone: a row's own text
-            key: key.clone(),        // clone: a row's own text
-            part: part.map(|it| it.name.clone()),                       // clone: a row's own text
+            item: miss.item.clone(),              // clone: a row's own text
+            key: key.clone(),                     // clone: a row's own text
+            part: part.map(|it| it.name.clone()), // clone: a row's own text
             hash: part.and_then(|it| it.hash).map(|it| format!("{it:x}")), // alloc: a row's text
-            names: part.and_then(|it| it.names.clone()),                // clone: a row's own text
+            names: part.and_then(|it| it.names.clone()), // clone: a row's own text
             beyond: miss.beyond,
         };
         if miss.parts.is_empty() {
@@ -355,7 +380,11 @@ fn query_counts(build: u64) -> Vec<QueryCountRow> {
     rows
 }
 
-fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::Counts) -> QueryCountRow {
+fn query_count_row(
+    build_id: u64,
+    query: &'static str,
+    counts: blaze_query::db::Counts,
+) -> QueryCountRow {
     let blaze_query::db::Counts {
         executed,
         verified,
@@ -398,7 +427,9 @@ pub struct Keeper(JoinHandle<()>);
 
 impl Keeper {
     pub fn join(self) -> Result<(), String> {
-        self.0.join().map_err(|_| "the profile history's thread (`blaze-history`) panicked".to_owned())  // alloc: error path
+        self.0
+            .join()
+            .map_err(|_| "the profile history's thread (`blaze-history`) panicked".to_owned()) // alloc: error path
     }
 }
 
@@ -420,7 +451,7 @@ pub fn keep_history(
     // clone: a path and a handle, once a daemon
     let (at, now) = (dir.clone(), Arc::clone(&doing));
     let thread = std::thread::Builder::new()
-        .name("blaze-history".to_owned())  // alloc: once a daemon
+        .name("blaze-history".to_owned()) // alloc: once a daemon
         .spawn(move || {
             // Held until the last flush is written: a daemon after this one numbers its builds
             // from what this one wrote.
@@ -455,15 +486,21 @@ pub fn keep_history(
                     _ = told_to.send(Told::Restored { torn: said.torn, dropped: why.dropped() });
                     keep(history, &mut why, &rows, &failed_to, &told_to, &now);
                 }
-                Err(error) => _ = opened_to.send(Err(error.to_string())),  // alloc: error path, once a daemon
+                Err(error) => _ = opened_to.send(Err(error.to_string())), // alloc: error path, once a daemon
             }
         })
-        .map_err(|error| format!("starting the profile history's thread (`blaze-history`): {error}"))?;  // alloc: error path
-    let first_build = match opened.recv() {
-        Ok(Ok(first)) => first,
-        Ok(Err(why)) => return Err(why),
-        Err(_) => return Err("the profile history's thread (`blaze-history`) ended before it opened the history".to_owned()),  // alloc: error path
-    };
+        .map_err(|error| {
+            format!("starting the profile history's thread (`blaze-history`): {error}")
+        })?; // alloc: error path
+    let first_build =
+        match opened.recv() {
+            Ok(Ok(first)) => first,
+            Ok(Err(why)) => return Err(why),
+            Err(_) => return Err(
+                "the profile history's thread (`blaze-history`) ended before it opened the history"
+                    .to_owned(),
+            ), // alloc: error path
+        };
     // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
     // ([`provenance_rows`]); one that keeps none counts alone.
     blaze_query::db::log_runs(true);
@@ -482,12 +519,19 @@ impl std::fmt::Display for Claim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Claim::Owned { dir, holder } => {
-                write!(f, "the profile history {} is written by another blaze serve (", dir.display())?;
+                write!(
+                    f,
+                    "the profile history {} is written by another blaze serve (",
+                    dir.display()
+                )?;
                 match holder {
                     Some(pid) => write!(f, "pid {pid}")?,
                     None => f.write_str("its pid unread")?,
                 }
-                write!(f, ", holding {OWNER}): two daemons over one history would give builds the same id")
+                write!(
+                    f,
+                    ", holding {OWNER}): two daemons over one history would give builds the same id"
+                )
             }
             Claim::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
         }
@@ -529,7 +573,8 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
     };
     use std::io::Write as _;
     file.set_len(0).map_err(io(&path, "writing the profile history's owner file"))?;
-    write!(file, "{}", std::process::id()).map_err(io(&path, "writing the profile history's owner file"))?;
+    write!(file, "{}", std::process::id())
+        .map_err(io(&path, "writing the profile history's owner file"))?;
     Ok(Owner { _lock: file })
 }
 
@@ -538,7 +583,14 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
 /// thread writes), and one for each build as it ends, which writes its row and gives its spans
 /// its commit. A flush that fails is logged and told to the daemon, for `blaze daemon status`;
 /// the next one goes on.
-fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed: &Sender<String>, told: &Sender<Told>, doing: &Doing) {
+fn keep(
+    mut history: History,
+    why: &mut File,
+    rows: &Receiver<ToHistory>,
+    failed: &Sender<String>,
+    told: &Sender<Told>,
+    doing: &Doing,
+) {
     let mut flushed_at = Instant::now();
     loop {
         doing.set(Step::Waiting, 0);
@@ -602,7 +654,12 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 doing.set(Step::Explaining, build);
                 let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
                 // clone: the answer's copy of whose build it is, once a build
-                let answer = Answer { build, workspace: row.workspace.clone(), command: row.command.clone(), rebuilt };
+                let answer = Answer {
+                    build,
+                    workspace: row.workspace.clone(),
+                    command: row.command.clone(),
+                    rebuilt,
+                };
                 // Sent before the record is durable: an answer may name a build whose record a
                 // crash then loses (docs/v2/plan/lanes/why.md, "Answered before durable").
                 _ = told.send(Told::Explained { answer, dropped: why.dropped() });
@@ -643,7 +700,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
         flushed_at = Instant::now();
         if let Err(error) = flushed {
             tracing::error!("{error}");
-            _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
+            _ = failed.send(error.to_string()); // alloc: error path, a flush that failed
         }
         if last {
             return;
@@ -665,7 +722,7 @@ fn commit_of(workspace: &Path) -> Option<String> {
     };
     let head = fs::read_to_string(dir.join("HEAD")).ok()?;
     let head = head.trim();
-    let Some(name) = head.strip_prefix("ref:").map(str::trim) else { return Some(head.to_owned()) };  // alloc: once a build, on the history's thread
+    let Some(name) = head.strip_prefix("ref:").map(str::trim) else { return Some(head.to_owned()) }; // alloc: once a build, on the history's thread
     let common = match fs::read_to_string(dir.join("commondir")) {
         Ok(common) => dir.join(common.trim()),
         // clone: a path, once a build
@@ -673,7 +730,7 @@ fn commit_of(workspace: &Path) -> Option<String> {
     };
     for at in [&dir, &common] {
         if let Ok(hash) = fs::read_to_string(at.join(name)) {
-            return Some(hash.trim().to_owned());  // alloc: once a build, on the history's thread
+            return Some(hash.trim().to_owned()); // alloc: once a build, on the history's thread
         }
     }
     let packed = fs::read_to_string(common.join("packed-refs")).ok()?;
@@ -801,7 +858,7 @@ impl Observe {
             sent: 0,
             explained: 0,
             unexplained: VecDeque::new(), // alloc: none until a build ends
-            asked: Vec::new(), // alloc: none until a `blaze why` waits
+            asked: Vec::new(),            // alloc: none until a `blaze why` waits
             history_gone: false,
             local: None,
         }
@@ -823,7 +880,10 @@ impl Observe {
     pub fn started(&mut self, row: BuildRow) {
         let Some(profiling) = &self.profiling else { return };
         if profiling.ended.send(ToHistory::Started(row)).is_err() {
-            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned()); // alloc: error path
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build is written"
+                    .to_owned(),
+            ); // alloc: error path
         }
     }
 
@@ -832,13 +892,20 @@ impl Observe {
     pub fn ended(&mut self, mut ended: Ended) {
         let build = ended.row.build_id;
         let Some(profiling) = &self.profiling else {
-            let _span = tracing::info_span!(target: "blaze", "explain a build's misses", build).entered();
+            let _span =
+                tracing::info_span!(target: "blaze", "explain a build's misses", build).entered();
             let ended_well = matches!(ended.row.outcome, history::Outcome::Ok);
             let ledger = self.local.get_or_insert_default();
-            let rebuilt = ledger.explain(build, ended_well, std::mem::take(&mut ended.misses)).rebuilt;
+            let rebuilt =
+                ledger.explain(build, ended_well, std::mem::take(&mut ended.misses)).rebuilt;
             let dropped = ledger.dropped();
             // clone: whose build it is, once a build of a daemon with no history
-            let answer = Answer { build, workspace: ended.row.workspace.clone(), command: ended.row.command.clone(), rebuilt };
+            let answer = Answer {
+                build,
+                workspace: ended.row.workspace.clone(),
+                command: ended.row.command.clone(),
+                rebuilt,
+            };
             self.answers.add(answer, dropped);
             return;
         };
@@ -850,7 +917,10 @@ impl Observe {
         self.sent += 1;
         self.unexplained.push_back(build);
         if sent.is_err() {
-            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned()); // alloc: error path
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build is written"
+                    .to_owned(),
+            ); // alloc: error path
         }
     }
 
@@ -872,14 +942,33 @@ impl Observe {
     /// Asked of the last build of the workspace holding `cwd`; while builds that ended before
     /// it was asked (at `now` on the loop's clock) are still being explained on the history's
     /// thread, it waits for them, up to [`WHY_WAIT`] ([`Observe::tick`]).
-    pub fn rebuilt(&mut self, to: RequestRef, cwd: Option<String>, item: Option<String>, all: bool, now: Duration, out: &mut Vec<Reply>) {
+    pub fn rebuilt(
+        &mut self,
+        to: RequestRef,
+        cwd: Option<String>,
+        item: Option<String>,
+        all: bool,
+        now: Duration,
+        out: &mut Vec<Reply>,
+    ) {
         if self.explained >= self.sent {
-            return answer(out, to, Response::Rebuilt(self.answers.rebuilt(cwd.as_deref(), item.as_deref(), all)));
+            return answer(
+                out,
+                to,
+                Response::Rebuilt(self.answers.rebuilt(cwd.as_deref(), item.as_deref(), all)),
+            );
         }
         // Never answered from a build older than one that ended before it was asked (rule 3).
         match self.history_gone {
             true => fail(out, to, never_explained(self.unexplained.front().copied())),
-            false => self.asked.push(Asked { to, cwd, item, all, after: self.sent, until: now + WHY_WAIT }),
+            false => self.asked.push(Asked {
+                to,
+                cwd,
+                item,
+                all,
+                after: self.sent,
+                until: now + WHY_WAIT,
+            }),
         }
     }
 
@@ -890,7 +979,7 @@ impl Observe {
     #[cfg(feature = "native")]
     pub fn explore(&mut self, to: RequestRef, dev: bool, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
-            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned())));  // alloc: error path
+            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned()))); // alloc: error path
         };
         if self.explorer.as_ref().is_some_and(|(was, _)| *was != dev) {
             self.explorer = None;
@@ -909,7 +998,13 @@ impl Observe {
             };
             match blaze_explore::start(config) {
                 Ok(explorer) => self.explorer = Some((dev, explorer)),
-                Err(error) => return fail(out, to, ApiError::new(error.to_string(), Some("blaze explore".to_owned()))),  // alloc: error path
+                Err(error) => {
+                    return fail(
+                        out,
+                        to,
+                        ApiError::new(error.to_string(), Some("blaze explore".to_owned())),
+                    );
+                } // alloc: error path
             }
         }
         let Some((_, explorer)) = &self.explorer else { return };
@@ -923,7 +1018,7 @@ impl Observe {
             None => NO_PROFILING,
             Some(_) => NO_EXPLORER,
         };
-        fail(out, to, ApiError::new(what, Some("blaze explore".to_owned())));  // alloc: error path
+        fail(out, to, ApiError::new(what, Some("blaze explore".to_owned()))); // alloc: error path
     }
 
     /// `blaze debug live`: `to` is sent a frame every [`live::EVERY`] from the next tick on.
@@ -1001,7 +1096,9 @@ impl Observe {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Gone, so nothing more comes back: what is held is answered now, and
                         // the status names the history's end. What its restore said stays.
-                        if !self.history_gone && (self.explained < self.sent || self.answers.restoring()) {
+                        if !self.history_gone
+                            && (self.explained < self.sent || self.answers.restoring())
+                        {
                             self.history_error = Some("the profile history's thread (`blaze-history`) ended: no more builds are explained".to_owned()); // alloc: error path
                         }
                         self.history_gone = true;
@@ -1013,10 +1110,19 @@ impl Observe {
         }
         if !self.asked.is_empty() {
             let (answers, explained, gone) = (&self.answers, self.explained, self.history_gone);
-            let (unexplained, doing) = (&self.unexplained, self.profiling.as_ref().map(|it| &*it.doing));
+            let (unexplained, doing) =
+                (&self.unexplained, self.profiling.as_ref().map(|it| &*it.doing));
             self.asked.retain(|it| {
                 if explained >= it.after {
-                    answer(out, it.to, Response::Rebuilt(answers.rebuilt(it.cwd.as_deref(), it.item.as_deref(), it.all)));
+                    answer(
+                        out,
+                        it.to,
+                        Response::Rebuilt(answers.rebuilt(
+                            it.cwd.as_deref(),
+                            it.item.as_deref(),
+                            it.all,
+                        )),
+                    );
                     return false;
                 }
                 if gone {
@@ -1056,7 +1162,11 @@ impl Observe {
                 return true;
             }
             if let Err(error) = it.feed.next(&mut it.frame) {
-                fail(out, it.to, ApiError::new(format!("the live feed: {error}"), Some("live".to_owned())));  // alloc: error path
+                fail(
+                    out,
+                    it.to,
+                    ApiError::new(format!("the live feed: {error}"), Some("live".to_owned())),
+                ); // alloc: error path
                 return false;
             }
             let frame = &mut it.frame;
@@ -1154,7 +1264,11 @@ mod tests {
             other => panic!("a second claim on a held history: {other:?}"),
         }
         let said = claim(&history).unwrap_err().to_string();
-        assert!(said.contains(&history.display().to_string()) && said.contains(&format!("pid {}", std::process::id())), "{said}");
+        assert!(
+            said.contains(&history.display().to_string())
+                && said.contains(&format!("pid {}", std::process::id())),
+            "{said}"
+        );
         drop(first);
         claim(&history).expect("a history its writer let go of is claimed again");
     }
@@ -1163,7 +1277,10 @@ mod tests {
     fn duckdb_unset_is_none_and_set_wrong_is_an_error_naming_it() {
         assert_eq!(duckdb(None), Ok(None));
         let relative = duckdb(Some("bin/duckdb".into())).unwrap_err();
-        assert!(relative.contains("BLAZE_DUCKDB=bin/duckdb") && relative.contains("absolute"), "{relative}");
+        assert!(
+            relative.contains("BLAZE_DUCKDB=bin/duckdb") && relative.contains("absolute"),
+            "{relative}"
+        );
         let dir = tempfile::tempdir().unwrap();
         let not_a_file = duckdb(Some(dir.path().into())).unwrap_err();
         assert!(not_a_file.contains("is not a file"), "{not_a_file}");
@@ -1184,9 +1301,14 @@ mod tests {
         assert_eq!(commit_of(&repo), None, "a .git with no HEAD");
         fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(git.join("refs/heads/main"), "aaaa\n").unwrap();
-        assert_eq!(commit_of(&repo.join("crates/a")).as_deref(), Some("aaaa"), "found from a directory inside");
+        assert_eq!(
+            commit_of(&repo.join("crates/a")).as_deref(),
+            Some("aaaa"),
+            "found from a directory inside"
+        );
         fs::write(git.join("HEAD"), "ref: refs/heads/packed\n").unwrap();
-        fs::write(git.join("packed-refs"), "# pack-refs with: peeled\nbbbb refs/heads/packed\n").unwrap();
+        fs::write(git.join("packed-refs"), "# pack-refs with: peeled\nbbbb refs/heads/packed\n")
+            .unwrap();
         assert_eq!(commit_of(&repo).as_deref(), Some("bbbb"));
         fs::write(git.join("HEAD"), "cccc\n").unwrap();
         assert_eq!(commit_of(&repo).as_deref(), Some("cccc"), "detached");
@@ -1198,7 +1320,11 @@ mod tests {
         fs::write(worktree.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
         fs::write(own.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(own.join("commondir"), "../..\n").unwrap();
-        assert_eq!(commit_of(&worktree).as_deref(), Some("aaaa"), "a worktree's branch is the common directory's");
+        assert_eq!(
+            commit_of(&worktree).as_deref(),
+            Some("aaaa"),
+            "a worktree's branch is the common directory's"
+        );
     }
 
     /// The engine's counts, mapped field for field, go with the build's row through the
@@ -1278,7 +1404,10 @@ mod tests {
         let (told_to, told) = crossbeam_channel::unbounded();
         keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default());
         assert_eq!(failed.try_recv().ok(), None);
-        assert!(matches!(told.try_recv(), Ok(Told::Explained { answer: Answer { build: 71, .. }, .. })));
+        assert!(matches!(
+            told.try_recv(),
+            Ok(Told::Explained { answer: Answer { build: 71, .. }, .. })
+        ));
         let written: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
@@ -1352,7 +1481,12 @@ mod tests {
     }
 
     fn explained(build: u64) -> Told {
-        let answer = Answer { build, workspace: "/w".to_owned(), command: "build".to_owned(), rebuilt: Vec::new() };
+        let answer = Answer {
+            build,
+            workspace: "/w".to_owned(),
+            command: "build".to_owned(),
+            rebuilt: Vec::new(),
+        };
         Told::Explained { answer, dropped: None }
     }
 
@@ -1367,12 +1501,24 @@ mod tests {
         let (told_to, told) = crossbeam_channel::unbounded();
         let doing = Arc::new(Doing::default());
         let dir = tempfile::tempdir().unwrap();
-        let profiling =
-            Profiling { dir: dir.path().to_path_buf(), duckdb: None, first_build: 1, ended, failed, told, doing: Arc::clone(&doing) };
+        let profiling = Profiling {
+            dir: dir.path().to_path_buf(),
+            duckdb: None,
+            first_build: 1,
+            ended,
+            failed,
+            told,
+            doing: Arc::clone(&doing),
+        };
         let mut observe = Observe::new(Some(profiling));
         let mut out = Vec::new();
         let at = Duration::from_secs(5);
-        told_to.send(Told::Restored { torn: Some("record 2 does not decode".to_owned()), dropped: None }).unwrap();
+        told_to
+            .send(Told::Restored {
+                torn: Some("record 2 does not decode".to_owned()),
+                dropped: None,
+            })
+            .unwrap();
         observe.ended(ended_row(1));
         observe.rebuilt(to(1, 1), Some("/w".to_owned()), None, false, at, &mut out);
         assert!(out.is_empty(), "build 1 is not explained yet: {out:?}");
@@ -1382,8 +1528,14 @@ mod tests {
         told_to.send(explained(1)).unwrap();
         observe.tick(at, |_| false, &mut out);
         match &out[..] {
-            [Reply { response: Response::Rebuilt(it), .. }, Reply { response: Response::Done { ok: true }, .. }] => {
-                assert_eq!((it.build, it.torn.as_deref(), it.restoring), (Some(1), Some("record 2 does not decode"), false));
+            [
+                Reply { response: Response::Rebuilt(it), .. },
+                Reply { response: Response::Done { ok: true }, .. },
+            ] => {
+                assert_eq!(
+                    (it.build, it.torn.as_deref(), it.restoring),
+                    (Some(1), Some("record 2 does not decode"), false)
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1400,13 +1552,24 @@ mod tests {
         assert!(out.is_empty(), "not due yet: {out:?}");
         observe.tick(at + WHY_WAIT, |_| false, &mut out);
         match &out[..] {
-            [Reply { response: Response::Error(error), .. }, Reply { response: Response::Done { ok: false }, .. }] => {
-                assert!(error.what.contains("build 2") && error.what.contains("flushing the profile history for build 1"), "{}", error.what);
+            [
+                Reply { response: Response::Error(error), .. },
+                Reply { response: Response::Done { ok: false }, .. },
+            ] => {
+                assert!(
+                    error.what.contains("build 2")
+                        && error.what.contains("flushing the profile history for build 1"),
+                    "{}",
+                    error.what
+                );
                 assert_eq!(error.at.as_deref(), Some("blaze why"));
             }
             other => panic!("{other:?}"),
         }
-        assert!(out.iter().all(|it| it.to.conn == Conn(1)), "nothing to the connection that went: {out:?}");
+        assert!(
+            out.iter().all(|it| it.to.conn == Conn(1)),
+            "nothing to the connection that went: {out:?}"
+        );
         out.clear();
 
         // The history's thread gone with build 2 unexplained: a held one, and one asked after,
@@ -1425,7 +1588,13 @@ mod tests {
             ] => {
                 assert_eq!((*a, *b), (to(1, 3), to(1, 4)));
                 for error in [held, after] {
-                    assert!(error.what.contains("build 2") && error.what.contains("blaze-history") && error.what.contains("ended"), "{}", error.what);
+                    assert!(
+                        error.what.contains("build 2")
+                            && error.what.contains("blaze-history")
+                            && error.what.contains("ended"),
+                        "{}",
+                        error.what
+                    );
                 }
             }
             other => panic!("{other:?}"),
@@ -1480,7 +1649,13 @@ mod tests {
             ] => {
                 assert_eq!((*a, *b), (to(1, 1), to(1, 2)));
                 for error in [held, after] {
-                    assert!(error.what.contains("build 2") && error.what.contains("blaze-history") && error.what.contains("ended"), "{}", error.what);
+                    assert!(
+                        error.what.contains("build 2")
+                            && error.what.contains("blaze-history")
+                            && error.what.contains("ended"),
+                        "{}",
+                        error.what
+                    );
                 }
             }
             other => panic!("{other:?}"),

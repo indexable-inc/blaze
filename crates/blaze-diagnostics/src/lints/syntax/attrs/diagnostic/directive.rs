@@ -68,7 +68,8 @@ pub(super) fn parse_list<'a, 't>(
     match args {
         Args::List(list) if !list.items.is_empty() => return Some(&list.items),
         Args::List(list) => {
-            let mut diag = sink.lint(MALFORMED, "expected a literal or missing delimiter", list.range);
+            let mut diag =
+                sink.lint(MALFORMED, "expected a literal or missing delimiter", list.range);
             diag.help(
                 "only literals are allowed as values for the `message`, `note` and `label` options. These options must be separated by a comma",
             );
@@ -96,7 +97,12 @@ fn malformed(sink: &mut Sink<'_, '_, '_>, mode: Mode, range: TextRange) {
 }
 
 /// rustc's `IgnoredDiagnosticOption`.
-fn ignored(sink: &mut Sink<'_, '_, '_>, option: &str, first: InFile<TextRange>, later: InFile<TextRange>) {
+fn ignored(
+    sink: &mut Sink<'_, '_, '_>,
+    option: &str,
+    first: InFile<TextRange>,
+    later: InFile<TextRange>,
+) {
     let later = sink.cx.span(later);
     // alloc: the diagnostic's text and span, as is all of `ignored`'s
     let message = format!("`{option}` is ignored due to previous definition of `{option}`");
@@ -110,7 +116,12 @@ fn ignored(sink: &mut Sink<'_, '_, '_>, option: &str, first: InFile<TextRange>, 
 }
 
 /// rustc's `parse_directive_items`: the directive `items` give, each lint as it comes to it.
-pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item<'_>], is_root: bool) -> Directive {
+pub(super) fn parse_items(
+    sink: &mut Sink<'_, '_, '_>,
+    mode: Mode,
+    items: &[Item<'_>],
+    is_root: bool,
+) -> Directive {
     let mut directive = Directive {
         is_rustc_attr: mode == Mode::RustcOnUnimplemented,
         // alloc: empty; a directive is of a diagnostic attribute, which `diagnostic::lints` alone reads
@@ -154,7 +165,11 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
                     ignored(sink, name, *first, at);
                 } else {
                     let format = format_string(sink, lit, str, mode);
-                    let slot = if name == "message" { &mut directive.message } else { &mut directive.label };
+                    let slot = if name == "message" {
+                        &mut directive.message
+                    } else {
+                        &mut directive.label
+                    };
                     *slot = Some((at, format));
                 }
             }
@@ -184,7 +199,11 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
                     continue;
                 };
                 let Some(first) = list.items.first() else {
-                    let mut diag = sink.lint(FILTERS, "empty `on`-clause in `#[rustc_on_unimplemented]`", span);
+                    let mut diag = sink.lint(
+                        FILTERS,
+                        "empty `on`-clause in `#[rustc_on_unimplemented]`",
+                        span,
+                    );
                     diag.span_label(sink.span(span), "empty `on`-clause here");
                     sink.parsed(diag);
                     continue;
@@ -262,14 +281,18 @@ fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit<'_>, value: &str, mode: 
                         diag
                     }
                     Warning::Specifier(range) => {
-                        let message = "format specifiers are not permitted in diagnostic attributes";
+                        let message =
+                            "format specifiers are not permitted in diagnostic attributes";
                         let mut diag = sink.lint(FORMAT_LITERALS, message, range);
                         diag.span_label(sink.span(range), "remove this format specifier");
                         diag
                     }
                     Warning::Disallowed(range) => {
                         // alloc: the diagnostic's text
-                        let message = format!("this format argument is not allowed in `#[{}]`", mode.as_str());
+                        let message = format!(
+                            "this format argument is not allowed in `#[{}]`",
+                            mode.as_str()
+                        );
                         let mut diag = sink.lint(FORMAT_LITERALS, message, range);
                         diag.span_label(sink.span(range), "remove this format argument");
                         diag.note(mode.allowed_format_arguments());
@@ -279,7 +302,13 @@ fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit<'_>, value: &str, mode: 
                 sink.parsed(diag);
             }
             // alloc: the parameters of a diagnostic attribute's format string
-            Format { params: parsed.params.into_iter().map(|(name, range)| (name, sink.at(range))).collect() }
+            Format {
+                params: parsed
+                    .params
+                    .into_iter()
+                    .map(|(name, range)| (name, sink.at(range)))
+                    .collect(),
+            }
         }
         Err(failed) => {
             let mut diag = sink.lint(FORMAT_LITERALS, failed.description, lit.range());
@@ -304,7 +333,11 @@ impl Invalid {
         let (range, message, label) = match self {
             Invalid::Literal(range) => {
                 // alloc: the diagnostic's text, as is each label below
-                (range, "literals inside `on`-clauses are not supported", "unexpected literal here".to_owned())
+                (
+                    range,
+                    "literals inside `on`-clauses are not supported",
+                    "unexpected literal here".to_owned(),
+                )
             }
             Invalid::ExpectedIdentifier(range, path) => (
                 range,
@@ -320,13 +353,19 @@ impl Invalid {
             ),
             Invalid::NotOne(range) => {
                 // alloc: as above
-                (range, "expected a single predicate in `not(..)`", "unexpected quantity of predicates here".to_owned())
+                (
+                    range,
+                    "expected a single predicate in `not(..)`",
+                    "unexpected quantity of predicates here".to_owned(),
+                )
             }
             Invalid::Flag(range, name) => (
                 range,
                 "invalid flag in `on`-clause",
                 // alloc: as above
-                format!("expected one of the `crate_local`, `direct` or `from_desugaring` flags, not `{name}`"),
+                format!(
+                    "expected one of the `crate_local`, `direct` or `from_desugaring` flags, not `{name}`"
+                ),
             ),
         };
         let mut diag = sink.lint(FILTERS, message, range);

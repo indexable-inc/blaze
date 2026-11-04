@@ -4,7 +4,13 @@ use hir_expand::{change::ChangeWithProcMacros, proc_macro::ProcMacros};
 
 use super::*;
 
-fn krate(root: u32, name: &str, origin: Origin, deps: Vec<Dep>, macros: Option<Vec<Macro>>) -> Krate {
+fn krate(
+    root: u32,
+    name: &str,
+    origin: Origin,
+    deps: Vec<Dep>,
+    macros: Option<Vec<Macro>>,
+) -> Krate {
     Krate {
         root,
         edition: "2021".to_owned(),
@@ -25,15 +31,21 @@ fn dep(krate: usize, name: &str) -> Dep {
 
 /// `app` on `lib` and the proc macro crate `derive`, with one recorded expansion.
 fn pack() -> Pack {
-    let file = |id: u32, path: &str, text: &str| File { id, path: path.to_owned(), text: text.to_owned() };
+    let file =
+        |id: u32, path: &str, text: &str| File { id, path: path.to_owned(), text: text.to_owned() };
     Pack {
         main: 2,
         tuple: "wasm32-unknown-unknown".to_owned(),
-        data_layout: "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20".to_owned(),
+        data_layout: "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+            .to_owned(),
         files: vec![
             file(0, "/lib/src/lib.rs", "pub fn one() -> u32 { 1 }\n"),
             file(1, "/proc-macro/1.rs", "pub fn Show() {}\n"),
-            file(2, "/app/src/main.rs", "#[derive(derive::Show)] struct S;\npub fn two() -> u32 { lib::one() + 1 }\n"),
+            file(
+                2,
+                "/app/src/main.rs",
+                "#[derive(derive::Show)] struct S;\npub fn two() -> u32 { lib::one() + 1 }\n",
+            ),
         ],
         roots: vec![
             Root { library: true, files: vec![0] },
@@ -42,14 +54,22 @@ fn pack() -> Pack {
         ],
         crates: vec![
             krate(0, "lib", Origin::Library("lib".to_owned()), Vec::new(), None),
-            krate(1, "derive", Origin::Library("derive".to_owned()), Vec::new(), Some(vec![Macro {
-                name: "Show".to_owned(),
-                kind: Kind::Derive,
-            }])),
+            krate(
+                1,
+                "derive",
+                Origin::Library("derive".to_owned()),
+                Vec::new(),
+                Some(vec![Macro { name: "Show".to_owned(), kind: Kind::Derive }]),
+            ),
             krate(2, "app", Origin::Local, vec![dep(0, "lib"), dep(1, "derive")], None),
         ],
         expansions: vec![Expansion {
-            call: Call { krate: "derive".to_owned(), name: "Show".to_owned(), input: "struct S ;".to_owned(), attr: None },
+            call: Call {
+                krate: "derive".to_owned(),
+                name: "Show".to_owned(),
+                input: "struct S ;".to_owned(),
+                attr: None,
+            },
             output: Ok("impl S { }".to_owned()),
         }],
     }
@@ -108,7 +128,8 @@ fn a_recorded_pack_is_the_workspace_it_was_loaded_from() {
         .find(|it| it.data(&db).root_file_id == main)
         .expect("the program's crate");
     let mut crates_seen = 0;
-    let again = record(&mut db, program, |_, crates| crates_seen = crates.len()).expect("the pack records");
+    let again =
+        record(&mut db, program, |_, crates| crates_seen = crates.len()).expect("the pack records");
     assert_eq!(crates_seen, 3);
     let before = pack();
     assert_eq!(again.main, before.main);
@@ -117,7 +138,10 @@ fn a_recorded_pack_is_the_workspace_it_was_loaded_from() {
     let names = |pack: &Pack| pack.crates.iter().map(|it| it.name.clone()).collect::<Vec<_>>();
     assert_eq!(names(&again), names(&before));
     let deps = |pack: &Pack| {
-        pack.crates.iter().map(|it| it.deps.iter().map(|it| (it.krate, it.name.clone())).collect::<Vec<_>>()).collect::<Vec<_>>()
+        pack.crates
+            .iter()
+            .map(|it| it.deps.iter().map(|it| (it.krate, it.name.clone())).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
     };
     assert_eq!(deps(&again), deps(&before));
     let mut texts: Vec<_> = again.files.iter().map(|it| (it.id, it.text.clone())).collect();
@@ -126,7 +150,13 @@ fn a_recorded_pack_is_the_workspace_it_was_loaded_from() {
     want.sort();
     assert_eq!(texts, want);
     let derive = &again.crates[1];
-    let kinds: Vec<_> = derive.macros.as_ref().expect("a proc macro crate").iter().map(|it| (it.name.clone(), it.kind)).collect();
+    let kinds: Vec<_> = derive
+        .macros
+        .as_ref()
+        .expect("a proc macro crate")
+        .iter()
+        .map(|it| (it.name.clone(), it.kind))
+        .collect();
     assert_eq!(kinds, [("Show".to_owned(), Kind::Derive)]);
     for (a, b) in again.crates.iter().zip(&before.crates) {
         let mut cfg = a.cfg.clone();

@@ -58,6 +58,7 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_hash::hash_map::Entry;
 use std::{
     borrow::Cow,
     cmp::Reverse,
@@ -65,13 +66,12 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
 };
-use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{ByHash, HashMap};
-use std::alloc::Global;
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
+use std::alloc::Global;
 
 use serde::{Deserialize, Serialize};
 
@@ -430,7 +430,9 @@ impl TryFrom<Columns> for Nodes {
             if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
                 let offsets = at.len();
                 // alloc: a refused trace's message, once
-                return Err(format!("{column} of {offsets} offsets for {len} nodes and {end} entries"));
+                return Err(format!(
+                    "{column} of {offsets} offsets for {len} nodes and {end} entries"
+                ));
             }
             match at.windows(2).position(|pair| pair[0] > pair[1]) {
                 // alloc: a refused trace's message, once
@@ -651,7 +653,10 @@ impl<M: Default> Slots<M> {
 
     #[track_caller]
     pub(crate) fn give(&mut self, handle: Handle<M>) {
-        assert!(self.slab.remove(handle).is_some(), "slot {handle:?} given back, but it is not live");
+        assert!(
+            self.slab.remove(handle).is_some(),
+            "slot {handle:?} given back, but it is not live"
+        );
     }
 
     /// Slots made so far, live or free: the rows each column has.
@@ -1091,7 +1096,7 @@ impl<M: Memo> Plane<M> {
             idle_running: Vec::new(), // alloc: kept scratch
             yielding: [0; 2],
             yielding_memory: 0,
-            yields: Vec::new(), // alloc: kept scratch
+            yields: Vec::new(),               // alloc: kept scratch
             active: [Vec::new(), Vec::new()], // alloc: kept scratch
             hold: None,
             passes: 0,
@@ -1099,12 +1104,12 @@ impl<M: Memo> Plane<M> {
             last_ns: 0,
             counts: Counts::default(),
             batch: Batch::default(),
-            touched: Vec::new(), // alloc: kept scratch
-            added: Vec::new(), // alloc: kept scratch
-            rising: Vec::new(), // alloc: kept scratch
+            touched: Vec::new(),  // alloc: kept scratch
+            added: Vec::new(),    // alloc: kept scratch
+            rising: Vec::new(),   // alloc: kept scratch
             skipping: Vec::new(), // alloc: kept scratch
-            order: Vec::new(), // alloc: kept scratch
-            passed: Vec::new(), // alloc: kept scratch
+            order: Vec::new(),    // alloc: kept scratch
+            passed: Vec::new(),   // alloc: kept scratch
             scan: BinaryHeap::new(),
             sorting: Vec::new(), // alloc: kept scratch
         })
@@ -1157,7 +1162,9 @@ impl<M: Memo> Plane<M> {
 
     /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.
     pub fn is_open(&self, request: RequestId) -> bool {
-        self.request_index.get(&request).is_some_and(|r| !self.requests[r.index() as usize].finished)
+        self.request_index
+            .get(&request)
+            .is_some_and(|r| !self.requests[r.index() as usize].finished)
     }
 
     /// What `request` did so far, if it is known: open, or finished and not released.
@@ -1221,7 +1228,13 @@ impl<M: Memo> Plane<M> {
                     .iter()
                     .find(|edge| !self.states[edge.dep as usize].settled())
                     .map(|edge| self.rows[edge.dep as usize].id);
-                each(Unsettled { request: request.id, id: self.rows[m].id, name: request.name(cold), state, on });
+                each(Unsettled {
+                    request: request.id,
+                    id: self.rows[m].id,
+                    name: request.name(cold),
+                    state,
+                    on,
+                });
             }
         }
     }
@@ -1263,7 +1276,8 @@ impl<M: Memo> Plane<M> {
         for &me in &request.nodes {
             let m = me as usize;
             debug_assert!(self.states[m].settled() && self.rows[m].task == NO_TASK);
-            let node = self.index.remove(&self.rows[m].id).expect("a node of a request in the index");
+            let node =
+                self.index.remove(&self.rows[m].id).expect("a node of a request in the index");
             debug_assert_eq!(node.index(), me);
             self.node_slots.give(node);
             self.states[m] = NodeState::Waiting;
@@ -1296,7 +1310,11 @@ impl<M: Memo> Plane<M> {
     /// [`Plane::step`], with its outputs appended to `out`: a caller that keeps one buffer and
     /// drains it gets them with no allocation of its own per step. An input refused appends
     /// nothing and changes nothing.
-    pub fn step_into(&mut self, input: PlaneInput, out: &mut Vec<PlaneOutput>) -> Result<(), Error> {
+    pub fn step_into(
+        &mut self,
+        input: PlaneInput,
+        out: &mut Vec<PlaneOutput>,
+    ) -> Result<(), Error> {
         // A time before the last is the last: completions race the clock that stamps them.
         let at = input.at_ns().max(self.last_ns);
         let mut touched = std::mem::take(&mut self.touched);
@@ -1343,7 +1361,8 @@ impl<M: Memo> Plane<M> {
                     it.idle = false;
                     it.vtime = self.vclock;
                     let (rows, tasks) = (&self.rows, &self.tasks);
-                    self.idle_running.retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
+                    self.idle_running
+                        .retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
                 }
             }
             PlaneInput::Yielded { id, .. } => {
@@ -1372,11 +1391,11 @@ impl<M: Memo> Plane<M> {
                     // Empty, so allocating nothing: the place the record takes below.
                     let kept = Event::Nodes {
                         first: 0,
-                        kinds: Vec::new(), // alloc: none, empty
+                        kinds: Vec::new(),    // alloc: none, empty
                         names: String::new(), // alloc: none, empty
-                        name_at: Vec::new(), // alloc: none, empty
-                        deps: Vec::new(), // alloc: none, empty
-                        deps_at: Vec::new(), // alloc: none, empty
+                        name_at: Vec::new(),  // alloc: none, empty
+                        deps: Vec::new(),     // alloc: none, empty
+                        deps_at: Vec::new(),  // alloc: none, empty
                     };
                     out.push(said(request, at, kept));
                     self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
@@ -1570,7 +1589,10 @@ impl<M: Memo> Plane<M> {
                         batch.deps.push(NEW | place);
                     }
                     Some((it, None)) if self.rows[it.index() as usize].request == r => {
-                        debug_assert!(self.node_slots.live(it), "the index holds a stale handle of {dep}");
+                        debug_assert!(
+                            self.node_slots.live(it),
+                            "the index holds a stale handle of {dep}"
+                        );
                         batch.deps.push(it.index());
                     }
                     _ => {
@@ -1727,15 +1749,19 @@ impl<M: Memo> Plane<M> {
             match &self.states[dep as usize] {
                 NodeState::Built | NodeState::Cached { .. } => {
                     if blocker == NONE
-                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                        || later(&self.rows, &self.cold, dep)
+                            > later(&self.rows, &self.cold, blocker)
                     {
                         blocker = dep;
                     }
                 }
                 // A failure that leaves what waits for it to run, under keep-going: as done.
-                NodeState::Failed { .. } if request.keep_going && self.cold[dep as usize].flags & OPEN != 0 => {
+                NodeState::Failed { .. }
+                    if request.keep_going && self.cold[dep as usize].flags & OPEN != 0 =>
+                {
                     if blocker == NONE
-                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                        || later(&self.rows, &self.cold, dep)
+                            > later(&self.rows, &self.cold, blocker)
                     {
                         blocker = dep;
                     }
@@ -1938,7 +1964,10 @@ impl<M: Memo> Plane<M> {
             let vacant = match self.flight.entry(key) {
                 Entry::Occupied(it) => {
                     let task = *it.get();
-                    debug_assert!(self.task_slots.live(task), "a key in flight names a task that ended");
+                    debug_assert!(
+                        self.task_slots.live(task),
+                        "a key in flight names a task that ended"
+                    );
                     self.join(at, me, task, out);
                     return;
                 }
@@ -2039,7 +2068,9 @@ impl<M: Memo> Plane<M> {
                 edge = it.next;
                 let dependent = &mut self.rows[it.owner as usize];
                 dependent.waiting -= 1;
-                if dependent.waiting == 0 && matches!(self.states[it.owner as usize], NodeState::Waiting) {
+                if dependent.waiting == 0
+                    && matches!(self.states[it.owner as usize], NodeState::Waiting)
+                {
                     self.cold[it.owner as usize].blocker = me;
                     self.became_ready(at, it.owner, out);
                 }
@@ -2086,7 +2117,11 @@ impl<M: Memo> Plane<M> {
         if task == NO_TASK {
             return None;
         }
-        debug_assert!(self.task_slots.live(task), "node {} names a task that ended", self.rows[m].id);
+        debug_assert!(
+            self.task_slots.live(task),
+            "node {} names a task that ended",
+            self.rows[m].id
+        );
         self.rows[m].task = NO_TASK;
         let t = self.tasks[row_of(task)];
         let next = self.rows[m].next_member;
@@ -2557,11 +2592,12 @@ impl<M: Memo> Plane<M> {
             .iter()
             .copied()
             .filter(|&it| self.cold[it as usize].flags & DONE != 0)
-            .max_by_key(|&it| (self.cold[it as usize].done_at, Reverse(self.rows[it as usize].seq)));
+            .max_by_key(|&it| {
+                (self.cold[it as usize].done_at, Reverse(self.rows[it as usize].seq))
+            });
         let blocker = |it: &u32| Some(self.cold[*it as usize].blocker).filter(|&it| it != NONE);
-        let mut path: Vec<u32> = std::iter::successors(last, blocker)
-            .map(|it| self.rows[it as usize].id.0)
-            .collect(); // alloc: the payload of the request's one `Event::Critical`
+        let mut path: Vec<u32> =
+            std::iter::successors(last, blocker).map(|it| self.rows[it as usize].id.0).collect(); // alloc: the payload of the request's one `Event::Critical`
         path.reverse();
         path
     }
@@ -2569,7 +2605,11 @@ impl<M: Memo> Plane<M> {
 
 /// Whether an entry of a request's running nodes is still what it says: the same node (a slot
 /// reused has another `seq`), running, at that priority.
-fn running_live(rows: &[NodeRow], states: &[NodeState], (priority, seq, node): (u64, u64, u32)) -> bool {
+fn running_live(
+    rows: &[NodeRow],
+    states: &[NodeState],
+    (priority, seq, node): (u64, u64, u32),
+) -> bool {
     let row = &rows[node as usize];
     row.seq == seq && row.priority == priority && states[node as usize] == NodeState::Running
 }
@@ -2635,7 +2675,12 @@ fn new_task(
 }
 
 /// Takes the ids of the first `len` nodes of a batch refused back out of the index.
-fn unindex(index: &mut HashMap<NodeId, NodeHandle, Global>, nodes: &(impl Given + ?Sized), len: usize) { // alloc: the plane's index, for the daemon's life
+fn unindex(
+    index: &mut HashMap<NodeId, NodeHandle, Global>,
+    nodes: &(impl Given + ?Sized),
+    len: usize,
+) {
+    // alloc: the plane's index, for the daemon's life
     for at in 0..len {
         index.remove(&nodes.id(at));
     }

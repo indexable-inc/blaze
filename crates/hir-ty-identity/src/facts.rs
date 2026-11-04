@@ -19,11 +19,10 @@ use hir_def::{
 use hir_ty::{
     ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, PointerAt, PointerCast,
     consteval::try_const_usize,
-    layout::Layout,
-    mir::VTableMap,
-    utils::detect_variant_from_bytes,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    layout::Layout,
     method_resolution::lookup_impl_const,
+    mir::VTableMap,
     next_solver::{
         AliasConst, AliasConstKind, Allocation, AllocationData, Const, ConstKind, DbInterner,
         FreeConstAliasId, GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind,
@@ -31,16 +30,19 @@ use hir_ty::{
         infer::{DbInternerInferExt as _, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
+    utils::detect_variant_from_bytes,
 };
 use hir_ty_mir::mir::{
     AggregateKind, AsmOperand, CastKind, MirBody, Operand, OperandKind, PlaceTy, Rvalue,
     StatementKind, StoredPlace, TerminatorKind,
-    dispatch::{self, Body, Call, Callee, LONGEST, UnsizeStep, variants, vtable_methods, within_longest},
+    dispatch::{
+        self, Body, Call, Callee, LONGEST, UnsizeStep, variants, vtable_methods, within_longest,
+    },
     normalize_or_keep,
 };
 use hir_ty_share::identity as share;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _, Ty as _};
 use rustc_abi::TargetDataLayout;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _, Ty as _};
 use smallvec::SmallVec;
 use std::{alloc::Global, borrow::Cow};
 
@@ -127,7 +129,9 @@ impl<'a, 'db> Facts<'a, 'db> {
         }
         for (_, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
-                MirBody::visit_statement_places(&statement.kind, &mut |place| self.place(body, place));
+                MirBody::visit_statement_places(&statement.kind, &mut |place| {
+                    self.place(body, place)
+                });
                 statement.kind.for_each_operand(&mut |operand| self.operand(operand));
                 match &statement.kind {
                     StatementKind::Assign(_, rvalue) => self.rvalue(body, rvalue),
@@ -147,14 +151,17 @@ impl<'a, 'db> Facts<'a, 'db> {
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
-            MirBody::visit_terminator_places(&terminator.kind, &mut |place| self.place(body, place));
+            MirBody::visit_terminator_places(&terminator.kind, &mut |place| {
+                self.place(body, place)
+            });
             terminator.kind.for_each_operand(&mut |operand| self.operand(operand));
             match &terminator.kind {
                 TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
                     self.h.update(&[11]);
                     self.call_site(body, func);
                 }
-                TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
+                TerminatorKind::Drop { place, .. }
+                | TerminatorKind::DropAndReplace { place, .. } => {
                     let ty = self.place_ty(body, place);
                     self.drop(ty);
                 }
@@ -197,29 +204,46 @@ impl<'a, 'db> Facts<'a, 'db> {
                     CastKind::PointerCoercion(PointerCast::ReifyFnPointer) => {
                         self.h.update(&[12]);
                         match self.operand_ty(body, operand).map(|it| it.kind()) {
-                            Some(TyKind::FnDef(def, args)) => self.callable(def.0, args.skip_binder()),
-                            _ => self.fail(|| "makes a function pointer of what is not a function item".to_owned()), // alloc: error path
+                            Some(TyKind::FnDef(def, args)) => {
+                                self.callable(def.0, args.skip_binder())
+                            }
+                            _ => self.fail(|| {
+                                "makes a function pointer of what is not a function item".to_owned()
+                            }), // alloc: error path
                         }
                     }
                     CastKind::PointerCoercion(PointerCast::ClosureFnPointer(_)) => {
                         self.h.update(&[13]);
                         match self.operand_ty(body, operand).map(|it| it.kind()) {
                             Some(TyKind::Closure(id, args)) => {
-                                let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                                self.closure(Body::Closure(blaze_query::db::AsId::as_id(&id.0)), parent);
+                                let parent =
+                                    GenericArgs::new_from_slice(args.as_closure().parent_args());
+                                self.closure(
+                                    Body::Closure(blaze_query::db::AsId::as_id(&id.0)),
+                                    parent,
+                                );
                             }
-                            _ => self.fail(|| "makes a function pointer of a closure not known".to_owned()), // alloc: error path
+                            _ => self.fail(|| {
+                                "makes a function pointer of a closure not known".to_owned()
+                            }), // alloc: error path
                         }
                     }
-                    CastKind::PointerCoercion(PointerCast::Unsize) => match self.operand_ty(body, operand) {
-                        Some(from) => self.unsize(from, to),
-                        None => self.fail(|| "unsizes the address of a static".to_owned()), // alloc: error path
-                    },
-                    CastKind::DynStar => self.fail(|| "makes a `dyn*`, which has no identity".to_owned()), // alloc: error path
+                    CastKind::PointerCoercion(PointerCast::Unsize) => {
+                        match self.operand_ty(body, operand) {
+                            Some(from) => self.unsize(from, to),
+                            None => self.fail(|| "unsizes the address of a static".to_owned()), // alloc: error path
+                        }
+                    }
+                    CastKind::DynStar => {
+                        self.fail(|| "makes a `dyn*`, which has no identity".to_owned())
+                    } // alloc: error path
                     _ => {}
                 }
             }
-            Rvalue::Aggregate(AggregateKind::Array(ty) | AggregateKind::Tuple(ty) | AggregateKind::Closure(ty), _) => {
+            Rvalue::Aggregate(
+                AggregateKind::Array(ty) | AggregateKind::Tuple(ty) | AggregateKind::Closure(ty),
+                _,
+            ) => {
                 self.ty(ty.as_ref());
             }
             _ => {}
@@ -246,7 +270,9 @@ impl<'a, 'db> Facts<'a, 'db> {
                         Ok(id) => {
                             self.h.update(&[3]).id(&id);
                         }
-                        Err(it) => self.fail(|| format!("the constant `{konst:?}` has no identity: {it}")), // alloc: error path
+                        Err(it) => {
+                            self.fail(|| format!("the constant `{konst:?}` has no identity: {it}"))
+                        } // alloc: error path
                     }
                 }
             }
@@ -298,9 +324,13 @@ impl<'a, 'db> Facts<'a, 'db> {
                 }
             }
             TyKind::Tuple(fields) => fields.iter().for_each(|it| self.ty(it)),
-            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => self.ty(element),
+            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+                self.ty(element)
+            }
             TyKind::Closure(_, args) => self.ty(args.as_closure().tupled_upvars_ty()),
-            TyKind::CoroutineClosure(_, args) => self.ty(args.as_coroutine_closure().tupled_upvars_ty()),
+            TyKind::CoroutineClosure(_, args) => {
+                self.ty(args.as_coroutine_closure().tupled_upvars_ty())
+            }
             TyKind::Coroutine(_, args) => self.ty(args.as_coroutine().tupled_upvars_ty()),
             _ => {}
         }
@@ -322,7 +352,8 @@ impl<'a, 'db> Facts<'a, 'db> {
         let thread_local = AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL);
         self.h.update(&[signature.flags.bits(), thread_local as u8]);
         if signature.flags.contains(StaticFlags::EXTERN) {
-            let link = AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone()); // clone: a handle of an interned name
+            let link = AttrFlags::link_name(db, id.into())
+                .unwrap_or_else(|| signature.name.symbol().clone()); // clone: a handle of an interned name
             self.h.part(link.as_str().as_bytes());
             return;
         }
@@ -333,14 +364,22 @@ impl<'a, 'db> Facts<'a, 'db> {
                 self.allocation(&value, ty, Holder::Static(id));
             }
             Err(error) => self.fail(|| {
-                format!("reads `{}`, whose value does not evaluate: {error:?}", signature.name.as_str()) // alloc: error path
+                format!(
+                    "reads `{}`, whose value does not evaluate: {error:?}",
+                    signature.name.as_str()
+                ) // alloc: error path
             }),
         }
     }
 
     /// An evaluated value of `ty`, which `holder` holds: its bytes and every piece of memory,
     /// function pointer, vtable, type id and static it holds.
-    pub(crate) fn allocation(&mut self, value: &AllocationData<'db>, ty: Ty<'db>, holder: Holder<'db>) {
+    pub(crate) fn allocation(
+        &mut self,
+        value: &AllocationData<'db>,
+        ty: Ty<'db>,
+        holder: Holder<'db>,
+    ) {
         self.h.part(&value.memory);
         let map = match &value.memory_map {
             MemoryMap::Empty => {
@@ -395,7 +434,12 @@ impl<'a, 'db> Facts<'a, 'db> {
             Ok(it) => it,
             Err(why) => {
                 let db = self.cx.db;
-                return self.fail(|| format!("uses {}, whose vtables can't be looked for: {why}", holder.describe(db, ty))); // alloc: error path
+                return self.fail(|| {
+                    format!(
+                        "uses {}, whose vtables can't be looked for: {why}",
+                        holder.describe(db, ty)
+                    )
+                }); // alloc: error path
             }
         };
         let held = held_ids(value, map, word);
@@ -509,7 +553,9 @@ impl<'a, 'db> Facts<'a, 'db> {
         let cx = self.cx;
         let db = cx.db;
         if !within_longest(args) {
-            return self.fail(|| format!("calls `{}` with type arguments past {LONGEST} types long", fn_path(db, f))); // alloc: error path
+            return self.fail(|| {
+                format!("calls `{}` with type arguments past {LONGEST} types long", fn_path(db, f))
+            }); // alloc: error path
         }
         match dispatch::call(&cx.infcx, cx.env, f, args) {
             Call::DropGlue(ty) => {
@@ -524,7 +570,9 @@ impl<'a, 'db> Facts<'a, 'db> {
                 }
             }
             Call::ConstEvalSelect(None) => {
-                self.fail(|| "calls `const_eval_select` with a run-time function not known".to_owned()) // alloc: error path
+                self.fail(|| {
+                    "calls `const_eval_select` with a run-time function not known".to_owned()
+                }) // alloc: error path
             }
             Call::Intrinsic(intrinsic) => {
                 // By name: its index is its rank among the toolchain's names and shifts when one
@@ -559,7 +607,12 @@ impl<'a, 'db> Facts<'a, 'db> {
                 self.args(args);
             }
             Call::Method(Err(why)) => self.fail(|| {
-                format!("calls `{}` for `{:?}`, which no impl's method is found for: {}", fn_path(db, f), args.type_at(0), why.describe()) // alloc: error path
+                format!(
+                    "calls `{}` for `{:?}`, which no impl's method is found for: {}",
+                    fn_path(db, f),
+                    args.type_at(0),
+                    why.describe()
+                ) // alloc: error path
             }),
             Call::Method(Ok(callee)) => self.method(f, args, callee),
         }
@@ -586,7 +639,9 @@ impl<'a, 'db> Facts<'a, 'db> {
                 }
             }
             Callee::Derived(..) => {
-                self.fail(|| format!("calls a derived `{}`, which blaze does not build", fn_path(db, f))) // alloc: error path
+                self.fail(|| {
+                    format!("calls a derived `{}`, which blaze does not build", fn_path(db, f))
+                }) // alloc: error path
             }
             Callee::CloneBuiltin(found) => {
                 self.h.update(&[42]);
@@ -614,10 +669,16 @@ impl<'a, 'db> Facts<'a, 'db> {
         for step in steps {
             match step {
                 UnsizeStep::Vtable(concrete, dyn_ty) => self.vtable(concrete, dyn_ty),
-                UnsizeStep::NotStruct(from) => self.fail(|| format!("unsizes `{from:?}`, which is not a struct")), // alloc: error path
-                UnsizeStep::NoFields(from) => self.fail(|| format!("unsizes `{from:?}`, a struct without fields")), // alloc: error path
+                UnsizeStep::NotStruct(from) => {
+                    self.fail(|| format!("unsizes `{from:?}`, which is not a struct"))
+                } // alloc: error path
+                UnsizeStep::NoFields(from) => {
+                    self.fail(|| format!("unsizes `{from:?}`, a struct without fields"))
+                } // alloc: error path
                 UnsizeStep::Unfollowed(from, to) => {
-                    self.fail(|| format!("unsizes `{from:?}` to `{to:?}`, which dispatch does not follow")) // alloc: error path
+                    self.fail(|| {
+                        format!("unsizes `{from:?}` to `{to:?}`, which dispatch does not follow")
+                    }) // alloc: error path
                 }
             }
         }
@@ -695,7 +756,9 @@ pub(crate) fn evaluate<'db>(cx: &Cx<'db>, konst: Const<'db>) -> Result<Allocatio
         }
         AliasConstKind::Anon { def_id } => cx.db.anon_const_eval(def_id.0, args, Some(cx.env)),
         AliasConstKind::InherentSelf { .. } => {
-            return Err(format!("`{konst:?}`: an inherent constant in `Self` form after type check")); // alloc: error path
+            return Err(format!(
+                "`{konst:?}`: an inherent constant in `Self` form after type check"
+            )); // alloc: error path
         }
     }
     .map_err(|error| format!("the constant `{konst:?}` does not evaluate: {error:?}")) // alloc: error path
@@ -737,7 +800,9 @@ impl<'db> Holder<'db> {
                     false => format!("the constant `{path}` with `{args:?}` of `{ty:?}`"), // alloc: error path
                 }
             }
-            Holder::Static(id) => format!("the static `{}` of `{ty:?}`", key::path(db, ItemId::Static(id))), // alloc: error path
+            Holder::Static(id) => {
+                format!("the static `{}` of `{ty:?}`", key::path(db, ItemId::Static(id)))
+            } // alloc: error path
             Holder::Body => format!("a value of `{ty:?}` in its body"), // alloc: error path
         }
     }
@@ -752,12 +817,18 @@ fn held_ids(value: &AllocationData<'_>, map: &ComplexMemoryMap<'_>, word: usize)
         let bytes = memory.get(at..at + word)?;
         Some(bytes.iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte)))
     };
-    let in_value = value.memory_map.value_pointers().iter().filter_map(|&at| read(&value.memory, at));
+    let in_value =
+        value.memory_map.value_pointers().iter().filter_map(|&at| read(&value.memory, at));
     let in_memory = map.memory.iter().flat_map(|(&start, memory)| {
-        value.memory_map.pointers_in(start..start + memory.len()).iter().filter_map(move |&addr| read(memory, addr - start))
+        value
+            .memory_map
+            .pointers_in(start..start + memory.len())
+            .iter()
+            .filter_map(move |&addr| read(memory, addr - start))
     });
     // alloc: one value's held ids, dropped with its facts
-    let mut ids: Vec<usize> = in_value.chain(in_memory).filter(|&it| it >= VTableMap::FIRST_ID).collect();
+    let mut ids: Vec<usize> =
+        in_value.chain(in_memory).filter(|&it| it >= VTableMap::FIRST_ID).collect();
     ids.sort_unstable();
     ids.dedup();
     ids
@@ -819,7 +890,10 @@ enum Leaf {
 /// Whether a value of `ty` is a number, with no pointer in it, as the code generator's
 /// `is_number` says.
 fn is_number(ty: Ty<'_>) -> bool {
-    matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char)
+    matches!(
+        ty.kind(),
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char
+    )
 }
 
 /// The memory const eval kept that holds `addr`, with the address it starts at, or that `addr`
@@ -902,9 +976,12 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     }
 
     fn word_at(&self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> Result<usize, String> {
-        let word = offset.checked_add(self.word).and_then(|end| bytes.get(offset..end)).ok_or_else(|| {
-            format!("a `{ty:?}` at offset {offset} is past its memory's {} bytes", bytes.len()) // alloc: error path
-        })?;
+        let word = offset
+            .checked_add(self.word)
+            .and_then(|end| bytes.get(offset..end))
+            .ok_or_else(|| {
+                format!("a `{ty:?}` at offset {offset} is past its memory's {} bytes", bytes.len()) // alloc: error path
+            })?;
         Ok(word.iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte)))
     }
 
@@ -925,7 +1002,9 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     fn count_place(&mut self, ty: Ty<'db>) -> Result<(), String> {
         self.places += 1;
         if self.places > PLACES {
-            return Err(format!("its value has more than {PLACES} places to look for a vtable in, at a `{ty:?}`")); // alloc: error path
+            return Err(format!(
+                "its value has more than {PLACES} places to look for a vtable in, at a `{ty:?}`"
+            )); // alloc: error path
         }
         Ok(())
     }
@@ -936,7 +1015,13 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         stdx::ensure_sufficient_stack(|| self.walk_level(bytes, at, offset, ty))
     }
 
-    fn walk_level(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>) -> Result<(), String> {
+    fn walk_level(
+        &mut self,
+        bytes: &[u8],
+        at: At,
+        offset: usize,
+        ty: Ty<'db>,
+    ) -> Result<(), String> {
         let ty = self.cx.normalize(ty);
         if !self.holds_pointer(ty) {
             return Ok(());
@@ -945,10 +1030,14 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         let (db, lang) = (self.cx.db, self.cx.interner.lang_items());
         match ty.kind() {
             TyKind::Pat(base, _) => self.walk(bytes, at, offset, base)?,
-            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => self.pointer(bytes, at, offset, ty, pointee)?,
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                self.pointer(bytes, at, offset, ty, pointee)?
+            }
             // `_vtable_ptr`, its first field, is a vtable whose id names its `dyn`, checked as the
             // code generator's `DynMetadata` arm checks it: no pointee.
-            TyKind::Adt(def, args) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
+            TyKind::Adt(def, args)
+                if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) =>
+            {
                 let place = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
                 let dyn_ty = self.cx.normalize(args.type_at(0));
                 let dyn_ty = matches!(dyn_ty.kind(), TyKind::Dynamic(..)).then_some(dyn_ty);
@@ -977,18 +1066,30 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                         return Ok(());
                     }
                     AdtId::EnumId(id) => {
-                        let Some(value) = bytes.get(offset..offset + layout.size.bytes_usize()) else {
-                            return Err(format!("a `{ty:?}` at offset {offset} is past its memory's {} bytes", bytes.len())); // alloc: error path
+                        let Some(value) = bytes.get(offset..offset + layout.size.bytes_usize())
+                        else {
+                            return Err(format!(
+                                "a `{ty:?}` at offset {offset} is past its memory's {} bytes",
+                                bytes.len()
+                            )); // alloc: error path
                         };
-                        let Some((variant, layout)) = detect_variant_from_bytes(layout, db, self.dl, value, id) else {
+                        let Some((variant, layout)) =
+                            detect_variant_from_bytes(layout, db, self.dl, value, id)
+                        else {
                             return Ok(());
                         };
                         (variant.into(), layout)
                     }
                 };
-                let offsets = (0..variant_layout.fields.count()).map(|i| variant_layout.fields.offset(i).bytes_usize());
+                let offsets = (0..variant_layout.fields.count())
+                    .map(|i| variant_layout.fields.offset(i).bytes_usize());
                 for ((_, field), field_at) in db.field_types(variant).iter().zip(offsets) {
-                    self.walk(bytes, at, offset + field_at, field.ty().instantiate(self.cx.interner, args).skip_norm_wip())?;
+                    self.walk(
+                        bytes,
+                        at,
+                        offset + field_at,
+                        field.ty().instantiate(self.cx.interner, args).skip_norm_wip(),
+                    )?;
                 }
             }
             TyKind::Tuple(fields) => {
@@ -1031,7 +1132,8 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         let layout = self.layout(ty)?;
         let mut held = None;
         for (i, (_, field)) in self.cx.db.field_types(id.into()).iter().enumerate() {
-            let field = self.cx.normalize(field.ty().instantiate(self.cx.interner, args).skip_norm_wip());
+            let field =
+                self.cx.normalize(field.ty().instantiate(self.cx.interner, args).skip_norm_wip());
             if self.layout(field)?.size.bytes() == 0 {
                 continue;
             }
@@ -1047,7 +1149,14 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     /// `relocate_pointer` takes it: a pointer to `dyn` pairs its vtable with that `dyn`, and the
     /// memory it points to is walked as the pointee's (the vtable's type, for a `dyn`). A
     /// static's memory is the static's own facts.
-    fn pointer(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>, pointee: Ty<'db>) -> Result<(), String> {
+    fn pointer(
+        &mut self,
+        bytes: &[u8],
+        at: At,
+        offset: usize,
+        ty: Ty<'db>,
+        pointee: Ty<'db>,
+    ) -> Result<(), String> {
         let addr = self.word_at(bytes, offset, ty)?;
         let raw = matches!(ty.kind(), TyKind::RawPtr(..));
         let provenance = self.provenance(at.word(offset));
@@ -1060,14 +1169,18 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         // The pointer's metadata is its pointee's struct tail's, found as the code generator's
         // `relocate_pointer` finds it: a `&Wrap<dyn Handler>` carries the vtable of the
         // concrete type at its tail for `dyn Handler`.
-        let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.cx.db, pointee, |it| self.cx.normalize(it));
+        let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.cx.db, pointee, |it| {
+            self.cx.normalize(it)
+        });
         let mut concrete = None;
         if matches!(tail.kind(), TyKind::Dynamic(..)) {
             // The metadata is a vtable const eval made, its id with provenance, as the code
             // generator's `vtable_word` takes it; else the pointer is not followed behind a raw
             // pointer (it is a number there), and refused elsewhere, as the code generator
             // refuses it.
-            let Some(of) = self.vtable_word(bytes, at, offset + self.word, ty, Some(tail))? else { return Ok(()) };
+            let Some(of) = self.vtable_word(bytes, at, offset + self.word, ty, Some(tail))? else {
+                return Ok(());
+            };
             concrete = Some(of);
         }
         // A raw pointer whose provenance is a function or a vtable keeps const eval's id of it (a
@@ -1075,7 +1188,10 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         // code generator's `relocate_pointer` relocates to that function or vtable, as rustc keeps
         // a raw pointer to either in a constant's value. What the id names is hashed by
         // `Facts::allocation`; a vtable for no `dyn` type is refused by `ids_left`.
-        if raw && provenance && (self.map.function_of(addr).is_some() || self.map.vtable_of(addr).is_some()) {
+        if raw
+            && provenance
+            && (self.map.function_of(addr).is_some() || self.map.vtable_of(addr).is_some())
+        {
             return Ok(());
         }
         if self.map.static_at(addr).is_some() {
@@ -1220,7 +1336,9 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                         self.walk(memory, at, pos, reach.ty)?;
                     }
                 }
-                None if self.sized(reach.ty).is_some_and(fits) => self.walk(memory, at, place, reach.ty)?,
+                None if self.sized(reach.ty).is_some_and(fits) => {
+                    self.walk(memory, at, place, reach.ty)?
+                }
                 None => {}
             },
         }
@@ -1260,7 +1378,8 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     /// it; `None` where only the pointee at the pointer is walked, if it fits.
     fn stride(&self, memory: &[u8], reach: Reach<'db>) -> Option<usize> {
         let size = self.sized(reach.ty)?;
-        (size > 0 && !is_number(reach.ty) && reach.at % size == 0 && memory.len() % size == 0).then_some(size)
+        (size > 0 && !is_number(reach.ty) && reach.at % size == 0 && memory.len() % size == 0)
+            .then_some(size)
     }
 
     /// Where the slice at the end of `ty`'s chain of last fields (through structs and tuples)
@@ -1276,7 +1395,10 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
                     let fields = self.cx.db.field_types(id.into());
                     let Some((_, last)) = fields.iter().next_back() else { return Ok(None) };
-                    (fields.iter().count() - 1, last.ty().instantiate(self.cx.interner, args).skip_norm_wip())
+                    (
+                        fields.iter().count() - 1,
+                        last.ty().instantiate(self.cx.interner, args).skip_norm_wip(),
+                    )
                 }
                 TyKind::Tuple(tys) => match tys.iter().next_back() {
                     Some(last) => (tys.len() - 1, last),
@@ -1292,7 +1414,11 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
 
     /// Where the `dyn` tail of `pointee` holding a `concrete` starts in a value of it, and the
     /// concrete value's size: the rule const eval and the code generator share.
-    fn dyn_tail(&self, pointee: Ty<'db>, concrete: Ty<'db>) -> Result<Option<(usize, usize)>, String> {
+    fn dyn_tail(
+        &self,
+        pointee: Ty<'db>,
+        concrete: Ty<'db>,
+    ) -> Result<Option<(usize, usize)>, String> {
         let layout = self.layout(concrete)?;
         let place = hir_ty::layout::dyn_tail_place(
             self.cx.db,
@@ -1396,10 +1522,16 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         }
         for (kept, memory, of) in &groups {
             let at = At { kept: *kept, raw: false };
-            let candidates = (0..memory.len().saturating_sub(self.word - 1)).step_by(self.word).filter(|&x| {
-                let id = memory[x..x + self.word].iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte));
-                id >= VTableMap::FIRST_ID && !self.provenance(at.word(x)) && self.map.vtable_ty(id).is_ok()
-            });
+            let candidates =
+                (0..memory.len().saturating_sub(self.word - 1)).step_by(self.word).filter(|&x| {
+                    let id = memory[x..x + self.word]
+                        .iter()
+                        .rev()
+                        .fold(0, |value, &byte| value << 8 | usize::from(byte));
+                    id >= VTableMap::FIRST_ID
+                        && !self.provenance(at.word(x))
+                        && self.map.vtable_ty(id).is_ok()
+                });
             // alloc: the words to look at, almost always none
             let candidates: SmallVec<[usize; 4]> = candidates.collect();
             for x in candidates {
@@ -1420,12 +1552,18 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                 let pointee = self.map.vtable_ty(id).map_err(|error| format!("{error:?}"))?; // alloc: error path
                 let place = match (kept, unrelocated) {
                     (Some(start), Some(reach)) => {
-                        format!("the memory const eval kept at {start:#x}, reached as `{:?}`", reach.ty) // alloc: error path
+                        format!(
+                            "the memory const eval kept at {start:#x}, reached as `{:?}`",
+                            reach.ty
+                        ) // alloc: error path
                     }
-                    (Some(start), None) => format!("the memory const eval kept at {start:#x}, which only provenance reaches"), // alloc: error path
+                    (Some(start), None) => format!(
+                        "the memory const eval kept at {start:#x}, which only provenance reaches"
+                    ), // alloc: error path
                     (None, _) => format!("its value, of `{ty:?}`"), // alloc: error path
                 };
-                let behind = if unrelocated.is_some_and(|it| it.raw) { " behind a raw pointer" } else { "" };
+                let behind =
+                    if unrelocated.is_some_and(|it| it.raw) { " behind a raw pointer" } else { "" };
                 return Err(format!(
                     // alloc: error path
                     "the word at {x} of {place}{behind} is const eval's id of `{pointee:?}` (a function or a \
@@ -1441,7 +1579,13 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     /// Whether every byte of the word at `x` of `memory` is a number by some type the memory is
     /// reached as, as the code generator's `Relocations::is_number` says over the numbers its
     /// walks noted there.
-    fn number(&mut self, kept: Option<usize>, memory: &[u8], of: &[Reach<'db>], x: usize) -> Result<bool, String> {
+    fn number(
+        &mut self,
+        kept: Option<usize>,
+        memory: &[u8],
+        of: &[Reach<'db>],
+        x: usize,
+    ) -> Result<bool, String> {
         let mut pos = x;
         // Each step moves `pos` to the end of a number that holds it, at least a byte on.
         for _ in 0..=self.word {
@@ -1468,7 +1612,13 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
 
     /// What `reach`'s walk of `memory` (kept at `kept`) says of the byte at `pos`, as
     /// [`VtableWalk::reach`] walks it.
-    fn leaf_reach(&mut self, kept: Option<usize>, memory: &[u8], reach: Reach<'db>, pos: usize) -> Result<Leaf, String> {
+    fn leaf_reach(
+        &mut self,
+        kept: Option<usize>,
+        memory: &[u8],
+        reach: Reach<'db>,
+        pos: usize,
+    ) -> Result<Leaf, String> {
         let at = At { kept, raw: reach.raw };
         let place = reach.at;
         let fits = |size: usize| place.checked_add(size).is_some_and(|end| end <= memory.len());
@@ -1478,8 +1628,15 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                 let element = self.cx.normalize(element);
                 let size = self.layout(element)?.size.bytes_usize();
                 let len = reach.len.unwrap_or(0);
-                match size.checked_mul(len).and_then(|whole| Some((whole, place.checked_add(whole)?))) {
-                    Some((whole, end)) if size > 0 && (!reach.raw || fits(whole)) && (place..end).contains(&pos) => {
+                match size
+                    .checked_mul(len)
+                    .and_then(|whole| Some((whole, place.checked_add(whole)?)))
+                {
+                    Some((whole, end))
+                        if size > 0
+                            && (!reach.raw || fits(whole))
+                            && (place..end).contains(&pos) =>
+                    {
                         self.leaf(memory, at, place + (pos - place) / size * size, element, pos)?
                     }
                     _ => Leaf::None,
@@ -1488,7 +1645,9 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             _ if !reach.raw => self.leaf(memory, at, place, reach.ty, pos)?,
             _ => match self.stride(memory, reach) {
                 Some(size) => self.leaf(memory, at, pos / size * size, reach.ty, pos)?,
-                None if self.sized(reach.ty).is_some_and(fits) => self.leaf(memory, at, place, reach.ty, pos)?,
+                None if self.sized(reach.ty).is_some_and(fits) => {
+                    self.leaf(memory, at, place, reach.ty, pos)?
+                }
                 None => Leaf::None,
             },
         };
@@ -1510,7 +1669,13 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     return Ok(if reach.raw { Leaf::None } else { Leaf::Number(begin, end) });
                 }
                 if !reach.raw || whole.checked_add(tail).is_some_and(fits) {
-                    return self.leaf(memory, at, begin + (pos - begin) / size * size, element, pos);
+                    return self.leaf(
+                        memory,
+                        at,
+                        begin + (pos - begin) / size * size,
+                        element,
+                        pos,
+                    );
                 }
             }
         }
@@ -1526,11 +1691,25 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     /// What a value of `ty` at `base` in `bytes` says of the byte at `pos`, as the code
     /// generator's `relocate` walks it: one level per level of the type, as deep as the program
     /// built it (rule 17).
-    fn leaf(&mut self, bytes: &[u8], at: At, base: usize, ty: Ty<'db>, pos: usize) -> Result<Leaf, String> {
+    fn leaf(
+        &mut self,
+        bytes: &[u8],
+        at: At,
+        base: usize,
+        ty: Ty<'db>,
+        pos: usize,
+    ) -> Result<Leaf, String> {
         stdx::ensure_sufficient_stack(|| self.leaf_level(bytes, at, base, ty, pos))
     }
 
-    fn leaf_level(&mut self, bytes: &[u8], at: At, base: usize, ty: Ty<'db>, pos: usize) -> Result<Leaf, String> {
+    fn leaf_level(
+        &mut self,
+        bytes: &[u8],
+        at: At,
+        base: usize,
+        ty: Ty<'db>,
+        pos: usize,
+    ) -> Result<Leaf, String> {
         let ty = self.cx.normalize(ty);
         if pos < base {
             return Ok(Leaf::None);
@@ -1569,12 +1748,15 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     Leaf::None
                 } else {
                     let pointee = self.cx.normalize(pointee);
-                    let tail =
-                        hir_ty::layout::struct_tail_erasing_lifetimes(db, pointee, |it| self.cx.normalize(it));
+                    let tail = hir_ty::layout::struct_tail_erasing_lifetimes(db, pointee, |it| {
+                        self.cx.normalize(it)
+                    });
                     match tail.kind() {
                         // The code generator relocates a vtable word by its provenance only.
                         TyKind::Dynamic(..) => self.vtable_leaf(bytes, at, meta, ty)?,
-                        TyKind::Str | TyKind::Slice(_) if !at.raw => Leaf::Number(meta, meta + word),
+                        TyKind::Str | TyKind::Slice(_) if !at.raw => {
+                            Leaf::Number(meta, meta + word)
+                        }
                         _ => Leaf::None,
                     }
                 }
@@ -1583,16 +1765,27 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             // provenance where a type can be trusted.
             TyKind::FnPtr(..) if in_word(base) => {
                 let function = self.map.function_of(self.word_at(bytes, base, ty)?).is_some();
-                if function && (!at.raw || self.provenance(at.word(base))) { Leaf::Word(base) } else { Leaf::None }
+                if function && (!at.raw || self.provenance(at.word(base))) {
+                    Leaf::Word(base)
+                } else {
+                    Leaf::None
+                }
             }
-            TyKind::Adt(def, _) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
+            TyKind::Adt(def, _)
+                if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) =>
+            {
                 let place = base + self.layout(ty)?.fields.offset(0).bytes_usize();
                 if in_word(place) { self.vtable_leaf(bytes, at, place, ty)? } else { Leaf::None }
             }
             // A `TypeId`'s words hold const eval's id of its type, which the code generator
             // writes rustc's hash over.
-            TyKind::Adt(def, _) if lang.TypeId.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
-                let id = bytes.get(base..base + 16).and_then(|it| it.try_into().ok()).map(u128::from_le_bytes);
+            TyKind::Adt(def, _)
+                if lang.TypeId.is_some_and(|it| def.def_id() == AdtId::StructId(it)) =>
+            {
+                let id = bytes
+                    .get(base..base + 16)
+                    .and_then(|it| it.try_into().ok())
+                    .map(u128::from_le_bytes);
                 match id.and_then(|it| self.map.type_id_ty(it)) {
                     Some(_) if pos < base + 16 => Leaf::Word(base + (pos - base) / word * word),
                     _ => Leaf::None,
@@ -1607,9 +1800,13 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     AdtId::StructId(id) => (id.into(), Cow::Borrowed(layout)),
                     AdtId::UnionId(id) => {
                         return match self.union_field(ty, id, args)? {
-                            Some((field_at, field)) => {
-                                self.leaf(bytes, At { raw: true, ..at }, base + field_at, field, pos)
-                            }
+                            Some((field_at, field)) => self.leaf(
+                                bytes,
+                                At { raw: true, ..at },
+                                base + field_at,
+                                field,
+                                pos,
+                            ),
                             None => Ok(Leaf::None),
                         };
                     }
@@ -1617,14 +1814,19 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                         let Some(value) = bytes.get(base..base + layout.size.bytes_usize()) else {
                             return Ok(Leaf::None);
                         };
-                        let Some((variant, layout)) = detect_variant_from_bytes(layout, db, self.dl, value, id) else {
+                        let Some((variant, layout)) =
+                            detect_variant_from_bytes(layout, db, self.dl, value, id)
+                        else {
                             return Ok(Leaf::None);
                         };
                         (variant.into(), layout)
                     }
                 };
                 let interner = self.cx.interner;
-                let mut fields = db.field_types(variant).iter().map(|(_, it)| it.ty().instantiate(interner, args).skip_norm_wip());
+                let mut fields = db
+                    .field_types(variant)
+                    .iter()
+                    .map(|(_, it)| it.ty().instantiate(interner, args).skip_norm_wip());
                 match field_at(self, &*variant_layout, &mut fields)? {
                     Some((start, field)) => return self.leaf(bytes, at, start, field, pos),
                     None => Leaf::None,
@@ -1656,7 +1858,15 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     Some(end) if size > 0 && pos < end => match is_number(element) {
                         true if at.raw => Leaf::None,
                         true => Leaf::Number(base, end),
-                        false => return self.leaf(bytes, at, base + (pos - base) / size * size, element, pos),
+                        false => {
+                            return self.leaf(
+                                bytes,
+                                at,
+                                base + (pos - base) / size * size,
+                                element,
+                                pos,
+                            );
+                        }
                     },
                     _ => Leaf::None,
                 }
@@ -1698,7 +1908,11 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         let (db, lang) = (self.cx.db, self.cx.interner.lang_items());
         match ty.kind() {
             TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) => true,
-            TyKind::Adt(def, _) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => true,
+            TyKind::Adt(def, _)
+                if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) =>
+            {
+                true
+            }
             TyKind::Adt(def, args) => variants(db, def.def_id()).into_iter().any(|variant| {
                 db.field_types(variant).iter().any(|(_, field)| {
                     let field = field.ty().instantiate(self.cx.interner, args).skip_norm_wip();

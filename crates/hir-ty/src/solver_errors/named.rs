@@ -7,7 +7,9 @@ use hir_def::{
 };
 use rustc_type_ir::{
     InferConst, InferTy, TypeFlags, TypeFoldable as _, TypeFolder, TypeSuperFoldable,
-    TypeVisitableExt, inherent::{IntoKind, Ty as _}, solve::TyOrConstInferVar,
+    TypeVisitableExt,
+    inherent::{IntoKind, Ty as _},
+    solve::TyOrConstInferVar,
 };
 
 use crate::{

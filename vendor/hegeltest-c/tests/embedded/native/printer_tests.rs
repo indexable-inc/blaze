@@ -272,39 +272,15 @@ fn slot_dies_after_resolve() {
     p.resolve().unwrap();
     assert!(!p.slot_is_live(slot));
     assert_eq!(p.text(Target::Slot(slot), "x"), Err(PrinterError::DeadSlot));
-    assert_eq!(
-        p.breakable(Target::Slot(slot), " "),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.hard_break(Target::Slot(slot)),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.begin_group(Target::Slot(slot), 0, ""),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.end_group(Target::Slot(slot), ""),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.shift_indent(Target::Slot(slot), 1),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.breakable(Target::Slot(slot), " "), Err(PrinterError::DeadSlot));
+    assert_eq!(p.hard_break(Target::Slot(slot)), Err(PrinterError::DeadSlot));
+    assert_eq!(p.begin_group(Target::Slot(slot), 0, ""), Err(PrinterError::DeadSlot));
+    assert_eq!(p.end_group(Target::Slot(slot), ""), Err(PrinterError::DeadSlot));
+    assert_eq!(p.shift_indent(Target::Slot(slot), 1), Err(PrinterError::DeadSlot));
     assert_eq!(p.deferred(Target::Slot(slot)), Err(PrinterError::DeadSlot));
-    assert_eq!(
-        p.begin_speculative(Target::Slot(slot)),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.commit_speculative(Target::Slot(slot)),
-        Err(PrinterError::DeadSlot)
-    );
-    assert_eq!(
-        p.abort_speculative(Target::Slot(slot)),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.begin_speculative(Target::Slot(slot)), Err(PrinterError::DeadSlot));
+    assert_eq!(p.commit_speculative(Target::Slot(slot)), Err(PrinterError::DeadSlot));
+    assert_eq!(p.abort_speculative(Target::Slot(slot)), Err(PrinterError::DeadSlot));
 }
 
 #[test]
@@ -407,10 +383,7 @@ fn resolve_aborts_open_main_speculations_and_seals_the_document() {
     p.resolve().unwrap();
     assert_eq!(p.value().unwrap(), "ab");
     assert_eq!(p.text(M, "late"), Err(PrinterError::DeadSlot));
-    assert_eq!(
-        p.text(Target::Slot(nested), "x"),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.text(Target::Slot(nested), "x"), Err(PrinterError::DeadSlot));
 }
 
 #[test]
@@ -427,10 +400,7 @@ fn resolve_aborts_straggling_slot_speculations() {
     assert_eq!(p.value().unwrap(), "abd");
     assert!(!p.slot_is_live(slot));
     assert!(!p.slot_is_live(nested));
-    assert_eq!(
-        p.text(Target::Slot(slot), "late"),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.text(Target::Slot(slot), "late"), Err(PrinterError::DeadSlot));
 }
 
 #[test]
@@ -577,14 +547,8 @@ fn commit_or_abort_without_begin_is_an_error() {
     assert_eq!(p.commit_speculative(M), Err(PrinterError::NoSpeculation));
     assert_eq!(p.abort_speculative(M), Err(PrinterError::NoSpeculation));
     let slot = p.deferred(M).unwrap();
-    assert_eq!(
-        p.commit_speculative(Target::Slot(slot)),
-        Err(PrinterError::NoSpeculation)
-    );
-    assert_eq!(
-        p.abort_speculative(Target::Slot(slot)),
-        Err(PrinterError::NoSpeculation)
-    );
+    assert_eq!(p.commit_speculative(Target::Slot(slot)), Err(PrinterError::NoSpeculation));
+    assert_eq!(p.abort_speculative(Target::Slot(slot)), Err(PrinterError::NoSpeculation));
 }
 
 #[test]
@@ -783,10 +747,7 @@ fn comment_forces_every_open_group_to_break() {
     p.breakable(M, " ").unwrap();
     p.text(M, "3").unwrap();
     p.end_group(M, "]").unwrap();
-    assert_eq!(
-        p.value().unwrap(),
-        "[1,\n 2,  // or any other generated value\n 3\n]"
-    );
+    assert_eq!(p.value().unwrap(), "[1,\n 2,  // or any other generated value\n 3\n]");
 }
 
 #[test]
@@ -946,10 +907,7 @@ fn comment_on_a_dead_slot_is_an_error() {
     let mut p = printer(79);
     let slot = p.deferred(M).unwrap();
     p.resolve().unwrap();
-    assert_eq!(
-        p.comment(Target::Slot(slot), "  // c"),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.comment(Target::Slot(slot), "  // c"), Err(PrinterError::DeadSlot));
 }
 
 #[test]
@@ -1066,10 +1024,7 @@ fn note_on_a_slot_killed_by_an_aborted_speculation_errors() {
     p.begin_speculative(M).unwrap();
     let slot = p.deferred(M).unwrap();
     p.abort_speculative(M).unwrap();
-    assert_eq!(
-        p.note(Target::Slot(slot), "late", None),
-        Err(PrinterError::DeadSlot)
-    );
+    assert_eq!(p.note(Target::Slot(slot), "late", None), Err(PrinterError::DeadSlot));
     p.note(M, "still live", None).unwrap();
     assert_eq!(p.value().unwrap(), "still live\n");
 }
@@ -1110,9 +1065,7 @@ fn apply(p: &mut Printer, target: Target, op: &Op) {
 fn random_text(rng: &mut SmallRng) -> String {
     let alphabet = ['a', 'b', 'x', 'é'];
     let len = rng.random_range(1..6);
-    (0..len)
-        .map(|_| alphabet[rng.random_range(0..alphabet.len())])
-        .collect()
+    (0..len).map(|_| alphabet[rng.random_range(0..alphabet.len())]).collect()
 }
 
 fn random_program(rng: &mut SmallRng) -> Vec<Op> {
@@ -1127,9 +1080,7 @@ fn random_program(rng: &mut SmallRng) -> Vec<Op> {
             6 => {
                 if open > 0 && rng.random_bool(0.5) {
                     open -= 1;
-                    Op::EndGroup {
-                        close: ["", "]", ")"][rng.random_range(0..3)].to_string(),
-                    }
+                    Op::EndGroup { close: ["", "]", ")"][rng.random_range(0..3)].to_string() }
                 } else {
                     open += 1;
                     Op::BeginGroup {
@@ -1146,9 +1097,7 @@ fn random_program(rng: &mut SmallRng) -> Vec<Op> {
         });
     }
     for _ in 0..open {
-        ops.push(Op::EndGroup {
-            close: String::new(),
-        });
+        ops.push(Op::EndGroup { close: String::new() });
     }
     ops
 }
@@ -1218,11 +1167,7 @@ fn deferred_and_speculative_printing_matches_inline() {
             subject.resolve().unwrap();
         }
 
-        assert_eq!(
-            subject.value().unwrap(),
-            model.value().unwrap(),
-            "seed {seed}"
-        );
+        assert_eq!(subject.value().unwrap(), model.value().unwrap(), "seed {seed}");
     }
 }
 
@@ -1248,9 +1193,7 @@ fn comments_always_terminate_their_line_and_appear_exactly_once() {
         for line in output.lines() {
             if let Some(position) = line.find('©') {
                 assert!(
-                    line[position..]
-                        .chars()
-                        .all(|c| c == '©' || c == ' ' || c.is_ascii_digit()),
+                    line[position..].chars().all(|c| c == '©' || c == ' ' || c.is_ascii_digit()),
                     "seed {seed}: comment must be the last thing on its line: {line:?}"
                 );
             }

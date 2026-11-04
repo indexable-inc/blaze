@@ -10,13 +10,7 @@ mod oracle {
 fn stdtr_matches_scipy_oracle() {
     for &(df, t, expected) in oracle::STDTR_CASES {
         let got = stdtr(df, t).unwrap();
-        assert_close(
-            got,
-            expected,
-            1e-12,
-            1e-15,
-            &format!("stdtr(df={df}, t={t}).unwrap()"),
-        );
+        assert_close(got, expected, 1e-12, 1e-15, &format!("stdtr(df={df}, t={t}).unwrap()"));
     }
 }
 
@@ -24,13 +18,7 @@ fn stdtr_matches_scipy_oracle() {
 fn stdtrit_strict_matches_scipy_oracle_for_df_le_2() {
     for &(df, p, expected) in oracle::STDTRIT_STRICT_CASES {
         let got = stdtrit(df, p).unwrap();
-        assert_close(
-            got,
-            expected,
-            1e-15,
-            0.0,
-            &format!("stdtrit(df={df}, p={p}).unwrap()"),
-        );
+        assert_close(got, expected, 1e-15, 0.0, &format!("stdtrit(df={df}, p={p}).unwrap()"));
     }
 }
 
@@ -38,13 +26,7 @@ fn stdtrit_strict_matches_scipy_oracle_for_df_le_2() {
 fn stdtrit_lax_matches_scipy_oracle_for_df_ge_3() {
     for &(df, p, expected) in oracle::STDTRIT_LAX_CASES {
         let got = stdtrit(df, p).unwrap();
-        assert_close(
-            got,
-            expected,
-            1e-7,
-            1e-9,
-            &format!("stdtrit(df={df}, p={p}).unwrap()"),
-        );
+        assert_close(got, expected, 1e-7, 1e-9, &format!("stdtrit(df={df}, p={p}).unwrap()"));
     }
 }
 
@@ -221,10 +203,7 @@ fn piecewise_cdf_inverse_round_trip() {
     for u in [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99] {
         let x = d.inverse_cdf(u).unwrap();
         let back = d.cdf(x).unwrap();
-        assert!(
-            (back - u).abs() < 1e-9,
-            "round-trip mismatch u={u}, x={x}, back={back}"
-        );
+        assert!((back - u).abs() < 1e-9, "round-trip mismatch u={u}, x={x}, back={back}");
     }
 }
 
@@ -262,9 +241,8 @@ fn piecewise_cdf_is_monotone_and_bounded() {
     let inner = UniformDistribution::new(256.0);
     let outer = LogStudentTDistribution::new(13.0, 2);
     let d = PiecewiseDistribution::new(inner, outer, 256.0).unwrap();
-    let xs = [
-        -1e10, -1e6, -1000.0, -256.0, -100.0, -1.0, 0.0, 1.0, 100.0, 256.0, 1000.0, 1e6, 1e10,
-    ];
+    let xs =
+        [-1e10, -1e6, -1000.0, -256.0, -100.0, -1.0, 0.0, 1.0, 100.0, 256.0, 1000.0, 1e6, 1e10];
     let mut prev = 0.0_f64;
     for &x in &xs {
         let c = d.cdf(x).unwrap();
@@ -277,8 +255,5 @@ fn piecewise_cdf_is_monotone_and_bounded() {
 fn assert_close(got: f64, want: f64, rel: f64, abs: f64, ctx: &str) {
     let diff = (got - want).abs();
     let tol = abs.max(rel * want.abs().max(got.abs()));
-    assert!(
-        diff <= tol,
-        "{ctx}: got {got}, want {want}, diff {diff}, tol {tol}"
-    );
+    assert!(diff <= tol, "{ctx}: got {got}, want {want}, diff {diff}, tol {tol}");
 }

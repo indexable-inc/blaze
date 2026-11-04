@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cfg::CfgAtom;
-use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros};
+use hir_expand::proc_macro::{
+    Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros,
+};
 use intern::sym;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::{Call, Dep, Expansion, Expansions, File, Kind, Krate, Macro, Origin, Pack, Root};
 
@@ -49,7 +51,11 @@ impl ProcMacroExpander for Recorder {
         self.inner.code()
     }
 
-    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand(
+        &self,
+        db: &Db,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let output = self.inner.expand(db, call);
         self.record(&call, &output);
         output
@@ -87,7 +93,9 @@ impl Recorder {
         };
         let recorded = match output {
             Ok(output) => Ok(output.tree.to_string()),
-            Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => Err(why.clone()),
+            Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => {
+                Err(why.clone())
+            }
         };
         self.expansions.lock().insert(call, recorded);
     }
@@ -119,7 +127,11 @@ fn closure(db: &Db, program: Crate) -> Vec<Crate> {
 /// Packs what `program`, a crate of `db`, is made of. `expand` runs over the database with its
 /// proc macros recording: every expansion the pack is to have has to happen in it. The
 /// database's proc macros are the recorders' from then on.
-pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -> Result<Pack, String> {
+pub fn record(
+    db: &mut Db,
+    program: Crate,
+    expand: impl FnOnce(&Db, &[Crate]),
+) -> Result<Pack, String> {
     let reading: &Db = db;
     let crates = closure(reading, program);
 
@@ -149,7 +161,8 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
     let db = &*db;
     expand(db, &crates);
 
-    let index: HashMap<Crate, usize, Global> = crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
+    let index: HashMap<Crate, usize, Global> =
+        crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
     let mut pack = Pack { main: program.data(db).root_file_id.index(), ..Pack::default() };
     let mut roots = HashSet::new_in(Global);
     let mut modules = HashSet::new_in(Global);
@@ -194,12 +207,16 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
             pack.roots.push(Root { library: root.is_library, files });
         }
         let macros = loaded.get(&krate).and_then(|it| it.macros()).map(|macros| {
-            macros.iter().map(|it| Macro { name: it.name.as_str().to_owned(), kind: Kind::of(it.kind) }).collect()
+            macros
+                .iter()
+                .map(|it| Macro { name: it.name.as_str().to_owned(), kind: Kind::of(it.kind) })
+                .collect()
         });
         let mut deps = Vec::new();
         if !data.target_kind.is_proc_macro() {
             for dep in data.dependencies.iter() {
-                let krate = *index.get(&dep.crate_id).ok_or("a dependency outside the program's crates")?;
+                let krate =
+                    *index.get(&dep.crate_id).ok_or("a dependency outside the program's crates")?;
                 deps.push(Dep {
                     krate,
                     name: dep.name.to_string(),
@@ -223,7 +240,11 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
                     CfgAtom::KeyValue { key, value } => format!("{key}={value}"),
                 })
                 .collect(),
-            env: krate.env(db).iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect(),
+            env: krate
+                .env(db)
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
             origin: match &data.origin {
                 CrateOrigin::Local { .. } => Origin::Local,
                 CrateOrigin::Library { name, .. } | CrateOrigin::Rustc { name } => {
@@ -237,7 +258,8 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
         });
     }
     let expansions = std::mem::take(&mut *expansions.lock());
-    pack.expansions = expansions.into_iter().map(|(call, output)| Expansion { call, output }).collect();
+    pack.expansions =
+        expansions.into_iter().map(|(call, output)| Expansion { call, output }).collect();
     pack.expansions.sort_by(|a, b| {
         (&a.call.krate, &a.call.name, &a.call.input, &a.call.attr).cmp(&(
             &b.call.krate,

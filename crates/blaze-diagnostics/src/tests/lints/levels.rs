@@ -2,7 +2,9 @@
 //! lint names in them, against rustc's UI tests as they are, under compiletest's flags
 //! (`-Z deduplicate-diagnostics=no` with them).
 
-use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use hir_expand::proc_macro::{
+    Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+};
 
 use crate::{
     Options,
@@ -10,8 +12,8 @@ use crate::{
     lints::{CommandLine, Level, LintOptions},
     model,
     tests::{
-        Mode, checked, checked_expanding_derives, checked_with, checked_with_proc_macros, compiletest, normalized,
-        ui_with,
+        Mode, checked, checked_expanding_derives, checked_with, checked_with_proc_macros,
+        compiletest, normalized, ui_with,
     },
 };
 
@@ -209,9 +211,11 @@ error: aborting due to 7 previous errors; 1 warning emitted
 
 For more information about this error, try `rustc --explain E0452`.
 "##;
-    let options = Options { keep_duplicates: false, ..compiletest(Mode::Other, &Options::default()) };
+    let options =
+        Options { keep_duplicates: false, ..compiletest(Mode::Other, &Options::default()) };
     let fixture = format!("//- /reasons-erroneous.rs crate:other:main edition:2015\n{source}");
-    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(&fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     assert_eq!(normalized(&stderr), expected);
 }
 
@@ -813,7 +817,8 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0602`.
 "##;
-    let stderr = ui("command-line-register-unknown-lint-tool.rs", &["-A", "unknown_tool::foo"], source);
+    let stderr =
+        ui("command-line-register-unknown-lint-tool.rs", &["-A", "unknown_tool::foo"], source);
     assert_eq!(stderr, expected);
 }
 
@@ -830,7 +835,8 @@ fn lint_levels(fixture: &str, args: &[&str]) -> Vec<(String, model::Level)> {
 
 #[test]
 fn cap_lints_lowers_a_denied_lint_and_drops_an_allowed_one() {
-    let fixture = "//- /main.rs crate:other:main\n#[deny(unused)]\nfn main() { let unused = (); }\n";
+    let fixture =
+        "//- /main.rs crate:other:main\n#[deny(unused)]\nfn main() { let unused = (); }\n";
     let unused = |level| vec![("unused_variables".to_owned(), level)];
     assert_eq!(lint_levels(fixture, &[]), unused(model::Level::Error));
     assert_eq!(lint_levels(fixture, &["--cap-lints", "warn"]), unused(model::Level::Warning));
@@ -840,8 +846,10 @@ fn cap_lints_lowers_a_denied_lint_and_drops_an_allowed_one() {
 /// `--force-warn` holds under `--cap-lints allow`, as rustc's `reveal_actual_level_spec` has it.
 #[test]
 fn force_warn_is_not_capped() {
-    let fixture = "//- /main.rs crate:other:main\n#[allow(unused)]\nfn main() { let unused = (); }\n";
-    let levels = lint_levels(fixture, &["--force-warn", "unused-variables", "--cap-lints", "allow"]);
+    let fixture =
+        "//- /main.rs crate:other:main\n#[allow(unused)]\nfn main() { let unused = (); }\n";
+    let levels =
+        lint_levels(fixture, &["--force-warn", "unused-variables", "--cap-lints", "allow"]);
     assert_eq!(levels, vec![("unused_variables".to_owned(), model::Level::Warning)]);
 }
 
@@ -864,7 +872,8 @@ here!();
 fn main() { from_dep(); from_here(); }
 "#;
     let checked = checked(fixture);
-    let unused: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
+    let unused: Vec<_> =
+        checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
     assert_eq!(unused.len(), 1, "{:?}", checked.messages());
     assert_eq!(unused[0].span.primary[0].file, "main.rs", "{:?}", checked.messages());
 }
@@ -875,7 +884,11 @@ fn main() { from_dep(); from_here(); }
 struct DeclaredByMacro;
 
 impl ProcMacroExpander for DeclaredByMacro {
-    fn expand(&self, _: &base_db::Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand(
+        &self,
+        _: &base_db::Db,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let call_site = call.call_site;
         let tree = hir_expand::quote! { call_site =>
             fn generated_by_derive() { let unused = (); }
@@ -883,7 +896,8 @@ impl ProcMacroExpander for DeclaredByMacro {
         Ok(Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == std::any::TypeId::of::<Self>()
     }
 }
@@ -920,7 +934,8 @@ struct S;
 fn main() { let by_hand = (); }
 "#;
     let checked = checked_with_proc_macros(fixture, extra);
-    let unused: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
+    let unused: Vec<_> =
+        checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
     assert_eq!(unused.len(), 1, "{:?}", checked.messages());
     assert!(unused[0].message.contains("by_hand"), "{:?}", checked.messages());
 }
@@ -977,15 +992,28 @@ pub struct SplitMix64(u64);
 fn blaze_tool_lints() {
     let fixture = "//- /main.rs crate:other:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\n#![warn(blaze::hot)]\n#![expect(blaze::wall_clock)]\nfn main() {}\n";
     let messages = checked(fixture).messages();
-    let unknown: Vec<_> = messages.iter().filter(|it| it.contains("unknown lint") || it.contains("unfulfilled")).collect();
+    let unknown: Vec<_> = messages
+        .iter()
+        .filter(|it| it.contains("unknown lint") || it.contains("unfulfilled"))
+        .collect();
     assert_eq!(unknown, ["unknown_lints: unknown lint: `blaze::const_purity`"], "{messages:?}");
 }
 
 #[test]
 fn command_line_flags_in_order() {
     let args: Vec<String> = [
-        "-A", "unused", "-Wdead-code", "--deny=warnings", "--forbid", "unsafe_code", "--force-warn", "clippy::all",
-        "-C", "opt-level=3", "--edition", "2021",
+        "-A",
+        "unused",
+        "-Wdead-code",
+        "--deny=warnings",
+        "--forbid",
+        "unsafe_code",
+        "--force-warn",
+        "clippy::all",
+        "-C",
+        "opt-level=3",
+        "--edition",
+        "2021",
     ]
     .into_iter()
     .map(str::to_owned)

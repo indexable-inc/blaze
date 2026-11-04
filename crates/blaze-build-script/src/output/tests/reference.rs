@@ -235,10 +235,7 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
 }
 
 /// `rustc-env=NAME=VALUE`.
-fn parse_rustc_env(
-    value: &str,
-    whence: impl std::fmt::Display,
-) -> Result<(String, String), Error> {
+fn parse_rustc_env(value: &str, whence: impl std::fmt::Display) -> Result<(String, String), Error> {
     match value.split_once('=') {
         Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
         None => Err(Error(format!("Variable rustc-env has no value in {whence}: {value}"))),

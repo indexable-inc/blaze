@@ -11,11 +11,11 @@
 use std::{ops::ControlFlow, rc::Rc};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile, view::ModuleSourceView};
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode, HasAttrs, HasModuleItem},
@@ -97,7 +97,8 @@ impl Orders {
     /// The key that sorts what is at `lo` in `module` as the AST has it, each module's items in
     /// place of its `mod`: rustc's order of `DefIndex`es and of the early lint pass.
     pub(super) fn key(&mut self, cx: &Cx<'_, '_>, module: hir::Module, lo: u32) -> Order {
-        let mut key = Order::from_slice(self.of.entry(module).or_insert_with(|| module_order(cx, module)));
+        let mut key =
+            Order::from_slice(self.of.entry(module).or_insert_with(|| module_order(cx, module)));
         key.push(lo);
         key
     }
@@ -118,11 +119,15 @@ fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Order {
 
 /// The fields of a struct, a union or an enum's variants, in the order they are written.
 pub(super) fn fields<'db>(item: &Item<'db>) -> SmallVec<[InFile<ast::Node<'db>>; 8]> {
-    let of = |kind: SyntaxKind| item.nodes().iter().filter(move |it| it.value.kind() == kind).copied();
+    let of =
+        |kind: SyntaxKind| item.nodes().iter().filter(move |it| it.value.kind() == kind).copied();
     let mut fields: SmallVec<[InFile<ast::Node<'db>>; 8]> = SmallVec::new();
     fields.extend(of(SyntaxKind::RECORD_FIELD).chain(of(SyntaxKind::TUPLE_FIELD)));
     radix::sort_by_key(&mut fields, |it| {
-        radix::pack_32(u32::from(it.file_id != item.node.file_id), it.value.text_range().start().into())
+        radix::pack_32(
+            u32::from(it.file_id != item.node.file_id),
+            it.value.text_range().start().into(),
+        )
     });
     fields
 }
@@ -143,9 +148,11 @@ pub(super) fn items<'db>(cx: &Cx<'_, 'db>) -> Vec<Item<'db>> {
         let root = cx.root(file);
         let list: Option<ast::AstChildren<'db, ast::Item<'db>>> = match source.value {
             ModuleSourceView::SourceFile(_) => ast::SourceFile::cast(root).map(|it| it.items()),
-            ModuleSourceView::Module(it) => ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
-                .and_then(|it| it.item_list())
-                .map(|it| it.items()),
+            ModuleSourceView::Module(it) => {
+                ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
+                    .and_then(|it| it.item_list())
+                    .map(|it| it.items())
+            }
             ModuleSourceView::BlockExpr(_) => continue,
         };
         for item in list.into_iter().flatten() {
@@ -193,7 +200,13 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     /// Visits `item`, written in `container`, and what is in it.
-    fn item(&mut self, item: InFile<ast::Item<'db>>, container: Container<'db>, module: hir::Module, in_body: Option<usize>) {
+    fn item(
+        &mut self,
+        item: InFile<ast::Item<'db>>,
+        container: Container<'db>,
+        module: hir::Module,
+        in_body: Option<usize>,
+    ) {
         if !self.cx.cfg_enabled(item.value.syntax()) {
             return;
         }
@@ -230,7 +243,8 @@ impl<'db> Walk<'_, '_, 'db> {
             _ => None,
         };
         for child in item.value.syntax().children() {
-            let list = matches!(child.kind(), SyntaxKind::ASSOC_ITEM_LIST | SyntaxKind::EXTERN_ITEM_LIST);
+            let list =
+                matches!(child.kind(), SyntaxKind::ASSOC_ITEM_LIST | SyntaxKind::EXTERN_ITEM_LIST);
             match inner {
                 Some(container) if list => {
                     self.keep(index, InFile::new(file, child));
@@ -245,7 +259,13 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     /// What a macro call or an attribute macro of an item expands to, in place of it.
-    fn expansion(&mut self, root: InFile<ast::Node<'db>>, container: Container<'db>, module: hir::Module, in_body: Option<usize>) {
+    fn expansion(
+        &mut self,
+        root: InFile<ast::Node<'db>>,
+        container: Container<'db>,
+        module: hir::Module,
+        in_body: Option<usize>,
+    ) {
         for child in root.value.children() {
             if is_item(child)
                 && let Some(item) = ast::Item::cast(child)
@@ -258,7 +278,14 @@ impl<'db> Walk<'_, '_, 'db> {
     /// `node`, under the item `owner`: one of its own, or an item in it, which is of
     /// `direct` when it is one of the items of an impl, a trait or an `extern` block `owner`
     /// is, else of `owner`'s body.
-    fn node(&mut self, file: HirFileId, node: ast::Node<'db>, owner: usize, direct: Option<Container<'db>>, module: hir::Module) {
+    fn node(
+        &mut self,
+        file: HirFileId,
+        node: ast::Node<'db>,
+        owner: usize,
+        direct: Option<Container<'db>>,
+        module: hir::Module,
+    ) {
         if !self.cx.cfg_enabled(node) {
             return;
         }
@@ -266,7 +293,9 @@ impl<'db> Walk<'_, '_, 'db> {
         if is_item(node) {
             let item = ast::Item::cast(node).expect("an item");
             match direct {
-                Some(container) => self.item(InFile::new(file, item), container, module, self.items[owner].in_body),
+                Some(container) => {
+                    self.item(InFile::new(file, item), container, module, self.items[owner].in_body)
+                }
                 None => self.item(InFile::new(file, item), Container::Module, module, Some(owner)),
             }
             return;
@@ -314,7 +343,12 @@ fn is_item(node: ast::Node<'_>) -> bool {
 
 /// Whether `f` accepts any attribute named `name` on `owner`, its `cfg_attr`s expanded,
 /// stopping at the first it does.
-pub(super) fn any_named<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>, name: &str, mut f: impl FnMut(ast::Meta<'t>) -> bool) -> bool {
+pub(super) fn any_named<'t>(
+    cx: &Cx<'_, '_>,
+    owner: impl HasAttrs<'t>,
+    name: &str,
+    mut f: impl FnMut(ast::Meta<'t>) -> bool,
+) -> bool {
     named(cx, owner, name, |meta, _| match f(meta) {
         true => ControlFlow::Break(()),
         false => ControlFlow::Continue(()),
@@ -323,7 +357,11 @@ pub(super) fn any_named<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>, name: &st
 }
 
 /// The first attribute named `name` on `owner`, as [`named`] gives it.
-pub(super) fn attr<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>, name: &str) -> Option<(ast::Meta<'t>, TextRange)> {
+pub(super) fn attr<'t>(
+    cx: &Cx<'_, '_>,
+    owner: impl HasAttrs<'t>,
+    name: &str,
+) -> Option<(ast::Meta<'t>, TextRange)> {
     named(cx, owner, name, |meta, range| ControlFlow::Break((meta, range)))
 }
 

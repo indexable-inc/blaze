@@ -57,7 +57,8 @@ pub struct Map {
 
 impl Map {
     pub fn encode(&self) -> Vec<u8> {
-        let names: usize = self.nodes.iter().map(|it| it.name.len() + 4 * it.edges.len() + 128).sum();
+        let names: usize =
+            self.nodes.iter().map(|it| it.name.len() + 4 * it.edges.len() + 128).sum();
         // alloc: once per link that keeps a code map
         let mut out = Vec::with_capacity(MAGIC.len() + 12 + self.image.len() + names);
         out.extend_from_slice(MAGIC);
@@ -87,7 +88,9 @@ impl Map {
         let mut at = Reader { bytes, at: 0 };
         if at.take(MAGIC.len(), "its magic")? != MAGIC {
             // alloc: an error
-            return Err("not a code map of this blaze (its first bytes are not `blzpmap1`)".to_owned());
+            return Err(
+                "not a code map of this blaze (its first bytes are not `blzpmap1`)".to_owned()
+            );
         }
         let len = at.u32("its image's path's length")? as usize;
         let image = at.text(len, "its image's path")?;
@@ -107,7 +110,9 @@ impl Map {
                 0 => None,
                 1 => Some(at.id("a node's identity")?),
                 // alloc: an error
-                other => return Err(format!("node {index} has flags {other:#x}, which no blaze writes")),
+                other => {
+                    return Err(format!("node {index} has flags {other:#x}, which no blaze writes"));
+                }
             };
             let key = at.id("a node's key")?;
             let code = at.id("a node's code")?;
@@ -124,7 +129,9 @@ impl Map {
                 let edge = at.u32("an edge")?;
                 if u64::from(edge) >= count {
                     // alloc: an error
-                    return Err(format!("node {index} refers to node {edge}, past its {count} nodes"));
+                    return Err(format!(
+                        "node {index} refers to node {edge}, past its {count} nodes"
+                    ));
                 }
                 edges.push(edge);
             }
@@ -140,14 +147,17 @@ impl Map {
     /// The nodes with code, by address: what [`Map::function_at`] searches.
     pub fn by_address(&self) -> Vec<u32> {
         // alloc: once per map read
-        let mut out: Vec<u32> = (0..self.nodes.len() as u32).filter(|it| self.nodes[*it as usize].size > 0).collect();
+        let mut out: Vec<u32> =
+            (0..self.nodes.len() as u32).filter(|it| self.nodes[*it as usize].size > 0).collect();
         out.sort_unstable_by_key(|it| (self.nodes[*it as usize].address, *it));
         out
     }
 
     /// The node whose code holds `address`, through `by_address` ([`Map::by_address`]).
     pub fn function_at(&self, by_address: &[u32], address: u64) -> Option<u32> {
-        let at = by_address.partition_point(|it| self.nodes[*it as usize].address <= address).checked_sub(1)?;
+        let at = by_address
+            .partition_point(|it| self.nodes[*it as usize].address <= address)
+            .checked_sub(1)?;
         let node = by_address[at];
         let it = &self.nodes[node as usize];
         (address - it.address < it.size).then_some(node)
@@ -192,7 +202,10 @@ impl Map {
             while let Some(&mut (node, ref mut edge)) = calls.last_mut() {
                 fuel = fuel.checked_sub(1).ok_or_else(|| {
                     // alloc: an error
-                    format!("the deep hash of {}'s code map ran past its {n} nodes and {edges} edges", self.image)
+                    format!(
+                        "the deep hash of {}'s code map ran past its {n} nodes and {edges} edges",
+                        self.image
+                    )
                 })?;
                 let edges = &self.nodes[node as usize].edges;
                 if let Some(&callee) = edges.get(*edge) {
@@ -225,7 +238,8 @@ impl Map {
                     on_stack[*it as usize] = false;
                 }
                 // alloc: once per component
-                let mut keys: Vec<Id> = members.iter().map(|it| self.nodes[*it as usize].key).collect();
+                let mut keys: Vec<Id> =
+                    members.iter().map(|it| self.nodes[*it as usize].key).collect();
                 keys.sort_unstable();
                 // alloc: once per component
                 let mut outside: Vec<Id> = Vec::new();
@@ -267,7 +281,9 @@ impl Map {
         deep.into_iter()
             .enumerate()
             // alloc: an error
-            .map(|(at, it)| it.ok_or_else(|| format!("node {at} of {}'s code map was never hashed", self.image)))
+            .map(|(at, it)| {
+                it.ok_or_else(|| format!("node {at} of {}'s code map was never hashed", self.image))
+            })
             .collect()
     }
 }
@@ -312,7 +328,9 @@ impl<'a> Reader<'a> {
         let at = self.at;
         let bytes = self.take(len, what)?;
         // alloc: once per name read
-        std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| format!("{what} at byte {at} is not UTF-8"))
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| format!("{what} at byte {at} is not UTF-8"))
     }
 }
 
@@ -349,8 +367,10 @@ pub fn write(perf: &Path, build_id: &str, map: &Map) -> Result<(), String> {
         Err(error) => return Err(format!("{}: {error}", file.display())),
     }
     let part = dir.join(format!(".{build_id}.part-{}", std::process::id()));
-    std::fs::write(&part, &bytes).map_err(|error| format!("writing {}: {error}", part.display()))?;
-    std::fs::rename(&part, &file).map_err(|error| format!("renaming {} to {}: {error}", part.display(), file.display()))?;
+    std::fs::write(&part, &bytes)
+        .map_err(|error| format!("writing {}: {error}", part.display()))?;
+    std::fs::rename(&part, &file)
+        .map_err(|error| format!("renaming {} to {}: {error}", part.display(), file.display()))?;
     collect(&dir)
 }
 
@@ -400,7 +420,11 @@ pub fn read(perf: &Path, build_id: &str) -> Result<Option<(PathBuf, Map)>, Strin
     let mut images = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", root.display()))?;
-        if entry.file_type().map_err(|error| format!("{}: {error}", entry.path().display()))?.is_dir() {
+        if entry
+            .file_type()
+            .map_err(|error| format!("{}: {error}", entry.path().display()))?
+            .is_dir()
+        {
             images.push(entry.path());
         }
     }
@@ -409,7 +433,8 @@ pub fn read(perf: &Path, build_id: &str) -> Result<Option<(PathBuf, Map)>, Strin
         let file = image.join(build_id);
         match std::fs::read(&file) {
             Ok(bytes) => {
-                let map = Map::decode(&bytes).map_err(|why| format!("{}: {why}; remove it", file.display()))?;
+                let map = Map::decode(&bytes)
+                    .map_err(|why| format!("{}: {why}; remove it", file.display()))?;
                 return Ok(Some((file, map)));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

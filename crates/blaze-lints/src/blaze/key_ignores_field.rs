@@ -68,7 +68,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the findings of one body, reported at the edge
     let mut found = Vec::new();
     let Some(analysis) = cx.analysis() else { return found };
-    let Ok(DefWithBodyId::FunctionId(owner)) = DefWithBodyId::try_from(analysis.def()) else { return found };
+    let Ok(DefWithBodyId::FunctionId(owner)) = DefWithBodyId::try_from(analysis.def()) else {
+        return found;
+    };
     let db = cx.db();
     let Some((kind, adt)) = kind(cx, db, analysis, owner) else { return found };
     if cx.is_in_test(cx.root()) {
@@ -101,7 +103,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     }
     let parents = Parents::of(body);
     for (id, expr) in body.exprs() {
-        if matches!(expr, Expr::Path(_)) && of_self(infer.expr_ty(id)) && handed_on(body, &parents, id) {
+        if matches!(expr, Expr::Path(_))
+            && of_self(infer.expr_ty(id))
+            && handed_on(body, &parents, id)
+        {
             whole = true;
         }
     }
@@ -125,7 +130,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 let split = ellipsis.map_or(args.len(), |it| it as usize);
                 let tail = args.len() - split;
                 for (at, &arg) in args.iter().enumerate() {
-                    let index = if at < split { at } else { fields.len().saturating_sub(tail) + (at - split) };
+                    let index = if at < split {
+                        at
+                    } else {
+                        fields.len().saturating_sub(tail) + (at - split)
+                    };
                     if let Some(field) = fields.get(index) {
                         named.push((field.name(db), arg));
                     }
@@ -170,7 +179,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let fields = it.fields(db);
         let missing = missing(db, &fields, |it| read.contains(it));
         if !missing.is_empty() {
-            let message = format!("{what} reads some fields of `{type_name}` but leaves {missing} out of the key: {RULE}");
+            let message = format!(
+                "{what} reads some fields of `{type_name}` but leaves {missing} out of the key: {RULE}"
+            );
             facts::push(&mut found, Lint::KeyIgnoresField, fn_range, message, None);
         }
     }
@@ -178,7 +189,12 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 }
 
 /// Which key the body of `owner` builds, and of what type: `None` when it builds none.
-fn kind(cx: &Cx<'_, '_>, db: &Db, analysis: &hir::BodyAnalysis<'_>, owner: FunctionId) -> Option<(Kind, hir::Adt)> {
+fn kind(
+    cx: &Cx<'_, '_>,
+    db: &Db,
+    analysis: &hir::BodyAnalysis<'_>,
+    owner: FunctionId,
+) -> Option<(Kind, hir::Adt)> {
     let ItemContainerId::ImplId(impl_id) = owner.loc(db).container else { return None };
     if AttrFlags::query(db, AttrDefId::ImplId(impl_id)).contains(AttrFlags::AUTOMATICALLY_DERIVED) {
         return None;
@@ -206,7 +222,10 @@ fn kind(cx: &Cx<'_, '_>, db: &Db, analysis: &hir::BodyAnalysis<'_>, owner: Funct
     let name = function.name(db);
     let name = name.as_str();
     let shaped = key_type(db, &function.ret_type(db))
-        || matches!(name, "key" | "id" | "content_id" | "hash_content" | "hash_into" | "fingerprint")
+        || matches!(
+            name,
+            "key" | "id" | "content_id" | "hash_content" | "hash_into" | "fingerprint"
+        )
         || name.ends_with("_key")
         || name.starts_with("key_")
         || function.assoc_fn_params(db).iter().any(|it| named(db, it.ty(), |it| it == "Hasher"));
@@ -287,7 +306,9 @@ fn pat_range(analysis: &hir::BodyAnalysis<'_>, pat: PatId) -> Option<TextRange> 
 /// Where a finding about the whole body goes: the function's name, or the walked item.
 fn fn_range(cx: &Cx<'_, '_>) -> TextRange {
     let root = cx.root();
-    ast::Fn::cast(root).and_then(|it| it.name()).map_or(root.text_range(), |it| it.syntax().text_range())
+    ast::Fn::cast(root)
+        .and_then(|it| it.name())
+        .map_or(root.text_range(), |it| it.syntax().text_range())
 }
 
 #[cfg(test)]
@@ -301,7 +322,10 @@ use core::hash::{Hash, Hasher};
 "#;
 
     fn lint_main(main: &str) -> String {
-        lint(&format!("{MAIN}{}", main.trim_start_matches('\n')), "-A clippy::all --warn=blaze::key_ignores_field")
+        lint(
+            &format!("{MAIN}{}", main.trim_start_matches('\n')),
+            "-A clippy::all --warn=blaze::key_ignores_field",
+        )
     }
 
     /// A `Hash` that reads two of three fields, an `Eq` with `..`, and a `field: _` with no
@@ -367,9 +391,18 @@ pub struct Derived {
             found.contains("`impl Hash for Partial` reads some fields of `Partial` but leaves `cache` out of the key"),
             "{found}"
         );
-        assert!(found.contains("`..` in `impl PartialEq for Rest` leaves `b` of `Rest` out of the key"), "{found}");
-        assert!(found.contains("`b: _` in `impl Ord for Silent` leaves `b` out of the key with no"), "{found}");
-        assert!(!found.contains("for Named`"), "a field left out with its reason is fine:\n{found}");
+        assert!(
+            found.contains("`..` in `impl PartialEq for Rest` leaves `b` of `Rest` out of the key"),
+            "{found}"
+        );
+        assert!(
+            found.contains("`b: _` in `impl Ord for Silent` leaves `b` out of the key with no"),
+            "{found}"
+        );
+        assert!(
+            !found.contains("for Named`"),
+            "a field left out with its reason is fine:\n{found}"
+        );
         assert!(!found.contains("Derived"), "a derive covers every field:\n{found}");
     }
 

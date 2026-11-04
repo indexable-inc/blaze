@@ -45,7 +45,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
         // clone: on the error path, for an error hir found
         take_value_of_method(cx, field_expr, &field, &ty, field_span.clone(), &at)
     } else if !is_primitive(receiver) {
-        let mut diag = no_such_field(cx, d, field_expr, base, &field, &ty, &field_span, module, &at);
+        let mut diag =
+            no_such_field(cx, d, field_expr, base, &field, &ty, &field_span, module, &at);
         let peeled = receiver.strip_references();
         if let Some((_, len)) = peeled.as_array(cx.db) {
             // clone: on the error path, for an error hir found
@@ -55,7 +56,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
                     true => Applicability::MachineApplicable,
                     false => Applicability::MaybeIncorrect,
                 };
-                let between = at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
+                let between =
+                    at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
                 diag.multipart_suggestion(
                     "instead of using tuple indexing, use array indexing",
                     // alloc: the error's text, for an error hir found
@@ -74,7 +76,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
                     // alloc: the error's text, for an error hir found
                     _ => "the value".to_owned(),
                 };
-                let between = at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
+                let between =
+                    at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
                 diag.multipart_suggestion(
                     // alloc: the error's text, for an error hir found
                     format!("{val} is a raw pointer; try dereferencing it"),
@@ -109,7 +112,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
             },
             _ => false,
         };
-        if receiver.is_int_or_uint() && unsuffixed_int && at(base.syntax().text_range()).expansion.is_none() {
+        if receiver.is_int_or_uint()
+            && unsuffixed_int
+            && at(base.syntax().text_range()).expansion.is_none()
+        {
             if is_valid_float_suffix(&field) {
                 diag.suggestion_verbose(
                     field_span.shrink_to_lo(),
@@ -137,10 +143,16 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
         // alloc: the error's text, for an error hir found
         let name = adt.name(cx.db).display(cx.db, cx.edition).to_string();
         // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the fields of `{name}`"));
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+            format!("the fields of `{name}`"),
+        );
     }
     // alloc: the error's text, for an error hir found
-    diag.fact_opt(cx.method_fact(receiver, d.name.as_str()), format!("what `{field}` is on `{ty}`"));
+    diag.fact_opt(
+        cx.method_fact(receiver, d.name.as_str()),
+        format!("what `{field}` is on `{ty}`"),
+    );
     code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
@@ -227,12 +239,18 @@ fn take_value_of_method<'db>(
 
 /// How many arguments besides `self` the method `name` the receiver of `x.name` would call
 /// takes.
-fn method_params<'db>(cx: &Cx<'_, 'db>, field_expr: ast::FieldExpr<'db>, name: &str) -> Option<usize> {
+fn method_params<'db>(
+    cx: &Cx<'_, 'db>,
+    field_expr: ast::FieldExpr<'db>,
+    name: &str,
+) -> Option<usize> {
     let base = field_expr.expr()?;
     let receiver = cx.vsema.type_of_expr(base)?.original;
     let scope = cx.vsema.scope(field_expr.syntax())?;
     let name = hir::Name::new_symbol_root(hir::Symbol::intern(name));
-    receiver.iterate_method_candidates(cx.db, &scope, Some(&name), |f| Some(f.params_without_self(cx.db).len()))
+    receiver.iterate_method_candidates(cx.db, &scope, Some(&name), |f| {
+        Some(f.params_without_self(cx.db).len())
+    })
 }
 
 /// rustc's `suggest_method_call`: `()` after `span`, with a `_` for each argument.
@@ -302,7 +320,10 @@ fn no_such_field<'db>(
             {
                 let impl_ty = cx.ty(&impl_ty);
                 // alloc: the error's text, for an error hir found
-                diag.span_note(span, format!("the candidate is defined in an impl for the type `{impl_ty}`"));
+                diag.span_note(
+                    span,
+                    format!("the candidate is defined in an impl for the type `{impl_ty}`"),
+                );
             }
             diag.multipart_suggestion(
                 "use associated function syntax instead",
@@ -310,7 +331,10 @@ fn no_such_field<'db>(
                 vec![
                     (at(base_range), cx.ty(&peeled)),
                     // alloc: the error's text, for an error hir found
-                    (at(TextRange::new(base_range.end(), field_expr_field_start(field_expr))), "::".to_owned()),
+                    (
+                        at(TextRange::new(base_range.end(), field_expr_field_start(field_expr))),
+                        "::".to_owned(),
+                    ),
                 ],
                 Applicability::MaybeIncorrect,
             );
@@ -400,7 +424,8 @@ fn field_candidates<'db>(
     ty: &hir::Type<'db>,
     module: Option<hir::Module>,
 ) -> Vec<Vec<(String, hir::Type<'db>)>> {
-    let visible = |field: &hir::Field| module.is_none_or(|module| field.is_visible_from(cx.db, module));
+    let visible =
+        |field: &hir::Field| module.is_none_or(|module| field.is_visible_from(cx.db, module));
     ty.autoderef(cx.db)
         .filter_map(|ty| {
             if ty.is_tuple() {

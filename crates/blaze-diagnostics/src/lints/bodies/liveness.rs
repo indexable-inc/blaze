@@ -31,7 +31,6 @@ mod flow;
 mod source;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::radix;
 use hir::InFile;
 use hir_def::{
@@ -57,6 +56,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind as _},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use std::rc::Rc;
 use syntax::SyntaxNodePtr;
 
@@ -72,7 +72,8 @@ use crate::{
 };
 
 /// The lints this module gives: it runs only when one may fire.
-pub(super) const LINTS: super::LintSet = super::lint_set(["unused_variables", "unused_assignments"]);
+pub(super) const LINTS: super::LintSet =
+    super::lint_set(["unused_variables", "unused_assignments"]);
 
 pub(super) fn lints<'db>(b: &BodyCx<'_, '_, 'db>, pool: &mut Pool<'db>) -> Vec<Found> {
     if b.mir_tainted() || source::skipped(b) || is_naked(b) {
@@ -132,7 +133,9 @@ fn capture_kind(ty: Ty<'_>) -> (CaptureKind, bool) {
     };
     match ty.kind() {
         TyKind::Closure(_, args) => by_kind(args.as_closure().kind()),
-        TyKind::CoroutineClosure(_, args) => (CaptureKind::CoroutineClosure, by_kind(args.as_coroutine_closure().kind()).1),
+        TyKind::CoroutineClosure(_, args) => {
+            (CaptureKind::CoroutineClosure, by_kind(args.as_coroutine_closure().kind()).1)
+        }
         _ => (CaptureKind::Coroutine, false),
     }
 }
@@ -200,9 +203,15 @@ impl<'db> Liveness<'_, '_, 'db> {
 impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
     fn new(b: &'b BodyCx<'b, 'a, 'db>, pool: Pool<'db>) -> Self {
         let db = b.db();
-        let infcx = DbInterner::new_with(db, b.cx.krate.base()).infer_ctxt().build(TypingMode::non_body_analysis());
+        let infcx = DbInterner::new_with(db, b.cx.krate.base())
+            .infer_ctxt()
+            .build(TypingMode::non_body_analysis());
         // With what the body's `for const` loops assume of their binders, as inference had it.
-        let env = hir_ty::comptime_env::body_env(&infcx, b.infer, db.trait_environment(b.owner.generic_def(db)));
+        let env = hir_ty::comptime_env::body_env(
+            &infcx,
+            b.infer,
+            db.trait_environment(b.owner.generic_def(db)),
+        );
         Liveness {
             b,
             source: Source::new(b),
@@ -237,7 +246,8 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
     fn body(&mut self, mir: &'db MirBody<'db>, closure: Option<(ExprId, Ty<'db>)>) -> DeadCaptures {
         let b = self.b;
         let store = b.store();
-        let (kind, in_place) = closure.map_or((CaptureKind::None, false), |(_, ty)| capture_kind(ty));
+        let (kind, in_place) =
+            closure.map_or((CaptureKind::None, false), |(_, ty)| capture_kind(ty));
         let captures: SmallVec<[&'db CapturedPlace; 8]> = match closure {
             Some((expr, _)) => match b.infer.closures_data.get(&expr) {
                 Some(data) => SmallVec::from_iter(data.min_captures.values().flatten()),
@@ -273,7 +283,11 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     && let Some(arm) = places.of_local(arm_local)
                     && places.of_local(place.local).is_none()
                 {
-                    places.push(Kind::Guard(arm), mir.locals[place.local].ty.as_ref(), Some(place.local));
+                    places.push(
+                        Kind::Guard(arm),
+                        mir.locals[place.local].ty.as_ref(),
+                        Some(place.local),
+                    );
                     named.push(Named::Guard);
                 }
             }
@@ -404,7 +418,16 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             if ever_live.contains(at) {
                 continue;
             }
-            self.fully_unused(mir, &flow, &mut report, *binding, *local, var, &mut lists[at as usize], drop_guards.contains(at));
+            self.fully_unused(
+                mir,
+                &flow,
+                &mut report,
+                *binding,
+                *local,
+                var,
+                &mut lists[at as usize],
+                drop_guards.contains(at),
+            );
         }
 
         for (at, named) in named.iter().enumerate() {
@@ -421,7 +444,8 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 continue;
             }
             let drop_guard = drop_guards.contains(at as Index);
-            let mut next_direct: SmallVec<[(MirSpan, Option<&StoredPlace>, Loc); 4]> = SmallVec::new();
+            let mut next_direct: SmallVec<[(MirSpan, Option<&StoredPlace>, Loc); 4]> =
+                SmallVec::new();
             let mut dead_assignments: SmallVec<[_; 2]> = SmallVec::new();
             for assignment in list {
                 let direct_assignment = assignment.kind == Access::Assign && assignment.direct;
@@ -478,7 +502,8 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
     ) -> HashMap<(u32, u32), Special, Global> {
         let store = self.b.store();
         let mut specials = HashMap::new_in(Global);
-        let mut stores: HashMap<MirSpan, SmallVec<[(&StoredPlace, (u32, u32)); 1]>, Global> = HashMap::new_in(Global);
+        let mut stores: HashMap<MirSpan, SmallVec<[(&StoredPlace, (u32, u32)); 1]>, Global> =
+            HashMap::new_in(Global);
         for (block, data) in mir.basic_blocks.iter() {
             for (index, statement) in data.statements.iter().enumerate() {
                 let key = (raw(block), index as u32);
@@ -502,7 +527,10 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                             specials.insert(key, Special::Skip);
                         }
                     }
-                    StatementKind::Assign(place, Rvalue::BinaryOp(_, lhs, _) | Rvalue::CheckedBinaryOp(_, lhs, _)) => {
+                    StatementKind::Assign(
+                        place,
+                        Rvalue::BinaryOp(_, lhs, _) | Rvalue::CheckedBinaryOp(_, lhs, _),
+                    ) => {
                         let OperandKind::Copy(lhs) = &lhs.kind else { continue };
                         if lhs == place {
                             if !places.is_indirect(place) {
@@ -559,8 +587,9 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let name = var.name.as_str();
 
         if list.is_empty() {
-            let used_after_uninitialized =
-                !is_arg && matches!(decl, Some(Decl::Simple(_))) && report.used(b).contains(&binding);
+            let used_after_uninitialized = !is_arg
+                && matches!(decl, Some(Decl::Simple(_)))
+                && report.used(b).contains(&binding);
             if used_after_uninitialized || !flow.mentions(local) {
                 return;
             }
@@ -568,7 +597,10 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             let sugg = match def.expansion.is_some() {
                 true => Sugg::NoSugg,
                 // clone: a lint's span, for an unused variable found
-                false => Sugg::TryPrefix { spans: vec![def.clone()], typo: self.typo(is_arg, name, &def, ty) },
+                false => Sugg::TryPrefix {
+                    spans: vec![def.clone()],
+                    typo: self.typo(is_arg, name, &def, ty),
+                },
             };
             // alloc: a lint's span, for an unused variable found
             self.unused_variable(report, var, &def, &[], vec![def.clone()], sugg);
@@ -587,13 +619,17 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             Some(Decl::Simple(init) | Decl::Matched(MirSpan::ExprId(init))) => {
                 let inside = expr_tree(store, init);
                 list.retain(|it| match it.key {
-                    Key::At(MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr)) => !inside.contains(&expr),
+                    Key::At(MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr)) => {
+                        !inside.contains(&expr)
+                    }
                     _ => true,
                 });
             }
             Some(Decl::Matched(MirSpan::PatId(param))) => {
                 let inside = pat_tree(store, param);
-                list.retain(|it| !matches!(it.key, Key::At(MirSpan::PatId(pat)) if inside.contains(&pat)));
+                list.retain(
+                    |it| !matches!(it.key, Key::At(MirSpan::PatId(pat)) if inside.contains(&pat)),
+                );
             }
             _ => {}
         }
@@ -663,10 +699,16 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             let rendered = format!("{value:?}");
             if rendered.split(&brace_name).any(|it| matches!(it.chars().next(), Some('}' | ':'))) {
                 // clone: a lint's span, for an unused variable found
-                diag.span_label(lit.clone(), "you might have meant to use string interpolation in this string literal");
+                diag.span_label(
+                    lit.clone(),
+                    "you might have meant to use string interpolation in this string literal",
+                );
                 diag.suggestion_with_style(
                     // alloc: the lint's suggestion, for an unused variable found
-                    vec![(lit.shrink_to_lo(), "format!(".to_owned()), (lit.shrink_to_hi(), ")".to_owned())],
+                    vec![
+                        (lit.shrink_to_lo(), "format!(".to_owned()),
+                        (lit.shrink_to_hi(), ")".to_owned()),
+                    ],
                     "string interpolation only works in `format!` invocations",
                     Applicability::MachineApplicable,
                     SuggestionStyle::ShowCode,
@@ -679,7 +721,10 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     .iter()
                     .map(|(span, shorthand)| {
                         // alloc: the lint's suggestion, for an unused variable found
-                        (span.clone(), if *shorthand { format!("{name}: _") } else { "_".to_owned() })
+                        (
+                            span.clone(),
+                            if *shorthand { format!("{name}: _") } else { "_".to_owned() },
+                        )
                     })
                     // alloc: the lint's suggestion, for an unused variable found
                     .collect();
@@ -740,10 +785,13 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let (diag, at) = match assignment.kind {
             Access::Assign => {
                 let Key::At(span) = assignment.key else { return };
-                let Some((assigned, at)) = self.assignment_span(mir, span, assignment.place) else { return };
+                let Some((assigned, at)) = self.assignment_span(mir, span, assignment.place) else {
+                    return;
+                };
                 let suggestion = match (named, assignment.place) {
                     (Named::Var { binding, local, .. }, Some(place))
-                        if place.projection.as_slice().is_empty() && mir.param_locals.contains(local) =>
+                        if place.projection.as_slice().is_empty()
+                            && mir.param_locals.contains(local) =>
                     {
                         let param = b.source_map.patterns_for_binding(*binding).first().copied();
                         param.zip(self.source.assignment(span)).and_then(|(param, assign)| {
@@ -753,7 +801,9 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     _ => None,
                 };
                 let overwrite = match suggestion.is_none() && assignment.direct {
-                    true => overwrite.and_then(|(span, place)| self.assignment_span(mir, span, place)),
+                    true => {
+                        overwrite.and_then(|(span, place)| self.assignment_span(mir, span, place))
+                    }
                     false => None,
                 };
                 let mut diag = Diag::lint(
@@ -767,7 +817,10 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 if let Some((overwrite, _)) = overwrite {
                     diag.span_label(assigned, "this value is reassigned later and never used");
                     // alloc: the lint's label, for a dead assignment found
-                    diag.span_label(overwrite, format!("`{name}` is overwritten here before the previous value is read"));
+                    diag.span_label(
+                        overwrite,
+                        format!("`{name}` is overwritten here before the previous value is read"),
+                    );
                 }
                 if let Some(parts) = suggestion {
                     diag.suggestion_with_style(
@@ -797,7 +850,9 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             Access::Capture => {
                 let Named::Capture { capture } = named else { return };
                 let Some((closure, _)) = closure else { return };
-                let (Some(span), Some(at)) = (source::capture_span(b, capture), b.expr_node(closure)) else {
+                let (Some(span), Some(at)) =
+                    (source::capture_span(b, capture), b.expr_node(closure))
+                else {
                     return;
                 };
                 let mut diag =
@@ -876,7 +931,10 @@ impl Typo {
             // alloc: the lint's suggestion, for a typo found
             vec![(self.span, self.path)],
             // alloc: the lint's suggestion, for a typo found
-            format!("you might have meant to pattern match on the similarly named {} `{}`", self.kind, self.item),
+            format!(
+                "you might have meant to pattern match on the similarly named {} `{}`",
+                self.kind, self.item
+            ),
             Applicability::MaybeIncorrect,
             SuggestionStyle::ShowAlways,
         );
@@ -893,7 +951,10 @@ fn raw(block: BasicBlockId) -> u32 {
 }
 
 /// The expressions of `root` and those in it.
-fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> HashSet<ExprId, Global> {
+fn expr_tree(
+    store: &hir_def::expr_store::ExpressionStore,
+    root: ExprId,
+) -> HashSet<ExprId, Global> {
     let mut found = HashSet::new_in(Global);
     // alloc: only for a binding no point of the body reads, which is reported
     let mut stack = vec![root];

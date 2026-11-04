@@ -40,8 +40,8 @@ use std::{
 };
 
 use blaze_hash::{FixedHasher, HashMap, HashSet};
-use std::alloc::Global;
 use parking_lot::{Mutex, MutexGuard};
+use std::alloc::Global;
 
 use crate::{
     clock,
@@ -296,7 +296,8 @@ struct Generation {
 
 impl Generation {
     fn get(&self, sym: Sym) -> Option<&std::sync::Arc<str>> {
-        (sym >> 4 & (EPOCHS - 1) == self.epoch).then(|| self.names.get((sym >> 12).checked_sub(1)? as usize))?
+        (sym >> 4 & (EPOCHS - 1) == self.epoch)
+            .then(|| self.names.get((sym >> 12).checked_sub(1)? as usize))?
     }
 
     fn add(&mut self, shard: usize, name: &str) -> Sym {
@@ -347,7 +348,10 @@ impl Names {
         }
         if names.current.names.len() == GENERATION {
             let epoch = names.current.epoch % (EPOCHS - 1) + 1;
-            let full = std::mem::replace(&mut names.current, Generation { epoch, ..Generation::default() });
+            let full = std::mem::replace(
+                &mut names.current,
+                Generation { epoch, ..Generation::default() },
+            );
             names.previous = full;
         }
         let id = names.current.add(shard, name);
@@ -612,7 +616,16 @@ pub fn fiber_stack(stack: FiberStack) {
     if let Some(ring) = ring() {
         let build = u64::from(BUILD.with(Cell::get));
         let what = KIND_PLOT << 62 | u64::from(stack.fiber) << 8 | FIBER_STACK_ROW;
-        ring.put([clock::ticks(), stack.reserved, stack.deepest, stack.touched, what, stack.grown, build, stack.job]);
+        ring.put([
+            clock::ticks(),
+            stack.reserved,
+            stack.deepest,
+            stack.touched,
+            what,
+            stack.grown,
+            build,
+            stack.job,
+        ]);
     }
 }
 
@@ -740,7 +753,9 @@ pub fn take_open() -> Option<NonZeroUsize> {
     }
     let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], job, running };
     if let Some(ring) = ring {
-        for (to, from) in carried.entered.iter_mut().zip(&ring.entered[..(depth as usize).min(OPEN_MAX)]) {
+        for (to, from) in
+            carried.entered.iter_mut().zip(&ring.entered[..(depth as usize).min(OPEN_MAX)])
+        {
             *to = from.load(Ordering::Relaxed);
         }
         ring.depth.store(0, Ordering::Release);
@@ -896,9 +911,16 @@ impl WaitedOn {
     }
 
     fn of(byte: u64) -> Option<WaitedOn> {
-        [WaitedOn::Job, WaitedOn::Key, WaitedOn::Counter, WaitedOn::Until, WaitedOn::Moved, WaitedOn::Nothing]
-            .into_iter()
-            .find(|it| *it as u64 == byte)
+        [
+            WaitedOn::Job,
+            WaitedOn::Key,
+            WaitedOn::Counter,
+            WaitedOn::Until,
+            WaitedOn::Moved,
+            WaitedOn::Nothing,
+        ]
+        .into_iter()
+        .find(|it| *it as u64 == byte)
     }
 }
 
@@ -979,7 +1001,9 @@ pub fn current_build() -> u32 {
 pub fn job_begins(spawner: u64, given: u64, build: u32, creator: u64) {
     let unjoined = UNJOINED.fetch_add(1, Ordering::Relaxed) << 32 | UNJOINED_SLOT;
     let outer = BUILD.with(|it| it.replace(build));
-    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, creator, outer })));
+    BEGUN.with(|it| {
+        it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, creator, outer }))
+    });
     RUNNING.with(|it| it.set(OnThread { job: unjoined, build }));
 }
 
@@ -1028,14 +1052,16 @@ pub fn switched(switch: Switch) {
     match switch.event {
         Switched::Started => {
             if let Some(begun) = BEGUN.with(Cell::take) {
-                (value, by, since, queued) = (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
+                (value, by, since, queued) =
+                    (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
             }
             RUNNING.with(|it| it.set(OnThread { job: switch.job, build }));
         }
         Switched::Ran => {
             // A job that began before the observer was installed: its life is not in the record.
             let Some(begun) = BEGUN.with(Cell::take) else { return };
-            (job, by, since, queued) = (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
+            (job, by, since, queued) =
+                (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
             RUNNING.with(|it| it.set(OnThread::default()));
             // It ran where it began, inside what the thread worked for before.
             BUILD.with(|it| it.set(begun.outer));
@@ -1053,7 +1079,8 @@ pub fn switched(switch: Switch) {
     // The thread's running job moves above whether or not the row is kept.
     let Some(ring) = ring() else { return };
     let queued_low = (queued & ((1 << QUEUED_LOW_BITS) - 1)) << QUEUED_LOW_SHIFT;
-    let what = KIND_PLOT << 62 | queued_low | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
+    let what =
+        KIND_PLOT << 62 | queued_low | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
     let where_ = u64::from(switch.core) << 32 | u64::from(switch.fiber);
     let build = (queued >> QUEUED_LOW_BITS) << 32 | u64::from(build);
     ring.put([clock::ticks(), job, value, where_, what, by, build, since]);
@@ -1643,7 +1670,8 @@ const NO_COL: u64 = 0xff;
 /// only when some were.
 const FOLDED_COL: u64 = 0xfc;
 const FOLDED_TICKS_COL: u64 = 0xfb;
-const _: () = assert!(TYPED < FOLDED_TICKS_COL as usize, "a typed column's index is a byte of its own");
+const _: () =
+    assert!(TYPED < FOLDED_TICKS_COL as usize, "a typed column's index is a byte of its own");
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
@@ -1764,7 +1792,12 @@ struct Opened {
 impl Opened {
     /// Its columns, as a span kind reads them.
     fn said(&self) -> Said {
-        Said { krate: (self.of >> 32) as Sym, function: self.of as Sym, unit: self.unit as Sym, typed: self.typed }
+        Said {
+            krate: (self.of >> 32) as Sym,
+            function: self.of as Sym,
+            unit: self.unit as Sym,
+            typed: self.typed,
+        }
     }
 }
 
@@ -2037,8 +2070,12 @@ impl Ring {
     /// thread takes slots; any thread frees them ([`Ring::free`]).
     #[inline]
     fn take_slot(&self) -> Option<usize> {
-        let (word_at, bits) =
-            self.taken.iter().enumerate().map(|(at, it)| (at, it.load(Ordering::Acquire))).find(|(_, it)| *it != u64::MAX)?;
+        let (word_at, bits) = self
+            .taken
+            .iter()
+            .enumerate()
+            .map(|(at, it)| (at, it.load(Ordering::Acquire)))
+            .find(|(_, it)| *it != u64::MAX)?;
         let bit = (!bits).trailing_zeros() as usize;
         let at = word_at * 64 + bit;
         let chunk = &self.open[at / CHUNK];
@@ -2123,7 +2160,10 @@ impl Ring {
     /// may read it while the thread is stopped.
     pub(crate) fn innermost(&self) -> u64 {
         let depth = self.depth.load(Ordering::Acquire) as usize;
-        depth.checked_sub(1).and_then(|top| self.entered.get(top)).map_or(0, |it| it.load(Ordering::Relaxed))
+        depth
+            .checked_sub(1)
+            .and_then(|top| self.entered.get(top))
+            .map_or(0, |it| it.load(Ordering::Relaxed))
     }
 
     /// The tid and name of [`Ring::current`].
@@ -2315,7 +2355,8 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     if wanted != 0 {
         span.record(&mut fields);
     }
-    let parent = if span.is_root() { Some(0) } else { span.parent().map(tracing::span::Id::into_u64) };
+    let parent =
+        if span.is_root() { Some(0) } else { span.parent().map(tracing::span::Id::into_u64) };
     began(site, parent, &fields.said)
 }
 
@@ -2364,7 +2405,9 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     let held = SITES[usize::from(site) - 1].get().is_some_and(|it| it.held);
     let made = ring.made.load(Ordering::Relaxed) + 1;
     ring.made.store(made, Ordering::Relaxed);
-    let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS) | (at as u64) << SEQ_BITS | made & SEQ_MASK;
+    let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS)
+        | (at as u64) << SEQ_BITS
+        | made & SEQ_MASK;
     let Some(slot) = ring.slot(at) else {
         // `take_slot` made its chunk: unreachable, but a lost span is not a panic.
         ring.lost.store(ring.lost.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
@@ -2376,7 +2419,10 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     slot.start.store(clock::ticks(), Ordering::Relaxed);
     slot.parent.store(parent, Ordering::Relaxed);
     let held_bit = if held { HELD_BIT } else { 0 };
-    slot.what.store(u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | held_bit | u64::from(site), Ordering::Relaxed);
+    slot.what.store(
+        u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | held_bit | u64::from(site),
+        Ordering::Relaxed,
+    );
     store_said(slot, said);
     // It counts CPU only while it is the innermost span entered ([`entered`]).
     slot.cpu.store(if counts { 0 } else { UNCOUNTED_CPU }, Ordering::Relaxed);
@@ -2406,7 +2452,9 @@ fn open_slot(id: u64) -> Option<&'static Slot> {
     if id == 0 || id == UNRECORDED {
         return None;
     }
-    by_number(ring_of(id)).and_then(|it| it.slot_of(id)).filter(|it| it.id.load(Ordering::Acquire) == id)
+    by_number(ring_of(id))
+        .and_then(|it| it.slot_of(id))
+        .filter(|it| it.id.load(Ordering::Acquire) == id)
 }
 
 /// Notes that a row names the open span `id` (an event, a sample, a pool job it gave): it is
@@ -2563,7 +2611,9 @@ pub(crate) fn exited(id: u64) {
     // Spans leave in the order they entered but for a guard dropped out of turn: then the
     // ones above it move down.
     if (top as usize) < OPEN_MAX && ring.entered[top as usize].load(Ordering::Relaxed) != id {
-        let Some(at) = ring.entered[..named].iter().rposition(|it| it.load(Ordering::Relaxed) == id) else {
+        let Some(at) =
+            ring.entered[..named].iter().rposition(|it| it.load(Ordering::Relaxed) == id)
+        else {
             return;
         };
         if counts {
@@ -2757,7 +2807,8 @@ static FOLD_AGE_TICKS: AtomicU64 = AtomicU64::new(0);
 pub fn fold_below(below: Duration) {
     let scale = clock::Scale::now();
     FOLD_AGE_TICKS.store(scale.ticks_in(FOLD_AGE.as_nanos() as u64), Ordering::Relaxed);
-    WAIT_FOLD_TICKS.store(scale.ticks_in(below.min(WAIT_FOLD_BELOW).as_nanos() as u64), Ordering::Relaxed);
+    WAIT_FOLD_TICKS
+        .store(scale.ticks_in(below.min(WAIT_FOLD_BELOW).as_nanos() as u64), Ordering::Relaxed);
     FOLD_TICKS.store(scale.ticks_in(below.as_nanos() as u64), Ordering::Relaxed);
 }
 
@@ -2867,7 +2918,11 @@ thread_local! {
 /// A sum's key: its build, its parent's site, whether its spans are roots and its site, with a
 /// bit set so no key is 0.
 fn fold_key(site: u16, parent_site: u16, root: bool, build: u32) -> u64 {
-    u64::from(build) << 32 | u64::from(parent_site) << 16 | u64::from(root) << 13 | 1 << 12 | u64::from(site)
+    u64::from(build) << 32
+        | u64::from(parent_site) << 16
+        | u64::from(root) << 13
+        | 1 << 12
+        | u64::from(site)
 }
 
 /// Adds the span `opened`, closing now under a parent of `parent_site` (0: none open), to its
@@ -2950,7 +3005,8 @@ fn put_fold(ring: &Ring, fold: &mut Fold) {
     let site = key & ((1 << SITE_BITS) - 1);
     let parent_site = key >> 16 & ((1 << SITE_BITS) - 1);
     let root = if key >> 13 & 1 == 1 { FOLD_ROOT } else { 0 };
-    let counted = if cpu.is_some() { FOLD_CPU } else { 0 } | if allocs.is_some() { FOLD_ALLOCS } else { 0 };
+    let counted =
+        if cpu.is_some() { FOLD_CPU } else { 0 } | if allocs.is_some() { FOLD_ALLOCS } else { 0 };
     let what = KIND_PLOT << 62
         | counted
         | root
@@ -2960,13 +3016,23 @@ fn put_fold(ring: &Ring, fold: &mut Fold) {
         | FOLD_ROW;
     let (count, bytes) = allocs.unwrap_or((0, 0));
     let build = key >> 32;
-    ring.put([last, first, ticks, max, what, cpu.unwrap_or(0), build << 32 | count.min(u64::from(u32::MAX)), bytes]);
+    ring.put([
+        last,
+        first,
+        ticks,
+        max,
+        what,
+        cpu.unwrap_or(0),
+        build << 32 | count.min(u64::from(u32::MAX)),
+        bytes,
+    ]);
 }
 
 /// Writes this thread's folded sums once the oldest is [`FOLD_AGE`] old.
 #[inline]
 fn fold_aged(ring: &Ring, now: u64) {
-    let oldest = FOLDS.try_with(|it| it.try_borrow().map_or(u64::MAX, |it| it.oldest)).unwrap_or(u64::MAX);
+    let oldest =
+        FOLDS.try_with(|it| it.try_borrow().map_or(u64::MAX, |it| it.oldest)).unwrap_or(u64::MAX);
     if oldest != u64::MAX && now.wrapping_sub(oldest) >= fold_age_ticks() {
         put_folds(ring);
     }
@@ -3000,10 +3066,20 @@ pub fn flush_folds() {
 /// 0: not counted), the thread that made it when another closes it (`made_by`), the children it
 /// folded and their ticks (`folded`) and each typed column said, [`COL_WORDS`] a row.
 #[inline]
-fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, made_by: Option<u64>, folded: Option<(u64, u64)>, typed: &[u64; TYPED]) {
+fn put_cols(
+    ring: &Ring,
+    now: u64,
+    id: u64,
+    cpu: u64,
+    made_by: Option<u64>,
+    folded: Option<(u64, u64)>,
+    typed: &[u64; TYPED],
+) {
     let said = (cpu != 0).then_some((CPU_COL, cpu));
     let made_by = made_by.map(|it| (THREAD_COL, it));
-    let folded = folded.into_iter().flat_map(|(spans, ticks)| [(FOLDED_COL, spans), (FOLDED_TICKS_COL, ticks)]);
+    let folded = folded
+        .into_iter()
+        .flat_map(|(spans, ticks)| [(FOLDED_COL, spans), (FOLDED_TICKS_COL, ticks)]);
     let mut values = said
         .into_iter()
         .chain(made_by)
@@ -3651,7 +3727,9 @@ pub(crate) fn write_working_on(out: &mut String) -> bool {
         let id = entered.load(Ordering::Relaxed);
         let Some(opened) = by_number(ring_of(id)).and_then(|it| it.opened(id)) else { continue };
         let Some(meta) = meta(opened.site) else { continue };
-        let of = [opened.of as Sym, opened.unit as Sym, (opened.of >> 32) as Sym].into_iter().find(|it| *it != 0);
+        let of = [opened.of as Sym, opened.unit as Sym, (opened.of >> 32) as Sym]
+            .into_iter()
+            .find(|it| *it != 0);
         match of.and_then(name) {
             Some(of) => {
                 // Writing to a `String` does not fail.
@@ -3734,7 +3812,12 @@ pub fn threads_now() -> Vec<ThreadNow> {
         let (tid, name) = ring.current();
         // alloc: a dump, on demand
         let name = self::name(name).as_deref().unwrap_or_default().to_owned();
-        threads.push(ThreadNow { tid: u64::from(tid), name, open, deeper: depth.saturating_sub(OPEN_MAX as u32) });
+        threads.push(ThreadNow {
+            tid: u64::from(tid),
+            name,
+            open,
+            deeper: depth.saturating_sub(OPEN_MAX as u32),
+        });
     }
     threads
 }
@@ -3750,7 +3833,8 @@ pub(crate) struct Epoch {
 
 impl Epoch {
     pub(crate) fn now() -> Epoch {
-        let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+        let now_us =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
         Epoch { now: Instant::now(), now_us, mono_ns: clock::mono_ns() }
     }
 
@@ -3875,7 +3959,10 @@ mod tests {
             rows.clear();
             ring.read(0, &mut rows);
             for (_, row) in &rows {
-                assert!(row.iter().all(|it| *it == row[0] || *it == KIND_PLOT << 62), "a row's words are of one write");
+                assert!(
+                    row.iter().all(|it| *it == row[0] || *it == KIND_PLOT << 62),
+                    "a row's words are of one write"
+                );
             }
         }
         stop.store(true, Ordering::Relaxed);
@@ -3889,7 +3976,10 @@ mod tests {
         let ring = Ring::new(1);
         let taken: Vec<usize> = (0..3000).map(|_| ring.take_slot().expect("a free slot")).collect();
         assert!(taken.iter().enumerate().all(|(i, at)| *at == i), "the lowest free slot first");
-        assert!(taken.iter().all(|&at| ring.slot(at).is_some()), "every taken slot's chunk is made");
+        assert!(
+            taken.iter().all(|&at| ring.slot(at).is_some()),
+            "every taken slot's chunk is made"
+        );
         assert!(ring.slot(3000 / CHUNK * CHUNK + CHUNK).is_none(), "no chunk before it is needed");
         let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS) | 700 << SEQ_BITS | 1;
         let slot = ring.slot_of(id).unwrap();
@@ -3897,7 +3987,10 @@ mod tests {
         ring.free(slot, id);
         assert_eq!(ring.take_slot(), Some(700));
         while ring.take_slot().is_some() {}
-        assert!(ring.taken.iter().all(|it| it.load(Ordering::Relaxed) == u64::MAX), "full at {SLOTS_OPEN}");
+        assert!(
+            ring.taken.iter().all(|it| it.load(Ordering::Relaxed) == u64::MAX),
+            "full at {SLOTS_OPEN}"
+        );
     }
 
     #[test]
@@ -3931,9 +4024,11 @@ mod tests {
         // ring is free or has passed to another thread, with a new lease. A thread taking it
         // marks it live before it bumps the lease, so a ring seen live under the old lease is
         // one being taken, or one the ended thread still holds: the bound says which.
-        blaze_graph::spin::SpinWait::within("the ended thread to have let its ring go", Duration::from_secs(10), || {
-            !ring.live.load(Ordering::Acquire) || ring.lease.load(Ordering::Relaxed) != lease
-        });
+        blaze_graph::spin::SpinWait::within(
+            "the ended thread to have let its ring go",
+            Duration::from_secs(10),
+            || !ring.live.load(Ordering::Acquire) || ring.lease.load(Ordering::Relaxed) != lease,
+        );
     }
 
     #[test]
@@ -3959,11 +4054,19 @@ mod tests {
             }
         }
         for i in count - GENERATION..count {
-            assert_eq!(names.get(syms[i]).as_deref(), Some(format!("key {i}").as_str()), "a recent name reads back");
+            assert_eq!(
+                names.get(syms[i]).as_deref(),
+                Some(format!("key {i}").as_str()),
+                "a recent name reads back"
+            );
         }
         assert_eq!(names.get(syms[0]), None, "the first name's generation was let go");
         let again = names.intern("key 0");
-        assert_eq!(names.get(again).as_deref(), Some("key 0"), "a name asked for again is named anew");
+        assert_eq!(
+            names.get(again).as_deref(),
+            Some("key 0"),
+            "a name asked for again is named anew"
+        );
     }
 
     #[test]
@@ -3971,7 +4074,8 @@ mod tests {
         crate::install();
         let thread = std::thread::spawn(|| {
             let _build = building(7);
-            let outer = tracing::info_span!(target: "blaze", "flight outer", krate = "app").entered();
+            let outer =
+                tracing::info_span!(target: "blaze", "flight outer", krate = "app").entered();
             let outer_id = outer.id().unwrap().into_u64();
             {
                 let _inner =
@@ -3986,14 +4090,26 @@ mod tests {
         self::read(&mut cursor, &mut read);
         let ours: Vec<&SpanRow> = read.spans.iter().filter(|it| it.thread == tid).collect();
         let name_of = |row: &SpanRow| meta(row.site).map(|it| it.name());
-        let inner = ours.iter().find(|it| name_of(it) == Some("flight inner")).expect("the inner span is a row");
-        let outer = ours.iter().find(|it| name_of(it) == Some("flight outer")).expect("the outer span is a row");
+        let inner = ours
+            .iter()
+            .find(|it| name_of(it) == Some("flight inner"))
+            .expect("the inner span is a row");
+        let outer = ours
+            .iter()
+            .find(|it| name_of(it) == Some("flight outer"))
+            .expect("the outer span is a row");
         assert_eq!(outer.span_id, outer_id);
         assert_eq!((inner.parent, inner.depth, outer.depth), (outer_id, 1, 0));
         assert_eq!((inner.build, outer.build), (7, 7));
         assert_eq!(name(outer.krate).as_deref(), Some("app"));
-        assert_eq!((name(inner.function).as_deref(), name(inner.unit).as_deref()), (Some("app::main"), Some("3")));
-        assert!(inner.start_ns >= outer.start_ns && inner.start_ns + inner.dur_ns <= outer.start_ns + outer.dur_ns);
+        assert_eq!(
+            (name(inner.function).as_deref(), name(inner.unit).as_deref()),
+            (Some("app::main"), Some("3"))
+        );
+        assert!(
+            inner.start_ns >= outer.start_ns
+                && inner.start_ns + inner.dur_ns <= outer.start_ns + outer.dur_ns
+        );
         read.clear();
         self::read(&mut cursor, &mut read);
         assert!(read.spans.iter().all(|it| it.thread != tid), "a cursor takes a row once");
@@ -4029,7 +4145,11 @@ mod tests {
         };
         let named = row("flight named late");
         assert_eq!(
-            (self::name(named.krate).as_deref(), self::name(named.function).as_deref(), self::name(named.unit).as_deref()),
+            (
+                self::name(named.krate).as_deref(),
+                self::name(named.function).as_deref(),
+                self::name(named.unit).as_deref()
+            ),
             (Some("shapes"), Some("shapes::area::of_square"), Some("5"))
         );
         assert_eq!(row("flight never named").function, 0);
@@ -4103,19 +4223,40 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let [wait] = key_waits(&read, asker)[..] else { panic!("the asker waited once for a key") };
-        let [asking] = named_on(asker, "flight asking")[..] else { panic!("the asking span is a row") };
+        let [asking] = named_on(asker, "flight asking")[..] else {
+            panic!("the asking span is a row")
+        };
         assert_eq!(asking.span_id, asking_id);
         assert_eq!(self::name(wait.function).as_deref(), Some("slow_query(of_square)"));
         let typed = span::read::<span::Wait>(wait).unwrap().expect("the wait is a `wait`").fields;
-        assert_eq!(typed.awaits.text().as_deref(), Some("slow_query(of_square)"), "a wait says what it awaits");
+        assert_eq!(
+            typed.awaits.text().as_deref(),
+            Some("slow_query(of_square)"),
+            "a wait says what it awaits"
+        );
         assert_eq!(typed.on, blaze_graph::wait::WaitKind::Key);
         assert!(typed.owner.is_some(), "a wait for a run says whose run it is");
-        assert_eq!(asking.get::<span::col::Awaits>(), None, "a span that waits on nothing awaits nothing");
+        assert_eq!(
+            asking.get::<span::col::Awaits>(),
+            None,
+            "a span that waits on nothing awaits nothing"
+        );
         assert_eq!((wait.parent, wait.depth), (asking_id, 1));
-        assert!(wait.dur_ns >= 100_000_000, "the wait lasted while the run slept: {} ns", wait.dur_ns);
-        let waited: i64 = named_on(asker, "wait").iter().filter(|it| it.parent == asking_id).map(|it| it.dur_ns).sum();
+        assert!(
+            wait.dur_ns >= 100_000_000,
+            "the wait lasted while the run slept: {} ns",
+            wait.dur_ns
+        );
+        let waited: i64 = named_on(asker, "wait")
+            .iter()
+            .filter(|it| it.parent == asking_id)
+            .map(|it| it.dur_ns)
+            .sum();
         let asking_self = asking.dur_ns - waited;
-        assert!(asking_self < wait.dur_ns / 4, "the asker's own time leaves out its waits: {asking_self} ns");
+        assert!(
+            asking_self < wait.dur_ns / 4,
+            "the asker's own time leaves out its waits: {asking_self} ns"
+        );
         assert!(key_waits(&read, runner).is_empty(), "the run's own thread waited for no key");
     }
 
@@ -4134,7 +4275,9 @@ mod tests {
         let (ended, has_ended) = crossbeam_channel::unbounded();
         let (waited, has_waited) = crossbeam_channel::unbounded::<()>();
         let holder = std::thread::spawn(move || {
-            let hold = flights.hold_named(key, |it| it.push_str("codegen round 3 of app")).expect("no one holds it");
+            let hold = flights
+                .hold_named(key, |it| it.push_str("codegen round 3 of app"))
+                .expect("no one holds it");
             held.send(()).unwrap();
             blaze_graph::spin::busy(Duration::from_millis(200));
             hold.end(&9);
@@ -4161,12 +4304,22 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let [hold] = named_on(holder, "hold")[..] else { panic!("the holder's hold is one span") };
-        let [wait] = key_waits(&read, waiter)[..] else { panic!("the waiter waited once for a key") };
+        let [wait] = key_waits(&read, waiter)[..] else {
+            panic!("the waiter waited once for a key")
+        };
         assert_eq!(self::name(hold.function).as_deref(), Some("codegen round 3 of app"));
-        let holder_of = span::read::<span::Hold>(hold).unwrap().expect("the hold is a `hold`").fields.holder;
-        assert_eq!(wait.get::<span::col::Owner>(), Some(holder_of), "the wait names the hold's holder as whose it waits on");
+        let holder_of =
+            span::read::<span::Hold>(hold).unwrap().expect("the hold is a `hold`").fields.holder;
+        assert_eq!(
+            wait.get::<span::col::Owner>(),
+            Some(holder_of),
+            "the wait names the hold's holder as whose it waits on"
+        );
         assert!(hold.dur_ns >= 150_000_000, "the hold lasted until it ended: {} ns", hold.dur_ns);
-        assert!(hold.start_ns <= wait.start_ns && wait.start_ns + wait.dur_ns <= hold.start_ns + hold.dur_ns + 50_000_000);
+        assert!(
+            hold.start_ns <= wait.start_ns
+                && wait.start_ns + wait.dur_ns <= hold.start_ns + hold.dur_ns + 50_000_000
+        );
     }
 
     #[test]
@@ -4199,10 +4352,18 @@ mod tests {
         let (by_taker, by_other, maker, ring_of_maker, lease) = std::thread::Builder::new()
             .name(MAKER.to_owned())
             .spawn(|| {
-                let by_taker = tracing::info_span!(target: "blaze", "flight outlived, closed by the taker");
-                let by_other = tracing::info_span!(target: "blaze", "flight outlived, closed by another");
+                let by_taker =
+                    tracing::info_span!(target: "blaze", "flight outlived, closed by the taker");
+                let by_other =
+                    tracing::info_span!(target: "blaze", "flight outlived, closed by another");
                 let ring = ring().unwrap();
-                (by_taker, by_other, crate::sampler::os_tid() as u32, ring.number, ring.lease.load(Ordering::Relaxed))
+                (
+                    by_taker,
+                    by_other,
+                    crate::sampler::os_tid() as u32,
+                    ring.number,
+                    ring.lease.load(Ordering::Relaxed),
+                )
             })
             .unwrap()
             .join()
@@ -4303,10 +4464,16 @@ mod tests {
         drop(moved);
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
-        let copied = |id: u64| read.spans.iter().find(|it| it.span_id == id).expect("the span is a row").copied;
+        let copied = |id: u64| {
+            read.spans.iter().find(|it| it.span_id == id).expect("the span is a row").copied
+        };
         assert_eq!(copied(copying), Some(FrameCopied { copies: 2, bytes: 300 }));
         assert_eq!(copied(quiet), Some(FrameCopied::default()), "counted, and none were made");
-        assert_eq!(copied(outer), Some(FrameCopied { copies: 3, bytes: 307 }), "a span counts those of the spans in it");
+        assert_eq!(
+            copied(outer),
+            Some(FrameCopied { copies: 3, bytes: 307 }),
+            "a span counts those of the spans in it"
+        );
         assert_eq!(copied(moved_id), None, "two threads' counts don't subtract");
     }
 
@@ -4352,9 +4519,11 @@ mod tests {
             use blaze_graph::sched::{Affinity, CoreId, Spawn};
             match job {
                 CarryJob::Block => {
-                    blaze_graph::spin::SpinWait::within("the moving job to start", Duration::from_secs(60), || {
-                        self.started.load(Ordering::Acquire)
-                    });
+                    blaze_graph::spin::SpinWait::within(
+                        "the moving job to start",
+                        Duration::from_secs(60),
+                        || self.started.load(Ordering::Acquire),
+                    );
                 }
                 CarryJob::Moving => {
                     let _build = building(41);
@@ -4364,14 +4533,18 @@ mod tests {
                     self.started.store(true, Ordering::Release);
                     let deadline = std::time::Instant::now() + Duration::from_secs(60);
                     while tid() == left {
-                        assert!(std::time::Instant::now() < deadline, "the job never moved to the fast core");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the job never moved to the fast core"
+                        );
                         cx.miss();
                     }
                     let reached = tid();
                     let after = tracing::info_span!(target: "blaze", "carry after");
                     let after_id = id(&after);
                     drop(after);
-                    let other = cx.spawn(CarryJob::Other, Spawn::root().hint(Affinity::Core(CoreId(1))));
+                    let other =
+                        cx.spawn(CarryJob::Other, Spawn::root().hint(Affinity::Core(CoreId(1))));
                     cx.wait_job(other).expect("waiting for a child is no cycle");
                     let mut seen = lock(&self.seen);
                     (seen.outer, seen.inner, seen.after) = (id(&outer), id(&inner), after_id);
@@ -4394,10 +4567,14 @@ mod tests {
         use blaze_graph::sched::{Affinity, CoreId, Cores, Spawn, fiber};
         crate::install();
         static CARRY: OnceLock<Carry> = OnceLock::new();
-        let work = CARRY.get_or_init(|| Carry { started: AtomicBool::new(false), seen: Mutex::new(CarrySeen::default()) });
+        let work = CARRY.get_or_init(|| Carry {
+            started: AtomicBool::new(false),
+            seen: Mutex::new(CarrySeen::default()),
+        });
         let cores = Cores::classes(&[(1024, 1), (512, 1)]).unwrap();
         let config = fiber::Config { fibers: 4, stack: 256 << 10, spin: 64 };
-        let driver = fiber::Driver::start(cores, work, config, |_| Ok(())).expect("the driver starts");
+        let driver =
+            fiber::Driver::start(cores, work, config, |_| Ok(())).expect("the driver starts");
         driver.spawn(CarryJob::Block, Spawn::root().hint(Affinity::Core(CoreId(0))));
         driver.spawn(CarryJob::Moving, Spawn::root().critical(true));
         driver.join().unwrap();
@@ -4406,16 +4583,37 @@ mod tests {
 
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
-        let span = |id: u64| *read.spans.iter().find(|it| it.span_id == id).expect("the span is a row");
-        let (outer, inner, after, other) = (span(seen.outer), span(seen.inner), span(seen.after), span(seen.other));
+        let span =
+            |id: u64| *read.spans.iter().find(|it| it.span_id == id).expect("the span is a row");
+        let (outer, inner, after, other) =
+            (span(seen.outer), span(seen.inner), span(seen.after), span(seen.other));
         assert_eq!((inner.parent, inner.depth), (seen.outer, 1));
-        assert_eq!((after.parent, after.depth), (seen.inner, 2), "a span made after the move nests under the job's");
+        assert_eq!(
+            (after.parent, after.depth),
+            (seen.inner, 2),
+            "a span made after the move nests under the job's"
+        );
         assert_eq!(after.thread, seen.reached);
-        assert_eq!((outer.thread, inner.thread), (seen.left, seen.left), "a span's thread is the one it began on");
-        assert!(inner.start_ns + inner.dur_ns >= after.start_ns + after.dur_ns, "the inner span closed after the move");
-        assert_eq!((outer.build, inner.build, after.build), (41, 41, 41), "the job's build moved with it");
+        assert_eq!(
+            (outer.thread, inner.thread),
+            (seen.left, seen.left),
+            "a span's thread is the one it began on"
+        );
+        assert!(
+            inner.start_ns + inner.dur_ns >= after.start_ns + after.dur_ns,
+            "the inner span closed after the move"
+        );
+        assert_eq!(
+            (outer.build, inner.build, after.build),
+            (41, 41, 41),
+            "the job's build moved with it"
+        );
         assert_eq!(other.thread, seen.left, "the other job ran on the thread the moving one left");
-        assert_eq!((other.parent, other.depth), (0, 0), "the other thread's next span is not inside the moved job's");
+        assert_eq!(
+            (other.parent, other.depth),
+            (0, 0),
+            "the other thread's next span is not inside the moved job's"
+        );
         assert_eq!(other.build, 0, "nor of its build");
 
         let job = read
@@ -4430,11 +4628,18 @@ mod tests {
         assert_eq!(moving.last().map(|it| it.event), Some(Switched::Ended));
         let moved = moving.iter().position(|it| it.waited == Some((WaitedOn::Moved, 0))).unwrap();
         let (parked, resumed) = (moving[moved], moving[moved + 1]);
-        assert_eq!((parked.thread, resumed.thread), (seen.left, seen.reached), "{parked:?} then {resumed:?}");
+        assert_eq!(
+            (parked.thread, resumed.thread),
+            (seen.left, seen.reached),
+            "{parked:?} then {resumed:?}"
+        );
         assert_eq!(resumed.event, Switched::Resumed);
         assert_eq!((parked.job, parked.fiber), (resumed.job, resumed.fiber), "one job, one fiber");
         assert!(
-            moving.iter().any(|it| it.event == Switched::Parked && matches!(it.waited, Some((WaitedOn::Job, _)))),
+            moving
+                .iter()
+                .any(|it| it.event == Switched::Parked
+                    && matches!(it.waited, Some((WaitedOn::Job, _)))),
             "the wait for the child is a parked switch too"
         );
     }
@@ -4492,21 +4697,45 @@ mod tests {
             .filter(|it| workers.contains(&it.thread) && it.start_ns >= since)
             .filter(|it| span::read::<span::Job>(it).ok().flatten().is_some())
             .collect();
-        assert!(jobs.iter().all(|it| it.depth == 0 && it.parent == 0), "a job's span is a root: {jobs:?}");
-        assert!(jobs.len() >= 3, "the first job's, and the second's before its park and after its resume: {jobs:?}");
-        let mut switches: Vec<&SwitchRow> =
-            read.switches.iter().filter(|it| workers.contains(&it.thread) && it.t_ns >= since).collect();
+        assert!(
+            jobs.iter().all(|it| it.depth == 0 && it.parent == 0),
+            "a job's span is a root: {jobs:?}"
+        );
+        assert!(
+            jobs.len() >= 3,
+            "the first job's, and the second's before its park and after its resume: {jobs:?}"
+        );
+        let mut switches: Vec<&SwitchRow> = read
+            .switches
+            .iter()
+            .filter(|it| workers.contains(&it.thread) && it.t_ns >= since)
+            .collect();
         switches.sort_by_key(|it| (it.thread, it.t_ns));
-        let parked = switches.iter().any(|it| it.event == Switched::Parked && matches!(it.waited, Some((WaitedOn::Key, _))));
+        let parked = switches.iter().any(|it| {
+            it.event == Switched::Parked && matches!(it.waited, Some((WaitedOn::Key, _)))
+        });
         assert!(parked, "the second job parked on the key: {switches:?}");
         for pair in switches.windows(2) {
             let [from, to] = [pair[0], pair[1]];
-            if from.thread != to.thread || !matches!(from.event, Switched::Started | Switched::Resumed) {
+            if from.thread != to.thread
+                || !matches!(from.event, Switched::Started | Switched::Resumed)
+            {
                 continue;
             }
-            let covers = |it: &&SpanRow| it.thread == from.thread && it.start_ns < to.t_ns && it.start_ns + it.dur_ns > from.t_ns;
-            assert!(jobs.iter().any(covers), "the run from {from:?} to {to:?} is inside a job span: {jobs:?}");
-            let crossing = |it: &&SpanRow| it.thread == from.thread && it.start_ns < from.t_ns && it.start_ns + it.dur_ns > to.t_ns;
+            let covers = |it: &&SpanRow| {
+                it.thread == from.thread
+                    && it.start_ns < to.t_ns
+                    && it.start_ns + it.dur_ns > from.t_ns
+            };
+            assert!(
+                jobs.iter().any(covers),
+                "the run from {from:?} to {to:?} is inside a job span: {jobs:?}"
+            );
+            let crossing = |it: &&SpanRow| {
+                it.thread == from.thread
+                    && it.start_ns < from.t_ns
+                    && it.start_ns + it.dur_ns > to.t_ns
+            };
             assert!(
                 !(from.event == Switched::Resumed && jobs.iter().any(crossing)),
                 "no job span stays open across a park: {jobs:?}"
@@ -4519,7 +4748,13 @@ mod tests {
         let mut read = Read::default();
         self::read(cursor, &mut read);
         let folds = read.folds.iter().filter(|it| it.thread == tid).cloned().collect();
-        let spans = read.spans.iter().filter(|it| it.thread == tid).filter_map(|it| meta(it.site)).map(|it| it.name().to_owned()).collect();
+        let spans = read
+            .spans
+            .iter()
+            .filter(|it| it.thread == tid)
+            .filter_map(|it| meta(it.site))
+            .map(|it| it.name().to_owned())
+            .collect();
         (folds, spans)
     }
 
@@ -4543,7 +4778,11 @@ mod tests {
                 let _named = tracing::info_span!(target: "blaze", "fold named").entered();
                 tracing::info!(target: "blaze", "fold names its span");
             }
-            let typed = span::open_raw(span::Job { kind: span::Name::kept("fold typed"), job: 9, creator: None });
+            let typed = span::open_raw(span::Job {
+                kind: span::Name::kept("fold typed"),
+                job: 9,
+                creator: None,
+            });
             span::close_raw(typed);
             let wait = span::open_raw(span::Wait {
                 awaits: span::Name::kept("fold wait"),
@@ -4556,27 +4795,60 @@ mod tests {
             self::read(&mut cursor, &mut read);
             let spans: Vec<&SpanRow> = read.spans.iter().filter(|it| it.thread == tid).collect();
             let named = |it: &SpanRow| meta(it.site).map(|it| it.name());
-            assert!(read.folds.iter().all(|it| it.thread != tid), "a sum younger than its age is held: {:?}", read.folds);
+            assert!(
+                read.folds.iter().all(|it| it.thread != tid),
+                "a sum younger than its age is held: {:?}",
+                read.folds
+            );
             for gone in ["fold short", "fold child", <span::Wait as span::Span>::NAME] {
-                assert!(!spans.iter().any(|it| named(it) == Some(gone)), "{gone}, short and named by no row, is no row: {spans:?}");
+                assert!(
+                    !spans.iter().any(|it| named(it) == Some(gone)),
+                    "{gone}, short and named by no row, is no row: {spans:?}"
+                );
             }
             for kept in ["fold parent", "fold named", <span::Job as span::Span>::NAME] {
-                assert!(spans.iter().any(|it| named(it) == Some(kept)), "{kept} is a row: one an event names, its parent, a typed span: {spans:?}");
+                assert!(
+                    spans.iter().any(|it| named(it) == Some(kept)),
+                    "{kept} is a row: one an event names, its parent, a typed span: {spans:?}"
+                );
             }
-            let parent = spans.iter().find(|it| named(it) == Some("fold parent")).expect("the parent is a row");
+            let parent = spans
+                .iter()
+                .find(|it| named(it) == Some("fold parent"))
+                .expect("the parent is a row");
             assert_eq!(parent.folded_spans, 3, "a parent says the children it folded: {parent:?}");
             assert!(parent.folded_ns > 0 && parent.folded_ns <= parent.dur_ns, "{parent:?}");
             flush_folds();
             let (folds, _) = mine(&mut cursor, tid);
-            let sum = |name: &str| folds.iter().find(|it| meta(it.site).map(|it| it.name()) == Some(name)).unwrap_or_else(|| panic!("a sum of {name}: {folds:?}"));
+            let sum = |name: &str| {
+                folds
+                    .iter()
+                    .find(|it| meta(it.site).map(|it| it.name()) == Some(name))
+                    .unwrap_or_else(|| panic!("a sum of {name}: {folds:?}"))
+            };
             assert_eq!(folds.len(), 3, "one sum a site and parent: {folds:?}");
             let short = sum("fold short");
-            assert_eq!((short.spans, short.root, short.build, short.parent_site), (100, true, 23, 0));
-            assert!(short.dur_ns >= short.max_dur_ns && short.to_ns >= short.from_ns && short.max_dur_ns > 0, "{short:?}");
+            assert_eq!(
+                (short.spans, short.root, short.build, short.parent_site),
+                (100, true, 23, 0)
+            );
+            assert!(
+                short.dur_ns >= short.max_dur_ns
+                    && short.to_ns >= short.from_ns
+                    && short.max_dur_ns > 0,
+                "{short:?}"
+            );
             let child = sum("fold child");
             assert_eq!((child.spans, child.root, child.parent_site), (3, false, parent.site));
-            assert_eq!(child.dur_ns, parent.folded_ns, "the parent's folded time is its children's sum");
-            assert_eq!(sum(<span::Wait as span::Span>::NAME).spans, 1, "a wait shorter than its bound folds, counted");
+            assert_eq!(
+                child.dur_ns, parent.folded_ns,
+                "the parent's folded time is its children's sum"
+            );
+            assert_eq!(
+                sum(<span::Wait as span::Span>::NAME).spans,
+                1,
+                "a wait shorter than its bound folds, counted"
+            );
             for _ in 0..10 {
                 let _short = tracing::info_span!(target: "blaze", "fold at the end").entered();
             }
@@ -4584,8 +4856,14 @@ mod tests {
         });
         let (tid, mut cursor) = thread.join().unwrap();
         let (folds, _) = mine(&mut cursor, tid);
-        let ended: Vec<_> = folds.iter().filter(|it| meta(it.site).map(|it| it.name()) == Some("fold at the end")).collect();
-        assert!(matches!(ended.as_slice(), [it] if it.spans == 10), "a thread that ends writes its sums as its ring passes on: {folds:?}");
+        let ended: Vec<_> = folds
+            .iter()
+            .filter(|it| meta(it.site).map(|it| it.name()) == Some("fold at the end"))
+            .collect();
+        assert!(
+            matches!(ended.as_slice(), [it] if it.spans == 10),
+            "a thread that ends writes its sums as its ring passes on: {folds:?}"
+        );
     }
 
     #[test]
@@ -4610,7 +4888,10 @@ mod tests {
             .filter_map(|it| span::read::<span::Job>(it).ok().flatten())
             .map(|it| it.fields.creator)
             .collect();
-        assert!(named.contains(&Some(creator)), "the job's span names the span it was given in, {creator}: {named:?}");
+        assert!(
+            named.contains(&Some(creator)),
+            "the job's span names the span it was given in, {creator}: {named:?}"
+        );
     }
 
     /// A job tree a pool runs: job 0 is given to the pool from the test's thread, each other
@@ -4652,7 +4933,11 @@ mod tests {
     /// job's upgrade, which lives only for the parent's run, for the rest.
     fn give(pool: &blaze_graph::pool::Pool, case: std::sync::Arc<Case>, job: usize) {
         let done = case.done.clone();
-        pool.submit(None, move || run_job(&case, job), move |it| done.send((job, it.is_ok())).unwrap());
+        pool.submit(
+            None,
+            move || run_job(&case, job),
+            move |it| done.send((job, it.is_ok())).unwrap(),
+        );
     }
 
     fn run_job(case: &std::sync::Arc<Case>, job: usize) {
@@ -4662,15 +4947,20 @@ mod tests {
             Some(key) => {
                 let mut bytes = [key; 32];
                 bytes[..4].copy_from_slice(&case.build.to_le_bytes());
-                let got = case.flights.get_or_run_named(blaze_graph::Key(bytes), |it| it.push_str("pool run key"), || {
-                    blaze_graph::spin::busy(spin);
-                    Ok(0)
-                });
+                let got = case.flights.get_or_run_named(
+                    blaze_graph::Key(bytes),
+                    |it| it.push_str("pool run key"),
+                    || {
+                        blaze_graph::spin::busy(spin);
+                        Ok(0)
+                    },
+                );
                 assert!(got.is_ok(), "nothing cancels a key's run here");
             }
             None => blaze_graph::spin::busy(spin),
         }
-        let children: Vec<usize> = (1..case.tree.parent.len()).filter(|&it| case.tree.parent[it] == job).collect();
+        let children: Vec<usize> =
+            (1..case.tree.parent.len()).filter(|&it| case.tree.parent[it] == job).collect();
         if children.is_empty() {
             return;
         }
@@ -4691,13 +4981,24 @@ mod tests {
             .filter(|it| it.build == build && matches!(it.event, Switched::Started | Switched::Ran))
             .map(|it| it.job)
             .collect();
-        let began: Vec<u64> = read.switches.iter().filter(|it| jobs.contains(&it.job)).filter_map(|it| it.began_as).collect();
+        let began: Vec<u64> = read
+            .switches
+            .iter()
+            .filter(|it| jobs.contains(&it.job))
+            .filter_map(|it| it.began_as)
+            .collect();
         jobs.extend(began);
-        let spans: std::collections::HashMap<u64, &SpanRow> = read.spans.iter().map(|it| (it.span_id, it)).collect();
+        let spans: std::collections::HashMap<u64, &SpanRow> =
+            read.spans.iter().map(|it| (it.span_id, it)).collect();
         // A fn, not a closure: an annotated closure argument is higher-ranked, and walking up to a
         // parent from the map needs the argument and the map's rows to share one lifetime.
-        fn root<'a>(spans: &std::collections::HashMap<u64, &'a SpanRow>, mut it: &'a SpanRow) -> &'a SpanRow {
-            while let Some(parent) = spans.get(&it.parent).copied().filter(|_| it.parent != 0 && it.depth > 0) {
+        fn root<'a>(
+            spans: &std::collections::HashMap<u64, &'a SpanRow>,
+            mut it: &'a SpanRow,
+        ) -> &'a SpanRow {
+            while let Some(parent) =
+                spans.get(&it.parent).copied().filter(|_| it.parent != 0 && it.depth > 0)
+            {
                 it = parent;
             }
             it
@@ -4705,7 +5006,12 @@ mod tests {
         let root_job = |it| root(&spans, it).get::<span::col::OfJob>();
         Read {
             switches: read.switches.iter().filter(|it| jobs.contains(&it.job)).copied().collect(),
-            spans: read.spans.iter().filter(|it| root_job(it).is_some_and(|job| jobs.contains(&job))).copied().collect(),
+            spans: read
+                .spans
+                .iter()
+                .filter(|it| root_job(it).is_some_and(|job| jobs.contains(&job)))
+                .copied()
+                .collect(),
             ..Read::default()
         }
     }
@@ -4716,40 +5022,68 @@ mod tests {
     /// spawner and from each wait to its waker without a gap, from the build's first row to its
     /// last.
     #[hegel::test(test_cases = 40)]
-    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build(tc: hegel::TestCase) {
+    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build(
+        tc: hegel::TestCase,
+    ) {
         use blaze_graph::{pool::Pool, pump::Flights, topology::Topology};
 
         use crate::time::{Begin, End, Input, Model, path};
         // The rings outlive each case's pool, so each case's rows are told apart by build.
         static BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7000);
         crate::install();
-        let pool = std::sync::Arc::new(Pool::new(&Topology::flat(2), false).expect("the pool starts"));
+        let pool =
+            std::sync::Arc::new(Pool::new(&Topology::flat(2), false).expect("the pool starts"));
         let tree = tree(&tc);
         let jobs = tree.parent.len();
         let build = BUILDS.fetch_add(1, Ordering::Relaxed);
         let (done, finished) = crossbeam_channel::unbounded();
-        let case = Case { tree, build, flights: Flights::new(), pool: std::sync::Arc::downgrade(&pool), done };
+        let case = Case {
+            tree,
+            build,
+            flights: Flights::new(),
+            pool: std::sync::Arc::downgrade(&pool),
+            done,
+        };
         give(&pool, std::sync::Arc::new(case), 0);
         for _ in 0..jobs {
-            let (job, ok) = finished.recv_timeout(Duration::from_secs(60)).expect("every job finishes within a minute");
+            let (job, ok) = finished
+                .recv_timeout(Duration::from_secs(60))
+                .expect("every job finishes within a minute");
             assert!(ok, "job {job} of build {build} panicked");
         }
         // A worker writes a job's `ended` (or `ran`) row after its `done`; joining the workers
         // is what makes every one of them written before the read.
-        let pool = std::sync::Arc::into_inner(pool).expect("no job holds the pool once every job is done");
+        let pool =
+            std::sync::Arc::into_inner(pool).expect("no job holds the pool once every job is done");
         drop(pool);
         let mut all = Read::default();
         window(Duration::from_secs(600), &mut all);
         let read = of_build(&all, build);
-        let ended = read.switches.iter().filter(|it| matches!(it.event, Switched::Ended | Switched::Ran)).count();
-        assert_eq!(ended, jobs, "build {build}: one end row a job, all written once the pool's workers are joined");
-        let input = Input { build: u64::from(build), ..Input::of_read(&read, 1).expect("the recorder's rows read") };
+        let ended = read
+            .switches
+            .iter()
+            .filter(|it| matches!(it.event, Switched::Ended | Switched::Ran))
+            .count();
+        assert_eq!(
+            ended, jobs,
+            "build {build}: one end row a job, all written once the pool's workers are joined"
+        );
+        let input = Input {
+            build: u64::from(build),
+            ..Input::of_read(&read, 1).expect("the recorder's rows read")
+        };
         let m = Model::build(input).expect("the build has rows");
 
         let lanes: Vec<_> = m.lanes.iter().filter(|it| it.id.job().is_some()).collect();
         assert_eq!(lanes.len(), jobs, "one lane a job: {:?}", read.switches);
         for lane in lanes {
-            assert_eq!((lane.begin, lane.end), (Begin::Started, End::Ended), "{}: {:?}", lane.id, lane.intervals);
+            assert_eq!(
+                (lane.begin, lane.end),
+                (Begin::Started, End::Ended),
+                "{}: {:?}",
+                lane.id,
+                lane.intervals
+            );
             let totals = lane.totals();
             assert_eq!(totals.unrecorded_ns, 0, "{}: {:?}", lane.id, lane.intervals);
             assert_eq!(totals.total(), lane.end_ns() - lane.begin_ns(), "{}", lane.id);
@@ -4759,7 +5093,12 @@ mod tests {
         for pair in path.links.windows(2) {
             assert_eq!(pair[0].to_ns, pair[1].from_ns, "links meet: {:?}", path.links);
         }
-        assert_eq!((path.start_ns(), path.end_ns()), (Some(m.bounds.start_ns), Some(m.bounds.end_ns)), "{:?}", path.links);
+        assert_eq!(
+            (path.start_ns(), path.end_ns()),
+            (Some(m.bounds.start_ns), Some(m.bounds.end_ns)),
+            "{:?}",
+            path.links
+        );
     }
 
     #[test]
@@ -4799,7 +5138,10 @@ mod tests {
             ]
         );
         assert!(
-            read.counters.iter().filter(|it| it.plot == Plot::Queued && it.build == 9).all(|it| it.fiber.is_none()),
+            read.counters
+                .iter()
+                .filter(|it| it.plot == Plot::Queued && it.build == 9)
+                .all(|it| it.fiber.is_none()),
             "a plot is of no fiber"
         );
     }

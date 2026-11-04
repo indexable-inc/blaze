@@ -93,7 +93,9 @@ pub(crate) struct Merge {
 pub(crate) fn plan(files: &[Name], ended: Option<u64>) -> Vec<Merge> {
     // alloc: once a flush that compacts
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_unstable_by_key(|&at| (files[at].group(), files[at].first, files[at].last, files[at].level));
+    order.sort_unstable_by_key(|&at| {
+        (files[at].group(), files[at].first, files[at].last, files[at].level)
+    });
     // alloc: once a flush that compacts
     let mut merges = Vec::new();
     for group in order.chunk_by(|&a, &b| files[a].group() == files[b].group()) {
@@ -111,13 +113,15 @@ struct Item {
 
 fn plan_group(files: &[Name], group: &[usize], ended: Option<u64>, merges: &mut Vec<Merge>) {
     // alloc: a group's files, once a flush that compacts
-    let mut items: Vec<Item> = group.iter().map(|&at| Item { name: files[at], covers: vec![at] }).collect();
+    let mut items: Vec<Item> =
+        group.iter().map(|&at| Item { name: files[at], covers: vec![at] }).collect();
     // Each merge takes `FAN_IN` items and gives back one, so a group of n files merges fewer
     // than n times.
     for _ in 0..group.len() {
         let Some(level) = lowest_full(&items) else { break };
         // alloc: a merge's files, once a merge
-        let mut at: Vec<usize> = (0..items.len()).filter(|&it| items[it].name.level == level).collect();
+        let mut at: Vec<usize> =
+            (0..items.len()).filter(|&it| items[it].name.level == level).collect();
         at.sort_unstable_by_key(|&it| (items[it].name.first, items[it].name.last));
         at.truncate(FAN_IN);
         fold(&mut items, &mut at, level + 1);

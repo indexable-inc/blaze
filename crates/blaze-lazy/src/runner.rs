@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
 use blaze_hash::{HashMap, SharedMap};
-use std::alloc::Global;
 use blaze_inproc::CellView;
 use blaze_inproc::ask::{self, Reader, Sender};
 use blaze_inproc::frame::Kind;
@@ -46,6 +45,7 @@ use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::{self, Tier};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use std::alloc::Global;
 
 use crate::{
     LazyId,
@@ -130,7 +130,9 @@ impl<C: Compiler, P: Placer, A: Answers> tier::Recompile for Recompiler<C, P, A>
         let shared = self
             .0
             .upgrade() // alloc: below, only once the runner closed
-            .ok_or_else(|| format!("tier-up of lazy function {function}: the lazy runner closed"))?;
+            .ok_or_else(|| {
+                format!("tier-up of lazy function {function}: the lazy runner closed")
+            })?;
         shared.recompile(LazyId(function), to)
     }
 }
@@ -244,7 +246,13 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         // alloc: setup, once per run.
         let shared = Arc::new(Shared {
             session,
-            state: Mutex::new(State { fetcher, closing: false, idle_queued: false, parked: 0, last_ask: None }),
+            state: Mutex::new(State {
+                fetcher,
+                closing: false,
+                idle_queued: false,
+                parked: 0,
+                last_ask: None,
+            }),
             wake: Condvar::new(),
             jobs: AtomicU64::new(0),
             spinning: AtomicBool::new(false),
@@ -254,11 +262,12 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             idle: config.idle,
             tier: Mutex::new(None),
             unbound: SegQueue::new(),
-            spare: Mutex::new(Vec::new()),   // alloc: setup; a buffer per thread that asks at once
+            spare: Mutex::new(Vec::new()), // alloc: setup; a buffer per thread that asks at once
         });
         if let Some(up) = tier {
             let recompiler = Recompiler(Arc::downgrade(&shared));
-            let runner = tier::Runner::start(functions, up.policy, up.config, Cells(up.cells), recompiler)?;
+            let runner =
+                tier::Runner::start(functions, up.policy, up.config, Cells(up.cells), recompiler)?;
             *lock(&shared.tier) = Some(Tiered {
                 runner,
                 bound: vec![false; functions as usize], // alloc: setup, once per run
@@ -292,7 +301,9 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             };
             if let Err(error) = self.frame(client, frame.kind, frame.seq, frame.body) {
                 // alloc: the run's end.
-                return format!("process {client} asked what is not a lazy function's code: {error}");
+                return format!(
+                    "process {client} asked what is not a lazy function's code: {error}"
+                );
             }
         }
     }
@@ -339,12 +350,19 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         let mut tiered = lock(&self.shared.tier);
         let Some(tiered) = tiered.as_mut() else {
             // alloc: the daemon's mistake, reported.
-            return Err(format!("remembering {tier:?} for lazy function {}: the run is not tiered", id.0));
+            return Err(format!(
+                "remembering {tier:?} for lazy function {}: the run is not tiered",
+                id.0
+            ));
         };
         match tiered.bound.get(id.index()) {
             None => {
                 // alloc: the daemon's mistake, reported.
-                Err(format!("remembering {tier:?} for lazy function {}, of {}", id.0, tiered.bound.len()))
+                Err(format!(
+                    "remembering {tier:?} for lazy function {}, of {}",
+                    id.0,
+                    tiered.bound.len()
+                ))
             }
             Some(true) => {
                 tiered.runner.remembered(id.0, tier);
@@ -419,7 +437,12 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let mut state = lock(&self.state);
         if let Some(target) = state.fetcher.target(LazyId(lazy)) {
             drop(state);
-            self.answers.send(to.client, to.seq, wire::READY_KIND, &wire::ready(to.request, lazy, target));
+            self.answers.send(
+                to.client,
+                to.seq,
+                wire::READY_KIND,
+                &wire::ready(to.request, lazy, target),
+            );
             return;
         }
         let id = LazyId(lazy);
@@ -545,7 +568,12 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
 
     fn buffers(&self) -> Buffers {
         // alloc: a thread's buffers, made once and reused for every compile it ends.
-        Buffers { actions: Vec::new(), callees: Vec::new(), frame: Vec::new(), seen: self.session.plan().scratch() }
+        Buffers {
+            actions: Vec::new(),
+            callees: Vec::new(),
+            frame: Vec::new(),
+            seen: self.session.plan().scratch(),
+        }
     }
 
     /// The end of `id`'s compile: recorded, answered (its waiters, and `asker`, who started it
@@ -613,7 +641,9 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let (target, cells) = {
             let mut placer = lock(&self.placer);
             // alloc: only for a placement that failed.
-            let target = placer.replace(key, &function).map_err(|why| named(&format!("placing it: {why}")))?;
+            let target = placer
+                .replace(key, &function)
+                .map_err(|why| named(&format!("placing it: {why}")))?;
             (target, placer.cells(&function.key))
         };
         if target == 0 {
@@ -627,7 +657,10 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
 
     /// `id`'s code, compiled, placed and published: where it runs, the function and where it
     /// counts, or why not, naming it.
-    fn compile_and_place(&self, id: LazyId) -> Result<(u64, CompiledFunction, Option<u64>), String> {
+    fn compile_and_place(
+        &self,
+        id: LazyId,
+    ) -> Result<(u64, CompiledFunction, Option<u64>), String> {
         let key = self.session.plan().key(id);
         self.place_compiled(id, catch_unwind(AssertUnwindSafe(|| self.compiler.compile(key))))
     }
@@ -650,7 +683,10 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let (key, item) = (plan.key(id), plan.item(id));
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.compiler.hit_answered(key))) {
             // alloc: the run's end.
-            let why = format!("keeping {key:?} (item {item:?}) after its first call: the compiler panicked: {}", panic_text(&*payload));
+            let why = format!(
+                "keeping {key:?} (item {item:?}) after its first call: the compiler panicked: {}",
+                panic_text(&*payload)
+            );
             self.answers.stop(Some((key, item)), &why);
         }
     }
@@ -665,14 +701,19 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let plan = self.session.plan();
         let (key, item) = (plan.key(id), plan.item(id));
         // alloc: called only for a failure.
-        let named = |why: &str| format!("compiling {key:?} (item {item:?}) on its first call: {why}");
+        let named =
+            |why: &str| format!("compiling {key:?} (item {item:?}) on its first call: {why}");
         let function = match compiled {
             Ok(Ok(function)) if function.key == key => function,
             // alloc: a failure.
-            Ok(Ok(function)) => return Err(named(&format!("the compiler gave {:?}", function.key))),
+            Ok(Ok(function)) => {
+                return Err(named(&format!("the compiler gave {:?}", function.key)));
+            }
             Ok(Err(why)) => return Err(named(&why)),
             // alloc: a failure.
-            Err(payload) => return Err(named(&format!("the compiler panicked: {}", panic_text(&*payload)))),
+            Err(payload) => {
+                return Err(named(&format!("the compiler panicked: {}", panic_text(&*payload))));
+            }
         };
         let placed = catch_unwind(AssertUnwindSafe(|| {
             let mut placer = lock(&self.placer);
@@ -702,7 +743,8 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
                     self.answers.send(to.client, to.seq, wire::FAILED_KIND, frame);
                 }
                 Action::Stop { lazy, why } => {
-                    let function = (*lazy < plan.len()).then(|| (plan.key(LazyId(*lazy)), plan.item(LazyId(*lazy))));
+                    let function = (*lazy < plan.len())
+                        .then(|| (plan.key(LazyId(*lazy)), plan.item(LazyId(*lazy))));
                     self.answers.stop(function, why);
                 }
             }

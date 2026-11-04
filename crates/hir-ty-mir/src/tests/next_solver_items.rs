@@ -12,12 +12,12 @@ use hir_def::{
         TraitSignature,
     },
 };
+use hir_expand::fixture;
 use intern::sym;
 use rustc_type_ir::{
     Interner as _,
     inherent::{GenericsOf as _, IntoKind as _},
 };
-use hir_expand::fixture;
 
 use crate::{
     InferenceResult,
@@ -36,8 +36,12 @@ fn declared(db: &TestDB, scope: &ItemScope, name: &str) -> ModuleDefId {
     scope
         .declarations()
         .find(|&decl| match decl {
-            ModuleDefId::AdtId(AdtId::StructId(it)) => StructSignature::of(db, it).name.as_str() == name,
-            ModuleDefId::AdtId(AdtId::EnumId(it)) => EnumSignature::of(db, it).name.as_str() == name,
+            ModuleDefId::AdtId(AdtId::StructId(it)) => {
+                StructSignature::of(db, it).name.as_str() == name
+            }
+            ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                EnumSignature::of(db, it).name.as_str() == name
+            }
             ModuleDefId::FunctionId(it) => FunctionSignature::of(db, it).name.as_str() == name,
             ModuleDefId::ConstId(it) => {
                 ConstSignature::of(db, it).name.as_ref().is_some_and(|it| it.as_str() == name)
@@ -210,8 +214,13 @@ fn h(_: N<{ 1 + 1 }>) {}
         };
         let variant = e.enum_variants(&db).variants.values().next().expect("a variant").0;
 
-        let named: [(SolverDefId<'_>, &str); 5] =
-            [(s.into(), "S"), (f.into(), "f"), (c.into(), "C"), (tr.into(), "Tr"), (variant.into(), "V")];
+        let named: [(SolverDefId<'_>, &str); 5] = [
+            (s.into(), "S"),
+            (f.into(), "f"),
+            (c.into(), "C"),
+            (tr.into(), "Tr"),
+            (variant.into(), "V"),
+        ];
         for (def, name) in named {
             let item_name = interner.item_name(def);
             assert_eq!(item_name.0.as_str(), name, "the name of {def:?}");
@@ -237,7 +246,11 @@ fn h(_: N<{ 1 + 1 }>) {}
         let anonymous: [SolverDefId<'_>; 3] =
             [impl_with(&db, scope, "m").into(), closure.into(), anon_const.into()];
         for def in anonymous {
-            assert_eq!(interner.item_name(def), Symbol(sym::tick_underscore), "the name of {def:?}");
+            assert_eq!(
+                interner.item_name(def),
+                Symbol(sym::tick_underscore),
+                "the name of {def:?}"
+            );
             assert_eq!(BoundRegionKind::Named(def).get_name(interner), None);
         }
     });

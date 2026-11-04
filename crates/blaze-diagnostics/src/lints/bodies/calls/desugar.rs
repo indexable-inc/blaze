@@ -41,7 +41,9 @@ fn for_loop(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<ForLoop> {
     let store = b.store();
     let Expr::Match { expr: into_iter, arms: [arm] } = store.expr(expr) else { return None };
     let Expr::Call { args: [head], .. } = store.expr(into_iter) else { return None };
-    let Expr::Loop { body, source: LoopSource::ForLoop, .. } = store.expr(arm.expr) else { return None };
+    let Expr::Loop { body, source: LoopSource::ForLoop, .. } = store.expr(arm.expr) else {
+        return None;
+    };
     let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };
     if !statements.is_empty() {
         return None;

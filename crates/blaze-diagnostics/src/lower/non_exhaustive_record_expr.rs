@@ -17,7 +17,9 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordExpr) -> Vec<Found> {
     let span = cx.span_of_ptr(d.expr);
     // alloc: empty, allocates nothing
-    let Some(syntax::view::Expr::RecordExpr(record)) = cx.node_view(d.expr).value.left() else { return vec![] };
+    let Some(syntax::view::Expr::RecordExpr(record)) = cx.node_view(d.expr).value.left() else {
+        return vec![];
+    };
     // alloc: empty, allocates nothing
     let Some(variant) = cx.vsema.resolve_variant(record) else { return vec![] };
     let what = variant_descr(variant);

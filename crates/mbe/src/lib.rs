@@ -600,7 +600,11 @@ pub fn expect_fragment<'t>(
 
 /// The first error a fragment's parse made: the parser's message, at the token it was at when
 /// it made it (`cursor`), or at the group's close when it was at the end.
-pub(crate) fn fragment_error(cursor: &tt::buffer::Cursor<'_>, msg: &str, delim_span: DelimSpan) -> ExpandError {
+pub(crate) fn fragment_error(
+    cursor: &tt::buffer::Cursor<'_>,
+    msg: &str,
+    delim_span: DelimSpan,
+) -> ExpandError {
     let span = cursor.token_tree().map_or(delim_span.close, |tt| tt.first_span());
     ExpandError::binding_error(span, msg)
 }

@@ -76,9 +76,9 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
             false => root,
         };
         let span = cx.span(finding.range);
-        let suggestion = finding
-            .suggestion
-            .map(|(range, message, code, applicability)| (cx.span(range), message, code, applicability));
+        let suggestion = finding.suggestion.map(|(range, message, code, applicability)| {
+            (cx.span(range), message, code, applicability)
+        });
         let diagnostic = cx.blaze(finding.lint, at, span, finding.message);
         for note in finding.notes {
             diagnostic.note(note);
@@ -154,8 +154,9 @@ fn find(cx: &Cx<'_, '_>, on_parallel: bool, on_serial: bool) -> Vec<Finding> {
 /// float reductions be computed in any order (and so round differently).
 fn reassociate(cx: &Cx<'_, '_>) -> bool {
     ast::AnyHasAttrs::cast(cx.root()).is_some_and(|item| {
-        item.attrs()
-            .any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "blaze::reassociate"))
+        item.attrs().any(|attr| {
+            attr.path().is_some_and(|path| path.syntax().text() == "blaze::reassociate")
+        })
     })
 }
 
@@ -254,7 +255,9 @@ impl<'db> Body<'_, '_, 'db> {
                 Closure::Independent { cost, writes_item: false } => work += cost,
                 Closure::Independent { writes_item: true, .. } => return None,
                 Closure::Captures => {
-                    return Some(Err(Dependence::Carried { name: "an adaptor's closure".to_owned() }));
+                    return Some(Err(Dependence::Carried {
+                        name: "an adaptor's closure".to_owned(),
+                    }));
                 }
             }
         }
@@ -305,7 +308,9 @@ impl<'db> Body<'_, '_, 'db> {
                     let wrapped = format!("({range_text})");
                     match text.contains(&wrapped) {
                         true => text.replacen(&wrapped, &format!("{wrapped}.into_par_iter()"), 1),
-                        false => text.replacen(range_text, &format!("{wrapped}.into_par_iter()"), 1),
+                        false => {
+                            text.replacen(range_text, &format!("{wrapped}.into_par_iter()"), 1)
+                        }
                     }
                 }
             };
@@ -522,7 +527,9 @@ impl<'db> Body<'_, '_, 'db> {
         }
         let mut work = match self.closures(&chain)? {
             Ok(it) => it,
-            Err(dependence) => return self.serial_chain(id, receiver, &dependence, chain.overhead()),
+            Err(dependence) => {
+                return self.serial_chain(id, receiver, &dependence, chain.overhead());
+            }
         };
         let output = infer.expr_ty(id);
         let mut reduction = None;

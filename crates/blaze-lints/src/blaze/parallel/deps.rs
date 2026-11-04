@@ -42,7 +42,9 @@ use hir_ty::{
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _};
 
 use super::{
-    effects::{self, DEEP, DIRECT, Effects, FRESH, STATIC, UNKNOWN, deep, derefs, direct, index_of},
+    effects::{
+        self, DEEP, DIRECT, Effects, FRESH, STATIC, UNKNOWN, deep, derefs, direct, index_of,
+    },
     iter::{Chain, Std},
     region::{self, Cycles, Liveness},
 };
@@ -192,9 +194,9 @@ impl Dependence {
                 "`{name}` is a `HashSet` the iterations insert into, and the order it iterates \
                  in depends on the order they run"
             ),
-            Dependence::CrossIndex { name } => format!(
-                "an iteration reads `{name}` at an index another iteration writes"
-            ),
+            Dependence::CrossIndex { name } => {
+                format!("an iteration reads `{name}` at an index another iteration writes")
+            }
             Dependence::Effect { said } => {
                 format!("each iteration {said}, which the others see in the order they run")
             }
@@ -213,12 +215,12 @@ impl Dependence {
                  (`.par_iter().map(..).collect::<Vec<_>>()` then `{}` over the `Vec`)",
                 reduction.rayon()
             ),
-            Dependence::Ordered { name } => format!(
-                "build `{name}` with rayon's `.map(..).collect()`, which keeps the order"
-            ),
-            Dependence::HashOrder { name } => format!(
-                "collect `{name}` into a `BTreeSet`, whose order is its elements'"
-            ),
+            Dependence::Ordered { name } => {
+                format!("build `{name}` with rayon's `.map(..).collect()`, which keeps the order")
+            }
+            Dependence::HashOrder { name } => {
+                format!("collect `{name}` into a `BTreeSet`, whose order is its elements'")
+            }
             Dependence::CrossIndex { name } => format!(
                 "read `{name}` from a copy made before the loop, or keep the dependence serial"
             ),
@@ -263,7 +265,9 @@ enum Base {
     /// What the parameter points at, and all that is reachable from there.
     Outer(LocalId),
     /// Memory allocated in the loop, or before it.
-    Fresh { inside: bool },
+    Fresh {
+        inside: bool,
+    },
     Static,
     Unknown,
 }
@@ -379,11 +383,10 @@ impl<'a, 'db> Mir<'a, 'db> {
 
     /// The name of the binding `local` is, or `_` for a temporary.
     pub(crate) fn name(&self, local: LocalId) -> String {
-        self.mir
-            .binding_locals
-            .iter()
-            .find(|(_, it)| **it == local)
-            .map_or_else(|| "_".to_owned(), |(binding, _)| self.hir[binding].name.as_str().to_owned())
+        self.mir.binding_locals.iter().find(|(_, it)| **it == local).map_or_else(
+            || "_".to_owned(),
+            |(binding, _)| self.hir[binding].name.as_str().to_owned(),
+        )
     }
 
     fn implements(&self, ty: Ty<'db>, trait_: Option<hir_def::TraitId>) -> bool {
@@ -641,23 +644,32 @@ impl<'db> Look<'_, '_, 'db> {
                 _ => None,
             },
             Site::Call { block } => self.call_root(block),
-            Site::Replace { block } => match self.m.blocks[block].terminator.as_ref().map(|it| &it.kind) {
-                Some(TerminatorKind::DropAndReplace { value, .. }) => self.operand_root(value),
-                _ => Some(UNKNOWN_ROOT),
-            },
+            Site::Replace { block } => {
+                match self.m.blocks[block].terminator.as_ref().map(|it| &it.kind) {
+                    Some(TerminatorKind::DropAndReplace { value, .. }) => self.operand_root(value),
+                    _ => Some(UNKNOWN_ROOT),
+                }
+            }
         }
     }
 
     fn rvalue_root(&self, rvalue: &Rvalue) -> Option<Root> {
         match rvalue {
-            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::UnaryOp(_, it) => self.operand_root(it),
+            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::UnaryOp(_, it) => {
+                self.operand_root(it)
+            }
             Rvalue::Cast(CastKind::PointerFromExposedAddress | CastKind::Transmute, _, _) => {
                 Some(UNKNOWN_ROOT)
             }
             Rvalue::Cast(_, it, _) => self.operand_root(it),
-            Rvalue::Ref(_, place) => Some(self.memory_root(place.local, place.projection.as_slice())),
-            Rvalue::CopyForDeref(place) => self.value_root(place.local, place.projection.as_slice()),
-            Rvalue::BinaryOp(BinOp::Offset, it, _) | Rvalue::CheckedBinaryOp(BinOp::Offset, it, _) => {
+            Rvalue::Ref(_, place) => {
+                Some(self.memory_root(place.local, place.projection.as_slice()))
+            }
+            Rvalue::CopyForDeref(place) => {
+                self.value_root(place.local, place.projection.as_slice())
+            }
+            Rvalue::BinaryOp(BinOp::Offset, it, _)
+            | Rvalue::CheckedBinaryOp(BinOp::Offset, it, _) => {
                 self.operand_root(it).map(|it| Root { index: None, ..it })
             }
             Rvalue::BinaryOp(..) | Rvalue::CheckedBinaryOp(..) => None,
@@ -855,7 +867,9 @@ impl<'db> Look<'_, '_, 'db> {
                 self.read_place(place, false, tally);
                 Ok(())
             }
-            OperandKind::Static(id) if effects::static_changes(self.m.db, self.m.env.krate, *id) => {
+            OperandKind::Static(id)
+                if effects::static_changes(self.m.db, self.m.env.krate, *id) =>
+            {
                 Err(Shared)
             }
             _ => Ok(()),
@@ -889,7 +903,8 @@ impl<'db> Look<'_, '_, 'db> {
                 continue;
             }
             let weight = if inner.contains_index(index) { effects::LOOP_WEIGHT } else { 1 };
-            work = work.saturating_add(effects::block_cost(m.db, m.env, block).saturating_mul(weight));
+            work =
+                work.saturating_add(effects::block_cost(m.db, m.env, block).saturating_mul(weight));
             for statement in &block.statements {
                 tally.may_panic |= statement.kind.may_panic();
                 match &statement.kind {
@@ -900,7 +915,9 @@ impl<'db> Look<'_, '_, 'db> {
                     StatementKind::InlineAsm(_) => return Err(Shared),
                     StatementKind::FakeRead(place) => self.use_place(place, &mut tally),
                     StatementKind::Deinit(place) => self.write_place(place, &mut tally)?,
-                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
+                    StatementKind::StorageLive(_)
+                    | StatementKind::StorageDead(_)
+                    | StatementKind::Nop => {}
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
@@ -943,7 +960,8 @@ impl<'db> Look<'_, '_, 'db> {
                     }
                     self.write_place(destination, &mut tally)?;
                 }
-                TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
+                TerminatorKind::Drop { place, .. }
+                | TerminatorKind::DropAndReplace { place, .. } => {
                     let ty = self.m.place_ty(place.local, place.projection.as_slice());
                     if !effects::drop_summary(m.db, m.env, ty).allowed() {
                         return Err(Shared);
@@ -966,16 +984,20 @@ impl<'db> Look<'_, '_, 'db> {
         }
         let mut dependences = std::mem::take(&mut tally.effects);
         for &base in &tally.indexed {
-            let at_other = tally.reads.iter().any(|&(read, len)| {
-                read.base == base && !len && !self.is_own(read.index)
-            });
+            let at_other = tally
+                .reads
+                .iter()
+                .any(|&(read, len)| read.base == base && !len && !self.is_own(read.index));
             let whole = matches!(base, Base::Local(local) if tally.mutated[index_of(local)]);
             if at_other || whole {
                 let name = match base {
                     Base::Local(local) | Base::Outer(local) => m.name(local),
                     _ => "_".to_owned(),
                 };
-                if !dependences.iter().any(|it| matches!(it, Dependence::CrossIndex { name: n } if *n == name)) {
+                if !dependences
+                    .iter()
+                    .any(|it| matches!(it, Dependence::CrossIndex { name: n } if *n == name))
+                {
                     dependences.push(Dependence::CrossIndex { name });
                 }
             }
@@ -1194,7 +1216,12 @@ impl<'db> Look<'_, '_, 'db> {
                 BinOp::BitXor => Reduction::Xor,
                 _ => return Err(carried()),
             };
-            return self.typed(name, ty, reduction, checked && matches!(op, BinOp::Add | BinOp::Mul));
+            return self.typed(
+                name,
+                ty,
+                reduction,
+                checked && matches!(op, BinOp::Add | BinOp::Mul),
+            );
         }
         // `local = min(local, e)` / `local.max(e)`: `local` passed as it is or read into a
         // temporary only the call takes (rustc's `as_call_operand`), the result straight into
@@ -1203,7 +1230,9 @@ impl<'db> Look<'_, '_, 'db> {
             // A `FakeRead` (of an assignment's right side) uses nothing.
             let private = |temp: LocalId| {
                 let uses = self.occurrences(temp).into_iter().filter(|&(block, at)| {
-                    at.is_none_or(|at| !matches!(self.statement(block, at), StatementKind::FakeRead(_)))
+                    at.is_none_or(|at| {
+                        !matches!(self.statement(block, at), StatementKind::FakeRead(_))
+                    })
                 });
                 !self.outer(temp) && uses.count() == 2
             };
@@ -1400,7 +1429,9 @@ fn is_lang(db: &Db, f: FunctionId) -> bool {
 /// The value of an integer constant operand.
 fn constant(db: &Db, operand: &Operand) -> Option<u128> {
     match &operand.kind {
-        OperandKind::Constant { konst, .. } => hir_ty::consteval::try_const_usize(db, konst.as_ref()),
+        OperandKind::Constant { konst, .. } => {
+            hir_ty::consteval::try_const_usize(db, konst.as_ref())
+        }
         OperandKind::Allocation { allocation } => {
             let memory = &allocation.as_ref().memory;
             (memory.len() <= 16).then(|| {

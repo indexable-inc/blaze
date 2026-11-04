@@ -13,7 +13,10 @@
 //! `find_similarly_named_module_or_crate`, `into_struct_error` of `FailedToResolve`) and
 //! `lib.rs` (`names_to_string`, `module_to_string`) (MIT or Apache-2.0).
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one lowering, dropped with it, not global state"
+)]
 use std::cell::OnceCell;
 
 use blaze_items::Fact;
@@ -94,7 +97,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedImport) -> Vec<Fou
     let mine = r.failure(&r.import(tree.value));
     let error = match mine {
         // alloc: the error's parts, for an error hir found
-        Some(Failure::Path { at, error }) => return vec![Found::new(path_diag(&r, at, error), Phase::Resolve)],
+        Some(Failure::Path { at, error }) => {
+            return vec![Found::new(path_diag(&r, at, error), Phase::Resolve)];
+        }
         Some(Failure::Import(error)) => error,
         None => {
             // hir finds no way to it where this walk finds one: still the error, as rustc's
@@ -102,15 +107,21 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedImport) -> Vec<Fou
             let import = r.import(tree.value);
             let path = import_path(&import, None);
             // alloc: the error's text, for an error hir found
-            let diag = Diag::error(Some("E0432"), format!("unresolved import `{path}`"), r.span(import.range));
+            let diag = Diag::error(
+                Some("E0432"),
+                format!("unresolved import `{path}`"),
+                r.span(import.range),
+            );
             // alloc: the error's parts, for an error hir found
             return vec![Found::new(diag, Phase::Resolve)];
         }
     };
     // rustc gives the failed imports of one `use` item in one diagnostic, at the first: the
     // others give nothing of their own.
-    let leaves = tree.value.syntax().ancestors().find_map(ast::Use::cast).map_or_else(Vec::new, leaves);
-    let at = leaves.iter().position(|it| it.syntax() == tree.value.syntax()).unwrap_or(leaves.len());
+    let leaves =
+        tree.value.syntax().ancestors().find_map(ast::Use::cast).map_or_else(Vec::new, leaves);
+    let at =
+        leaves.iter().position(|it| it.syntax() == tree.value.syntax()).unwrap_or(leaves.len());
     let import_error = |leaf: &ast::UseTree<'db>| {
         let r = Resolver::new(cx, file, leaf.syntax());
         match r.failure(&r.import(*leaf)) {
@@ -206,12 +217,18 @@ pub(super) fn macro_path_error<'db>(
                 };
                 let (expected_an, expected_descr) = expected;
                 // alloc: the error's text, for an error hir found
-                let message = format!("cannot find {expected_descr} `{}` in {scope}", path[unresolved].name);
+                let message =
+                    format!("cannot find {expected_descr} `{}` in {scope}", path[unresolved].name);
                 let span = r.span(range);
                 // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(Some("E0433"), message, span.clone());
                 // alloc: the error's text, for an error hir found
-                diag.span_label(span, format!("{expected_an} {expected_descr} can't exist within {found_an} {found_descr}"));
+                diag.span_label(
+                    span,
+                    format!(
+                        "{expected_an} {expected_descr} can't exist within {found_an} {found_descr}"
+                    ),
+                );
                 return diag;
             }
             Some(found) => module = Some(found),
@@ -250,26 +267,40 @@ pub(super) fn visibility_segments(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Vec<S
 
 /// rustc's E0433 of a `pub(in path)` or `pub(super)` that names nothing
 /// (`try_resolve_visibility`'s `FailedToResolve`): at the first segment that names no module.
-pub(super) fn visibility_path_error<'db>(cx: &Cx<'_, 'db>, file: hir::HirFileId, path: ast::Path<'db>) -> Diag {
+pub(super) fn visibility_path_error<'db>(
+    cx: &Cx<'_, 'db>,
+    file: hir::HirFileId,
+    path: ast::Path<'db>,
+) -> Diag {
     let r = Resolver::new(cx, file, path.syntax());
     let segments = visibility_segments(cx, path);
     let mut module = None;
     for (at, segment) in segments.iter().enumerate() {
         match r.module(&segments[..=at]) {
             Some(found) => module = Some(found),
-            None => return path_diag(&r, segment.range, r.path_error(&segments, at, module, false)),
+            None => {
+                return path_diag(&r, segment.range, r.path_error(&segments, at, module, false));
+            }
         }
     }
     // hir finds no module where this walk finds one: still the error, with what it can say.
     let names = names_to_string(segments.iter().map(|it| it.name.as_str()));
     // alloc: the error's text, for an error hir found
-    Diag::error(Some("E0433"), format!("failed to resolve: `{names}`"), r.span(path.syntax().text_range()))
+    Diag::error(
+        Some("E0433"),
+        format!("failed to resolve: `{names}`"),
+        r.span(path.syntax().text_range()),
+    )
 }
 
 fn suggest(diag: &mut Diag, suggestion: Suggestion) {
     match suggestion.parts.is_empty() {
         true => diag.help(suggestion.message),
-        false => diag.multipart_suggestion(suggestion.message, suggestion.parts, Applicability::MaybeIncorrect),
+        false => diag.multipart_suggestion(
+            suggestion.message,
+            suggestion.parts,
+            Applicability::MaybeIncorrect,
+        ),
     };
 }
 
@@ -327,7 +358,10 @@ fn is_path_segment_keyword(name: &str) -> bool {
 }
 
 /// Resolution of the paths of the import at `node` through hir's resolver.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one lowering, dropped with it, not global state"
+)]
 struct Resolver<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     file: hir::HirFileId,
@@ -337,7 +371,10 @@ struct Resolver<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one lowering, dropped with it, not global state"
+    )]
     fn new(cx: &'c Cx<'a, 'db>, file: hir::HirFileId, node: ast::Node<'db>) -> Self {
         Resolver { cx, file, node, current: OnceCell::new() }
     }
@@ -390,8 +427,12 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         if rest.is_empty() {
             let current = self.current()?;
             return match kind {
-                PathKind::Abs if self.edition() > Edition::Edition2015 => Some(Scope::ExternPrelude),
-                PathKind::Abs | PathKind::Crate => Some(Scope::Def(ModuleDef::Module(current.crate_root(db)))),
+                PathKind::Abs if self.edition() > Edition::Edition2015 => {
+                    Some(Scope::ExternPrelude)
+                }
+                PathKind::Abs | PathKind::Crate => {
+                    Some(Scope::Def(ModuleDef::Module(current.crate_root(db))))
+                }
                 PathKind::Super(n) => {
                     let mut module = current;
                     for _ in 0..n {
@@ -405,7 +446,9 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let path = ModPath::from_segments(kind, rest.iter().map(|it| Name::new_root(&it.name)));
         let mut items = self.cx.vsema.resolve_mod_path(self.node, &path)?;
         items.find_map(|it| match it {
-            ItemInNs::Types(def @ (ModuleDef::Module(_) | ModuleDef::Trait(_))) => Some(Scope::Def(def)),
+            ItemInNs::Types(def @ (ModuleDef::Module(_) | ModuleDef::Trait(_))) => {
+                Some(Scope::Def(def))
+            }
             ItemInNs::Types(def @ ModuleDef::Adt(hir::Adt::Enum(_))) => Some(Scope::Def(def)),
             _ => None,
         })
@@ -471,11 +514,19 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
                     }
                     let (label, note, suggestion) = match self.similar_path(path) {
                         Some((suggested, note)) => {
-                            let suggested = names_to_string(suggested.iter().map(|it| it.name.as_str()));
+                            let suggested =
+                                names_to_string(suggested.iter().map(|it| it.name.as_str()));
                             // alloc: the error's parts, for an error hir found
                             let parts = vec![(self.span(segment.range), suggested)];
                             // alloc: the error's text, for an error hir found
-                            (None, note, Some(Suggestion { parts, message: "a similar path exists".to_owned() }))
+                            (
+                                None,
+                                note,
+                                Some(Suggestion {
+                                    parts,
+                                    message: "a similar path exists".to_owned(),
+                                }),
+                            )
                         }
                         None => (Some(failed.label), None, failed.suggestion),
                     };
@@ -517,17 +568,23 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let names = self.names_in(scope, &source.name);
         // alloc: the error's parts, for an error hir found
         let names: Vec<&str> = names.iter().map(Name::as_str).collect();
-        let suggestion = find_best_match_for_name(&names, &source.name, None).copied().map(|it| Suggestion {
-            // alloc: the error's text, for an error hir found
-            parts: vec![(self.span(source.range), it.to_owned())],
-            // alloc: the error's text, for an error hir found
-            message: "a similar name exists in the module".to_owned(),
-        });
+        let suggestion =
+            find_best_match_for_name(&names, &source.name, None).copied().map(|it| Suggestion {
+                // alloc: the error's text, for an error hir found
+                parts: vec![(self.span(source.range), it.to_owned())],
+                // alloc: the error's text, for an error hir found
+                message: "a similar name exists in the module".to_owned(),
+            });
         let fact = match scope {
             Scope::Def(ModuleDef::Module(m)) => Some((
                 self.cx.resolves_fact(m, &source.name),
                 // alloc: the error's text, for an error hir found
-                format!("what `{}` names in `{}`", source.name, module_to_string(self.cx, ModuleDef::Module(m)).unwrap_or_else(|| "crate".to_owned())),
+                format!(
+                    "what `{}` names in `{}`",
+                    source.name,
+                    module_to_string(self.cx, ModuleDef::Module(m))
+                        .unwrap_or_else(|| "crate".to_owned())
+                ),
             )),
             _ => None,
         };
@@ -555,9 +612,13 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
                 // alloc: the error's parts, for an error hir found
                 .collect(),
             // alloc: the error's parts, for an error hir found
-            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => e.variants_iter(db).map(|it| it.name(db)).collect(),
+            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => {
+                e.variants_iter(db).map(|it| it.name(db)).collect()
+            }
             // alloc: the error's parts, for an error hir found
-            Scope::Def(ModuleDef::Trait(t)) => t.items_iter(db).filter_map(|it| it.name(db)).collect(),
+            Scope::Def(ModuleDef::Trait(t)) => {
+                t.items_iter(db).filter_map(|it| it.name(db)).collect()
+            }
             // alloc: empty, allocates nothing
             _ => Vec::new(),
         };
@@ -573,8 +634,12 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         // alloc: the error's parts, for an error hir found
         let mut path = path.to_vec();
         match path.as_slice() {
-            [first, second, ..] if first.name == ROOT && !is_path_segment_keyword(&second.name) => {}
-            [first, ..] if self.edition() > Edition::Edition2015 && !is_path_segment_keyword(&first.name) => {
+            [first, second, ..] if first.name == ROOT && !is_path_segment_keyword(&second.name) => {
+            }
+            [first, ..]
+                if self.edition() > Edition::Edition2015
+                    && !is_path_segment_keyword(&first.name) =>
+            {
                 // alloc: the error's text, for an error hir found
                 path.insert(0, Segment { name: String::new(), range: TextRange::default() });
             }
@@ -602,7 +667,11 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         }
         let mut crates = self.extern_prelude();
         crates.sort_unstable_by(|a, b| b.symbol().cmp_order(a.symbol()));
-        crates.into_iter().map(|it| with(it.as_str())).find(|it| self.module(it).is_some()).map(|it| (it, None))
+        crates
+            .into_iter()
+            .map(|it| with(it.as_str()))
+            .find(|it| self.module(it).is_some())
+            .map(|it| (it, None))
     }
 
     /// The names of the crate's extern prelude: its dependencies.
@@ -614,7 +683,13 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
     /// rustc's `report_path_resolution_error` of the segment `at` of `path`, `module` what the
     /// segments before it named; `macro_last` when the last segment is looked for as a macro
     /// (an import's path is all of modules).
-    fn path_error(&self, path: &[Segment], at: usize, module: Option<Scope>, macro_last: bool) -> PathError {
+    fn path_error(
+        &self,
+        path: &[Segment],
+        at: usize,
+        module: Option<Scope>,
+        macro_last: bool,
+    ) -> PathError {
         let cx = self.cx;
         let db = cx.db;
         let ident = &path[at];
@@ -635,7 +710,8 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         };
         let fact = in_module.map(|m| {
             // alloc: the error's text, for an error hir found
-            let of = module_to_string(cx, ModuleDef::Module(m)).map_or_else(|| "the crate root".to_owned(), |it| format!("`{it}`"));
+            let of = module_to_string(cx, ModuleDef::Module(m))
+                .map_or_else(|| "the crate root".to_owned(), |it| format!("`{it}`"));
             // alloc: the error's text, for an error hir found
             (cx.resolves_fact(m, name), format!("what `{name}` names in {of}"))
         });
@@ -676,7 +752,10 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
                     // alloc: the error's text, for an error hir found
                     "you might be missing crate `core`".to_owned(),
                     // alloc: the error's text, for an error hir found
-                    Some(Suggestion { parts, message: "try using `std` instead of `core`".to_owned() }),
+                    Some(Suggestion {
+                        parts,
+                        message: "try using `std` instead of `core`".to_owned(),
+                    }),
                 );
             }
             if name == "_" {
@@ -705,7 +784,9 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         if at > 0 {
             let parent = match path[at - 1].name.as_str() {
                 // alloc: the error's text, for an error hir found
-                ROOT if self.edition() > Edition::Edition2015 => "the list of imported crates".to_owned(),
+                ROOT if self.edition() > Edition::Edition2015 => {
+                    "the list of imported crates".to_owned()
+                }
                 // alloc: the error's text, for an error hir found
                 ROOT | "crate" => "the crate root".to_owned(),
                 // alloc: the error's text, for an error hir found
@@ -714,7 +795,9 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
             let in_types = !(macro_last && at + 1 == path.len());
             let label = match self.value(Some(&path[..at]), name).filter(|_| in_types) {
                 // alloc: the error's text, for an error hir found
-                Some(def) => format!("expected type, found {} `{name}` in {parent}", value_descr(cx, def)),
+                Some(def) => {
+                    format!("expected type, found {} `{name}` in {parent}", value_descr(cx, def))
+                }
                 // alloc: the error's text, for an error hir found
                 None => format!("could not find `{name}` in {parent}"),
             };
@@ -794,7 +877,8 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         candidates.sort_by_cached_key(|it| (it.len(), it.join("::")));
         let candidate = candidates.into_iter().next()?;
         let len = candidate.len();
-        let start = (0..=at.min(len - 1)).find(|&i| path[i].name != candidate[i]).unwrap_or_default();
+        let start =
+            (0..=at.min(len - 1)).find(|&i| path[i].name != candidate[i]).unwrap_or_default();
         Some(candidate[start..].join("::"))
     }
 
@@ -805,7 +889,8 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let current = self.current()?;
         let mut candidates = self.extern_prelude();
         for module in self.cx.krate.modules_iter(db) {
-            let below = std::iter::successors(module.parent(db), |it| it.parent(db)).any(|it| it == current);
+            let below = std::iter::successors(module.parent(db), |it| it.parent(db))
+                .any(|it| it == current);
             if below && let Some(it) = module.name(db) {
                 candidates.push(it);
             }
@@ -815,7 +900,10 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         candidates.dedup();
         // alloc: the error's parts, for an error hir found
         let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
-        find_best_match_for_name(&candidates, name, None).copied().filter(|it| *it != name).map(str::to_owned)
+        find_best_match_for_name(&candidates, name, None)
+            .copied()
+            .filter(|it| *it != name)
+            .map(str::to_owned)
     }
 
     /// rustc's `current_crate_outer_attr_insert_span`: before the first token after the crate
@@ -827,16 +915,22 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         // A doc comment is a `DOC_COMMENT` node: an inner one is skipped with the inner
         // attributes, an outer one's token counts.
         let is_token = |token: &ast::Token<'_>| {
-            !matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::COMMENT)
+            !matches!(
+                token.kind(),
+                SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::COMMENT
+            )
         };
         let at = source
             .children_with_tokens()
             .find_map(|it| match it {
                 NodeOrToken::Node(node) => {
-                    if ast::AnyAttr::cast(node).is_some_and(|it| it.kind() == ast::AttrKind::Inner) {
+                    if ast::AnyAttr::cast(node).is_some_and(|it| it.kind() == ast::AttrKind::Inner)
+                    {
                         return None;
                     }
-                    node.descendants_with_tokens().filter_map(NodeOrToken::into_token).find(is_token)
+                    node.descendants_with_tokens()
+                        .filter_map(NodeOrToken::into_token)
+                        .find(is_token)
                 }
                 NodeOrToken::Token(token) => is_token(&token).then_some(token),
             })
@@ -851,7 +945,9 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
 pub(crate) fn missing_crate(cx: &Cx<'_, '_>, name: &str) -> String {
     if cx.cargo() {
         // alloc: the error's text, for an error hir found
-        format!("if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml`")
+        format!(
+            "if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml`"
+        )
     } else {
         // alloc: the error's text, for an error hir found
         format!("you might be missing a crate named `{name}`")
@@ -867,7 +963,9 @@ pub(crate) fn missing_crate_2015(cx: &Cx<'_, '_>, name: &str) -> String {
         )
     } else {
         // alloc: the error's text, for an error hir found
-        format!("you might be missing a crate named `{name}`, add it to your project and import it in your code")
+        format!(
+            "you might be missing a crate named `{name}`, add it to your project and import it in your code"
+        )
     }
 }
 
@@ -941,7 +1039,8 @@ fn push_path_segments(path: ast::Path<'_>, out: &mut Vec<Segment>) {
 /// first, as rustc's import has them: a `::` with no path before it as `{{root}}`. How many
 /// trees those are.
 fn nested_segments(tree: ast::UseTree<'_>, segments: &mut Vec<Segment>) -> usize {
-    let depth = tree.parent_use_tree_list().map_or(0, |it| nested_segments(it.parent_use_tree(), segments));
+    let depth =
+        tree.parent_use_tree_list().map_or(0, |it| nested_segments(it.parent_use_tree(), segments));
     match tree.path() {
         Some(path) => push_path_segments(path, segments),
         None => {
@@ -973,9 +1072,17 @@ mod tests {
         };
         assert_eq!(import_path(&import, None), "zed::baz");
         assert_eq!(import_path(&import, Some(1)), "zed");
-        let glob = Import { module_path: vec![segment("a"), segment("b")], source: None, range: TextRange::default() };
+        let glob = Import {
+            module_path: vec![segment("a"), segment("b")],
+            source: None,
+            range: TextRange::default(),
+        };
         assert_eq!(import_path(&glob, None), "a::b::*");
-        let single = Import { module_path: vec![segment(ROOT)], source: Some(segment("foo")), range: TextRange::default() };
+        let single = Import {
+            module_path: vec![segment(ROOT)],
+            source: Some(segment("foo")),
+            range: TextRange::default(),
+        };
         assert_eq!(import_path(&single, None), "foo");
     }
 
@@ -996,7 +1103,12 @@ mod tests {
                 let depth = nested_segments(tree, &mut segments);
                 for it in &segments {
                     let written = if it.name == ROOT { "::" } else { it.name.as_str() };
-                    assert_eq!(&text[it.range], written, "in {}", &text[tree.syntax().text_range()]);
+                    assert_eq!(
+                        &text[it.range],
+                        written,
+                        "in {}",
+                        &text[tree.syntax().text_range()]
+                    );
                 }
                 let names: Vec<_> = segments.into_iter().map(|it| it.name).collect();
                 (&text[tree.syntax().text_range()], names.join(" "), depth)
@@ -1021,7 +1133,8 @@ mod tests {
             ("n", "{{root}} n", 2),
             ("o::{}", "{{root}} o", 2),
         ];
-        let expected: Vec<_> = expected.iter().map(|&(tree, names, depth)| (tree, names.to_owned(), depth)).collect();
+        let expected: Vec<_> =
+            expected.iter().map(|&(tree, names, depth)| (tree, names.to_owned(), depth)).collect();
         assert_eq!(trees, expected);
     }
 

@@ -79,12 +79,25 @@ fn carry_with_fiber_jobs() {
     use blaze_graph::{pool, pump, sched::fiber};
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
-        fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open, end: flight::end_open });
+        fiber::carry(fiber::Carried {
+            take: flight::take_open,
+            put: flight::put_open,
+            end: flight::end_open,
+        });
         _ = fiber::observe(observed);
         _ = fiber::observe_idle(idled);
         _ = fiber::observe_spawner(given);
-        _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended, held: hold_began });
-        _ = pool::span_jobs(pool::JobSpans { began: job_began, ended: job_ended, driving: worker_began, drove: worker_ended });
+        _ = pump::span_waits(pump::WaitSpans {
+            begin: wait_began,
+            end: wait_ended,
+            held: hold_began,
+        });
+        _ = pool::span_jobs(pool::JobSpans {
+            began: job_began,
+            ended: job_ended,
+            driving: worker_began,
+            drove: worker_ended,
+        });
     });
 }
 
@@ -115,7 +128,11 @@ fn worker_ended(span: u64) {
 /// by the job its switches name and by the span it was given inside: the span of the job it
 /// runs inside, for [`job_ended`].
 fn job_began(kind: &'static str) -> u64 {
-    let job = span::Job { kind: span::Name::kept(kind), job: flight::running_job(), creator: flight::begun_creator() };
+    let job = span::Job {
+        kind: span::Name::kept(kind),
+        job: flight::running_job(),
+        creator: flight::begun_creator(),
+    };
     flight::job_began(span::open_raw(job))
 }
 
@@ -188,7 +205,9 @@ fn observed(switch: blaze_graph::sched::Switch) {
     use blaze_graph::sched::{SwitchEvent, Wait};
     use flight::{Switched, WaitedOn};
     let (event, waited) = match switch.event {
-        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at, given.build, given.creator),
+        SwitchEvent::Began { given } => {
+            return flight::job_begins(given.spawner, given.at, given.build, given.creator);
+        }
         SwitchEvent::Started => (Switched::Started, None),
         SwitchEvent::Ready => (Switched::Ready, None),
         SwitchEvent::Resumed => (Switched::Resumed, None),
@@ -198,7 +217,9 @@ fn observed(switch: blaze_graph::sched::Switch) {
         SwitchEvent::Parked(Some(on)) => (
             Switched::Parked,
             Some(match on {
-                Wait::Job(job) => (WaitedOn::Job, u64::from(switch.awaited) << 32 | u64::from(job.0)),
+                Wait::Job(job) => {
+                    (WaitedOn::Job, u64::from(switch.awaited) << 32 | u64::from(job.0))
+                }
                 Wait::Key(key) => {
                     let [a, b, c, d, e, f, g, h, ..] = key.0;
                     (WaitedOn::Key, u64::from_le_bytes([a, b, c, d, e, f, g, h]))
@@ -416,12 +437,17 @@ mod tests {
         let awaits: Vec<_> = read
             .spans
             .iter()
-            .filter(|it| it.thread == tid && flight::meta(it.site).map(|it| it.name()) == Some("wait"))
+            .filter(|it| {
+                it.thread == tid && flight::meta(it.site).map(|it| it.name()) == Some("wait")
+            })
             .map(|it| it.get::<span::col::Awaits>().and_then(span::Name::text))
             .collect();
         assert_eq!(
             awaits.iter().map(|it| it.as_deref()).collect::<Vec<_>>(),
-            [Some("scope 13 of unit codegen serde v1.0.219 (build script)"), Some("scope 14 of no span")],
+            [
+                Some("scope 13 of unit codegen serde v1.0.219 (build script)"),
+                Some("scope 14 of no span")
+            ],
             "the innermost span that names what it is of, past one that names nothing"
         );
     }
@@ -468,7 +494,8 @@ mod tests {
         let started = Instant::now();
         for _ in 0..N {
             let krate = span::Name::of("serde");
-            let _span = span::UnitBodies { krate, unit: span::Name::of("serde v1.0.219 (lib)") }.open();
+            let _span =
+                span::UnitBodies { krate, unit: span::Name::of("serde v1.0.219 (lib)") }.open();
         }
         let typed_ns = per(started);
         let (krate, unit) = (span::Name::of("serde"), span::Name::of("serde v1.0.219 (lib)"));

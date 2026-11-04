@@ -12,7 +12,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_def::{
@@ -40,6 +39,7 @@ use rustc_type_ir::{
     inherent::{BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{MirBody, MirLowerError, is_by_move_coroutine, normalize_or_keep};
 

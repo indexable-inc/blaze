@@ -59,7 +59,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, for_expr: ast::ForExpr<'t>) {
     if !hash_iterated(cx, &ty) {
         return;
     }
-    let (Some(start), Some(end)) = (cx.range(for_expr.syntax()), cx.range(iterable.syntax())) else { return };
+    let (Some(start), Some(end)) = (cx.range(for_expr.syntax()), cx.range(iterable.syntax()))
+    else {
+        return;
+    };
     let db = cx.db();
     let shown = ty.strip_references().display(db, cx.krate().to_display_target(db)).to_string();
     let span = cx.span(TextRange::new(start.start(), end.end().max(start.start())));

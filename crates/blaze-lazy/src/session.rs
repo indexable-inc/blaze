@@ -46,7 +46,12 @@ impl Session {
     /// The session of a build that `purpose` describes, whose functions `plan` divides, run on
     /// `isa`, its stubs calling the run process's hook at `hook` (0 to write the cell later).
     /// Refused for a release build or one that writes an output.
-    pub fn new(purpose: &Purpose<'_>, plan: Plan, isa: &Isa, hook: u64) -> Result<(Session, Stubs), SessionError> {
+    pub fn new(
+        purpose: &Purpose<'_>,
+        plan: Plan,
+        isa: &Isa,
+        hook: u64,
+    ) -> Result<(Session, Stubs), SessionError> {
         allow(purpose).map_err(SessionError::Refused)?;
         let stubs = stub::generate(isa, plan.len(), hook).map_err(SessionError::Stub)?;
         Ok((Session { plan, layout: stubs.layout }, stubs))
@@ -68,14 +73,22 @@ impl Session {
     /// Every lazy function and the address its slot starts at, for a region written at
     /// `base`: what blaze-link puts in each one's slot when it places the image.
     pub fn slots(&self, base: u64) -> impl Iterator<Item = (InstanceKey, u64)> + '_ {
-        self.plan.lazy().iter().enumerate().map(move |(id, key)| (*key, self.entry(base, LazyId(id as u32))))
+        self.plan
+            .lazy()
+            .iter()
+            .enumerate()
+            .map(move |(id, key)| (*key, self.entry(base, LazyId(id as u32))))
     }
 
     /// What to compile before anything asks: the lazy callees of what is compiled ahead
     /// (`ahead`, the entry and what runs at start), then what history says the run reaches
     /// (`reached`, the code hashes of the functions the last run of this test executed), each
     /// once, at the higher of its priorities.
-    pub fn first(&self, ahead: &[CompiledFunction], reached: &[CodeHash]) -> Vec<(LazyId, Priority)> {
+    pub fn first(
+        &self,
+        ahead: &[CompiledFunction],
+        reached: &[CodeHash],
+    ) -> Vec<(LazyId, Priority)> {
         // alloc: setup, once per run before it starts.
         let (mut callees, mut history, mut seen) = (Vec::new(), Vec::new(), self.plan.scratch());
         for function in ahead {

@@ -18,10 +18,7 @@ fn lowered(text: &str) -> (Grammar, Lowered) {
 }
 
 fn rhs_lens(lowered: &Lowered, lhs: NtId) -> Vec<usize> {
-    lowered.by_lhs[lhs]
-        .iter()
-        .map(|&p| lowered.productions[p].rhs.len())
-        .collect()
+    lowered.by_lhs[lhs].iter().map(|&p| lowered.productions[p].rhs.len()).collect()
 }
 
 #[test]
@@ -32,10 +29,8 @@ fn rules_keep_their_alternatives() {
     let b = grammar.rule_id("b").unwrap();
     let x = grammar.terminal_id("X").unwrap();
     assert_eq!(lowered.by_lhs.len(), grammar.rules.len());
-    let prods: Vec<&Production> = lowered.by_lhs[start]
-        .iter()
-        .map(|&p| &lowered.productions[p])
-        .collect();
+    let prods: Vec<&Production> =
+        lowered.by_lhs[start].iter().map(|&p| &lowered.productions[p]).collect();
     assert_eq!(
         prods,
         vec![
@@ -64,20 +59,9 @@ fn groups_become_nonterminals_with_one_production_per_alternative() {
     assert_eq!(group, grammar.rules.len());
     let alts: Vec<(Provenance, usize)> = lowered.by_lhs[group]
         .iter()
-        .map(|&p| {
-            (
-                lowered.productions[p].provenance,
-                lowered.productions[p].rhs.len(),
-            )
-        })
+        .map(|&p| (lowered.productions[p].provenance, lowered.productions[p].rhs.len()))
         .collect();
-    assert_eq!(
-        alts,
-        vec![
-            (Provenance::Group { alt: 0 }, 1),
-            (Provenance::Group { alt: 1 }, 2)
-        ]
-    );
+    assert_eq!(alts, vec![(Provenance::Group { alt: 0 }, 1), (Provenance::Group { alt: 1 }, 2)]);
 }
 
 fn repeat_nonterminals(grammar: &Grammar, lowered: &Lowered) -> Vec<NtId> {
@@ -138,19 +122,13 @@ fn finished(lowering: Lowering) -> Lowered {
     for (id, production) in productions.iter().enumerate() {
         by_lhs[production.lhs].push(id);
     }
-    Lowered {
-        productions,
-        by_lhs,
-    }
+    Lowered { productions, by_lhs }
 }
 
 #[test]
 fn exact_parts_derive_their_count_in_one_way() {
     for n in 0..=70u32 {
-        let mut lowering = Lowering {
-            productions: Vec::new(),
-            nonterminals: 0,
-        };
+        let mut lowering = Lowering { productions: Vec::new(), nonterminals: 0 };
         let mut parts = Parts::new(Symbol::Terminal(0));
         let rhs = parts.exact(&mut lowering, n);
         assert_eq!(rhs.len(), n.count_ones() as usize);
@@ -169,10 +147,7 @@ fn exact_parts_derive_their_count_in_one_way() {
 #[test]
 fn up_to_parts_derive_every_count_to_their_bound_in_one_way() {
     for d in 1..=70u32 {
-        let mut lowering = Lowering {
-            productions: Vec::new(),
-            nonterminals: 0,
-        };
+        let mut lowering = Lowering { productions: Vec::new(), nonterminals: 0 };
         let mut parts = Parts::new(Symbol::Terminal(0));
         let part = parts.up_to(&mut lowering, d);
         let lowered = finished(lowering);
@@ -186,20 +161,13 @@ fn up_to_parts_derive_every_count_to_their_bound_in_one_way() {
 fn wide_bounded_repeats_lower_to_logarithmically_many_productions() {
     let (grammar, lowered) =
         lowered("start: \"a\"~0..1048576 \"b\"~1000..1048576 \"c\"~1048576 \"d\"~5..1048575\n");
-    assert!(
-        lowered.productions.len() < 400,
-        "{}",
-        lowered.productions.len()
-    );
+    assert!(lowered.productions.len() < 400, "{}", lowered.productions.len());
     let symbols: usize = lowered.productions.iter().map(|p| p.rhs.len()).sum();
     assert!(symbols < 600, "{symbols}");
     let repeats = repeat_nonterminals(&grammar, &lowered);
     for nt in repeats {
         assert_eq!(lowered.by_lhs[nt].len(), 1);
-        assert_eq!(
-            lowered.productions[lowered.by_lhs[nt][0]].provenance,
-            Provenance::Repeat
-        );
+        assert_eq!(lowered.productions[lowered.by_lhs[nt][0]].provenance, Provenance::Repeat);
     }
     for p in &lowered.productions {
         assert!(p.rhs.len() <= 21, "{p:?}");
@@ -212,10 +180,7 @@ fn an_exact_wide_repeat_is_a_sum_of_powers_of_two() {
     let top = repeat_nonterminals(&grammar, &lowered)[0];
     let prod = &lowered.productions[lowered.by_lhs[top][0]];
     assert_eq!(prod.rhs.len(), 3);
-    assert_eq!(
-        derivation_counts(&lowered, Symbol::Nonterminal(top)),
-        BTreeMap::from([(100, 1)])
-    );
+    assert_eq!(derivation_counts(&lowered, Symbol::Nonterminal(top)), BTreeMap::from([(100, 1)]));
 }
 
 #[test]
@@ -236,9 +201,7 @@ fn factorised_repeats_parse_like_unrolled_ones() {
     let tree = parser
         .parse(
             &lexer,
-            &format!("{}{}", "a".repeat(13), "b".repeat(37))
-                .chars()
-                .collect::<Vec<char>>(),
+            &format!("{}{}", "a".repeat(13), "b".repeat(37)).chars().collect::<Vec<char>>(),
         )
         .unwrap();
     let Tree::Rule { children, .. } = &tree else {
@@ -259,16 +222,9 @@ fn unbounded_repeats_add_one_item_at_a_time_after_their_minimum() {
         panic!("{star:?}");
     };
     assert_eq!(
-        lowered.by_lhs[any]
-            .iter()
-            .map(|&p| &lowered.productions[p])
-            .collect::<Vec<_>>(),
+        lowered.by_lhs[any].iter().map(|&p| &lowered.productions[p]).collect::<Vec<_>>(),
         vec![
-            &Production {
-                lhs: any,
-                rhs: vec![],
-                provenance: Provenance::RepeatPart,
-            },
+            &Production { lhs: any, rhs: vec![], provenance: Provenance::RepeatPart },
             &Production {
                 lhs: any,
                 rhs: vec![Symbol::Nonterminal(any), Symbol::Terminal(a)],
@@ -290,12 +246,7 @@ fn unbounded_repeats_add_one_item_at_a_time_after_their_minimum() {
     assert!(!accepts("aaa"));
     assert!(!accepts(""));
     let tree = parser
-        .parse(
-            &lexer,
-            &format!("aaa{}", "b".repeat(73))
-                .chars()
-                .collect::<Vec<char>>(),
-        )
+        .parse(&lexer, &format!("aaa{}", "b".repeat(73)).chars().collect::<Vec<char>>())
         .unwrap();
     let Tree::Rule { children, .. } = &tree else {
         panic!("{tree:?}");
@@ -310,17 +261,9 @@ fn the_unrolling_limit_is_on_the_unrolled_symbols() {
     assert_eq!(unrolled_symbols(2, 3), 5);
     assert_eq!(unrolled_symbols(2, 4), 9);
     assert_eq!(unrolled_symbols(1 << 20, 1 << 20), 1 << 20);
-    assert_eq!(
-        unrolled_symbols(0, 1 << 20),
-        (1u64 << 20) * ((1 << 20) + 1) / 2
-    );
-    let symbols = |lowered: &Lowered| {
-        lowered
-            .productions
-            .iter()
-            .map(|p| p.rhs.len())
-            .sum::<usize>()
-    };
+    assert_eq!(unrolled_symbols(0, 1 << 20), (1u64 << 20) * ((1 << 20) + 1) / 2);
+    let symbols =
+        |lowered: &Lowered| lowered.productions.iter().map(|p| p.rhs.len()).sum::<usize>();
     let (_, unrolled) = lowered("start: \"a\"~0..10\n");
     assert_eq!(unrolled.productions.len(), 1 + 11);
     assert_eq!(symbols(&unrolled), 1 + 55);

@@ -19,14 +19,8 @@ fn int_node(min: i128, value: i128) -> ChoiceNode {
 fn a_recorded_conclusion_is_served_on_exact_repeat() {
     let mut cache = ExecCache::default();
     let nodes = alloc::vec![bool_node(true)];
-    let recorded = cache.record(
-        alloc::vec![1, 2, 3],
-        Status::Interesting,
-        Some("origin"),
-        &nodes,
-        &[],
-        true,
-    );
+    let recorded =
+        cache.record(alloc::vec![1, 2, 3], Status::Interesting, Some("origin"), &nodes, &[], true);
     assert!(!recorded.verdict_mismatch);
     let hit = cache.serve(&[1, 2, 3]).unwrap();
     assert_eq!(hit.status, Status::Interesting);
@@ -49,40 +43,16 @@ fn the_generation_tier_checks_verdicts_without_keeping_serving_entries() {
 fn a_verdict_change_on_a_repeat_is_a_mismatch() {
     let mut cache = ExecCache::default();
     cache.record(alloc::vec![7], Status::Valid, None, &[], &[], false);
-    let flipped = cache.record(
-        alloc::vec![7],
-        Status::Interesting,
-        Some("o"),
-        &[],
-        &[],
-        true,
-    );
+    let flipped = cache.record(alloc::vec![7], Status::Interesting, Some("o"), &[], &[], true);
     assert!(flipped.verdict_mismatch);
-    assert!(
-        cache.serve(&[7]).is_none(),
-        "a contradicted conclusion must not become servable"
-    );
+    assert!(cache.serve(&[7]).is_none(), "a contradicted conclusion must not become servable");
 }
 
 #[test]
 fn an_origin_change_alone_is_a_mismatch() {
     let mut cache = ExecCache::default();
-    cache.record(
-        alloc::vec![7],
-        Status::Interesting,
-        Some("a"),
-        &[],
-        &[],
-        false,
-    );
-    let moved = cache.record(
-        alloc::vec![7],
-        Status::Interesting,
-        Some("b"),
-        &[],
-        &[],
-        false,
-    );
+    cache.record(alloc::vec![7], Status::Interesting, Some("a"), &[], &[], false);
+    let moved = cache.record(alloc::vec![7], Status::Interesting, Some("b"), &[], &[], false);
     assert!(moved.verdict_mismatch);
 }
 
@@ -91,10 +61,7 @@ fn the_execution_cache_is_bounded() {
     let mut cache = ExecCache::with_full_tier_bound(1);
     let key: Vec<u8> = (0..100).collect();
     cache.record(key.clone(), Status::Valid, None, &[], &[], true);
-    assert!(
-        cache.serve(&key).is_none(),
-        "an entry over the whole budget is evicted immediately"
-    );
+    assert!(cache.serve(&key).is_none(), "an entry over the whole budget is evicted immediately");
     assert_eq!(cache.full_bytes, 0);
 }
 
@@ -117,14 +84,7 @@ fn clear_drops_both_tiers() {
     cache.record(alloc::vec![7], Status::Valid, None, &[], &[], true);
     cache.clear();
     assert!(cache.serve(&[7]).is_none());
-    let again = cache.record(
-        alloc::vec![7],
-        Status::Interesting,
-        Some("o"),
-        &[],
-        &[],
-        true,
-    );
+    let again = cache.record(alloc::vec![7], Status::Interesting, Some("o"), &[], &[], true);
     assert!(!again.verdict_mismatch);
 }
 
@@ -157,24 +117,13 @@ fn the_kind_ledger_treats_a_constraint_change_as_kind_drift() {
 #[test]
 fn kind_drift_is_scoped_to_the_value_prefix() {
     let mut ledger = KindLedger::default();
+    assert!(ledger.observe(&[bool_node(true), int_node(0, 5)]).unwrap().is_none());
     assert!(
-        ledger
-            .observe(&[bool_node(true), int_node(0, 5)])
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        ledger
-            .observe(&[bool_node(false), bool_node(true)])
-            .unwrap()
-            .is_none(),
+        ledger.observe(&[bool_node(false), bool_node(true)]).unwrap().is_none(),
         "a different position-0 value opens an independent prefix"
     );
     assert!(
-        ledger
-            .observe(&[bool_node(true), bool_node(true)])
-            .unwrap()
-            .is_some(),
+        ledger.observe(&[bool_node(true), bool_node(true)]).unwrap().is_some(),
         "the same position-0 value must reuse the recorded prefix"
     );
 }
@@ -206,9 +155,7 @@ fn the_kind_ledger_names_a_grammar_constraint_by_its_identity() {
         .unwrap();
     let constraint = alloc::sync::Arc::new(constraint);
     let plain = StringChoice {
-        intervals: IntervalSet::new(alloc::vec![(b'a' as u32, b'a' as u32)])
-            .unwrap()
-            .into(),
+        intervals: IntervalSet::new(alloc::vec![(b'a' as u32, b'a' as u32)]).unwrap().into(),
         min_size: 0,
         max_size: 4,
         constraint: None,

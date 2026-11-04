@@ -18,8 +18,8 @@ use base_db::{Db, FileId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, key};
 use hir_def::{
-    DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _, SyntheticSyntax,
-    expr_store::Body, hir::generics::GenericParams,
+    DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _, SyntheticSyntax, expr_store::Body,
+    hir::generics::GenericParams,
 };
 use hir_expand::{FileRange, InFile};
 use span::TextRange;

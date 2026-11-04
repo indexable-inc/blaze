@@ -7,9 +7,9 @@ use std::ops::Range;
 
 #[cfg(test)]
 use blaze_ids::bits::Ones;
-use blaze_ids::bits::{self as shared, BitSlice, BitSliceMut, Bits, WordsMut};
 #[cfg(test)]
 pub(super) use blaze_ids::bits::range_masks as masks;
+use blaze_ids::bits::{self as shared, BitSlice, BitSliceMut, Bits, WordsMut};
 pub(super) use blaze_ids::bits::{range_masks, words_for};
 
 use crate::mem::Frame;

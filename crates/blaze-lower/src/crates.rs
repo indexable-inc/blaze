@@ -86,8 +86,9 @@ pub(crate) fn src_path(unit: &Unit, what: &str) -> Result<String, LowerError> {
 pub(crate) fn toolchain() -> Result<Version, LowerError> {
     let version = target::rustc_version();
     let number = version.split(' ').next().unwrap_or(version);
-    Version::parse(number)
-        .map_err(|error| LowerError::new(format!("blaze's rustc version `{version}` is not a version: {error}")))
+    Version::parse(number).map_err(|error| {
+        LowerError::new(format!("blaze's rustc version `{version}` is not a version: {error}"))
+    })
 }
 
 /// What every crate built for `triple` shares: its target's data layout (blaze's table), the
@@ -97,7 +98,11 @@ pub(crate) fn workspace_data(
     toolchain: &Version,
     const_eval: ConstEvalBudget,
 ) -> Result<Arc<CrateWorkspaceData>, LowerError> {
-    Ok(Arc::new(CrateWorkspaceData { target: Ok(target_data(triple)?), toolchain: Some(toolchain.clone()), const_eval }))
+    Ok(Arc::new(CrateWorkspaceData {
+        target: Ok(target_data(triple)?),
+        toolchain: Some(toolchain.clone()),
+        const_eval,
+    }))
 }
 
 /// The target data every crate built for `triple` is given, which the front end lays types out
@@ -113,7 +118,12 @@ pub fn target_data(triple: &str) -> Result<TargetData, LowerError> {
         Some("wasm64") => Arch::Wasm64,
         _ => Arch::Other,
     };
-    Ok(TargetData { tuple: Symbol::intern(triple), data_layout: data_layout.into_boxed_str(), arch, has_thumb_interworking })
+    Ok(TargetData {
+        tuple: Symbol::intern(triple),
+        data_layout: data_layout.into_boxed_str(),
+        arch,
+        has_thumb_interworking,
+    })
 }
 
 /// The cfgs rustc compiles the unit with: the target's, with what the profile, the crate type,
@@ -129,7 +139,8 @@ pub(crate) fn cfg(
     let test = is_test(unit, plan);
     let profile = &unit.profile;
     let on = |yes: bool| if yes { "on" } else { "off" };
-    let mut flags: Vec<String> = Vec::with_capacity(10 + 2 * plan.cfgs.len() + plan.rustflags.len());
+    let mut flags: Vec<String> =
+        Vec::with_capacity(10 + 2 * plan.cfgs.len() + plan.rustflags.len());
     flags.extend(["-C".to_owned(), format!("opt-level={}", profile.opt_level)]);
     flags.extend(["-C".to_owned(), format!("debug-assertions={}", on(profile.debug_assertions))]);
     flags.extend(["-C".to_owned(), format!("overflow-checks={}", on(profile.overflow_checks))]);
@@ -213,9 +224,12 @@ pub(crate) fn links_proc_macro(is_proc_macro: bool, root_text: &str, edition: Ed
         return false;
     }
     let parse = ast::SourceFile::parse(root_text, edition);
-    parse.tree().syntax().descendants().filter_map(ast::ExternCrate::cast).any(|item| {
-        item.name_ref().is_some_and(|name| name.text() == "proc_macro")
-    })
+    parse
+        .tree()
+        .syntax()
+        .descendants()
+        .filter_map(ast::ExternCrate::cast)
+        .any(|item| item.name_ref().is_some_and(|name| name.text() == "proc_macro"))
 }
 
 /// A cfg as `--cfg` takes it: `name`, or `name="value"` with the value a string literal.
@@ -234,9 +248,12 @@ pub(crate) fn atom(cfg: &str) -> Result<CfgAtom, String> {
         return Ok(CfgAtom::Flag(Symbol::intern(name)));
     };
     let Some(inner) = value.strip_prefix('"').and_then(|it| it.strip_suffix('"')) else {
-        return Err(format!("`--cfg {cfg}`: a cfg's value is a string in quotes, as `{name}=\"value\"`"));
+        return Err(format!(
+            "`--cfg {cfg}`: a cfg's value is a string in quotes, as `{name}=\"value\"`"
+        ));
     };
-    let value = unescape(inner).ok_or_else(|| format!("`--cfg {cfg}`: the value has an escape rustc does not take"))?;
+    let value = unescape(inner)
+        .ok_or_else(|| format!("`--cfg {cfg}`: the value has an escape rustc does not take"))?;
     Ok(CfgAtom::KeyValue { key: Symbol::intern(name), value: Symbol::intern(&value) })
 }
 
@@ -285,7 +302,11 @@ fn unescape(text: &str) -> Option<Cow<'_, str>> {
 /// The units that compile (every mode but `RunCustomBuild`), each after the units it depends
 /// on and those `after` has for it (by unit; a crate made with its crate depends on them): the
 /// order their crates are made in. A cycle is an error naming it.
-pub(crate) fn topological(units: &Units, whats: &[String], after: &[Vec<usize>]) -> Result<Vec<usize>, LowerError> {
+pub(crate) fn topological(
+    units: &Units,
+    whats: &[String],
+    after: &[Vec<usize>],
+) -> Result<Vec<usize>, LowerError> {
     const UNSEEN: u8 = 0;
     const OPEN: u8 = 1;
     const DONE: u8 = 2;
@@ -332,10 +353,16 @@ pub(crate) fn topological(units: &Units, whats: &[String], after: &[Vec<usize>])
                 }
                 OPEN => {
                     let from = stack.iter().position(|it| it.0 == on).unwrap_or(0);
-                    let cycle: Vec<&str> =
-                        stack[from..].iter().map(|it| whats[it.0].as_str()).chain([whats[on].as_str()]).collect();
+                    let cycle: Vec<&str> = stack[from..]
+                        .iter()
+                        .map(|it| whats[it.0].as_str())
+                        .chain([whats[on].as_str()])
+                        .collect();
                     return Err(LowerError::at(
-                        format!("the units depend on each other in a cycle: {}", cycle.join(" -> ")),
+                        format!(
+                            "the units depend on each other in a cycle: {}",
+                            cycle.join(" -> ")
+                        ),
                         whats[on].clone(),
                     ));
                 }
@@ -368,7 +395,10 @@ pub(crate) fn dependency(
 
 pub(crate) fn edition(unit: &Unit, what: &str) -> Result<Edition, LowerError> {
     unit.target.edition.parse::<Edition>().map_err(|_| {
-        LowerError::at(format!("{what} has edition `{}`, which blaze does not know", unit.target.edition), what)
+        LowerError::at(
+            format!("{what} has edition `{}`, which blaze does not know", unit.target.edition),
+            what,
+        )
     })
 }
 
@@ -488,7 +518,12 @@ fn run_partition(units: &Units, ignored: &[&str]) -> Vec<usize> {
                 deps: unit
                     .dependencies
                     .iter()
-                    .map(|dep| (part.get(dep.index).copied().unwrap_or(dep.index), dep.extern_crate_name.as_str()))
+                    .map(|dep| {
+                        (
+                            part.get(dep.index).copied().unwrap_or(dep.index),
+                            dep.extern_crate_name.as_str(),
+                        )
+                    })
                     .collect(), // alloc: as `first`, one per run
                 env: plan
                     .env
@@ -532,7 +567,12 @@ pub(crate) fn run_profile_atom(units: &Units, run: usize) -> CfgAtom {
 /// `unit`'s variables (`plan.env`) as its crate is made with them: an `OUT_DIR` that is one of
 /// its runs' named by its run class's ([`run_classes`]), so units apart only in which run of a
 /// class they depend on have one crate. A run's own `OUT_DIR` is in its plan.
-pub(crate) fn class_env(units: &Units, unit: &Unit, env: &[(String, String)], class: &[usize]) -> Vec<(String, String)> {
+pub(crate) fn class_env(
+    units: &Units,
+    unit: &Unit,
+    env: &[(String, String)],
+    class: &[usize],
+) -> Vec<(String, String)> {
     let mut out = env.to_vec(); // alloc: once per unit lowered, its variables, which its crate and lowering keep
     for (name, value) in &mut out {
         if name != "OUT_DIR" {
@@ -582,13 +622,20 @@ pub(crate) fn origin(package: &PackagePlan, unit: &Unit) -> CrateOrigin {
 
 /// The `--crate-type`s cargo passes for the unit, by rustc's names. A `--test` crate is an
 /// executable whatever its target's types (rustc's `collect_crate_types`).
-pub(crate) fn crate_types(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<CrateTypes, LowerError> {
+pub(crate) fn crate_types(
+    unit: &Unit,
+    plan: &UnitPlan,
+    what: &str,
+) -> Result<CrateTypes, LowerError> {
     if is_test(unit, plan) {
         return Ok(CrateTypes::of(&[CrateType::Bin]));
     }
     let named = |name: &String| {
         CrateType::ALL.into_iter().find(|it| it.as_str() == name).ok_or_else(|| {
-            LowerError::at(format!("{what} has the crate type `{name}`, which blaze does not know"), what)
+            LowerError::at(
+                format!("{what} has the crate type `{name}`, which blaze does not know"),
+                what,
+            )
         })
     };
     let types = unit.target.crate_types.iter().map(named).collect::<Result<Vec<_>, _>>()?;
@@ -596,7 +643,11 @@ pub(crate) fn crate_types(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<Cr
 }
 
 /// What the crate is: a `--test` crate is a test (a bench's a bench), whatever its target.
-pub(crate) fn target_kind(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<TargetKind, LowerError> {
+pub(crate) fn target_kind(
+    unit: &Unit,
+    plan: &UnitPlan,
+    what: &str,
+) -> Result<TargetKind, LowerError> {
     if is_test(unit, plan) {
         let bench = unit.target.kind.iter().any(|it| it == "bench");
         return Ok(if bench { TargetKind::Bench } else { TargetKind::Test });
@@ -651,7 +702,10 @@ pub(crate) struct Root {
 /// The first manifest with a `[workspace]` that does not exclude the first member, from that
 /// member's directory up (cargo's `find_workspace_root`), else the member's own: read through
 /// the mounts, stopping where they end.
-pub(crate) fn root<T: blaze_query::Tree>(units: &Units, tree: &files::Mounts<'_, T>) -> Result<Root, LowerError> {
+pub(crate) fn root<T: blaze_query::Tree>(
+    units: &Units,
+    tree: &files::Mounts<'_, T>,
+) -> Result<Root, LowerError> {
     let Some(member) = units.packages.iter().find(|it| it.is_member) else {
         return Ok(Root { dir: None, const_eval: ConstEvalBudget::default() });
     };
@@ -668,8 +722,9 @@ pub(crate) fn root<T: blaze_query::Tree>(units: &Units, tree: &files::Mounts<'_,
         if let Some(bytes) = tree.read(&manifest)? {
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| LowerError::at("the manifest is not UTF-8", manifest.clone()))?;
-            let table: toml::Table =
-                text.parse().map_err(|error| LowerError::at(format!("the manifest: {error}"), manifest.clone()))?;
+            let table: toml::Table = text.parse().map_err(|error| {
+                LowerError::at(format!("the manifest: {error}"), manifest.clone())
+            })?;
             if let Some(workspace) = table.get("workspace") {
                 let excluded = workspace
                     .get("exclude")
@@ -677,7 +732,9 @@ pub(crate) fn root<T: blaze_query::Tree>(units: &Units, tree: &files::Mounts<'_,
                     .into_iter()
                     .flatten()
                     .filter_map(toml::Value::as_str)
-                    .any(|it| files::rest(own, &files::normalize(&format!("{dir}/{it}"))).is_some());
+                    .any(|it| {
+                        files::rest(own, &files::normalize(&format!("{dir}/{it}"))).is_some()
+                    });
                 if !excluded {
                     let const_eval = const_eval(workspace, &manifest)?;
                     return Ok(Root { dir: Some(dir.to_owned()), const_eval });
@@ -698,12 +755,16 @@ pub(crate) fn root<T: blaze_query::Tree>(units: &Units, tree: &files::Mounts<'_,
 fn const_eval(workspace: &toml::Value, manifest: &str) -> Result<ConstEvalBudget, LowerError> {
     let mut budget = ConstEvalBudget::default();
     let key = ConstEvalBudget::KEY;
-    let Some(value) = workspace.get("metadata").and_then(|it| it.get("blaze")).and_then(|it| it.get(key)) else {
+    let Some(value) =
+        workspace.get("metadata").and_then(|it| it.get("blaze")).and_then(|it| it.get(key))
+    else {
         return Ok(budget);
     };
     let Some(settings) = value.as_table() else {
         return Err(LowerError::at(
-            format!("`{key}` under `[workspace.metadata.blaze]` is a table: `{key} = {{ steps = N, memory = BYTES }}`"),
+            format!(
+                "`{key}` under `[workspace.metadata.blaze]` is a table: `{key} = {{ steps = N, memory = BYTES }}`"
+            ),
             manifest,
         ));
     };
@@ -731,7 +792,8 @@ fn const_eval(workspace: &toml::Value, manifest: &str) -> Result<ConstEvalBudget
 /// (cargo's `compute_cap_lints`). The check and the front end's crate read this one list.
 pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool, extra_verbose: bool) -> Vec<String> {
     const SHORT: [&str; 4] = ["-A", "-W", "-D", "-F"];
-    const LONG: [&str; 6] = ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
+    const LONG: [&str; 6] =
+        ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
     let mut out = plan.lints.clone(); // clone: the unit's own list, once per unit per build
     let mut flags = plan.rustflags.iter();
     while let Some(flag) = flags.next() {

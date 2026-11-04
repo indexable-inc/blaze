@@ -55,7 +55,11 @@ fn check(data: &[u8]) {
     let mut input = Input::new(data);
     if input.u8() & 1 == 0 {
         let table = input.rest();
-        let head = shared::head(Some(shared::IndexRef::of(table)), &[shared::lone_ref(shared::BLOCK as u64)], &[]);
+        let head = shared::head(
+            Some(shared::IndexRef::of(table)),
+            &[shared::lone_ref(shared::BLOCK as u64)],
+            &[],
+        );
         let pack = shared::lone_pack();
         let mut sim = shared::store_of(&[
             (HEAD, head.as_slice()),
@@ -63,7 +67,12 @@ fn check(data: &[u8]) {
             (INDEX, table),
         ]);
         let mut wants: Vec<(Key, Option<&[u8]>)> = vec![(shared::lone_key(), Some(shared::LONE))];
-        wants.extend(shared::index_keys(table).into_iter().filter(|it| *it != shared::lone_key()).map(|key| (key, None)));
+        wants.extend(
+            shared::index_keys(table)
+                .into_iter()
+                .filter(|it| *it != shared::lone_key())
+                .map(|key| (key, None)),
+        );
         shared::read_back(&mut sim, &wants);
     } else {
         let (values, settles) = shared::values(&mut input);

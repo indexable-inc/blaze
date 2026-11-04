@@ -153,7 +153,10 @@ impl Frontend for Program {
         };
         Ok(Described {
             owner: function.owner,
-            identity: ContentId::of("blaze v2 test identity 1", &function.identity_of.unwrap_or(*id).to_le_bytes()),
+            identity: ContentId::of(
+                "blaze v2 test identity 1",
+                &function.identity_of.unwrap_or(*id).to_le_bytes(),
+            ),
             bound: Ok(code.0),
             item: item(*id),
             code,
@@ -189,7 +192,13 @@ impl Frontend for Program {
             owner: Owner::Workspace,
             symbol: None,
             name: format!("app::S{id}"),
-            refs: self.static_calls.get(id).into_iter().flatten().map(|it| FrontRef::Function(*it)).collect(),
+            refs: self
+                .static_calls
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(|it| FrontRef::Function(*it))
+                .collect(),
         })
     }
 
@@ -204,12 +213,17 @@ impl Frontend for Program {
     fn counted(&self, functions: &[(u32, Origin)]) -> Vec<crate::backend::Counted> {
         (functions.iter())
             .map(|(id, _)| {
-                let body = self.bodies.get(id).map(|&(body, drop_glue)| crate::backend::Instantiates {
-                    body: ContentId::of("blaze v2 test body 1", &body.to_le_bytes()),
-                    drop_glue,
-                });
+                let body =
+                    self.bodies.get(id).map(|&(body, drop_glue)| crate::backend::Instantiates {
+                        body: ContentId::of("blaze v2 test body 1", &body.to_le_bytes()),
+                        drop_glue,
+                    });
                 let (krate, heads_own_path) = self.crates.get(id).copied().unwrap_or((0, false));
-                let value = if krate == 0 { self.recursion_limit } else { self.limits.get(&krate).copied() };
+                let value = if krate == 0 {
+                    self.recursion_limit
+                } else {
+                    self.limits.get(&krate).copied()
+                };
                 let limit = value.map(|value| crate::backend::Limit {
                     krate: ContentId::of("blaze v2 test crate 1", &krate.to_le_bytes()),
                     value,
@@ -223,7 +237,14 @@ impl Frontend for Program {
         format!("f{id}")
     }
 
-    fn past_recursion_limit(&self, id: &u32, depth: u32, limit: u32, head: &u32, limit_of: &u32) -> CodegenError {
+    fn past_recursion_limit(
+        &self,
+        id: &u32,
+        depth: u32,
+        limit: u32,
+        head: &u32,
+        limit_of: &u32,
+    ) -> CodegenError {
         let what = format!(
             "f{id} repeats its body {depth} times on its path from f{head}, past {limit} of f{limit_of}'s crate"
         );
@@ -299,7 +320,12 @@ impl Prepare for Machine {
     ) -> Result<(Shape, Prepared), CodegenError> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
         let function = &program.functions[id];
-        let prepared = Prepared { body: function.body, refs: refs.len(), built_in: program.built_in(*id), own: function.anchors };
+        let prepared = Prepared {
+            body: function.body,
+            refs: refs.len(),
+            built_in: program.built_in(*id),
+            own: function.anchors,
+        };
         if prepared.body == FAILS_ITS_CHECK {
             return Err(error(unit.instance.key(), unit.item, "a layout too big for the target"));
         }
@@ -339,7 +365,11 @@ impl Prepare for Machine {
             body: Attrs::default(),
             external: true,
         };
-        let exported = Exported { body: prepared.body, code: unit.instance.code, built_in: prepared.built_in.clone() };
+        let exported = Exported {
+            body: prepared.body,
+            code: unit.instance.code,
+            built_in: prepared.built_in.clone(),
+        };
         Ok((summary, exported))
     }
 
@@ -364,7 +394,12 @@ impl Prepare for Machine {
         // A release compile calls `bcmp` of its own accord, as LLVM does for a `memcmp`.
         let mut extra = Vec::new();
         if imports.is_some() {
-            relocs.push(crate::Relocation { at: 0, kind: RelocKind::PcRel32, target: bcmp(), addend: -4 });
+            relocs.push(crate::Relocation {
+                at: 0,
+                kind: RelocKind::PcRel32,
+                target: bcmp(),
+                addend: -4,
+            });
             extra.push("bcmp".to_owned());
         }
         let mut code = code(&prepared);
@@ -390,8 +425,16 @@ impl Prepare for Machine {
             let at = code.len() as u32 + 1;
             code.extend([0xe8, 0, 0, 0, 0]);
             let span = blaze_format::SpanRef { anchor: own[1], index: 7 };
-            relocs.push(crate::Relocation { at, kind: RelocKind::PcRel32, target: Target::Position(span), addend: -4 });
-            lines.push(crate::Line { at: 0, span: blaze_format::SpanRef { anchor: own[0], index: 2 } });
+            relocs.push(crate::Relocation {
+                at,
+                kind: RelocKind::PcRel32,
+                target: Target::Position(span),
+                addend: -4,
+            });
+            lines.push(crate::Line {
+                at: 0,
+                span: blaze_format::SpanRef { anchor: own[0], index: 2 },
+            });
         }
         let function = CompiledFunction {
             key: unit.instance.key(),
@@ -560,7 +603,9 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
 /// entry. Kept under their codes, the same two are two templates.
 #[test]
 fn two_items_written_alike_share_one_template_each_at_its_own_positions() {
-    let anchors = |n: u8| -> [ContentId; crate::template::OWN_TABLES] { std::array::from_fn(|t| ContentId([n + t as u8; 32])) };
+    let anchors = |n: u8| -> [ContentId; crate::template::OWN_TABLES] {
+        std::array::from_fn(|t| ContentId([n + t as u8; 32]))
+    };
     let (two, three) = (anchors(0x20), anchors(0x30));
     let program_of = |relative: bool| {
         let mut program = program();
@@ -581,17 +626,27 @@ fn two_items_written_alike_share_one_template_each_at_its_own_positions() {
             .find(|it| it.lines.iter().any(|line| line.span.anchor == own[0]))
             .expect("a function at its own positions");
         let located = blaze_format::SpanRef { anchor: own[1], index: 7 };
-        assert!(function.relocs.targets().contains(&Target::Position(located)), "its panic location is its own");
+        assert!(
+            function.relocs.targets().contains(&Target::Position(located)),
+            "its panic location is its own"
+        );
         function.key
     };
     let policy = policy(OptLevel::O0, Mode::Output);
-    let (program, machine, memo, mut store) = (program_of(true), Machine::default(), Memo::new(), Store::default());
+    let (program, machine, memo, mut store) =
+        (program_of(true), Machine::default(), Memo::new(), Store::default());
     let cold = build(&program, &machine, &policy, &memo, &store).unwrap();
     assert_ne!(at_own(&cold, &two), at_own(&cold, &three), "two functions, each its own instance");
-    assert_eq!(machine.emitted.load(Ordering::Relaxed), 3, "`main`, `4` and one compile of the two");
+    assert_eq!(
+        machine.emitted.load(Ordering::Relaxed),
+        3,
+        "`main`, `4` and one compile of the two"
+    );
 
     let owned_program = program_of(false);
-    let owned = build(&owned_program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let owned =
+        build(&owned_program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+            .unwrap();
     assert_eq!(templates(&owned), templates(&cold) + 1, "kept under their codes, two templates");
 
     store.keep(&cold.puts);
@@ -623,7 +678,12 @@ fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
 fn symbols_defined_twice_are_refused_before_anything_compiles_naming_each() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let mut program = program();
-    for (id, symbol) in [(4, "__rust_panic_cleanup"), (5, "__rust_panic_cleanup"), (2, "__rust_start_panic"), (3, "__rust_start_panic")] {
+    for (id, symbol) in [
+        (4, "__rust_panic_cleanup"),
+        (5, "__rust_panic_cleanup"),
+        (2, "__rust_start_panic"),
+        (3, "__rust_start_panic"),
+    ] {
         program.functions.get_mut(&id).unwrap().symbol = Some(symbol.to_owned());
     }
     let machine = Machine::default();
@@ -661,7 +721,8 @@ fn a_callee_edit_renames_its_callers_and_compiles_only_it() {
     let (old, new) = (key_of(&before, 0x44), key_of(&after, 0x45));
     assert_ne!(old, new);
     // 2 is the same template; its call now names the new 4.
-    let caller = after.functions.iter().find(|it| it.relocs.targets().contains(&Target::Direct(new)));
+    let caller =
+        after.functions.iter().find(|it| it.relocs.targets().contains(&Target::Direct(new)));
     assert!(caller.is_some_and(|it| it.code[0] == 0x22));
     assert!(after.functions.iter().all(|it| !it.relocs.targets().contains(&Target::Direct(old))));
 }
@@ -673,12 +734,14 @@ fn equal_code_is_one_function_unless_its_address_is_significant() {
     program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
     program.function(2, 0x77, &[]);
     program.function(3, 0x77, &[]);
-    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let built =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     assert_eq!(built.deduped.merged.len(), 1);
     assert_eq!(built.functions.len(), 2);
 
     program.functions.get_mut(&3).unwrap().symbol = Some("exported".to_owned());
-    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let built =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     assert!(built.deduped.merged.is_empty());
     assert_eq!(built.functions.len(), 3);
 }
@@ -687,8 +750,10 @@ fn equal_code_is_one_function_unless_its_address_is_significant() {
 fn a_root_reaches_what_it_calls_and_an_edit_elsewhere_changes_nothing_it_reaches() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let mut program = program();
-    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
-    let key = |built: &Built, name: &str| built.debug_names.iter().find(|it| it.1 == name).unwrap().0;
+    let built =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let key =
+        |built: &Built, name: &str| built.debug_names.iter().find(|it| it.1 == name).unwrap().0;
     assert_eq!(built.inputs.len(), 5);
     assert!(built.inputs.is_sorted_by_key(|it| it.0));
     assert_eq!(built.debug_names.len(), 5);
@@ -700,7 +765,8 @@ fn a_root_reaches_what_it_calls_and_an_edit_elsewhere_changes_nothing_it_reaches
     assert!(all.is_sorted());
 
     program.functions.get_mut(&5).unwrap().body = 0x56;
-    let after = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let after =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     assert_eq!(after.reached(&key(&after, "f2")), two);
     assert_ne!(after.reached(&after.roots[0]), all);
 }
@@ -713,7 +779,9 @@ fn a_static_root_is_built_though_no_code_names_it() {
     let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
     let without = build(&program, &machine, &policy, &memo, &store).unwrap();
     assert!(without.statics.is_empty());
-    let with = Build::new(&machine, &program, &policy, &memo).run_with_statics(&[(1, member())], &[7], &[], &store).unwrap();
+    let with = Build::new(&machine, &program, &policy, &memo)
+        .run_with_statics(&[(1, member())], &[7], &[], &store)
+        .unwrap();
     assert_eq!(with.statics.len(), 1);
     assert_eq!(with.statics[0].item, static_item(7));
     assert_eq!(with.functions.len(), without.functions.len());
@@ -733,7 +801,8 @@ fn statics_are_kept_by_which_they_are() {
     assert_eq!(built.statics.len(), 2);
     assert_eq!(machine.statics.load(Ordering::Relaxed), 2);
     let caller = built.functions.iter().find(|it| it.code[0] == 0x44).unwrap();
-    let statics = caller.relocs.iter().filter(|it| matches!(it.target, Target::Static { .. })).count();
+    let statics =
+        caller.relocs.iter().filter(|it| matches!(it.target, Target::Static { .. })).count();
     assert_eq!(statics, 2);
     store.keep(&built.puts);
     let warm = Machine::default();
@@ -757,7 +826,11 @@ fn a_static_is_kept_with_its_section() {
     assert_eq!(warm.statics.load(Ordering::Relaxed), 0);
     let sections: Vec<_> = again.statics.iter().map(|it| it.section.clone()).collect();
     let item_order = static_item(7) < static_item(8);
-    let want = if item_order { vec![None, Some(".init_array".to_owned())] } else { vec![Some(".init_array".to_owned()), None] };
+    let want = if item_order {
+        vec![None, Some(".init_array".to_owned())]
+    } else {
+        vec![Some(".init_array".to_owned()), None]
+    };
     assert_eq!(sections, want);
 }
 
@@ -787,7 +860,8 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
 fn a_summary_names_the_callees_its_body_calls() {
     let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
     let mut store = Store::default();
-    let main = |built: &Built| built.functions.iter().find(|it| it.code[0] == 0x11).unwrap().code.clone();
+    let main =
+        |built: &Built| built.functions.iter().find(|it| it.code[0] == 0x11).unwrap().code.clone();
     let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
     // Built in at depth through 2: what 2's summary says it calls.
     assert!(main(&cold).contains(&0x44), "{:x?}", main(&cold));
@@ -815,7 +889,8 @@ fn a_body_with_one_more_reference_has_a_template_of_its_own() {
     let machine = Machine::default();
     let with = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
     assert_eq!(machine.emitted.load(Ordering::Relaxed), 1);
-    let read = |built: &Built| built.functions.iter().any(|it| it.code[0] == 0x44 && it.relocs.len() == 2);
+    let read =
+        |built: &Built| built.functions.iter().any(|it| it.code[0] == 0x44 && it.relocs.len() == 2);
     assert!(read(&with));
     assert!(!read(&without));
     store.keep(&with.puts);
@@ -849,10 +924,10 @@ fn a_release_compile_is_kept_by_which_of_its_references_are_one() {
 #[test]
 fn a_live_build_starts_at_cranelift_and_tiers_up() {
     let mut policy = policy(OptLevel::O0, Mode::Live);
-    policy.profile.packages.insert(
-        "*".to_owned(),
-        Override { opt_level: Some(OptLevel::O3), ..Override::default() },
-    );
+    policy
+        .profile
+        .packages
+        .insert("*".to_owned(), Override { opt_level: Some(OptLevel::O3), ..Override::default() });
     let mut program = program();
     program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
     program.functions.get_mut(&4).unwrap().owner = Owner::Dependency;
@@ -863,7 +938,9 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
     assert_eq!(built.tiered.len(), 1);
     // Members and the tiered function are reached through their slots.
     let tiered = built.tiered[0];
-    assert!(built.functions.iter().any(|it| it.relocs.targets().contains(&Target::Function(tiered))));
+    assert!(
+        built.functions.iter().any(|it| it.relocs.targets().contains(&Target::Function(tiered)))
+    );
     assert_eq!(machine.summarized.load(Ordering::Relaxed), 0);
     let up = build.tier_up(&Store::default()).unwrap();
     assert_eq!(up.replaced.len(), 1);
@@ -874,10 +951,10 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
 #[test]
 fn a_tiered_callee_may_be_built_in_but_a_patchable_one_may_not() {
     let mut policy = policy(OptLevel::O0, Mode::Live);
-    policy.profile.packages.insert(
-        "*".to_owned(),
-        Override { opt_level: Some(OptLevel::O3), ..Override::default() },
-    );
+    policy
+        .profile
+        .packages
+        .insert("*".to_owned(), Override { opt_level: Some(OptLevel::O3), ..Override::default() });
     let mut program = program();
     program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
     program.functions.get_mut(&4).unwrap().owner = Owner::Dependency;
@@ -915,7 +992,13 @@ fn a_store_entry_that_does_not_read_is_an_error_not_a_compile() {
 /// the decoder does not.
 #[test]
 fn a_store_hit_is_read_in_place() {
-    let at = |n: u8| kernel::template(&InstanceKey(ContentId([n; 32])), &crate::Settings(ContentId::default()), &ContentId::default());
+    let at = |n: u8| {
+        kernel::template(
+            &InstanceKey(ContentId([n; 32])),
+            &crate::Settings(ContentId::default()),
+            &ContentId::default(),
+        )
+    };
     let key = at(1);
     let mut store = Store::default();
     store.0.insert(key, vec![7; 4096]);
@@ -932,7 +1015,9 @@ fn a_store_hit_is_read_in_place() {
     let mut out = Out::default();
     let sum = |bytes: &[u8]| Ok::<u64, String>(bytes.iter().map(|&it| u64::from(it)).sum());
     assert!(matches!(out.read(&store, &key, &unit, sum), Read::Hit(28672)));
-    let read = blaze_alloc_count::assert_at_most(0, "a warm store hit", || out.read(&store, &key, &unit, sum));
+    let read = blaze_alloc_count::assert_at_most(0, "a warm store hit", || {
+        out.read(&store, &key, &unit, sum)
+    });
     assert!(matches!(read, Read::Hit(28672)));
     let missing = at(2);
     assert!(matches!(out.read(&store, &missing, &unit, sum), Read::Miss));
@@ -973,7 +1058,11 @@ fn a_second_put_of_other_bytes_under_one_key_is_refused() {
         out.finish(names)
     };
 
-    let equal = finished(&[(by_a, key, Kind::Code, &[1, 2, 3]), (by_b, side, Kind::Debug, &[4]), (by_b, key, Kind::Code, &[1, 2, 3])]);
+    let equal = finished(&[
+        (by_a, key, Kind::Code, &[1, 2, 3]),
+        (by_b, side, Kind::Debug, &[4]),
+        (by_b, key, Kind::Code, &[1, 2, 3]),
+    ]);
     assert!(equal.errors.is_empty(), "{:?}", equal.errors);
     let mut keys = vec![key, side];
     keys.sort();
@@ -988,15 +1077,31 @@ fn a_second_put_of_other_bytes_under_one_key_is_refused() {
     let refused = &forward.errors[0];
     let (kept, given) = (blaze_cas::content_of(&[1, 2, 3]), blaze_cas::content_of(&[1, 2, 4]));
     let (kept, given) = if by_a < by_b { (kept, given) } else { (given, kept) };
-    let parts = ["`first_fn`".to_owned(), "`then_fn`".to_owned(), format!("{key:?}"), format!("{kept:?}"), format!("{given:?}")];
+    let parts = [
+        "`first_fn`".to_owned(),
+        "`then_fn`".to_owned(),
+        format!("{key:?}"),
+        format!("{kept:?}"),
+        format!("{given:?}"),
+    ];
     for part in &parts {
         assert!(refused.what.contains(part.as_str()), "{} does not name {part}", refused.what);
     }
     assert!(refused.what.contains("refused"), "{}", refused.what);
 
-    let kinds = finished(&[(by_a, key, Kind::Code, &[1, 2, 3]), (by_b, key, Kind::Debug, &[1, 2, 3])]);
-    assert_eq!(kinds.errors.len(), 1, "another kind under one key is refused too: {:?}", kinds.errors);
-    assert!(kinds.errors[0].what.contains("Debug") && kinds.errors[0].what.contains("Code"), "{}", kinds.errors[0].what);
+    let kinds =
+        finished(&[(by_a, key, Kind::Code, &[1, 2, 3]), (by_b, key, Kind::Debug, &[1, 2, 3])]);
+    assert_eq!(
+        kinds.errors.len(),
+        1,
+        "another kind under one key is refused too: {:?}",
+        kinds.errors
+    );
+    assert!(
+        kinds.errors[0].what.contains("Debug") && kinds.errors[0].what.contains("Code"),
+        "{}",
+        kinds.errors[0].what
+    );
 }
 
 fn test_static(id: u32) -> DescribedStatic<u32, u32> {
@@ -1024,8 +1129,16 @@ fn a_static_definition_key_covers_its_reference_count_and_kinds() {
     let one = definition(&described, std::slice::from_ref(&callee));
     assert_ne!(definition(&described, &[]), one, "the count of references");
     assert_ne!(definition(&described, &[callee.clone(), callee]), one, "the count of references");
-    assert_ne!(definition(&described, &[Target::Data(ContentId([3; 32]))]), one, "a reference's kind");
-    assert_ne!(definition(&described, &[Target::Direct(InstanceKey(ContentId([2; 32])))]), one, "a reference's kind");
+    assert_ne!(
+        definition(&described, &[Target::Data(ContentId([3; 32]))]),
+        one,
+        "a reference's kind"
+    );
+    assert_ne!(
+        definition(&described, &[Target::Direct(InstanceKey(ContentId([2; 32])))]),
+        one,
+        "a reference's kind"
+    );
     assert_eq!(
         definition(&described, &[Target::Function(InstanceKey(ContentId([7; 32])))]),
         one,
@@ -1037,16 +1150,32 @@ fn a_static_definition_key_covers_its_reference_count_and_kinds() {
 /// walk's names ([`names_of`]).
 #[test]
 fn a_statics_refused_put_names_it_by_its_path() {
-    let spec = policy(OptLevel::O0, Mode::Output).choose(&Origin::Member(Package::new("app")), None).unwrap().first;
-    let (a, b): (StaticId, StaticId) = ((static_item(1), ContentId::default()), (static_item(2), ContentId::default()));
+    let spec = policy(OptLevel::O0, Mode::Output)
+        .choose(&Origin::Member(Package::new("app")), None)
+        .unwrap()
+        .first;
+    let (a, b): (StaticId, StaticId) =
+        ((static_item(1), ContentId::default()), (static_item(2), ContentId::default()));
     let mut map = blaze_hash::HashMap::new_in(Global);
     for (id, at) in [(1, a), (2, b)] {
-        map.insert(at, StaticNode::<Machine> { value: id, described: test_static(id), spec: spec.clone(), refs: Vec::new() });
+        map.insert(
+            at,
+            StaticNode::<Machine> {
+                value: id,
+                described: test_static(id),
+                spec: spec.clone(),
+                refs: Vec::new(),
+            },
+        );
     }
     let statics = Sorted::of(map);
     let nodes = Sorted::<InstanceKey, Node<Machine>>::default();
     let unit = Unit {
-        instance: Instance { code: CodeHash(ContentId([1; 32])), args: ContentId::default(), settings: spec.settings() },
+        instance: Instance {
+            code: CodeHash(ContentId([1; 32])),
+            args: ContentId::default(),
+            settings: spec.settings(),
+        },
         backend: spec.backend,
         arch: Arch::X86_64,
         item: static_item(1),
@@ -1058,7 +1187,10 @@ fn a_statics_refused_put_names_it_by_its_path() {
     let finished = out.finish(names_of(&nodes, Some(&statics)));
     assert_eq!(finished.errors.len(), 1, "{:?}", finished.errors);
     let what = &finished.errors[0].what;
-    assert!(what.contains("the static `app::S1`") && what.contains("the static `app::S2`"), "{what}");
+    assert!(
+        what.contains("the static `app::S1`") && what.contains("the static `app::S2`"),
+        "{what}"
+    );
 }
 
 /// A store-keyed template the memo already keeps another of is refused, never instantiated,
@@ -1066,15 +1198,22 @@ fn a_statics_refused_put_names_it_by_its_path() {
 #[test]
 fn a_store_keyed_memo_put_of_another_template_is_refused() {
     let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
-    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let cold =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     // alloc: a test's templates
-    let templates: Vec<Template> = cold.puts.iter().filter_map(|it| blob::decode(&it.bytes).ok()).collect();
+    let templates: Vec<Template> =
+        cold.puts.iter().filter_map(|it| blob::decode(&it.bytes).ok()).collect();
     let first = templates[0].clone();
-    let second = templates.iter().find(|it| **it != first).expect("a build of two templates").clone();
+    let second =
+        templates.iter().find(|it| **it != first).expect("a build of two templates").clone();
     let memo = Memo::new();
     let key = blaze_cas::Key(ContentId([9; 32]));
     let unit = Unit {
-        instance: Instance { code: CodeHash(ContentId([1; 32])), args: ContentId::default(), settings: crate::Settings(ContentId::default()) },
+        instance: Instance {
+            code: CodeHash(ContentId([1; 32])),
+            args: ContentId::default(),
+            settings: crate::Settings(ContentId::default()),
+        },
         backend: Backend::Cranelift { speed: false },
         arch: Arch::X86_64,
         item: item(1),
@@ -1083,10 +1222,16 @@ fn a_store_keyed_memo_put_of_another_template_is_refused() {
     // An earlier build of the memo, which kept `first` under `key`.
     let mut earlier = Out::default();
     assert!(earlier.keyed(&memo, by, &unit, key, first.clone()).is_some());
-    assert!(earlier.keyed(&memo, by, &unit, key, first).is_some(), "an equal template is the kept one");
+    assert!(
+        earlier.keyed(&memo, by, &unit, key, first).is_some(),
+        "an equal template is the kept one"
+    );
     assert!(earlier.finish(|_| Some("f")).errors.is_empty());
     let mut out = Out::default();
-    assert!(out.keyed(&memo, by, &unit, key, second).is_none(), "another template is never instantiated");
+    assert!(
+        out.keyed(&memo, by, &unit, key, second).is_none(),
+        "another template is never instantiated"
+    );
     let finished = out.finish(|_| Some("f"));
     assert_eq!(finished.errors.len(), 1, "{:?}", finished.errors);
     let what = &finished.errors[0].what;
@@ -1098,7 +1243,8 @@ fn a_store_keyed_memo_put_of_another_template_is_refused() {
 #[test]
 fn a_release_compile_of_other_bytes_than_the_memos_under_its_key_fails_the_build() {
     let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
-    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let cold =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     // alloc: a test's templates
     let templates: Vec<(Key, Template)> =
         cold.puts.iter().filter_map(|it| Some((it.key, blob::decode(&it.bytes).ok()?))).collect();
@@ -1106,10 +1252,12 @@ fn a_release_compile_of_other_bytes_than_the_memos_under_its_key_fails_the_build
     // The earlier build's: each key with another key's template.
     let memo = Memo::new();
     for (key, template) in &templates {
-        let other = templates.iter().map(|it| &it.1).find(|it| *it != template).expect("two templates");
+        let other =
+            templates.iter().map(|it| &it.1).find(|it| *it != template).expect("two templates");
         assert!(memo.put_keyed(*key, other.clone()).is_ok());
     }
-    let errors = build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
+    let errors =
+        build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
     assert!(errors.iter().any(|it| it.what.contains("the memo already kept")), "{errors:?}");
     assert!(errors.iter().all(|it| it.what.contains("rule 18")), "{errors:?}");
 }
@@ -1128,7 +1276,9 @@ fn a_release_key_covers_the_bodies_its_imports_build_in() {
     let refs = [Target::Function(g)];
     let g_refs: [&[Target]; 1] = [&[]];
     let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
-    let key = |built_in: &[InstanceKey]| release_template_key(&instance, &[], &refs, &imports, &[g], &g_refs, &[built_in]).1;
+    let key = |built_in: &[InstanceKey]| {
+        release_template_key(&instance, &[], &refs, &imports, &[g], &g_refs, &[built_in]).1
+    };
     assert_ne!(key(&h), key(&edited), "an edit of `h`, which `g` builds in");
     assert_ne!(key(&h), key(&[]), "`g` building `h` in or not");
     assert_eq!(key(&h), key(&h));
@@ -1150,11 +1300,21 @@ fn a_release_key_covers_its_imports_settings() {
     let refs = [Target::Function(g)];
     let g_refs: [&[Target]; 1] = [&[]];
     let g_at = |settings: u8| {
-        Instance { code: CodeHash(ContentId([2; 32])), args: ContentId::default(), settings: crate::Settings(ContentId([settings; 32])) }
-            .key()
+        Instance {
+            code: CodeHash(ContentId([2; 32])),
+            args: ContentId::default(),
+            settings: crate::Settings(ContentId([settings; 32])),
+        }
+        .key()
     };
-    let key = |unit: InstanceKey| release_template_key(&instance, &[], &refs, &imports, &[unit], &g_refs, &[&[]]).1;
-    assert_ne!(key(g_at(2)), key(g_at(3)), "`g`'s export at opt level 2 and 3, under one walk name");
+    let key = |unit: InstanceKey| {
+        release_template_key(&instance, &[], &refs, &imports, &[unit], &g_refs, &[&[]]).1
+    };
+    assert_ne!(
+        key(g_at(2)),
+        key(g_at(3)),
+        "`g`'s export at opt level 2 and 3, under one walk name"
+    );
     assert_eq!(key(g_at(3)), key(g_at(3)));
 }
 
@@ -1172,8 +1332,9 @@ fn a_stored_function_is_the_decoded_templates() {
         let Ok(template) = blob::decode(bytes) else { continue };
         templates += 1;
         for count in [template.refs, template.refs + 1] {
-            let refs: Vec<Target> =
-                (0..count).map(|n| Target::Function(InstanceKey(ContentId([n as u8 + 2; 32])))).collect();
+            let refs: Vec<Target> = (0..count)
+                .map(|n| Target::Function(InstanceKey(ContentId([n as u8 + 2; 32]))))
+                .collect();
             let made = stored_function(bytes, key, &refs, None).expect("a template");
             assert_eq!(made, template.instantiate(key, &refs));
         }
@@ -1206,7 +1367,12 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
     let stored = stored_function(&crate::blob::encode(&template), key, &[], None).unwrap().unwrap();
     assert_eq!(stored, mismatched);
     let mut out = Out::default();
-    for it in [mismatched, stored, function(Some(crate::Profiled::Used { mismatched: false, applied: true })), function(None)] {
+    for it in [
+        mismatched,
+        stored,
+        function(Some(crate::Profiled::Used { mismatched: false, applied: true })),
+        function(None),
+    ] {
         out.push(CodeHash(ContentId::default()), ItemKey(ContentId::default()), it);
     }
     assert_eq!(out.functions.len(), 4);
@@ -1217,7 +1383,11 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
     // Built with a profile in a build of none is an error, not counts filed under no profile.
     let mut out = Out::default();
     let named = ItemKey(ContentId([2; 32]));
-    out.push(CodeHash(ContentId::default()), named, function(Some(crate::Profiled::Used { mismatched: false, applied: true })));
+    out.push(
+        CodeHash(ContentId::default()),
+        named,
+        function(Some(crate::Profiled::Used { mismatched: false, applied: true })),
+    );
     out.profiled(crate::settings::Pgo::None);
     assert!(out.stats.profiles.is_empty());
     assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
@@ -1229,7 +1399,8 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
 fn a_level_without_its_backend_names_the_function() {
     let mut policy = policy(OptLevel::O3, Mode::Output);
     policy.toolchain.llvm = None;
-    let errors = build(&program(), &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap_err();
+    let errors = build(&program(), &Machine::default(), &policy, &Memo::new(), &Store::default())
+        .unwrap_err();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].item, item(1));
 }
@@ -1294,7 +1465,8 @@ fn an_edit_of_a_body_an_import_builds_in_compiles_its_importer_again() {
 #[test]
 fn another_summary_under_a_summarys_flight_key_fails_the_build() {
     let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
-    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let cold =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     let other: Vec<(InstanceKey, Summary)> = (cold.puts.iter())
         .filter(|it| it.kind == Kind::Query)
         .filter_map(|it| Some((InstanceKey(it.key.0), Summary::decode(&it.bytes).ok()?)))
@@ -1303,8 +1475,11 @@ fn another_summary_under_a_summarys_flight_key_fails_the_build() {
     assert!(!other.is_empty(), "an O3 build keeps its summaries");
     let memo = Memo::new();
     assert!(memo.flights().keep_summaries(other).is_empty());
-    let errors = build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
-    let refused = |it: &CodegenError| it.what.contains("the function `f") && it.what.contains("its summary and another build's");
+    let errors =
+        build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
+    let refused = |it: &CodegenError| {
+        it.what.contains("the function `f") && it.what.contains("its summary and another build's")
+    };
     assert!(errors.iter().any(refused), "{errors:?}");
 }
 
@@ -1318,7 +1493,10 @@ fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() 
     build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap();
     let salted = Machine { salt: 1, ..Machine::default() };
     let errors = build(&program, &salted, &policy, &memo, &Store::default()).unwrap_err();
-    assert!(errors.iter().any(|it| it.what.contains("this build prepared it as shape")), "{errors:?}");
+    assert!(
+        errors.iter().any(|it| it.what.contains("this build prepared it as shape")),
+        "{errors:?}"
+    );
     assert_eq!(salted.emitted.load(Ordering::Relaxed), 0, "nothing landed is compiled again");
 }
 
@@ -1345,13 +1523,17 @@ fn chain(count: u32, drop_glue: bool, limit: u32) -> Program {
 fn a_body_repeated_past_the_limit_along_its_path_stops_the_build() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let run = |program: &Program| {
-        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(1, member())], &Store::default())
+        Build::new(&Machine::default(), program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default())
     };
     // f1 is the body's first; f6 is its sixth along the path, a repeat of 5, past 4.
     let errors = run(&chain(30, false, 4)).unwrap_err();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0].item, item(6));
-    assert_eq!(errors[0].what, "f6 repeats its body 5 times on its path from f1, past 4 of f1's crate");
+    assert_eq!(
+        errors[0].what,
+        "f6 repeats its body 5 times on its path from f1, past 4 of f1's crate"
+    );
     let deep = chain(30, false, 4);
     run(&deep).unwrap_err();
     assert!(deep.reached.lock().iter().flatten().all(|it| *it <= 6), "nothing past f6 is walked");
@@ -1382,7 +1564,8 @@ fn a_body_repeated_past_the_limit_along_its_path_stops_the_build() {
 fn a_dependency_is_held_to_its_own_limit_where_rustc_collects_it_in_its_own_build() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let run = |program: &Program| {
-        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(1, member())], &Store::default())
+        Build::new(&Machine::default(), program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default())
     };
     // `main` (crate 0, the default 128) calls `d::run` (crate 1, 256, not generic), which runs a
     // chain of 200 repeats of one generic body of crate 1: d's build collects it, within 256.
@@ -1398,7 +1581,10 @@ fn a_dependency_is_held_to_its_own_limit_where_rustc_collects_it_in_its_own_buil
     // The same `d::run` were it generic or `#[inline]`: the bin collects it, under 128.
     program.crates.insert(2, (1, false));
     let errors = run(&program).unwrap_err();
-    assert_eq!(errors[0].what, "f132 repeats its body 129 times on its path from f1, past 128 of f1's crate");
+    assert_eq!(
+        errors[0].what,
+        "f132 repeats its body 129 times on its path from f1, past 128 of f1's crate"
+    );
 
     // A generic chain of a dependency with a limit of 8, reached from the root's code (limit
     // 128): the root's build collects it, held to the root's limit.
@@ -1437,7 +1623,8 @@ fn the_limit_counts_on_rustcs_depth_first_path_not_the_shortest() {
         program.function(go(k), 0x33, calls).code_of = (k != 0).then_some(1);
         program.bodies.insert(go(k), (if k == 0 { 5 } else { 4 }, false));
     }
-    let built = Build::new(&Machine::default(), &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default());
+    let built = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default());
     assert!(built.is_ok(), "rustc builds it: {:?}", built.err());
 
     // Past the limit on rustc's path too (`S200::go` from `main` first): refused.
@@ -1536,7 +1723,8 @@ fn a_refusal_of_an_early_pass_is_gone_once_the_deferred_are_described() {
         program.bodies.insert(id, (7, false));
     }
     let run = |program: &Program| {
-        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(main, member())], &Store::default())
+        Build::new(&Machine::default(), program, &policy, &Memo::new())
+            .run(&[(main, member())], &Store::default())
     };
     let built = run(&program).expect("the last pass refuses nothing");
     assert_eq!(built.stats.instances, 10);
@@ -1562,13 +1750,16 @@ fn a_release_compile_that_built_in_unkept_code_fails_the_build() {
     program.functions.get_mut(&3).unwrap().body = 0x33;
     // As D2 builds it, each import's code and what it builds in is kept: `f2` imports `f4`,
     // whose export builds `f6` in.
-    let plain = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let plain =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     assert!(plain.stats.imported > 0, "`f2` imports `f4`");
     let stray = CodeHash(ContentId([0x77; 32]));
     let machine = Machine { unkept: Some((0x22, stray)), ..Machine::default() };
     let errors = build(&program, &machine, &policy, &Memo::new(), &Store::default()).unwrap_err();
     let named = |it: &CodegenError| {
-        it.what.contains("`f2` built in the code") && it.what.contains(&format!("{stray:?}")) && it.what.contains("template's key")
+        it.what.contains("`f2` built in the code")
+            && it.what.contains(&format!("{stray:?}"))
+            && it.what.contains("template's key")
     };
     assert!(errors.iter().any(named), "{errors:?}");
     assert!(errors.iter().all(|it| !it.what.contains("`f3`")), "{errors:?}");
@@ -1587,10 +1778,13 @@ fn the_release_store_check_refuses_code_its_key_does_not_hold() {
     let stray = CodeHash(ContentId([0x77; 32]));
     let machine = Machine { unkept: Some((0x22, stray)), ..Machine::default() };
     let memo = Memo::new();
-    let mut checked = Build::new(&machine, &program, &policy, &memo).verify_store(blaze_store_check::Setting::ALL);
+    let mut checked = Build::new(&machine, &program, &policy, &memo)
+        .verify_store(blaze_store_check::Setting::ALL);
     let errors = checked.run(&[(1, member())], &store).unwrap_err();
     let named = |it: &CodegenError| {
-        it.what.starts_with(blaze_store_check::VAR) && it.what.contains("`f2` built in the code") && it.what.contains(&format!("{stray:?}"))
+        it.what.starts_with(blaze_store_check::VAR)
+            && it.what.contains("`f2` built in the code")
+            && it.what.contains(&format!("{stray:?}"))
     };
     assert!(errors.iter().any(named), "{errors:?}");
 }
@@ -1651,17 +1845,25 @@ fn one_instance_asked_for_by_two_origins_is_two_functions_of_its_test_binary() {
     program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
     program.function(2, 0x22, &[]).identity_of = Some(9);
     let dependency = program.function(3, 0x23, &[]);
-    (dependency.identity_of, dependency.origin) = (Some(9), Origin::Dependency(Package::new("dep")));
+    (dependency.identity_of, dependency.origin) =
+        (Some(9), Origin::Dependency(Package::new("dep")));
     let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
         .unwrap_or_else(|errors| panic!("{errors:?}"));
     assert_eq!(built.stats.instances, 3, "2 and 3 are two keys");
-    let key_of = |body: u8| built.functions.iter().find(|it| it.code[0] == body).map(|it| it.key).unwrap();
-    let id = |key| built.inputs.binary_search_by_key(&key, |it| it.0).ok().map(|at| built.versions[at].0);
+    let key_of =
+        |body: u8| built.functions.iter().find(|it| it.code[0] == body).map(|it| it.key).unwrap();
+    let id = |key| {
+        built.inputs.binary_search_by_key(&key, |it| it.0).ok().map(|at| built.versions[at].0)
+    };
     let (member, dependency) = (key_of(0x22), key_of(0x23));
     assert_ne!(id(member), id(dependency), "two functions across versions");
     let live = |key| built.identities.iter().find(|it| it.0 == key).map(|it| it.1);
     assert!(live(member).is_some() && live(dependency).is_some(), "{:?}", built.identities);
-    assert_ne!(live(member), live(dependency), "two functions across edits: each its own live slot");
+    assert_ne!(
+        live(member),
+        live(dependency),
+        "two functions across edits: each its own live slot"
+    );
     crate::ExecTable::new(&built, &[], 0, |_| None, ContentId::default(), std::iter::empty())
         .unwrap_or_else(|why| panic!("{}", why.describe(&built)));
 }

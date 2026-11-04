@@ -17,8 +17,8 @@ use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag,
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
+use std::alloc::Global;
 
 use crate::confine::LIVE;
 
@@ -42,7 +42,8 @@ impl WarmKey {
         }
         hasher.part(&crate::trace::os_bytes(command.dir.as_os_str()));
         blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
-            let mut sorted: Vec<&(OsString, OsString), &blaze_mem::Frame> = Vec::with_capacity_in(set.len(), frame);
+            let mut sorted: Vec<&(OsString, OsString), &blaze_mem::Frame> =
+                Vec::with_capacity_in(set.len(), frame);
             sorted.extend(set);
             sorted.sort_unstable();
             hasher.update(&(sorted.len() as u64).to_le_bytes());
@@ -192,13 +193,19 @@ impl Pool {
     /// Starts a process of `key` as `command` says, which must be sandboxed: it is the
     /// caller's once [`Event::Ready`] says it connected. Its socket's directory is the one
     /// thing of the pool's it may write.
-    pub fn start(&mut self, key: WarmKey, mut command: Command, effects: &mut Vec<Effect>) -> Server {
+    pub fn start(
+        &mut self,
+        key: WarmKey,
+        mut command: Command,
+        effects: &mut Vec<Effect>,
+    ) -> Server {
         let server = Server(self.count);
         self.count += 1;
         let socket = self.socket(server);
         let socket_path = self.config.root.join(socket.as_str());
         // alloc: the directory the process may write, which its sandbox's command keeps.
-        let socket_dir = socket_path.parent().expect("a socket's name is under its directory").to_owned();
+        let socket_dir =
+            socket_path.parent().expect("a socket's name is under its directory").to_owned();
         let live = self.config.root.join(self.live(server).as_str());
         command.env.retain(|it| it.0 != SOCKET && it.0 != LIVE);
         command.env.push((SOCKET.into(), socket_path.into_os_string()));
@@ -368,14 +375,22 @@ mod tests {
             env: vec![("PATH".into(), path.into()), ("CARGO".into(), "c".into())],
             dir: "/ws".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() },
+            sandbox: Sandbox::On {
+                read: Vec::new(),
+                write: Vec::new(),
+                network: false,
+                trace: true,
+                services: Vec::new(),
+            },
             memory: None,
         }
     }
 
     fn tags(effects: &[Effect]) -> (Tag, Tag) {
-        let listen = effects.iter().find_map(|it| matches!(it, Effect::Listen { .. }).then(|| it.tag()));
-        let spawn = effects.iter().find_map(|it| matches!(it, Effect::Spawn { .. }).then(|| it.tag()));
+        let listen =
+            effects.iter().find_map(|it| matches!(it, Effect::Listen { .. }).then(|| it.tag()));
+        let spawn =
+            effects.iter().find_map(|it| matches!(it, Effect::Spawn { .. }).then(|| it.tag()));
         (listen.unwrap(), spawn.unwrap())
     }
 
@@ -383,9 +398,15 @@ mod tests {
     fn a_path_passed_through_is_not_a_new_server() {
         let set = [("CARGO".into(), "c".into())];
         let code = ContentId::of("blaze v2 test 1", b"srv");
-        assert_eq!(WarmKey::of(&code, &command("/a"), &set), WarmKey::of(&code, &command("/b"), &set));
+        assert_eq!(
+            WarmKey::of(&code, &command("/a"), &set),
+            WarmKey::of(&code, &command("/b"), &set)
+        );
         let other = [("CARGO".into(), "d".into())];
-        assert_ne!(WarmKey::of(&code, &command("/a"), &set), WarmKey::of(&code, &command("/a"), &other));
+        assert_ne!(
+            WarmKey::of(&code, &command("/a"), &set),
+            WarmKey::of(&code, &command("/a"), &other)
+        );
     }
 
     /// A process allowed other Mach lookups is another process.
@@ -418,15 +439,28 @@ mod tests {
         assert!(pool.owns(listen) && pool.owns(spawn));
         effects.clear();
         assert_eq!(pool.take(key), None);
-        let ready = pool.complete(Completion { tag: listen, done: Done::Accepted { conn: Conn(5) } }, &mut effects);
+        let ready = pool.complete(
+            Completion { tag: listen, done: Done::Accepted { conn: Conn(5) } },
+            &mut effects,
+        );
         assert_eq!(ready, Some(Event::Ready { server, conn: Conn(5) }));
         assert_eq!(effects, vec![Effect::Unlisten { tag: listen }]);
         effects.clear();
         pool.give_back(server, &mut effects);
         assert!(effects.is_empty());
         assert_eq!(pool.take(key), Some((server, Conn(5))));
-        let exit = Exit { code: Some(0), signal: None, stdout: Vec::new(), stderr: Vec::new(), traced: None, peak_memory: 0 };
-        let ended = pool.complete(Completion { tag: spawn, done: Done::Exited(Box::new(exit.clone())) }, &mut effects);
+        let exit = Exit {
+            code: Some(0),
+            signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            traced: None,
+            peak_memory: 0,
+        };
+        let ended = pool.complete(
+            Completion { tag: spawn, done: Done::Exited(Box::new(exit.clone())) },
+            &mut effects,
+        );
         assert_eq!(ended, Some(Event::Ended { server, exit: Ok(Box::new(exit)) }));
         assert!(effects.iter().any(|it| matches!(it, Effect::Hangup { conn: Conn(5), .. })));
         assert!(pool.is_empty());
@@ -444,8 +478,14 @@ mod tests {
         let two = pool.start(key, command("/a"), &mut effects);
         let (listen_two, spawn_two) = tags(&effects);
         effects.clear();
-        pool.complete(Completion { tag: listen_one, done: Done::Accepted { conn: Conn(1) } }, &mut effects);
-        pool.complete(Completion { tag: listen_two, done: Done::Accepted { conn: Conn(2) } }, &mut effects);
+        pool.complete(
+            Completion { tag: listen_one, done: Done::Accepted { conn: Conn(1) } },
+            &mut effects,
+        );
+        pool.complete(
+            Completion { tag: listen_two, done: Done::Accepted { conn: Conn(2) } },
+            &mut effects,
+        );
         effects.clear();
         pool.give_back(one, &mut effects);
         pool.give_back(two, &mut effects);
@@ -459,12 +499,17 @@ mod tests {
     fn a_socket_name_allocates_only_itself_and_a_warm_key_nothing() {
         let pool = Pool::new(config());
         assert_eq!(pool.socket(Server(7)).as_str(), "pool/socket/7/s");
-        let name = blaze_alloc_count::assert_at_most(1, "a socket's name: the FileName alone", || pool.socket(Server(7)));
+        let name =
+            blaze_alloc_count::assert_at_most(1, "a socket's name: the FileName alone", || {
+                pool.socket(Server(7))
+            });
         assert_eq!(name.as_str(), "pool/socket/7/s");
         let (code, command) = (ContentId::of("blaze v2 test 1", b"srv"), command("/a"));
         let set = [("CARGO".into(), "c".into()), ("A".into(), "1".into())];
         let cold = WarmKey::of(&code, &command, &set);
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm key", || WarmKey::of(&code, &command, &set));
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm key", || {
+            WarmKey::of(&code, &command, &set)
+        });
         assert_eq!(warm, cold);
     }
 }

@@ -48,7 +48,10 @@ struct ManifestPackage {
 pub struct Directory {
     source: SourceId,
     root: PathBuf,
-    #[expect(clippy::disallowed_types, reason = "the vendored packages, read the first time one is asked for: per directory source, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the vendored packages, read the first time one is asked for: per directory source, not global"
+    )]
     packages: std::sync::OnceLock<Result<Vec<Vendored>, String>>,
 }
 
@@ -169,7 +172,8 @@ fn verify(package: &Vendored) -> anyhow::Result<()> {
         let path = package.root.join(file);
         let bytes = std::fs::read(&path)
             .with_context(|| format!("failed to calculate checksum of: {}", path.display()))?;
-        let actual: String = blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual: String =
+            blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
         if &actual != expected {
             bail!(
                 "the listed checksum of `{}` has changed:\nexpected: {expected}\nactual:   {actual}\n\n\

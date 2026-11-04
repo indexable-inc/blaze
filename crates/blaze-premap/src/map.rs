@@ -24,7 +24,10 @@ impl Memory {
     pub fn of(view: &View<'_>) -> Result<Memory, PremapError> {
         let meta = view.meta();
         if !view.whole() {
-            return Err(PremapError::of(format_args!("the dependency image {:?} is read without its segment bytes", meta.key.0)));
+            return Err(PremapError::of(format_args!(
+                "the dependency image {:?} is read without its segment bytes",
+                meta.key.0
+            )));
         }
         let len = view.end() - meta.base;
         let mut name = String::from("blaze-premap-"); // alloc: setup, once per image: its memory object's name
@@ -64,7 +67,12 @@ impl Memory {
 
     /// What a run maps, each at its fixed address.
     pub fn maps(&self) -> impl Iterator<Item = FixedMap<'_>> + '_ {
-        self.maps.iter().map(|&(range, at, access)| FixedMap { memory: &self.memory, range, at, access })
+        self.maps.iter().map(|&(range, at, access)| FixedMap {
+            memory: &self.memory,
+            range,
+            at,
+            access,
+        })
     }
 
     pub fn base(&self) -> u64 {

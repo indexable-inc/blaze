@@ -93,11 +93,17 @@ impl View {
                 v.sample_types =
                     vec![ValueType::new("samples", "count"), ValueType::new("cpu", "nanoseconds")];
                 v.default_type = 1;
-                v.period = p.meta.cpu_period_ns.map(|it| (ValueType::new("cpu", "nanoseconds"), it as i64));
+                v.period = p
+                    .meta
+                    .cpu_period_ns
+                    .map(|it| (ValueType::new("cpu", "nanoseconds"), it as i64));
                 for s in &p.cpu_samples {
                     let mut labels = thread_labels(s.process, s.thread);
                     if let Some(span) = s.span_id.and_then(|id| spans_by_id.get(&(s.process, id))) {
-                        labels.push(("span".to_owned(), LabelValue::Str(p.spans[*span].name.clone())));
+                        labels.push((
+                            "span".to_owned(),
+                            LabelValue::Str(p.spans[*span].name.clone()),
+                        ));
                     }
                     if !s.on_cpu {
                         labels.push(("cpu".to_owned(), LabelValue::Str("off".to_owned())));
@@ -117,7 +123,10 @@ impl View {
                     ValueType::new("inuse_space", "bytes"),
                 ];
                 v.default_type = 3;
-                v.period = p.meta.alloc_sample_bytes.map(|it| (ValueType::new("space", "bytes"), it as i64));
+                v.period = p
+                    .meta
+                    .alloc_sample_bytes
+                    .map(|it| (ValueType::new("space", "bytes"), it as i64));
                 for a in &p.allocs {
                     let mut labels = Vec::new();
                     if let Some(span) = &a.span_name {
@@ -143,13 +152,20 @@ impl View {
                         ValueType::new("self_cpu", "nanoseconds"),
                         ValueType::new("alloc_space", "bytes"),
                     ],
-                    _ => vec![ValueType::new("waits", "count"), ValueType::new("wait", "nanoseconds")],
+                    _ => vec![
+                        ValueType::new("waits", "count"),
+                        ValueType::new("wait", "nanoseconds"),
+                    ],
                 };
                 v.default_type = 1;
                 // Each span's frame: its name, at its callsite.
                 let mut frame_of: BTreeMap<(String, Option<String>, Option<u32>, FrameKind), u32> =
                     BTreeMap::new();
-                let mut frame = |frames: &mut Vec<Frame>, name: &str, file: Option<&String>, line: Option<u32>, kind: FrameKind| {
+                let mut frame = |frames: &mut Vec<Frame>,
+                                 name: &str,
+                                 file: Option<&String>,
+                                 line: Option<u32>,
+                                 kind: FrameKind| {
                     let key = (name.to_owned(), file.cloned(), line, kind);
                     *frame_of.entry(key).or_insert_with(|| {
                         let mut f = Frame::named(name, kind);
@@ -184,8 +200,17 @@ impl View {
                     let mut at = Some(s);
                     let mut hops = 0;
                     while let Some(span) = at {
-                        stack.push(frame(&mut v.frames, &span.name, span.file.as_ref(), span.line, FrameKind::Span));
-                        at = span.parent.and_then(|id| spans_by_id.get(&(span.process, id))).map(|i| &p.spans[*i]);
+                        stack.push(frame(
+                            &mut v.frames,
+                            &span.name,
+                            span.file.as_ref(),
+                            span.line,
+                            FrameKind::Span,
+                        ));
+                        at = span
+                            .parent
+                            .and_then(|id| spans_by_id.get(&(span.process, id)))
+                            .map(|i| &p.spans[*i]);
                         hops += 1;
                         if hops > 4096 {
                             break;
@@ -197,7 +222,8 @@ impl View {
                     }
                     let values = match kind {
                         Kind::Spans => {
-                            let own = s.dur_ns - child_wall.get(&(s.process, s.span_id)).copied().unwrap_or(0);
+                            let own = s.dur_ns
+                                - child_wall.get(&(s.process, s.span_id)).copied().unwrap_or(0);
                             vec![
                                 1,
                                 own.max(0),

@@ -34,7 +34,10 @@ pub(crate) fn module_id(bytes: &[u8]) -> ContentId {
 
 /// The store key the machine code of module `module` from `engines` is kept under.
 pub(crate) fn code_key(module: &ContentId, engines: &Engines) -> Key {
-    Key(Hasher::new("blaze v2 wasm proc macro machine code 2").id(module).id(&engines.code).finish())
+    Key(Hasher::new("blaze v2 wasm proc macro machine code 2")
+        .id(module)
+        .id(&engines.code)
+        .finish())
 }
 
 /// How many loads each way went: what the `macro modules ...` counters plot.
@@ -128,7 +131,8 @@ impl Codes {
             }
         }
         // alloc: error path
-        let module = Module::new(&engines.engine, bytes).map_err(|e| LoadError::Compile(format!("{e:#}")))?;
+        let module = Module::new(&engines.engine, bytes)
+            .map_err(|e| LoadError::Compile(format!("{e:#}")))?;
         let put = match store {
             Some(_) => Some(Put {
                 keep: Keep::Machine(key),
@@ -181,10 +185,16 @@ fn name_code(module: &Module, what: &str) {
 
 /// The machine code `store` keeps under `key`, when its own directory keeps it as a
 /// [`Kind::Machine`]; any other value under the key is refused, unread past its kind.
-fn local<'g>(store: &'g Reader, guard: &'g Guard, key: &Key) -> Result<Option<Local<'g>>, LoadError> {
+fn local<'g>(
+    store: &'g Reader,
+    guard: &'g Guard,
+    key: &Key,
+) -> Result<Option<Local<'g>>, LoadError> {
     match store.get_from(guard, key) {
         Ok(None) => Ok(None),
-        Ok(Some((Origin::Own, entry))) if entry.kind == Kind::Machine => Ok(Some(Local(entry.bytes))),
+        Ok(Some((Origin::Own, entry))) if entry.kind == Kind::Machine => {
+            Ok(Some(Local(entry.bytes)))
+        }
         Ok(Some((origin, entry))) => Err(LoadError::NotLocal { origin, kind: entry.kind }),
         // alloc: error path
         Err(corrupt) => Err(LoadError::Cached(corrupt.to_string())),

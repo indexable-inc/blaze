@@ -152,7 +152,8 @@ impl Query for Must {
     }
     fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
         ran("must");
-        let file = cx.file(key)?.unwrap_or_else(|| panic!("must was asked of {key}, which is gone"));
+        let file =
+            cx.file(key)?.unwrap_or_else(|| panic!("must was asked of {key}, which is gone"));
         Ok(Num(file.bytes.len() as u64))
     }
 }
@@ -272,7 +273,8 @@ fn setup() -> (Database, Arc<MemTree>) {
 }
 
 fn view(db: &Database, tree: &MemTree, files: &[(&str, &str)]) -> ViewId {
-    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (*path, bytes.as_bytes())).collect();
+    let files: Vec<(&str, &[u8])> =
+        files.iter().map(|(path, bytes)| (*path, bytes.as_bytes())).collect();
     db.open(View { root: tree.root(&files) })
 }
 
@@ -457,7 +459,10 @@ fn the_image_holds_the_database() {
     let same = view(&started, &tree, &[("a", "abc")]);
     assert_eq!(double(&started, same, "a"), 6);
     assert_eq!((runs("len"), runs("double")), (0, 0), "every memo verified from the image");
-    assert!(matches!(started.memo(&key::<Double>("a")).map(|memo| memo.value), Some(Stored::Disk(_))));
+    assert!(matches!(
+        started.memo(&key::<Double>("a")).map(|memo| memo.value),
+        Some(Stored::Disk(_))
+    ));
 
     let longer = view(&started, &tree, &[("a", "abcd")]);
     assert_eq!(double(&started, longer, "a"), 8);
@@ -476,7 +481,10 @@ fn an_image_whose_symbols_were_not_restored_is_refused() {
     double(&db, one, "a");
     let (bytes, _) = image_of(&db, Builder::new());
     assert_eq!(intern::restored_from(), None, "no test restores the process's symbols");
-    assert_eq!(Database::from_image_with(config(&tree), opened(&bytes)).err(), Some(DbError::Symbols));
+    assert_eq!(
+        Database::from_image_with(config(&tree), opened(&bytes)).err(),
+        Some(DbError::Symbols)
+    );
 }
 
 #[test]
@@ -490,7 +498,10 @@ fn an_image_without_the_databases_sections_is_refused() {
     other.add(SectionId::DB_MEMOS, blaze_format::schema("blaze v2 db memos 1"), &[]);
     let other = other.finish().expect("an image");
     let error = Database::open_image(Config::memory(), opened(&other)).err();
-    assert!(matches!(error, Some(DbError::Refused(Refused::Schema { id: SectionId::DB_MEMOS, .. }))), "{error:?}");
+    assert!(
+        matches!(error, Some(DbError::Refused(Refused::Schema { id: SectionId::DB_MEMOS, .. }))),
+        "{error:?}"
+    );
     assert!(error.is_some_and(|error| error.is_image()));
 }
 
@@ -576,7 +587,8 @@ fn a_corrupt_group_fails_the_keys_in_it() {
     let (db, tree) = setup();
     let names: Vec<String> = (0..KEYS).map(|n| format!("f{n}")).collect();
     let contents: Vec<String> = (0..KEYS).map(|n| "x".repeat(n % 7)).collect();
-    let files: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(contents.iter().map(String::as_str)).collect();
+    let files: Vec<(&str, &str)> =
+        names.iter().map(String::as_str).zip(contents.iter().map(String::as_str)).collect();
     let one = view(&db, &tree, &files);
     for name in &names {
         double(&db, one, name);
@@ -593,7 +605,11 @@ fn a_corrupt_group_fails_the_keys_in_it() {
             let mut started = match Database::open_image(config(&tree), image) {
                 Ok(started) => started,
                 Err(DbError::Corrupt(corrupt)) => {
-                    assert_eq!((corrupt.section, corrupt.group), (SectionId::DB_BLOB, group), "only paths are read at start");
+                    assert_eq!(
+                        (corrupt.section, corrupt.group),
+                        (SectionId::DB_BLOB, group),
+                        "only paths are read at start"
+                    );
                     continue;
                 }
                 Err(error) => panic!("{error}"),
@@ -612,22 +628,45 @@ fn a_corrupt_group_fails_the_keys_in_it() {
             let mut failed = Vec::new();
             for (n, name) in names.iter().enumerate() {
                 match started.pin().get::<Double>(same, name) {
-                    Ok(value) => assert_eq!(value, 2 * (n % 7) as u64, "{name} is right from the image"),
+                    Ok(value) => {
+                        assert_eq!(value, 2 * (n % 7) as u64, "{name} is right from the image")
+                    }
                     Err(error) => {
                         the_group(error, name);
                         failed.push(name);
                     }
                 }
             }
-            assert!(!failed.is_empty(), "{} group {group} held memos: a key of it fails", section.id);
-            assert!(failed.len() < KEYS, "{} group {group}: the other keys answer from the image", section.id);
+            assert!(
+                !failed.is_empty(),
+                "{} group {group} held memos: a key of it fails",
+                section.id
+            );
+            assert!(
+                failed.len() < KEYS,
+                "{} group {group}: the other keys answer from the image",
+                section.id
+            );
             for &name in &failed {
-                the_group(started.pin().get::<Double>(same, name).expect_err("asked again, it fails again"), name);
+                the_group(
+                    started
+                        .pin()
+                        .get::<Double>(same, name)
+                        .expect_err("asked again, it fails again"),
+                    name,
+                );
             }
-            assert_eq!(runs("len") + runs("double"), 0, "{} group {group}: nothing is computed again", section.id);
+            assert_eq!(
+                runs("len") + runs("double"),
+                0,
+                "{} group {group}: nothing is computed again",
+                section.id
+            );
             let mut live = Live::new();
             the_group(
-                started.write_image(&mut Builder::new(), &mut live).expect_err("no image without the group"),
+                started
+                    .write_image(&mut Builder::new(), &mut live)
+                    .expect_err("no image without the group"),
                 "the image",
             );
             let found = started.take_corrupt();
@@ -719,7 +758,11 @@ fn another_roots_files_are_inputs_shared_by_every_view() {
     let one = view(&db, &tree, &[("a", "1")]);
     assert_eq!(db.pin().get::<RootLen>(one, &core), Ok(402));
     assert_eq!(db.pin().get::<RootLen>(one, &(library, "nope".to_owned())), Ok(u64::MAX));
-    assert_eq!(db.pin().get::<RootLen>(one, &(library, "core".to_owned())), Ok(u64::MAX), "a directory");
+    assert_eq!(
+        db.pin().get::<RootLen>(one, &(library, "core".to_owned())),
+        Ok(u64::MAX),
+        "a directory"
+    );
     assert_eq!(runs("root len"), 3);
 
     let two = view(&db, &tree, &[("a", "22")]);
@@ -729,7 +772,10 @@ fn another_roots_files_are_inputs_shared_by_every_view() {
 
     let newer = tree.root(&[("core/lib.rs", b"abcde".as_slice())]);
     assert_eq!(db.pin().get::<RootLen>(two, &(newer, "core/lib.rs".to_owned())), Ok(501));
-    assert_ne!(Input::file_at_key(library, "core/lib.rs"), Input::file_at_key(newer, "core/lib.rs"));
+    assert_ne!(
+        Input::file_at_key(library, "core/lib.rs"),
+        Input::file_at_key(newer, "core/lib.rs")
+    );
     assert_ne!(Input::file_at_key(library, "core/lib.rs"), Input::file_key("core/lib.rs"));
 
     let (bytes, _) = image_of(&db, Builder::new());
@@ -790,9 +836,11 @@ impl Query for Hold {
     }
     fn execute(_: &mut Cx<'_>, _: &()) -> Result<Num, Cancelled> {
         HELD.store(1, Ordering::SeqCst);
-        blaze_graph::spin::SpinWait::within("the test to release the held query", std::time::Duration::from_secs(60), || {
-            RELEASED.load(Ordering::SeqCst) != 0
-        });
+        blaze_graph::spin::SpinWait::within(
+            "the test to release the held query",
+            std::time::Duration::from_secs(60),
+            || RELEASED.load(Ordering::SeqCst) != 0,
+        );
         Ok(Num(5))
     }
 }
@@ -832,7 +880,11 @@ fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     let one = view(&db, &tree, &[("a", "abc")]);
     let pool = Pool::new(&Topology::flat(1), false).expect("a pool");
     let wait = |flag: &AtomicUsize| {
-        blaze_graph::spin::SpinWait::within("a query to set its flag", Duration::from_secs(60), || flag.load(Ordering::SeqCst) != 0);
+        blaze_graph::spin::SpinWait::within(
+            "a query to set its flag",
+            Duration::from_secs(60),
+            || flag.load(Ordering::SeqCst) != 0,
+        );
     };
 
     std::thread::scope(|scope| {
@@ -842,12 +894,18 @@ fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
         let (asked, heard) = crossbeam_channel::unbounded();
         {
             let (db, asked) = (db.clone(), asked.clone());
-            pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("asks", it)));
+            pool.submit(
+                None,
+                move || db.pin().get::<AsksHold>(one, &()),
+                move |it| _ = asked.send(("asks", it)),
+            );
         }
         wait(&ASKING);
-        blaze_graph::spin::SpinWait::within("the asking job to park on the held query", Duration::from_secs(60), || {
-            pool.parked() == 1
-        });
+        blaze_graph::spin::SpinWait::within(
+            "the asking job to park on the held query",
+            Duration::from_secs(60),
+            || pool.parked() == 1,
+        );
 
         {
             let (db, asked) = (db.clone(), asked.clone());
@@ -857,22 +915,31 @@ fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
                 move |it| _ = asked.send(("len", it)),
             );
         }
-        let (name, len) = heard.recv_timeout(Duration::from_secs(60)).expect("the worker ran another job");
+        let (name, len) =
+            heard.recv_timeout(Duration::from_secs(60)).expect("the worker ran another job");
         assert_eq!(name, "len", "the waiting query holds no worker");
         assert_eq!(len.expect("no panic"), Ok(3));
 
         {
             let (db, asked) = (db.clone(), asked.clone());
-            pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
+            pool.submit(
+                None,
+                move || db.pin().get::<AsksHold>(one, &()),
+                move |it| _ = asked.send(("again", it)),
+            );
         }
-        blaze_graph::spin::SpinWait::within("the second asking job to park on the held query", Duration::from_secs(60), || {
-            pool.parked() == 2
-        });
+        blaze_graph::spin::SpinWait::within(
+            "the second asking job to park on the held query",
+            Duration::from_secs(60),
+            || pool.parked() == 2,
+        );
 
         RELEASED.store(1, Ordering::SeqCst);
         assert_eq!(holder.join().expect("the holder"), Ok(5));
         let mut ended: Vec<_> = (0..2)
-            .map(|_| heard.recv_timeout(Duration::from_secs(60)).expect("the waiting queries ended"))
+            .map(|_| {
+                heard.recv_timeout(Duration::from_secs(60)).expect("the waiting queries ended")
+            })
             .map(|(name, it)| (name, it.expect("no panic")))
             .collect();
         ended.sort_by_key(|it| it.0);
@@ -905,7 +972,8 @@ fn threads_asking_overlapping_keys_run_each_once() {
     let (mut db, tree) = setup();
     db.register::<Counted>();
     let files: Vec<(String, String)> = (0..64).map(|i| (format!("f{i}"), "x".repeat(i))).collect();
-    let files: Vec<(&str, &str)> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let files: Vec<(&str, &str)> =
+        files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
     let one = view(&db, &tree, &files);
     std::thread::scope(|scope| {
         for thread in 0..8 {
@@ -919,7 +987,11 @@ fn threads_asking_overlapping_keys_run_each_once() {
             });
         }
     });
-    assert_eq!(COUNTED.load(Ordering::SeqCst), 64, "each key ran once, whichever thread asked first");
+    assert_eq!(
+        COUNTED.load(Ordering::SeqCst),
+        64,
+        "each key ran once, whichever thread asked first"
+    );
 }
 
 const TEXT: SchemaHash = SchemaHash(ContentId([0x54; 32]));
@@ -1002,7 +1074,11 @@ fn edges_round_trip_through_their_record() {
     assert_eq!(record.edge(), edge);
     let bytes = crate::image::encode_edge(&edge);
     assert_eq!(bytes.len(), crate::table::EDGE_RECORD);
-    assert_eq!(EdgeRecord::as_bytes(&[record]), bytes.as_slice(), "the image's layout, read in place");
+    assert_eq!(
+        EdgeRecord::as_bytes(&[record]),
+        bytes.as_slice(),
+        "the image's layout, read in place"
+    );
     let aligned = Aligned::copy(&bytes);
     // SAFETY: `Aligned` is at a 16-byte boundary.
     let read = unsafe { EdgeRecord::from_bytes(aligned.bytes()) };
@@ -1056,7 +1132,9 @@ fn a_warm_hit_allocates_nothing() {
     let name = "a".to_owned();
     let pinned = db.pin();
     assert_eq!(pinned.get::<Double>(one, &name), Ok(6));
-    let got = blaze_alloc_count::assert_at_most(0, "a warm Pinned::get", || pinned.get::<Double>(one, &name));
+    let got = blaze_alloc_count::assert_at_most(0, "a warm Pinned::get", || {
+        pinned.get::<Double>(one, &name)
+    });
     assert_eq!(got, Ok(6));
     drop(pinned);
 
@@ -1077,7 +1155,11 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     drop(task);
     double(&db, one, "a");
     let task = blaze_reclaim::enter();
-    let again = db.slot(&task, &key::<Len>("a")).expect("no image").and_then(|slot| slot.key()).expect("still kept");
+    let again = db
+        .slot(&task, &key::<Len>("a"))
+        .expect("no image")
+        .and_then(|slot| slot.key())
+        .expect("still kept");
     assert_eq!(again.as_ptr(), kept, "not encoded and swapped in again");
     drop(task);
 
@@ -1089,7 +1171,8 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
 
     // Its bytes are read back once: the next view's run of len(a) takes the key decoded then.
     let task = blaze_reclaim::enter();
-    let decoded: *const crate::AnyKey = &**db.keys.get(&task, &key::<Len>("a")).expect("decoded for its run");
+    let decoded: *const crate::AnyKey =
+        &**db.keys.get(&task, &key::<Len>("a")).expect("decoded for its run");
     drop(task);
     let longest = view(&db, &tree, &[("a", "abcde")]);
     assert_eq!(db.pin().get::<Double>(longest, &"a".to_owned()), Ok(10));
@@ -1164,9 +1247,10 @@ fn a_revalidation_that_changes_nothing_allocates_nothing() {
     }
     let reused = db.open(View { root });
     let pinned = db.pin();
-    let got = blaze_alloc_count::assert_at_most(0, "revalidating double(a) in a reused view", || {
-        pinned.get::<Double>(reused, &name)
-    });
+    let got =
+        blaze_alloc_count::assert_at_most(0, "revalidating double(a) in a reused view", || {
+            pinned.get::<Double>(reused, &name)
+        });
     assert_eq!(got, Ok(6));
     assert_eq!((runs("double"), runs("len")), (1, 1), "verified, not run again");
 }
@@ -1241,7 +1325,9 @@ fn marks_are_a_bit_a_memo() {
     assert!(!marks.insert_growing(3), "marked once");
     assert!(marks.insert_growing(64));
     assert!(marks.insert_growing(200), "past the end it was made for");
-    assert!(marks.contains(64) && marks.contains(200) && !marks.contains(65) && !marks.contains(1000));
+    assert!(
+        marks.contains(64) && marks.contains(200) && !marks.contains(65) && !marks.contains(1000)
+    );
     assert_eq!(marks.iter().collect::<Vec<_>>(), [3, 64, 200]);
 }
 
@@ -1287,8 +1373,10 @@ fn layered() -> (Database, Vec<MemoId>) {
     let names: Vec<String> =
         (0..LAYERS).flat_map(|layer| (0..WIDTH).map(move |i| format!("{layer}.{i}"))).collect();
     for round in 0..3usize {
-        let texts: Vec<String> = (0..names.len()).map(|at| "x".repeat(1 + at * (round + 1) % 7)).collect();
-        let files: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(texts.iter().map(String::as_str)).collect();
+        let texts: Vec<String> =
+            (0..names.len()).map(|at| "x".repeat(1 + at * (round + 1) % 7)).collect();
+        let files: Vec<(&str, &str)> =
+            names.iter().map(String::as_str).zip(texts.iter().map(String::as_str)).collect();
         let one = view(&db, &tree, &files);
         let pinned = db.pin();
         for i in 0..WIDTH {
@@ -1309,7 +1397,13 @@ fn layered() -> (Database, Vec<MemoId>) {
 /// What [`Database::mark`] reaches from `roots`, and from the open views' results when `views`,
 /// with marks made for `capacity` memos: the memos reached, ascending; those the results name;
 /// and the input keys, sorted.
-fn marked(db: &Database, views: bool, roots: &[MemoId], capacity: usize, how: Mark) -> (Vec<MemoId>, Vec<MemoId>, Vec<QueryKey>) {
+fn marked(
+    db: &Database,
+    views: bool,
+    roots: &[MemoId],
+    capacity: usize,
+    how: Mark,
+) -> (Vec<MemoId>, Vec<MemoId>, Vec<QueryKey>) {
     let task = blaze_reclaim::enter();
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut states = Vec::new_in(frame);
@@ -1318,8 +1412,10 @@ fn marked(db: &Database, views: bool, roots: &[MemoId], capacity: usize, how: Ma
         }
         let mut work = Vec::new_in(frame);
         work.extend_from_slice(roots);
-        let (mut reached, mut hot) =
-            (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
+        let (mut reached, mut hot) = (
+            Bits::<_, MemoId>::from_words(Vec::new_in(frame)),
+            Bits::<_, MemoId>::from_words(Vec::new_in(frame)),
+        );
         reached.grow(capacity);
         hot.grow(capacity);
         let mut inputs = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
@@ -1363,7 +1459,10 @@ fn parallel_marking_reaches_what_serial_marking_does() {
             );
         }
     }
-    assert!(reached_some && hot_some, "some round's roots reach memos, and the open view names some");
+    assert!(
+        reached_some && hot_some,
+        "some round's roots reach memos, and the open view names some"
+    );
 }
 
 /// A parallel mark allocates nothing on the thread that asks it: its marks and what it keeps
@@ -1379,13 +1478,24 @@ fn a_parallel_mark_allocates_nothing_on_its_caller() {
         db.views.for_each(&task, |state| states.push(state));
         let mut work = Vec::new_in(frame);
         work.extend_from_slice(&all);
-        let (mut reached, mut hot) =
-            (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
+        let (mut reached, mut hot) = (
+            Bits::<_, MemoId>::from_words(Vec::new_in(frame)),
+            Bits::<_, MemoId>::from_words(Vec::new_in(frame)),
+        );
         reached.grow(end);
         hot.grow(end);
         let mut inputs = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
         blaze_alloc_count::assert_at_most(0, "a parallel mark, on its caller", || {
-            db.mark(&task, frame, &states, &mut work, &mut reached, &mut hot, &mut inputs, Mark::Parallel { batch: 64 });
+            db.mark(
+                &task,
+                frame,
+                &states,
+                &mut work,
+                &mut reached,
+                &mut hot,
+                &mut inputs,
+                Mark::Parallel { batch: 64 },
+            );
         });
         reached.count()
     });
@@ -1475,7 +1585,8 @@ fn query_kinds_name_each_kind_both_ways() {
     assert_eq!(of("second"), None);
 }
 
-const BROKEN: Corrupt = Corrupt { section: SectionId::VFS_BLOBS, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };
+const BROKEN: Corrupt =
+    Corrupt { section: SectionId::VFS_BLOBS, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };
 
 /// A [`MemTree`] whose file `broken` names fails its check while it is set.
 struct Breaking {
@@ -1484,7 +1595,11 @@ struct Breaking {
 }
 
 impl Tree for Breaking {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         if *self.broken.lock() == Some(path) {
             return Err(BROKEN);
         }
@@ -1499,9 +1614,12 @@ impl Tree for Breaking {
 fn a_file_that_fails_its_check_fails_the_request_and_is_read_again() {
     reset();
     let tree = Arc::new(Breaking { files: MemTree::default(), broken: Mutex::new(Some("a")) });
-    let mut db = Database::new(Config { tree: Some(tree.clone()), dir: FileName::new("db"), tags: TAGS });
+    let mut db =
+        Database::new(Config { tree: Some(tree.clone()), dir: FileName::new("db"), tags: TAGS });
     register(&mut db);
-    let view = db.open(View { root: tree.files.root(&[("a", b"four".as_slice()), ("b", b"xy".as_slice())]) });
+    let view = db.open(View {
+        root: tree.files.root(&[("a", b"four".as_slice()), ("b", b"xy".as_slice())]),
+    });
     assert_eq!(db.pin().get::<Double>(view, &"a".to_owned()).err(), Some(DbError::Corrupt(BROKEN)));
     assert_eq!(double(&db, view, "b"), 4, "another file of the view still reads");
     *tree.broken.lock() = None;
@@ -1551,7 +1669,11 @@ fn an_edit_reruns_only_the_directories_above_it() {
         assert!(db.why(edited, &subtree(dir)).is_some(), "{dir:?} is above the edit: it reran");
     }
     for dir in ["a/c", "d"] {
-        assert_eq!(db.why(edited, &subtree(dir)), None, "{dir:?} is beside the edit: verified, not run");
+        assert_eq!(
+            db.why(edited, &subtree(dir)),
+            None,
+            "{dir:?} is beside the edit: verified, not run"
+        );
     }
     assert_eq!(tree_of(&db, edited, "a/c", false), tree_of(&db, one, "a/c", false));
 
@@ -1564,7 +1686,9 @@ fn an_edit_reruns_only_the_directories_above_it() {
 fn a_hash_sees_names_kinds_and_contents() {
     let (db, tree) = setup();
     let base = tree_of(&db, view(&db, &tree, &[("a/x", "1")]), "", false);
-    for files in [&[("a/y", "1")][..], &[("a/x", "2")], &[("b/x", "1")], &[("a/x/x", "1")], &[("a", "1")]] {
+    for files in
+        [&[("a/y", "1")][..], &[("a/x", "2")], &[("b/x", "1")], &[("a/x/x", "1")], &[("a", "1")]]
+    {
         assert_ne!(tree_of(&db, view(&db, &tree, files), "", false), base, "{files:?}");
     }
     let one = view(&db, &tree, &[("a/x", "1")]);
@@ -1574,18 +1698,32 @@ fn a_hash_sees_names_kinds_and_contents() {
 #[test]
 fn a_package_leaves_out_hidden_names_and_the_top_target() {
     let (db, tree) = setup();
-    let source = [("src/lib.rs", "fn f() {}"), ("src/target/t.rs", "1"), ("Cargo.toml", "[package]")];
+    let source =
+        [("src/lib.rs", "fn f() {}"), ("src/target/t.rs", "1"), ("Cargo.toml", "[package]")];
     let mut cluttered = source.to_vec();
-    cluttered.extend([(".git/HEAD", "ref"), (".env", "x"), ("target/debug/out", "bin"), ("src/.cache/c", "y")]);
+    cluttered.extend([
+        (".git/HEAD", "ref"),
+        (".env", "x"),
+        ("target/debug/out", "bin"),
+        ("src/.cache/c", "y"),
+    ]);
     let clean = view(&db, &tree, &source);
     let noisy = view(&db, &tree, &cluttered);
     assert_eq!(tree_of(&db, noisy, "", true), tree_of(&db, clean, "", true));
-    assert_ne!(tree_of(&db, noisy, "", false), tree_of(&db, clean, "", false), "a plain tree keeps them");
+    assert_ne!(
+        tree_of(&db, noisy, "", false),
+        tree_of(&db, clean, "", false),
+        "a plain tree keeps them"
+    );
 
     let mut nested = source;
     nested[1].1 = "2";
     let nested = view(&db, &tree, &nested);
-    assert_ne!(tree_of(&db, nested, "", true), tree_of(&db, clean, "", true), "only the top `target` is left out");
+    assert_ne!(
+        tree_of(&db, nested, "", true),
+        tree_of(&db, clean, "", true),
+        "only the top `target` is left out"
+    );
 }
 
 #[test]
@@ -1602,7 +1740,11 @@ fn no_directory_has_no_tree() {
 struct Backwards(MemTree);
 
 impl Tree for Backwards {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         self.0.file(root, path)
     }
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Lent<'_, '_>)) -> bool {
@@ -1654,14 +1796,23 @@ fn a_tree_that_lists_out_of_order_stops_the_read_naming_the_directory() {
     let files: &[(&str, &[u8])] = &[("b", b"1"), ("c/x", b"2"), ("a", b"3")];
     let backwards = Arc::new(Backwards(MemTree::default()));
     let root = backwards.0.root(files);
-    let mut db = Database::new(Config { tree: Some(backwards.clone()), dir: FileName::new("db"), tags: TAGS });
+    let mut db = Database::new(Config {
+        tree: Some(backwards.clone()),
+        dir: FileName::new("db"),
+        tags: TAGS,
+    });
     register(&mut db);
     db.register::<Listing>();
     let one = db.open(View { root });
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.pin().get::<Listing>(one, &String::new())));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.pin().get::<Listing>(one, &String::new())
+    }));
     let panic = failed.expect_err("a listing out of order is the tree's error");
     let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or("");
-    assert!(message.contains("listed directory \"\"") && message.contains("out of order"), "{message}");
+    assert!(
+        message.contains("listed directory \"\"") && message.contains("out of order"),
+        "{message}"
+    );
 }
 
 static SPREAD: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
@@ -1764,7 +1915,8 @@ fn spread_setup(files: &[(String, String)]) -> (Database, ViewId, Arc<MemTree>) 
     db.register::<All>();
     db.register::<Each>();
     db.register::<CountedAll>();
-    let files: Vec<(&str, &str)> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let files: Vec<(&str, &str)> =
+        files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
     let one = view(&db, &tree, &files);
     (db, one, tree)
 }
@@ -1782,13 +1934,16 @@ fn list_key<Q: Query<Key = Vec<String>>>(names: &[String]) -> QueryKey {
 /// view verifies them as it verifies the loop's.
 #[test]
 fn get_all_gives_the_values_and_edges_a_loop_of_get_gives() {
-    let files: Vec<(String, String)> = (0..32).map(|i| (format!("all{i}"), "x".repeat(i))).collect();
+    let files: Vec<(String, String)> =
+        (0..32).map(|i| (format!("all{i}"), "x".repeat(i))).collect();
     let (db, one, tree) = spread_setup(&files);
     let mut asked: Vec<String> = (0..32).map(|i| format!("all{i}")).collect();
     asked.extend(names(&["all3", "all-missing", "all3", "all0"]));
-    let expected = fold(asked.iter().map(|name| match name.strip_prefix("all").and_then(|n| n.parse::<u64>().ok()) {
-        Some(n) => n,
-        None => u64::MAX,
+    let expected = fold(asked.iter().map(|name| {
+        match name.strip_prefix("all").and_then(|n| n.parse::<u64>().ok()) {
+            Some(n) => n,
+            None => u64::MAX,
+        }
     }));
 
     assert_eq!(db.pin().get::<All>(one, &asked), Ok(expected));
@@ -1804,7 +1959,8 @@ fn get_all_gives_the_values_and_edges_a_loop_of_get_gives() {
 
     let mut edited = files.clone();
     edited[5].1.push('y');
-    let edited: Vec<(&str, &str)> = edited.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let edited: Vec<(&str, &str)> =
+        edited.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
     let two = view(&db, &tree, &edited);
     // all5 is one longer, and it is read once, at position 5.
     let changed = expected.wrapping_add(1_000_003u64.wrapping_pow((asked.len() - 1 - 5) as u32));
@@ -1812,25 +1968,33 @@ fn get_all_gives_the_values_and_edges_a_loop_of_get_gives() {
     assert_eq!(db.pin().get::<Each>(two, &asked), Ok(changed));
     assert_eq!(spread_runs("all5"), 2, "only the edited file's key ran again");
     assert_eq!(spread_runs("all6"), 1);
-    assert_eq!(db.why(two, &list_key::<All>(&asked)).map(|why| why.chain[0].key), Some(key::<Spread>("all5")));
+    assert_eq!(
+        db.why(two, &list_key::<All>(&asked)).map(|why| why.chain[0].key),
+        Some(key::<Spread>("all5"))
+    );
 }
 
 /// A key whose run panics fails the call with its panic, raised once the jobs ahead have ended;
 /// what they resolved stays as memos.
 #[test]
 fn a_key_that_fails_fails_get_all_and_the_jobs_results_are_kept() {
-    let files: Vec<(String, String)> = (0..8).map(|i| (format!("fail{i}"), "x".repeat(i))).collect();
+    let files: Vec<(String, String)> =
+        (0..8).map(|i| (format!("fail{i}"), "x".repeat(i))).collect();
     let (db, one, _) = spread_setup(&files);
     let mut asked = names(&["fail0", "gone"]);
     asked.extend((1..8).map(|i| format!("fail{i}")));
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.pin().get::<All>(one, &asked)));
+    let failed =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.pin().get::<All>(one, &asked)));
     let panic = failed.expect_err("the key that panics fails the call");
     let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or("");
     assert!(message.contains("gone"), "the key's own panic: {message}");
     assert!(db.memo(&list_key::<All>(&asked)).is_none());
     assert!(db.memo(&key::<Spread>("gone")).is_none());
     for i in 1..8 {
-        assert!(db.memo(&key::<Spread>(&format!("fail{i}"))).is_some(), "fail{i} was resolved ahead and kept");
+        assert!(
+            db.memo(&key::<Spread>(&format!("fail{i}"))).is_some(),
+            "fail{i} was resolved ahead and kept"
+        );
     }
     assert_eq!(db.pin().get::<Spread>(one, &"fail7".to_owned()), Ok(7));
     assert_eq!(spread_runs("fail7"), 1, "kept, not run again");
@@ -1840,7 +2004,8 @@ fn a_key_that_fails_fails_get_all_and_the_jobs_results_are_kept() {
 /// and the request asked again without it reuses them.
 #[test]
 fn a_cancelled_key_cancels_get_all_and_the_jobs_results_are_kept() {
-    let files: Vec<(String, String)> = (0..8).map(|i| (format!("cancel{i}"), "x".repeat(i))).collect();
+    let files: Vec<(String, String)> =
+        (0..8).map(|i| (format!("cancel{i}"), "x".repeat(i))).collect();
     let (db, one, _) = spread_setup(&files);
     let mut asked = names(&["cancel0", "no"]);
     asked.extend((1..8).map(|i| format!("cancel{i}")));
@@ -1848,7 +2013,10 @@ fn a_cancelled_key_cancels_get_all_and_the_jobs_results_are_kept() {
     assert!(db.memo(&list_key::<All>(&asked)).is_none());
     assert!(db.memo(&key::<Spread>("no")).is_none());
     for i in 1..8 {
-        assert!(db.memo(&key::<Spread>(&format!("cancel{i}"))).is_some(), "cancel{i} was resolved ahead and kept");
+        assert!(
+            db.memo(&key::<Spread>(&format!("cancel{i}"))).is_some(),
+            "cancel{i} was resolved ahead and kept"
+        );
     }
     let rest: Vec<String> = (0..8).map(|i| format!("cancel{i}")).collect();
     assert_eq!(db.pin().get::<All>(one, &rest), Ok(fold(0..8)));
@@ -1860,7 +2028,8 @@ fn a_cancelled_key_cancels_get_all_and_the_jobs_results_are_kept() {
 /// A `get_all` of keys the view resolved allocates its list of values and nothing else.
 #[test]
 fn a_warm_get_all_allocates_only_its_list() {
-    let files: Vec<(String, String)> = (0..16).map(|i| (format!("warm{i}"), "x".repeat(i))).collect();
+    let files: Vec<(String, String)> =
+        (0..16).map(|i| (format!("warm{i}"), "x".repeat(i))).collect();
     let (db, one, _) = spread_setup(&files);
     let asked: Vec<String> = (0..16).map(|i| format!("warm{i}")).collect();
     assert_eq!(db.pin().get::<CountedAll>(one, &(asked.clone(), 0)), Ok(fold(0..16)));
@@ -1894,9 +2063,9 @@ fn same_len(db: &Database, view: ViewId, name: &str) -> u64 {
 /// Each memo's value word of `name`'s key.
 fn words(db: &Database, name: &str) -> Vec<u64> {
     let task = blaze_reclaim::enter();
-    db.slot(&task, &key::<SameLen>(name))
-        .expect("no image")
-        .map_or_else(Vec::new, |slot| slot.memos().iter().map(|&memo| db.store.value_word(&task, memo)).collect())
+    db.slot(&task, &key::<SameLen>(name)).expect("no image").map_or_else(Vec::new, |slot| {
+        slot.memos().iter().map(|&memo| db.store.value_word(&task, memo)).collect()
+    })
 }
 
 /// Collects until every memo let go of is freed: other tests' threads may still be in tasks
@@ -1910,7 +2079,10 @@ fn collect_until_freed(db: &Database) {
         if db.store.dying() == 0 {
             return;
         }
-        assert!(std::time::Instant::now() < deadline, "what the collections let go of was never freed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "what the collections let go of was never freed"
+        );
         std::thread::yield_now();
     }
 }
@@ -1922,7 +2094,10 @@ fn shared_three() -> (Database, Arc<MemTree>, ViewId, ViewId) {
     db.register::<SameLen>();
     let one = view(&db, &tree, &[("a", "xyz"), ("b", "abc")]);
     let two = view(&db, &tree, &[("a", "pqr")]);
-    assert_eq!((same_len(&db, one, "a"), same_len(&db, one, "b"), same_len(&db, two, "a")), (3, 3, 3));
+    assert_eq!(
+        (same_len(&db, one, "a"), same_len(&db, one, "b"), same_len(&db, two, "a")),
+        (3, 3, 3)
+    );
     assert_eq!(runs("same len"), 3, "a's file differs in the two views: it runs in each");
     (db, tree, one, two)
 }
@@ -1943,7 +2118,11 @@ fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
     assert_eq!(db.evict(&key::<SameLen>("b")), 1);
     assert_eq!(words(&db, "b"), [0], "b's memo let go of the row");
     assert_eq!(words(&db, "a"), [row, row], "a's memos still name it");
-    assert_eq!((same_len(&db, one, "a"), runs("same len")), (3, 3), "a's value is read, not made again");
+    assert_eq!(
+        (same_len(&db, one, "a"), runs("same len")),
+        (3, 3),
+        "a's value is read, not made again"
+    );
     assert_eq!(same_len(&db, one, "b"), 3);
     assert_eq!(runs("same len"), 4, "b's evicted value is made again");
     assert_eq!(words(&db, "b"), [row], "and refilled into the shared row, not a row of its own");
@@ -1958,7 +2137,10 @@ fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
     collect_until_freed(&db);
     assert_eq!(db.store.shared_rows(), 0, "no memo names the row: it is freed");
     let task = blaze_reclaim::enter();
-    assert!(matches!(db.slot(&task, &key::<SameLen>("a")), Ok(None)) && matches!(db.slot(&task, &key::<SameLen>("b")), Ok(None)));
+    assert!(
+        matches!(db.slot(&task, &key::<SameLen>("a")), Ok(None))
+            && matches!(db.slot(&task, &key::<SameLen>("b")), Ok(None))
+    );
 }
 
 /// The image writes equal values once, whatever their kind: a shared kind's memos and a plain
@@ -1966,7 +2148,10 @@ fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
 #[test]
 fn equal_values_go_into_the_image_once() {
     let (db, tree, one, _) = shared_three();
-    assert_eq!((db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())), (Ok(3), Ok(3)));
+    assert_eq!(
+        (db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())),
+        (Ok(3), Ok(3))
+    );
     let (bytes, _) = image_of(&db, Builder::new());
 
     let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
@@ -1982,11 +2167,16 @@ fn equal_values_go_into_the_image_once() {
     let task = blaze_reclaim::enter();
     let at = |key: QueryKey| {
         let slot = started.slot(&task, &key).expect("not corrupt").expect("a key of the image");
-        let bytes = started.store.bytes(&task, *slot.memos().last().expect("a memo")).expect("mapped");
+        let bytes =
+            started.store.bytes(&task, *slot.memos().last().expect("a memo")).expect("mapped");
         (bytes.as_ptr(), bytes.len())
     };
     let shared = at(key::<SameLen>("b"));
-    assert_eq!(at(key::<SameLen>("a")), shared, "a shared kind's equal values are one copy in the blob");
+    assert_eq!(
+        at(key::<SameLen>("a")),
+        shared,
+        "a shared kind's equal values are one copy in the blob"
+    );
     assert_eq!(at(key::<Len>("a")), shared, "so are any kind's: Len's value has the same bytes");
     assert_eq!(at(key::<Len>("b")), shared);
 }
@@ -1996,7 +2186,10 @@ fn equal_values_go_into_the_image_once() {
 fn equal_values_go_into_a_cold_pack_once() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "xyz"), ("b", "abc")]);
-    assert_eq!((db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())), (Ok(3), Ok(3)));
+    assert_eq!(
+        (db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())),
+        (Ok(3), Ok(3))
+    );
     db.close(one);
     let mut effects = Vec::new();
     db.collect(&[key::<Len>("a"), key::<Len>("b")], &mut effects);
@@ -2006,7 +2199,10 @@ fn equal_values_go_into_a_cold_pack_once() {
     let (_, tag) = mapped(&mut effects);
     db.complete(Completion { tag, done: Done::Mapped(mapping(&bytes)) }, &mut effects);
     for name in ["a", "b"] {
-        assert!(matches!(db.memo(&key::<Len>(name)).map(|memo| memo.value), Some(Stored::Disk(_))), "{name}");
+        assert!(
+            matches!(db.memo(&key::<Len>(name)).map(|memo| memo.value), Some(Stored::Disk(_))),
+            "{name}"
+        );
     }
 }
 
@@ -2063,7 +2259,8 @@ fn a_switching_job_takes_its_query_marks_and_stacks_with_it() {
     assert_eq!(crate::Run::new().base, 0, "the thread's key stack is empty for the next job");
     assert!(crate::take_unreadable_corrupt().is_none());
     assert!(
-        (crate::take_inside(), crate::take_stacks(), crate::take_unreadable()) == (None, None, None),
+        (crate::take_inside(), crate::take_stacks(), crate::take_unreadable())
+            == (None, None, None),
         "a thread outside any query has nothing to carry"
     );
 

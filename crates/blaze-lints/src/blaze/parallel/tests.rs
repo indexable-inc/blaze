@@ -320,7 +320,8 @@ pub mod io {
 
 pub(super) const MAIN: &str = "//- /src/lib.rs crate:main deps:std\n";
 
-pub(super) const FLAGS: &str = "-A clippy::all --warn=blaze::parallelizable --warn=blaze::serial_dependence";
+pub(super) const FLAGS: &str =
+    "-A clippy::all --warn=blaze::parallelizable --warn=blaze::serial_dependence";
 
 /// The lint a message is of.
 fn lint_of(message: &str) -> Option<&'static str> {

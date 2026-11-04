@@ -53,10 +53,7 @@ pub(crate) struct ParseError {
 }
 
 fn err(line: usize, message: impl Into<String>) -> ParseError {
-    ParseError {
-        line,
-        message: message.into(),
-    }
+    ParseError { line, message: message.into() }
 }
 
 /// The parsed document, for turning the byte offsets of the spans the TOML
@@ -67,10 +64,7 @@ struct Source<'t> {
 
 impl Source<'_> {
     fn line_at(&self, offset: usize) -> usize {
-        self.text[..offset.min(self.text.len())]
-            .matches('\n')
-            .count()
-            + 1
+        self.text[..offset.min(self.text.len())].matches('\n').count() + 1
     }
 
     fn line_of<T>(&self, spanned: &Spanned<T>) -> usize {
@@ -85,12 +79,8 @@ impl Source<'_> {
 /// Parse the text of a `hegel.toml`.
 pub(crate) fn parse(text: &str) -> Result<ConfigFile, ParseError> {
     let src = Source { text };
-    let table = DeTable::parse(text).map_err(|e| {
-        err(
-            src.line_at(e.span().map_or(0, |span| span.start)),
-            e.message(),
-        )
-    })?;
+    let table = DeTable::parse(text)
+        .map_err(|e| err(src.line_at(e.span().map_or(0, |span| span.start)), e.message()))?;
     let mut out = ConfigFile::default();
     for (key, value) in in_file_order(table.get_ref()) {
         match key.get_ref().as_ref() {
@@ -109,12 +99,7 @@ pub(crate) fn parse(text: &str) -> Result<ConfigFile, ParseError> {
             }
             "profiles" => {
                 let DeValue::Table(profiles) = value.get_ref() else {
-                    return Err(type_error(
-                        &src,
-                        value,
-                        "profiles",
-                        "[profiles.<name>] tables",
-                    ));
+                    return Err(type_error(&src, value, "profiles", "[profiles.<name>] tables"));
                 };
                 for (name, delta) in in_file_order(profiles) {
                     out.profiles.push(parse_profile(&src, name, delta)?);
@@ -175,12 +160,7 @@ fn parse_profile(
         return Err(invalid_name_err(name, line));
     }
     let DeValue::Table(entries) = table.get_ref() else {
-        return Err(type_error(
-            src,
-            table,
-            &format!("profiles.{name}"),
-            "a table of settings",
-        ));
+        return Err(type_error(src, table, &format!("profiles.{name}"), "a table of settings"));
     };
     let mut delta = ProfileDelta::default();
     for (key, value) in in_file_order(entries) {
@@ -214,10 +194,7 @@ fn type_error(
     key: &str,
     expected: &str,
 ) -> ParseError {
-    src.err_at(
-        value,
-        format!("`{key}` expects {expected}, got {}", kind(value.get_ref())),
-    )
+    src.err_at(value, format!("`{key}` expects {expected}, got {}", kind(value.get_ref())))
 }
 
 fn expect_string<'a>(
@@ -254,10 +231,8 @@ fn expect_array<'a>(
         .iter()
         .map(|item| match item.get_ref() {
             DeValue::String(s) => Ok(s.as_ref()),
-            other => Err(src.err_at(
-                item,
-                format!("elements of `{key}` must be strings, got {}", kind(other)),
-            )),
+            other => Err(src
+                .err_at(item, format!("elements of `{key}` must be strings, got {}", kind(other)))),
         })
         .collect()
 }
@@ -274,10 +249,7 @@ fn expect_int(
     };
     match i128::from_str_radix(n.as_str(), n.radix()) {
         Ok(v) if (min..=max).contains(&v) => Ok(v),
-        _ => Err(src.err_at(
-            value,
-            format!("`{key}` must be between {min} and {max}, got {n}"),
-        )),
+        _ => Err(src.err_at(value, format!("`{key}` must be between {min} and {max}, got {n}"))),
     }
 }
 
@@ -513,11 +485,7 @@ pub(crate) fn discover(
     read: impl Fn(&str) -> Option<Vec<u8>>,
 ) -> Option<(String, Vec<u8>)> {
     let check = |path: String| {
-        if exists(&path) {
-            read(&path).map(|bytes| (path, bytes))
-        } else {
-            None
-        }
+        if exists(&path) { read(&path).map(|bytes| (path, bytes)) } else { None }
     };
     let Some(mut dir) = cwd else {
         return check(FILE_NAME.to_string());
@@ -560,12 +528,9 @@ pub(crate) fn load() -> Result<ConfigFile, ProfileError> {
 /// filesystem.
 #[cfg(all(not(miri), not(target_family = "wasm")))]
 fn load_from_sys() -> Result<ConfigFile, ProfileError> {
-    load_from(
-        crate::sys::env_var(CONFIG_VAR),
-        crate::sys::cwd(),
-        crate::sys::fs::exists,
-        |path| crate::sys::fs::read(path).ok(),
-    )
+    load_from(crate::sys::env_var(CONFIG_VAR), crate::sys::cwd(), crate::sys::fs::exists, |path| {
+        crate::sys::fs::read(path).ok()
+    })
 }
 
 /// [`load_from`] on WebAssembly, which has no working directory or
@@ -612,11 +577,7 @@ fn parse_bytes(path: String, bytes: Vec<u8>) -> Result<ConfigFile, ProfileError>
             config.path = Some(path);
             Ok(config)
         }
-        Err(e) => Err(ProfileError::Config {
-            path,
-            line: e.line,
-            message: e.message,
-        }),
+        Err(e) => Err(ProfileError::Config { path, line: e.line, message: e.message }),
     }
 }
 

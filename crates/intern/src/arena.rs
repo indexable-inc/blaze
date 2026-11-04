@@ -110,7 +110,9 @@ impl Table {
         debug_assert!(groups.is_power_of_two());
         let group = |_| Group {
             ctrl: AtomicU64::new(0),
-            values: std::array::from_fn(|_| crate::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            values: std::array::from_fn(|_| {
+                crate::sync::atomic::AtomicPtr::new(std::ptr::null_mut())
+            }),
         };
         Table {
             // alloc: a shard's table, once a doubling, over the inserts that filled the last
@@ -370,8 +372,9 @@ impl Bump {
         if pad + size > self.left {
             let bytes = self.next.max(size.next_multiple_of(CHUNK_ALIGN));
             self.next = (self.next * 2).min(LAST_CHUNK);
-            self.cursor =
-                space::claim_offset(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"));
+            self.cursor = space::claim_offset(
+                Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"),
+            );
             self.left = bytes;
             pad = 0;
         }
@@ -387,7 +390,10 @@ impl Bump {
 /// against a set: an insert is new exactly when the value was not there, a find sees what was
 /// inserted before it, and each value has one address and is read whole.
 #[cfg(all(test, blaze_check))]
-#[allow(unsafe_code, reason = "the model's values are `u64`s written and read through the store's raw pointers")]
+#[allow(
+    unsafe_code,
+    reason = "the model's values are `u64`s written and read through the store's raw pointers"
+)]
 mod model {
     use std::sync::Arc;
 
@@ -414,7 +420,8 @@ mod model {
             Entry::Vacant(vacant) => {
                 // SAFETY: `insert` hands `write` fresh memory of `Layout::new::<u64>()`, aligned
                 // and written by no one else.
-                let at = vacant.insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) });
+                let at = vacant
+                    .insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) });
                 (at, true)
             }
         };
@@ -512,19 +519,26 @@ mod model {
             let history = Arc::new(History::<Set>::new());
             let other = {
                 let (store, history) = (store.clone(), history.clone());
-                thread::spawn(move || [Op::Intern(7), Op::Intern(8)].map(|op| run(&history, &store, op)))
+                thread::spawn(move || {
+                    [Op::Intern(7), Op::Intern(8)].map(|op| run(&history, &store, op))
+                })
             };
             let zero = run(&history, &store, Op::Find(0));
             let eight = run(&history, &store, Op::Intern(8));
             let seven = run(&history, &store, Op::Find(7));
             let [seven_at, eight_at] = other.join().unwrap();
             history.check(Set(0x7f));
-            assert_eq!(zero, Some(before[0]), "a value from before the growth is found where it was");
+            assert_eq!(
+                zero,
+                Some(before[0]),
+                "a value from before the growth is found where it was"
+            );
             assert_eq!(eight, eight_at, "8 interned once");
             if seven.is_some() {
                 assert_eq!(seven, seven_at, "7 found where it was interned");
             }
-            let mut all: Vec<usize> = before.iter().copied().chain(seven_at).chain(eight_at).collect();
+            let mut all: Vec<usize> =
+                before.iter().copied().chain(seven_at).chain(eight_at).collect();
             all.sort_unstable();
             all.dedup();
             assert_eq!(all.len(), 9, "nine values, nine addresses");
@@ -537,7 +551,10 @@ mod model {
 }
 
 #[cfg(all(test, not(blaze_check)))]
-#[allow(unsafe_code, reason = "the tests' values are `u64`s written and read through the store's raw pointers")]
+#[allow(
+    unsafe_code,
+    reason = "the tests' values are `u64`s written and read through the store's raw pointers"
+)]
 mod tests {
     use std::collections::HashMap;
 

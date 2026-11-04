@@ -26,7 +26,6 @@ pub(super) use types::{ByEnv, Sets, described};
 use blaze_core::decimal::decimal;
 use blaze_format::leb;
 use blaze_hash::{FixedHasher, HashMap};
-use std::alloc::Global;
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
@@ -61,6 +60,7 @@ use cranelift_object::{
 use intern::{Symbol, sym};
 use serde_derive::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::alloc::Global;
 use std::hash::{Hash, Hasher};
 
 /// The statement the code of a function is of from `offset` on, as an index into the

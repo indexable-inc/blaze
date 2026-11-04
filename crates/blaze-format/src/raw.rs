@@ -49,7 +49,10 @@ pub(crate) fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
 /// `bytes`, a part of `buffer`, as a `T`, once [`Record::check`] accepts them when `DEEP`
 /// (with all they reach: what [`crate::open`] runs), else [`Record::check_shallow`] (which
 /// a [`Record::SHALLOW_PLAIN`] `T` needs none of).
-pub(crate) fn view<'a, T: Record, const DEEP: bool>(bytes: &'a [u8], buffer: &[u8]) -> Result<&'a T, FormatError> {
+pub(crate) fn view<'a, T: Record, const DEEP: bool>(
+    bytes: &'a [u8],
+    buffer: &[u8],
+) -> Result<&'a T, FormatError> {
     fits::<T>(bytes, 1, buffer)?;
     match DEEP {
         true => T::check(bytes, buffer)?,
@@ -73,7 +76,9 @@ pub(crate) fn view_slice<'a, T: Record, const DEEP: bool>(
     fits::<T>(bytes, len, buffer)?;
     let size = size_of::<T>();
     match DEEP {
-        true if !T::PLAIN => (0..len).try_for_each(|i| crate::check_field::<T>(bytes, i * size, buffer))?,
+        true if !T::PLAIN => {
+            (0..len).try_for_each(|i| crate::check_field::<T>(bytes, i * size, buffer))?
+        }
         false if !T::SHALLOW_PLAIN => {
             (0..len).try_for_each(|i| crate::check_field_shallow::<T>(bytes, i * size, buffer))?
         }
@@ -87,7 +92,10 @@ pub(crate) fn view_slice<'a, T: Record, const DEEP: bool>(
 }
 
 /// `bytes`, a part of `buffer`, as an `H`, which any bytes of its size are.
-pub(crate) fn in_place<'a, H: AnyBits>(bytes: &'a [u8], buffer: &[u8]) -> Result<&'a H, FormatError> {
+pub(crate) fn in_place<'a, H: AnyBits>(
+    bytes: &'a [u8],
+    buffer: &[u8],
+) -> Result<&'a H, FormatError> {
     fits::<H>(bytes, 1, buffer)?;
     // SAFETY: `fits` checked size and alignment, and `AnyBits` makes every such bytes an `H`.
     Ok(unsafe { &*bytes.as_ptr().cast::<H>() })
@@ -119,14 +127,26 @@ mod tests {
         assert_eq!(bytes, &le[..]);
         let buffer = Aligned::copy_from(bytes);
         for len in [0, 1, 7, 100] {
-            assert_eq!(view_slice::<u32, true>(&buffer[..4 * len], len, &buffer).unwrap(), &words(&buffer[..4 * len])[..]);
-            assert_eq!(view_slice::<u32, false>(&buffer[..4 * len], len, &buffer).unwrap(), &words(&buffer[..4 * len])[..]);
+            assert_eq!(
+                view_slice::<u32, true>(&buffer[..4 * len], len, &buffer).unwrap(),
+                &words(&buffer[..4 * len])[..]
+            );
+            assert_eq!(
+                view_slice::<u32, false>(&buffer[..4 * len], len, &buffer).unwrap(),
+                &words(&buffer[..4 * len])[..]
+            );
         }
         assert_eq!(*view::<u32, true>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
         assert_eq!(*view::<u32, false>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
-        assert_eq!(*view::<u64, true>(&buffer[8..16], &buffer).unwrap(), u64::from_le_bytes(buffer[8..16].try_into().unwrap()));
+        assert_eq!(
+            *view::<u64, true>(&buffer[8..16], &buffer).unwrap(),
+            u64::from_le_bytes(buffer[8..16].try_into().unwrap())
+        );
         let slice = in_place::<Slice<u32>>(&buffer[16..24], &buffer).unwrap();
-        assert_eq!((slice.offset, slice.len), (words(&buffer[16..20])[0] as i32, words(&buffer[20..24])[0]));
+        assert_eq!(
+            (slice.offset, slice.len),
+            (words(&buffer[16..20])[0] as i32, words(&buffer[20..24])[0])
+        );
     }
 
     #[test]
@@ -139,7 +159,10 @@ mod tests {
         assert!(view_slice::<u32, true>(&buffer[0..8], 3, &buffer).is_err());
         assert!(view_slice::<u32, false>(&buffer[2..10], 2, &buffer).is_err());
         assert!(view_slice::<u32, false>(&buffer[0..8], usize::MAX, &buffer).is_err());
-        assert!(view_slice::<Slice<u32>, false>(&buffer[2..10], 1, &buffer).is_err(), "a Slice off its alignment");
+        assert!(
+            view_slice::<Slice<u32>, false>(&buffer[2..10], 1, &buffer).is_err(),
+            "a Slice off its alignment"
+        );
         assert!(in_place::<Rel<u32>>(&buffer[2..6], &buffer).is_err());
         let two = Aligned::copy_from(&[2]);
         assert!(view::<bool, true>(&two, &two).is_err(), "a bool of 2");

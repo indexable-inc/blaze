@@ -109,8 +109,10 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// `print_pat_range`.
     pub(crate) fn print_range(&self, out: &mut String, range: &IntRange, ty: Ty<'db>) {
         let Some(info) = self.int_info(ty) else { return };
-        if matches!((range.lo, range.hi), (MaybeInfiniteInt::NegInfinity, MaybeInfiniteInt::PosInfinity))
-        {
+        if matches!(
+            (range.lo, range.hi),
+            (MaybeInfiniteInt::NegInfinity, MaybeInfiniteInt::PosInfinity)
+        ) {
             out.push('_');
             return;
         }
@@ -312,7 +314,9 @@ impl<'a, 'db> Cx<'a, 'db> {
                             StructSignature::of(db, s).name.as_str().to_owned()
                         }
                         // alloc: as above.
-                        (AdtId::UnionId(u), _) => UnionSignature::of(db, u).name.as_str().to_owned(),
+                        (AdtId::UnionId(u), _) => {
+                            UnionSignature::of(db, u).name.as_str().to_owned()
+                        }
                         (AdtId::EnumId(_), _) => String::new(), // alloc: empty.
                     };
                     (variant, name)
@@ -320,7 +324,8 @@ impl<'a, 'db> Cx<'a, 'db> {
             }
             _ => None,
         };
-        let is_union = matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)));
+        let is_union =
+            matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)));
         let mut first = true;
         let mut comma = |out: &mut String| {
             if !std::mem::take(&mut first) {

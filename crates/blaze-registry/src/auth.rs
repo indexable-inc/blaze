@@ -15,12 +15,12 @@ use std::{
 
 use anyhow::bail;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::config::{Config, OptValue, PathAndArgs, Value, env_key};
 use blaze_manifest::files::Disk;
 use blaze_source::SourceId;
 use parking_lot::Mutex;
 use serde_derive::Serialize;
+use std::alloc::Global;
 
 use crate::{api::check_token, registry_source};
 
@@ -305,7 +305,8 @@ struct State {
 impl Auth {
     // dyn: the CLI's output, as on `Auth::shell`.
     pub fn new(config: Config<Disk>, shell: Box<dyn Shell>) -> Auth {
-        let state = State { config, tokens: HashMap::new_in(Global), registries: HashMap::new_in(Global) };
+        let state =
+            State { config, tokens: HashMap::new_in(Global), registries: HashMap::new_in(Global) };
         Auth { state: Mutex::new(state), shell }
     }
 
@@ -791,7 +792,11 @@ fn registry_name(config: &Config<Disk>, source: &SourceId) -> anyhow::Result<Opt
 /// cargo's `resolve_credential_alias`: a provider of no arguments named in
 /// `[credential-alias]`, unless that would shadow a built-in one; the program resolved.
 // dyn: the CLI's output, as on `Auth::shell`.
-fn resolve_alias(config: &Config<Disk>, shell: &dyn Shell, mut provider: PathAndArgs) -> Vec<String> {
+fn resolve_alias(
+    config: &Config<Disk>,
+    shell: &dyn Shell,
+    mut provider: PathAndArgs,
+) -> Vec<String> {
     if provider.args.is_empty() {
         let name = provider.path.raw_value().to_owned();
         let key = format!("credential-alias.{name}");

@@ -57,7 +57,12 @@ pub macro global_asm("assembly template", $(operands,)* $(options($(option),*))?
 "#;
 
 fn library() -> Library<'static> {
-    Library { core: CORE, core_prelude: "        pub use crate::include_str;", std: STD, ..Library::default() }
+    Library {
+        core: CORE,
+        core_prelude: "        pub use crate::include_str;",
+        std: STD,
+        ..Library::default()
+    }
 }
 
 #[test]

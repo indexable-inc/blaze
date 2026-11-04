@@ -13,12 +13,13 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, Unbuilt, BuildScriptRan, Cached, Cargo,
-    CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
-    LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch, NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
-    ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
-    TestResult, Traced, Ub,
-    Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
+    ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
+    CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
+    FactRead, FetchVerb, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
+    NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
+    TestResult, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb,
+    ViewRef, Worked,
 };
 
 const REQUESTS: usize = 35;
@@ -69,12 +70,12 @@ impl Gen {
             1 => 256 + self.below(4),
             n => n % 6,
         };
-        (0..len).map(|_| CHARS[self.below(CHARS.len() as u64) as usize]).collect()  // alloc: test and fuzz reference only
+        (0..len).map(|_| CHARS[self.below(CHARS.len() as u64) as usize]).collect() // alloc: test and fuzz reference only
     }
 
     fn bytes(&mut self) -> Vec<u8> {
         let len = self.count(1);
-        (0..len).map(|_| self.next() as u8).collect()  // alloc: test and fuzz reference only
+        (0..len).map(|_| self.next() as u8).collect() // alloc: test and fuzz reference only
     }
 
     /// How many items a list has: at the top sometimes past what a head of one byte says.
@@ -87,7 +88,7 @@ impl Gen {
 
     fn many<T>(&mut self, depth: u32, mut one: impl FnMut(&mut Gen) -> T) -> Vec<T> {
         let len = self.count(depth);
-        (0..len).map(|_| one(self)).collect()  // alloc: test and fuzz reference only
+        (0..len).map(|_| one(self)).collect() // alloc: test and fuzz reference only
     }
 
     fn maybe<T>(&mut self, one: impl FnOnce(&mut Gen) -> T) -> Option<T> {
@@ -146,9 +147,12 @@ impl Gen {
                     _ => Mode::Symlink,
                 },
             },
-            1 => {
-                Op::Edit { path: self.text(), at: self.wide(), len: self.wide(), bytes: self.bytes() }
-            }
+            1 => Op::Edit {
+                path: self.text(),
+                at: self.wide(),
+                len: self.wide(),
+                bytes: self.bytes(),
+            },
             2 => Op::Delete { path: self.text() },
             _ => Op::Rename { from: self.text(), to: self.text() },
         }
@@ -156,14 +160,14 @@ impl Gen {
 
     fn ops(&mut self, depth: u32) -> Vec<Op> {
         match self.plain {
-            true => Vec::new(),  // alloc: test and fuzz reference only
+            true => Vec::new(), // alloc: test and fuzz reference only
             false => self.many(depth, Gen::op),
         }
     }
 
     fn changes(&mut self, depth: u32) -> Vec<Change> {
         if self.plain {
-            return Vec::new();  // alloc: test and fuzz reference only
+            return Vec::new(); // alloc: test and fuzz reference only
         }
         self.many(depth, |g| Change {
             path: g.text(),
@@ -177,7 +181,7 @@ impl Gen {
 
     fn edges(&mut self, depth: u32) -> Vec<Edge> {
         if self.plain {
-            return Vec::new();  // alloc: test and fuzz reference only
+            return Vec::new(); // alloc: test and fuzz reference only
         }
         self.many(depth, |g| Edge { read: g.key(), saw: g.fingerprint() })
     }
@@ -203,7 +207,7 @@ impl Gen {
         match self.below(kinds) {
             0 => ViewRef::Head(self.text()),
             1 => ViewRef::Root(View { root: self.id() }),
-            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) },  // alloc: test and fuzz reference only
+            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) }, // alloc: test and fuzz reference only
         }
     }
 
@@ -272,7 +276,9 @@ impl Gen {
             15 => Request::CodegenInputs { view: self.view(0), targets: self.targets() },
             16 => Request::Trace { view: self.view(0), targets: self.targets() },
             17 => Request::Tables { view: self.view(0) },
-            18 => Request::Edit { base: self.id(), head: self.text(), edits: self.many(0, Gen::edit) },
+            18 => {
+                Request::Edit { base: self.id(), head: self.text(), edits: self.many(0, Gen::edit) }
+            }
             19 => Request::WillTest {
                 view: self.view(0),
                 filter: self.texts(0),
@@ -287,8 +293,15 @@ impl Gen {
                 wait_ms: self.wide(),
             },
             21 => Request::Memory,
-            22 => Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() },
-            23 => Request::Doc { view: self.view(0), no_deps: self.yes(), private: self.yes(), targets: self.targets() },
+            22 => {
+                Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() }
+            }
+            23 => Request::Doc {
+                view: self.view(0),
+                no_deps: self.yes(),
+                private: self.yes(),
+                targets: self.targets(),
+            },
             24 => Request::Explore { dev: self.yes() },
             25 => Request::Profile { seconds: self.u32() },
             26 => Request::Live,
@@ -298,7 +311,11 @@ impl Gen {
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
             29 => Request::Gc { dry_run: self.yes() },
-            30 => Request::Rebuilt { all: self.yes(), cwd: self.maybe_text(), item: self.maybe_text() },
+            30 => Request::Rebuilt {
+                all: self.yes(),
+                cwd: self.maybe_text(),
+                item: self.maybe_text(),
+            },
             31 => Request::Launch { program: self.text(), pid: self.u32() },
             32 => Request::FetchUrl {
                 url: self.maybe_text(),
@@ -331,7 +348,9 @@ impl Gen {
             2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
             3 => Edit::AddField { field: self.text(), strukt: self.target() },
             4 => Edit::RemoveField { field: self.text(), strukt: self.target() },
-            5 => Edit::AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() },
+            5 => {
+                Edit::AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() }
+            }
             6 => Edit::RemoveItem { item: self.target() },
             7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
             8 => Edit::Rename { to: self.text(), item: self.target() },
@@ -443,7 +462,7 @@ impl Gen {
             message: self.text(),
             children: match depth < 2 {
                 true => self.many(1, |g| g.diagnostic(depth + 1)),
-                false => Vec::new(),  // alloc: test and fuzz reference only
+                false => Vec::new(), // alloc: test and fuzz reference only
             },
             rendered: self.text(),
             explanation: self.maybe(Gen::text),
@@ -553,7 +572,11 @@ impl Gen {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
                 }),
                 critical_path_us: self.wide(),
-                placed: crate::PlacedBytes { cloned: self.wide(), written: self.wide(), copied: self.wide() },
+                placed: crate::PlacedBytes {
+                    cloned: self.wide(),
+                    written: self.wide(),
+                    copied: self.wide(),
+                },
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),
@@ -585,12 +608,18 @@ impl Gen {
                 views: self.u32(),
                 history: self.maybe(Gen::text),
                 requests: self.many(depth, Gen::wide),
-                settings: self.many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
+                settings: self
+                    .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 build: crate::Build {
                     id: self.id(),
-                    exe: crate::Executable { path: self.text(), len: self.wide(), modified_ns: self.wide(), inode: self.wide() },
+                    exe: crate::Executable {
+                        path: self.text(),
+                        len: self.wide(),
+                        modified_ns: self.wide(),
+                        inode: self.wide(),
+                    },
                 },
                 bugs: self.many(depth, |g| crate::Bug {
                     kind: g.text(),
@@ -604,10 +633,8 @@ impl Gen {
             14 => Response::Error(ApiError::from(self.report(depth))),
             15 => Response::Opened { root: self.id() },
             16 => Response::Reached(Reach {
-                items: self.many(depth, |g| ReachedItem {
-                    path: g.text(),
-                    facts: g.many(1, Gen::fact),
-                }),
+                items: self
+                    .many(depth, |g| ReachedItem { path: g.text(), facts: g.many(1, Gen::fact) }),
                 tests: self.texts(depth),
                 changes: self.changes(depth),
                 compiled: self.texts(depth),
@@ -662,7 +689,11 @@ impl Gen {
             28 => Response::Documented(Documented {
                 dir: self.text(),
                 pages: self.wide(),
-                crates: self.many(depth, |g| DocumentedCrate { name: g.text(), asked: g.yes(), package: g.text() }),
+                crates: self.many(depth, |g| DocumentedCrate {
+                    name: g.text(),
+                    asked: g.yes(),
+                    package: g.text(),
+                }),
                 source_pages: self.wide(),
             }),
             29 => Response::Explored { link: self.text() },
@@ -712,18 +743,31 @@ impl Gen {
             35 => Response::UnitBegan(self.unit_of()),
             36 => Response::TestReady(self.artifact()),
             37 => Response::Rebuilt(self.rebuilt(depth)),
-            38 => Response::Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
+            38 => Response::Launched {
+                live: self.yes(),
+                env: self.many(depth, |g| (g.text(), g.text())),
+            },
             39 => Response::Stopping { doing: self.text() },
             41 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
             40 => Response::Unchecked(Unchecked {
-                open: self.many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
-                behind: self.many(depth, |g| Behind { id: g.maybe(Gen::u32), why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
-                tests: self.many(depth, |g| Unbuilt { unit: g.text(), behind: g.text(), why: g.text() }),
+                open: self
+                    .many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
+                behind: self.many(depth, |g| Behind {
+                    id: g.maybe(Gen::u32),
+                    why: g.text(),
+                    unit: g.text(),
+                    units: g.texts(depth + 1),
+                }),
+                tests: self.many(depth, |g| Unbuilt {
+                    unit: g.text(),
+                    behind: g.text(),
+                    why: g.text(),
+                }),
                 stopped: self.yes(),
             }),
             42 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
             _ => {
-                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
+                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
         }
     }
@@ -735,7 +779,10 @@ impl Gen {
             log: self.maybe_text(),
             rule: self.maybe_text(),
             facts: self.many(depth + 1, |g| crate::Fact { key: g.text(), text: g.report_text() }),
-            fixes: self.many(depth + 1, |g| crate::Fix { note: g.maybe(Gen::report_text), lines: g.texts(depth + 2) }),
+            fixes: self.many(depth + 1, |g| crate::Fix {
+                note: g.maybe(Gen::report_text),
+                lines: g.texts(depth + 2),
+            }),
             blocks: self.maybe(|g| crate::Blocks {
                 all: g.texts(depth + 1),
                 what: g.text(),
@@ -791,7 +838,11 @@ impl Gen {
             }),
             command: self.maybe_text(),
             dropped: if self.yes() { Some(self.wide()) } else { None },
-            rebuilt: self.many(depth, |g| crate::Rebuild { item: g.text(), step: g.text(), cause: g.rebuild_cause(depth) }),
+            rebuilt: self.many(depth, |g| crate::Rebuild {
+                item: g.text(),
+                step: g.text(),
+                cause: g.rebuild_cause(depth),
+            }),
             restoring: self.yes(),
             workspace: self.maybe_text(),
         }
@@ -964,7 +1015,7 @@ where
     assert_eq!(framed[..4], (old.len() as u32).to_be_bytes());
     assert_eq!(framed[4..], old[..], "{envelope:?}");
     let permuted = writer.permuted();
-    let mut kept = vec![7];  // alloc: test and fuzz reference only
+    let mut kept = vec![7]; // alloc: test and fuzz reference only
     encode_into(writer, &mut kept, envelope).unwrap();
     assert_eq!(kept[0], 7);
     assert_eq!(kept[5..], old[..], "{envelope:?}");
@@ -986,7 +1037,9 @@ fn same_answer<T: DeserializeOwned + PartialEq + Debug>(bytes: &[u8]) {
 /// The response `bytes` encode read where it lies, by both codecs and by [`decode`], is the
 /// one they read owned, or all of them refuse it.
 fn same_lent(bytes: &[u8]) {
-    fn lent(read: Result<Envelope<ResponseRef<'_>>, cbor::Error>) -> Result<Envelope<Response>, cbor::Error> {
+    fn lent(
+        read: Result<Envelope<ResponseRef<'_>>, cbor::Error>,
+    ) -> Result<Envelope<Response>, cbor::Error> {
         read.map(|it| Envelope { schema: it.schema, id: it.id, body: it.body.into_owned() })
     }
     let owned = cbor::from_slice::<Envelope<Response>>(bytes);

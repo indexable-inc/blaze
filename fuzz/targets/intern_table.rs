@@ -62,7 +62,11 @@ fn check(data: &[u8]) {
     let restored = match restore(data) {
         Ok(restored) => restored,
         Err(RestoreError::Invalid { what, at, .. }) => {
-            assert!(at <= data.len() as u64, "{what}: refused at byte {at} of a section of {} bytes", data.len());
+            assert!(
+                at <= data.len() as u64,
+                "{what}: refused at byte {at} of a section of {} bytes",
+                data.len()
+            );
             return;
         }
         Err(RestoreError::Corrupt(corrupt)) => {
@@ -73,7 +77,9 @@ fn check(data: &[u8]) {
             return;
         }
         Err(other) => {
-            panic!("a fresh table restoring a section of its own schema is refused only as invalid or corrupt: {other}")
+            panic!(
+                "a fresh table restoring a section of its own schema is refused only as invalid or corrupt: {other}"
+            )
         }
     };
     readable(&restored);
@@ -95,7 +101,10 @@ fn check(data: &[u8]) {
         (restored.first, restored.end),
         "the table written again has the same compiled-in IDs and end"
     );
-    assert_eq!(again.values, restored.values, "the table written again holds the same IDs and bytes");
+    assert_eq!(
+        again.values, restored.values,
+        "the table written again holds the same IDs and bytes"
+    );
     let mut first_of: HashMap<&[u8], u32> = HashMap::with_capacity(again.values.len());
     for (id, bytes) in &again.values {
         first_of.entry(&**bytes).or_insert(*id);
@@ -128,13 +137,22 @@ fn readable(restored: &Restored) {
     let Restored { first, end, values, found, .. } = restored;
     assert!(1 <= *first && first <= end, "compiled-in IDs 1..{first} below the end {end}");
     assert_eq!(values.len(), found.len(), "one find per value");
-    assert!(values.windows(2).all(|pair| pair[0].0 < pair[1].0), "the values' IDs ascend, each once");
+    assert!(
+        values.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "the values' IDs ascend, each once"
+    );
     assert!(values.first().is_none_or(|(id, _)| *id >= 1), "ID 0 names no value");
-    assert!(values.last().is_none_or(|(id, _)| id < end), "every value's ID is below the end {end}");
+    assert!(
+        values.last().is_none_or(|(id, _)| id < end),
+        "every value's ID is below the end {end}"
+    );
     let statics = values.iter().take_while(|(id, _)| id < first).count();
     assert_eq!(statics, (*first - 1) as usize, "every compiled-in ID reads");
     for (id, bytes) in values {
-        assert!(std::str::from_utf8(bytes).is_ok(), "ID {id} of a text table holds {bytes:?}, not UTF-8");
+        assert!(
+            std::str::from_utf8(bytes).is_ok(),
+            "ID {id} of a text table holds {bytes:?}, not UTF-8"
+        );
     }
 }
 
@@ -167,7 +185,8 @@ fn names() -> Vec<String> {
 
 /// [`VALUES`] written with the second and fourth freed, and their IDs.
 fn with_freed() -> (Vec<u8>, Vec<u32>) {
-    let all = fuzz::restore(&fuzz::section(&VALUES, &[])).expect("a section `section` wrote restores");
+    let all =
+        fuzz::restore(&fuzz::section(&VALUES, &[])).expect("a section `section` wrote restores");
     let freed: Vec<u32> = [VALUES[1], VALUES[3]]
         .iter()
         .map(|value| id_of(&all, value).expect("every value written has an ID"))
@@ -232,7 +251,8 @@ mod tests {
         let bytes: Vec<&[u8]> = names.iter().map(|name| name.as_bytes()).collect();
         let section = fuzz::section(&bytes, &[]);
         let restored = fuzz::restore(&section).expect("a section `section` wrote restores");
-        let first = u32::from_le_bytes(section[ROOT_FIRST..ROOT_FIRST + 4].try_into().expect("4 bytes"));
+        let first =
+            u32::from_le_bytes(section[ROOT_FIRST..ROOT_FIRST + 4].try_into().expect("4 bytes"));
         assert_eq!(first, restored.first, "`Root::first` is at byte {ROOT_FIRST} of the section");
         for name in &names {
             assert!(id_of(&restored, name.as_bytes()).is_some(), "{name:?} was written");
@@ -247,7 +267,11 @@ mod tests {
         for value in [VALUES[0], VALUES[2]] {
             assert!(id_of(&restored, value).is_some(), "{value:?} was kept");
         }
-        assert_eq!(VALUES.iter().filter(|value| id_of(&restored, value).is_some()).count(), 2, "only two were kept");
+        assert_eq!(
+            VALUES.iter().filter(|value| id_of(&restored, value).is_some()).count(),
+            2,
+            "only two were kept"
+        );
     }
 
     /// The damaged seeds are refused where `table/tests.rs` refuses them: the copy of `Root`'s

@@ -14,7 +14,8 @@
 //! (`test_runs`) come with its end, as its links do ([`crate::history::History::tests_ran`]).
 
 use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, types::UInt32Type,
+    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    types::UInt32Type,
 };
 use arrow_schema::ArrowError;
 
@@ -371,7 +372,8 @@ pub fn crate_deps(rows: &[CrateDepRow]) -> Result<RecordBatch, ArrowError> {
 
 /// The `query_counts` rows of `rows`.
 pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
-    let count = |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
+    let count =
+        |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
         count(|it| it.build_id),
@@ -413,7 +415,8 @@ pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
 
 /// The `key_parts` rows of `rows`.
 pub fn key_parts(rows: &[KeyPartRow]) -> Result<RecordBatch, ArrowError> {
-    let text = |of: fn(&KeyPartRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+    let text =
+        |of: fn(&KeyPartRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
@@ -430,7 +433,8 @@ pub fn key_parts(rows: &[KeyPartRow]) -> Result<RecordBatch, ArrowError> {
 
 /// The `misses` rows of `rows`.
 pub fn misses(rows: &[MissRow]) -> Result<RecordBatch, ArrowError> {
-    let text = |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+    let text =
+        |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
@@ -473,17 +477,29 @@ mod tests {
                 outcome: LinkOutcome::Patched,
                 dur_ns: Some(40_000_000),
             },
-            LinkRow { build_id: 3, image: "app (test)".into(), krate: None, outcome: LinkOutcome::Placed, dur_ns: None },
+            LinkRow {
+                build_id: 3,
+                image: "app (test)".into(),
+                krate: None,
+                outcome: LinkOutcome::Placed,
+                dur_ns: None,
+            },
         ])
         .unwrap();
         let outcome = links.column(3).as_dictionary::<UInt32Type>();
         let names = outcome.values().as_string::<i32>();
-        let said: Vec<&str> = outcome.keys().iter().map(|it| names.value(it.unwrap() as usize)).collect();
+        let said: Vec<&str> =
+            outcome.keys().iter().map(|it| names.value(it.unwrap() as usize)).collect();
         assert_eq!(said, ["patched", "placed"]);
         assert!(links.column(2).is_null(1) && links.column(4).is_null(1));
 
-        let deps = crate_deps(&[CrateDepRow { build_id: 3, krate: "app".into(), dep: "cc".into(), kind: DepKind::Build }])
-            .unwrap();
+        let deps = crate_deps(&[CrateDepRow {
+            build_id: 3,
+            krate: "app".into(),
+            dep: "cc".into(),
+            kind: DepKind::Build,
+        }])
+        .unwrap();
         let kind = deps.column(3).as_dictionary::<UInt32Type>();
         assert_eq!(kind.values().as_string::<i32>().value(kind.keys().value(0) as usize), "build");
     }
@@ -511,7 +527,10 @@ mod tests {
         };
         let batch = provenance(&[changed, read]).unwrap();
         let at = |name: &str| schema::PROVENANCE.column(name).unwrap();
-        assert_eq!(batch.column(at("cause_key")).as_string::<i32>().value(0), "`FileText.text`(Id(2))");
+        assert_eq!(
+            batch.column(at("cause_key")).as_string::<i32>().value(0),
+            "`FileText.text`(Id(2))"
+        );
         assert!(batch.column(at("cause")).is_null(1) && batch.column(at("cause_key")).is_null(1));
         assert_eq!(batch.column(at("what")).as_string::<i32>().value(1), "the proc macro's output");
 
@@ -526,6 +545,9 @@ mod tests {
             beyond: Some("its process variables"),
         }])
         .unwrap();
-        assert_eq!(parts.column(schema::KEY_PARTS.column("hash").unwrap()).as_string::<i32>().value(0), "cd");
+        assert_eq!(
+            parts.column(schema::KEY_PARTS.column("hash").unwrap()).as_string::<i32>().value(0),
+            "cd"
+        );
     }
 }

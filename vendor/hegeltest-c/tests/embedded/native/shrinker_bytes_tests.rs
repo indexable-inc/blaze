@@ -57,10 +57,7 @@ fn shrink_bytes_linear_scan_breaks_when_replace_shortens_below_sz() {
 
 #[test]
 fn redistribute_bytes_pair_partial_move_triggers_bin_search() {
-    let initial = vec![
-        bytes_node(vec![1, 2, 3], 0, 10),
-        bytes_node(vec![4, 5], 0, 10),
-    ];
+    let initial = vec![bytes_node(vec![1, 2, 3], 0, 10), bytes_node(vec![4, 5], 0, 10)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: crate::native::shrinker::ShrinkRun<'_>| match run {
             crate::native::shrinker::ShrinkRun::Full(nodes) => {
@@ -84,10 +81,7 @@ fn redistribute_bytes_pair_partial_move_triggers_bin_search() {
 
 #[test]
 fn redistribute_bytes_pair_moves_several_elements_in_one_invocation() {
-    let initial = vec![
-        bytes_node(vec![1, 2, 3, 4, 5, 6, 7, 8], 0, 10),
-        bytes_node(vec![9], 0, 10),
-    ];
+    let initial = vec![bytes_node(vec![1, 2, 3, 4, 5, 6, 7, 8], 0, 10), bytes_node(vec![9], 0, 10)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: crate::native::shrinker::ShrinkRun<'_>| match run {
             crate::native::shrinker::ShrinkRun::Full(nodes) => {
@@ -104,27 +98,19 @@ fn redistribute_bytes_pair_moves_several_elements_in_one_invocation() {
     );
     drive_no_yield(shrinker.redistribute_bytes_pairs()).unwrap();
     match &shrinker.current_nodes[0].value() {
-        ChoiceValue::Bytes(b) => assert_eq!(
-            b,
-            &vec![1],
-            "one invocation should move every element the predicate allows"
-        ),
+        ChoiceValue::Bytes(b) => {
+            assert_eq!(b, &vec![1], "one invocation should move every element the predicate allows")
+        }
         _ => unreachable!(),
     }
 }
 
 #[test]
 fn redistribute_bytes_pair_moves_entire_value_when_accepted() {
-    let initial = vec![
-        bytes_node(vec![1, 2, 3], 0, 10),
-        bytes_node(vec![4, 5], 0, 10),
-    ];
+    let initial = vec![bytes_node(vec![1, 2, 3], 0, 10), bytes_node(vec![4, 5], 0, 10)];
     let mut shrinker = accepting_shrinker(initial);
     drive_no_yield(shrinker.redistribute_bytes_pairs()).unwrap();
-    let (a, b) = match (
-        &shrinker.current_nodes[0].value(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    let (a, b) = match (&shrinker.current_nodes[0].value(), &shrinker.current_nodes[1].value()) {
         (ChoiceValue::Bytes(a), ChoiceValue::Bytes(b)) => (a.clone(), b.clone()),
         _ => unreachable!(),
     };

@@ -40,26 +40,43 @@ pub const MOST_SLOTS: u64 = 1 << 24;
 pub enum DecodeError {
     /// Not of this version of [`History::encode`].
     Version,
-    Short { at: usize },
+    Short {
+        at: usize,
+    },
     /// The kinds' peaks are not [`Estimates`]' bytes.
     Estimates(admission::DecodeError),
     /// Not as many bytes as `count` records take after the kinds.
-    Length { count: u64, bytes: usize },
+    Length {
+        count: u64,
+        bytes: usize,
+    },
     /// A table of a size no history has.
     Slots(u64),
     /// A kind not after the one before it.
-    KindOrder { kind: u32 },
+    KindOrder {
+        kind: u32,
+    },
     /// A kind's times no observations make.
-    KindUnsound { kind: u32 },
+    KindUnsound {
+        kind: u32,
+    },
     /// A record's slot not after the one before it, or past the table.
-    SlotOrder { slot: u32 },
+    SlotOrder {
+        slot: u32,
+    },
     /// A record in a slot not of its key's bucket.
-    Bucket { slot: u32 },
+    Bucket {
+        slot: u32,
+    },
     /// A record after an empty way of its bucket, which fills from its first.
-    Gap { slot: u32 },
+    Gap {
+        slot: u32,
+    },
     /// A record no observations make: unseen, stamped after the clock or with another's
     /// stamp, or a run where no run reached.
-    Unsound { slot: u32 },
+    Unsound {
+        slot: u32,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -67,21 +84,30 @@ impl fmt::Display for DecodeError {
         match self {
             DecodeError::Version => write!(f, "a task history of another version"),
             DecodeError::Short { at } => write!(f, "a task history cut short at byte {at}"),
-            DecodeError::Estimates(error) => write!(f, "a task history's memory estimates: {error}"),
+            DecodeError::Estimates(error) => {
+                write!(f, "a task history's memory estimates: {error}")
+            }
             DecodeError::Length { count, bytes } => {
                 write!(f, "a task history of {count} records in {bytes} bytes")
             }
             DecodeError::Slots(slots) => write!(f, "a task history of a table of {slots} slots"),
-            DecodeError::KindOrder { kind } => write!(f, "a task history with kind {kind} out of order"),
+            DecodeError::KindOrder { kind } => {
+                write!(f, "a task history with kind {kind} out of order")
+            }
             DecodeError::KindUnsound { kind } => {
                 write!(f, "a task history with times of kind {kind} that no runs make")
             }
-            DecodeError::SlotOrder { slot } => write!(f, "a task history with slot {slot} out of order"),
+            DecodeError::SlotOrder { slot } => {
+                write!(f, "a task history with slot {slot} out of order")
+            }
             DecodeError::Bucket { slot } => {
                 write!(f, "a task history with the record in slot {slot} out of its bucket")
             }
             DecodeError::Gap { slot } => {
-                write!(f, "a task history with the record in slot {slot} after an empty way of its bucket")
+                write!(
+                    f,
+                    "a task history with the record in slot {slot} after an empty way of its bucket"
+                )
             }
             DecodeError::Unsound { slot } => {
                 write!(f, "a task history with a record in slot {slot} that no runs make")
@@ -98,7 +124,13 @@ pub(crate) fn encode(history: &History) -> Vec<u8> {
     // The table's every slot is the records' room: one allocation, never grown, whose pages
     // past the records are never touched.
     let mut out = Vec::with_capacity(
-        MAGIC.len() + 32 + estimates.len() + 8 + kinds.len() * KIND_BYTES + 8 + history.keys.slots() * RECORD_BYTES,
+        MAGIC.len()
+            + 32
+            + estimates.len()
+            + 8
+            + kinds.len() * KIND_BYTES
+            + 8
+            + history.keys.slots() * RECORD_BYTES,
     );
     out.put_bytes(MAGIC);
     out.put_u64(history.keys.slots() as u64);
@@ -129,7 +161,9 @@ fn record_bytes(slot: usize, record: &Record) -> [u8; RECORD_BYTES] {
     for (at, half) in [slot as u32, record.kind.0, record.seen, 0].into_iter().enumerate() {
         bytes[at * 4..at * 4 + 4].copy_from_slice(&half.to_le_bytes());
     }
-    for (at, word) in [record.stamp, record.key[0], record.key[1], record.peak].into_iter().enumerate() {
+    for (at, word) in
+        [record.stamp, record.key[0], record.key[1], record.peak].into_iter().enumerate()
+    {
         bytes[16 + at * 8..24 + at * 8].copy_from_slice(&word.to_le_bytes());
     }
     for (at, run) in record.runs.into_iter().enumerate() {
@@ -207,7 +241,8 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
             return Err(DecodeError::Gap { slot });
         }
         last = Some(slot);
-        if table::bucket_in(slots, record.kind, record.key) != slot as usize - slot as usize % WAYS {
+        if table::bucket_in(slots, record.kind, record.key) != slot as usize - slot as usize % WAYS
+        {
             return Err(DecodeError::Bucket { slot });
         }
         if pad != 0 || !record.is_sound() || record.stamp > clock {
@@ -217,7 +252,8 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
     }
     // Each record's stamp and its index in `records`, which is in slot order; the sort is
     // stable, so records of one stamp stay in slot order.
-    let mut stamps: Vec<(u64, usize)> = records.iter().enumerate().map(|(at, (_, it))| (it.stamp, at)).collect(); // alloc: once per daemon start
+    let mut stamps: Vec<(u64, usize)> =
+        records.iter().enumerate().map(|(at, (_, it))| (it.stamp, at)).collect(); // alloc: once per daemon start
     radix::sort_copy_by_key(&mut stamps, |&(stamp, _)| stamp);
     if let Some(pair) = stamps.windows(2).find(|it| it[0].0 == it[1].0) {
         return Err(DecodeError::Unsound { slot: records[pair[1].1].0 as u32 });

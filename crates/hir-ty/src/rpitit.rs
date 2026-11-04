@@ -22,8 +22,7 @@
 use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
-    FunctionId, ImplId, ItemContainerId, Lookup, TraitId,
-    signatures::FunctionSignature,
+    FunctionId, ImplId, ItemContainerId, Lookup, TraitId, signatures::FunctionSignature,
 };
 use rustc_type_ir::{
     BoundVar, Interner as _, IsRigid, TypeFoldable, TypeSuperFoldable, TypeVisitable as _,
@@ -267,7 +266,11 @@ pub fn opaques_to_rpitits<'db, T: TypeFoldable<DbInterner<'db>>>(
 /// `ty` with each of `trait_fn`'s RPITITs unknown, an error type: the trait's return type as
 /// rustc's `ImplTraitInTraitCollector` leaves it for an error, each item a type variable
 /// (printed `_`), for E0053 "incompatible return type".
-pub fn rpitits_unknown<'db>(interner: DbInterner<'db>, trait_fn: FunctionId, ty: Ty<'db>) -> Ty<'db> {
+pub fn rpitits_unknown<'db>(
+    interner: DbInterner<'db>,
+    trait_fn: FunctionId,
+    ty: Ty<'db>,
+) -> Ty<'db> {
     ty.fold_with(&mut BottomUpFolder {
         interner,
         ty_op: |ty: Ty<'db>| match as_rpitit(ty) {
@@ -306,7 +309,10 @@ pub fn rpitits_to_opaques<'db, T: TypeFoldable<DbInterner<'db>>>(
 
 /// `type_of` of an RPITIT. The trait's item has a value only when its method has a default
 /// body: that body's opaque type, with the item's own arguments, which are the opaque's.
-pub fn type_of_rpitit<'db>(interner: DbInterner<'db>, rpitit: RpititId) -> EarlyBinder<'db, Ty<'db>> {
+pub fn type_of_rpitit<'db>(
+    interner: DbInterner<'db>,
+    rpitit: RpititId,
+) -> EarlyBinder<'db, Ty<'db>> {
     let db = interner.db;
     match rpitit.side(db) {
         RpititSide::Trait(_) => {
@@ -317,15 +323,18 @@ pub fn type_of_rpitit<'db>(interner: DbInterner<'db>, rpitit: RpititId) -> Early
             );
             let opaque = rpitit.opaque(db);
             let args = GenericArgs::identity_for_item(interner, opaque.into());
-            EarlyBinder::bind(interner, Ty::new_alias(
+            EarlyBinder::bind(
                 interner,
-                IsRigid::No,
-                AliasTy::new_from_args(
+                Ty::new_alias(
                     interner,
-                    AliasTyKind::Opaque { def_id: opaque.into() },
-                    args,
+                    IsRigid::No,
+                    AliasTy::new_from_args(
+                        interner,
+                        AliasTyKind::Opaque { def_id: opaque.into() },
+                        args,
+                    ),
                 ),
-            ))
+            )
         }
         RpititSide::Impl { .. } => match impl_rpitit_tys(db, rpitit.function)
             .get(rpitit.idx.into_raw().into_u32() as usize)
@@ -333,12 +342,10 @@ pub fn type_of_rpitit<'db>(interner: DbInterner<'db>, rpitit: RpititId) -> Early
             Some(Ok(ty)) => ty.get(),
             // Reported where the impl's method is checked, and by a use that normalizes to it
             // ([`rpitit_value_error`]).
-            Some(Err(_)) | None => {
-                EarlyBinder::bind(
-                    interner,
-                    Ty::new_error(interner, crate::next_solver::ErrorGuaranteed),
-                )
-            }
+            Some(Err(_)) | None => EarlyBinder::bind(
+                interner,
+                Ty::new_error(interner, crate::next_solver::ErrorGuaranteed),
+            ),
         },
     }
 }
@@ -479,8 +486,11 @@ fn impl_rpitit_tys_in<'db>(
     }
 
     // rustc's `trait_to_impl_args`: the impl's trait arguments and the impl method's own.
-    let trait_to_impl_args = GenericArgs::identity_for_item(interner, impl_fn.into())
-        .rebase_onto(interner, impl_.into(), trait_ref.args);
+    let trait_to_impl_args = GenericArgs::identity_for_item(interner, impl_fn.into()).rebase_onto(
+        interner,
+        impl_.into(),
+        trait_ref.args,
+    );
     // The impl's where clauses and the trait method's own: a bound of an `impl Trait` may need
     // the method's own where clauses (`fn items<T: Clone>(..) -> impl Iterator<Item = impl Clone>`).
     let param_env = crate::lower::hybrid_param_env(interner, impl_, trait_fn, trait_to_impl_args);
@@ -503,7 +513,8 @@ fn impl_rpitit_tys_in<'db>(
         vars: vec![None; count], // alloc: per impl method, one slot per `impl Trait`
         bounds: Vec::new_in(frame),
     };
-    let trait_sig = named_signature(db, trait_fn, trait_to_impl_args, frame).fold_with(&mut collector);
+    let trait_sig =
+        named_signature(db, trait_fn, trait_to_impl_args, frame).fold_with(&mut collector);
     let Collector { vars, bounds, .. } = collector;
     if trait_sig.inputs().len() != impl_sig.inputs().len() {
         // E0050, reported where the signatures are compared.
@@ -690,10 +701,8 @@ pub fn named_signature<'db>(
     frame: &Frame,
 ) -> FnSig<'db> {
     let interner = DbInterner::new_no_crate(db);
-    let raw = db
-        .callable_item_signature(function.into())
-        .instantiate(interner, args)
-        .skip_norm_wip();
+    let raw =
+        db.callable_item_signature(function.into()).instantiate(interner, args).skip_norm_wip();
     let named = raw.bound_vars().len();
     let bound = crate::lower::bind_elided_lifetimes(db, function, raw, frame);
     let scope = SolverDefId::FunctionId(function);
@@ -727,10 +736,7 @@ pub fn named_signature<'db>(
     let mut tys = Vec::with_capacity_in(inputs.len() + 1, frame);
     tys.extend(inputs.iter().copied());
     tys.push(output);
-    FnSig {
-        inputs_and_output: crate::next_solver::Tys::new_from_slice(&tys),
-        ..raw.skip_binder()
-    }
+    FnSig { inputs_and_output: crate::next_solver::Tys::new_from_slice(&tys), ..raw.skip_binder() }
 }
 
 /// Relates the trait method's signature, instantiated for the impl and normalized, with the impl
@@ -916,11 +922,10 @@ fn lifetime_name(db: &Db, region: Region<'_>) -> Box<str> {
                     .iter_self_late_bound()
                     .nth(late.kind.var.as_usize())
                 {
-                    Some((_, hir_def::hir::generics::GenericParamDataRef::LifetimeParamData(it)))
-                        if !it.is_fresh() =>
-                    {
-                        Some(it.name.as_str().into())
-                    }
+                    Some((
+                        _,
+                        hir_def::hir::generics::GenericParamDataRef::LifetimeParamData(it),
+                    )) if !it.is_fresh() => Some(it.name.as_str().into()),
                     _ => None,
                 }
             }
@@ -977,10 +982,14 @@ impl<'db> rustc_type_ir::TypeFolder<DbInterner<'db>> for Remap<'db, '_> {
             | RegionKind::ReError(_)
             | RegionKind::ReErased
             | RegionKind::ReEarlyParam(_) => region,
-            RegionKind::ReLateParam(late) if late.scope == SolverDefId::FunctionId(self.trait_fn) => {
+            RegionKind::ReLateParam(late)
+                if late.scope == SolverDefId::FunctionId(self.trait_fn) =>
+            {
                 self.of_trait(region).unwrap_or_else(|| self.uncaptured(region))
             }
-            RegionKind::ReLateParam(late) if late.scope == SolverDefId::FunctionId(self.impl_fn) => {
+            RegionKind::ReLateParam(late)
+                if late.scope == SolverDefId::FunctionId(self.impl_fn) =>
+            {
                 // The trait's lifetime at the same place in the signatures; one the impl's
                 // takes at two places is the trait's only if both are the same one.
                 let mut found = self.regions.iter().filter(|(i, _)| *i == region).map(|(_, t)| *t);
@@ -995,9 +1004,9 @@ impl<'db> rustc_type_ir::TypeFolder<DbInterner<'db>> for Remap<'db, '_> {
                     _ => first,
                 }
             }
-            RegionKind::ReLateParam(_)
-            | RegionKind::ReVar(_)
-            | RegionKind::RePlaceholder(_) => self.uncaptured(region),
+            RegionKind::ReLateParam(_) | RegionKind::ReVar(_) | RegionKind::RePlaceholder(_) => {
+                self.uncaptured(region)
+            }
         }
     }
 }
@@ -1019,7 +1028,6 @@ pub(crate) fn rpitit_item_bounds(
 pub fn rpitit_item_bounds_of_key(db: &Db, key: blaze_query::db::Id) -> Option<RpititId> {
     rpitit_item_bounds::arguments(db, key).map(|(function, idx)| RpititId { function, idx })
 }
-
 
 /// rustc's `predicates_of` an impl's RPITIT item (`gather_explicit_predicates_of`'s
 /// `ImplTraitInTraitData::Impl` arm): the trait item's predicates, which are its method's,
@@ -1048,15 +1056,20 @@ pub fn impl_method_hybrid_predicates(db: &Db, impl_fn: FunctionId) -> GenericPre
     };
     let interner = DbInterner::new_with(db, hir_def::HasModule::krate(&impl_fn, db));
     let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
-    let args = GenericArgs::identity_for_item(interner, impl_fn.into())
-        .rebase_onto(interner, impl_.into(), trait_ref.args);
+    let args = GenericArgs::identity_for_item(interner, impl_fn.into()).rebase_onto(
+        interner,
+        impl_.into(),
+        trait_ref.args,
+    );
     let impl_predicates = GenericPredicates::query(db, impl_.into());
     let trait_predicates = GenericPredicates::query(db, trait_fn.into());
     let own = |range: std::ops::Range<u32>| {
         trait_predicates
             .predicates
             .get()
-            .map_bound(move |it| it.as_slice()[range.start as usize..range.end as usize].iter().copied())
+            .map_bound(move |it| {
+                it.as_slice()[range.start as usize..range.end as usize].iter().copied()
+            })
             .iter_instantiated(interner, args.as_slice())
             .map(|it| it.skip_norm_wip())
     };
@@ -1064,7 +1077,8 @@ pub fn impl_method_hybrid_predicates(db: &Db, impl_fn: FunctionId) -> GenericPre
     // rustc's order of a `GenericPredicates`: the parent's (the impl's own, which has none),
     // its associated types' bounds, then the item's own and its associated types' bounds.
     let parent: &[Clause<'_>] = impl_predicates.predicates.get().skip_binder().as_slice();
-    let own_non_assoc = own(trait_predicates.own_predicates_start..trait_predicates.own_assoc_ty_bounds_start);
+    let own_non_assoc =
+        own(trait_predicates.own_predicates_start..trait_predicates.own_assoc_ty_bounds_start);
     let own_assoc = own(trait_predicates.own_assoc_ty_bounds_start..trait_len);
     let mut clauses = Vec::new(); // alloc: the memo's clauses, interned below
     clauses.extend(parent.iter().copied());
@@ -1105,10 +1119,7 @@ pub(crate) fn default_body_clauses<'db, 'f>(
     if !is_trait_method(db, function) || !FunctionSignature::of(db, function).has_body() {
         return finder.clauses;
     }
-    let sig = db
-        .callable_item_signature(function.into())
-        .instantiate_identity()
-        .skip_norm_wip();
+    let sig = db.callable_item_signature(function.into()).instantiate_identity().skip_norm_wip();
     finder.bound_vars = Some(sig.bound_vars());
     // The signature's binder is accounted for: its bound regions are the clauses'.
     sig.skip_binder().output().visit_with(&mut finder);
@@ -1146,8 +1157,8 @@ impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for DefaultBodyFinder<'db,
             // Out of the binders walked into to reach it; a region bound inside the projection
             // itself cannot be named outside it (rustc's "we don't support this").
             let depth = self.depth;
-            let shifted = rustc_type_ir::fold_regions(interner, args, |region, inner| {
-                match region.kind() {
+            let shifted =
+                rustc_type_ir::fold_regions(interner, args, |region, inner| match region.kind() {
                     RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(index), bound)
                         if inner == rustc_type_ir::INNERMOST =>
                     {
@@ -1157,8 +1168,7 @@ impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for DefaultBodyFinder<'db,
                         <Region<'db> as crate::next_solver::RegionExt<'db>>::error(interner)
                     }
                     _ => region,
-                }
-            });
+                });
             let projection = crate::next_solver::ProjectionClause {
                 projection_term: rustc_type_ir::AliasTerm::new_from_args(
                     interner,

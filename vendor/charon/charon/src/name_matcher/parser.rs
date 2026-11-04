@@ -88,10 +88,7 @@ impl fmt::Debug for Pattern {
 
 fn parse_pat_elem(i: &str) -> ParseResult<'_, PatElem> {
     let parse_glob = tag("*").map(|_| PatElem::Glob);
-    parse_glob
-        .or(parse_impl_elem)
-        .or(parse_simple_elem)
-        .parse(i)
+    parse_glob.or(parse_impl_elem).or(parse_simple_elem).parse(i)
 }
 
 fn parse_simple_elem(i: &str) -> ParseResult<'_, PatElem> {
@@ -119,18 +116,11 @@ fn parse_simple_elem(i: &str) -> ParseResult<'_, PatElem> {
 }
 
 fn parse_impl_elem(i: &str) -> ParseResult<'_, PatElem> {
-    let for_ty = preceded(
-        tag("for").followed_by(multispace1),
-        parse_pat_ty.followed_by(multispace0),
-    );
+    let for_ty =
+        preceded(tag("for").followed_by(multispace1), parse_pat_ty.followed_by(multispace0));
     let impl_contents = parse_pattern.followed_by(multispace0).and(for_ty.opt());
     let impl_pattern = tag("{").followed_by(multispace0).precedes(
-        delimited(
-            tag("impl").followed_by(multispace1.cut()).opt(),
-            impl_contents,
-            tag("}"),
-        )
-        .cut(),
+        delimited(tag("impl").followed_by(multispace1.cut()).opt(), impl_contents, tag("}")).cut(),
     );
     map_res(impl_pattern, |(mut pat, for_ty)| {
         if let Some(for_ty) = for_ty {
@@ -138,10 +128,7 @@ fn parse_impl_elem(i: &str) -> ParseResult<'_, PatElem> {
                 .elems
                 .last_mut()
                 .ok_or_else(|| anyhow::anyhow!("trait path must be nonempty"))?;
-            let PatElem::Ident {
-                generics, is_trait, ..
-            } = last_elem
-            else {
+            let PatElem::Ident { generics, is_trait, .. } = last_elem else {
                 return Err(anyhow::anyhow!("trait path must end in an ident"));
             };
             // Set the type as the first generic arg.
@@ -156,11 +143,7 @@ fn parse_impl_elem(i: &str) -> ParseResult<'_, PatElem> {
 impl fmt::Display for PatElem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PatElem::Ident {
-                name,
-                generics,
-                is_trait,
-            } => {
+            PatElem::Ident { name, generics, is_trait } => {
                 write!(f, "{name}")?;
                 let generics = generics.as_slice();
                 let (ty, generics) = if let [ty, generics @ ..] = generics
@@ -185,13 +168,10 @@ impl fmt::Display for PatElem {
 }
 
 fn parse_pat_ty(i: &str) -> ParseResult<'_, PatTy> {
-    let mutability = tag("mut").followed_by(multispace0).opt().map(|mtbl| {
-        if mtbl.is_some() {
-            RefKind::Mut
-        } else {
-            RefKind::Shared
-        }
-    });
+    let mutability = tag("mut")
+        .followed_by(multispace0)
+        .opt()
+        .map(|mtbl| if mtbl.is_some() { RefKind::Mut } else { RefKind::Shared });
     tag("&")
         .followed_by(multispace0)
         .precedes(mutability.and(parse_pat_ty))
@@ -241,10 +221,8 @@ fn test_roundtrip() {
         "foo::{impl &Clone for usize}",
     ];
 
-    let test_strings = idempotent_test_strings
-        .into_iter()
-        .map(|s| (s, s))
-        .chain(other_test_strings);
+    let test_strings =
+        idempotent_test_strings.into_iter().map(|s| (s, s)).chain(other_test_strings);
     for (input, expected) in test_strings {
         let pat = Pattern::parse(input).map_err(|e| e.to_string()).unwrap();
         assert_eq!(pat.to_string(), expected);

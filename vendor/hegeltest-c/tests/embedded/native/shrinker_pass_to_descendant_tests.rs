@@ -11,36 +11,19 @@ use alloc::vec::Vec;
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
 }
 
 fn lab(start: usize, end: usize, label: u64) -> Span {
-    Span {
-        start,
-        end,
-        label,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { start, end, label, depth: 0, parent: None, discarded: false }
 }
 
 #[test]
 fn pass_to_descendant_replaces_outer_with_inner_same_label() {
-    let initial = vec![
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(5),
-    ];
+    let initial = vec![int_node(1), int_node(2), int_node(3), int_node(4), int_node(5)];
     let mut spans = Spans::new();
     spans.push(lab(0, 5, 1));
     spans.push(lab(2, 4, 1));
@@ -106,14 +89,8 @@ fn pass_to_descendant_skips_equal_length_descendant() {
 
 #[test]
 fn pass_to_descendant_handles_multiple_descendants() {
-    let initial = vec![
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(5),
-        int_node(6),
-    ];
+    let initial =
+        vec![int_node(1), int_node(2), int_node(3), int_node(4), int_node(5), int_node(6)];
     let mut spans = Spans::new();
     spans.push(lab(0, 6, 1));
     spans.push(lab(1, 4, 1));

@@ -53,7 +53,8 @@ impl Intents {
     ) {
         self.cancel_where(builder, |intent| intent.conn == conn);
         let deadline_ns = self.now_ns.saturating_add(wait_ms.saturating_mul(1_000_000));
-        let intent = Intent { conn, opened, head, deadline_ns: Some(deadline_ns), cancelled: false };
+        let intent =
+            Intent { conn, opened, head, deadline_ns: Some(deadline_ns), cancelled: false };
         self.started.push((job, intent));
     }
 

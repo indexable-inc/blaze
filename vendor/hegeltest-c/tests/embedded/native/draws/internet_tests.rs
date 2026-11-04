@@ -20,19 +20,12 @@ fn top_level_domains_excludes_arpa() {
 
 #[test]
 fn top_level_domains_starts_with_com() {
-    assert_eq!(
-        TOP_LEVEL_DOMAINS[0], "COM",
-        "COM is the shrink target, must be first"
-    );
+    assert_eq!(TOP_LEVEL_DOMAINS[0], "COM", "COM is the shrink target, must be first");
 }
 
 #[test]
 fn top_level_domains_is_non_trivial() {
-    assert!(
-        TOP_LEVEL_DOMAINS.len() > 1000,
-        "expected ~1500 TLDs, got {}",
-        TOP_LEVEL_DOMAINS.len()
-    );
+    assert!(TOP_LEVEL_DOMAINS.len() > 1000, "expected ~1500 TLDs, got {}", TOP_LEVEL_DOMAINS.len());
 }
 
 #[test]
@@ -63,10 +56,7 @@ fn generate_domain_respects_max_length_4() {
             saw_dotted = true;
         }
     }
-    assert!(
-        saw_dotted,
-        "expected to see at least one dotted draw across 500 seeds"
-    );
+    assert!(saw_dotted, "expected to see at least one dotted draw across 500 seeds");
 }
 
 #[test]
@@ -87,18 +77,13 @@ fn generate_domain_labels_obey_rfc1035() {
         for label in &labels[..labels.len() - 1] {
             assert!(!label.is_empty() && label.len() <= 63, "label {label:?}");
             let bytes = label.as_bytes();
-            assert!(
-                bytes[0].is_ascii_alphabetic(),
-                "label {label:?} must start with a letter"
-            );
+            assert!(bytes[0].is_ascii_alphabetic(), "label {label:?} must start with a letter");
             assert!(
                 bytes[bytes.len() - 1].is_ascii_alphanumeric(),
                 "label {label:?} must end with alphanumeric"
             );
             assert!(
-                bytes
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-'),
+                bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-'),
                 "label {label:?} has non-DNS chars"
             );
             assert!(
@@ -180,10 +165,7 @@ fn generate_url_has_http_scheme_and_authority() {
     for seed in 0..200 {
         let mut ntc = fresh_ntc(seed);
         let s = generate_url(&mut ntc).unwrap();
-        assert!(
-            s.starts_with("http://") || s.starts_with("https://"),
-            "wrong scheme in {s:?}"
-        );
+        assert!(s.starts_with("http://") || s.starts_with("https://"), "wrong scheme in {s:?}");
         let after_scheme = s.split_once("://").unwrap().1;
         assert!(after_scheme.contains('/'), "missing path-separator: {s:?}");
     }
@@ -191,11 +173,8 @@ fn generate_url_has_http_scheme_and_authority() {
 
 #[test]
 fn generate_url_path_chars_url_safe() {
-    let url_safe: std::collections::HashSet<char> = ('a'..='z')
-        .chain('A'..='Z')
-        .chain('0'..='9')
-        .chain("$-_.+!*'(),~%/".chars())
-        .collect();
+    let url_safe: std::collections::HashSet<char> =
+        ('a'..='z').chain('A'..='Z').chain('0'..='9').chain("$-_.+!*'(),~%/".chars()).collect();
     for seed in 0..200 {
         let mut ntc = fresh_ntc(seed);
         let s = generate_url(&mut ntc).unwrap();
@@ -203,10 +182,7 @@ fn generate_url_path_chars_url_safe() {
         let domain_path = after_scheme.split_once('#').map_or(after_scheme, |x| x.0);
         let path = domain_path.split_once('/').map_or("", |x| x.1);
         for c in path.chars() {
-            assert!(
-                url_safe.contains(&c),
-                "path char {c:?} not URL-safe in {s:?}"
-            );
+            assert!(url_safe.contains(&c), "path char {c:?} not URL-safe in {s:?}");
         }
         for chunk in path.split('%').skip(1) {
             let bytes = chunk.as_bytes();
@@ -222,11 +198,8 @@ fn generate_url_path_chars_url_safe() {
 
 #[test]
 fn generate_url_fragments_chars_in_safe_set() {
-    let frag_safe: std::collections::HashSet<char> = ('a'..='z')
-        .chain('A'..='Z')
-        .chain('0'..='9')
-        .chain("$-_.+!*'(),~%/?".chars())
-        .collect();
+    let frag_safe: std::collections::HashSet<char> =
+        ('a'..='z').chain('A'..='Z').chain('0'..='9').chain("$-_.+!*'(),~%/?".chars()).collect();
     for seed in 0..300 {
         let mut ntc = fresh_ntc(seed);
         let s = generate_url(&mut ntc).unwrap();
@@ -234,20 +207,14 @@ fn generate_url_fragments_chars_in_safe_set() {
             continue;
         };
         for c in fragment.chars() {
-            assert!(
-                frag_safe.contains(&c),
-                "fragment char {c:?} not in fragment-safe set ({s:?})"
-            );
+            assert!(frag_safe.contains(&c), "fragment char {c:?} not in fragment-safe set ({s:?})");
         }
     }
 }
 
 #[test]
 fn url_encode_path_safe_chars_passthrough() {
-    assert_eq!(
-        url_encode_path("abcXYZ012$-_.+!*'(),~").unwrap(),
-        "abcXYZ012$-_.+!*'(),~"
-    );
+    assert_eq!(url_encode_path("abcXYZ012$-_.+!*'(),~").unwrap(), "abcXYZ012$-_.+!*'(),~");
 }
 
 #[test]

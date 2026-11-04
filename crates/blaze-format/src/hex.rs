@@ -192,10 +192,10 @@ mod tests {
 
     #[hegel::test]
     fn decodes_as_the_copies_did(tc: TestCase) {
-        let text: Vec<u8> = tc.draw(gs::vecs(hegel::one_of!(
-            gs::sampled_from(b"09afAFg+".to_vec()),
-            gs::integers::<u8>(),
-        )).max_size(19));
+        let text: Vec<u8> = tc.draw(
+            gs::vecs(hegel::one_of!(gs::sampled_from(b"09afAFg+".to_vec()), gs::integers::<u8>(),))
+                .max_size(19),
+        );
         assert_eq!(decode::<8>(&text), decode_reference::<8>(&text));
         assert_eq!(decode_lower::<8>(&text), decode_lower_reference::<8>(&text));
         assert_eq!(decode::<4>(&text), decode_reference::<4>(&text));

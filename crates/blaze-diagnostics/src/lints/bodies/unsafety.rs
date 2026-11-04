@@ -11,7 +11,6 @@
 //! `unsafe` of them in every edition, and only lints a call outside a block before 2024.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::{DefWithBody, InFile};
 use hir_def::{
     CallableDefId, DefWithBodyId,
@@ -21,6 +20,7 @@ use hir_def::{
 use hir_ty::next_solver::{CallableIdWrapper, TyKind};
 use rustc_type_ir::inherent::IntoKind as _;
 use span::Edition;
+use std::alloc::Global;
 use syntax::{
     TextRange, TextSize,
     view::{self as ast, AstNode},
@@ -51,15 +51,21 @@ pub(super) fn lints(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
         return Vec::new();
     }
     // alloc: empty, pushed to only for an unused block
-    let mut visitor = Visitor { b, ops: operations(b), context: Context::Safe, warnings: Vec::new() };
+    let mut visitor =
+        Visitor { b, ops: operations(b), context: Context::Safe, warnings: Vec::new() };
     visitor.expr(b.body.root_expr());
     let mut warnings: Vec<(ExprId, Option<ExprId>)> = visitor.warnings;
     // alloc: a block per unused one, empty when none is
     let blocks: Vec<_> = warnings.iter().map(|&(block, _)| (block, Block::of(b, block))).collect();
     // clone: a lint's spans, for an unused block found
-    let block_of = |id: ExprId| blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.clone());
+    let block_of =
+        |id: ExprId| blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.clone());
     let span_of = |id: ExprId| {
-        blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.as_ref()).map(|it| (&it.span.file, it.span.lo, it.span.hi))
+        blocks
+            .iter()
+            .find(|(it, _)| *it == id)
+            .and_then(|(_, it)| it.as_ref())
+            .map(|it| (&it.span.file, it.span.lo, it.span.hi))
     };
     warnings.sort_by(|&(a, _), &(b, _)| span_of(a).cmp(&span_of(b)));
     // alloc: the lints found, empty until one is
@@ -84,7 +90,11 @@ enum Context {
     Safe,
     /// A block lowering makes `unsafe` (`format_args!`'s): what is in it uses no block around.
     Builtin,
-    Block { block: ExprId, used: bool, nested_used: Vec<ExprId> },
+    Block {
+        block: ExprId,
+        used: bool,
+        nested_used: Vec<ExprId>,
+    },
 }
 
 struct Visitor<'s, 'a, 'db> {
@@ -191,7 +201,9 @@ impl Visitor<'_, '_, '_> {
             Expr::Assignment { target, .. } => self.pat(target),
             _ => {}
         }
-        store.walk_child_exprs_without_pats(expr, |it| stdx::ensure_sufficient_stack(|| self.expr(it)));
+        store.walk_child_exprs_without_pats(expr, |it| {
+            stdx::ensure_sufficient_stack(|| self.expr(it))
+        });
     }
 
     fn pat(&mut self, pat: PatId) {

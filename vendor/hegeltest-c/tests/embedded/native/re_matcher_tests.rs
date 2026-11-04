@@ -41,11 +41,7 @@ fn check(pattern: &str, text: &str, pos: usize, expected_end: Option<usize>, exp
         "match end of {pattern:?} on {text:?} at {pos}"
     );
     if pos == 0 {
-        assert_eq!(
-            full(pattern, text),
-            expected_full,
-            "fullmatch of {pattern:?} on {text:?}"
-        );
+        assert_eq!(full(pattern, text), expected_full, "fullmatch of {pattern:?} on {text:?}");
     }
     let parsed = parse_pattern(pattern, 0).unwrap();
     if let Ok(program) = Program::compile(&parsed) {
@@ -402,10 +398,7 @@ fn depth_limit_fires_on_long_repeats_of_capturing_items() {
     let long = chars(&"ab".repeat(2000));
     assert_eq!(match_at(&relaxed, &long, 0), Err(MatchError::DepthLimit));
     let lazy = parse_pattern("(?:(a)b)*?$", 0).unwrap();
-    assert_eq!(
-        match_at(&Matcher::new(&lazy), &long, 0),
-        Err(MatchError::DepthLimit)
-    );
+    assert_eq!(match_at(&Matcher::new(&lazy), &long, 0), Err(MatchError::DepthLimit));
 }
 
 /// The default depth limit keeps the deepest recursion the matcher
@@ -423,10 +416,7 @@ fn the_depth_limit_fires_before_a_small_stack_overflows() {
             (match_at(&matcher, &text, 0), matcher.fullmatch(&text))
         })
         .unwrap();
-    assert_eq!(
-        worker.join().unwrap(),
-        (Err(MatchError::DepthLimit), Err(MatchError::DepthLimit))
-    );
+    assert_eq!(worker.join().unwrap(), (Err(MatchError::DepthLimit), Err(MatchError::DepthLimit)));
 }
 
 #[test]
@@ -436,15 +426,9 @@ fn default_limits_handle_long_unit_sequence_repeats() {
     text.push_str(&"x\\\"".repeat(2000));
     text.push('"');
     let text = chars(&text);
-    assert_eq!(
-        match_at(&Matcher::new(&parsed), &text, 0),
-        Ok(Some(text.len()))
-    );
+    assert_eq!(match_at(&Matcher::new(&parsed), &text, 0), Ok(Some(text.len())));
     let lazy = parse_pattern("\"(?:\\\\.|[^\"])*?\"", 0).unwrap();
-    assert_eq!(
-        match_at(&Matcher::new(&lazy), &text, 0),
-        Ok(Some(text.len()))
-    );
+    assert_eq!(match_at(&Matcher::new(&lazy), &text, 0), Ok(Some(text.len())));
     let units = parse_pattern("(?:ab)*", 0).unwrap();
     let long = chars(&"ab".repeat(5000));
     assert_eq!(match_at(&Matcher::new(&units), &long, 0), Ok(Some(10_000)));
@@ -454,10 +438,7 @@ fn default_limits_handle_long_unit_sequence_repeats() {
 
 #[test]
 fn errors_display() {
-    assert_eq!(
-        alloc::format!("{}", MatchError::StepLimit),
-        "regex match exceeded its step limit"
-    );
+    assert_eq!(alloc::format!("{}", MatchError::StepLimit), "regex match exceeded its step limit");
     assert_eq!(
         alloc::format!("{}", MatchError::DepthLimit),
         "regex match exceeded its nesting depth limit"
@@ -508,9 +489,7 @@ fn unit_alternatives_recognises_only_unit_sequences() {
 
 fn touch_at(pattern: &str, text: &str, pos: usize) -> (Option<usize>, Touch) {
     let parsed = parse_pattern(pattern, 0).unwrap();
-    Matcher::new(&parsed)
-        .match_at_touch(&chars(text), pos)
-        .unwrap()
+    Matcher::new(&parsed).match_at_touch(&chars(text), pos).unwrap()
 }
 
 fn touch(pattern: &str, text: &str) -> (Option<usize>, Touch) {
@@ -523,10 +502,7 @@ fn touch_reports_how_a_match_depended_on_the_edges_of_the_text() {
     assert_eq!(touch("abc", "abc"), (Some(3), Touch::Never));
     assert_eq!(
         touch("abc", "ab"),
-        (
-            None,
-            Touch::Unless(vec![Probe::Literal('c' as u32, unicode)])
-        )
+        (None, Touch::Unless(vec![Probe::Literal('c' as u32, unicode)]))
     );
     assert_eq!(touch("\"[^\"]*\"", "\"ab\""), (Some(4), Touch::Never));
     assert!(matches!(touch("a*", "aa"), (Some(2), Touch::Tail(_))));
@@ -537,27 +513,15 @@ fn touch_reports_how_a_match_depended_on_the_edges_of_the_text() {
     ));
     assert_eq!(
         touch("a{1,3}", "aa"),
-        (
-            Some(2),
-            Touch::Unless(vec![Probe::Literal('a' as u32, unicode)])
-        )
+        (Some(2), Touch::Unless(vec![Probe::Literal('a' as u32, unicode)]))
     );
     assert_eq!(
         touch("a(?:.|b)?", "a"),
-        (
-            Some(1),
-            Touch::Unless(vec![
-                Probe::Any(unicode),
-                Probe::Literal('b' as u32, unicode)
-            ])
-        )
+        (Some(1), Touch::Unless(vec![Probe::Any(unicode), Probe::Literal('b' as u32, unicode)]))
     );
     assert_eq!(
         touch("a[^b]?[^b]?", "a"),
-        (
-            Some(1),
-            Touch::Unless(vec![Probe::NotLiteral('b' as u32, unicode)])
-        )
+        (Some(1), Touch::Unless(vec![Probe::NotLiteral('b' as u32, unicode)]))
     );
     assert!(matches!(
         touch("[a-z]+(?<=a)", "abc"),
@@ -674,9 +638,7 @@ fn touch_claims_hold_on_longer_texts() {
                     .chars()
                     .next()
                     .is_none_or(|c| {
-                        !probes
-                            .iter()
-                            .any(|probe| probe_matches(&parsed, probe, c).unwrap())
+                        !probes.iter().any(|probe| probe_matches(&parsed, probe, c).unwrap())
                     })
                     .then_some(end),
                 Touch::End => None,
@@ -720,9 +682,7 @@ fn tail_len(pattern: &str, text: &str, longer: &str) -> Option<usize> {
 
 fn probes(pattern: &str, text: &str) -> (ParsedPattern, Vec<Probe>) {
     let parsed = parse_pattern(pattern, 0).unwrap();
-    let (_, touch) = Matcher::new(&parsed)
-        .match_at_touch(&chars(text), 0)
-        .unwrap();
+    let (_, touch) = Matcher::new(&parsed).match_at_touch(&chars(text), 0).unwrap();
     let Touch::Unless(probes) = touch else {
         panic!("{pattern:?} on {text:?} gave {touch:?}");
     };
@@ -749,11 +709,8 @@ fn probes_run_their_tests_again_on_the_next_character() {
         ("(?s)a.?", "a", "x\n", ""),
     ] {
         let (parsed, probes) = probes(pattern, text);
-        let matched = |c: char| {
-            probes
-                .iter()
-                .any(|probe| probe_matches(&parsed, probe, c).unwrap())
-        };
+        let matched =
+            |c: char| probes.iter().any(|probe| probe_matches(&parsed, probe, c).unwrap());
         for c in passing.chars() {
             assert!(matched(c), "{pattern:?} on {text:?} then {c:?}");
         }
@@ -779,10 +736,7 @@ fn run_len_continues_a_tail_run_through_every_construct() {
     assert_eq!(tail_len("(?i)a*", "aA", "aAa"), Some(3));
     let parsed = parse_pattern("a*", 0).unwrap();
     assert_eq!(run_len(&parsed, usize::MAX, &chars("aaa"), 0), None);
-    assert_eq!(
-        run_len(&parse_pattern("a", 0).unwrap(), 0, &chars("a"), 0),
-        None
-    );
+    assert_eq!(run_len(&parse_pattern("a", 0).unwrap(), 0, &chars("a"), 0), None);
 }
 
 #[test]
@@ -800,27 +754,15 @@ fn literal_sequences_are_plain_literals_inside_flag_groups() {
     let unicode = SRE_FLAG_UNICODE;
     let sequence = |pattern: &str| literal_sequence(&parse_pattern(pattern, 0).unwrap());
     assert_eq!(sequence("abc"), Some((vec![97, 98, 99], unicode)));
-    assert_eq!(
-        sequence("(?i:abc)"),
-        Some((vec![97, 98, 99], unicode | SRE_FLAG_IGNORECASE))
-    );
+    assert_eq!(sequence("(?i:abc)"), Some((vec![97, 98, 99], unicode | SRE_FLAG_IGNORECASE)));
     assert_eq!(
         sequence("(?s:(?i:ab))"),
-        Some((
-            vec![97, 98],
-            unicode | SRE_FLAG_IGNORECASE | SRE_FLAG_DOTALL
-        ))
+        Some((vec![97, 98], unicode | SRE_FLAG_IGNORECASE | SRE_FLAG_DOTALL))
     );
-    assert_eq!(
-        sequence("(?x:a\\ b)"),
-        Some((vec![97, 32, 98], unicode | SRE_FLAG_VERBOSE))
-    );
+    assert_eq!(sequence("(?x:a\\ b)"), Some((vec![97, 32, 98], unicode | SRE_FLAG_VERBOSE)));
     assert_eq!(sequence("(?a:ab)"), Some((vec![97, 98], SRE_FLAG_ASCII)));
     assert_eq!(sequence("(?i)(?-i:ab)"), Some((vec![97, 98], unicode)));
-    assert_eq!(
-        sequence("(?i:)"),
-        Some((vec![], unicode | SRE_FLAG_IGNORECASE))
-    );
+    assert_eq!(sequence("(?i:)"), Some((vec![], unicode | SRE_FLAG_IGNORECASE)));
     assert_eq!(sequence("a.c"), None);
     assert_eq!(sequence("(ab)"), None);
     assert_eq!(sequence("(?i:a)b"), None);

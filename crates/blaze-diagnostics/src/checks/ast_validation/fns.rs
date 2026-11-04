@@ -39,16 +39,51 @@ use crate::{
 /// or after it is refused.
 const NO_SPLATTED_ARG_INDEX: usize = u8::MAX as usize;
 
-const ONLY_C: &str = "only `extern \"C\"` and `extern \"C-unwind\"` functions may have a C variable argument list";
+const ONLY_C: &str =
+    "only `extern \"C\"` and `extern \"C-unwind\"` functions may have a C variable argument list";
 
 /// The ABIs rustc knows (`ExternAbi::from_str`).
 const ABIS: &[&str] = &[
-    "C", "C-unwind", "Rust", "Swift", "aapcs", "aapcs-unwind", "avr-interrupt", "avr-non-blocking-interrupt", "cdecl",
-    "cdecl-unwind", "cmse-nonsecure-call", "cmse-nonsecure-entry", "custom", "efiapi", "fastcall", "fastcall-unwind",
-    "gpu-kernel", "msp430-interrupt", "ptx-kernel", "riscv-interrupt-m", "riscv-interrupt-s", "rust-call", "rust-cold",
-    "rust-invalid", "rust-preserve-none", "stdcall", "stdcall-unwind", "system", "system-unwind", "sysv64",
-    "sysv64-unwind", "tail", "thiscall", "thiscall-unwind", "unadjusted", "vectorcall", "vectorcall-unwind", "win64",
-    "win64-unwind", "x86-interrupt",
+    "C",
+    "C-unwind",
+    "Rust",
+    "Swift",
+    "aapcs",
+    "aapcs-unwind",
+    "avr-interrupt",
+    "avr-non-blocking-interrupt",
+    "cdecl",
+    "cdecl-unwind",
+    "cmse-nonsecure-call",
+    "cmse-nonsecure-entry",
+    "custom",
+    "efiapi",
+    "fastcall",
+    "fastcall-unwind",
+    "gpu-kernel",
+    "msp430-interrupt",
+    "ptx-kernel",
+    "riscv-interrupt-m",
+    "riscv-interrupt-s",
+    "rust-call",
+    "rust-cold",
+    "rust-invalid",
+    "rust-preserve-none",
+    "stdcall",
+    "stdcall-unwind",
+    "system",
+    "system-unwind",
+    "sysv64",
+    "sysv64-unwind",
+    "tail",
+    "thiscall",
+    "thiscall-unwind",
+    "unadjusted",
+    "vectorcall",
+    "vectorcall-unwind",
+    "win64",
+    "win64-unwind",
+    "x86-interrupt",
 ];
 
 /// An ABI's string literal (`T![string]`, which always casts to `ast::String`).
@@ -145,7 +180,9 @@ pub(super) fn abi_of(abi: ast::Abi<'_>) -> Option<&'static str> {
 /// `CoroutineKind`: a function's `async`, `gen` or `async gen`, where it is written.
 pub(super) fn coroutine_kind(item: ast::Fn<'_>) -> Option<(TextRange, &'static str)> {
     match (item.async_token(), item.gen_token()) {
-        (Some(async_), Some(gen_)) => Some((async_.text_range().cover(gen_.text_range()), "async gen")),
+        (Some(async_), Some(gen_)) => {
+            Some((async_.text_range().cover(gen_.text_range()), "async gen"))
+        }
         (Some(async_), None) => Some((async_.text_range(), "async")),
         (None, Some(gen_)) => Some((gen_.text_range(), "gen")),
         (None, None) => None,
@@ -211,7 +248,9 @@ pub(super) fn inputs<'db>(v: &V<'_, '_, 'db>, list: Option<ast::ParamList<'db>>)
         && v.kept(it.syntax())
     {
         let start = ast::written_range(it.syntax()).start();
-        let end = it.name().map_or(it.syntax().text_range().end(), |name| name.syntax().text_range().end());
+        let end = it
+            .name()
+            .map_or(it.syntax().text_range().end(), |name| name.syntax().text_range().end());
         inputs.push(Input {
             node: InputNode::SelfParam(it),
             range: TextRange::new(start, end.max(start)),
@@ -245,9 +284,10 @@ fn param_is_self(param: ast::Param<'_>) -> bool {
         ty = it.ty();
     }
     match ty {
-        Some(ast::Type::PathType(it)) => it
-            .path()
-            .is_some_and(|it| it.qualifier().is_none() && it.segment().and_then(|it| it.name_ref()).is_some_and(|it| it.text() == "self")),
+        Some(ast::Type::PathType(it)) => it.path().is_some_and(|it| {
+            it.qualifier().is_none()
+                && it.segment().and_then(|it| it.name_ref()).is_some_and(|it| it.text() == "self")
+        }),
         _ => false,
     }
 }
@@ -286,7 +326,11 @@ pub(super) fn check_decl<'db>(
     {
         let span = v.span(first.range);
         // clone: a span, on the error path
-        let mut diag = Diag::error(None, "`self` parameter is only allowed in associated functions", span.clone());
+        let mut diag = Diag::error(
+            None,
+            "`self` parameter is only allowed in associated functions",
+            span.clone(),
+        );
         diag.note("associated functions are those in `impl` or `trait` definitions");
         diag.span_label(span, "not semantically valid as function parameter");
         v.emit(out, node, diag);
@@ -338,7 +382,8 @@ fn splatting<'db>(
     let Some(&(first_index, _)) = valid.first() else { return };
     let many = |message: &str, help: &str, extra: Option<TextRange>| {
         // alloc: the error's spans
-        let spans: Vec<Span> = valid.iter().map(|it| it.1).chain(extra).map(|it| v.span(it)).collect();
+        let spans: Vec<Span> =
+            valid.iter().map(|it| it.1).chain(extra).map(|it| v.span(it)).collect();
         // clone: a span, on the error path
         let mut diag = Diag::error(None, message, spans[0].clone());
         for span in &spans[1..] {
@@ -390,7 +435,12 @@ const PARAM_ATTRS: &[&str] = &["allow", "deny", "expect", "forbid", "rustc_splat
 
 /// `check_decl_attrs`: doc comments and builtin attributes other than the lint ones on
 /// parameters, in the order they are written.
-fn param_attrs<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, inputs: &[Input<'db>], out: &mut Out) {
+fn param_attrs<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    inputs: &[Input<'db>],
+    out: &mut Out,
+) {
     for input in inputs {
         let mut found: SmallVec<[(TextRange, bool); 4]> = SmallVec::new();
         for doc in input.syntax().children().filter(|it| it.kind() == SyntaxKind::DOC_COMMENT) {
@@ -447,7 +497,13 @@ pub(super) fn patterns<'db>(
                 if it.amp_token().is_none()
                     && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
                 {
-                    report(v.span(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end())), true);
+                    report(
+                        v.span(TextRange::new(
+                            mut_.text_range().start(),
+                            name.syntax().text_range().end(),
+                        )),
+                        true,
+                    );
                 }
                 continue;
             }
@@ -480,7 +536,9 @@ fn expanded_pat<'db>(v: &V<'_, '_, 'db>, pat: ast::Pat<'db>) -> InFile<ast::Pat<
     let mut pat = InFile::new(v.tree.file, pat);
     for _ in 0..MACRO_DEPTH {
         let ast::Pat::MacroPat(call) = pat.value else { break };
-        let Some(root) = call.macro_call().and_then(|it| v.cx.vsema.expand_macro_call(it)) else { break };
+        let Some(root) = call.macro_call().and_then(|it| v.cx.vsema.expand_macro_call(it)) else {
+            break;
+        };
         let Some(next) = ast::Pat::cast(root.value) else { break };
         pat = InFile::new(root.file_id, next);
     }
@@ -494,7 +552,9 @@ fn named_param(pat: ast::Pat<'_>) -> bool {
     match pat {
         ast::Pat::IdentPat(it) => it.ref_token().is_none() && it.pat().is_none(),
         ast::Pat::RefPat(it) if it.mut_token().is_none() => match it.pat() {
-            Some(ast::Pat::RefPat(inner)) if inner.mut_token().is_none() => inner.pat().is_some_and(plain),
+            Some(ast::Pat::RefPat(inner)) if inner.mut_token().is_none() => {
+                inner.pat().is_some_and(plain)
+            }
             Some(inner) => plain(inner),
             None => false,
         },
@@ -516,7 +576,13 @@ pub(super) fn visit_fn<'db>(
     check_decl(v, node, &inputs, ctxt.is_assoc(), Splat::of(abi), out);
     match ctxt {
         Ctxt::Foreign(block) => {
-            items::safety_in_extern(v, node, item.safe_token().or(item.unsafe_token()), *block, out);
+            items::safety_in_extern(
+                v,
+                node,
+                item.safe_token().or(item.unsafe_token()),
+                *block,
+                out,
+            );
         }
         _ => items::safe_outside_extern(v, node, item.safe_token(), out),
     }
@@ -536,7 +602,11 @@ pub(super) fn visit_fn<'db>(
         let const_span = v.span(const_.text_range());
         let coroutine_span = v.span(coroutine);
         // alloc: the error's message
-        let mut diag = Diag::error(None, format!("functions cannot be both `const` and `{kind}`"), coroutine_span.clone());
+        let mut diag = Diag::error(
+            None,
+            format!("functions cannot be both `const` and `{kind}`"),
+            coroutine_span.clone(),
+        );
         // clone: a span, on the error path
         diag.primary(const_span.clone());
         diag.span_label(const_span, "`const` because of this");
@@ -579,10 +649,20 @@ pub(super) fn closure<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut O
 }
 
 /// E0737 `RequiresRustAbi`: `#[track_caller]` at `attr` with the ABI written at `abi`.
-pub(super) fn requires_rust_abi(v: &V<'_, '_, '_>, node: ast::Node<'_>, attr: TextRange, abi: Span, out: &mut Out) {
+pub(super) fn requires_rust_abi(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    attr: TextRange,
+    abi: Span,
+    out: &mut Out,
+) {
     let span = v.span(attr);
     // clone: a span, on the error path
-    let mut diag = Diag::error(Some("E0737"), "`#[track_caller]` can only be used with the Rust ABI", span.clone());
+    let mut diag = Diag::error(
+        Some("E0737"),
+        "`#[track_caller]` can only be used with the Rust ABI",
+        span.clone(),
+    );
     diag.span_label(span, "using `#[track_caller]` here");
     diag.span_label(abi, "not using the Rust ABI because of this");
     v.emit(out, node, diag);
@@ -645,8 +725,10 @@ impl<'i, 'db> Sig<'i, 'db> {
 
     pub(super) fn of_fn_ptr(ty: ast::FnPtrType<'db>, inputs: &'i [Input<'db>]) -> Sig<'i, 'db> {
         let safe = safe_token(ty.syntax()).map(|it| it.text_range());
-        let qualifiers =
-            [ty.abi().map(|it| it.syntax().text_range()), safe.or(ty.unsafe_token().map(|it| it.text_range()))];
+        let qualifiers = [
+            ty.abi().map(|it| it.syntax().text_range()),
+            safe.or(ty.unsafe_token().map(|it| it.text_range())),
+        ];
         Sig {
             span: decl_range(ty.syntax()),
             safe,
@@ -683,7 +765,9 @@ pub(super) fn decl_range(node: ast::Node<'_>) -> TextRange {
 
 /// A function pointer type's `safe`, which blaze's tree keeps as a token of the type.
 pub(super) fn safe_token(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
-    node.children_with_tokens().filter_map(NodeOrToken::into_token).find(|it| it.kind() == SyntaxKind::SAFE_KW)
+    node.children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|it| it.kind() == SyntaxKind::SAFE_KW)
 }
 
 fn params_end(list: Option<ast::ParamList<'_>>, owner: ast::Node<'_>) -> TextSize {
@@ -707,7 +791,9 @@ fn canon(abi: &str, arch: Option<&str>) -> Canon {
         "gpu-kernel" if matches!(arch, "amdgpu" | "nvptx64") => Canon::GpuKernel,
         "ptx-kernel" if arch == "nvptx64" => Canon::GpuKernel,
         "x86-interrupt" if matches!(arch, "x86" | "x86_64") => Canon::Interrupt { x86: true },
-        "avr-interrupt" | "avr-non-blocking-interrupt" if arch == "avr" => Canon::Interrupt { x86: false },
+        "avr-interrupt" | "avr-non-blocking-interrupt" if arch == "avr" => {
+            Canon::Interrupt { x86: false }
+        }
         "msp430-interrupt" if arch == "msp430" => Canon::Interrupt { x86: false },
         "riscv-interrupt-m" | "riscv-interrupt-s" if riscv => Canon::Interrupt { x86: false },
         _ => Canon::Unchecked,
@@ -715,7 +801,13 @@ fn canon(abi: &str, arch: Option<&str>) -> Canon {
 }
 
 /// `check_extern_fn_signature`: what the ABI `abi` allows of `sig`.
-pub(super) fn signature(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+pub(super) fn signature(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    abi: &str,
+    sig: &Sig<'_, '_>,
+    out: &mut Out,
+) {
     match canon(abi, v.arch()) {
         Canon::Unchecked => {}
         Canon::GpuKernel => {
@@ -737,7 +829,11 @@ pub(super) fn signature(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: 
                     // alloc: as above
                     inputs => inputs.iter().map(|it| it.range).collect(),
                 };
-                let mut diag = Diag::error(None, "invalid signature for `extern \"x86-interrupt\"` function", v.span(ranges[0]));
+                let mut diag = Diag::error(
+                    None,
+                    "invalid signature for `extern \"x86-interrupt\"` function",
+                    v.span(ranges[0]),
+                );
                 for range in &ranges[1..] {
                     diag.primary(v.span(*range));
                 }
@@ -782,7 +878,8 @@ fn reject_safe_fn(v: &V<'_, '_, '_>, node: ast::Node<'_>, sig: &Sig<'_, '_>, out
     match sig.safe {
         Some(_) if sig.fn_ptr => {}
         Some(safe) => {
-            let mut diag = Diag::error(None, "foreign functions with the \"custom\" ABI cannot be safe", span);
+            let mut diag =
+                Diag::error(None, "foreign functions with the \"custom\" ABI cannot be safe", span);
             diag.suggestion_verbose(
                 v.span(until_non_whitespace(node, safe.cover(sig.span))),
                 "remove the `safe` keyword from this definition",
@@ -794,7 +891,8 @@ fn reject_safe_fn(v: &V<'_, '_, '_>, node: ast::Node<'_>, sig: &Sig<'_, '_>, out
         None if sig.foreign => {}
         None => {
             // clone: a span, on the error path
-            let mut diag = Diag::error(None, "functions with the \"custom\" ABI must be unsafe", span.clone());
+            let mut diag =
+                Diag::error(None, "functions with the \"custom\" ABI must be unsafe", span.clone());
             diag.suggestion_verbose(
                 span.shrink_to_lo(),
                 "add the `unsafe` keyword to this definition",
@@ -807,7 +905,13 @@ fn reject_safe_fn(v: &V<'_, '_, '_>, node: ast::Node<'_>, sig: &Sig<'_, '_>, out
 }
 
 /// `reject_coroutine`: `async` or `gen` with an ABI that cannot have it.
-fn reject_coroutine(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+fn reject_coroutine(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    abi: &str,
+    sig: &Sig<'_, '_>,
+    out: &mut Out,
+) {
     let Some((range, kind)) = sig.coroutine else { return };
     // alloc: the error's message
     let message = format!("functions with the \"{abi}\" ABI cannot be `{kind}`");
@@ -832,7 +936,13 @@ fn never_or_unit(ty: ast::Type<'_>) -> (bool, bool) {
 }
 
 /// `reject_return`: a return type other than `!` or `()`.
-fn reject_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+fn reject_return(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    abi: &str,
+    sig: &Sig<'_, '_>,
+    out: &mut Out,
+) {
     let Some(ret) = sig.ret else { return };
     let (never, unit) = never_or_unit(ret);
     if never || unit {
@@ -840,7 +950,11 @@ fn reject_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_
     }
     let span = v.span(ret.syntax().text_range());
     // alloc: the error's message, and a span clone on the error path
-    let mut diag = Diag::error(None, format!("invalid signature for `extern \"{abi}\"` function"), span.clone());
+    let mut diag = Diag::error(
+        None,
+        format!("invalid signature for `extern \"{abi}\"` function"),
+        span.clone(),
+    );
     // alloc: the error's note
     diag.note(format!("functions with the \"{abi}\" ABI cannot have a return type"));
     diag.span_help(span, "remove the return type");
@@ -849,7 +963,13 @@ fn reject_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_
 
 /// `reject_params_or_return`: any parameter, or a return type other than `()` (or `!` but for
 /// the `"custom"` ABI).
-fn reject_params_or_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+fn reject_params_or_return(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    abi: &str,
+    sig: &Sig<'_, '_>,
+    out: &mut Out,
+) {
     let mut ranges: SmallVec<[TextRange; 8]> = SmallVec::new();
     ranges.extend(sig.inputs.iter().map(|it| it.range));
     if let Some(ret) = sig.ret {
@@ -865,12 +985,18 @@ fn reject_params_or_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, si
     let symbol = sig.name.map_or("", |it| unraw(it.text()));
     let space = if sig.name.is_some() { " " } else { "" };
     // alloc: the error's message
-    let mut diag = Diag::error(None, format!("invalid signature for `extern \"{abi}\"` function"), v.span(first));
+    let mut diag = Diag::error(
+        None,
+        format!("invalid signature for `extern \"{abi}\"` function"),
+        v.span(first),
+    );
     for range in &ranges[1..] {
         diag.primary(v.span(*range));
     }
     // alloc: the error's note
-    diag.note(format!("functions with the \"{abi}\" ABI cannot have any parameters or return type"));
+    diag.note(format!(
+        "functions with the \"{abi}\" ABI cannot have any parameters or return type"
+    ));
     diag.suggestion_verbose(
         v.span(suggestion),
         "remove the parameters and return type",
@@ -897,11 +1023,14 @@ fn variadics(v: &V<'_, '_, '_>) -> Variadics {
             Variadics::NotSupported(if big { "bpfeb" } else { "bpfel" })
         }
         "spirv" => Variadics::NotSupported("spirv"),
-        "riscv32" if v.walk.cfg.get_cfg_values("target_abi").any(|it| it.as_str() == "ilp32e") => Variadics::Unstable,
+        "riscv32" if v.walk.cfg.get_cfg_values("target_abi").any(|it| it.as_str() == "ilp32e") => {
+            Variadics::Unstable
+        }
         "sparc" | "avr" | "m68k" | "msp430" => Variadics::Unstable,
-        "aarch64" | "amdgpu" | "arm" | "arm64ec" | "csky" | "hexagon" | "loongarch32" | "loongarch64" | "mips"
-        | "mips32r6" | "mips64" | "mips64r6" | "nvptx64" | "powerpc" | "powerpc64" | "riscv32" | "riscv64" | "s390x"
-        | "sparc64" | "wasm32" | "wasm64" | "x86" | "x86_64" | "xtensa" => Variadics::Stable,
+        "aarch64" | "amdgpu" | "arm" | "arm64ec" | "csky" | "hexagon" | "loongarch32"
+        | "loongarch64" | "mips" | "mips32r6" | "mips64" | "mips64r6" | "nvptx64" | "powerpc"
+        | "powerpc64" | "riscv32" | "riscv64" | "s390x" | "sparc64" | "wasm32" | "wasm64"
+        | "x86" | "x86_64" | "xtensa" => Variadics::Stable,
         _ => Variadics::Unstable,
     }
 }
@@ -920,7 +1049,11 @@ fn c_variadic<'db>(
     let sig_span = v.span(signature_range(item));
     if item.const_token().is_some() && !v.feature("const_c_variadic") {
         // clone: a span, on the error path
-        let diag = feature_err("const_c_variadic", "c-variadic const function definitions are unstable", sig_span.clone());
+        let diag = feature_err(
+            "const_c_variadic",
+            "c-variadic const function definitions are unstable",
+            sig_span.clone(),
+        );
         v.emit(out, node, diag);
     }
     if let Some((coroutine, kind)) = coroutine_kind(item) {
@@ -955,7 +1088,8 @@ fn c_variadic<'db>(
         Variadics::Unstable | Variadics::Stable => {}
     }
     let Some(abi) = item.abi() else {
-        let mut diag = Diag::error(None, "`...` is not supported for non-extern functions", variadic);
+        let mut diag =
+            Diag::error(None, "`...` is not supported for non-extern functions", variadic);
         diag.help(ONLY_C);
         v.emit(out, node, diag);
         return;
@@ -967,8 +1101,10 @@ fn c_variadic<'db>(
     }
     if item.unsafe_token().is_none() {
         // `FnSig::safety_span`: the `safe`, else before the ABI.
-        let at = item.safe_token().map_or(TextRange::empty(abi_range.start()), |it| it.text_range());
-        let mut diag = Diag::error(None, "functions with a C variable argument list must be unsafe", variadic);
+        let at =
+            item.safe_token().map_or(TextRange::empty(abi_range.start()), |it| it.text_range());
+        let mut diag =
+            Diag::error(None, "functions with a C variable argument list must be unsafe", variadic);
         diag.suggestion_verbose(
             v.span(at),
             "add the `unsafe` keyword to this definition",
@@ -995,8 +1131,17 @@ fn c_variadic_abi(
         // `ExternAbi::supports_c_variadic`.
         let supported = matches!(
             abi,
-            "cdecl" | "cdecl-unwind" | "aapcs" | "aapcs-unwind" | "win64" | "win64-unwind" | "sysv64" | "sysv64-unwind"
-                | "efiapi" | "system" | "system-unwind"
+            "cdecl"
+                | "cdecl-unwind"
+                | "aapcs"
+                | "aapcs-unwind"
+                | "win64"
+                | "win64-unwind"
+                | "sysv64"
+                | "sysv64-unwind"
+                | "efiapi"
+                | "system"
+                | "system-unwind"
         );
         if is_c {
             // A naked C-variadic `extern "C"` function is allowed.

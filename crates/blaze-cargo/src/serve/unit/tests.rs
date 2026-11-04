@@ -5,7 +5,10 @@ use std::{
     path::PathBuf,
 };
 
-#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test job's slots, as the job keeps them: per job, not global"
+)]
 use std::sync::OnceLock;
 
 use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
@@ -55,7 +58,14 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
         is_std: false,
         dependencies: deps
             .iter()
-            .map(|it| UnitDep { index: *it, extern_crate_name: "dep".to_owned(), public: None, noprelude: None, nounused: None, dev: false })
+            .map(|it| UnitDep {
+                index: *it,
+                extern_crate_name: "dep".to_owned(),
+                public: None,
+                noprelude: None,
+                nounused: None,
+                dev: false,
+            })
             .collect(),
     }
 }
@@ -107,16 +117,34 @@ fn build(dir: &std::path::Path) -> Units {
     let p_out = out.join("p-0002/out").to_string_lossy().into_owned();
     let units = vec![
         // 0: z-sys's script compiled, 1: run.
-        unit(Z, target("build-script-build", "custom-build", "/w/z-sys/build.rs"), Mode::Build, &[]),
-        unit(Z, target("build-script-build", "custom-build", "/w/z-sys/build.rs"), Mode::RunCustomBuild, &[0]),
+        unit(
+            Z,
+            target("build-script-build", "custom-build", "/w/z-sys/build.rs"),
+            Mode::Build,
+            &[],
+        ),
+        unit(
+            Z,
+            target("build-script-build", "custom-build", "/w/z-sys/build.rs"),
+            Mode::RunCustomBuild,
+            &[0],
+        ),
         // 2: p's script compiled, 3: run, after z-sys's run.
         unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]),
-        unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::RunCustomBuild, &[2, 1]),
+        unit(
+            P,
+            target("build-script-build", "custom-build", "/w/p/build.rs"),
+            Mode::RunCustomBuild,
+            &[2, 1],
+        ),
     ];
     let script_plan = |out_dir: &str, links: Option<&str>, name: &str| UnitPlan {
         out_dir: Some(out_dir.to_owned()),
         links: links.map(str::to_owned),
-        env: vec![("CARGO_PKG_NAME".to_owned(), name.to_owned()), ("PROFILE".to_owned(), "debug".to_owned())],
+        env: vec![
+            ("CARGO_PKG_NAME".to_owned(), name.to_owned()),
+            ("PROFILE".to_owned(), "debug".to_owned()),
+        ],
         ..plan("", &[])
     };
     Units {
@@ -139,17 +167,33 @@ fn build(dir: &std::path::Path) -> Units {
     }
 }
 
-#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test job's slots, as the job keeps them: per job, not global"
+)]
 fn slots(units: &Units) -> Vec<OnceLock<script::Applied>> {
     units.graph.units.iter().map(|_| OnceLock::new()).collect()
 }
 
 fn value(code: i32, stdout: &str, stderr: &str) -> Value {
-    Value { code: Some(code), signal: None, stdout: stdout.as_bytes().to_vec(), stderr: stderr.as_bytes().to_vec(), files: Vec::new() }
+    Value {
+        code: Some(code),
+        signal: None,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+        files: Vec::new(),
+    }
 }
 
-#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
-fn of<'a>(units: &'a Units, scripts: &'a [OnceLock<script::Applied>], tools: &'a std::path::Path) -> script::Of<'a> {
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test job's slots, as the job keeps them: per job, not global"
+)]
+fn of<'a>(
+    units: &'a Units,
+    scripts: &'a [OnceLock<script::Applied>],
+    tools: &'a std::path::Path,
+) -> script::Of<'a> {
     script::Of {
         units,
         host: HOST,
@@ -182,7 +226,10 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     assert_eq!(output.env, [("Z_VERSION".to_owned(), "1.3".to_owned())]);
     assert_eq!(output.library_links, ["static=z"]);
     assert_eq!(output.library_paths.len(), 1);
-    assert_eq!(output.library_paths[0].path(), std::path::Path::new(&format!("native={out_dir}/lib")));
+    assert_eq!(
+        output.library_paths[0].path(),
+        std::path::Path::new(&format!("native={out_dir}/lib"))
+    );
     assert_eq!(output.metadata, [("include".to_owned(), format!("{out_dir}/include"))]);
     // cargo's warning line, of the package by name and version.
     assert_eq!(judged.diagnostics.len(), 1);
@@ -195,7 +242,12 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     assert_eq!(codegen::link_lib(&output.library_links[0]).unwrap().name, "z");
 
     // The dependent's script is told `DEP_Z_INCLUDE`.
-    let applied = script::Applied { package_id: Z.to_owned(), links: Some("z".to_owned()), output, out_dir: out_dir.clone() };
+    let applied = script::Applied {
+        package_id: Z.to_owned(),
+        links: Some("z".to_owned()),
+        output,
+        out_dir: out_dir.clone(),
+    };
     assert!(scripts[1].set(applied).is_ok());
     let p = script::script_unit(&of(&units, &scripts, &tools), 3).unwrap();
     assert_eq!(p.dependencies.len(), 1);
@@ -209,7 +261,8 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
 /// whether it links a dependent's program or its build script.
 #[test]
 fn a_kinded_link_search_reaches_the_link_as_its_directory() {
-    let search = ["native=/o/lib", "crate=/c", "dependency=/d", "/plain", "all=/a", "framework=/f"].map(PathBuf::from);
+    let search = ["native=/o/lib", "crate=/c", "dependency=/d", "/plain", "all=/a", "framework=/f"]
+        .map(PathBuf::from);
     let dirs = codegen::search_dirs(&search);
     assert_eq!(dirs, ["/o/lib", "/plain", "/a", "/f"].map(PathBuf::from));
 }
@@ -227,7 +280,11 @@ fn a_directive_the_sandbox_refuses_fails_the_build() {
     let report = judged.failure.expect("the sandbox refused it");
     assert_eq!(report.rule.as_deref(), Some("sandbox:link-dir"));
     assert_eq!(report.subject(), Some("z-sys"));
-    assert!(report.flat().contains("`cargo:rustc-link-search=native=/home/me/lib`"), "{}", report.flat());
+    assert!(
+        report.flat().contains("`cargo:rustc-link-search=native=/home/me/lib`"),
+        "{}",
+        report.flat()
+    );
     // Outside the sandbox nothing is checked.
     let judged = script::judge(&z, &[], &value(0, printed, ""), None, None, false);
     assert!(judged.output.is_some());
@@ -240,7 +297,14 @@ fn a_failed_script_says_what_cargo_says() {
     let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
-    let judged = script::judge(&z, &[], &value(101, "cargo:warning=no zlib\n", "thread 'main' panicked\n"), Some(&[]), None, false);
+    let judged = script::judge(
+        &z,
+        &[],
+        &value(101, "cargo:warning=no zlib\n", "thread 'main' panicked\n"),
+        Some(&[]),
+        None,
+        false,
+    );
     assert!(judged.output.is_none());
     // Its warning is cargo's line; its failure is a report of the script, how it ended and the
     // end of what it wrote (its directives left out).
@@ -249,10 +313,14 @@ fn a_failed_script_says_what_cargo_says() {
     let report = judged.failure.expect("the run failed");
     assert_eq!(report.rule.as_deref(), Some("build-script:failed"));
     assert_eq!(report.subject(), Some("z-sys"));
-    assert_eq!(report.flat(), "the build script failed\n  it ended with exit status: 101\n  thread 'main' panicked");
+    assert_eq!(
+        report.flat(),
+        "the build script failed\n  it ended with exit status: 101\n  thread 'main' panicked"
+    );
 
     // An error it logged fails it too, said as the headline.
-    let judged = script::judge(&z, &[], &value(0, "cargo::error=no `zlib`\n", ""), Some(&[]), None, true);
+    let judged =
+        script::judge(&z, &[], &value(0, "cargo::error=no `zlib`\n", ""), Some(&[]), None, true);
     assert!(judged.diagnostics.is_empty(), "{:?}", judged.diagnostics);
     let report = judged.failure.expect("it logged an error");
     assert_eq!(report.rule.as_deref(), Some("build-script:error"));
@@ -262,7 +330,9 @@ fn a_failed_script_says_what_cargo_says() {
     let printed = "cargo:blaze-report=headline=z-sys can't find zlib\ncargo:blaze-report=rule=llvm:pin\n\
                    cargo:blaze-report=fact.found=`ZLIB_DIR` is not set\ncargo:blaze-report=fix=nix develop\n\
                    cargo::error=no zlib: set ZLIB_DIR\n";
-    let report = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false).failure.expect("it logged an error");
+    let report = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false)
+        .failure
+        .expect("it logged an error");
     assert_eq!(report.flat(), "z-sys can't find zlib\n  `ZLIB_DIR` is not set\n  fix: nix develop");
     assert_eq!(report.rule.as_deref(), Some("llvm:pin"));
 }
@@ -284,8 +354,15 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     #[cfg(unix)]
     assert_eq!(get("TMPDIR"), None);
     let outside = script::inherited(&job, &units.plans[1], false);
-    assert!(outside.iter().any(|(name, value)| name == "TMPDIR" && value == "/tmp/nix-shell.dv7jx8"), "a run outside the sandbox has the shell's");
-    assert_eq!(get("BLAZE_SCRIPT_CACHE"), None, "how blaze checks its store is the job's, never a script's");
+    assert!(
+        outside.iter().any(|(name, value)| name == "TMPDIR" && value == "/tmp/nix-shell.dv7jx8"),
+        "a run outside the sandbox has the shell's"
+    );
+    assert_eq!(
+        get("BLAZE_SCRIPT_CACHE"),
+        None,
+        "how blaze checks its store is the job's, never a script's"
+    );
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("z-sys")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
     assert_eq!(get("PATH"), Some(OsString::from("/usr/bin")));
@@ -303,9 +380,16 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         roots: blaze_usercode::roots::RootMap::default(),
     };
     let one = blaze_usercode::script::prepare(&z, &env, &place).unwrap();
-    let other: Vec<(String, String)> =
-        job.iter().map(|(name, value)| (name.clone(), value.replace("hunter2", "swordfish"))).collect();
-    let two = blaze_usercode::script::prepare(&z, &script::inherited(&other, &units.plans[1], true), &place).unwrap();
+    let other: Vec<(String, String)> = job
+        .iter()
+        .map(|(name, value)| (name.clone(), value.replace("hunter2", "swordfish")))
+        .collect();
+    let two = blaze_usercode::script::prepare(
+        &z,
+        &script::inherited(&other, &units.plans[1], true),
+        &place,
+    )
+    .unwrap();
     // A value passed through is in no key: what the script reads of it is traced.
     assert_eq!(one.spec.key, two.spec.key);
     assert!(!one.given.iter().any(|it| it == "SECRET_TOKEN"));
@@ -318,7 +402,16 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
 fn artifact_of(unit: &Unit, plan: &UnitPlan) -> Artifact {
     let package = package(&unit.pkg_id, "p", "/w/p");
     let main = artifact::main(unit, plan).unwrap();
-    artifact::artifact(unit, plan, &package, &main, ContentId::of("blaze v2 test 1", b"x"), false, artifact::Runs::default()).unwrap()
+    artifact::artifact(
+        unit,
+        plan,
+        &package,
+        &main,
+        ContentId::of("blaze v2 test 1", b"x"),
+        false,
+        artifact::Runs::default(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -341,7 +434,13 @@ fn a_libs_artifact_is_cargos() {
     assert_eq!(it.path, "/w/target/debug/libp.rlib");
     assert_eq!(
         it.profile,
-        UnitProfile { opt_level: "0".into(), debuginfo: 2, debug_assertions: true, overflow_checks: true, test: false }
+        UnitProfile {
+            opt_level: "0".into(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            test: false
+        }
     );
     assert_eq!(it.target, unit_target(&lib).unwrap());
     assert_eq!(it.features, ["default"]);
@@ -353,7 +452,12 @@ fn a_bins_artifact_is_cargos() {
     let bin = unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
     let plan = plan(
         "-0123",
-        &["/w/target/debug/deps/p-0123", "/w/target/debug/deps/p-0123.d", "/w/target/debug/p", "/w/target/debug/p.d"],
+        &[
+            "/w/target/debug/deps/p-0123",
+            "/w/target/debug/deps/p-0123.d",
+            "/w/target/debug/p",
+            "/w/target/debug/p.d",
+        ],
     );
     let it = artifact_of(&bin, &plan);
     assert_eq!(it.kind, ArtifactKind::Bin);
@@ -392,12 +496,16 @@ fn a_test_runs_from_deps_beside_the_packages_binaries() {
     assert_eq!(it.filenames, ["/w/target/debug/deps/it-4567"]);
     assert_eq!(it.executable.as_deref(), Some("/w/target/debug/deps/it-4567"));
     assert_eq!(artifact::made(&plan), [format!("{out}/it-4567")]);
-    assert_eq!(artifact::uplifted(&format!("{out}/it-4567"), &plan), Some("/w/target/debug/deps/it-4567"));
+    assert_eq!(
+        artifact::uplifted(&format!("{out}/it-4567"), &plan),
+        Some("/w/target/debug/deps/it-4567")
+    );
 }
 
 #[test]
 fn a_build_scripts_artifact_is_cargos() {
-    let script = unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
+    let script =
+        unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
     let plan = plan(
         "-89ab",
         &[
@@ -442,7 +550,16 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
 
     let package = package(P, "p", "/w/p");
     let runs = artifact::Runs { runner: vec!["qemu-aarch64".to_owned()], env: env.clone() };
-    let it = artifact::artifact(&bin, &plan, &package, "/w/target/debug/p", ContentId::of("blaze v2 test 1", b"x"), false, runs).unwrap();
+    let it = artifact::artifact(
+        &bin,
+        &plan,
+        &package,
+        "/w/target/debug/p",
+        ContentId::of("blaze v2 test 1", b"x"),
+        false,
+        runs,
+    )
+    .unwrap();
     assert_eq!(it.runner, ["qemu-aarch64"]);
     assert!(it.harness);
     let job = [
@@ -452,18 +569,30 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
     ];
     let process = run::process_env(&job, &it, "linux");
     assert!(process.windows(2).all(|it| it[0].0 < it[1].0), "{process:?}");
-    let get = |name: &str| process.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
+    let get =
+        |name: &str| process.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("p")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
     assert_eq!(
         get("LD_LIBRARY_PATH"),
-        Some(OsString::from("/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug:/opt/lib"))
+        Some(OsString::from(
+            "/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug:/opt/lib"
+        ))
     );
     // A library's artifact runs nothing, and says no environment.
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
     let lib_plan = self::plan("-0123", &["/w/target/debug/deps/libp-0123.rlib"]);
     let runs = artifact::Runs { runner: Vec::new(), env };
-    let it = artifact::artifact(&lib, &lib_plan, &package, "/w/target/debug/deps/libp-0123.rlib", ContentId::of("blaze v2 test 1", b"x"), false, runs).unwrap();
+    let it = artifact::artifact(
+        &lib,
+        &lib_plan,
+        &package,
+        "/w/target/debug/deps/libp-0123.rlib",
+        ContentId::of("blaze v2 test 1", b"x"),
+        false,
+        runs,
+    )
+    .unwrap();
     assert!(it.env.is_empty());
 }
 
@@ -490,7 +619,10 @@ fn run_picks_the_binary_cargo_picks() {
         "`cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the \
          `default-run` manifest key.\navailable binaries: a, b"
     );
-    assert_eq!(run::choose(&two[..1], None, None).unwrap_err(), "a bin target must be available for `cargo run`");
+    assert_eq!(
+        run::choose(&two[..1], None, None).unwrap_err(),
+        "a bin target must be available for `cargo run`"
+    );
     assert!(run::choose(&two, Some("c"), None).unwrap_err().starts_with("no bin target named `c`"));
 }
 
@@ -499,21 +631,37 @@ fn a_dependencys_lints_are_capped_and_rustc_closing_lines_hidden() {
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
     let mut plan = plan("-0123", &[]);
     plan.lints = vec!["--warn=unused_qualifications".to_owned()];
-    plan.rustflags = vec!["-D".to_owned(), "warnings".to_owned(), "-Ctarget-cpu=native".to_owned(), "-Aunused".to_owned()];
+    plan.rustflags = vec![
+        "-D".to_owned(),
+        "warnings".to_owned(),
+        "-Ctarget-cpu=native".to_owned(),
+        "-Aunused".to_owned(),
+    ];
     plan.check_cfg = vec!["cfg(foo)".to_owned()];
     assert_eq!(
         compile::lint_flags(&lib, &plan, true, false),
         ["--warn=unused_qualifications", "-D", "warnings", "-Aunused", "--check-cfg", "cfg(foo)"]
     );
-    assert_eq!(compile::lint_flags(&lib, &plan, false, false).last().map(String::as_str), Some("allow"));
-    assert_eq!(compile::lint_flags(&lib, &plan, false, true).last().map(String::as_str), Some("warn"));
-    assert_eq!(compile::lint_flags(&lib, &plan, true, true), compile::lint_flags(&lib, &plan, true, false));
+    assert_eq!(
+        compile::lint_flags(&lib, &plan, false, false).last().map(String::as_str),
+        Some("allow")
+    );
+    assert_eq!(
+        compile::lint_flags(&lib, &plan, false, true).last().map(String::as_str),
+        Some("warn")
+    );
+    assert_eq!(
+        compile::lint_flags(&lib, &plan, true, true),
+        compile::lint_flags(&lib, &plan, true, false)
+    );
     assert!(compile::local(Some("(/w/p)")));
     assert!(!compile::local(Some("(https://github.com/a/b#0123)")));
     assert!(!compile::local(None));
     assert!(compile::cargo_hides("aborting due to 2 previous errors; 1 warning emitted"));
     assert!(compile::cargo_hides("3 warnings emitted"));
-    assert!(!compile::cargo_hides("For more information about this error, try `rustc --explain E0308`."));
+    assert!(!compile::cargo_hides(
+        "For more information about this error, try `rustc --explain E0308`."
+    ));
 }
 
 #[test]
@@ -603,15 +751,34 @@ fn a_records_header_is_checked_in_place() {
     let mut bytes = Vec::new();
     let counts = blaze_codegen::driver::ProfileCounts { used: 5, mismatched: 1, applied: 3 };
     let profiles = [(ContentId([3; 32]), counts)];
-    compile::header::write(&mut bytes, &[one, two], &[("/usr/lib/libz.so".to_owned(), lib)], &profiles);
+    compile::header::write(
+        &mut bytes,
+        &[one, two],
+        &[("/usr/lib/libz.so".to_owned(), lib)],
+        &profiles,
+    );
     let body = bytes.len();
     bytes.extend_from_slice(b"cbor");
-    let same = |path: &std::path::Path| (path == std::path::Path::new("/usr/lib/libz.so")).then_some([7; 32]);
+    let same = |path: &std::path::Path| {
+        (path == std::path::Path::new("/usr/lib/libz.so")).then_some([7; 32])
+    };
     let changed = |_: &std::path::Path| Some([8; 32]);
     assert_eq!(compile::header::check(&bytes, |_| true, &mut { same }), Some(body));
-    assert_eq!(compile::header::check(&bytes, |key| *key != two, &mut { same }), None, "an output gone");
-    assert_eq!(compile::header::check(&bytes, |_| true, &mut { changed }), None, "a library changed");
-    assert_eq!(compile::header::check(&bytes[..body - 3], |_| true, &mut { same }), None, "cut short");
+    assert_eq!(
+        compile::header::check(&bytes, |key| *key != two, &mut { same }),
+        None,
+        "an output gone"
+    );
+    assert_eq!(
+        compile::header::check(&bytes, |_| true, &mut { changed }),
+        None,
+        "a library changed"
+    );
+    assert_eq!(
+        compile::header::check(&bytes[..body - 3], |_| true, &mut { same }),
+        None,
+        "cut short"
+    );
     assert_eq!(compile::header::check(b"nope", |_| true, &mut { same }), None);
     assert_eq!(compile::header::profiles(&bytes).as_deref(), Some(&profiles[..]));
     assert_eq!(compile::header::profiles(&bytes[..body - 3]), None, "cut short");
@@ -629,29 +796,57 @@ fn a_profile_is_judged_over_every_unit_counted_or_recorded() {
     let profiles = [codegen::Named { id: profiled, path: "a.profdata", names: Ok(by_blaze) }];
     let ran = [(profiled, ProfileCounts { used: 10, mismatched: 0, applied: 4 })];
     let never_ran = [(profiled, ProfileCounts { used: 6, mismatched: 0, applied: 0 })];
-    let replayed = |counts: &[(ContentId, ProfileCounts)]| -> Result<Recorded, blaze_api::ApiError> { Ok(Recorded::Read(counts.to_vec())) };
+    let replayed =
+        |counts: &[(ContentId, ProfileCounts)]| -> Result<Recorded, blaze_api::ApiError> {
+            Ok(Recorded::Read(counts.to_vec()))
+        };
     // `bin a` (unit 0) replayed from a record that applied, `bin b` (unit 1) built with
     // nothing applied: one applied anywhere passes.
-    let units = [Accounted { unit: 0, counted: None }, Accounted { unit: 1, counted: Some(&never_ran[..]) }];
-    let judged = codegen::judge(true, units, |unit| {
-        assert_eq!(unit, 0, "only the unit nothing counted this job is read from its record");
-        replayed(&ran)
-    }, &profiles);
+    let units = [
+        Accounted { unit: 0, counted: None },
+        Accounted { unit: 1, counted: Some(&never_ran[..]) },
+    ];
+    let judged = codegen::judge(
+        true,
+        units,
+        |unit| {
+            assert_eq!(unit, 0, "only the unit nothing counted this job is read from its record");
+            replayed(&ran)
+        },
+        &profiles,
+    );
     assert_eq!(judged.map_err(|it| it.what), Ok(Vec::new()));
     // Both replayed, nothing applied: refused, naming the path, the ID and the cause.
     let units = [Accounted { unit: 0, counted: None }, Accounted { unit: 1, counted: None }];
-    let refused = codegen::judge(true, units, |_| replayed(&never_ran), &profiles).unwrap_err().what;
-    assert!(refused.contains("`-C profile-use=a.profdata`") && refused.contains(&format!("{profiled:x}")), "{refused}");
-    assert!(refused.contains("none of the 12 functions") && refused.contains("key version"), "{refused}");
+    let refused =
+        codegen::judge(true, units, |_| replayed(&never_ran), &profiles).unwrap_err().what;
+    assert!(
+        refused.contains("`-C profile-use=a.profdata`")
+            && refused.contains(&format!("{profiled:x}")),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("none of the 12 functions") && refused.contains("key version"),
+        "{refused}"
+    );
     // A failed job is not judged: nothing is read, nothing refused.
-    let units = [Accounted { unit: 0, counted: Some(&never_ran[..]) }, Accounted { unit: 1, counted: None }];
-    let judged = codegen::judge(false, units, |_| panic!("a failed job reads no record"), &profiles);
+    let units = [
+        Accounted { unit: 0, counted: Some(&never_ran[..]) },
+        Accounted { unit: 1, counted: None },
+    ];
+    let judged =
+        codegen::judge(false, units, |_| panic!("a failed job reads no record"), &profiles);
     assert_eq!(judged.map_err(|it| it.what), Ok(Vec::new()));
     // In a job that succeeded, a unit with neither counts nor a record is an error naming it.
     let units = [Accounted { unit: 1, counted: None }];
-    let missing = |_| Ok(Recorded::Missing("unit 1 (`b`): the store has no record under its key 0a0b".to_owned()));
+    let missing = |_| {
+        Ok(Recorded::Missing("unit 1 (`b`): the store has no record under its key 0a0b".to_owned()))
+    };
     let refused = codegen::judge(true, units, missing, &profiles).unwrap_err().what;
-    assert!(refused.starts_with("unit 1 (`b`): the store has no record under its key 0a0b"), "{refused}");
+    assert!(
+        refused.starts_with("unit 1 (`b`): the store has no record under its key 0a0b"),
+        "{refused}"
+    );
 }
 
 /// A profile that applied to nothing refuses the job only when blaze made it under other keys
@@ -667,14 +862,24 @@ fn only_a_profile_blaze_made_is_refused_for_applying_to_nothing() {
         let profiles = [Named { id, path: "a.profdata", names }];
         let counted = [(id, counts)];
         let units = [Accounted { unit: 0, counted: Some(&counted[..]) }];
-        codegen::judge(true, units, |_| panic!("every unit is counted"), &profiles).map_err(|it| it.what)
+        codegen::judge(true, units, |_| panic!("every unit is counted"), &profiles)
+            .map_err(|it| it.what)
     };
     let nothing = ProfileCounts { used: 6, mismatched: 0, applied: 0 };
     let by_rustc = Names { records: 4, blaze: 0, rustc: 3, foreign: 1 };
     let warned = judge(Ok(by_rustc), nothing).unwrap();
     assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].contains("`-C profile-use=a.profdata`") && warned[0].contains("3 are symbols rustc mangled"), "{warned:?}");
-    assert!(warned[0].contains("blaze can't apply profiles rustc made; make one with blaze's -Cprofile-generate"), "{warned:?}");
+    assert!(
+        warned[0].contains("`-C profile-use=a.profdata`")
+            && warned[0].contains("3 are symbols rustc mangled"),
+        "{warned:?}"
+    );
+    assert!(
+        warned[0].contains(
+            "blaze can't apply profiles rustc made; make one with blaze's -Cprofile-generate"
+        ),
+        "{warned:?}"
+    );
     let by_blaze = Names { records: 4, blaze: 4, rustc: 0, foreign: 0 };
     let refused = judge(Ok(by_blaze), nothing).unwrap_err();
     assert!(refused.contains("a.profdata") && refused.contains("key version"), "{refused}");
@@ -686,7 +891,10 @@ fn only_a_profile_blaze_made_is_refused_for_applying_to_nothing() {
     let warned = judge(Err("is not an indexed profile"), nothing).unwrap();
     assert!(warned.len() == 1 && warned[0].contains("is not an indexed profile"), "{warned:?}");
     // Applied somewhere: nothing said.
-    assert_eq!(judge(Ok(by_rustc), ProfileCounts { used: 6, mismatched: 0, applied: 1 }), Ok(Vec::new()));
+    assert_eq!(
+        judge(Ok(by_rustc), ProfileCounts { used: 6, mismatched: 0, applied: 1 }),
+        Ok(Vec::new())
+    );
 }
 
 fn selection<'a>(filter: &'a [String], args: &'a [String]) -> crate::serve::work::Selection<'a> {
@@ -712,9 +920,13 @@ fn libtests_selection_is_read_as_libtest_reads_it() {
     let only = test::filter(&selection(&[], &strings(&["--ignored"]))).expect("--ignored");
     assert_eq!(only.ignored, Ignored::Only);
     assert_eq!(test::filter(&selection(&[], &[])).expect("none").ignored, Ignored::Skip);
-    let both = test::filter(&selection(&[], &strings(&["--ignored", "--include-ignored"]))).unwrap_err();
+    let both =
+        test::filter(&selection(&[], &strings(&["--ignored", "--include-ignored"]))).unwrap_err();
     assert_eq!(both.what, "the options --include-ignored and --ignored are mutually exclusive");
-    assert_eq!(test::filter(&selection(&[], &strings(&["--skip"]))).unwrap_err().what, "argument to option 'skip' missing");
+    assert_eq!(
+        test::filter(&selection(&[], &strings(&["--skip"]))).unwrap_err().what,
+        "argument to option 'skip' missing"
+    );
     let other = test::filter(&selection(&[], &strings(&["--nocapture"]))).unwrap_err();
     assert!(other.what.starts_with("`--nocapture` after `--`"), "{}", other.what);
 }
@@ -728,10 +940,16 @@ fn an_evaluated_test_is_judged_as_libtest_judges_it() {
     use test::{Ran, judged};
     let expected = WithMessage("overflow".to_owned());
     assert_eq!(judged(Ran::Returned, &No), (Passed, String::new()));
-    assert_eq!(judged(Ran::Returned, &Yes), (Failed, "note: test did not panic as expected\n".to_owned()));
+    assert_eq!(
+        judged(Ran::Returned, &Yes),
+        (Failed, "note: test did not panic as expected\n".to_owned())
+    );
     assert_eq!(judged(Ran::Panicked("boom"), &No), (Failed, "boom\n".to_owned()));
     assert_eq!(judged(Ran::Panicked("boom"), &Yes), (Passed, String::new()));
-    assert_eq!(judged(Ran::Panicked("attempt to add with overflow"), &expected), (Passed, String::new()));
+    assert_eq!(
+        judged(Ran::Panicked("attempt to add with overflow"), &expected),
+        (Passed, String::new())
+    );
     assert_eq!(
         judged(Ran::Panicked("boom"), &expected),
         (
@@ -742,12 +960,18 @@ fn an_evaluated_test_is_judged_as_libtest_judges_it() {
     );
     let ub = Ran::Ub { report: "error: Undefined Behavior: out-of-bounds read", seed: 7 };
     for expects in [&No, &Yes, &expected] {
-        assert_eq!(judged(ub, expects), (Failed, "error: Undefined Behavior: out-of-bounds read\nseed: 7\n".to_owned()));
+        assert_eq!(
+            judged(ub, expects),
+            (Failed, "error: Undefined Behavior: out-of-bounds read\nseed: 7\n".to_owned())
+        );
         let (outcome, output) = judged(Ran::Unsupported("inline assembly"), expects);
         assert_eq!(outcome, Failed);
         assert!(output.ends_with("inline assembly\n"), "{output}");
         let stopped = Ran::Stopped { message: "stack overflow", seed: 3 };
-        assert_eq!(judged(stopped, expects), (Failed, "blaze's MIR evaluator stopped: stack overflow\nseed: 3\n".to_owned()));
+        assert_eq!(
+            judged(stopped, expects),
+            (Failed, "blaze's MIR evaluator stopped: stack overflow\nseed: 3\n".to_owned())
+        );
     }
 }
 
@@ -756,7 +980,10 @@ fn an_evaluated_test_is_judged_as_libtest_judges_it() {
 fn ub_settings_are_the_checkers_where_none_is_given() {
     let default = hir_ty_ub::Config::default();
     let none = test::ub_config(blaze_api::Ub { seed: None, schedules: None });
-    assert_eq!((none.seed, none.schedules, none.leaks), (default.seed, default.schedules, default.leaks));
+    assert_eq!(
+        (none.seed, none.schedules, none.leaks),
+        (default.seed, default.schedules, default.leaks)
+    );
     let given = test::ub_config(blaze_api::Ub { seed: Some(42), schedules: Some(8) });
     assert_eq!((given.seed, given.schedules), (42, 8));
 }
@@ -811,7 +1038,12 @@ fn a_pack_is_of_the_packages_binary_or_else_its_library() {
     };
     let units = with(vec![
         unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
-        unit(app, target("build-script-build", "custom-build", "/w/app/build.rs"), Mode::Build, &[]),
+        unit(
+            app,
+            target("build-script-build", "custom-build", "/w/app/build.rs"),
+            Mode::Build,
+            &[],
+        ),
         unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[0]),
         unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[2]),
     ]);
@@ -822,8 +1054,13 @@ fn a_pack_is_of_the_packages_binary_or_else_its_library() {
 
     let mut tested = unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[]);
     tested.checked_as_test = true;
-    let units = with(vec![tested, unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[])]);
-    assert_eq!(pack::program_unit(&units, "app").unwrap(), 1, "a binary checked as a test is no program");
+    let units =
+        with(vec![tested, unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[])]);
+    assert_eq!(
+        pack::program_unit(&units, "app").unwrap(),
+        1,
+        "a binary checked as a test is no program"
+    );
 
     let units = with(vec![
         unit(app, target("one", "bin", "/w/app/src/bin/one.rs"), Mode::Check, &[]),
@@ -842,13 +1079,24 @@ fn a_graph_with_a_unit_it_cant_place_is_refused() {
     let mut units = build(dir.path());
     units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[9]));
     units.plans.push(plan("-0004", &[]));
-    assert_eq!(graph::Graph::new(&units).err(), Some(UnitError::Dependency { unit: 4, dep: 9, count: 5 }));
+    assert_eq!(
+        graph::Graph::new(&units).err(),
+        Some(UnitError::Dependency { unit: 4, dep: 9, count: 5 })
+    );
 
     let mut units = build(dir.path());
-    units.graph.units.push(unit("path+file:///w/q#0.1.0", target("q", "lib", "/w/q/src/lib.rs"), Mode::Build, &[]));
+    units.graph.units.push(unit(
+        "path+file:///w/q#0.1.0",
+        target("q", "lib", "/w/q/src/lib.rs"),
+        Mode::Build,
+        &[],
+    ));
     units.plans.push(plan("-0004", &[]));
     let refused = graph::Graph::new(&units).err();
-    assert_eq!(refused, Some(UnitError::Package { unit: 4, pkg_id: "path+file:///w/q#0.1.0".to_owned() }));
+    assert_eq!(
+        refused,
+        Some(UnitError::Package { unit: 4, pkg_id: "path+file:///w/q#0.1.0".to_owned() })
+    );
 }
 
 /// What a build script's run is told is never guessed: an `OUT_DIR` under no `<profile>/build`,
@@ -868,7 +1116,10 @@ fn a_script_run_missing_what_cargo_tells_it_is_refused() {
     let z = units.packages.iter_mut().find(|it| it.id == Z).unwrap();
     z.manifest_path = "Cargo.toml".to_owned();
     let refused = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap_err();
-    assert!(refused.contains("the manifest of `z-sys`, `Cargo.toml`, is in no directory"), "{refused}");
+    assert!(
+        refused.contains("the manifest of `z-sys`, `Cargo.toml`, is in no directory"),
+        "{refused}"
+    );
 
     let mut units = build(dir.path());
     units.plans[0].outputs.clear();
@@ -886,7 +1137,8 @@ fn a_script_run_missing_what_cargo_tells_it_is_refused() {
 fn a_test_binarys_context_holds_the_native_inputs_it_linked() {
     let context = ContentId([1; 32]);
     assert_eq!(compile::with_natives(context, &[]), context);
-    let libz = |n: u8| ("/w/target/debug/build/z-sys-0001/out/libz.a".to_owned(), ContentId([n; 32]));
+    let libz =
+        |n: u8| ("/w/target/debug/build/z-sys-0001/out/libz.a".to_owned(), ContentId([n; 32]));
     let with = compile::with_natives(context, &[libz(2)]);
     assert_ne!(with, context);
     assert_eq!(with, compile::with_natives(context, &[libz(2)]));
@@ -897,8 +1149,14 @@ fn a_test_binarys_context_holds_the_native_inputs_it_linked() {
 /// graph, where every unit sits at another index, the key is the same, and std is built once.
 #[test]
 fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
-    let core = unit("core", target("core", "lib", "/rustc/0/library/core/src/lib.rs"), Mode::Build, &[]);
-    let mut alloc = unit("alloc", target("alloc", "lib", "/rustc/0/library/alloc/src/lib.rs"), Mode::Build, &[0]);
+    let core =
+        unit("core", target("core", "lib", "/rustc/0/library/core/src/lib.rs"), Mode::Build, &[]);
+    let mut alloc = unit(
+        "alloc",
+        target("alloc", "lib", "/rustc/0/library/alloc/src/lib.rs"),
+        Mode::Build,
+        &[0],
+    );
     alloc.is_std = true;
     let app = unit("app", target("app", "bin", "/w/src/main.rs"), Mode::Build, &[]);
     let first = [core.clone(), alloc.clone()];
@@ -912,7 +1170,11 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
     assert_eq!(bytes(&first, &first[1]), bytes(&second, &moved));
     let mut other = moved.clone();
     other.dependencies[0].index = 0;
-    assert_ne!(bytes(&first, &first[1]), bytes(&second, &other), "a dependency on another unit is another key");
+    assert_ne!(
+        bytes(&first, &first[1]),
+        bytes(&second, &other),
+        "a dependency on another unit is another key"
+    );
 }
 
 /// A build script's compile is one program under every goal, so `blaze check` and `blaze
@@ -922,7 +1184,8 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
 fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
     use crate::serve::work::Goal;
     let goals = [Goal::Check, Goal::Build, Goal::Test, Goal::Run];
-    let script = unit("p", target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
+    let script =
+        unit("p", target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
     let keyed: Vec<u8> = goals.iter().map(|goal| compile::keyed_goal(*goal, &script)).collect();
     assert!(keyed.iter().all(|it| *it == keyed[0]), "{keyed:?}");
     let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
@@ -956,8 +1219,11 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         ("Cargo.toml", b"[package]\nname = \"m\"\n\n[lib]\nproc-macro = true\n"),
         ("src/lib.rs", MACROS),
     ]);
-    let (core, proc_macro, m) =
-        ("path+file:///rustc/abc/library/core#0.0.0", "path+file:///rustc/abc/library/proc_macro#0.0.0", "path+file:///w#0.1.0");
+    let (core, proc_macro, m) = (
+        "path+file:///rustc/abc/library/core#0.0.0",
+        "path+file:///rustc/abc/library/proc_macro#0.0.0",
+        "path+file:///w#0.1.0",
+    );
     let std_dep = |index: usize, name: &str| UnitDep {
         index,
         extern_crate_name: name.to_owned(),
@@ -967,7 +1233,11 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         dev: false,
     };
     let made = |pkg: &str, target: Target, is_std: bool, dependencies: Vec<UnitDep>| Unit {
-        profile: Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() },
+        profile: Profile {
+            incremental: true,
+            strip: Strip::Resolved(Stripped::None),
+            ..Profile::dev()
+        },
         is_std,
         dependencies,
         ..unit(pkg, target, Mode::Build, &[])
@@ -979,8 +1249,18 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         graph: UnitGraph {
             version: 1,
             units: vec![
-                made(core, target("core", "lib", "/rustc/abc/library/core/src/lib.rs"), true, Vec::new()),
-                made(proc_macro, target("proc_macro", "lib", "/rustc/abc/library/proc_macro/src/lib.rs"), true, vec![std_dep(0, "core")]),
+                made(
+                    core,
+                    target("core", "lib", "/rustc/abc/library/core/src/lib.rs"),
+                    true,
+                    Vec::new(),
+                ),
+                made(
+                    proc_macro,
+                    target("proc_macro", "lib", "/rustc/abc/library/proc_macro/src/lib.rs"),
+                    true,
+                    vec![std_dep(0, "core")],
+                ),
                 made(m, macro_target, false, vec![std_dep(0, "core"), std_dep(1, "proc_macro")]),
             ],
             roots: vec![2],
@@ -988,7 +1268,10 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         plans: vec![plan("", &[]), plan("", &[]), plan("", &[])],
         packages: vec![
             PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") },
-            PackagePlan { is_member: false, ..package(proc_macro, "proc_macro", "/rustc/abc/library/proc_macro") },
+            PackagePlan {
+                is_member: false,
+                ..package(proc_macro, "proc_macro", "/rustc/abc/library/proc_macro")
+            },
             package(m, "m", "/w"),
         ],
         lock: None,
@@ -1010,7 +1293,11 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
             files: Vec::new(),
         },
         mounts: vec![
-            Mount { at: "/rustc/abc/library".to_owned(), origin: Origin::Root(library), under: String::new() },
+            Mount {
+                at: "/rustc/abc/library".to_owned(),
+                origin: Origin::Root(library),
+                under: String::new(),
+            },
             Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
         ],
         host: HOST.to_owned(),
@@ -1019,7 +1306,14 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
     };
-    blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
+    blaze_lower::lower(blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &tree,
+        root: view,
+        host_cpu: None,
+    })
+    .unwrap()
 }
 
 /// A host-built proc macro's lib builds no code: its expanders run its MIR and find its macros
@@ -1052,7 +1346,8 @@ fn a_proc_macros_root_is_its_file_on_disk_and_its_def_map_has_its_macros() {
 #[test]
 fn a_check_links_its_build_scripts_and_checks_the_rest() {
     use crate::serve::work::Goal;
-    let script = unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
+    let script =
+        unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Check, &[]);
     let bin = unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
     assert!(!super::checks_only(Goal::Check, &script));
@@ -1090,9 +1385,20 @@ fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
     let record = compile::crate_record(&unit(P, macros, Mode::Build, &[]), None, &[]);
     let path = "/t/wasm32-wasip1+macros/debug/build/m/0/out/m-0.wasm";
     let error = compile::module_at(path, record).unwrap_err();
-    assert_eq!(error, compile::ModuleError::NotAModule { path: path.to_owned(), found: compile::FileKind::Archive });
+    assert_eq!(
+        error,
+        compile::ModuleError::NotAModule {
+            path: path.to_owned(),
+            found: compile::FileKind::Archive
+        }
+    );
     let said = error.to_string();
-    assert!(said.contains(path) && said.contains("an `ar` archive") && said.contains("a linked wasm32-wasip1 module"), "{said}");
+    assert!(
+        said.contains(path)
+            && said.contains("an `ar` archive")
+            && said.contains("a linked wasm32-wasip1 module"),
+        "{said}"
+    );
     let module = b"\0asm\x01\0\0\0".to_vec();
     assert_eq!(compile::module_at(path, module.clone()), Ok(module));
 }
@@ -1119,19 +1425,30 @@ fn a_front_end_whose_drop_panics_fails_its_holder_not_the_loop() {
 /// package, its version and the target, so the profile tells each script apart.
 #[test]
 fn a_units_phase_spans_name_its_package_version_and_target() {
-    let script = |pkg: &str| unit(pkg, target("build-script-build", "custom-build", "build.rs"), Mode::Build, &[]);
+    let script = |pkg: &str| {
+        unit(pkg, target("build-script-build", "custom-build", "build.rs"), Mode::Build, &[])
+    };
     let serde = script("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.219");
     let libc = script("registry+https://github.com/rust-lang/crates.io-index#libc@0.2.170");
     assert_eq!(compile::span_unit(&serde), "serde v1.0.219 (build script)");
     assert_eq!(compile::span_unit(&libc), "libc v0.2.170 (build script)");
     let lib = target("blaze_api", "lib", "src/lib.rs");
     let api = "path+file:///w/crates/blaze-api#0.1.0";
-    assert_eq!(compile::span_unit(&unit(api, lib.clone(), Mode::Build, &[])), "blaze-api v0.1.0 (lib)");
+    assert_eq!(
+        compile::span_unit(&unit(api, lib.clone(), Mode::Build, &[])),
+        "blaze-api v0.1.0 (lib)"
+    );
     assert_eq!(compile::span_unit(&unit(api, lib, Mode::Test, &[])), "blaze-api v0.1.0 (lib test)");
     let bin = target("blaze", "bin", "src/main.rs");
-    assert_eq!(compile::span_unit(&unit(api, bin, Mode::Build, &[])), "blaze-api v0.1.0 (bin \"blaze\")");
+    assert_eq!(
+        compile::span_unit(&unit(api, bin, Mode::Build, &[])),
+        "blaze-api v0.1.0 (bin \"blaze\")"
+    );
     let tests = target("e2e", "test", "tests/e2e.rs");
-    assert_eq!(compile::span_unit(&unit(api, tests, Mode::Test, &[])), "blaze-api v0.1.0 (test \"e2e\")");
+    assert_eq!(
+        compile::span_unit(&unit(api, tests, Mode::Test, &[])),
+        "blaze-api v0.1.0 (test \"e2e\")"
+    );
 }
 
 /// A library's doctests are named as cargo names the unit, and each example's program and
@@ -1161,14 +1478,22 @@ fn main() { let _ = option_env!(\"FOO\"); let _ = 1; }\n";
 /// process with the variables `env`: lowered over files in memory, its crate resolved so the
 /// `env!` log has what it read, and its record's base key worked out as `compile` works it out,
 /// with what its code read.
-fn script_run(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaze_cas::Key, super::reads::Reads) {
+fn script_run(
+    text: &'static [u8],
+    on_core: bool,
+    env: &[(&str, &str)],
+) -> (blaze_cas::Key, super::reads::Reads) {
     let (lowered, base) = script_lowered(text, on_core, env);
     let krate = lowered.krate(1).unwrap();
     (base, super::reads::Reads::of(lowered.db(), krate).unwrap())
 }
 
 /// [`script_run`]'s front end, its crate resolved, and the record's base key.
-fn script_lowered(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaze_lower::Lowered, blaze_cas::Key) {
+fn script_lowered(
+    text: &'static [u8],
+    on_core: bool,
+    env: &[(&str, &str)],
+) -> (blaze_lower::Lowered, blaze_cas::Key) {
     let front = script_front(text, on_core, env);
     (front.lowered, front.base)
 }
@@ -1200,32 +1525,68 @@ fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> Scr
 
 /// [`script_front`] of a request that asks for the script's package (`primary`) or only for
 /// `core`, so the script is not of a primary package.
-fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], primary: bool) -> ScriptFront {
+fn script_front_for(
+    text: &'static [u8],
+    on_core: bool,
+    env: &[(&str, &str)],
+    primary: bool,
+) -> ScriptFront {
     use blaze_units::{
         query::{BuildConfig, Command, Invocation, Mount, Origin},
         schema::{Strip, Stripped},
     };
     let tree = blaze_query::MemTree::default();
-    let library = tree.root(&[("core/Cargo.toml", b"[package]\nname = \"core\"\n"), ("core/src/lib.rs", b"pub mod marker {}\n")]);
-    let view = tree.root(&[("Cargo.toml", b"[package]\nname = \"s\"\nbuild = \"build.rs\"\n"), ("build.rs", text)]);
+    let library = tree.root(&[
+        ("core/Cargo.toml", b"[package]\nname = \"core\"\n"),
+        ("core/src/lib.rs", b"pub mod marker {}\n"),
+    ]);
+    let view = tree.root(&[
+        ("Cargo.toml", b"[package]\nname = \"s\"\nbuild = \"build.rs\"\n"),
+        ("build.rs", text),
+    ]);
     let (core, s) = ("path+file:///rustc/abc/library/core#0.0.0", "path+file:///w#0.1.0");
     let resolved = |mut it: Unit| {
-        it.profile = Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() };
+        it.profile =
+            Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() };
         it
     };
-    let mut core_unit = resolved(unit(core, target("core", "lib", "/rustc/abc/library/core/src/lib.rs"), Mode::Build, &[]));
+    let mut core_unit = resolved(unit(
+        core,
+        target("core", "lib", "/rustc/abc/library/core/src/lib.rs"),
+        Mode::Build,
+        &[],
+    ));
     core_unit.is_std = true;
-    let mut script = resolved(unit(s, target("build-script-build", "custom-build", "/w/build.rs"), Mode::Build, &[]));
+    let mut script = resolved(unit(
+        s,
+        target("build-script-build", "custom-build", "/w/build.rs"),
+        Mode::Build,
+        &[],
+    ));
     script.dependencies = match on_core {
-        true => vec![UnitDep { index: 0, extern_crate_name: "core".to_owned(), public: None, noprelude: Some(true), nounused: None, dev: false }],
+        true => vec![UnitDep {
+            index: 0,
+            extern_crate_name: "core".to_owned(),
+            public: None,
+            noprelude: Some(true),
+            nounused: None,
+            dev: false,
+        }],
         false => Vec::new(),
     };
     let mut script_plan = plan("", &[]);
     script_plan.env = vec![("CARGO_MANIFEST_PATH".to_owned(), "/w/Cargo.toml".to_owned())];
     let units = Units {
-        graph: UnitGraph { version: 1, units: vec![core_unit, script], roots: vec![if primary { 1 } else { 0 }] },
+        graph: UnitGraph {
+            version: 1,
+            units: vec![core_unit, script],
+            roots: vec![if primary { 1 } else { 0 }],
+        },
         plans: vec![plan("", &[]), script_plan],
-        packages: vec![PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") }, package(s, "s", "/w")],
+        packages: vec![
+            PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") },
+            package(s, "s", "/w"),
+        ],
         lock: None,
         warnings: Vec::new(),
         target_dir: "/w/target".to_owned(),
@@ -1245,7 +1606,11 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
             files: Vec::new(),
         },
         mounts: vec![
-            Mount { at: "/rustc/abc/library".to_owned(), origin: Origin::Root(library), under: String::new() },
+            Mount {
+                at: "/rustc/abc/library".to_owned(),
+                origin: Origin::Root(library),
+                under: String::new(),
+            },
             Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
         ],
         host: HOST.to_owned(),
@@ -1254,7 +1619,13 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
     };
-    let lower = blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
+    let lower = blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &tree,
+        root: view,
+        host_cpu: None,
+    };
     let mut lowered = blaze_lower::lower(lower).unwrap();
     let identity = lowered.identity(1).unwrap();
     let krate = lowered.krate(1).unwrap();
@@ -1288,12 +1659,20 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
 /// compare.
 fn one_maker() -> crate::serve::RecordMakers {
     let id = |what: &[u8]| ContentId::of("blaze v2 cargo test record makers", what);
-    crate::serve::RecordMakers { front_end: id(b"front end"), codegen: id(b"code generator"), record: id(b"record") }
+    crate::serve::RecordMakers {
+        front_end: id(b"front end"),
+        codegen: id(b"code generator"),
+        record: id(b"record"),
+    }
 }
 
 /// The key of the record of `base` that `store` has for the variables `env`, as
 /// `compile::fresh` looks.
-fn look(store: &super::reads::tests::Store, base: blaze_cas::Key, env: &[(&str, &str)]) -> Option<blaze_cas::Key> {
+fn look(
+    store: &super::reads::tests::Store,
+    base: blaze_cas::Key,
+    env: &[(&str, &str)],
+) -> Option<blaze_cas::Key> {
     store.find(base, &super::reads::tests::env(env)).map(|it| it.key)
 }
 
@@ -1312,7 +1691,9 @@ fn primary_package_keys_only_a_record_whose_code_read_it() {
     let env = [("FOO", "on")];
     let vars = super::reads::tests::env(&env);
     let front = |text, primary| script_front_for(text, true, &env, primary);
-    let reads = |front: &ScriptFront| super::reads::Reads::of(front.lowered.db(), front.lowered.krate(1).unwrap()).unwrap();
+    let reads = |front: &ScriptFront| {
+        super::reads::Reads::of(front.lowered.db(), front.lowered.krate(1).unwrap()).unwrap()
+    };
     let mut store = super::reads::tests::Store::default();
 
     let (asked, other) = (front(SCRIPT, true), front(SCRIPT, false));
@@ -1320,19 +1701,30 @@ fn primary_package_keys_only_a_record_whose_code_read_it() {
     assert_eq!(asked.base, other.base, "a crate that never read it: its key holds no primary-ness");
     assert_eq!(reads(&asked), super::reads::Reads::named(&["FOO"]));
     assert_eq!(reads(&other), reads(&asked));
-    let filed = store.keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
+    let filed = store
+        .keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
     let found = store.find_for(other.base, &vars, &|it| other.units.is_primary_manifest(it));
     assert_eq!(found.map(|it| it.key), Some(filed), "built as primary, found as not");
 
     let (asked, other) = (front(PRIMARY_SCRIPT, true), front(PRIMARY_SCRIPT, false));
-    assert_eq!(asked.base, other.base, "a crate that read it: its base key holds no primary-ness either");
+    assert_eq!(
+        asked.base, other.base,
+        "a crate that read it: its base key holds no primary-ness either"
+    );
     assert_eq!(reads(&asked), super::reads::Reads::primary("/w/Cargo.toml"), "it is filed by it");
     assert_eq!(reads(&other), reads(&asked));
-    let filed = store.keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
-    assert_eq!(store.find_for(asked.base, &vars, &|it| asked.units.is_primary_manifest(it)).map(|it| it.key), Some(filed));
+    let filed = store
+        .keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
+    assert_eq!(
+        store
+            .find_for(asked.base, &vars, &|it| asked.units.is_primary_manifest(it))
+            .map(|it| it.key),
+        Some(filed)
+    );
     let found = store.find_for(other.base, &vars, &|it| other.units.is_primary_manifest(it));
     assert_eq!(found, None, "made as primary, its package no longer primary: a miss");
-    let not = store.keep_for(other.base, &reads(&other), &vars, &|it| other.units.is_primary_manifest(it));
+    let not = store
+        .keep_for(other.base, &reads(&other), &vars, &|it| other.units.is_primary_manifest(it));
     assert_ne!(not, filed, "two values, two records");
 }
 
@@ -1362,12 +1754,20 @@ fn build_script_compile_is_reused_across_runs() {
         ("TERM_SESSION_ID", "w0t0p0"),
     ];
     let (base, read) = script_run(SCRIPT, true, &first);
-    assert_eq!(read, super::reads::Reads::named(&["FOO"]), "the script read `FOO` and nothing else of the process");
+    assert_eq!(
+        read,
+        super::reads::Reads::named(&["FOO"]),
+        "the script read `FOO` and nothing else of the process"
+    );
     let mut store = super::reads::tests::Store::default();
     let filed = store.keep(base, &read, &super::reads::tests::env(&first));
     let (again, read_again) = script_run(SCRIPT, true, &second);
     assert_eq!(again, base, "a variable no crate read is not in the record's key");
-    assert_eq!(look(&store, again, &second), Some(filed), "the second run's compile is a store hit");
+    assert_eq!(
+        look(&store, again, &second),
+        Some(filed),
+        "the second run's compile is a store hit"
+    );
     let slots = store.0.len();
     assert_eq!(store.keep(again, &read_again, &super::reads::tests::env(&second)), filed);
     assert_eq!(store.0.len(), slots, "the second run files nothing new");
@@ -1381,13 +1781,18 @@ fn a_real_input_of_a_build_script_makes_its_record_miss() {
     let (base, read) = script_run(SCRIPT, true, &run);
     let mut store = super::reads::tests::Store::default();
     let filed = store.keep(base, &read, &super::reads::tests::env(&run));
-    let other_value: &[(&str, &str)] = &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let other_value: &[(&str, &str)] =
+        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
     let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
     for env in [other_value, unset] {
         let (again, read_again) = script_run(SCRIPT, true, env);
         assert_eq!(again, base, "{env:?}: the base key holds no variable's value");
         assert_eq!(look(&store, again, env), None, "{env:?}: a variable the script read changed");
-        let elsewhere = super::reads::tests::Store::default().keep(again, &read_again, &super::reads::tests::env(env));
+        let elsewhere = super::reads::tests::Store::default().keep(
+            again,
+            &read_again,
+            &super::reads::tests::env(env),
+        );
         assert_ne!(elsewhere, filed, "{env:?}");
     }
     let (edited, _) = script_run(SCRIPT_EDITED, true, &run);
@@ -1406,7 +1811,13 @@ fn a_real_input_of_a_build_script_makes_its_record_miss() {
 /// no-op rebuild lower everything again: 86 s in place of about 1 s.
 #[test]
 fn a_kept_front_end_outlives_a_variable_no_crate_read() {
-    let first = [("FOO", "on"), ("SHLVL", "1"), ("OLDPWD", "/w"), ("TERM_SESSION_ID", "w0t0p0"), ("INVOCATION_ID", "5e1f")];
+    let first = [
+        ("FOO", "on"),
+        ("SHLVL", "1"),
+        ("OLDPWD", "/w"),
+        ("TERM_SESSION_ID", "w0t0p0"),
+        ("INVOCATION_ID", "5e1f"),
+    ];
     let second = [
         ("CC", "clang"),
         ("FOO", "on"),
@@ -1418,14 +1829,32 @@ fn a_kept_front_end_outlives_a_variable_no_crate_read() {
     ];
     let mut front = script_front(SCRIPT, true, &first);
     let now = front.config_with(&second);
-    assert_eq!(blaze_lower::config_differs(&front.config, &now), None, "the environment is not compared whole");
+    assert_eq!(
+        blaze_lower::config_differs(&front.config, &now),
+        None,
+        "the environment is not compared whole"
+    );
     let read = blaze_units::query::EnvReads::default();
-    assert_eq!(super::env_moved(&front.lowered, &read, &now.invocation.env), None, "no crate read what moved");
+    assert_eq!(
+        super::env_moved(&front.lowered, &read, &now.invocation.env),
+        None,
+        "no crate read what moved"
+    );
     let krate = front.lowered.krate(1).unwrap();
-    let lower = blaze_lower::Lower { units: &front.units, config: &now, files: &front.tree, root: front.view, host_cpu: None };
+    let lower = blaze_lower::Lower {
+        units: &front.units,
+        config: &now,
+        files: &front.tree,
+        root: front.view,
+        host_cpu: None,
+    };
     assert_eq!(front.lowered.refresh(lower, |_| Ok(())), Ok(true));
     let db = front.lowered.db();
-    assert_eq!(base_db::process_env_var(db, "SHLVL").as_deref(), Some("3"), "the build reads the request's values");
+    assert_eq!(
+        base_db::process_env_var(db, "SHLVL").as_deref(),
+        Some("3"),
+        "the build reads the request's values"
+    );
     assert_eq!(super::reads::Reads::of(db, krate).unwrap(), super::reads::Reads::named(&["FOO"]));
 }
 
@@ -1443,18 +1872,28 @@ fn a_variable_a_crate_read_lets_the_kept_front_end_go_by_name() {
     for changed in [other, unset] {
         let now = front.config_with(changed);
         assert_eq!(blaze_lower::config_differs(&front.config, &now), None, "{changed:?}");
-        let moved = super::env_moved(&front.lowered, &read, &now.invocation.env).expect("`FOO` was read");
+        let moved =
+            super::env_moved(&front.lowered, &read, &now.invocation.env).expect("`FOO` was read");
         assert_eq!(moved.name, "FOO", "{changed:?}");
-        assert!(moved.by.contains("option_env!") && moved.by.contains("build-script-build"), "{}", moved.by);
+        assert!(
+            moved.by.contains("option_env!") && moved.by.contains("build-script-build"),
+            "{}",
+            moved.by
+        );
         let said = format!("{moved} {moved:?}");
         assert!(!said.contains("value-before") && !said.contains("value-after"), "{said}");
     }
     let mut read = blaze_units::query::EnvReads::default();
     let env = super::reads::tests::env(&first);
     read.var(&env, "BLAZE_ITEM_STORE", "the item store's mode").unwrap();
-    let now = front.config_with(&[("BLAZE_ITEM_STORE", "off"), ("FOO", "value-before"), ("SHLVL", "2")]);
-    let moved = super::env_moved(&front.lowered, &read, &now.invocation.env).expect("the item store's mode moved");
-    assert_eq!((moved.name.as_str(), moved.by.as_str()), ("BLAZE_ITEM_STORE", "the item store's mode"));
+    let now =
+        front.config_with(&[("BLAZE_ITEM_STORE", "off"), ("FOO", "value-before"), ("SHLVL", "2")]);
+    let moved = super::env_moved(&front.lowered, &read, &now.invocation.env)
+        .expect("the item store's mode moved");
+    assert_eq!(
+        (moved.name.as_str(), moved.by.as_str()),
+        ("BLAZE_ITEM_STORE", "the item store's mode")
+    );
 }
 
 /// Where `d`'s build script's run (unit 1) writes, as cargo names it.
@@ -1481,8 +1920,18 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         graph: UnitGraph {
             version: 1,
             units: vec![
-                unit(D, target("build-script-build", "custom-build", "/r/d/build.rs"), Mode::Build, &[]),
-                unit(D, target("build-script-build", "custom-build", "/r/d/build.rs"), Mode::RunCustomBuild, &[0]),
+                unit(
+                    D,
+                    target("build-script-build", "custom-build", "/r/d/build.rs"),
+                    Mode::Build,
+                    &[],
+                ),
+                unit(
+                    D,
+                    target("build-script-build", "custom-build", "/r/d/build.rs"),
+                    Mode::RunCustomBuild,
+                    &[0],
+                ),
                 unit(D, target("d", "lib", "/r/d/src/lib.rs"), Mode::Build, &[1]),
             ],
             roots: vec![2],
@@ -1525,7 +1974,14 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
     };
-    blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
+    blaze_lower::lower(blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &tree,
+        root: view,
+        host_cpu: None,
+    })
+    .unwrap()
 }
 
 /// A package of a front lowered over files in memory ([`front_of`]): its name, whether it is at
@@ -1550,9 +2006,12 @@ struct MemFront {
 fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
     use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
     let tree = blaze_query::MemTree::default();
-    let paths: Vec<(String, String)> =
-        pkgs.iter().map(|it| (format!("{}/Cargo.toml", it.name), format!("{}/src/lib.rs", it.name))).collect();
-    let manifests: Vec<String> = pkgs.iter().map(|it| format!("[package]\nname = \"{}\"\n", it.name)).collect();
+    let paths: Vec<(String, String)> = pkgs
+        .iter()
+        .map(|it| (format!("{}/Cargo.toml", it.name), format!("{}/src/lib.rs", it.name)))
+        .collect();
+    let manifests: Vec<String> =
+        pkgs.iter().map(|it| format!("[package]\nname = \"{}\"\n", it.name)).collect();
     let mut files: Vec<(&str, &[u8])> = Vec::new();
     for ((pkg, (manifest_at, lib_at)), manifest) in pkgs.iter().zip(&paths).zip(&manifests) {
         files.push((manifest_at.as_str(), manifest.as_bytes()));
@@ -1562,12 +2021,19 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
     let view = tree.root(&[]);
     let id = |pkg: &MemPkg<'_>| match pkg.path {
         true => format!("path+file:///r/{}#0.1.0", pkg.name),
-        false => format!("registry+https://github.com/rust-lang/crates.io-index#{}@0.1.0", pkg.name),
+        false => {
+            format!("registry+https://github.com/rust-lang/crates.io-index#{}@0.1.0", pkg.name)
+        }
     };
     let units: Vec<Unit> = pkgs
         .iter()
         .map(|pkg| {
-            let mut u = unit(&id(pkg), target(pkg.name, "lib", &format!("/r/{}/src/lib.rs", pkg.name)), Mode::Build, &[]);
+            let mut u = unit(
+                &id(pkg),
+                target(pkg.name, "lib", &format!("/r/{}/src/lib.rs", pkg.name)),
+                Mode::Build,
+                &[],
+            );
             u.dependencies = pkg
                 .deps
                 .iter()
@@ -1583,7 +2049,9 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
             u
         })
         .collect();
-    let roots = (0..pkgs.len()).filter(|at| !pkgs.iter().any(|it| it.deps.iter().any(|dep| dep.0 == *at))).collect();
+    let roots = (0..pkgs.len())
+        .filter(|at| !pkgs.iter().any(|it| it.deps.iter().any(|dep| dep.0 == *at)))
+        .collect();
     let packages: Vec<PackagePlan> = pkgs
         .iter()
         .map(|pkg| PackagePlan {
@@ -1597,7 +2065,13 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         .collect();
     for (pkg, plan) in pkgs.iter().zip(&packages) {
         let reached = compile::capped(false, plan.is_member, plan.source.as_deref());
-        assert_eq!(reached, !pkg.path, "{} is {}", pkg.name, if pkg.path { "checked whole" } else { "reached only" });
+        assert_eq!(
+            reached,
+            !pkg.path,
+            "{} is {}",
+            pkg.name,
+            if pkg.path { "checked whole" } else { "reached only" }
+        );
     }
     let units = Units {
         graph: UnitGraph { version: 1, units, roots },
@@ -1631,19 +2105,30 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
     };
-    let lowered =
-        blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap();
+    let lowered = blaze_lower::lower(blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &tree,
+        root: view,
+        host_cpu: None,
+    })
+    .unwrap();
     MemFront { lowered, units }
 }
 
 /// What a reached-only build runs of unit `unit`'s crate: whether its graph has a sealed trait,
 /// and [`compile::reached_only_diags`].
-fn sealed_diags(lowered: &blaze_lower::Lowered, unit: usize) -> (bool, Vec<blaze_diagnostics::Diag>) {
+fn sealed_diags(
+    lowered: &blaze_lower::Lowered,
+    unit: usize,
+) -> (bool, Vec<blaze_diagnostics::Diag>) {
     let db = lowered.db();
     let krate = lowered.krate(unit).unwrap();
     let files = blaze_diagnostics::Files::new(lowered.paths(), "/");
     let in_graph = blaze_query::db::attach(db, || hir_ty::sealed_in_graph(db, krate));
-    let diags = compile::reached_only_diags(db, krate, files, || Ok(blaze_diagnostics::Options::default())).unwrap();
+    let diags =
+        compile::reached_only_diags(db, krate, files, || Ok(blaze_diagnostics::Options::default()))
+            .unwrap();
     (in_graph, diags)
 }
 
@@ -1681,7 +2166,8 @@ fn a_reached_only_crate_that_implements_a_trait_sealed_upstream_is_refused() {
 
     let (in_graph, d) = diags(1);
     assert!(in_graph, "`d` depends on `l`, which seals `S`");
-    let errors: Vec<&str> = d.iter().filter(|it| it.is_error()).map(|it| it.message.as_str()).collect();
+    let errors: Vec<&str> =
+        d.iter().filter(|it| it.is_error()).map(|it| it.message.as_str()).collect();
     assert!(
         errors.iter().any(|it| it.contains("impl S for DT")
             && it.contains("`S`")
@@ -1690,7 +2176,9 @@ fn a_reached_only_crate_that_implements_a_trait_sealed_upstream_is_refused() {
         "{d:#?}"
     );
     assert!(
-        errors.iter().any(|it| it.contains("`DSub`") && it.contains("DSub: LSub: S") && it.contains("rule: sealed-supertrait-elsewhere")),
+        errors.iter().any(|it| it.contains("`DSub`")
+            && it.contains("DSub: LSub: S")
+            && it.contains("rule: sealed-supertrait-elsewhere")),
         "{d:#?}"
     );
 
@@ -1717,13 +2205,19 @@ const BAD_EXPANSION: &str = "macro_rules! m { (a) => { 1 }; }\npub fn fine() -> 
 fn a_dependency_whose_macro_call_fails_to_expand_fails_its_own_unit_naming_the_call() {
     let front = front_of(&[
         MemPkg { name: "bad", path: false, lib: BAD_EXPANSION, deps: &[] },
-        MemPkg { name: "user", path: false, lib: "pub fn two() -> i32 { dep::fine() + 1 }\n", deps: &[(0, "dep")] },
+        MemPkg {
+            name: "user",
+            path: false,
+            lib: "pub fn two() -> i32 { dep::fine() + 1 }\n",
+            deps: &[(0, "dep")],
+        },
     ]);
     let (_, bad) = sealed_diags(&front.lowered, 0);
     let shown: Vec<&blaze_diagnostics::Diag> =
         bad.iter().filter(|it| it.is_error() && !compile::cargo_hides(&it.message)).collect();
     let [error] = shown[..] else { panic!("one error of `bad`'s own, its unit failed: {bad:#?}") };
-    let at = error.span.primary.first().unwrap_or_else(|| panic!("the error is placed: {error:#?}"));
+    let at =
+        error.span.primary.first().unwrap_or_else(|| panic!("the error is placed: {error:#?}"));
     assert!(at.file.ends_with("bad/src/lib.rs"), "{error:#?}");
     let line = BAD_EXPANSION[..at.lo as usize].matches('\n').count() + 1;
     assert_eq!(line, 3, "on the line of the call: {error:#?}");
@@ -1746,7 +2240,9 @@ const ORPHAN_UP: &str = "#![feature(fundamental)]\npub trait Conv { type Out; }\
 /// `l`'s source, sealing `S` (with `sealed`) and relaxing the orphan rule for `up::Conv` on it.
 fn orphan_l(sealed: bool) -> String {
     let attr = if sealed { "#[blaze::sealed]\n" } else { "" };
-    format!("{attr}pub trait S {{}}\npub struct A;\nimpl S for A {{}}\nimpl<T: S> up::Conv for T {{ type Out = u64; }}\n")
+    format!(
+        "{attr}pub trait S {{}}\npub struct A;\nimpl S for A {{}}\nimpl<T: S> up::Conv for T {{ type Out = u64; }}\n"
+    )
 }
 
 /// R3-C1's graph: `up` (unit 0, registry) has `Conv`; `l` (unit 1, a path package, so checked
@@ -1830,7 +2326,13 @@ fn a_reached_only_crate_that_seals_keeps_its_relaxed_impl_in_its_sealed_graph() 
     ]);
     let (in_graph, l) = sealed_diags(&front.lowered, 1);
     assert!(in_graph, "`l` seals `S` itself");
-    assert!(!l.iter().any(|it| matches!(it.code.as_ref().and_then(|it| it.error()), Some("E0210" | "E0117"))), "{l:#?}");
+    assert!(
+        !l.iter().any(|it| matches!(
+            it.code.as_ref().and_then(|it| it.error()),
+            Some("E0210" | "E0117")
+        )),
+        "{l:#?}"
+    );
 }
 
 /// Rule 18 for what makes a record: the front end's, the code generator's and the record's code
@@ -1913,26 +2415,47 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
 
     let (in_graph, before) = sealed_diags(&open.lowered, 2);
     assert!(!in_graph, "no crate of `d`'s graph seals a trait yet");
-    assert!(before.is_empty(), "a reached-only crate with no sealed graph runs no check: {before:#?}");
+    assert!(
+        before.is_empty(),
+        "a reached-only crate with no sealed graph runs no check: {before:#?}"
+    );
     let (in_graph, after) = sealed_diags(&sealed.lowered, 2);
     assert!(in_graph, "`l` seals `S` now");
-    assert!(after.iter().any(|it| it.is_error() && it.code.as_ref().and_then(|it| it.error()) == Some("E0117")), "{after:#?}");
+    assert!(
+        after
+            .iter()
+            .any(|it| it.is_error() && it.code.as_ref().and_then(|it| it.error()) == Some("E0117")),
+        "{after:#?}"
+    );
 
-    assert_ne!(key(&mut open, 2), key(&mut sealed, 2), "`d`'s record key moves when `l` gains `#[blaze::sealed]`");
+    assert_ne!(
+        key(&mut open, 2),
+        key(&mut sealed, 2),
+        "`d`'s record key moves when `l` gains `#[blaze::sealed]`"
+    );
     assert_eq!(key(&mut open, 0), key(&mut sealed, 0), "`up` depends on nothing that changed");
 }
 
 /// `d`'s build script's run, giving the cfgs `cfgs`.
 fn d_ran(cfgs: &[&str]) -> blaze_lower::Ran {
-    blaze_lower::Ran { cfgs: strings(cfgs), env: Vec::new(), out_dir: D_OUT.to_owned(), files: Vec::new() }
+    blaze_lower::Ran {
+        cfgs: strings(cfgs),
+        env: Vec::new(),
+        out_dir: D_OUT.to_owned(),
+        files: Vec::new(),
+    }
 }
 
 /// The value items of `krate`'s root, by name, sorted: what its dependents resolve in it.
 fn root_values(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> Vec<String> {
     let db = lowered.db();
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    let mut names: Vec<String> =
-        def_map.module(db, def_map.crate_root(db)).scope(db).values().map(|(name, _)| name.as_str().to_owned()).collect();
+    let mut names: Vec<String> = def_map
+        .module(db, def_map.crate_root(db))
+        .scope(db)
+        .values()
+        .map(|(name, _)| name.as_str().to_owned())
+        .collect();
     names.sort();
     names
 }
@@ -1953,7 +2476,9 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let macros = super::deps::tests::no_macros();
     let build = ContentId::of("blaze v2 cargo test build", b"a served dependency's script moves");
     let mode = hir_def::deps::Mode::Serve;
-    let mut keep = |lowered: &blaze_lower::Lowered, session: &mut super::deps::Session, served: hir_def::deps::Served| {
+    let mut keep = |lowered: &blaze_lower::Lowered,
+                    session: &mut super::deps::Session,
+                    served: hir_def::deps::Served| {
         let kept = super::deps::Kept { served, mode };
         let (puts, _) = super::deps::store(lowered, Some(&kept), session, &[], "/w").unwrap();
         for it in puts {
@@ -1966,7 +2491,9 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     first.ran(1, &d_ran(&[])).unwrap();
     let d = first.krate(2).unwrap();
     let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
-    let served = super::deps::images(&mut first, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    let served = super::deps::images(&mut first, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d` is keyed");
     assert_eq!(served.hits, Vec::new(), "a cold store");
     assert_eq!(root_values(&first, d), ["slow"]);
     keep(&first, &mut session, served);
@@ -1977,17 +2504,28 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     kept.ran(1, &d_ran(&[])).unwrap();
     let d = kept.krate(2).unwrap();
     let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
-    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d` is keyed");
     assert_eq!(served.hits, [d], "`d` is read from its image");
     assert_eq!(root_values(&kept, d), ["slow"]);
-    assert!(super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().is_none(), "no key moved");
+    assert!(
+        super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().is_none(),
+        "no key moved"
+    );
 
     // Its front end is kept for a build whose `CC` moved: the script's run gives `fast` now.
     kept.ran(1, &d_ran(&["fast"])).unwrap();
     let fast = cfg::CfgAtom::Flag(intern::Symbol::intern("fast"));
     assert!(d.cfg_options(kept.db()).check_atom(&fast), "the run's cfg is applied to `d`");
-    assert_eq!(root_values(&kept, d), ["slow"], "unserved, `d` resolves as its image of the old cfg has it");
-    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d`'s key moved");
+    assert_eq!(
+        root_values(&kept, d),
+        ["slow"],
+        "unserved, `d` resolves as its image of the old cfg has it"
+    );
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d`'s key moved");
     assert_eq!(served.hits, Vec::new(), "no image of `d` with `fast`");
     assert!(hir_def::deps::image_of(kept.db(), d).is_none(), "`d` lost the image of the old cfg");
     assert_eq!(root_values(&kept, d), ["fast"], "`d` resolves with the cfg its run gives now");
@@ -1996,7 +2534,9 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     // Either cfg again finds its own image.
     for (cfgs, values) in [(&[][..], ["slow"]), (&["fast"][..], ["fast"])] {
         kept.ran(1, &d_ran(cfgs)).unwrap();
-        let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d`'s key moved");
+        let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
+            .unwrap()
+            .expect("`d`'s key moved");
         assert_eq!(served.hits, [d], "{cfgs:?}");
         assert_eq!(root_values(&kept, d), values, "{cfgs:?}");
     }
@@ -2013,29 +2553,42 @@ fn a_serve_at_the_view_the_last_serve_left_walks_no_key_and_a_write_brings_the_w
     let store = super::deps::tests::opened(&mut sim);
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
-    let build = ContentId::of("blaze v2 cargo test build", b"a serve at the view the last one left");
+    let build =
+        ContentId::of("blaze v2 cargo test build", b"a serve at the view the last one left");
     let mode = hir_def::deps::Mode::Serve;
 
     let mut front = script_cfg_front();
     front.ran(1, &d_ran(&[])).unwrap();
     let d = front.krate(2).unwrap();
     let mut session = super::deps::session(&front, &reader, &macros, &[]).unwrap();
-    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(), "`d` is keyed");
+    assert!(
+        super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(),
+        "`d` is keyed"
+    );
     assert_eq!(session.walks(), 1);
     // As `deps::serve` ends once it served.
     super::deps::stamp(&front, build, &mut session);
-    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(), "no key moved");
+    assert!(
+        super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(),
+        "no key moved"
+    );
     assert_eq!(session.walks(), 1, "no write since the serve that keyed `d`: no walk");
 
     front.ran(1, &d_ran(&["fast"])).unwrap();
-    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(), "`d`'s key moved");
+    assert!(
+        super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(),
+        "`d`'s key moved"
+    );
     assert_eq!(session.walks(), 2, "a write: the walk runs again");
     super::deps::stamp(&front, build, &mut session);
 
     // Writes that leave every key as it was: walked once, then skipped at that view.
     front.ran(1, &d_ran(&["fast", "other"])).unwrap();
     front.ran(1, &d_ran(&["fast"])).unwrap();
-    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(), "the cfg is back");
+    assert!(
+        super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(),
+        "the cfg is back"
+    );
     assert_eq!(session.walks(), 3, "writes came between: walked once");
     assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none());
     assert_eq!(session.walks(), 3, "the walk that moved nothing stands at its view");
@@ -2070,7 +2623,8 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let mut store = super::deps::tests::opened(&mut sim);
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
-    let build = ContentId::of("blaze v2 cargo test build", b"a served dependency's OUT_DIR file moves");
+    let build =
+        ContentId::of("blaze v2 cargo test build", b"a served dependency's OUT_DIR file moves");
     let mode = hir_def::deps::Mode::Serve;
 
     // One daemon resolves `d` with its first `gen.rs`, and images it.
@@ -2078,7 +2632,9 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     first.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
     let d = first.krate(2).unwrap();
     let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
-    let served = super::deps::images(&mut first, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    let served = super::deps::images(&mut first, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d` is keyed");
     assert_eq!(root_values(&first, d), ["one"]);
     let kept = super::deps::Kept { served, mode };
     let (puts, _) = super::deps::store(&first, Some(&kept), &mut session, &[], "/w").unwrap();
@@ -2092,7 +2648,9 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     kept.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
     let d = kept.krate(2).unwrap();
     let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
-    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d` is keyed");
     assert_eq!(served.hits, [d], "`d` is read from its image");
     assert_eq!(root_values(&kept, d), ["one"]);
     super::deps::stamp(&kept, build, &mut session);
@@ -2103,7 +2661,10 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
         .unwrap()
         .expect("`d`'s key moved with its `OUT_DIR` file");
     assert_eq!(served.hits, Vec::new(), "no image of `d` with this `gen.rs`");
-    assert!(hir_def::deps::image_of(kept.db(), d).is_none(), "`d` lost the image of the old `gen.rs`");
+    assert!(
+        hir_def::deps::image_of(kept.db(), d).is_none(),
+        "`d` lost the image of the old `gen.rs`"
+    );
     assert_eq!(root_values(&kept, d), ["two"], "`d` resolves with the file its run left now");
 }
 
@@ -2121,14 +2682,20 @@ fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_chang
     let made: &[u8] = b"create table a (x int);";
     std::fs::write(&schema, made).unwrap();
     let hash = blaze_usercode::inputs::hash_reader(made).unwrap();
-    let traced = blaze_core::Traced { files: vec![(schema.clone(), Some(hash))], ..blaze_core::Traced::default() };
+    let traced = blaze_core::Traced {
+        files: vec![(schema.clone(), Some(hash))],
+        ..blaze_core::Traced::default()
+    };
     let shape = blaze_usercode::index::Shape::of(&traced).encode();
     // What the daemon's `proc_macro_api::kept::Keeping::reads_now` works out, with no variable passed.
     let now = |env: &base_db::Env, shape: &[u8]| proc_macro_api::kept::reads_in(&[], env, shape);
     let db = lowered.db();
     // As a crate served by its reads notes them (`hir_def::deps::filed::search`): the file's
     // names with the values they had. An expansion that runs notes the same under its call.
-    let read = base_db::ExpansionRead::Traced { shape: shape.as_slice().into(), values: now(krate.env(db), &shape).unwrap() };
+    let read = base_db::ExpansionRead::Traced {
+        shape: shape.as_slice().into(),
+        values: now(krate.env(db), &shape).unwrap(),
+    };
     let served = base_db::ReadBy::Served(ContentId::of("blaze v2 cargo test image", b"script"));
     db.files().expansions_are_read(krate, served, vec![read]);
     let read = super::reads::Reads::of(db, krate).unwrap();
@@ -2140,7 +2707,11 @@ fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_chang
     std::fs::write(&schema, b"create table a (x int, y int);").unwrap();
     assert_eq!(store.find_now(base, &env, now), None, "the file changed: the record misses");
     std::fs::write(&schema, made).unwrap();
-    assert_eq!(store.find_now(base, &env, now).map(|it| it.key), Some(filed), "the file as it was again");
+    assert_eq!(
+        store.find_now(base, &env, now).map(|it| it.key),
+        Some(filed),
+        "the file as it was again"
+    );
 }
 
 /// A span written in blaze-cargo with no target of its own has its module's path for one,
@@ -2177,8 +2748,12 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
     std::thread::spawn(|| tracing::warn!(steps = 3, "{MESSAGE}")).join().unwrap();
     let mut read = blaze_profile::flight::Read::default();
     blaze_profile::flight::window(std::time::Duration::from_secs(60), &mut read);
-    let batch = blaze_profile::batches::events(&read.events, blaze_profile::batches::Process::this()).unwrap();
-    let column = |name: &str| batch.column_by_name(name).unwrap_or_else(|| panic!("the events table has `{name}`"));
+    let batch =
+        blaze_profile::batches::events(&read.events, blaze_profile::batches::Process::this())
+            .unwrap();
+    let column = |name: &str| {
+        batch.column_by_name(name).unwrap_or_else(|| panic!("the events table has `{name}`"))
+    };
     let messages = column("message").as_string::<i32>();
     let rows: Vec<usize> = (0..batch.num_rows()).filter(|&row| messages.is_valid(row) && messages.value(row) == MESSAGE).collect();
     assert_eq!(rows.len(), 1, "the warn is one row of the events table, its message alone: {:?}", read.events);

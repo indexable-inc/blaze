@@ -69,11 +69,7 @@ pub(super) fn read_dir(path: &str) -> Result<Vec<String>, Error> {
     }
     let mut names = Vec::new();
     loop {
-        let len = data
-            .cFileName
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(data.cFileName.len());
+        let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
         if let Ok(name) = String::from_utf16(&data.cFileName[..len]) {
             if name != "." && name != ".." {
                 names.push(name);
@@ -258,13 +254,7 @@ pub(super) fn stderr_write(bytes: &[u8]) {
     unsafe {
         let handle = GetStdHandle(STD_ERROR_HANDLE);
         let mut n: u32 = 0;
-        WriteFile(
-            handle,
-            bytes.as_ptr(),
-            bytes.len() as u32,
-            &mut n,
-            core::ptr::null_mut(),
-        );
+        WriteFile(handle, bytes.as_ptr(), bytes.len() as u32, &mut n, core::ptr::null_mut());
     }
 }
 
@@ -288,11 +278,7 @@ pub(super) fn env_var(name: &str) -> Option<String> {
         if n == 0 {
             // SAFETY: no preconditions.
             let empty_but_set = unsafe { GetLastError() } == 0;
-            return if empty_but_set {
-                Some(String::new())
-            } else {
-                None
-            };
+            return if empty_but_set { Some(String::new()) } else { None };
         }
         if (n as usize) < buf.len() {
             return Some(String::from_utf16_lossy(&buf[..n as usize]));

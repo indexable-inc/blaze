@@ -15,7 +15,10 @@
 use hir::InFile;
 use syntax::{
     SyntaxKind, TextRange,
-    view::{self as ast, AstNode as _, HasGenericParams as _, HasName as _, HasTypeBounds as _, HasVisibility as _},
+    view::{
+        self as ast, AstNode as _, HasGenericParams as _, HasName as _, HasTypeBounds as _,
+        HasVisibility as _,
+    },
 };
 
 use super::{Ctxt, Out, V, const_token, ending_semi_or_hi, extend_while_whitespace, fns, unraw};
@@ -27,7 +30,8 @@ use crate::{
 };
 
 /// Where the items rustc's `extern` keyword page explains.
-const EXTERN_NOTE: &str = "for more information, visit https://doc.rust-lang.org/std/keyword.extern.html";
+const EXTERN_NOTE: &str =
+    "for more information, visit https://doc.rust-lang.org/std/keyword.extern.html";
 
 /// `VisibilityNotPermittedNote`: why a visibility is not permitted where it is.
 #[derive(Clone, Copy)]
@@ -46,17 +50,26 @@ impl VisNote {
             }
             VisNote::TraitImpl => "trait items always share the visibility of their trait",
             VisNote::IndividualImplItems => "place qualifiers on individual impl items instead",
-            VisNote::IndividualForeignItems => "place qualifiers on individual foreign items instead",
+            VisNote::IndividualForeignItems => {
+                "place qualifiers on individual foreign items instead"
+            }
         }
     }
 }
 
 /// E0449 `visibility_not_permitted` of `vis`, written on `node` or on what is in it.
-fn visibility(v: &V<'_, '_, '_>, node: ast::Node<'_>, vis: Option<ast::Visibility<'_>>, note: VisNote, out: &mut Out) {
+fn visibility(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    vis: Option<ast::Visibility<'_>>,
+    note: VisNote,
+    out: &mut Out,
+) {
     let Some(vis) = vis else { return };
     let span = v.span(vis.syntax().text_range());
     // clone: a span, on the error path
-    let mut diag = Diag::error(Some("E0449"), "visibility qualifiers are not permitted here", span.clone());
+    let mut diag =
+        Diag::error(Some("E0449"), "visibility qualifiers are not permitted here", span.clone());
     diag.note(note.text());
     diag.suggestion(span, "remove the qualifier", "", Applicability::MachineApplicable);
     v.emit(out, node, diag);
@@ -73,21 +86,39 @@ pub(super) fn no_mangle(v: &V<'_, '_, '_>, node: ast::Node<'_>, out: &mut Out) {
     if unraw(name.text()).is_ascii() || !v.has_attr(node, "no_mangle") {
         return;
     }
-    let diag = Diag::error(Some("E0754"), "`#[no_mangle]` requires ASCII identifier", v.span(head_range(node)));
+    let diag = Diag::error(
+        Some("E0754"),
+        "`#[no_mangle]` requires ASCII identifier",
+        v.span(head_range(node)),
+    );
     v.emit(out, node, diag);
 }
 
 /// `check_defaultness` with `default` not allowed: `ForbiddenDefault`.
-fn defaultness(v: &V<'_, '_, '_>, node: ast::Node<'_>, default: Option<ast::Token<'_>>, out: &mut Out) {
+fn defaultness(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    default: Option<ast::Token<'_>>,
+    out: &mut Out,
+) {
     let Some(default) = default else { return };
-    let mut diag =
-        Diag::error(None, "`default` is only allowed on items in trait impls", v.span(head_range(node)));
+    let mut diag = Diag::error(
+        None,
+        "`default` is only allowed on items in trait impls",
+        v.span(head_range(node)),
+    );
     diag.span_label(v.span(default.text_range()), "`default` because of this");
     v.emit(out, node, diag);
 }
 
 /// `check_type_no_bounds`: `BoundInContext` over the bounds of `list`.
-fn no_bounds(v: &V<'_, '_, '_>, node: ast::Node<'_>, list: Option<ast::TypeBoundList<'_>>, ctx: &str, out: &mut Out) {
+fn no_bounds(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    list: Option<ast::TypeBoundList<'_>>,
+    ctx: &str,
+    out: &mut Out,
+) {
     let Some(list) = list else { return };
     let mut bounds = list.bounds();
     let Some(first) = bounds.next() else { return };
@@ -95,12 +126,18 @@ fn no_bounds(v: &V<'_, '_, '_>, node: ast::Node<'_>, list: Option<ast::TypeBound
     let last = bounds.last().map_or(first, |it| it.syntax().text_range());
     let range = first.cover(last);
     // alloc: the error's message
-    let diag = Diag::error(None, format!("bounds on `type`s in {ctx} have no effect"), v.span(range));
+    let diag =
+        Diag::error(None, format!("bounds on `type`s in {ctx} have no effect"), v.span(range));
     v.emit(out, node, diag);
 }
 
 /// `check_item_safety` of an item outside an `extern` block: `safe` is `InvalidSafetyOnItem`.
-pub(super) fn safe_outside_extern(v: &V<'_, '_, '_>, node: ast::Node<'_>, safe: Option<ast::Token<'_>>, out: &mut Out) {
+pub(super) fn safe_outside_extern(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    safe: Option<ast::Token<'_>>,
+    out: &mut Out,
+) {
     if safe.is_none() {
         return;
     }
@@ -161,7 +198,8 @@ pub(super) fn fn_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out) 
             assoc(v, node, item.default_token(), &ctxt, out);
             if matches!(ctxt, Ctxt::TraitImpl(_) | Ctxt::Impl(_)) && item.body().is_none() {
                 let span = v.span(item_range(node));
-                let mut diag = Diag::error(None, "associated function in `impl` without body", span);
+                let mut diag =
+                    Diag::error(None, "associated function in `impl` without body", span);
                 diag.suggestion(
                     v.span(ending_semi_or_hi(node)),
                     "provide a definition for the function",
@@ -208,7 +246,13 @@ fn fn_without_body(v: &V<'_, '_, '_>, node: ast::Node<'_>, item: ast::Fn<'_>, ou
 
 /// `visit_assoc_item`'s first checks of an associated item: `#[no_mangle]`, `default` (only
 /// in impls).
-fn assoc(v: &V<'_, '_, '_>, node: ast::Node<'_>, default: Option<ast::Token<'_>>, ctxt: &Ctxt<'_>, out: &mut Out) {
+fn assoc(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    default: Option<ast::Token<'_>>,
+    ctxt: &Ctxt<'_>,
+    out: &mut Out,
+) {
     no_mangle(v, node, out);
     if matches!(ctxt, Ctxt::Trait(_)) {
         defaultness(v, node, default, out);
@@ -225,7 +269,13 @@ fn assoc_vis(v: &V<'_, '_, '_>, node: ast::Node<'_>, ctxt: &Ctxt<'_>, out: &mut 
 
 /// `check_trait_fn_not_const`, `check_impl_fn_not_const` and
 /// `check_async_fn_in_const_trait_or_impl` of an associated function.
-fn assoc_fn_constness(v: &V<'_, '_, '_>, node: ast::Node<'_>, item: ast::Fn<'_>, ctxt: &Ctxt<'_>, out: &mut Out) {
+fn assoc_fn_constness(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    item: ast::Fn<'_>,
+    ctxt: &Ctxt<'_>,
+    out: &mut Out,
+) {
     let parent_const = ctxt.constness();
     let parent_const_span = parent_const.map(|it| v.cx.span(it.map(|it| it.text_range())));
     match (ctxt, item.const_token()) {
@@ -237,10 +287,14 @@ fn assoc_fn_constness(v: &V<'_, '_, '_>, node: ast::Node<'_>, item: ast::Fn<'_>,
             if let Some(parent) = &parent_const_span {
                 let span = v.span(extend_while_whitespace(const_));
                 // clone: a span, on the error path
-                let mut diag = Diag::error(None, "redundant `const` fn marker in const impl", span.clone());
+                let mut diag =
+                    Diag::error(None, "redundant `const` fn marker in const impl", span.clone());
                 diag.suggestion(span, "remove the `const`", "", Applicability::MachineApplicable);
                 // clone: as above
-                diag.span_label(parent.clone(), "this declares all associated functions implicitly const");
+                diag.span_label(
+                    parent.clone(),
+                    "this declares all associated functions implicitly const",
+                );
                 v.emit(out, node, diag);
             }
         }
@@ -275,8 +329,14 @@ fn trait_fn_const(
     let in_impl = matches!(ctxt, Ctxt::TraitImpl(_));
     let const_trait_impl = v.feature("const_trait_impl");
     let make_impl_const = match ctxt {
-        Ctxt::TraitImpl(it) if const_trait_impl && it.value.const_token().is_none() && it.value.excl_token().is_none() => {
-            it.value.trait_().map(|trait_| v.cx.span(it.with_value(trait_.syntax().text_range())).shrink_to_lo())
+        Ctxt::TraitImpl(it)
+            if const_trait_impl
+                && it.value.const_token().is_none()
+                && it.value.excl_token().is_none() =>
+        {
+            it.value
+                .trait_()
+                .map(|trait_| v.cx.span(it.with_value(trait_.syntax().text_range())).shrink_to_lo())
         }
         _ => None,
     };
@@ -294,7 +354,11 @@ fn trait_fn_const(
     let what = if in_impl { "trait impls" } else { "traits" };
     let span = v.span(const_.text_range());
     // alloc: the error's message, and a span clone on the error path
-    let mut diag = Diag::error(Some("E0379"), format!("functions in {what} cannot be declared const"), span.clone());
+    let mut diag = Diag::error(
+        Some("E0379"),
+        format!("functions in {what} cannot be declared const"),
+        span.clone(),
+    );
     // alloc: the error's label
     diag.span_label(span, format!("functions in {what} cannot be const"));
     let applicability = match &parent_const {
@@ -308,10 +372,20 @@ fn trait_fn_const(
     let message = if multiple { "remove the `const` ..." } else { "remove the `const`" };
     diag.suggestion(v.span(extend_while_whitespace(const_)), message, "", applicability);
     if let Some(at) = make_impl_const {
-        diag.suggestion(at, "... and declare the impl to be const instead", "const ", Applicability::MaybeIncorrect);
+        diag.suggestion(
+            at,
+            "... and declare the impl to be const instead",
+            "const ",
+            Applicability::MaybeIncorrect,
+        );
     }
     if let Some(at) = make_trait_const {
-        diag.suggestion(at, "... and declare the trait to be const instead", "const ", Applicability::MaybeIncorrect);
+        diag.suggestion(
+            at,
+            "... and declare the trait to be const instead",
+            "const ",
+            Applicability::MaybeIncorrect,
+        );
     }
     v.emit(out, node, diag);
 }
@@ -337,7 +411,8 @@ pub(super) fn impl_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out
         for (token, modifier, name, code) in modifiers {
             let Some(token) = token else { continue };
             // alloc: the error's message, and a span clone on the error path
-            let mut diag = Diag::error(code, format!("inherent impls cannot be {name}"), self_ty.clone());
+            let mut diag =
+                Diag::error(code, format!("inherent impls cannot be {name}"), self_ty.clone());
             // alloc: the error's note
             diag.note(format!("only trait implementations may be annotated with `{modifier}`"));
             // alloc: the error's label
@@ -374,7 +449,14 @@ fn unsafe_negative(
 
 /// `ConstWithoutBody`, `StaticWithoutBody`, `TyAliasWithoutBody`, `AssocConstWithoutBody` and
 /// `AssocTypeWithoutBody`: `message`, with the placeholder definition `code` of the `what`.
-fn without_body(v: &V<'_, '_, '_>, node: ast::Node<'_>, message: &str, what: &str, code: &str, out: &mut Out) {
+fn without_body(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    message: &str,
+    what: &str,
+    code: &str,
+    out: &mut Out,
+) {
     let mut diag = Diag::error(None, message, v.span(item_range(node)));
     diag.suggestion(
         v.span(ending_semi_or_hi(node)),
@@ -396,7 +478,8 @@ pub(super) fn trait_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
     let Some(name) = trait_.name() else { return };
     let ident = v.span(name.syntax().text_range());
     if let Some(const_) = const_token(node) {
-        let mut diag = Diag::error(None, "auto traits cannot be const", v.span(const_.text_range()));
+        let mut diag =
+            Diag::error(None, "auto traits cannot be const", v.span(const_.text_range()));
         diag.help("remove the `const` keyword");
         v.emit(out, node, diag);
     }
@@ -405,7 +488,8 @@ pub(super) fn trait_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
     {
         let span = v.span(params.syntax().text_range());
         // clone: a span, on the error path
-        let mut diag = Diag::error(Some("E0567"), "auto traits cannot have generic parameters", span.clone());
+        let mut diag =
+            Diag::error(Some("E0567"), "auto traits cannot have generic parameters", span.clone());
         diag.suggestion_with_style(
             // alloc: the error's suggestion
             vec![(span, String::new())],
@@ -449,8 +533,11 @@ pub(super) fn trait_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
         && where_.predicates().any(|it| v.kept(it.syntax()))
     {
         let range = where_.syntax().text_range();
-        let mut diag =
-            Diag::error(Some("E0568"), "auto traits cannot have super traits or lifetime bounds", v.span(range));
+        let mut diag = Diag::error(
+            Some("E0568"),
+            "auto traits cannot have super traits or lifetime bounds",
+            v.span(range),
+        );
         auto_trait_bounds(v, &mut diag, range, &ident);
         v.emit(out, node, diag);
     }
@@ -461,7 +548,13 @@ pub(super) fn trait_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
         for name in names {
             let span = v.span(name.syntax().text_range());
             match &mut diag {
-                None => diag = Some(Diag::error(Some("E0380"), "auto traits cannot have associated items", span)),
+                None => {
+                    diag = Some(Diag::error(
+                        Some("E0380"),
+                        "auto traits cannot have associated items",
+                        span,
+                    ))
+                }
                 Some(diag) => {
                     diag.primary(span);
                 }
@@ -554,12 +647,17 @@ pub(super) fn struct_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut O
     no_mangle(v, node, out);
     let Some(attr) = v.attr(node, "rustc_scalable_vector") else { return };
     if !matches!(struct_.field_list(), Some(ast::FieldList::TupleFieldList(_))) {
-        let diag = Diag::error(None, "scalable vectors must be tuple structs", v.span(item_range(node)));
+        let diag =
+            Diag::error(None, "scalable vectors must be tuple structs", v.span(item_range(node)));
         v.emit(out, node, diag);
     }
     // `Arch::supports_scalable_vectors`.
     if !matches!(v.arch(), Some("aarch64" | "riscv32" | "riscv64")) {
-        let diag = Diag::error(None, "scalable vectors are not supported on this architecture", v.span(attr));
+        let diag = Diag::error(
+            None,
+            "scalable vectors are not supported on this architecture",
+            v.span(attr),
+        );
         v.emit(out, node, diag);
     }
 }
@@ -572,7 +670,11 @@ pub(super) fn union_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
     if fields.fields().any(|it| v.kept(it.syntax())) {
         return;
     }
-    v.emit(out, node, Diag::error(None, "unions cannot have zero fields", v.span(item_range(node))));
+    v.emit(
+        out,
+        node,
+        Diag::error(None, "unions cannot have zero fields", v.span(item_range(node))),
+    );
 }
 
 /// A `const` item, free or associated: one without a body is refused but in a trait.
@@ -584,7 +686,14 @@ pub(super) fn const_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
             no_mangle(v, node, out);
             defaultness(v, node, item.default_token(), out);
             if matches!(ctxt, Ctxt::Free) && item.body().is_none() {
-                without_body(v, node, "free constant item without body", "constant", " = <expr>;", out);
+                without_body(
+                    v,
+                    node,
+                    "free constant item without body",
+                    "constant",
+                    " = <expr>;",
+                    out,
+                );
             }
         }
         Ctxt::Trait(_) | Ctxt::TraitImpl(_) | Ctxt::Impl(_) => {
@@ -597,7 +706,8 @@ pub(super) fn const_<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Ou
             if let Some(underscore) = item.underscore_token() {
                 let span = v.span(underscore.text_range());
                 // clone: a span, on the error path
-                let mut diag = Diag::error(None, "`const` items in this context need a name", span.clone());
+                let mut diag =
+                    Diag::error(None, "`const` items in this context need a name", span.clone());
                 diag.span_label(span, "`_` is not a valid name for this `const` item");
                 v.emit(out, node, diag);
             }
@@ -676,7 +786,9 @@ pub(super) fn type_alias<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mu
 }
 
 /// The `where` clauses of a type alias: before its type and after it.
-fn where_clauses(alias: ast::TypeAlias<'_>) -> (Option<ast::WhereClause<'_>>, Option<ast::WhereClause<'_>>) {
+fn where_clauses(
+    alias: ast::TypeAlias<'_>,
+) -> (Option<ast::WhereClause<'_>>, Option<ast::WhereClause<'_>>) {
     let eq = alias.eq_token().map(|it| it.text_range().start());
     let mut before = None;
     let mut after = None;
@@ -691,7 +803,12 @@ fn where_clauses(alias: ast::TypeAlias<'_>) -> (Option<ast::WhereClause<'_>>, Op
 
 /// A free type alias's `where` clauses: with `checked_type_aliases`,
 /// `check_type_alias_where_clause_location`; without it, one after the type is an error.
-fn where_clause_location(v: &V<'_, '_, '_>, node: ast::Node<'_>, alias: ast::TypeAlias<'_>, out: &mut Out) {
+fn where_clause_location(
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
+    alias: ast::TypeAlias<'_>,
+    out: &mut Out,
+) {
     let (before, after) = where_clauses(alias);
     if !v.feature("checked_type_aliases") {
         let Some(after) = after else { return };
@@ -710,7 +827,9 @@ fn where_clause_location(v: &V<'_, '_, '_>, node: ast::Node<'_>, alias: ast::Typ
     let message = "where clauses are not allowed before the type for type aliases";
     // clone: a span, on the error path
     let mut diag = Diag::error(None, message, span.clone());
-    diag.note("see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information");
+    diag.note(
+        "see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information",
+    );
     let after_preds = after.is_some_and(|it| it.predicates().next().is_some());
     if before.predicates().next().is_some() || after.is_none() {
         // alloc: the error's suggestion
@@ -766,7 +885,12 @@ fn foreign_fn<'db>(
         );
         diag.note(EXTERN_NOTE);
         diag.span_label(ident, "cannot have a body");
-        diag.suggestion(v.span(body.syntax().text_range()), "remove the invalid body", ";", Applicability::MaybeIncorrect);
+        diag.suggestion(
+            v.span(body.syntax().text_range()),
+            "remove the invalid body",
+            ";",
+            Applicability::MaybeIncorrect,
+        );
         diag.span_label(
             block_head(v, block),
             "`extern` blocks define existing foreign functions and functions inside of them cannot have a body",
@@ -778,7 +902,12 @@ fn foreign_fn<'db>(
         let message = format!("functions in `extern` blocks cannot have `{kw}` qualifier");
         let mut diag = Diag::error(None, message, v.span(range));
         // alloc: the error's suggestion
-        diag.suggestion(v.span(range), format!("remove the `{kw}` qualifier"), "", Applicability::MaybeIncorrect);
+        diag.suggestion(
+            v.span(range),
+            format!("remove the `{kw}` qualifier"),
+            "",
+            Applicability::MaybeIncorrect,
+        );
         diag.span_label(block_head(v, block), "in this `extern` block");
         v.emit(out, node, diag);
     };
@@ -818,7 +947,11 @@ fn foreign_type(
     let mut cannot_have = |range: TextRange, descr: &str, remove: &str| {
         let span = v.span(range);
         // alloc: the error's message, and a span clone on the error path
-        let mut diag = Diag::error(None, format!("`type`s inside `extern` blocks cannot have {descr}"), span.clone());
+        let mut diag = Diag::error(
+            None,
+            format!("`type`s inside `extern` blocks cannot have {descr}"),
+            span.clone(),
+        );
         diag.note(EXTERN_NOTE);
         // alloc: the error's suggestion
         diag.suggestion(span, format!("remove the {remove}"), "", Applicability::MaybeIncorrect);
@@ -849,7 +982,8 @@ fn body_in_extern(
 ) {
     let ident = v.span(name.syntax().text_range());
     // alloc: the error's message, and a span clone on the error path
-    let mut diag = Diag::error(None, format!("incorrect `{kind}` inside `extern` block"), ident.clone());
+    let mut diag =
+        Diag::error(None, format!("incorrect `{kind}` inside `extern` block"), ident.clone());
     diag.note(EXTERN_NOTE);
     diag.span_label(ident, "cannot have a body");
     diag.span_label(v.span(body), "the invalid body");
@@ -873,8 +1007,11 @@ fn ascii_in_extern(
     if unraw(name.text()).is_ascii() {
         return;
     }
-    let mut diag =
-        Diag::error(None, "items in `extern` blocks cannot use non-ascii identifiers", v.span(name.syntax().text_range()));
+    let mut diag = Diag::error(
+        None,
+        "items in `extern` blocks cannot use non-ascii identifiers",
+        v.span(name.syntax().text_range()),
+    );
     diag.note(
         "this limitation may be lifted in the future; see issue #83942 <https://github.com/rust-lang/rust/issues/83942> for more information",
     );

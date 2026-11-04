@@ -7,10 +7,7 @@ use crate::ffi::sys as hegel_c;
 use std::ptr;
 
 fn engine_label_from_name(name: &str) -> u64 {
-    let name = hegel_c::hegel_string_t {
-        data: name.as_ptr().cast(),
-        len: name.len(),
-    };
+    let name = hegel_c::hegel_string_t { data: name.as_ptr().cast(), len: name.len() };
     let mut label = 0u64;
     let rc = unsafe { hegel_c::hegel_label_from_name(ptr::null_mut(), name, &mut label) };
     assert_eq!(rc, hegel_c::hegel_result_t::HEGEL_OK);
@@ -29,19 +26,8 @@ fn engine_combine_labels(labels: &[u64]) -> u64 {
 #[test]
 fn label_from_name_matches_the_engine() {
     let long = "x".repeat(1000);
-    for name in [
-        "",
-        "a",
-        "hegel.integer",
-        "mycrate.pairs",
-        "ünïcödé ✓",
-        long.as_str(),
-    ] {
-        assert_eq!(
-            label_from_name(name),
-            engine_label_from_name(name),
-            "{name:?}"
-        );
+    for name in ["", "a", "hegel.integer", "mycrate.pairs", "ünïcödé ✓", long.as_str()] {
+        assert_eq!(label_from_name(name), engine_label_from_name(name), "{name:?}");
     }
 }
 
@@ -63,10 +49,7 @@ fn default_labels_come_from_the_type_name() {
         fn do_draw(&self, _tc: &crate::TestCase) {}
     }
     use crate::generators::Generator;
-    assert_eq!(
-        Alpha.label(),
-        label_from_name(std::any::type_name::<Alpha>())
-    );
+    assert_eq!(Alpha.label(), label_from_name(std::any::type_name::<Alpha>()));
     assert_ne!(Alpha.label(), Beta.label());
 }
 
@@ -74,19 +57,8 @@ fn default_labels_come_from_the_type_name() {
 fn combine_labels_matches_the_engine() {
     let a = label_from_name("a");
     let b = label_from_name("b");
-    for labels in [
-        &[][..],
-        &[a],
-        &[a, b],
-        &[b, a],
-        &[a, a, a],
-        &[u64::MAX, 0, 1 << 63],
-    ] {
-        assert_eq!(
-            combine_labels(labels),
-            engine_combine_labels(labels),
-            "{labels:?}"
-        );
+    for labels in [&[][..], &[a], &[a, b], &[b, a], &[a, a, a], &[u64::MAX, 0, 1 << 63]] {
+        assert_eq!(combine_labels(labels), engine_combine_labels(labels), "{labels:?}");
     }
 }
 

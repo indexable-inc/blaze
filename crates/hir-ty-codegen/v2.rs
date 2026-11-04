@@ -56,6 +56,8 @@ pub(crate) mod toolchain;
 pub(crate) mod unwind;
 pub(crate) mod wasm;
 
+#[cfg(feature = "llvm")]
+pub use crate::llvm::pgo::Profile;
 pub use allocator::allocations_unobserved;
 pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
@@ -63,12 +65,10 @@ pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
 pub use linked::{Assumed, LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
-pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
-pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
-#[cfg(feature = "llvm")]
-pub use crate::llvm::pgo::Profile;
 #[cfg(feature = "llvm")]
 pub use release::{give_profile, profile_id};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
+pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
@@ -100,12 +100,7 @@ pub trait Hashes: Sync {
     /// A const generic argument by its value and type.
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String>;
     /// Where a statement or expression of `owner`'s body is, in its item's span table.
-    fn span(
-        &self,
-        db: &Db,
-        owner: DefWithBodyId,
-        span: MirSpan,
-    ) -> Result<SpanRef, String>;
+    fn span(&self, db: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String>;
     /// The anchors of `owner`'s span tables in [`hir_ty_share::code::table_of`]'s order: what
     /// [`Hashes::span`] names a span of the body by, beside its index in the table.
     fn anchors(&self, db: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String>;
@@ -399,7 +394,8 @@ pub(crate) fn failed_in_front(
     why: impl std::fmt::Display,
 ) -> CodegenError {
     // alloc: the error's message, its parts kept apart for the reader
-    let (named, why) = blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
+    let (named, why) =
+        blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
     let front = frontend::item_of(db, &instance.0).ok().map(|id| {
         // clone: the error's parts, kept beside its message
         Box::new(blaze_codegen::FrontItem { id, named: named.clone(), why: why.clone() })

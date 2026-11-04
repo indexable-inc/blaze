@@ -157,7 +157,10 @@ impl<'a> PinFile<'a> {
 /// An id is `<pid>-<n>`, digits and one dash.
 fn valid(id: &str) -> bool {
     id.split_once('-').is_some_and(|(pid, n)| {
-        !pid.is_empty() && !n.is_empty() && pid.bytes().all(|it| it.is_ascii_digit()) && n.bytes().all(|it| it.is_ascii_digit())
+        !pid.is_empty()
+            && !n.is_empty()
+            && pid.bytes().all(|it| it.is_ascii_digit())
+            && n.bytes().all(|it| it.is_ascii_digit())
     })
 }
 
@@ -166,5 +169,7 @@ fn valid(id: &str) -> bool {
 /// the order of `live`. A pin whose generation was not seen holds every file.
 pub fn pinned(live: &[&str], said: &[(&str, u64)]) -> Vec<Pinned> {
     // alloc: once a flush that retired files
-    live.iter().map(|id| said.iter().filter(|(it, _)| it == id).map(|&(_, generation)| generation).max()).collect()
+    live.iter()
+        .map(|id| said.iter().filter(|(it, _)| it == id).map(|&(_, generation)| generation).max())
+        .collect()
 }

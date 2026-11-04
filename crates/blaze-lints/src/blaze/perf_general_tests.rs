@@ -112,7 +112,10 @@ pub fn sum_all(xs: &[u32]) -> u32 {
 "#,
     );
     assert_eq!(found.matches("the bounds check stays in every iteration").count(), 1, "{found}");
-    assert!(found.contains("`xs` is indexed by the loop variable of a range ending at `n`"), "{found}");
+    assert!(
+        found.contains("`xs` is indexed by the loop variable of a range ending at `n`"),
+        "{found}"
+    );
 }
 
 /// Two writes to one `File` are found; one write is not.
@@ -177,7 +180,11 @@ pub fn first(v: &mut Vec<u32>) -> u32 {
 }
 "#,
     );
-    assert_eq!(found.matches("on a `Vec` inside a loop shifts every other element").count(), 1, "{found}");
+    assert_eq!(
+        found.matches("on a `Vec` inside a loop shifts every other element").count(),
+        1,
+        "{found}"
+    );
     assert!(found.contains("it is used as a queue"), "{found}");
 }
 

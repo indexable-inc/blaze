@@ -4,7 +4,8 @@
 //! of a generic one, from the caller's own binder over it, never expanded.
 
 use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map,
+    DefWithBodyId, FunctionId, ModuleDefId,
+    nameres::crate_def_map,
     signatures::{FunctionSignature, VariantFields},
 };
 use hir_expand::fixture;
@@ -99,7 +100,8 @@ fn an_unmet_field_binder_names_the_first_field_that_fails() {
             .iter()
             .filter_map(|it| match it {
                 InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
-                    kind: SolverDiagnosticKind::ReflectedMemberUnmet { member, member_ty, inner, .. },
+                    kind:
+                        SolverDiagnosticKind::ReflectedMemberUnmet { member, member_ty, inner, .. },
                     ..
                 }) => Some((*member, member_ty.is_some(), inner)),
                 _ => None,
@@ -108,7 +110,8 @@ fn an_unmet_field_binder_names_the_first_field_that_fails() {
         let [(ReflectedMember::Field(field), true, inner)] = unmet[..] else {
             panic!("one error naming a field, not {diagnostics:?}");
         };
-        let name = VariantFields::of(db, field.parent).fields()[field.local_id].name.as_str().to_owned();
+        let name =
+            VariantFields::of(db, field.parent).fields()[field.local_id].name.as_str().to_owned();
         assert_eq!(name, "b", "`b` is the first field that is not `Show`; `c` is not reported");
         assert!(
             matches!(**inner, SolverDiagnosticKind::TraitUnimplemented { .. }),

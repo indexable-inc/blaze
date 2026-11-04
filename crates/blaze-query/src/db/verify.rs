@@ -18,9 +18,7 @@ use super::{
     counts,
     ingredient::{self, Kind},
     local::{self, Walk},
-    row::{
-        DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at, span,
-    },
+    row::{DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at, span},
     storage::{FIELD, NodeRow, Storage, color, key_parts, or},
 };
 
@@ -120,9 +118,7 @@ fn walk(
             let Some(header) = function_header(storage, row) else { return false };
             let word = header.verified.load(Ordering::Acquire);
             let meta = header.meta.load(Ordering::Relaxed);
-            if word & (RUNNING | PROVISIONAL) != 0
-                || meta & UNTRACKED != 0
-                || word & VIEW_MASK == 0
+            if word & (RUNNING | PROVISIONAL) != 0 || meta & UNTRACKED != 0 || word & VIEW_MASK == 0
             {
                 return false;
             }

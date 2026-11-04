@@ -148,7 +148,9 @@ pub enum Ended<T> {
     Panicked(Panic),
     /// A task of a batch that reads gave way, on the thread group `group`: the loop posts it
     /// again with new readers. Others are posted again where they ran.
-    GaveWay { group: Option<u32> },
+    GaveWay {
+        group: Option<u32>,
+    },
 }
 
 /// Runs thread tasks and hands back how each ended: the daemon's threads, or the simulation's
@@ -264,8 +266,14 @@ impl<W: Work> Threads<W> {
                         // readers.
                         let mut readers = Some(job.readers);
                         let (ended, peak, ran_ns, puts) = loop {
-                            match run_measured(&*job.work, job.task, readers.take().unwrap_or_default()) {
-                                (Some(ended), peak, ran_ns, puts) => break (ended, peak, ran_ns, puts),
+                            match run_measured(
+                                &*job.work,
+                                job.task,
+                                readers.take().unwrap_or_default(),
+                            ) {
+                                (Some(ended), peak, ran_ns, puts) => {
+                                    break (ended, peak, ran_ns, puts);
+                                }
                                 (None, peak, ran_ns, puts) if job.task.reads => {
                                     break (Ended::GaveWay { group: None }, peak, ran_ns, puts);
                                 }
@@ -311,11 +319,18 @@ fn run_measured<W: Work>(
         catch_unwind(AssertUnwindSafe(|| work.run(arg, readers)))
     });
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    span.ended(blaze_profile::span::TaskEnded { peak: matches!(result, Ok(Some(_))).then_some(peak) });
+    span.ended(blaze_profile::span::TaskEnded {
+        peak: matches!(result, Ok(Some(_))).then_some(peak),
+    });
     match result {
         Ok(None) => (None, peak, ran_ns, Vec::new()),
         Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, proc_macro_api::kept::take_puts()),
-        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, ran_ns, proc_macro_api::kept::take_puts()),
+        Err(panic) => (
+            Some(Ended::Panicked(panicked(&*panic))),
+            peak,
+            ran_ns,
+            proc_macro_api::kept::take_puts(),
+        ),
     }
 }
 
@@ -419,7 +434,8 @@ impl Drop for InJob {
 /// its fiber (blaze-graph's hosts catch each job's panic). Elsewhere (the plane's loop, an IO
 /// thread) nothing catches it, and the thread would end without a word.
 fn in_a_job() -> bool {
-    IN_JOB.try_with(|depth| depth.get() > 0).unwrap_or(false) || blaze_graph::sched::fiber::on_fiber()
+    IN_JOB.try_with(|depth| depth.get() > 0).unwrap_or(false)
+        || blaze_graph::sched::fiber::on_fiber()
 }
 
 /// What [`record_alloc_failures`] has an allocation failure do: in a job, panic, failing that
@@ -448,24 +464,42 @@ pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     Panic { message, at }
 }
 
-fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: &'static Sender<Ran<W::Value>>) {
+fn post_work<W: Work>(
+    task: Posting,
+    work: Arc<W>,
+    readers: W::Readers,
+    done: &'static Sender<Ran<W::Value>>,
+) {
     let pool = blaze_graph::exec::shared();
     // The batch's work comes back with the result, for a task that gave way to be posted again
     // without counting another reference.
     let run = move || (run_measured(&*work, task, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
-        Ok(((Some(ended), peak, ran_ns, puts), _)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
+        Ok(((Some(ended), peak, ran_ns, puts), _)) => {
+            _ = done.send(Ran { task, ended, peak, ran_ns, puts })
+        }
         Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
             let ended = Ended::GaveWay { group: blaze_graph::pool::group() };
             _ = done.send(Ran { task, ended, peak, ran_ns, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
         Ok(((None, ..), work)) => {
-            post_work(Posting { near: blaze_graph::pool::group(), ..task }, work, W::Readers::default(), done);
+            post_work(
+                Posting { near: blaze_graph::pool::group(), ..task },
+                work,
+                W::Readers::default(),
+                done,
+            );
         }
         // A panic outside the measure: its puts stay in the thread's buffer.
         Err(panic) => {
-            _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0, ran_ns: 0, puts: Vec::new() });
+            _ = done.send(Ran {
+                task,
+                ended: Ended::Panicked(panicked(&*panic)),
+                peak: 0,
+                ran_ns: 0,
+                puts: Vec::new(),
+            });
         }
     };
     match task.critical {
@@ -572,9 +606,17 @@ impl<W: Work> Inline<W> {
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
             match run_measured(&*work, task, readers) {
-                (Some(ended), peak, _, puts) => out.push(Ran { task, ended, peak, ran_ns: 0, puts }),
+                (Some(ended), peak, _, puts) => {
+                    out.push(Ran { task, ended, peak, ran_ns: 0, puts })
+                }
                 (None, peak, _, puts) if task.reads => {
-                    out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, ran_ns: 0, puts });
+                    out.push(Ran {
+                        task,
+                        ended: Ended::GaveWay { group: None },
+                        peak,
+                        ran_ns: 0,
+                        puts,
+                    });
                 }
                 (None, ..) => self.queue.push_back((task, work, W::Readers::default())),
             }
@@ -747,8 +789,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
         let first = self.reserve(count);
         let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
-        let (tasks, keys, sizes) =
-            (Vec::with_capacity(count as usize), Vec::with_capacity(count as usize), Vec::with_capacity(count as usize));
+        let (tasks, keys, sizes) = (
+            Vec::with_capacity(count as usize),
+            Vec::with_capacity(count as usize),
+            Vec::with_capacity(count as usize),
+        );
         Fresh { nodes, tasks, keys, sizes, over: Vec::new(), count }
     }
 
@@ -780,15 +825,35 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// # Panics
     ///
     /// As [`Plane::push`], and when `node` has a key.
-    pub fn push_learned(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task, learn: Key) -> NodeId {
-        assert!(node.key.is_none(), "node {} is given a key of the plane's beside the one it learns by", node.name);
+    pub fn push_learned(
+        &self,
+        fresh: &mut Fresh,
+        node: NodeRef<'_>,
+        task: Task,
+        learn: Key,
+    ) -> NodeId {
+        assert!(
+            node.key.is_none(),
+            "node {} is given a key of the plane's beside the one it learns by",
+            node.name
+        );
         self.push_predicted(fresh, node, task, Some(learn))
     }
 
     /// The next node of `fresh`, its memory and cost predicted by `learn` (or its kind alone),
     /// which its run then teaches ([`Plane::key`]).
-    fn push_predicted(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task, learn: Option<Key>) -> NodeId {
-        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+    fn push_predicted(
+        &self,
+        fresh: &mut Fresh,
+        mut node: NodeRef<'_>,
+        task: Task,
+        learn: Option<Key>,
+    ) -> NodeId {
+        assert!(
+            (fresh.tasks.len() as u32) < fresh.count,
+            "a batch of {} nodes given another",
+            fresh.count
+        );
         let kind = match task {
             Task::Thread { kind, .. } | Task::Loop { kind } => kind,
             Task::Gone => panic!("node {} is pushed with no task", node.name),
@@ -825,12 +890,27 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// # Panics
     ///
     /// As [`Plane::push_learned`].
-    pub fn push_sized(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task, learn: Key, source: u64) -> NodeId {
+    pub fn push_sized(
+        &self,
+        fresh: &mut Fresh,
+        mut node: NodeRef<'_>,
+        task: Task,
+        learn: Key,
+        source: u64,
+    ) -> NodeId {
         if source == 0 {
             return self.push_learned(fresh, node, task, learn);
         }
-        assert!(node.key.is_none(), "node {} is given a key of the plane's beside the one it learns by", node.name);
-        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+        assert!(
+            node.key.is_none(),
+            "node {} is given a key of the plane's beside the one it learns by",
+            node.name
+        );
+        assert!(
+            (fresh.tasks.len() as u32) < fresh.count,
+            "a batch of {} nodes given another",
+            fresh.count
+        );
         let kind = match task {
             Task::Thread { kind, .. } | Task::Loop { kind } => kind,
             Task::Gone => panic!("node {} is pushed with no task", node.name),
@@ -878,7 +958,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     fn sized(&self, kind: TaskKind, source: u64) -> u64 {
         let per_kib = self.per_kib(kind).unwrap_or(PER_SOURCE_KIB);
         let kind_peak = self.predict.predict(kind, None).peak;
-        source.div_ceil(1024).saturating_mul(per_kib).max(SIZED_FLOOR).min(kind_peak.max(SIZED_FLOOR))
+        source
+            .div_ceil(1024)
+            .saturating_mul(per_kib)
+            .max(SIZED_FLOOR)
+            .min(kind_peak.max(SIZED_FLOOR))
     }
 
     /// The bytes a sized node of `kind` held per KiB of its source lately, once one ended:
@@ -906,8 +990,19 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// # Panics
     ///
     /// As [`Plane::push`], when `node` has a key, and when `kind` is no program's.
-    pub fn push_program(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, kind: TaskKind, arg: u32, program: Key) -> NodeId {
-        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+    pub fn push_program(
+        &self,
+        fresh: &mut Fresh,
+        mut node: NodeRef<'_>,
+        kind: TaskKind,
+        arg: u32,
+        program: Key,
+    ) -> NodeId {
+        assert!(
+            (fresh.tasks.len() as u32) < fresh.count,
+            "a batch of {} nodes given another",
+            fresh.count
+        );
         assert!(node.key.is_none(), "program build {} is given a key of the plane's", node.name);
         assert!(of_program(kind), "{kind:?} is no part of a program's build");
         let Prediction { cost, peak } = self.predict.predict(kind, Some(program));
@@ -932,7 +1027,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
             None => 0,
         };
         let end = first + count;
-        let free = self.batches.range(..end).next_back().is_none_or(|(at, batch)| at + batch.tasks.len() as u32 <= first);
+        let free = self
+            .batches
+            .range(..end)
+            .next_back()
+            .is_none_or(|(at, batch)| at + batch.tasks.len() as u32 <= first);
         assert!(free, "the plane's node ids wrapped onto nodes that have not settled");
         self.next_node = end;
         NodeId(first)
@@ -980,7 +1079,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
         let request = RequestId(self.next_request);
         self.next_request = self.next_request.wrapping_add(1).max(1);
         let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle };
-        self.step(input).unwrap_or_else(|error| panic!("the plane refused to open {request}: {error}"));
+        self.step(input)
+            .unwrap_or_else(|error| panic!("the plane refused to open {request}: {error}"));
         request
     }
 
@@ -1008,7 +1108,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
         );
         let first = nodes.first();
         if count > 0 {
-            self.batches.insert(first.0, Batch { tasks, keys, sizes, over, live: count, work, reads, request: request.0 });
+            self.batches.insert(
+                first.0,
+                Batch { tasks, keys, sizes, over, live: count, work, reads, request: request.0 },
+            );
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
@@ -1056,8 +1159,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
             let key = self.key(id);
             self.predict.observe(kind, key, ns(at).saturating_sub(start), 0);
         }
-        let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak: 0 };
-        self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id,
+            outcome,
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input)
+            .unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
     }
 
     /// A thread task of [`Happened::Post`] posted with the readers the loop made for it.
@@ -1084,8 +1195,17 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// A thread task of [`Happened::Post`] the loop has no readers for: it ends failed.
     pub fn refuse(&mut self, at: Duration, task: Posting, why: String) {
-        let input = PlaneInput::Done { at_ns: ns(at), id: task.id, outcome: Outcome::Failed { why }, added: Vec::new(), group: None, peak: 0 };
-        self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {}: {error}", task.id));
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id: task.id,
+            outcome: Outcome::Failed { why },
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input).unwrap_or_else(|error| {
+            panic!("the plane refused the end of task {}: {error}", task.id)
+        });
     }
 
     /// Takes the thread tasks that ended into the plane.
@@ -1099,7 +1219,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
             }
             let outcome = match ended {
                 Ended::GaveWay { group } => {
-                    self.happened.push(Happened::Post { task: Posting { near: group, ..task }, again: true });
+                    self.happened.push(Happened::Post {
+                        task: Posting { near: group, ..task },
+                        again: true,
+                    });
                     continue;
                 }
                 Ended::Did(Did { outcome, value }) => {
@@ -1119,11 +1242,22 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 self.predict.observe(task.kind, key, ran_ns, peak);
                 let source = self.size(id);
                 if source > 0 {
-                    self.per_kib.entry(task.kind).or_default().observe(peak / source.div_ceil(1024));
+                    self.per_kib
+                        .entry(task.kind)
+                        .or_default()
+                        .observe(peak / source.div_ceil(1024));
                 }
             }
-            let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
-            self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
+            let input = PlaneInput::Done {
+                at_ns: ns(at),
+                id,
+                outcome,
+                added: Vec::new(),
+                group: None,
+                peak,
+            };
+            self.step(input)
+                .unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
         self.ran = ran;
         let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::held() };
@@ -1206,9 +1340,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     self.settled(id);
                     let (ok, why, skipped) = match state {
                         NodeState::Built | NodeState::Cached { .. } => (true, None, None),
-                        NodeState::Failed { why } => (false, Some(refused_by_own_runs(why, over)), None),
+                        NodeState::Failed { why } => {
+                            (false, Some(refused_by_own_runs(why, over)), None)
+                        }
                         NodeState::Skipped { because } => {
-                            let why = format!("skipped: node {because} it waited for did not end well"); // alloc: a node skipped, once
+                            let why =
+                                format!("skipped: node {because} it waited for did not end well"); // alloc: a node skipped, once
                             (false, Some(why), Some(NodeId(because)))
                         }
                         _ => (false, Some("cancelled".to_owned()), None), // alloc: a node cancelled, once
@@ -1219,13 +1356,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     self.run(id, pool, near, critical);
                 }
                 PlaneOutput::Finished { request, ok } => {
-                    let stats = self
-                        .graph
-                        .stats(request)
-                        .unwrap_or_else(|| panic!("the plane finished {request}, which it holds no stats of"));
-                    self.graph
-                        .release(request)
-                        .unwrap_or_else(|error| panic!("the plane refused to release {request}: {error}"));
+                    let stats = self.graph.stats(request).unwrap_or_else(|| {
+                        panic!("the plane finished {request}, which it holds no stats of")
+                    });
+                    self.graph.release(request).unwrap_or_else(|error| {
+                        panic!("the plane refused to release {request}: {error}")
+                    });
                     self.happened.push(Happened::Finished { request, ok, stats });
                 }
                 // An idle task asked to give way holds its thread until its `Done`, as the plane
@@ -1244,7 +1380,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
             Task::Gone => return,
         };
         let _build = blaze_profile::flight::building(batch.request);
-        let span = blaze_profile::span::detached(blaze_profile::span::Admission { kind: task_name(kind), node: u64::from(id.0) });
+        let span = blaze_profile::span::detached(blaze_profile::span::Admission {
+            kind: task_name(kind),
+            node: u64::from(id.0),
+        });
         // A node made ready again (after it gave way) begins a new wait; the old one ends unsaid.
         self.admitting.insert(id, Admitting { span, since_ns: self.now_ns });
     }
@@ -1303,7 +1442,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 self.loops.insert(id, self.now_ns);
                 self.happened.push(Happened::Run { id });
             }
-            Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
+            Some((_, Task::Gone)) | None => {
+                panic!("the plane runs node {id}, which the daemon gave no task")
+            }
         }
     }
 }
@@ -1322,7 +1463,10 @@ mod tests {
     fn put(what: &str) -> proc_macro_api::kept::Put {
         let id = ContentId::of("blaze-cargo plane test put", what.as_bytes());
         proc_macro_api::kept::Put {
-            keep: proc_macro_api::kept::Keep::Run { run: RunKey { code: id, given: id }, traced: Traced::default() },
+            keep: proc_macro_api::kept::Keep::Run {
+                run: RunKey { code: id, given: id },
+                traced: Traced::default(),
+            },
             value: what.as_bytes().to_vec(),
             what: what.to_owned(),
         }
@@ -1357,7 +1501,18 @@ mod tests {
 
     #[test]
     fn each_runner_runs_a_task_and_hands_back_its_value() {
-        let task = |pool| Posting { id: NodeId(4), pool, near: None, critical: false, kind: kinds::COMPILE, arg: 20, reads: false, build: 1, granted: 0, passed: 0 };
+        let task = |pool| Posting {
+            id: NodeId(4),
+            pool,
+            near: None,
+            critical: false,
+            kind: kinds::COMPILE,
+            arg: 20,
+            reads: false,
+            build: 1,
+            granted: 0,
+            passed: 0,
+        };
         let runners: [(Runner<Next>, Pool); 3] = [
             (Runner::Threads(Threads::new(1, 1)), Pool::Io),
             (Runner::Threads(Threads::new(1, 1)), Pool::Work),
@@ -1370,7 +1525,9 @@ mod tests {
             while ran.is_empty() {
                 runner.take(&mut ran);
             }
-            let [Ran { ended: Ended::Did(Did { value: 21, .. }), .. }] = ran.as_slice() else { panic!("the task ends with its value") };
+            let [Ran { ended: Ended::Did(Did { value: 21, .. }), .. }] = ran.as_slice() else {
+                panic!("the task ends with its value")
+            };
             assert_eq!(runner.running(), 0);
             assert!(!runner.ready());
         }
@@ -1386,20 +1543,39 @@ mod tests {
         fn running(_: u32) -> Option<Did<u32>> {
             built(blaze_mem::frame::running_tag().map_or(u32::MAX, |tag| tag as u32))
         }
-        for kind in [kinds::COMPILE, kinds::UNIT_NAMES, kinds::UNIT_BODIES, kinds::UNIT_LINK, kinds::UNIT_STORE] {
+        for kind in [
+            kinds::COMPILE,
+            kinds::UNIT_NAMES,
+            kinds::UNIT_BODIES,
+            kinds::UNIT_LINK,
+            kinds::UNIT_STORE,
+        ] {
             let runners: [(Runner<Next>, Pool); 3] = [
                 (Runner::Threads(Threads::new(1, 1)), Pool::Io),
                 (Runner::Threads(Threads::new(1, 1)), Pool::Work),
                 (Runner::Inline(Inline::new(1)), Pool::Work),
             ];
             for (mut runner, pool) in runners {
-                let task = Posting { id: NodeId(5), pool, near: None, critical: false, kind, arg: 0, reads: false, build: 1, granted: 0, passed: 0 };
+                let task = Posting {
+                    id: NodeId(5),
+                    pool,
+                    near: None,
+                    critical: false,
+                    kind,
+                    arg: 0,
+                    reads: false,
+                    build: 1,
+                    granted: 0,
+                    passed: 0,
+                };
                 runner.post(task, Arc::new(Each(running as fn(u32) -> Option<Did<u32>>)), ());
                 let mut ran = Vec::new();
                 while ran.is_empty() {
                     runner.take(&mut ran);
                 }
-                let [Ran { ended: Ended::Did(Did { value, .. }), .. }] = ran.as_slice() else { panic!("the task ends with its value") };
+                let [Ran { ended: Ended::Did(Did { value, .. }), .. }] = ran.as_slice() else {
+                    panic!("the task ends with its value")
+                };
                 let want = blaze_graph::admission::tag_of(kind);
                 assert_eq!(*value, want as u32, "a {kind:?} task on {pool:?} runs as {want:?}");
             }
@@ -1418,15 +1594,31 @@ mod tests {
                 .expect_err("the thread panics");
             std::panic::resume_unwind(raised)
         }));
-        let task = Posting { id: NodeId(9), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false, build: 1, granted: 0, passed: 0 };
+        let task = Posting {
+            id: NodeId(9),
+            pool: Pool::Work,
+            near: None,
+            critical: false,
+            kind: kinds::COMPILE,
+            arg: 0,
+            reads: false,
+            build: 1,
+            granted: 0,
+            passed: 0,
+        };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
         let mut ran = Vec::new();
         runner.take(&mut ran);
-        let [Ran { ended: Ended::Panicked(panic), .. }] = ran.as_slice() else { panic!("the task ends panicked") };
+        let [Ran { ended: Ended::Panicked(panic), .. }] = ran.as_slice() else {
+            panic!("the task ends panicked")
+        };
         assert_eq!(panic.message.as_deref(), Some("plane-test: the task's panic"));
         let at = panic.at.as_deref().expect("the hook saw where it was raised");
-        assert!(at.contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"), "{at}");
+        assert!(
+            at.contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"),
+            "{at}"
+        );
         assert_eq!(panic.to_string(), format!("panicked at {at}: plane-test: the task's panic"));
     }
 
@@ -1472,10 +1664,15 @@ mod tests {
             match (&it.ended, arg) {
                 (Ended::Panicked(panic), 2) => {
                     let message = panic.message.as_deref().expect("the panic's message");
-                    assert!(message.starts_with("an allocation of 137740 bytes (aligned to 64) failed"), "{message}");
+                    assert!(
+                        message.starts_with("an allocation of 137740 bytes (aligned to 64) failed"),
+                        "{message}"
+                    );
                 }
                 (Ended::Did(Did { value, .. }), _) => assert_eq!(*value, arg as u32 + 100),
-                _ => panic!("task {arg} should have {}", if arg == 2 { "panicked" } else { "built" }),
+                _ => {
+                    panic!("task {arg} should have {}", if arg == 2 { "panicked" } else { "built" })
+                }
             }
         }
     }
@@ -1494,14 +1691,27 @@ mod tests {
                 built(0)
             }
         }));
-        let task = Posting { id: NodeId(7), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false, build: 1, granted: 0, passed: 0 };
+        let task = Posting {
+            id: NodeId(7),
+            pool: Pool::Work,
+            near: None,
+            critical: false,
+            kind: kinds::COMPILE,
+            arg: 0,
+            reads: false,
+            build: 1,
+            granted: 0,
+            passed: 0,
+        };
         let mut runner = Inline::new(3);
         runner.post(task, work, ());
         let mut ran = Vec::new();
         while ran.is_empty() {
             runner.take(&mut ran);
         }
-        let [Ran { ended: Ended::Did(_), puts, .. }] = ran.as_slice() else { panic!("one task ends") };
+        let [Ran { ended: Ended::Did(_), puts, .. }] = ran.as_slice() else {
+            panic!("one task ends")
+        };
         assert_eq!(ours(puts, "plane-a"), ["plane-a before", "plane-a after"]);
     }
 
@@ -1511,12 +1721,25 @@ mod tests {
             proc_macro_api::kept::put(put("plane-b gave way"));
             None
         }));
-        let task = Posting { id: NodeId(8), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: true, build: 1, granted: 0, passed: 0 };
+        let task = Posting {
+            id: NodeId(8),
+            pool: Pool::Work,
+            near: None,
+            critical: false,
+            kind: kinds::COMPILE,
+            arg: 0,
+            reads: true,
+            build: 1,
+            granted: 0,
+            passed: 0,
+        };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
         let mut ran = Vec::new();
         runner.take(&mut ran);
-        let [Ran { ended: Ended::GaveWay { .. }, puts, .. }] = ran.as_slice() else { panic!("the task gives way") };
+        let [Ran { ended: Ended::GaveWay { .. }, puts, .. }] = ran.as_slice() else {
+            panic!("the task gives way")
+        };
         assert!(puts.is_empty());
         assert_eq!(ours(&proc_macro_api::kept::take_puts(), "plane-b"), ["plane-b gave way"]);
     }
@@ -1552,10 +1775,26 @@ mod tests {
         let mut plane = Plane::new(config, predict, Runner::Inline(Inline::new(9))).unwrap();
         let request = plane.open(Duration::ZERO, false, false);
         let key = Key([3; 32]);
-        let node = |kind, name, key| NodeRef { kind, name, deps: &[], pool: Pool::Work, cost: 1, key, memory: 0 };
+        let node = |kind, name, key| NodeRef {
+            kind,
+            name,
+            deps: &[],
+            pool: Pool::Work,
+            cost: 1,
+            key,
+            memory: 0,
+        };
         let mut fresh = plane.fresh(2, 16, 0);
-        plane.push(&mut fresh, node(NodeKind::Std, "thread", Some(key)), Task::Thread { kind: kinds::COMPILE, arg: 0 });
-        let looped = plane.push(&mut fresh, node(NodeKind::ScriptRun, "loop", None), Task::Loop { kind: loops::SCRIPT_RUN });
+        plane.push(
+            &mut fresh,
+            node(NodeKind::Std, "thread", Some(key)),
+            Task::Thread { kind: kinds::COMPILE, arg: 0 },
+        );
+        let looped = plane.push(
+            &mut fresh,
+            node(NodeKind::ScriptRun, "loop", None),
+            Task::Loop { kind: loops::SCRIPT_RUN },
+        );
         plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
         assert_eq!(*asked.lock(), [(kinds::COMPILE, Some(key)), (loops::SCRIPT_RUN, None)]);
 
@@ -1563,10 +1802,12 @@ mod tests {
         while !ran_loop || observed.lock().is_empty() {
             plane.poll(Duration::ZERO);
             plane.happened(&mut happened);
-            ran_loop |= happened.iter().any(|it| matches!(it, Happened::Run { id } if *id == looped));
+            ran_loop |=
+                happened.iter().any(|it| matches!(it, Happened::Run { id } if *id == looped));
             happened.clear();
         }
-        let seen: Vec<_> = observed.lock().iter().map(|&(kind, key, ran_ns, _)| (kind, key, ran_ns)).collect();
+        let seen: Vec<_> =
+            observed.lock().iter().map(|&(kind, key, ran_ns, _)| (kind, key, ran_ns)).collect();
         assert_eq!(seen, [(kinds::COMPILE, Some(key), 0)], "the simulation's tasks take no time");
         plane.ended(Duration::from_millis(5), looped, Outcome::Built);
         let last = observed.lock().last().copied();
@@ -1584,7 +1825,8 @@ mod tests {
         let pool = blaze_graph::exec::shared().workers();
         let config = PlaneConfig { io: 1, work: pool, budget: None, starve_after: 8 };
         let history = blaze_history::History::new(blaze_history::Config::default());
-        let mut plane = Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
+        let mut plane =
+            Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
         let ran_on: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let work = Each({
             let ran_on = Arc::clone(&ran_on);
@@ -1595,7 +1837,9 @@ mod tests {
                 });
                 let mut ran_on = ran_on.lock();
                 ran_on.extend(names);
-                ran_on.push(std::thread::current().name().unwrap_or("a thread with no name").to_owned());
+                ran_on.push(
+                    std::thread::current().name().unwrap_or("a thread with no name").to_owned(),
+                );
                 built(arg)
             }
         });
@@ -1604,7 +1848,15 @@ mod tests {
         let mut fresh = plane.fresh(PROGRAMS, names.iter().map(String::len).sum(), 0);
         let ids: Vec<NodeId> = (0..PROGRAMS)
             .map(|at| {
-                let node = NodeRef { kind: NodeKind::Codegen, name: &names[at as usize], deps: &[], pool: Pool::Work, cost: 1, key: None, memory: 0 };
+                let node = NodeRef {
+                    kind: NodeKind::Codegen,
+                    name: &names[at as usize],
+                    deps: &[],
+                    pool: Pool::Work,
+                    cost: 1,
+                    key: None,
+                    memory: 0,
+                };
                 plane.push(&mut fresh, node, Task::Thread { kind: kinds::COMPILE, arg: at })
             })
             .collect();
@@ -1613,14 +1865,22 @@ mod tests {
         assert!(settled.iter().all(|it| it.1), "every program builds: {settled:?}");
 
         let mut threads = std::mem::take(&mut *ran_on.lock());
-        assert_eq!(threads.len(), PROGRAMS as usize * 65, "every program and its parallel work ran");
+        assert_eq!(
+            threads.len(),
+            PROGRAMS as usize * 65,
+            "every program and its parallel work ran"
+        );
         threads.sort_unstable();
         threads.dedup();
         assert!(
             threads.iter().all(|it| it.starts_with("blaze-work-")),
             "only the pool's workers ran the programs: {threads:?}"
         );
-        assert!(threads.len() <= pool, "{} threads ran {PROGRAMS} programs, past the pool's {pool}", threads.len());
+        assert!(
+            threads.len() <= pool,
+            "{} threads ran {PROGRAMS} programs, past the pool's {pool}",
+            threads.len()
+        );
     }
 
     /// A guess over the whole budget asks for the budget and runs alone; only a unit's own
@@ -1639,13 +1899,22 @@ mod tests {
         let budget = Budget { bytes: gib, from: "the test's budget".to_owned(), kept_back: 0 };
         let config = PlaneConfig { io: 1, work: 2, budget: Some(budget), starve_after: 8 };
         let mut history = blaze_history::History::new(blaze_history::Config::default());
-        let (other, script, unseen, big) = (Key([7; 32]), Key([8; 32]), Key([9; 32]), Key([10; 32]));
+        let (other, script, unseen, big) =
+            (Key([7; 32]), Key([8; 32]), Key([9; 32]), Key([10; 32]));
         // Another unit's codegen held 120 GB: its kind's peak from now on.
         history.observe(kinds::COMPILE, Some(&other), 1_000, 120 * gib);
         history.observe(kinds::COMPILE, Some(&big), 1_000, 2 * gib);
         let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
         let request = plane.open(Duration::ZERO, true, false);
-        let node = |name| NodeRef { kind: NodeKind::Codegen, name, deps: &[], pool: Pool::Work, cost: 1, key: None, memory: 0 };
+        let node = |name| NodeRef {
+            kind: NodeKind::Codegen,
+            name,
+            deps: &[],
+            pool: Pool::Work,
+            cost: 1,
+            key: None,
+            memory: 0,
+        };
         let task = |arg| Task::Thread { kind: kinds::COMPILE, arg };
         let mut fresh = plane.fresh(3, 64, 0);
         // A build script of 4 KiB never measured: sized, at the floor, nowhere near the kind's.
@@ -1667,7 +1936,11 @@ mod tests {
         }
         settled.sort_by_key(|it| it.0);
         assert_eq!(settled[0].0, sized);
-        assert!(settled[0].1, "a small unit is not refused for its kind's peak: {:?}", settled[0].2);
+        assert!(
+            settled[0].1,
+            "a small unit is not refused for its kind's peak: {:?}",
+            settled[0].2
+        );
         assert_eq!(settled[1].0, guessed);
         assert!(settled[1].1, "a guess over the budget runs alone: {:?}", settled[1].2);
         assert_eq!(settled[2].0, own);
@@ -1705,7 +1978,15 @@ mod tests {
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
         let (program, other) = (Key([5; 32]), Key([6; 32]));
-        let node = |name| NodeRef { kind: NodeKind::Codegen, name, deps: &[], pool: Pool::Work, cost: 1, key: None, memory: 0 };
+        let node = |name| NodeRef {
+            kind: NodeKind::Codegen,
+            name,
+            deps: &[],
+            pool: Pool::Work,
+            cost: 1,
+            key: None,
+            memory: 0,
+        };
         assert!(!plane.predict().measured(kinds::PROGRAM, Some(program)));
 
         let request = plane.open(Duration::ZERO, true, false);
@@ -1715,8 +1996,12 @@ mod tests {
         plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
         assert_eq!(settle(&mut plane, &[first, again]), [(first, true), (again, true)]);
         assert!(plane.predict().measured(kinds::PROGRAM, Some(program)));
-        assert!(!plane.predict().measured(kinds::PROGRAM, Some(other)), "another program is not measured by it");
-        let record = plane.predict().record(kinds::PROGRAM, &program).expect("its runs teach its key");
+        assert!(
+            !plane.predict().measured(kinds::PROGRAM, Some(other)),
+            "another program is not measured by it"
+        );
+        let record =
+            plane.predict().record(kinds::PROGRAM, &program).expect("its runs teach its key");
         assert_eq!(record.seen, 2);
     }
 }

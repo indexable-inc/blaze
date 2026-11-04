@@ -40,7 +40,10 @@ pub(crate) fn built() -> Vec<Artifact> {
     vec![
         artifact("foo", "test", "x", true, Some("deps/x-4567")),
         artifact("foo", "lib", "foo", false, None),
-        Artifact { kind: ArtifactKind::Doctest, ..artifact("foo", "lib", "foo", true, Some("deps/foo-doctests")) },
+        Artifact {
+            kind: ArtifactKind::Doctest,
+            ..artifact("foo", "lib", "foo", true, Some("deps/foo-doctests"))
+        },
         artifact("foo", "bin", "foo", true, Some("deps/foo-89ab")),
         artifact("foo", "lib", "foo", true, Some("deps/foo-0123abcd")),
         artifact("foo", "bin", "foo", false, Some("foo")),
@@ -70,23 +73,43 @@ fn rerun_names_the_package_as_cargos_needs_spec_flag_does() {
 
     let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
     let mut err = Vec::new();
-    let code = run(&asked(Command::Test, &["--fail-fast"]), &built(), &[], 3, speaking(), &mut err, &mut fake).unwrap();
+    let code = run(
+        &asked(Command::Test, &["--fail-fast"]),
+        &built(),
+        &[],
+        3,
+        speaking(),
+        &mut err,
+        &mut fake,
+    )
+    .unwrap();
     assert_eq!(code, 101);
-    assert!(String::from_utf8(err).unwrap().ends_with("error: test failed, to rerun pass `-p foo --lib`\n"));
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .ends_with("error: test failed, to rerun pass `-p foo --lib`\n")
+    );
 }
 
 #[test]
 fn executables_in_cargos_order() {
     let built = built();
     let (tests, docs) = executables(&built);
-    let shown: Vec<String> = tests.iter().map(|it| running(it, Path::new("/w"), Kind::Test)).collect();
-    assert_eq!(shown, [
-        "unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
-        "unittests src/main.rs (target/debug/deps/foo-89ab)",
-        "tests/x.rs (target/debug/deps/x-4567)",
-    ]);
+    let shown: Vec<String> =
+        tests.iter().map(|it| running(it, Path::new("/w"), Kind::Test)).collect();
+    assert_eq!(
+        shown,
+        [
+            "unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
+            "unittests src/main.rs (target/debug/deps/foo-89ab)",
+            "tests/x.rs (target/debug/deps/x-4567)",
+        ]
+    );
     assert_eq!(docs.len(), 1);
-    assert_eq!(running(tests[0], Path::new("/w"), Kind::Bench), "benches src/lib.rs (target/debug/deps/foo-0123abcd)");
+    assert_eq!(
+        running(tests[0], Path::new("/w"), Kind::Bench),
+        "benches src/lib.rs (target/debug/deps/foo-0123abcd)"
+    );
 }
 
 #[test]
@@ -129,11 +152,15 @@ fn no_fail_fast_runs_them_all() {
     let (code, err) = tested(&asked(Command::Test, &["--no-fail-fast"]), &mut fake, speaking());
     assert_eq!(code, 101);
     assert_eq!(fake.ran.len(), 4);
-    assert!(err.contains("error: test failed, to rerun pass `--test x`\n   Doc-tests foo\n"), "{err}");
+    assert!(
+        err.contains("error: test failed, to rerun pass `--test x`\n   Doc-tests foo\n"),
+        "{err}"
+    );
     assert!(err.ends_with("error: 2 targets failed:\n    `--lib`\n    `--test x`\n"), "{err}");
 
     let mut fake = Fake { ends: vec![("foo-doctests", Ended::Code(101))], ..Fake::default() };
-    let (code, err) = tested(&asked(Command::Test, &["-p", "foo", "--fail-fast"]), &mut fake, speaking());
+    let (code, err) =
+        tested(&asked(Command::Test, &["-p", "foo", "--fail-fast"]), &mut fake, speaking());
     assert_eq!(code, 101);
     assert!(err.ends_with("error: doctest failed, to rerun pass `-p foo --doc`\n"), "{err}");
 }
@@ -147,7 +174,8 @@ fn by_default_every_test_executable_runs_past_a_failed_one() {
         let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
         let (code, err) = tested(&asked(Command::Test, words), &mut fake, speaking());
         assert_eq!(code, 101, "{words:?}");
-        let ran: Vec<&str> = fake.ran.iter().map(|it| it.program.file_name().unwrap().to_str().unwrap()).collect();
+        let ran: Vec<&str> =
+            fake.ran.iter().map(|it| it.program.file_name().unwrap().to_str().unwrap()).collect();
         assert_eq!(ran, ["foo-0123abcd", "foo-89ab", "x-4567", "foo-doctests"], "{words:?}: {err}");
         assert!(err.ends_with("error: 1 target failed:\n    `--lib`\n"), "{words:?}: {err}");
     }
@@ -159,7 +187,11 @@ fn by_default_every_test_executable_runs_past_a_failed_one() {
 #[test]
 fn the_end_lists_each_test_that_never_built_and_what_held_it_back() {
     let unbuilt = [
-        Unbuilt { unit: "foo v0.1.0 (test \"y\")".into(), behind: "foo v0.1.0 (test \"y\")".into(), why: "errors in its items".into() },
+        Unbuilt {
+            unit: "foo v0.1.0 (test \"y\")".into(),
+            behind: "foo v0.1.0 (test \"y\")".into(),
+            why: "errors in its items".into(),
+        },
         Unbuilt {
             unit: "bar v0.1.0 (lib test)".into(),
             behind: "bar v0.1.0 (build script run)".into(),
@@ -168,7 +200,9 @@ fn the_end_lists_each_test_that_never_built_and_what_held_it_back() {
     ];
     let mut fake = Fake { ends: vec![("x-4567", Ended::Code(101))], ..Fake::default() };
     let mut err = Vec::new();
-    let code = run(&asked(Command::Test, &[]), &built(), &unbuilt, 1, speaking(), &mut err, &mut fake).unwrap();
+    let code =
+        run(&asked(Command::Test, &[]), &built(), &unbuilt, 1, speaking(), &mut err, &mut fake)
+            .unwrap();
     let err = String::from_utf8(err).unwrap();
     assert_eq!(code, 101);
     assert_eq!(fake.ran.len(), 4, "{err}");
@@ -182,7 +216,16 @@ fn the_end_lists_each_test_that_never_built_and_what_held_it_back() {
     );
 
     let mut err = Vec::new();
-    let code = run(&asked(Command::Test, &[]), &built(), &unbuilt[1..], 1, speaking(), &mut err, &mut Fake::default()).unwrap();
+    let code = run(
+        &asked(Command::Test, &[]),
+        &built(),
+        &unbuilt[1..],
+        1,
+        speaking(),
+        &mut err,
+        &mut Fake::default(),
+    )
+    .unwrap();
     let err = String::from_utf8(err).unwrap();
     assert_eq!(code, 101, "{err}");
     assert!(err.ends_with("error: 1 test target never built, so never ran:\n    bar v0.1.0 (lib test): behind bar v0.1.0 (build script run) (the build script failed)\n"), "{err}");
@@ -199,15 +242,28 @@ fn no_fail_fast_with_one_failure_is_its_own_error() {
 
 #[test]
 fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
-    let doc = Artifact { kind: ArtifactKind::Doctest, ..artifact("foo", "lib", "my-lib", true, Some("deps/my_lib-doctests")) };
+    let doc = Artifact {
+        kind: ArtifactKind::Doctest,
+        ..artifact("foo", "lib", "my-lib", true, Some("deps/my_lib-doctests"))
+    };
     let mut err = Vec::new();
-    let code = run(&asked(Command::Test, &[]), &[doc.clone()], &[], 1, speaking(), &mut err, &mut Fake::default()).unwrap();
+    let code = run(
+        &asked(Command::Test, &[]),
+        &[doc.clone()],
+        &[],
+        1,
+        speaking(),
+        &mut err,
+        &mut Fake::default(),
+    )
+    .unwrap();
     assert_eq!(code, 0);
     assert_eq!(String::from_utf8(err).unwrap(), "   Doc-tests my-lib\n");
 
     let mut err = Vec::new();
     let verbose = Speaking { verbose: 1, ..speaking() };
-    run(&asked(Command::Test, &[]), &[doc], &[], 1, verbose, &mut err, &mut Fake::default()).unwrap();
+    run(&asked(Command::Test, &[]), &[doc], &[], 1, verbose, &mut err, &mut Fake::default())
+        .unwrap();
     assert_eq!(
         String::from_utf8(err).unwrap(),
         "   Doc-tests my-lib\n     Running `/w/target/debug/deps/my_lib-doctests`\n"
@@ -218,18 +274,33 @@ fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
 #[test]
 fn extra_verbose_shows_the_variables_cargo_sets() {
     let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(3))], ..Fake::default() };
-    let (_, err) = tested(&asked(Command::Test, &["--fail-fast"]), &mut fake, Speaking { verbose: 2, ..speaking() });
+    let (_, err) = tested(
+        &asked(Command::Test, &["--fail-fast"]),
+        &mut fake,
+        Speaking { verbose: 2, ..speaking() },
+    );
     let shown = "`CARGO_PKG_NAME=foo /w/target/debug/deps/foo-0123abcd`";
     assert!(err.starts_with(&format!("     Running {shown}\n")), "{err}");
-    assert!(err.contains(&format!("process didn't exit successfully: {shown} (exit status: 3)")), "{err}");
+    assert!(
+        err.contains(&format!("process didn't exit successfully: {shown} (exit status: 3)")),
+        "{err}"
+    );
 
-    let (_, err) = tested(&asked(Command::Test, &[]), &mut Fake::default(), Speaking { verbose: 1, ..speaking() });
+    let (_, err) = tested(
+        &asked(Command::Test, &[]),
+        &mut Fake::default(),
+        Speaking { verbose: 1, ..speaking() },
+    );
     assert!(err.starts_with("     Running `/w/target/debug/deps/foo-0123abcd`\n"), "{err}");
 }
 
 #[test]
 fn no_run_under_json_lists_nothing() {
-    let (code, err) = tested(&asked(Command::Test, &["--no-run"]), &mut Fake::default(), Speaking { json: true, ..speaking() });
+    let (code, err) = tested(
+        &asked(Command::Test, &["--no-run"]),
+        &mut Fake::default(),
+        Speaking { json: true, ..speaking() },
+    );
     assert_eq!(code, 0);
     assert_eq!(err, "");
 }
@@ -238,7 +309,11 @@ fn no_run_under_json_lists_nothing() {
 #[test]
 fn quiet_keeps_the_error_and_drops_the_note() {
     let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(3))], ..Fake::default() };
-    let (code, err) = tested(&asked(Command::Test, &["--fail-fast"]), &mut fake, Speaking { quiet: true, ..speaking() });
+    let (code, err) = tested(
+        &asked(Command::Test, &["--fail-fast"]),
+        &mut fake,
+        Speaking { quiet: true, ..speaking() },
+    );
     assert_eq!(code, 3);
     assert!(err.starts_with("error: test failed, to rerun pass `--lib`\n\nCaused by:\n"), "{err}");
     assert!(!err.contains("note:"), "{err}");
@@ -259,15 +334,12 @@ fn a_test_that_ended_otherwise() {
         "{err}"
     );
 
-    let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Signal(libc::SIGSEGV))], ..Fake::default() };
-    let (code, err) = tested(&asked(Command::Test, &["--fail-fast", "--", "--nocapture"]), &mut fake, speaking());
+    let mut fake =
+        Fake { ends: vec![("foo-0123abcd", Ended::Signal(libc::SIGSEGV))], ..Fake::default() };
+    let (code, err) =
+        tested(&asked(Command::Test, &["--fail-fast", "--", "--nocapture"]), &mut fake, speaking());
     assert_eq!(code, 101);
-    assert!(
-        err.ends_with(
-            "(signal: 11, SIGSEGV: invalid memory reference)\n"
-        ),
-        "{err}"
-    );
+    assert!(err.ends_with("(signal: 11, SIGSEGV: invalid memory reference)\n"), "{err}");
 }
 
 #[test]
@@ -286,7 +358,8 @@ fn no_run_lists_the_executables() {
 #[test]
 fn quiet_and_bench() {
     let mut fake = Fake::default();
-    let (code, err) = tested(&asked(Command::Bench, &["-q"]), &mut fake, Speaking { quiet: true, ..speaking() });
+    let (code, err) =
+        tested(&asked(Command::Bench, &["-q"]), &mut fake, Speaking { quiet: true, ..speaking() });
     assert_eq!(code, 0);
     assert_eq!(err, "");
     // No doc tests for bench; libtest's `--bench`, and `--quiet` to a harness.
@@ -314,7 +387,8 @@ fn result(binary: &str, name: &str, outcome: TestOutcome, output: &str) -> TestR
 #[test]
 fn the_tests_that_ran_outside_named_in_one_note_as_cargos_shell_writes_it() {
     let inside = result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "");
-    let outside = TestResult { name: "tests::writes_home".to_owned(), outside: true, ..inside.clone() };
+    let outside =
+        TestResult { name: "tests::writes_home".to_owned(), outside: true, ..inside.clone() };
     let mut text = String::new();
     super::outside(&mut text, std::slice::from_ref(&inside), false);
     assert_eq!(text, "", "nothing when every test ran inside");
@@ -324,7 +398,11 @@ fn the_tests_that_ran_outside_named_in_one_note_as_cargos_shell_writes_it() {
         "note: 1 test ran outside the sandbox, so it runs every time and its pass is never kept: tests::writes_home\n"
     );
     text.clear();
-    let failed = TestResult { name: "tests::dials".to_owned(), outcome: TestOutcome::Failed, ..outside.clone() };
+    let failed = TestResult {
+        name: "tests::dials".to_owned(),
+        outcome: TestOutcome::Failed,
+        ..outside.clone()
+    };
     super::outside(&mut text, &[outside, inside, failed], true);
     assert_eq!(
         text,
@@ -335,7 +413,10 @@ fn the_tests_that_ran_outside_named_in_one_note_as_cargos_shell_writes_it() {
 
 #[test]
 fn an_executable_index_past_any_request_is_refused_naming_it() {
-    let far = TestResult { executable: u32::MAX - 1, ..result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "") };
+    let far = TestResult {
+        executable: u32::MAX - 1,
+        ..result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "")
+    };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert!(!reached(&[far], speaking(), &mut out, &mut err).unwrap());
     let err = String::from_utf8(err).unwrap();
@@ -347,7 +428,12 @@ fn an_executable_index_past_any_request_is_refused_naming_it() {
 fn reached_results_in_libtests_format() {
     let results = [
         result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, ""),
-        result("/w/target/debug/deps/foo-0123abcd", "b", TestOutcome::Failed, "thread 'b' panicked\n"),
+        result(
+            "/w/target/debug/deps/foo-0123abcd",
+            "b",
+            TestOutcome::Failed,
+            "thread 'b' panicked\n",
+        ),
         result("/w/target/debug/deps/foo-0123abcd", "c", TestOutcome::Unreached, ""),
         result("/w/target/debug/deps/x-4567", "d", TestOutcome::Ignored, ""),
     ];
@@ -383,7 +469,11 @@ fn reached_results_of_executables_interleaved_by_their_first_and_in_the_order_th
         "     Running target/debug/deps/x-4567\n     Running target/debug/deps/foo-0123abcd\n"
     );
     let out = String::from_utf8(out).unwrap();
-    let tests: Vec<&str> = out.lines().filter_map(|it| it.strip_prefix("test ")).filter(|it| it.ends_with("... ok")).collect();
+    let tests: Vec<&str> = out
+        .lines()
+        .filter_map(|it| it.strip_prefix("test "))
+        .filter(|it| it.ends_with("... ok"))
+        .collect();
     assert_eq!(tests, ["x1 ... ok", "x2 ... ok", "f1 ... ok", "f2 ... ok", "f3 ... ok"]);
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert!(reached(&[], speaking(), &mut out, &mut err).unwrap());

@@ -65,11 +65,9 @@ fn nested_shrink_minimizes_values_inside_clone_nodes() {
     let initial = vec![clone_node(vec![int_node(47), bool_node(true)])];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
-            ShrinkRun::Full(nodes) => (
-                int_at_path_at_least(nodes, &[0, 0], 10),
-                nodes.to_vec(),
-                Spans::new(),
-            ),
+            ShrinkRun::Full(nodes) => {
+                (int_at_path_at_least(nodes, &[0, 0], 10), nodes.to_vec(), Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
         initial,
@@ -84,17 +82,13 @@ fn nested_shrink_minimizes_values_inside_clone_nodes() {
 
 #[test]
 fn nested_shrink_recurses_into_clones_inside_clones() {
-    let initial = vec![clone_node(vec![
-        int_node(30),
-        clone_node(vec![int_node(20), bool_node(true)]),
-    ])];
+    let initial =
+        vec![clone_node(vec![int_node(30), clone_node(vec![int_node(20), bool_node(true)])])];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
-            ShrinkRun::Full(nodes) => (
-                int_at_path_at_least(nodes, &[0, 1, 0], 5),
-                nodes.to_vec(),
-                Spans::new(),
-            ),
+            ShrinkRun::Full(nodes) => {
+                (int_at_path_at_least(nodes, &[0, 1, 0], 5), nodes.to_vec(), Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
         initial,
@@ -112,17 +106,12 @@ fn nested_shrink_recurses_into_clones_inside_clones() {
 
 #[test]
 fn unconstrained_clone_nodes_are_deleted_outright() {
-    let initial = vec![
-        int_node(3),
-        clone_node(vec![int_node(9), bool_node(true), int_node(2)]),
-    ];
+    let initial = vec![int_node(3), clone_node(vec![int_node(9), bool_node(true), int_node(2)])];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
-            ShrinkRun::Full(nodes) => (
-                int_at_path_at_least(nodes, &[0], 3),
-                nodes.to_vec(),
-                Spans::new(),
-            ),
+            ShrinkRun::Full(nodes) => {
+                (int_at_path_at_least(nodes, &[0], 3), nodes.to_vec(), Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
         initial,
@@ -157,10 +146,7 @@ fn nested_shrink_tolerates_runs_that_drop_the_clone_node() {
 
 #[test]
 fn empty_clone_streams_are_left_alone() {
-    let initial = vec![ChoiceNode::clone_stream(
-        Arc::new(RealizedStream::empty()),
-        false,
-    )];
+    let initial = vec![ChoiceNode::clone_stream(Arc::new(RealizedStream::empty()), false)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => (true, nodes.to_vec(), Spans::new()),
@@ -204,11 +190,8 @@ fn nested_clone_probe_routes_probe_requests_through_the_outer_test_fn() {
         i: 0,
     };
     let child_prefix = [ChoiceValue::Integer(BigInt::from(3))];
-    let (matched, nodes, _) = drive_no_yield(probe.run(ShrinkRun::Probe {
-        prefix: &child_prefix,
-        max_size: 4,
-    }))
-    .unwrap();
+    let (matched, nodes, _) =
+        drive_no_yield(probe.run(ShrinkRun::Probe { prefix: &child_prefix, max_size: 4 })).unwrap();
     assert!(matched);
     assert_eq!(nodes.len(), 1);
     assert_eq!(int_value(&nodes[0]), 3);
@@ -235,9 +218,8 @@ impl ShrinkProbe for SweepRecordingProbe {
 #[test]
 fn nested_clone_probe_forwards_sweep_modes_to_the_outer_probe() {
     let modes: Arc<Mutex<Vec<SweepMode>>> = Arc::default();
-    let mut outer: Box<dyn ShrinkProbe + Send> = Box::new(SweepRecordingProbe {
-        modes: Arc::clone(&modes),
-    });
+    let mut outer: Box<dyn ShrinkProbe + Send> =
+        Box::new(SweepRecordingProbe { modes: Arc::clone(&modes) });
     let template = vec![clone_node(vec![int_node(5)])];
     let outer_values: Vec<ChoiceValue> = template.iter().map(|n| n.value()).collect();
     let mut probe = super::NestedCloneProbe {
@@ -246,10 +228,7 @@ fn nested_clone_probe_forwards_sweep_modes_to_the_outer_probe() {
         outer_values: &outer_values,
         i: 0,
     };
-    assert_eq!(
-        probe.set_sweep_mode(SweepMode::Confirm),
-        Some(SweepMode::Fast)
-    );
+    assert_eq!(probe.set_sweep_mode(SweepMode::Confirm), Some(SweepMode::Fast));
     assert_eq!(*modes.lock().unwrap(), vec![SweepMode::Confirm]);
 }
 
@@ -284,9 +263,7 @@ impl ShrinkProbe for GauntletedCloneProbe {
 fn nested_clone_shrink_reaches_the_minimum_through_confirmation_sweeps() {
     let initial = vec![clone_node(vec![int_node(47), bool_node(true)])];
     let mut shrinker = Shrinker::with_probe(
-        Box::new(GauntletedCloneProbe {
-            mode: SweepMode::Fast,
-        }),
+        Box::new(GauntletedCloneProbe { mode: SweepMode::Fast }),
         initial,
         Spans::new(),
     );
@@ -316,8 +293,7 @@ impl crate::native::shrinker::ShrinkProbe for AdoptionRecorder {
     }
 
     fn candidate_adopted(&mut self) -> Result<(), crate::control::InternalError> {
-        self.adopted
-            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        self.adopted.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
@@ -326,9 +302,7 @@ impl crate::native::shrinker::ShrinkProbe for AdoptionRecorder {
 fn nested_clone_probe_forwards_candidate_adopted() {
     let adopted = Arc::new(core::sync::atomic::AtomicUsize::new(0));
     let mut inner: Box<dyn crate::native::shrinker::ShrinkProbe + Send> =
-        Box::new(AdoptionRecorder {
-            adopted: adopted.clone(),
-        });
+        Box::new(AdoptionRecorder { adopted: adopted.clone() });
     let template = vec![clone_node(vec![int_node(3)])];
     let outer_values: Vec<ChoiceValue> = template.iter().map(|n| n.value()).collect();
     let mut probe = NestedCloneProbe {

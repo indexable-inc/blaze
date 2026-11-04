@@ -100,13 +100,7 @@ fn too_slow_check_quiet_when_under_threshold() {
 #[test]
 fn too_slow_check_quiet_when_enough_valid_cases() {
     assert!(
-        too_slow_check(
-            10_000,
-            Duration::from_secs(60),
-            Duration::from_secs(30),
-            false,
-        )
-        .is_none()
+        too_slow_check(10_000, Duration::from_secs(60), Duration::from_secs(30), false,).is_none()
     );
 }
 
@@ -268,11 +262,7 @@ fn cached_test_function_executes_a_truncated_known_path_to_overrun() {
 
             let again = ctx.cached_test_function(&truncated, None, 0).await.unwrap();
             assert_eq!(again.status, Status::EarlyStop);
-            assert_eq!(
-                count.get(),
-                3,
-                "an overrun concluded nothing and is never served"
-            );
+            assert_eq!(count.get(), 3, "an overrun concluded nothing and is never served");
         },
     );
 }
@@ -297,11 +287,7 @@ fn cached_test_function_probe_executes_a_truncated_prefix_with_continuation() {
             let prefix = [ChoiceValue::Boolean(false)];
             let run = ctx.cached_test_function(&prefix, None, 1).await.unwrap();
             assert_eq!(run.status, Status::Valid);
-            assert_eq!(
-                count.get(),
-                2,
-                "a probe must execute the body to draw its continuation"
-            );
+            assert_eq!(count.get(), 2, "a probe must execute the body to draw its continuation");
         },
     );
 }
@@ -368,17 +354,13 @@ fn a_repeated_stateful_probe_is_served() {
                     BigInt::from(500),
                 )]),
             ));
-            let first = ctx
-                .cached_test_function(std::slice::from_ref(&clone), None, 0)
-                .await
-                .unwrap();
+            let first =
+                ctx.cached_test_function(std::slice::from_ref(&clone), None, 0).await.unwrap();
             assert_eq!(first.status, Status::Interesting);
             assert_eq!(count.get(), 1);
 
-            let second = ctx
-                .cached_test_function(std::slice::from_ref(&clone), None, 0)
-                .await
-                .unwrap();
+            let second =
+                ctx.cached_test_function(std::slice::from_ref(&clone), None, 0).await.unwrap();
             assert_eq!(second.status, Status::Interesting);
             assert_eq!(count.get(), 1, "the clone-bearing repeat must be served");
         },
@@ -418,10 +400,7 @@ fn a_reexecuted_fingerprint_with_a_different_outcome_flips_the_run() {
                 .await
                 .unwrap();
             assert_eq!(run.status, Status::Interesting);
-            assert!(
-                mismatch.is_none(),
-                "quiet strictness flips instead of aborting"
-            );
+            assert!(mismatch.is_none(), "quiet strictness flips instead of aborting");
             assert!(ctx.nd_active);
         },
     );
@@ -434,9 +413,7 @@ fn a_reexecuted_fingerprint_with_a_different_outcome_aborts_under_error_strictne
     use std::sync::atomic::{AtomicUsize, Ordering};
     let execs = AtomicUsize::new(0);
     with_engine(
-        Settings::new()
-            .database(None)
-            .nondeterminism_strictness(NondeterminismStrictness::Error),
+        Settings::new().database(None).nondeterminism_strictness(NondeterminismStrictness::Error),
         None,
         move |ds| {
             if rbool(ds).is_err() {
@@ -470,10 +447,7 @@ fn a_reexecuted_fingerprint_with_a_different_outcome_aborts_under_error_strictne
                 }
                 other => panic!("expected the flaky abort, got {other:?}"),
             }
-            assert!(
-                !ctx.nd_active,
-                "error strictness aborts instead of flipping"
-            );
+            assert!(!ctx.nd_active, "error strictness aborts instead of flipping");
         },
     );
 }
@@ -485,9 +459,7 @@ fn a_valid_to_invalid_verdict_flip_aborts_with_the_bare_diagnostic() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let execs = AtomicUsize::new(0);
     with_engine(
-        Settings::new()
-            .database(None)
-            .nondeterminism_strictness(NondeterminismStrictness::Error),
+        Settings::new().database(None).nondeterminism_strictness(NondeterminismStrictness::Error),
         None,
         move |ds| {
             if rbool(ds).is_err() {
@@ -514,10 +486,7 @@ fn a_valid_to_invalid_verdict_flip_aborts_with_the_bare_diagnostic() {
             match mismatch {
                 Some(RunError::Flaky(msg)) => {
                     assert!(msg.contains("Flaky test detected"), "{msg}");
-                    assert!(
-                        !msg.contains("did not reproduce"),
-                        "no failure to name: {msg}"
-                    );
+                    assert!(!msg.contains("did not reproduce"), "no failure to name: {msg}");
                 }
                 other => panic!("expected the flaky abort, got {other:?}"),
             }
@@ -542,9 +511,7 @@ fn the_execution_cache_is_flushed_and_serving_stops_at_the_flip() {
 
             ctx.nd_flip();
             assert!(
-                ctx.exec_cache
-                    .serve(&serialize_choices(&choices).unwrap())
-                    .is_none(),
+                ctx.exec_cache.serve(&serialize_choices(&choices).unwrap()).is_none(),
                 "the flip flushes the cache"
             );
             ctx.cached_test_function(&choices, None, 0).await.unwrap();
@@ -556,10 +523,7 @@ fn the_execution_cache_is_flushed_and_serving_stops_at_the_flip() {
 fn tiny_invalid_run(
     settings: Settings,
     body_status: TestCaseResult,
-) -> (
-    Result<crate::backend::TestRunResult, crate::backend::RunError>,
-    u64,
-) {
+) -> (Result<crate::backend::TestRunResult, crate::backend::RunError>, u64) {
     let execs = Cell::new(0u64);
     let mut run_case = |ds: Box<dyn DataSource + Send + Sync>| {
         execs.set(execs.get() + 1);
@@ -618,10 +582,7 @@ fn an_all_invalid_run_under_suppression_is_unsatisfiable() {
     );
     match result {
         Err(RunError::Unsatisfiable(msg)) => {
-            assert!(
-                msg.contains("459 inputs were rejected by assume() or a filter"),
-                "{msg}"
-            );
+            assert!(msg.contains("459 inputs were rejected by assume() or a filter"), "{msg}");
         }
         other => panic!("expected Unsatisfiable, got {other:?}"),
     }
@@ -633,13 +594,10 @@ fn an_all_invalid_run_under_suppression_is_unsatisfiable() {
 #[test]
 fn an_all_overrun_run_under_suppression_is_unsatisfiable() {
     let (result, execs) = tiny_invalid_run(
-        Settings::new()
-            .database(None)
-            .test_cases(10_000)
-            .suppress_health_check([
-                HealthCheck::TestCasesTooLarge,
-                HealthCheck::LargeInitialTestCase,
-            ]),
+        Settings::new().database(None).test_cases(10_000).suppress_health_check([
+            HealthCheck::TestCasesTooLarge,
+            HealthCheck::LargeInitialTestCase,
+        ]),
         TestCaseResult::Overrun,
     );
     match result {
@@ -662,10 +620,7 @@ fn an_all_invalid_run_is_unsatisfiable_under_nd_handling() {
         .suppress_health_check([HealthCheck::FilterTooMuch]);
     settings.nd_force = true;
     let (result, _) = tiny_invalid_run(settings, TestCaseResult::Invalid);
-    assert!(
-        matches!(result, Err(RunError::Unsatisfiable(_))),
-        "{result:?}"
-    );
+    assert!(matches!(result, Err(RunError::Unsatisfiable(_))), "{result:?}");
 }
 
 /// A test accepting one of seven equally likely values, with FilterTooMuch
@@ -701,10 +656,7 @@ fn a_rare_valid_value_is_reached_under_suppression() {
             Duration::from_secs(30),
             Duration::from_secs(300),
         );
-        assert!(
-            result.as_ref().is_ok_and(|r| r.failures.is_empty()),
-            "seed {seed}: {result:?}"
-        );
+        assert!(result.as_ref().is_ok_and(|r| r.failures.is_empty()), "seed {seed}: {result:?}");
         assert_eq!(valid.get(), 5, "seed {seed} after {} cases", execs.get());
     }
 }
@@ -712,10 +664,8 @@ fn a_rare_valid_value_is_reached_under_suppression() {
 /// A tiny space whose cases are valid runs to its test-case budget.
 #[test]
 fn a_tiny_passing_space_generates_to_its_test_case_budget() {
-    let (result, execs) = tiny_invalid_run(
-        Settings::new().database(None).test_cases(50),
-        TestCaseResult::Valid,
-    );
+    let (result, execs) =
+        tiny_invalid_run(Settings::new().database(None).test_cases(50), TestCaseResult::Valid);
     assert!(result.unwrap().failures.is_empty());
     assert!(execs >= 50, "a valid space is budget-bounded: {execs}");
 }
@@ -727,23 +677,18 @@ fn verbose_output_announces_every_case() {
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = std::sync::Arc::clone(&lines);
     let (result, execs) = tiny_invalid_run(
-        Settings::new()
-            .database(None)
-            .test_cases(50)
-            .verbosity(Verbosity::Verbose)
-            .output(Output::callback(move |line| {
+        Settings::new().database(None).test_cases(50).verbosity(Verbosity::Verbose).output(
+            Output::callback(move |line| {
                 sink.lock().unwrap().push(line.to_string());
-            })),
+            }),
+        ),
         TestCaseResult::Valid,
     );
     assert!(result.unwrap().failures.is_empty());
     let lines = lines.lock().unwrap();
     let announced = lines.iter().filter(|l| *l == "Running test case").count() as u64;
     assert_eq!(announced, execs, "{lines:?}");
-    let generate = lines
-        .iter()
-        .position(|l| l == "Starting phase: Generate")
-        .unwrap();
+    let generate = lines.iter().position(|l| l == "Starting phase: Generate").unwrap();
     assert_eq!(lines[generate + 1], "Running test case", "{lines:?}");
 }
 
@@ -755,20 +700,16 @@ fn verbose_output_announces_reuse_replays() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = std::sync::Arc::clone(&lines);
     let calls = AtomicU64::new(0);
     let result = reuse_run(
-        Settings::new()
-            .database(Some(path.clone()))
-            .verbosity(Verbosity::Verbose)
-            .output(Output::callback(move |line| {
+        Settings::new().database(Some(path.clone())).verbosity(Verbosity::Verbose).output(
+            Output::callback(move |line| {
                 sink.lock().unwrap().push(line.to_string());
-            })),
+            }),
+        ),
         "k",
         |ds| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -783,10 +724,7 @@ fn verbose_output_announces_reuse_replays() {
     let lines = lines.lock().unwrap();
     let announced = lines.iter().filter(|l| *l == "Running test case").count() as u64;
     assert_eq!(announced, calls.load(Ordering::SeqCst), "{lines:?}");
-    let reuse = lines
-        .iter()
-        .position(|l| l == "Starting phase: Reuse")
-        .unwrap();
+    let reuse = lines.iter().position(|l| l == "Starting phase: Reuse").unwrap();
     assert_eq!(lines[reuse + 1], "Running test case", "{lines:?}");
 }
 
@@ -798,10 +736,7 @@ fn overrun_during_draw_overrides_a_swallowed_valid_outcome() {
             TestCaseResult::Valid
         },
         async |ctx, _| {
-            let run = ctx
-                .execute(NativeTestCase::for_choices(&[], None, None))
-                .await
-                .unwrap();
+            let run = ctx.execute(NativeTestCase::for_choices(&[], None, None)).await.unwrap();
             assert_eq!(run.status, Status::EarlyStop);
         },
     );
@@ -837,12 +772,7 @@ fn span_mutation_re_executes_proposals_that_are_not_exact_repeats() {
             Err(()) => TestCaseResult::Overrun,
         },
         async |ctx, count| {
-            let nodes = vec![
-                bool_node(false),
-                bool_node(true),
-                bool_node(false),
-                bool_node(true),
-            ];
+            let nodes = vec![bool_node(false), bool_node(true), bool_node(false), bool_node(true)];
             let span = |start, end| Span {
                 start,
                 end,
@@ -872,12 +802,8 @@ fn span_mutation_returns_interesting_proposal() {
             Err(()) => TestCaseResult::Overrun,
         },
         async |ctx, count| {
-            let nodes = vec![
-                bool_node(false),
-                bool_node(false),
-                bool_node(false),
-                bool_node(false),
-            ];
+            let nodes =
+                vec![bool_node(false), bool_node(false), bool_node(false), bool_node(false)];
             let span = |start, end| Span {
                 start,
                 end,
@@ -905,13 +831,7 @@ const NESTED: &str = "start: \"[\" (start (\",\" start)*)? \"]\" | \"x\"\n";
 /// A grammar spec for `text`, strings capped at `max_size`, with its
 /// simplest string found so that nodes can be recorded under it.
 fn grammar_spec(text: &str, max_size: u64) -> Rc<GrammarSpec> {
-    grammar_spec_with(
-        text,
-        GrammarOptions {
-            max_size,
-            ..GrammarOptions::default()
-        },
-    )
+    grammar_spec_with(text, GrammarOptions { max_size, ..GrammarOptions::default() })
 }
 
 fn grammar_spec_with(text: &str, options: GrammarOptions) -> Rc<GrammarSpec> {
@@ -1010,10 +930,7 @@ fn grammar_mutation_returns_at_the_first_interesting_proposal() {
 fn grammar_mutation_keeps_within_the_depth_cap() {
     let spec = grammar_spec_with(
         "start: \"(\" start \")\" | \"x\"\n",
-        GrammarOptions {
-            max_depth: 3,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { max_depth: 3, ..GrammarOptions::default() },
     );
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut draw = drawing(&spec, &seen);
@@ -1176,9 +1093,7 @@ fn span_mutation_skips_proposals_already_executed() {
 
             for value in [false, true] {
                 let choices = [ChoiceValue::Boolean(value), ChoiceValue::Boolean(value)];
-                ctx.test_function(NativeTestCase::for_choices(&choices, None, None))
-                    .await
-                    .unwrap();
+                ctx.test_function(NativeTestCase::for_choices(&choices, None, None)).await.unwrap();
             }
             let before = count.get();
             ctx.try_span_mutation(&nodes, &spans).await.unwrap();
@@ -1195,12 +1110,7 @@ fn span_mutation_stops_when_example_budget_is_full() {
             Err(()) => TestCaseResult::Overrun,
         },
         async |ctx, count| {
-            let nodes = vec![
-                bool_node(false),
-                bool_node(true),
-                bool_node(false),
-                bool_node(true),
-            ];
+            let nodes = vec![bool_node(false), bool_node(true), bool_node(false), bool_node(true)];
             let span = |start, end| Span {
                 start,
                 end,
@@ -1332,9 +1242,7 @@ fn collecting_settings() -> (Settings, Arc<crate::sys::sync::Mutex<Vec<String>>>
     let sink = Arc::clone(&lines);
     let settings = Settings::new()
         .database(None)
-        .output(Output::callback(move |line| {
-            sink.lock().push(line.to_string())
-        }));
+        .output(Output::callback(move |line| sink.lock().push(line.to_string())));
     (settings, lines)
 }
 
@@ -1366,11 +1274,7 @@ fn a_v1_blob_draw_past_the_recorded_choices_does_not_reproduce() {
         if rbool(ds).is_err() {
             return TestCaseResult::Overrun;
         }
-        if first {
-            boom("continuation reached")
-        } else {
-            TestCaseResult::Valid
-        }
+        if first { boom("continuation reached") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert!(
@@ -1433,15 +1337,14 @@ fn a_v1_blob_draw_of_another_kind_does_not_reproduce() {
 fn a_v1_blob_divergence_is_silent_when_quiet() {
     let blob = crate::native::blob::encode_failure(&[ChoiceValue::Boolean(true)]).unwrap();
     let (settings, lines) = collecting_settings();
-    let result = reproduce_blob_sync(
-        &settings.verbosity(Verbosity::Quiet),
-        &blob,
-        |ds| match rint(ds, 0, 100) {
-            Ok(_) => boom("changed shape"),
-            Err(()) => TestCaseResult::Overrun,
-        },
-    )
-    .unwrap();
+    let result =
+        reproduce_blob_sync(&settings.verbosity(Verbosity::Quiet), &blob, |ds| {
+            match rint(ds, 0, 100) {
+                Ok(_) => boom("changed shape"),
+                Err(()) => TestCaseResult::Overrun,
+            }
+        })
+        .unwrap();
     assert!(result.failures.is_empty());
     assert!(lines.lock().is_empty(), "got {:?}", *lines.lock());
 }
@@ -1463,11 +1366,7 @@ fn a_v1_blob_divergence_in_a_cloned_stream_does_not_reproduce() {
     })
     .unwrap();
     assert!(result.failures.is_empty());
-    assert!(
-        divergence_line(&lines, 1, " of stream [0]"),
-        "got {:?}",
-        *lines.lock()
-    );
+    assert!(divergence_line(&lines, 1, " of stream [0]"), "got {:?}", *lines.lock());
 }
 
 #[test]
@@ -1521,11 +1420,7 @@ fn a_v1_blob_retries_up_to_its_budget() {
         if rbool(ds).is_err() {
             return TestCaseResult::Overrun;
         }
-        if calls == 3 {
-            boom("third replay")
-        } else {
-            TestCaseResult::Valid
-        }
+        if calls == 3 { boom("third replay") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert_eq!(calls, 3, "the replay loop retries past the early passes");
@@ -1650,11 +1545,7 @@ fn reproduce_blob_replays_an_nd_blob_until_a_replay_fails() {
             return TestCaseResult::Overrun;
         }
         calls += 1;
-        if calls == 3 {
-            boom("third replay")
-        } else {
-            TestCaseResult::Valid
-        }
+        if calls == 3 { boom("third replay") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert_eq!(calls, 3, "the replay loop retries past the early misses");
@@ -1802,10 +1693,8 @@ fn run_main_with_urandom_backend_generates_and_passes() {
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let settings = Settings::new()
-        .test_cases(20)
-        .database(None)
-        .backend(crate::settings::Backend::Urandom);
+    let settings =
+        Settings::new().test_cases(20).database(None).backend(crate::settings::Backend::Urandom);
     let exploration = run_main_sync(
         &settings,
         None,
@@ -1827,10 +1716,8 @@ fn run_main_with_urandom_backend_finds_counterexample() {
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let settings = Settings::new()
-        .test_cases(20)
-        .database(None)
-        .backend(crate::settings::Backend::Urandom);
+    let settings =
+        Settings::new().test_cases(20).database(None).backend(crate::settings::Backend::Urandom);
     let exploration = run_main_sync(
         &settings,
         None,
@@ -1839,11 +1726,7 @@ fn run_main_with_urandom_backend_finds_counterexample() {
         Duration::from_secs(300),
     );
     let result = exploration.unwrap();
-    assert!(
-        result.failures[0].origin.contains("always fails"),
-        "{:?}",
-        result.failures
-    );
+    assert!(result.failures[0].origin.contains("always fails"), "{:?}", result.failures);
 }
 
 #[test]
@@ -1872,37 +1755,18 @@ fn run_main_stops_shrinking_when_budget_is_exhausted() {
             }
             len += 1;
         }
-        if len > 0 {
-            boom("non-empty vec")
-        } else {
-            TestCaseResult::Valid
-        }
+        if len > 0 { boom("non-empty vec") } else { TestCaseResult::Valid }
     };
     let mut run_case = |ds: Box<dyn DataSource + Send + Sync>| {
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let settings = Settings::new()
-        .test_cases(200)
-        .database(None)
-        .derandomize(true);
-    let exploration = run_main_sync(
-        &settings,
-        None,
-        &mut run_case,
-        Duration::from_secs(30),
-        Duration::ZERO,
-    );
+    let settings = Settings::new().test_cases(200).database(None).derandomize(true);
+    let exploration =
+        run_main_sync(&settings, None, &mut run_case, Duration::from_secs(30), Duration::ZERO);
     let result = exploration.unwrap();
-    assert!(
-        !result.failures.is_empty(),
-        "the failure must still be reported"
-    );
-    assert!(
-        result.failures[0].origin.contains("non-empty vec"),
-        "{:?}",
-        result.failures
-    );
+    assert!(!result.failures.is_empty(), "the failure must still be reported");
+    assert!(result.failures[0].origin.contains("non-empty vec"), "{:?}", result.failures);
 }
 
 /// The nondeterministic counterpart of the budget guard above: when the
@@ -1925,32 +1789,21 @@ fn run_main_reports_a_confirmed_nd_failure_when_the_shrink_budget_is_exhausted()
         if rint(ds, 0, 100).is_err() {
             return TestCaseResult::Overrun;
         }
-        if a && n % 2 == 0 {
-            boom("racy")
-        } else {
-            TestCaseResult::Valid
-        }
+        if a && n % 2 == 0 { boom("racy") } else { TestCaseResult::Valid }
     };
     let mut run_case = |ds: Box<dyn DataSource + Send + Sync>| {
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let mut settings = Settings::new()
-        .test_cases(200)
-        .database(None)
-        .derandomize(true)
-        .output(Output::callback(move |line| {
+    let mut settings = Settings::new().test_cases(200).database(None).derandomize(true).output(
+        Output::callback(move |line| {
             sink.lock().unwrap().push(line.to_string());
-        }));
+        }),
+    );
     settings.nd_force = true;
-    let result = run_main_sync(
-        &settings,
-        None,
-        &mut run_case,
-        Duration::from_secs(30),
-        Duration::ZERO,
-    )
-    .unwrap();
+    let result =
+        run_main_sync(&settings, None, &mut run_case, Duration::from_secs(30), Duration::ZERO)
+            .unwrap();
     assert_eq!(result.failures.len(), 1, "{:?}", result.failures);
     let failure = &result.failures[0];
     assert!(failure.origin.contains("racy"), "{failure:?}");
@@ -1979,10 +1832,7 @@ fn a_passing_run_executes_a_seed_pinned_count() {
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let settings = Settings::new()
-        .test_cases(50)
-        .database(None)
-        .derandomize(true);
+    let settings = Settings::new().test_cases(50).database(None).derandomize(true);
     let result = run_main_sync(
         &settings,
         None,
@@ -2009,21 +1859,14 @@ fn a_deterministic_shrink_stays_within_the_tree_era_execution_budget() {
                 Err(()) => return TestCaseResult::Overrun,
             }
         }
-        if sum >= 200 {
-            boom("large sum")
-        } else {
-            TestCaseResult::Valid
-        }
+        if sum >= 200 { boom("large sum") } else { TestCaseResult::Valid }
     };
     let mut run_case = |ds: Box<dyn DataSource + Send + Sync>| {
         execs.set(execs.get() + 1);
         let result = body(&*ds);
         ds.mark_complete(&result);
     };
-    let settings = Settings::new()
-        .test_cases(50)
-        .database(None)
-        .derandomize(true);
+    let settings = Settings::new().test_cases(50).database(None).derandomize(true);
     let result = run_main_sync(
         &settings,
         None,
@@ -2047,13 +1890,8 @@ fn run_main_reports_too_slow_at_call_site() {
         ds.mark_complete(&result);
     };
     let settings = Settings::new().test_cases(100).database(None);
-    let exploration = run_main_sync(
-        &settings,
-        None,
-        &mut run_case,
-        Duration::ZERO,
-        Duration::from_secs(300),
-    );
+    let exploration =
+        run_main_sync(&settings, None, &mut run_case, Duration::ZERO, Duration::from_secs(300));
     let result = exploration;
     match result {
         Err(crate::backend::RunError::HealthCheck(check, msg)) => {
@@ -2133,10 +1971,8 @@ fn genuine_overrun_is_early_stop_and_not_cached() {
             TestCaseResult::Valid
         },
         async |ctx, count| {
-            let (run, _mismatch) = ctx
-                .test_function(NativeTestCase::for_simplest(1).unwrap())
-                .await
-                .unwrap();
+            let (run, _mismatch) =
+                ctx.test_function(NativeTestCase::for_simplest(1).unwrap()).await.unwrap();
             assert_eq!(run.status, Status::EarlyStop);
 
             let choices: Vec<ChoiceValue> = run.nodes.iter().map(|n| n.value().clone()).collect();
@@ -2174,10 +2010,7 @@ fn reuse_replay_extends_past_stored_prefix() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
 
     let result = reuse_run(
         Settings::new()
@@ -2194,11 +2027,7 @@ fn reuse_replay_extends_past_stored_prefix() {
                 Ok(v) => v,
                 Err(()) => return TestCaseResult::Overrun,
             };
-            if a {
-                boom("replayed bug")
-            } else {
-                TestCaseResult::Valid
-            }
+            if a { boom("replayed bug") } else { TestCaseResult::Valid }
         },
     );
     assert!(
@@ -2213,10 +2042,7 @@ fn reuse_consults_secondary_corpus_when_primary_fails_to_reproduce() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap());
     let secondary_key = crate::native::database::sub_key(b"k", b"secondary");
     db.save(
         &secondary_key,
@@ -2248,10 +2074,7 @@ fn reuse_randomly_samples_secondary_corpus_when_it_overflows_the_shortfall() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap());
     let secondary_key = crate::native::database::sub_key(b"k", b"secondary");
     for n in [4242, 4243, 4244, 4245] {
         db.save(
@@ -2285,10 +2108,7 @@ fn reuse_skips_secondary_corpus_once_a_primary_entry_reproduces() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap());
     let secondary_key = crate::native::database::sub_key(b"k", b"secondary");
     db.save(
         &secondary_key,
@@ -2329,10 +2149,7 @@ fn shrink_phase_drains_stale_secondary_corpus_entries() {
     db.save(&secondary_key, &stale);
 
     let result = reuse_run(
-        Settings::new()
-            .database(Some(path.clone()))
-            .test_cases(200)
-            .verbosity(Verbosity::Quiet),
+        Settings::new().database(Some(path.clone())).test_cases(200).verbosity(Verbosity::Quiet),
         "k",
         |ds| match rint(ds, i64::MIN, i64::MAX) {
             Ok(n) if n >= 1000 => boom("big bug"),
@@ -2386,9 +2203,7 @@ fn should_generate_more_ignores_bugs_without_stop_on_first_failure() {
         false,
         Some(std::time::Duration::from_secs(11)),
     ));
-    assert!(should_generate_more(
-        false, 5, None, None, false, false, false, None
-    ));
+    assert!(should_generate_more(false, 5, None, None, false, false, false, None));
 }
 
 #[test]
@@ -2398,14 +2213,8 @@ fn reuse_stops_after_first_reproduced_bug_without_multiple_reporting() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(1111))]).unwrap(),
-    );
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(2222))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(1111))]).unwrap());
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(2222))]).unwrap());
 
     let calls = AtomicUsize::new(0);
     let result = reuse_run(
@@ -2442,17 +2251,11 @@ fn reuse_found_bug_skips_generation_entirely() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap());
 
     let calls = AtomicUsize::new(0);
     let result = reuse_run(
-        Settings::new()
-            .database(Some(path.clone()))
-            .test_cases(200)
-            .verbosity(Verbosity::Quiet),
+        Settings::new().database(Some(path.clone())).test_cases(200).verbosity(Verbosity::Quiet),
         "k",
         |ds| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -2580,20 +2383,11 @@ fn one_reported_failure_shrinks_only_the_smallest_and_persists_the_rest() {
     assert_eq!(result.failures.len(), 1);
     assert!(result.failures[0].origin.contains("small"));
 
-    let mut stored: Vec<Vec<ChoiceValue>> = db
-        .fetch(b"k")
-        .iter()
-        .map(|raw| deserialize_choices(raw).unwrap())
-        .collect();
+    let mut stored: Vec<Vec<ChoiceValue>> =
+        db.fetch(b"k").iter().map(|raw| deserialize_choices(raw).unwrap()).collect();
     stored.sort_by_key(|choices| choices.len());
     assert_eq!(stored.len(), 2, "{stored:?}");
-    assert_eq!(
-        stored[0],
-        vec![
-            ChoiceValue::Integer(BigInt::from(1)),
-            ChoiceValue::Boolean(false)
-        ]
-    );
+    assert_eq!(stored[0], vec![ChoiceValue::Integer(BigInt::from(1)), ChoiceValue::Boolean(false)]);
     let smallest_sighting = *large_sightings.lock().unwrap().iter().min().unwrap();
     assert_eq!(
         stored[1],
@@ -2640,11 +2434,7 @@ fn one_reported_failure_shrinks_a_smaller_failure_found_while_shrinking() {
     .unwrap();
     assert_eq!(*first_failure.lock().unwrap(), Some("large"));
     assert_eq!(result.failures.len(), 1);
-    assert!(
-        result.failures[0].origin.contains("small"),
-        "{}",
-        result.failures[0].origin
-    );
+    assert!(result.failures[0].origin.contains("small"), "{}", result.failures[0].origin);
     let blob = result.failures[0].reproduce_blob.as_deref().unwrap();
     assert_eq!(
         crate::native::blob::decode_failure(blob).unwrap(),
@@ -2659,10 +2449,7 @@ fn stop_on_first_failure_off_generates_after_a_database_replay() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap());
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = std::sync::Arc::clone(&lines);
     let calls = AtomicU64::new(0);
@@ -2693,10 +2480,7 @@ fn stop_on_first_failure_off_generates_after_a_database_replay() {
         calls.load(Ordering::SeqCst)
     );
     let lines = lines.lock().unwrap();
-    assert!(
-        lines.iter().any(|l| l == "Starting phase: Generate"),
-        "{lines:?}"
-    );
+    assert!(lines.iter().any(|l| l == "Starting phase: Generate"), "{lines:?}");
     assert!(
         !lines.iter().any(|l| l == "Starting phase: Shrink"),
         "an aligned replay that generation added nothing to still skips shrinking: {lines:?}"
@@ -2709,10 +2493,7 @@ fn a_failure_found_after_an_aligned_replay_restores_shrinking() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(4242))]).unwrap());
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = std::sync::Arc::clone(&lines);
     let result = reuse_run(
@@ -2737,10 +2518,7 @@ fn a_failure_found_after_an_aligned_replay_restores_shrinking() {
     .unwrap();
     assert_eq!(result.failures.len(), 1);
     let lines = lines.lock().unwrap();
-    assert!(
-        lines.iter().any(|l| l == "Starting phase: Shrink"),
-        "{lines:?}"
-    );
+    assert!(lines.iter().any(|l| l == "Starting phase: Shrink"), "{lines:?}");
     assert_eq!(db.fetch(b"k").len(), 2, "both failures are persisted");
 }
 
@@ -2751,14 +2529,8 @@ fn stop_on_first_failure_off_replays_every_stored_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(1111))]).unwrap(),
-    );
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(2222))]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(1111))]).unwrap());
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Integer(BigInt::from(2222))]).unwrap());
 
     let calls = AtomicUsize::new(0);
     let result = reuse_run(
@@ -2789,9 +2561,7 @@ fn stop_on_first_failure_off_replays_every_stored_failure() {
 
 #[test]
 fn should_generate_more_stops_without_bug_markers() {
-    assert!(!should_generate_more(
-        false, 5, None, None, true, true, true, None
-    ));
+    assert!(!should_generate_more(false, 5, None, None, true, true, true, None));
 }
 
 #[test]
@@ -2862,10 +2632,7 @@ fn shrink_verify_surfaces_generator_nondeterminism() {
     );
     match result {
         Err(crate::backend::RunError::NonDeterministic(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("non-deterministic"),
-                "got: {msg}"
-            );
+            assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
         }
         other => panic!("expected RunError::NonDeterministic, got {other:?}"),
     }
@@ -2908,10 +2675,7 @@ fn final_replay_surfaces_generator_nondeterminism_under_error_strictness() {
     );
     match result {
         Err(crate::backend::RunError::NonDeterministic(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("non-deterministic"),
-                "got: {msg}"
-            );
+            assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
         }
         other => panic!("expected RunError::NonDeterministic, got {other:?}"),
     }
@@ -2998,10 +2762,7 @@ fn a_concurrent_run_shrinks_and_reports_a_caveated_blob() {
     assert!(result.failures[0].reproduce_blob.is_some());
     let caveat = result.failures[0].caveat.as_deref().unwrap();
     assert!(caveat.starts_with("nondeterministic failure"), "{caveat}");
-    assert!(
-        seen_bug.load(Ordering::SeqCst),
-        "the bug must have been discovered by generation"
-    );
+    assert!(seen_bug.load(Ordering::SeqCst), "the bug must have been discovered by generation");
 }
 
 #[test]
@@ -3030,10 +2791,7 @@ fn a_concurrent_one_shot_bug_is_reported_unconfirmed() {
     assert!(result.failures[0].origin.contains("racy origin"));
     assert!(result.failures[0].reproduce_blob.is_none());
     let caveat = result.failures[0].caveat.as_deref().unwrap();
-    assert!(
-        caveat.starts_with("unconfirmed failure: failed 0 of"),
-        "{caveat}"
-    );
+    assert!(caveat.starts_with("unconfirmed failure: failed 0 of"), "{caveat}");
 }
 
 #[test]
@@ -3044,9 +2802,7 @@ fn a_flipped_reuse_run_persists_v2_entries() {
     let seeded = serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap();
     db.save(b"k", &seeded);
 
-    let mut settings = Settings::new()
-        .database(Some(path.clone()))
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(Some(path.clone())).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         if rbool(ds).is_err() {
@@ -3064,44 +2820,34 @@ fn a_flipped_reuse_run_persists_v2_entries() {
     let primary = db.fetch(b"k");
     assert!(!primary.is_empty());
     assert!(
-        primary
-            .iter()
-            .all(|e| crate::native::blob::decode_nd_state(e).is_some()),
+        primary.iter().all(|e| crate::native::blob::decode_nd_state(e).is_some()),
         "a flipped reuse run persists version-2 entries"
     );
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
-    assert!(
-        db.fetch(&secondary).contains(&seeded),
-        "the stale v1 entry is demoted, not deleted"
-    );
+    assert!(db.fetch(&secondary).contains(&seeded), "the stale v1 entry is demoted, not deleted");
 }
 
 #[test]
 fn debug_runs_log_the_loaded_config_path() {
     use std::sync::{Arc, Mutex};
-    for (path, expected) in [
-        (Some("/a/hegel.toml"), "loaded config: /a/hegel.toml"),
-        (None, "no config file loaded"),
-    ] {
+    for (path, expected) in
+        [(Some("/a/hegel.toml"), "loaded config: /a/hegel.toml"), (None, "no config file loaded")]
+    {
         let lines: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink = Arc::clone(&lines);
-        let mut settings = Settings::new()
-            .database(None)
-            .test_cases(2)
-            .verbosity(Verbosity::Debug)
-            .output(Output::callback(move |line| {
-                sink.lock().unwrap().push(line.to_string());
-            }));
+        let mut settings =
+            Settings::new().database(None).test_cases(2).verbosity(Verbosity::Debug).output(
+                Output::callback(move |line| {
+                    sink.lock().unwrap().push(line.to_string());
+                }),
+            );
         settings.config_path = path.map(String::from);
         reuse_run(settings, "k", |ds| match rbool(ds) {
             Ok(_) => TestCaseResult::Valid,
             Err(()) => TestCaseResult::Overrun,
         })
         .unwrap();
-        assert!(
-            lines.lock().unwrap().iter().any(|l| l == expected),
-            "missing {expected:?}"
-        );
+        assert!(lines.lock().unwrap().iter().any(|l| l == expected), "missing {expected:?}");
     }
 }
 
@@ -3156,14 +2902,8 @@ fn reuse_detects_nondeterministic_generator_across_replays() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap());
 
     let flip = AtomicUsize::new(0);
     let result = reuse_run(
@@ -3187,10 +2927,7 @@ fn reuse_detects_nondeterministic_generator_across_replays() {
     );
     match result {
         Err(crate::backend::RunError::NonDeterministic(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("non-deterministic"),
-                "got: {msg}"
-            );
+            assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
         }
         other => panic!("expected RunError::NonDeterministic, got {other:?}"),
     }
@@ -3240,10 +2977,7 @@ fn nondeterministic_generator_contradicts_the_reuse_fed_kind_ledger_at_simplest_
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
 
     let flip = AtomicUsize::new(0);
     let result = reuse_run(
@@ -3268,10 +3002,7 @@ fn nondeterministic_generator_contradicts_the_reuse_fed_kind_ledger_at_simplest_
     );
     match result {
         Err(crate::backend::RunError::NonDeterministic(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("non-deterministic"),
-                "got: {msg}"
-            );
+            assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
         }
         other => panic!("expected RunError::NonDeterministic, got {other:?}"),
     }
@@ -3321,14 +3052,9 @@ fn run_main_shrinks_a_cloned_stream_failure_to_the_minimal_tree() {
     };
     assert_eq!(
         record.owned_values(),
-        vec![ChoiceValue::Integer(crate::native::bignum::BigInt::from(
-            100
-        ))]
+        vec![ChoiceValue::Integer(crate::native::bignum::BigInt::from(100))]
     );
-    assert_eq!(
-        choices[1],
-        ChoiceValue::Integer(crate::native::bignum::BigInt::from(0))
-    );
+    assert_eq!(choices[1], ChoiceValue::Integer(crate::native::bignum::BigInt::from(0)));
 }
 
 /// Settings entering ND handling directly, for lifecycle tests.
@@ -3403,20 +3129,13 @@ fn history_records_raw_displacements_and_shrink_accepts() {
             )
             .unwrap();
             ctx.record_run(
-                &interesting_at(
-                    origin,
-                    vec![bool_node(true), bool_node(true), bool_node(false)],
-                ),
+                &interesting_at(origin, vec![bool_node(true), bool_node(true), bool_node(false)]),
                 Duration::ZERO,
                 false,
             )
             .unwrap();
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
+                .unwrap();
             let history = ctx.origins.get(origin).unwrap().history();
             assert_eq!(history.entries().len(), 3);
             assert!(history.entries()[0].accept, "founding sighting");
@@ -3442,10 +3161,7 @@ fn history_dedupes_repeated_timelines() {
                 )
                 .unwrap();
             }
-            assert_eq!(
-                ctx.origins.get(origin).unwrap().history().entries().len(),
-                1
-            );
+            assert_eq!(ctx.origins.get(origin).unwrap().history().entries().len(), 1);
         },
     );
 }
@@ -3458,19 +3174,11 @@ fn history_is_kept_only_while_deterministic() {
         |_ds| TestCaseResult::Valid,
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.nd_flip();
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
+                .unwrap();
             ctx.record_run(
                 &interesting_at("Panic: other", vec![bool_node(false)]),
                 Duration::ZERO,
@@ -3478,16 +3186,8 @@ fn history_is_kept_only_while_deterministic() {
             )
             .unwrap();
             let history = ctx.origins.get(origin).unwrap().history();
-            assert_eq!(
-                history.entries().len(),
-                1,
-                "post-flip executions must not enter history"
-            );
-            assert!(
-                ctx.origins
-                    .get("Panic: other")
-                    .is_none_or(|c| c.history().is_empty())
-            );
+            assert_eq!(history.entries().len(), 1, "post-flip executions must not enter history");
+            assert!(ctx.origins.get("Panic: other").is_none_or(|c| c.history().is_empty()));
         },
     );
 }
@@ -3503,45 +3203,27 @@ fn a_measurement_run_neither_displaces_nor_persists() {
         |_ds| TestCaseResult::Valid,
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                true,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, true)
+                .unwrap();
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap(),
                 &[bool_node(true)],
                 "a measurement run must not displace the incumbent"
             );
-            assert_eq!(
-                ctx.origins.get(origin).unwrap().history().entries().len(),
-                1
-            );
+            assert_eq!(ctx.origins.get(origin).unwrap().history().entries().len(), 1);
 
             ctx.reuse_replays = true;
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                true,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, true)
+                .unwrap();
             ctx.reuse_replays = false;
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap(),
                 &[bool_node(false)],
                 "a reuse-phase replay must displace like a raw run"
             );
-            assert_eq!(
-                ctx.origins.get(origin).unwrap().history().entries().len(),
-                2
-            );
+            assert_eq!(ctx.origins.get(origin).unwrap().history().entries().len(), 2);
         },
     );
 }
@@ -3560,27 +3242,15 @@ fn history_is_dropped_when_the_origin_confirms() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(
-                &interesting_at(&origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
-            assert!(
-                ctx.origins
-                    .get(&origin)
-                    .is_some_and(|c| !c.history().is_empty())
-            );
+            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
+            assert!(ctx.origins.get(&origin).is_some_and(|c| !c.history().is_empty()));
             ctx.nd_flip();
             let output = Settings::new().output;
-            ctx.nd_discovery_sweep(Verbosity::Quiet, &output)
-                .await
-                .unwrap();
+            ctx.nd_discovery_sweep(Verbosity::Quiet, &output).await.unwrap();
             assert!(!ctx.origins.needs_confirmation(&origin));
             assert!(
-                ctx.origins
-                    .get(&origin)
-                    .is_none_or(|c| c.history().is_empty()),
+                ctx.origins.get(&origin).is_none_or(|c| c.history().is_empty()),
                 "confirmation must drop the origin's history"
             );
         },
@@ -3600,12 +3270,8 @@ fn a_first_check_outcome_miss_flips_the_run_before_displacement() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(ctx.nd_active, "an outcome miss must flip the run");
             assert_eq!(
@@ -3632,12 +3298,8 @@ fn a_first_check_realized_timeline_miss_flips_the_run() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(5)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![int_node(5)]), Duration::ZERO, false)
+                .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(
                 ctx.nd_active,
@@ -3661,12 +3323,8 @@ fn first_check_evidence_seeds_the_origins_ledger() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(5)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![int_node(5)]), Duration::ZERO, false)
+                .unwrap();
             ctx.first_check_sweep().await.unwrap();
             let seed = ctx.origins.entry(&origin).take_seed().unwrap();
             assert_eq!(seed.fails(), 1, "the failing divergent replay is a fail");
@@ -3747,16 +3405,8 @@ fn each_origin_gets_its_own_first_check() {
             .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(!ctx.nd_active);
-            assert!(
-                ctx.origins
-                    .get("Panic: a")
-                    .is_some_and(|c| c.first_checked())
-            );
-            assert!(
-                ctx.origins
-                    .get("Panic: b")
-                    .is_some_and(|c| c.first_checked())
-            );
+            assert!(ctx.origins.get("Panic: a").is_some_and(|c| c.first_checked()));
+            assert!(ctx.origins.get("Panic: b").is_some_and(|c| c.first_checked()));
             assert_eq!(execs.load(Ordering::SeqCst) as u64, 2 * FIRST_CHECK_REPLAYS);
         },
     );
@@ -3779,19 +3429,11 @@ fn an_all_reproduce_first_check_keeps_the_run_deterministic() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(
-                &interesting_at(&origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(!ctx.nd_active);
-            assert!(
-                ctx.origins
-                    .get(origin.as_str())
-                    .is_some_and(|c| c.first_checked())
-            );
+            assert!(ctx.origins.get(origin.as_str()).is_some_and(|c| c.first_checked()));
             assert_eq!(execs.load(Ordering::SeqCst) as u64, FIRST_CHECK_REPLAYS);
             assert!(
                 ctx.origins.entry(&origin).take_seed().is_none(),
@@ -3806,12 +3448,8 @@ fn an_all_reproduce_first_check_keeps_the_run_deterministic() {
 /// shortlex-smaller, mirroring a real generation phase.
 fn seed_history(ctx: &mut Engine<'_>, origin: &str, values: &[i128]) {
     for &value in values {
-        ctx.record_run(
-            &interesting_at(origin, vec![int_node(value)]),
-            Duration::ZERO,
-            false,
-        )
-        .unwrap();
+        ctx.record_run(&interesting_at(origin, vec![int_node(value)]), Duration::ZERO, false)
+            .unwrap();
     }
 }
 
@@ -3825,20 +3463,14 @@ fn a_final_replay_miss_backtracks_to_the_reproduction_boundary() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 50 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 50 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
             seed_history(ctx, &origin, &[90, 40]);
             assert_eq!(ctx.origins.incumbent(&origin).unwrap(), &[int_node(40)]);
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(ctx.nd_active);
             assert_eq!(
                 ctx.origins.incumbent(&origin).unwrap(),
@@ -3847,9 +3479,7 @@ fn a_final_replay_miss_backtracks_to_the_reproduction_boundary() {
             );
             assert!(!ctx.origins.needs_confirmation(&origin));
             assert!(
-                ctx.origins
-                    .get(&origin)
-                    .is_none_or(|c| c.history().is_empty()),
+                ctx.origins.get(&origin).is_none_or(|c| c.history().is_empty()),
                 "a restored origin's history is dropped"
             );
         },
@@ -3869,11 +3499,7 @@ fn the_backtrack_scan_probes_geometrically() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 90 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -3951,10 +3577,7 @@ fn three_bar_rejections_exhaust_the_backtrack() {
             let Backtrack::Exhausted { evidence } = ctx.backtrack(&origin).await.unwrap() else {
                 panic!("expected exhaustion after BACKTRACK_BAR_ATTEMPTS rejections");
             };
-            assert_eq!(
-                evidence.0, 3,
-                "each one-shot candidate failed its scan probe once"
-            );
+            assert_eq!(evidence.0, 3, "each one-shot candidate failed its scan probe once");
         },
     );
 }
@@ -3984,11 +3607,7 @@ fn a_spent_backtrack_budget_short_circuits_the_next_backtrack() {
                 panic!("expected exhaustion");
             };
             assert_eq!(evidence, (0, 0));
-            assert_eq!(
-                execs.load(Ordering::SeqCst),
-                0,
-                "a spent budget skips the scan"
-            );
+            assert_eq!(execs.load(Ordering::SeqCst), 0, "a spent budget skips the scan");
         },
     );
 }
@@ -4047,19 +3666,13 @@ fn the_sweep_rejects_an_origin_out_of_bar_attempts() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(origin).spend_bar_attempt());
             }
             let output = Settings::new().output;
-            ctx.nd_discovery_sweep(Verbosity::Debug, &output)
-                .await
-                .unwrap();
+            ctx.nd_discovery_sweep(Verbosity::Debug, &output).await.unwrap();
             assert!(
                 ctx.origins.incumbent(origin).is_none(),
                 "at the attempt cap the origin is evicted"
@@ -4086,12 +3699,8 @@ fn shrink_admission_rejects_an_origin_out_of_bar_attempts() {
         },
         async |ctx| {
             let origin = "Panic: bug".to_string();
-            ctx.record_run(
-                &interesting_at(&origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.origins.entry(&origin).clear_history();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(&origin).spend_bar_attempt());
@@ -4112,11 +3721,7 @@ fn shrink_admission_rejects_an_origin_out_of_bar_attempts() {
             assert!(!timed_out);
             assert!(shrunk.contains(&origin));
             assert!(ctx.origins.incumbent(&origin).is_none());
-            assert_eq!(
-                execs.load(Ordering::SeqCst),
-                0,
-                "no admission batch runs at the cap"
-            );
+            assert_eq!(execs.load(Ordering::SeqCst), 0, "no admission batch runs at the cap");
         },
     );
 }
@@ -4134,26 +3739,17 @@ fn the_final_replay_review_confirms_through_the_bar() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             assert!(ctx.origins.needs_confirmation(origin));
             ctx.origins.entry(origin).record_miss();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 !ctx.origins.needs_confirmation(origin),
                 "the review's reproducing run passed the bar"
             );
-            assert!(
-                ctx.origins.incumbent(origin).is_some(),
-                "the map incumbent stays"
-            );
+            assert!(ctx.origins.incumbent(origin).is_some(), "the map incumbent stays");
             let caveat = ctx.origins.caveat(origin).unwrap();
             assert!(caveat.contains("confirmed"), "{caveat}");
             assert!(
@@ -4176,30 +3772,17 @@ fn a_bar_rejected_review_falls_through_to_eviction() {
             if rbool(ds).is_err() {
                 return TestCaseResult::Overrun;
             }
-            if n == 0 {
-                boom("bug")
-            } else {
-                TestCaseResult::Valid
-            }
+            if n == 0 { boom("bug") } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.origins.entry(origin).clear_history();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(ctx.origins.needs_confirmation(origin));
-            assert!(
-                ctx.origins.incumbent(origin).is_none(),
-                "a bar-rejected review evicts"
-            );
+            assert!(ctx.origins.incumbent(origin).is_none(), "a bar-rejected review evicts");
             let caveat = ctx.origins.caveat(origin).unwrap();
             assert!(caveat.contains("below the confirmation bar"), "{caveat}");
         },
@@ -4222,9 +3805,7 @@ fn a_dry_review_folds_the_exhausted_backtracks_evidence() {
             seed_history(ctx, origin, &[90, 80]);
             ctx.nd_flip();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(ctx.origins.incumbent(origin).is_none());
             let caveat = ctx.origins.caveat(origin).unwrap();
             assert!(
@@ -4251,20 +3832,14 @@ fn an_out_of_attempts_review_evicts_without_a_batch() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             ctx.origins.entry(origin).clear_history();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(origin).spend_bar_attempt());
             }
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 ctx.origins.incumbent(origin).is_none(),
                 "a reproducing review at the attempt cap still evicts"
@@ -4379,11 +3954,7 @@ fn backtrack_grafts_the_other_reproducing_entries() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 80 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 80 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4396,11 +3967,8 @@ fn backtrack_grafts_the_other_reproducing_entries() {
             let counterexample = ctx.origins.get(&origin).unwrap();
             assert_eq!(counterexample.incumbent().unwrap(), &[int_node(85)]);
             let graph = counterexample.graph().unwrap();
-            let start_values: Vec<ChoiceValue> = graph.nodes()[0]
-                .edges
-                .iter()
-                .map(|e| e.value.clone())
-                .collect();
+            let start_values: Vec<ChoiceValue> =
+                graph.nodes()[0].edges.iter().map(|e| e.value.clone()).collect();
             assert_eq!(
                 start_values,
                 vec![int_node(85).value()],
@@ -4422,11 +3990,7 @@ fn a_backtracked_incumbent_anchors_from_its_bar_batch() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 50 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 50 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4461,9 +4025,7 @@ fn an_exhausted_backtrack_reports_caveat_only() {
             let origin = "Panic: bug";
             seed_history(ctx, origin, &[90, 40]);
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 !ctx.origins.any_live(),
                 "an exhausted backtrack rejects into the caveat-only path"
@@ -4515,11 +4077,7 @@ fn a_displaced_incumbent_is_recoverable_after_a_late_flip() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 90 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4541,10 +4099,7 @@ fn a_displaced_incumbent_is_recoverable_after_a_late_flip() {
                 &[int_node(90)],
                 "the verify miss backtracks to the displaced incumbent"
             );
-            assert!(
-                !shrunk.contains(&origin),
-                "a restored origin requeues for a gauntleted pass"
-            );
+            assert!(!shrunk.contains(&origin), "a restored origin requeues for a gauntleted pass");
             assert!(!ctx.origins.needs_confirmation(&origin));
             ctx.shrink_origin(
                 origin.clone(),
@@ -4572,19 +4127,13 @@ fn backtrack_resumes_gauntleted_shrinking_under_remaining_budget() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 50 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 50 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
             seed_history(ctx, &origin, &[90, 40]);
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, true)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, true).await.unwrap();
             assert_eq!(
                 ctx.origins.incumbent(&origin).unwrap(),
                 &[int_node(50)],
@@ -4621,18 +4170,13 @@ fn a_flip_during_final_replay_reviews_already_replayed_origins() {
             .unwrap();
             seed_history(ctx, "Panic: zeta", &[90, 40]);
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 !ctx.origins.needs_confirmation("Panic: alpha"),
                 "the deterministically replayed origin re-entered the queue and confirmed"
             );
             assert!(!ctx.origins.needs_confirmation("Panic: zeta"));
-            assert_eq!(
-                ctx.origins.incumbent("Panic: zeta").unwrap(),
-                &[int_node(90)]
-            );
+            assert_eq!(ctx.origins.incumbent("Panic: zeta").unwrap(), &[int_node(90)]);
             assert!(ctx.origins.incumbent("Panic: alpha").is_some());
         },
     );
@@ -4648,11 +4192,7 @@ fn a_single_entry_history_probes_its_founding_sighting() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 90 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4676,11 +4216,7 @@ fn the_refinement_narrows_to_the_newest_reproducing_entry() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 84 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 84 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4708,11 +4244,7 @@ fn a_raw_sighting_can_be_the_restored_incumbent() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 90 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -4780,26 +4312,14 @@ fn a_post_flip_origin_faces_the_bar_at_shrink_time() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 50 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 50 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
             ctx.nd_flip();
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(90)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
-            assert!(
-                ctx.origins
-                    .get(&origin)
-                    .is_none_or(|c| c.history().is_empty())
-            );
+            ctx.record_run(&interesting_at(&origin, vec![int_node(90)]), Duration::ZERO, false)
+                .unwrap();
+            assert!(ctx.origins.get(&origin).is_none_or(|c| c.history().is_empty()));
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             ctx.shrink_origin(
@@ -4834,12 +4354,8 @@ fn a_post_flip_fluke_is_rejected_at_the_bar_at_shrink_time() {
         async |ctx| {
             let origin = format!("Panic: {bug}");
             ctx.nd_flip();
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(90)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![int_node(90)]), Duration::ZERO, false)
+                .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let timed_out = ctx
@@ -4870,11 +4386,7 @@ fn a_mid_shrink_flip_requeues_from_the_pre_shrink_nodes() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 50 {
-                boom("bug")
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 50 { boom("bug") } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = "Panic: bug";
@@ -4882,15 +4394,10 @@ fn a_mid_shrink_flip_requeues_from_the_pre_shrink_nodes() {
             // probes that repeat these keys execute (nothing to serve) and
             // the contradicting verdicts are the observed mid-shrink flip.
             ctx.collect_statistics = true;
-            ctx.record_run(
-                &interesting_at(origin, vec![int_node(70)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![int_node(70)]), Duration::ZERO, false)
+                .unwrap();
             for v in 50..70 {
-                ctx.record_run(&valid_at(vec![int_node(v)]), Duration::ZERO, false)
-                    .unwrap();
+                ctx.record_run(&valid_at(vec![int_node(v)]), Duration::ZERO, false).unwrap();
             }
             ctx.collect_statistics = false;
             let output = ctx.settings.output.clone();
@@ -4907,10 +4414,7 @@ fn a_mid_shrink_flip_requeues_from_the_pre_shrink_nodes() {
             .await
             .unwrap();
             let shrink_calls = ctx.calls - calls_before;
-            assert!(
-                ctx.nd_active,
-                "a probe contradicting a generation verdict flips the run"
-            );
+            assert!(ctx.nd_active, "a probe contradicting a generation verdict flips the run");
             assert!(
                 !shrunk.contains(origin),
                 "a mid-shrink flip requeues instead of marking shrunk"
@@ -4954,10 +4458,7 @@ fn an_exact_final_replay_vanish_aborts_under_error_strictness() {
             )
             .unwrap();
             let output = ctx.settings.output.clone();
-            let err = ctx
-                .final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap_err();
+            let err = ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap_err();
             assert!(
                 matches!(err, RunError::Flaky(_)),
                 "an exact-repeat vanish aborts through the cache mismatch: {err:?}"
@@ -5026,11 +4527,7 @@ fn tied_raw_candidates_restore_the_shortlex_least() {
             let Ok(v) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if v >= 90 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -5049,9 +4546,7 @@ fn tied_raw_candidates_restore_the_shortlex_least() {
 #[test]
 fn a_second_pass_probe_can_find_the_candidate() {
     let bug = "bug";
-    let counts = Rc::new(std::cell::RefCell::new(
-        std::collections::HashMap::<i64, u32>::new(),
-    ));
+    let counts = Rc::new(std::cell::RefCell::new(std::collections::HashMap::<i64, u32>::new()));
     let body_counts = counts.clone();
     with_engine(
         quiet_settings(),
@@ -5063,11 +4558,7 @@ fn a_second_pass_probe_can_find_the_candidate() {
             let mut counts = body_counts.borrow_mut();
             let seen = counts.entry(v).or_insert(0);
             *seen += 1;
-            if v >= 90 && *seen >= 2 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v >= 90 && *seen >= 2 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -5094,12 +4585,8 @@ fn an_exact_shrink_verify_vanish_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![int_node(90)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![int_node(90)]), Duration::ZERO, false)
+                .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let err = ctx
@@ -5134,12 +4621,8 @@ fn a_divergent_shrink_verify_vanish_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![int_node(90)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![int_node(90)]), Duration::ZERO, false)
+                .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let err = ctx
@@ -5207,12 +4690,8 @@ fn a_first_check_outcome_miss_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(true)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
+                .unwrap();
             match ctx.first_check_sweep().await {
                 Err(crate::backend::RunError::Flaky(msg)) => {
                     assert!(msg.contains("Flaky test detected"), "got: {msg}");
@@ -5248,10 +4727,7 @@ fn a_deterministic_failing_run_pays_exactly_the_first_check_per_origin() {
         },
     );
     assert!(result.is_ok());
-    assert_eq!(
-        execs.load(Ordering::SeqCst) as u64,
-        1 + FIRST_CHECK_REPLAYS + 1
-    );
+    assert_eq!(execs.load(Ordering::SeqCst) as u64, 1 + FIRST_CHECK_REPLAYS + 1);
 }
 
 #[test]
@@ -5263,32 +4739,20 @@ fn nd_raw_interesting_never_displaces_an_occupied_origin() {
         async |ctx| {
             let origin = "Panic: bug";
             let big = vec![bool_node(true), bool_node(true)];
-            ctx.record_run(&interesting_at(origin, big), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(&interesting_at(origin, big), Duration::ZERO, false).unwrap();
             assert_eq!(ctx.origins.incumbent(origin).unwrap().len(), 2);
 
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
+                .unwrap();
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap().len(),
                 2,
                 "a raw interesting run must not displace an occupied origin"
             );
 
-            ctx.origins
-                .entry(origin)
-                .confirm(0.9, None, Graph::new(), 0, (4, 4))
+            ctx.origins.entry(origin).confirm(0.9, None, Graph::new(), 0, (4, 4)).unwrap();
+            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
                 .unwrap();
-            ctx.record_run(
-                &interesting_at(origin, vec![bool_node(false)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
             assert_eq!(ctx.origins.incumbent(origin).unwrap().len(), 2);
         },
     );
@@ -5336,23 +4800,12 @@ fn nd_discovery_sweep_evicts_an_unconfirmable_origin() {
             )
             .unwrap();
             let output = ctx.settings.output.clone();
-            ctx.nd_discovery_sweep(Verbosity::Debug, &output)
-                .await
-                .unwrap();
+            ctx.nd_discovery_sweep(Verbosity::Debug, &output).await.unwrap();
             assert!(!ctx.origins.any_live());
-            assert_eq!(
-                ctx.origins.unconfirmed().collect::<Vec<_>>(),
-                vec!["Panic: fluke"]
-            );
+            assert_eq!(ctx.origins.unconfirmed().collect::<Vec<_>>(), vec!["Panic: fluke"]);
         },
     );
-    assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("nd discovery confirm"))
-    );
+    assert!(lines.lock().unwrap().iter().any(|l| l.contains("nd discovery confirm")));
 }
 
 #[test]
@@ -5374,18 +4827,10 @@ fn nd_discovery_sweep_confirms_a_real_failure() {
             )
             .unwrap();
             let output = ctx.settings.output.clone();
-            ctx.nd_discovery_sweep(Verbosity::Quiet, &output)
-                .await
-                .unwrap();
+            ctx.nd_discovery_sweep(Verbosity::Quiet, &output).await.unwrap();
             assert!(!ctx.origins.needs_confirmation("Panic: bug"));
             assert!(
-                ctx.origins
-                    .get("Panic: bug")
-                    .unwrap()
-                    .graph()
-                    .unwrap()
-                    .edge_count()
-                    > 1,
+                ctx.origins.get("Panic: bug").unwrap().graph().unwrap().edge_count() > 1,
                 "confirmation replays realizing fresh continuations must be grafted"
             );
             let (witness, anchor) = ctx.origins.entry("Panic: bug").take_witness().unwrap();
@@ -5401,9 +4846,7 @@ fn nd_persists_only_validated_incumbents() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    let mut settings = Settings::new()
-        .database(Some(path.clone()))
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(Some(path.clone())).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     with_engine(
         settings,
@@ -5426,13 +4869,8 @@ fn nd_persists_only_validated_incumbents() {
                 "raw interesting must not persist before confirmation"
             );
             let output = ctx.settings.output.clone();
-            ctx.nd_discovery_sweep(Verbosity::Quiet, &output)
-                .await
-                .unwrap();
-            assert!(
-                !db.fetch(b"k").is_empty(),
-                "confirmation commits the validated incumbent"
-            );
+            ctx.nd_discovery_sweep(Verbosity::Quiet, &output).await.unwrap();
+            assert!(!db.fetch(b"k").is_empty(), "confirmation commits the validated incumbent");
         },
     );
 }
@@ -5442,12 +4880,11 @@ fn nd_boost_raises_the_anchor_or_declines() {
     use std::sync::{Arc, Mutex};
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&lines);
-    let mut settings = Settings::new()
-        .database(None)
-        .verbosity(Verbosity::Debug)
-        .output(Output::callback(move |line| {
+    let mut settings = Settings::new().database(None).verbosity(Verbosity::Debug).output(
+        Output::callback(move |line| {
             sink.lock().unwrap().push(line.to_string());
-        }));
+        }),
+    );
     settings.nd_force = true;
     with_engine(
         settings,
@@ -5462,27 +4899,13 @@ fn nd_boost_raises_the_anchor_or_declines() {
             let incumbent = interesting_at("Panic: bug", vec![bool_node(true)]);
             ctx.origins
                 .entry("Panic: bug")
-                .confirm(
-                    0.1,
-                    None,
-                    build_graph(&[vec![ChoiceValue::Boolean(false)]]),
-                    1,
-                    (4, 9),
-                )
+                .confirm(0.1, None, build_graph(&[vec![ChoiceValue::Boolean(false)]]), 1, (4, 9))
                 .unwrap();
-            let (witness, lcb) = ctx
-                .nd_boost("Panic: bug", &incumbent, 0.0)
-                .await
-                .unwrap()
-                .unwrap();
+            let (witness, lcb) =
+                ctx.nd_boost("Panic: bug", &incumbent, 0.0).await.unwrap().unwrap();
             assert_eq!(witness.origin.as_deref(), Some("Panic: bug"));
             assert!(lcb > 0.5);
-            assert!(
-                ctx.nd_boost("Panic: bug", &incumbent, 0.99)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(ctx.nd_boost("Panic: bug", &incumbent, 0.99).await.unwrap().is_none());
         },
     );
     assert!(
@@ -5500,13 +4923,12 @@ fn nd_gauntlet_run_shrinks_a_deterministic_core_end_to_end() {
     use std::sync::{Arc, Mutex};
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&lines);
-    let mut settings = Settings::new()
-        .database(None)
-        .test_cases(20)
-        .verbosity(Verbosity::Debug)
-        .output(Output::callback(move |line| {
-            sink.lock().unwrap().push(line.to_string());
-        }));
+    let mut settings =
+        Settings::new().database(None).test_cases(20).verbosity(Verbosity::Debug).output(
+            Output::callback(move |line| {
+                sink.lock().unwrap().push(line.to_string());
+            }),
+        );
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         if rbool(ds).is_err() {
@@ -5528,10 +4950,7 @@ fn nd_gauntlet_run_shrinks_a_deterministic_core_end_to_end() {
 fn nd_gauntlet_run_holds_a_flaky_failure_end_to_end() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let execs = AtomicUsize::new(0);
-    let mut settings = Settings::new()
-        .database(None)
-        .test_cases(20)
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(None).test_cases(20).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         if rbool(ds).is_err() {
@@ -5546,10 +4965,7 @@ fn nd_gauntlet_run_holds_a_flaky_failure_end_to_end() {
     .unwrap();
     assert_eq!(result.failures.len(), 1);
     assert!(result.failures[0].origin.contains("Panic: flaky"));
-    assert!(
-        !result.failures[0].origin.contains("[unconfirmed"),
-        "an 80%-failure bug must confirm"
-    );
+    assert!(!result.failures[0].origin.contains("[unconfirmed"), "an 80%-failure bug must confirm");
     assert!(result.failures[0].reproduce_blob.is_some());
 }
 
@@ -5565,27 +4981,14 @@ fn nd_evidence_batch_restores_the_capture_flag() {
         },
         async |ctx| {
             ctx.capture_replays = true;
-            ctx.nd_evidence_batch(
-                "Panic: bug",
-                graph_of(&[ChoiceValue::Boolean(true)]),
-                1,
-                None,
-            )
-            .await
-            .unwrap();
-            assert!(
-                ctx.capture_replays,
-                "a batch inside a capture window restores the flag"
-            );
+            ctx.nd_evidence_batch("Panic: bug", graph_of(&[ChoiceValue::Boolean(true)]), 1, None)
+                .await
+                .unwrap();
+            assert!(ctx.capture_replays, "a batch inside a capture window restores the flag");
             ctx.capture_replays = false;
-            ctx.nd_evidence_batch(
-                "Panic: bug",
-                graph_of(&[ChoiceValue::Boolean(true)]),
-                1,
-                None,
-            )
-            .await
-            .unwrap();
+            ctx.nd_evidence_batch("Panic: bug", graph_of(&[ChoiceValue::Boolean(true)]), 1, None)
+                .await
+                .unwrap();
             assert!(!ctx.capture_replays);
         },
     );
@@ -5601,20 +5004,11 @@ fn anchor_seed_extension_reaches_the_reference_batch() {
                 Ok(v) => v,
                 Err(()) => return TestCaseResult::Overrun,
             };
-            if failing {
-                boom("bug")
-            } else {
-                TestCaseResult::Valid
-            }
+            if failing { boom("bug") } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let batch = ctx
-                .nd_evidence_batch(
-                    "Panic: bug",
-                    graph_of(&[ChoiceValue::Boolean(true)]),
-                    1,
-                    None,
-                )
+                .nd_evidence_batch("Panic: bug", graph_of(&[ChoiceValue::Boolean(true)]), 1, None)
                 .await
                 .unwrap();
             assert!(batch.bar_accepted);
@@ -5626,12 +5020,7 @@ fn anchor_seed_extension_reaches_the_reference_batch() {
             assert!(batch.evidence.lower_bound() > nd::RETENTION_HIGH_WATER);
             assert!(batch.witness.is_some());
             let rejected = ctx
-                .nd_evidence_batch(
-                    "Panic: bug",
-                    graph_of(&[ChoiceValue::Boolean(false)]),
-                    1,
-                    None,
-                )
+                .nd_evidence_batch("Panic: bug", graph_of(&[ChoiceValue::Boolean(false)]), 1, None)
                 .await
                 .unwrap();
             assert!(!rejected.bar_accepted);
@@ -5715,11 +5104,7 @@ fn boost_runs_below_the_floor() {
     })
     .unwrap();
     assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("nd boost: origin=Panic: bug racing")),
+        lines.lock().unwrap().iter().any(|l| l.contains("nd boost: origin=Panic: bug racing")),
         "a 20%-reliable incumbent sits below the boost floor"
     );
 }
@@ -5801,16 +5186,10 @@ fn deterministic_core_is_retained() {
     })
     .unwrap();
     assert_eq!(result.failures.len(), 1);
-    let state = db
-        .fetch(b"k")
-        .iter()
-        .find_map(|e| crate::native::blob::decode_nd_state(e))
-        .unwrap();
-    let start_values: Vec<ChoiceValue> = state.graph.nodes()[0]
-        .edges
-        .iter()
-        .map(|e| e.value.clone())
-        .collect();
+    let state =
+        db.fetch(b"k").iter().find_map(|e| crate::native::blob::decode_nd_state(e)).unwrap();
+    let start_values: Vec<ChoiceValue> =
+        state.graph.nodes()[0].edges.iter().map(|e| e.value.clone()).collect();
     assert_eq!(
         start_values,
         vec![ChoiceValue::Boolean(true)],
@@ -5843,11 +5222,8 @@ fn nd_reports_each_origin_with_its_own_caveat_and_blob() {
     let mut origins: Vec<&str> = result.failures.iter().map(|f| f.origin.as_str()).collect();
     origins.sort_unstable();
     assert_eq!(origins, ["Panic: one", "Panic: two"]);
-    let blobs: Vec<&str> = result
-        .failures
-        .iter()
-        .map(|f| f.reproduce_blob.as_deref().unwrap())
-        .collect();
+    let blobs: Vec<&str> =
+        result.failures.iter().map(|f| f.reproduce_blob.as_deref().unwrap()).collect();
     assert_ne!(blobs[0], blobs[1], "each origin encodes its own incumbent");
     for f in &result.failures {
         let caveat = f.caveat.as_deref().unwrap();
@@ -5862,20 +5238,13 @@ fn nd_reports_each_origin_with_its_own_caveat_and_blob() {
 fn nd_unconfirmed_failure_is_reported_with_a_caveat() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let execs = AtomicUsize::new(0);
-    let mut settings = Settings::new()
-        .database(None)
-        .test_cases(10)
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(None).test_cases(10).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         if rbool(ds).is_err() {
             return TestCaseResult::Overrun;
         }
-        if execs.fetch_add(1, Ordering::SeqCst) == 1 {
-            boom("once")
-        } else {
-            TestCaseResult::Valid
-        }
+        if execs.fetch_add(1, Ordering::SeqCst) == 1 { boom("once") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert_eq!(result.failures.len(), 1);
@@ -5895,10 +5264,7 @@ fn nd_reuse_retries_a_stored_flaky_timeline_until_it_reproduces() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
     let execs = AtomicUsize::new(0);
     let mut settings = Settings::new()
         .database(Some(path.clone()))
@@ -5918,10 +5284,7 @@ fn nd_reuse_retries_a_stored_flaky_timeline_until_it_reproduces() {
     .unwrap();
     assert_eq!(result.failures.len(), 1);
     assert!(result.failures[0].origin.contains("Panic: bug"));
-    assert!(
-        !db.fetch(b"k").is_empty(),
-        "a reproduced entry stays in the primary corpus"
-    );
+    assert!(!db.fetch(b"k").is_empty(), "a reproduced entry stays in the primary corpus");
 }
 
 #[test]
@@ -5930,14 +5293,9 @@ fn nd_misaligned_trusted_reuse_confirms_at_shrink_and_persists_its_state() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
     let execs = AtomicUsize::new(0);
-    let mut settings = Settings::new()
-        .database(Some(path.clone()))
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(Some(path.clone())).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         let n = execs.fetch_add(1, Ordering::SeqCst);
@@ -5975,14 +5333,9 @@ fn nd_trusted_failure_that_stops_reproducing_is_still_reported() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
     let execs = AtomicUsize::new(0);
-    let mut settings = Settings::new()
-        .database(Some(path.clone()))
-        .verbosity(Verbosity::Quiet);
+    let mut settings = Settings::new().database(Some(path.clone())).verbosity(Verbosity::Quiet);
     settings.nd_force = true;
     let result = reuse_run(settings, "k", |ds| {
         let first = match rbool(ds) {
@@ -5993,11 +5346,7 @@ fn nd_trusted_failure_that_stops_reproducing_is_still_reported() {
             return TestCaseResult::Overrun;
         }
         let n = execs.fetch_add(1, Ordering::SeqCst);
-        if n == 2 && first {
-            boom("bug")
-        } else {
-            TestCaseResult::Valid
-        }
+        if n == 2 && first { boom("bug") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert_eq!(result.failures.len(), 1);
@@ -6108,14 +5457,8 @@ fn reuse_kind_flip_under_quiet_completes_without_failures() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap());
 
     let flip = AtomicUsize::new(0);
     let result = reuse_run(
@@ -6158,11 +5501,7 @@ fn outcome_flake_under_quiet_confirms_and_shrinks_the_failure() {
                 return TestCaseResult::Overrun;
             }
             let n = execs.fetch_add(1, Ordering::SeqCst);
-            if n == 0 || n == 2 {
-                TestCaseResult::Valid
-            } else {
-                boom("outcome")
-            }
+            if n == 0 || n == 2 { TestCaseResult::Valid } else { boom("outcome") }
         },
     )
     .unwrap();
@@ -6233,11 +5572,7 @@ fn a_double_flip_in_one_verify_prints_the_warn_notice_once() {
             if rint(ds, 0, hi).is_err() {
                 return TestCaseResult::Overrun;
             }
-            if n == 0 {
-                boom("shift")
-            } else {
-                TestCaseResult::Valid
-            }
+            if n == 0 { boom("shift") } else { TestCaseResult::Valid }
         },
     )
     .unwrap();
@@ -6256,9 +5591,7 @@ fn a_double_flip_in_one_verify_prints_the_warn_notice_once() {
 #[test]
 fn nd_handling_confirms_and_shrinks_a_clone_bearing_body() {
     let result = reuse_run(
-        nd_settings()
-            .phases([Phase::Generate, Phase::Shrink])
-            .test_cases(200),
+        nd_settings().phases([Phase::Generate, Phase::Shrink]).test_cases(200),
         "k",
         |ds| {
             let a = match rbool(ds) {
@@ -6273,11 +5606,7 @@ fn nd_handling_confirms_and_shrinks_a_clone_bearing_body() {
                 Ok(v) => v,
                 Err(()) => return TestCaseResult::Overrun,
             };
-            if a && b {
-                boom("clone bug")
-            } else {
-                TestCaseResult::Valid
-            }
+            if a && b { boom("clone bug") } else { TestCaseResult::Valid }
         },
     )
     .unwrap();
@@ -6305,8 +5634,7 @@ fn measurement_runs_move_no_counters_but_still_admit_origins() {
                 settled: Vec::new(),
                 ended: false,
             };
-            ctx.record_run(&valid, Duration::from_secs(1), true)
-                .unwrap();
+            ctx.record_run(&valid, Duration::from_secs(1), true).unwrap();
             ctx.record_run(
                 &interesting_at("Panic: measured", vec![bool_node(true)]),
                 Duration::ZERO,
@@ -6324,8 +5652,7 @@ fn measurement_runs_move_no_counters_but_still_admit_origins() {
             );
             assert!(ctx.origins.needs_confirmation("Panic: measured"));
 
-            ctx.record_run(&valid, Duration::from_secs(1), false)
-                .unwrap();
+            ctx.record_run(&valid, Duration::from_secs(1), false).unwrap();
             assert_eq!(ctx.calls, 1);
             assert_eq!(ctx.valid_test_cases, 1);
             assert_eq!(ctx.total_test_time, Duration::from_secs(1));
@@ -6364,18 +5691,13 @@ fn nd_reproduce_replays_the_counterexample_as_one_test_case_whichever_branch_the
             let stored = ReproSource::Graph {
                 graph: Arc::new(build_graph(&[
                     vec![ChoiceValue::Boolean(true), ChoiceValue::Boolean(true)],
-                    vec![
-                        ChoiceValue::Boolean(true),
-                        ChoiceValue::Integer(BigInt::from(7)),
-                    ],
+                    vec![ChoiceValue::Boolean(true), ChoiceValue::Integer(BigInt::from(7))],
                 ])),
                 longest: 2,
             };
             for _ in 0..2 {
-                let (run, evidence) = ctx
-                    .nd_reproduce(Some("Panic: branch"), &stored, 1, 0)
-                    .await
-                    .unwrap();
+                let (run, evidence) =
+                    ctx.nd_reproduce(Some("Panic: branch"), &stored, 1, 0).await.unwrap();
                 let run = run.unwrap();
                 assert_eq!(run.origin.as_deref(), Some("Panic: branch"));
                 assert_eq!(
@@ -6395,21 +5717,17 @@ fn a_replay_that_leaves_its_counterexample_is_named_at_debug_verbosity() {
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&lines);
     with_engine(
-        nd_settings()
-            .verbosity(Verbosity::Debug)
-            .output(Output::callback(move |line| {
-                sink.lock().unwrap().push(line.to_string());
-            })),
+        nd_settings().verbosity(Verbosity::Debug).output(Output::callback(move |line| {
+            sink.lock().unwrap().push(line.to_string());
+        })),
         None,
         |ds| match rint(ds, 0, 100) {
             Ok(_) => TestCaseResult::Valid,
             Err(()) => TestCaseResult::Overrun,
         },
         async |ctx| {
-            let stored = ReproSource::Graph {
-                graph: graph_of(&[ChoiceValue::Boolean(true)]),
-                longest: 1,
-            };
+            let stored =
+                ReproSource::Graph { graph: graph_of(&[ChoiceValue::Boolean(true)]), longest: 1 };
             let (run, _) = ctx.nd_reproduce(None, &stored, 1, 0).await.unwrap();
             assert!(run.is_none());
         },
@@ -6461,11 +5779,7 @@ fn nd_reproduce_spends_its_attempts_on_diverged_clone_replays() {
             };
             let (run, evidence) = ctx.nd_reproduce(None, &stored, 3, 0).await.unwrap();
             assert!(run.is_none());
-            assert_eq!(
-                evidence.runs(),
-                3,
-                "every replay is one budgeted trial, diverged or not"
-            );
+            assert_eq!(evidence.runs(), 3, "every replay is one budgeted trial, diverged or not");
         },
     );
 }
@@ -6481,19 +5795,11 @@ fn nd_reproduce_falls_back_to_fresh_generation_past_a_dry_counterexample() {
             Err(()) => TestCaseResult::Overrun,
         },
         async |ctx| {
-            let stored = ReproSource::Graph {
-                graph: graph_of(&[ChoiceValue::Boolean(false)]),
-                longest: 1,
-            };
-            let (run, _) = ctx
-                .nd_reproduce(Some("Panic: fresh"), &stored, 2, 0)
-                .await
-                .unwrap();
+            let stored =
+                ReproSource::Graph { graph: graph_of(&[ChoiceValue::Boolean(false)]), longest: 1 };
+            let (run, _) = ctx.nd_reproduce(Some("Panic: fresh"), &stored, 2, 0).await.unwrap();
             assert!(run.is_none(), "the stored run never fails");
-            let (run, _) = ctx
-                .nd_reproduce(Some("Panic: fresh"), &stored, 2, 40)
-                .await
-                .unwrap();
+            let (run, _) = ctx.nd_reproduce(Some("Panic: fresh"), &stored, 2, 40).await.unwrap();
             assert!(
                 run.is_some(),
                 "fresh generation past a dry counterexample still finds the failure"
@@ -6582,11 +5888,7 @@ fn nd_failures_persist_v2_state_and_reproduce_across_runs() {
         crate::native::blob::decode_blob(blob),
         Some(crate::native::blob::DecodedBlob::Nd(_))
     ));
-    assert_eq!(
-        db.fetch(b"k").len(),
-        1,
-        "an aligned reuse hit re-persists the stored state"
-    );
+    assert_eq!(db.fetch(b"k").len(), 1, "an aligned reuse hit re-persists the stored state");
 }
 
 #[test]
@@ -6594,15 +5896,10 @@ fn nd_trusted_promotion_repersists_the_shrunk_graph() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    let extra = vec![
-        ChoiceValue::Boolean(true),
-        ChoiceValue::Boolean(false),
-        ChoiceValue::Boolean(true),
-    ];
-    let state = nd_state_of(&[
-        vec![ChoiceValue::Boolean(true), ChoiceValue::Boolean(true)],
-        extra.clone(),
-    ]);
+    let extra =
+        vec![ChoiceValue::Boolean(true), ChoiceValue::Boolean(false), ChoiceValue::Boolean(true)];
+    let state =
+        nd_state_of(&[vec![ChoiceValue::Boolean(true), ChoiceValue::Boolean(true)], extra.clone()]);
     assert_eq!(state.graph.edge_count(), 4);
     db.save(b"k", &crate::native::blob::encode_nd_state(&state).unwrap());
 
@@ -6626,11 +5923,8 @@ fn nd_trusted_promotion_repersists_the_shrunk_graph() {
     else {
         panic!("a promoted trusted origin emits replay state");
     };
-    let start_values: Vec<ChoiceValue> = reported.graph.nodes()[0]
-        .edges
-        .iter()
-        .map(|e| e.value.clone())
-        .collect();
+    let start_values: Vec<ChoiceValue> =
+        reported.graph.nodes()[0].edges.iter().map(|e| e.value.clone()).collect();
     assert_eq!(
         start_values,
         vec![ChoiceValue::Boolean(true)],
@@ -6737,12 +6031,7 @@ fn branch_t() -> Run {
 fn branch_s_witness() -> RunResult {
     let mut witness = interesting_at(
         "Panic: branch",
-        vec![
-            bool_node(true),
-            bool_node(true),
-            bool_node(true),
-            int_node(42),
-        ],
+        vec![bool_node(true), bool_node(true), bool_node(true), int_node(42)],
     );
     let span = |label: u64, start: usize, end: usize, depth: u32, parent: Option<usize>| Span {
         start,
@@ -6789,16 +6078,9 @@ fn measurement_replays_are_counted_in_the_run_statistics() {
                 false,
             )
             .unwrap();
-            assert!(
-                !ctx.statistics
-                    .render()
-                    .iter()
-                    .any(|l| l.contains("measurement"))
-            );
+            assert!(!ctx.statistics.render().iter().any(|l| l.contains("measurement")));
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 ctx.statistics
                     .render()
@@ -6860,10 +6142,7 @@ fn a_deterministic_entry_replayed_in_a_run_flipped_by_a_stored_nd_entry_has_no_c
     let db = DirectoryTestCaseDatabase::new(&path);
     let state = nd_state_of(&[vec![ChoiceValue::Boolean(true)]]);
     db.save(b"k", &crate::native::blob::encode_nd_state(&state).unwrap());
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap());
 
     let flaky_calls = AtomicUsize::new(0);
     let result = reuse_run(
@@ -6892,10 +6171,7 @@ fn a_deterministic_entry_replayed_in_a_run_flipped_by_a_stored_nd_entry_has_no_c
     let flaky = failure("Panic: flaky");
     assert!(flaky.reproduce_blob.is_some());
     assert!(
-        flaky
-            .caveat
-            .as_deref()
-            .is_some_and(|c| c.starts_with("nondeterministic failure")),
+        flaky.caveat.as_deref().is_some_and(|c| c.starts_with("nondeterministic failure")),
         "the origin that flipped the run keeps its caveat: {:?}",
         flaky.caveat
     );
@@ -6963,11 +6239,7 @@ fn nd_confirmed_dry_caveat_does_not_fold_report_replays_into_confirmation_counts
         if rbool(ds).is_err() {
             return TestCaseResult::Overrun;
         }
-        if execs.fetch_add(1, Ordering::SeqCst) <= 4 {
-            boom("bug")
-        } else {
-            TestCaseResult::Valid
-        }
+        if execs.fetch_add(1, Ordering::SeqCst) <= 4 { boom("bug") } else { TestCaseResult::Valid }
     })
     .unwrap();
     assert_eq!(result.failures.len(), 1);
@@ -7000,19 +6272,13 @@ fn stale_nd_entries_demote_to_secondary_then_delete() {
     let result = reuse_run(settings(), "k", body).unwrap();
     assert!(result.failures.is_empty());
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
-    assert!(
-        db.fetch(b"k").is_empty(),
-        "a primary miss demotes the entry instead of deleting it"
-    );
+    assert!(db.fetch(b"k").is_empty(), "a primary miss demotes the entry instead of deleting it");
     assert_eq!(db.fetch(&secondary).len(), 1);
 
     let result = reuse_run(settings(), "k", body).unwrap();
     assert!(result.failures.is_empty());
     assert!(db.fetch(b"k").is_empty());
-    assert!(
-        db.fetch(&secondary).is_empty(),
-        "a secondary miss deletes the entry"
-    );
+    assert!(db.fetch(&secondary).is_empty(), "a secondary miss deletes the entry");
 }
 
 #[test]
@@ -7046,11 +6312,7 @@ fn nd_reproduction_holds_across_runs_for_a_family_of_flaky_bodies() {
             |ds| body(&execs, ds),
         )
         .unwrap();
-        assert_eq!(
-            result.failures.len(),
-            1,
-            "period {period}: first run finds the bug"
-        );
+        assert_eq!(result.failures.len(), 1, "period {period}: first run finds the bug");
 
         let execs = AtomicUsize::new(0);
         let result = reuse_run(
@@ -7102,10 +6364,7 @@ fn a_v2_entry_replay_that_detects_nondeterminism_under_error_strictness_aborts()
     );
     match result {
         Err(crate::backend::RunError::NonDeterministic(msg)) => {
-            assert!(
-                msg.to_lowercase().contains("non-deterministic"),
-                "got: {msg}"
-            );
+            assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
         }
         other => panic!("expected RunError::NonDeterministic, got {other:?}"),
     }
@@ -7133,17 +6392,12 @@ fn a_fresh_tier_replay_that_detects_nondeterminism_under_error_strictness_aborts
             }
         },
         async |ctx| {
-            let stored = ReproSource::Graph {
-                graph: graph_of(&[ChoiceValue::Boolean(true)]),
-                longest: 1,
-            };
+            let stored =
+                ReproSource::Graph { graph: graph_of(&[ChoiceValue::Boolean(true)]), longest: 1 };
             let result = ctx.nd_reproduce(None, &stored, 0, 4).await;
             match result {
                 Err(crate::backend::RunError::NonDeterministic(msg)) => {
-                    assert!(
-                        msg.to_lowercase().contains("non-deterministic"),
-                        "got: {msg}"
-                    );
+                    assert!(msg.to_lowercase().contains("non-deterministic"), "got: {msg}");
                 }
                 Err(other) => panic!("expected RunError::NonDeterministic, got {other:?}"),
                 Ok(_) => panic!("expected RunError::NonDeterministic, got a result"),
@@ -7209,11 +6463,7 @@ fn nd_shrinking_never_lowers_the_failure_probability_at_the_noise_floor() {
         "the final example must keep the p = 0.9 bug rather than drift to the \
          p = 0.02 noise floor: {atoms:?}"
     );
-    assert_eq!(
-        atoms,
-        vec![10],
-        "the L4 standard: one atom, minimized to the bug boundary"
-    );
+    assert_eq!(atoms, vec![10], "the L4 standard: one atom, minimized to the bug boundary");
 }
 
 #[test]
@@ -7236,17 +6486,9 @@ fn final_replay_evicts_a_dry_unconfirmed_origin() {
             .unwrap();
             assert!(ctx.origins.incumbent("Panic: bug").is_some());
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
-            assert!(
-                !ctx.origins.any_live(),
-                "a dry unconfirmed origin leaves the interesting map"
-            );
-            assert_eq!(
-                ctx.origins.unconfirmed().collect::<Vec<_>>(),
-                vec!["Panic: bug"]
-            );
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
+            assert!(!ctx.origins.any_live(), "a dry unconfirmed origin leaves the interesting map");
+            assert_eq!(ctx.origins.unconfirmed().collect::<Vec<_>>(), vec!["Panic: bug"]);
         },
     );
 }
@@ -7271,9 +6513,7 @@ fn a_reproducing_final_replay_confirms_an_unconfirmed_origin() {
             .unwrap();
             assert!(ctx.origins.needs_confirmation("Panic: bug"));
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 !ctx.origins.needs_confirmation("Panic: bug"),
                 "a reproducing final replay confirms the origin"
@@ -7301,13 +6541,7 @@ fn report_blobs_only_confirmed_origins() {
             .unwrap();
             ctx.origins
                 .entry("Panic: a")
-                .confirm(
-                    0.5,
-                    None,
-                    build_graph(&[vec![ChoiceValue::Boolean(true)]]),
-                    1,
-                    (4, 6),
-                )
+                .confirm(0.5, None, build_graph(&[vec![ChoiceValue::Boolean(true)]]), 1, (4, 6))
                 .unwrap();
             ctx.record_run(
                 &interesting_at("Panic: b", vec![bool_node(false)]),
@@ -7319,13 +6553,7 @@ fn report_blobs_only_confirmed_origins() {
             assert_eq!(report.failures.len(), 1);
             assert_eq!(report.failures[0].origin, "Panic: a");
             assert!(report.failures[0].reproduce_blob.is_some());
-            assert!(
-                report.failures[0]
-                    .caveat
-                    .as_deref()
-                    .unwrap()
-                    .contains("confirmed")
-            );
+            assert!(report.failures[0].caveat.as_deref().unwrap().contains("confirmed"));
         },
     );
 }
@@ -7341,30 +6569,16 @@ fn an_origin_admitted_during_the_final_replay_is_not_blobbed() {
             if rbool(ds).is_err() {
                 return TestCaseResult::Overrun;
             }
-            if execs.fetch_add(1, Ordering::SeqCst) == 0 {
-                boom("b")
-            } else {
-                boom("a")
-            }
+            if execs.fetch_add(1, Ordering::SeqCst) == 0 { boom("b") } else { boom("a") }
         },
         async |ctx| {
+            ctx.origins.entry("Panic: a").replace(vec![bool_node(true)], Vec::new());
             ctx.origins
                 .entry("Panic: a")
-                .replace(vec![bool_node(true)], Vec::new());
-            ctx.origins
-                .entry("Panic: a")
-                .confirm(
-                    0.5,
-                    None,
-                    build_graph(&[vec![ChoiceValue::Boolean(true)]]),
-                    1,
-                    (4, 6),
-                )
+                .confirm(0.5, None, build_graph(&[vec![ChoiceValue::Boolean(true)]]), 1, (4, 6))
                 .unwrap();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 ctx.origins.incumbent("Panic: b").is_some(),
                 "the report-time measurement run admits the new origin"
@@ -7404,11 +6618,7 @@ fn unconfirmed_origins_report_caveat_only_when_nothing_confirmed() {
                 assert!(failure.reproduce_blob.is_none());
             }
             assert!(
-                report.failures[0]
-                    .caveat
-                    .as_deref()
-                    .unwrap()
-                    .contains("failed 0 of 24 replays")
+                report.failures[0].caveat.as_deref().unwrap().contains("failed 0 of 24 replays")
             );
             assert!(
                 report.failures[1]
@@ -7474,16 +6684,14 @@ fn nd_runs_record_targeting_observations_as_race_seeds() {
         None,
         |_ds| TestCaseResult::Valid,
         async |ctx| {
-            ctx.record_run(&observing_run(), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(&observing_run(), Duration::ZERO, false).unwrap();
             assert!(!ctx.targeting.is_empty());
         },
     );
     with_counting_ctx(
         |_ds| TestCaseResult::Valid,
         async |ctx, _execs| {
-            ctx.record_run(&observing_run(), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(&observing_run(), Duration::ZERO, false).unwrap();
             assert!(!ctx.targeting.is_empty());
         },
     );
@@ -7645,8 +6853,7 @@ fn nd_targeting_race_with_no_distinct_candidates_adopts_nothing() {
             TestCaseResult::Valid
         },
         async |ctx| {
-            ctx.targeting
-                .record(&[], &HashMap::from_iter([("".to_string(), 1.0)]));
+            ctx.targeting.record(&[], &HashMap::from_iter([("".to_string(), 1.0)]));
             ctx.optimise_targets_nd().await.unwrap();
             let target = ctx.targeting.nd_target("").unwrap();
             assert!(!target.dead);
@@ -7766,8 +6973,7 @@ fn nd_targeting_reference_interrupted_by_a_discovery_is_not_marked_dead() {
             })
         },
         async |ctx| {
-            ctx.targeting
-                .record(&[], &HashMap::from_iter([("s".to_string(), 1.0)]));
+            ctx.targeting.record(&[], &HashMap::from_iter([("s".to_string(), 1.0)]));
             ctx.optimise_targets_nd().await.unwrap();
             assert!(ctx.targeting.nd_target("s").is_none());
             assert!(ctx.origins.any_live());
@@ -7780,24 +6986,15 @@ fn reproduce_blob_never_runs_a_fresh_generation() {
     let state = nd_state_of(&[vec![ChoiceValue::Integer(BigInt::from(0))]]);
     let blob = crate::native::blob::encode_nd_failure(&state).unwrap();
     let draws = std::cell::RefCell::new(Vec::new());
-    let result = reproduce_blob_sync(&quiet_settings(), &blob, |ds| {
-        match rint(ds, 0, 1_000_000) {
-            Ok(v) => {
-                draws.borrow_mut().push(v);
-                if v != 0 {
-                    boom("nonzero")
-                } else {
-                    TestCaseResult::Valid
-                }
-            }
-            Err(()) => TestCaseResult::Overrun,
+    let result = reproduce_blob_sync(&quiet_settings(), &blob, |ds| match rint(ds, 0, 1_000_000) {
+        Ok(v) => {
+            draws.borrow_mut().push(v);
+            if v != 0 { boom("nonzero") } else { TestCaseResult::Valid }
         }
+        Err(()) => TestCaseResult::Overrun,
     })
     .unwrap();
-    assert!(
-        result.failures.is_empty(),
-        "a fresh generation would draw a nonzero value and fail"
-    );
+    assert!(result.failures.is_empty(), "a fresh generation would draw a nonzero value and fail");
     let draws = draws.borrow();
     assert!(!draws.is_empty());
     assert!(draws.iter().all(|&v| v == 0));
@@ -8006,10 +7203,7 @@ fn drain_stops_at_mid_drain_nd_flip() {
     assert_eq!(result.failures.len(), 1);
     let db = DirectoryTestCaseDatabase::new(&path);
     let secondary = db.fetch(&secondary_key);
-    assert!(
-        !secondary.contains(&drained_first),
-        "the first entry got its replay and its delete"
-    );
+    assert!(!secondary.contains(&drained_first), "the first entry got its replay and its delete");
     assert!(
         secondary.contains(&survivor),
         "a mid-drain flip stops the single-replay deletes for the rest"
@@ -8021,10 +7215,8 @@ fn deterministic_final_replay_is_stamped() {
     use std::sync::atomic::{AtomicU32, Ordering};
     let stamped = AtomicU32::new(0);
     let execs = AtomicU32::new(0);
-    let settings = Settings::new()
-        .database(None)
-        .verbosity(Verbosity::Quiet)
-        .report_multiple_failures(false);
+    let settings =
+        Settings::new().database(None).verbosity(Verbosity::Quiet).report_multiple_failures(false);
     let result = reuse_run(settings, "k", |ds| {
         execs.fetch_add(1, Ordering::SeqCst);
         stamped.fetch_add(u32::from(ds.should_capture()), Ordering::SeqCst);
@@ -8092,21 +7284,11 @@ impl LoggingDatabase {
 
 impl TestCaseDatabase for LoggingDatabase {
     fn fetch(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        self.0
-            .entries
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .unwrap_or_default()
+        self.0.entries.lock().unwrap().get(key).cloned().unwrap_or_default()
     }
 
     fn save(&self, key: &[u8], value: &[u8]) {
-        self.0
-            .ops
-            .lock()
-            .unwrap()
-            .push(DbOp::Save(key.to_vec(), value.to_vec()));
+        self.0.ops.lock().unwrap().push(DbOp::Save(key.to_vec(), value.to_vec()));
         let mut entries = self.0.entries.lock().unwrap();
         let values = entries.entry(key.to_vec()).or_default();
         if !values.contains(&value.to_vec()) {
@@ -8115,22 +7297,14 @@ impl TestCaseDatabase for LoggingDatabase {
     }
 
     fn delete(&self, key: &[u8], value: &[u8]) {
-        self.0
-            .ops
-            .lock()
-            .unwrap()
-            .push(DbOp::Delete(key.to_vec(), value.to_vec()));
+        self.0.ops.lock().unwrap().push(DbOp::Delete(key.to_vec(), value.to_vec()));
         if let Some(values) = self.0.entries.lock().unwrap().get_mut(key) {
             values.retain(|v| v != value);
         }
     }
 
     fn move_value(&self, src: &[u8], dst: &[u8], value: &[u8]) {
-        self.0
-            .ops
-            .lock()
-            .unwrap()
-            .push(DbOp::Move(src.to_vec(), dst.to_vec(), value.to_vec()));
+        self.0.ops.lock().unwrap().push(DbOp::Move(src.to_vec(), dst.to_vec(), value.to_vec()));
         let mut entries = self.0.entries.lock().unwrap();
         if let Some(values) = entries.get_mut(src) {
             values.retain(|v| v != value);
@@ -8152,10 +7326,8 @@ fn persister_saves_new_bytes_before_deleting_superseded() {
     let old = serialize_choices(&[ChoiceValue::Integer(BigInt::from(5))]).unwrap();
     let new = serialize_choices(&[ChoiceValue::Integer(BigInt::from(3))]).unwrap();
     let ops = db.ops();
-    let saved_new = ops
-        .iter()
-        .position(|op| *op == DbOp::Save(b"k".to_vec(), new.clone()))
-        .unwrap();
+    let saved_new =
+        ops.iter().position(|op| *op == DbOp::Save(b"k".to_vec(), new.clone())).unwrap();
     let removed_old = ops
         .iter()
         .position(|op| {
@@ -8181,10 +7353,7 @@ fn persister_deletes_superseded_same_run_saves() {
         vec![serialize_choices(&[ChoiceValue::Integer(BigInt::from(3))]).unwrap()]
     );
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
-    assert!(
-        db.fetch(&secondary).is_empty(),
-        "a superseded same-run save is deleted, not demoted"
-    );
+    assert!(db.fetch(&secondary).is_empty(), "a superseded same-run save is deleted, not demoted");
 }
 
 #[test]
@@ -8192,11 +7361,9 @@ fn end_of_run_reconciliation_demotes_only_the_run_start_primary() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    let run_start = serialize_choices(&[
-        ChoiceValue::Integer(BigInt::from(1005)),
-        ChoiceValue::Boolean(true),
-    ])
-    .unwrap();
+    let run_start =
+        serialize_choices(&[ChoiceValue::Integer(BigInt::from(1005)), ChoiceValue::Boolean(true)])
+            .unwrap();
     db.save(b"k", &run_start);
 
     let result = reuse_run(
@@ -8272,10 +7439,7 @@ fn nd_secondary_corpus_stays_bounded_across_runs() {
         .unwrap();
         assert_eq!(result.failures.len(), 1);
         assert_eq!(db.fetch(b"k").len(), 1);
-        assert!(
-            db.fetch(&secondary).len() <= run,
-            "at most one secondary deposit per run"
-        );
+        assert!(db.fetch(&secondary).len() <= run, "at most one secondary deposit per run");
     }
 }
 
@@ -8307,10 +7471,7 @@ fn secondary_corpus_cap_evicts_shortlex_largest() {
     let mut kept = db.fetch(&secondary);
     kept.sort_by(|a, b| shortlex(a, b));
     let expected: Vec<Vec<u8>> = (0..50).map(entry).collect();
-    assert_eq!(
-        kept, expected,
-        "eviction removes exactly the shortlex-largest overflow"
-    );
+    assert_eq!(kept, expected, "eviction removes exactly the shortlex-largest overflow");
 }
 
 #[test]
@@ -8318,10 +7479,7 @@ fn reuse_stops_sampling_secondary_once_the_primary_reproduces() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    db.save(
-        b"k",
-        &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap(),
-    );
+    db.save(b"k", &serialize_choices(&[ChoiceValue::Boolean(true)]).unwrap());
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
     let sampled = serialize_choices(&[ChoiceValue::Boolean(false)]).unwrap();
     db.save(&secondary, &sampled);
@@ -8354,11 +7512,8 @@ fn shrink_drain_stops_at_secondary_entries_above_the_incumbent() {
     let db = DirectoryTestCaseDatabase::new(&path);
     db.save(
         b"k",
-        &serialize_choices(&[
-            ChoiceValue::Integer(BigInt::from(1005)),
-            ChoiceValue::Boolean(true),
-        ])
-        .unwrap(),
+        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(1005)), ChoiceValue::Boolean(true)])
+            .unwrap(),
     );
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
     let above = serialize_choices(&[
@@ -8401,11 +7556,7 @@ fn a_flip_during_a_successful_final_replay_keeps_the_failure() {
                 return TestCaseResult::Overrun;
             };
             execs.set(execs.get() + 1);
-            if v == 3 && execs.get() > 1 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if v == 3 && execs.get() > 1 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -8414,17 +7565,11 @@ fn a_flip_during_a_successful_final_replay_keeps_the_failure() {
             let (run, mismatch) = ctx.test_function(ntc).await.unwrap();
             assert_eq!(run.status, Status::Valid);
             assert!(mismatch.is_none());
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(3)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![int_node(3)]), Duration::ZERO, false)
+                .unwrap();
             assert!(!ctx.nd_handling());
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, false)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
             assert!(
                 ctx.nd_handling(),
                 "the verdict flip inside the successful replay entered nd handling"
@@ -8457,11 +7602,7 @@ fn a_dry_pooled_review_backtracks_over_history_at_the_final_replay() {
             let Ok(b) = rint(ds, 0, 100) else {
                 return TestCaseResult::Overrun;
             };
-            if b == 77 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if b == 77 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -8471,17 +7612,11 @@ fn a_dry_pooled_review_backtracks_over_history_at_the_final_replay() {
                 false,
             )
             .unwrap();
-            ctx.record_run(
-                &interesting_at(&origin, vec![int_node(3)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(&origin, vec![int_node(3)]), Duration::ZERO, false)
+                .unwrap();
             ctx.nd_flip();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, true)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, true).await.unwrap();
             assert!(
                 !ctx.origins.needs_confirmation(&origin),
                 "the dry review backtracked over history and confirmed"
@@ -8535,17 +7670,11 @@ fn an_exhausted_backtrack_after_a_dry_pooled_review_rejects_the_origin() {
                 false,
             )
             .unwrap();
-            ctx.record_run(
-                &interesting_at(origin, vec![wide_node(3)]),
-                Duration::ZERO,
-                false,
-            )
-            .unwrap();
+            ctx.record_run(&interesting_at(origin, vec![wide_node(3)]), Duration::ZERO, false)
+                .unwrap();
             ctx.nd_flip();
             let output = ctx.settings.output.clone();
-            ctx.final_replay(Verbosity::Quiet, &output, None, true)
-                .await
-                .unwrap();
+            ctx.final_replay(Verbosity::Quiet, &output, None, true).await.unwrap();
             assert!(
                 ctx.origins.incumbent(origin).is_none(),
                 "an origin nothing reproduces is rejected into the caveat-only report"
@@ -8589,10 +7718,7 @@ fn a_seeded_bar_quota_with_no_reproducing_replay_rejects_at_the_cap() {
                 )
                 .await
                 .unwrap();
-            assert!(
-                !batch.bar_accepted,
-                "an accept needs an in-batch reproduction"
-            );
+            assert!(!batch.bar_accepted, "an accept needs an in-batch reproduction");
             assert!(batch.witness.is_none());
             assert_eq!(batch.evidence.runs(), nd::CONFIRM_CAP);
         },
@@ -8612,11 +7738,7 @@ fn a_seeded_bar_quota_accepts_once_a_replay_reproduces() {
                 return TestCaseResult::Overrun;
             };
             execs.set(execs.get() + 1);
-            if execs.get() >= 3 {
-                boom(bug)
-            } else {
-                TestCaseResult::Valid
-            }
+            if execs.get() >= 3 { boom(bug) } else { TestCaseResult::Valid }
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
@@ -8653,24 +7775,15 @@ fn error_strictness_aborts_on_a_shrink_probe_verdict_flip() {
                 return TestCaseResult::Overrun;
             }
             execs.set(execs.get() + 1);
-            if execs.get() > 1 {
-                boom("flake")
-            } else {
-                TestCaseResult::Valid
-            }
+            if execs.get() > 1 { boom("flake") } else { TestCaseResult::Valid }
         },
         async |ctx| {
             ctx.collect_statistics = true;
-            let first = ctx
-                .cached_test_function(&[ChoiceValue::Boolean(true)], None, 0)
-                .await
-                .unwrap();
+            let first =
+                ctx.cached_test_function(&[ChoiceValue::Boolean(true)], None, 0).await.unwrap();
             assert_eq!(first.status, Status::Valid);
             ctx.collect_statistics = false;
-            let err = match ctx
-                .cached_test_function(&[ChoiceValue::Boolean(true)], None, 0)
-                .await
-            {
+            let err = match ctx.cached_test_function(&[ChoiceValue::Boolean(true)], None, 0).await {
                 Err(err) => err,
                 Ok(_) => panic!("expected the probe verdict flip to abort"),
             };
@@ -8693,10 +7806,7 @@ fn error_strictness_aborts_on_kind_drift_in_the_pre_shrink_drain() {
         .unwrap(),
     );
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
-    db.save(
-        &secondary,
-        &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap(),
-    );
+    db.save(&secondary, &serialize_choices(&[ChoiceValue::Integer(BigInt::from(7))]).unwrap());
     let executions = Rc::new(Cell::new(0u32));
     let execs = executions.clone();
     let mut run_case = move |ds: Box<dyn DataSource + Send + Sync>| {
@@ -8813,8 +7923,7 @@ fn reconciliation_demotes_a_reproduced_run_start_entry_after_a_flip() {
     assert_eq!(primary.len(), 1);
     assert!(crate::native::blob::decode_nd_state(&primary[0]).is_some());
     assert!(
-        db.fetch(&crate::native::database::sub_key(b"k", b"secondary"))
-            .contains(&run_start),
+        db.fetch(&crate::native::database::sub_key(b"k", b"secondary")).contains(&run_start),
         "the reproduced run-start entry demotes instead of deleting"
     );
 }
@@ -8824,25 +7933,17 @@ fn superseding_one_origin_keeps_a_byte_identical_entry_shared_with_another() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    let settings = Settings::new()
-        .database(Some(path))
-        .verbosity(Verbosity::Quiet);
+    let settings = Settings::new().database(Some(path)).verbosity(Verbosity::Quiet);
     let exchange = CaseExchange::new();
     let fut = async {
         let mut ctx = Engine::new(&settings, Some("k"), &exchange).unwrap();
         ctx.nd_flip();
-        ctx.origins
-            .entry("Panic: a")
-            .replace(vec![int_node(90)], Vec::new());
+        ctx.origins.entry("Panic: a").replace(vec![int_node(90)], Vec::new());
         ctx.record_nd_incumbent("Panic: a").unwrap();
-        ctx.origins
-            .entry("Panic: b")
-            .replace(vec![int_node(90)], Vec::new());
+        ctx.origins.entry("Panic: b").replace(vec![int_node(90)], Vec::new());
         ctx.record_nd_incumbent("Panic: b").unwrap();
         assert_eq!(db.fetch(b"k").len(), 1);
-        ctx.origins
-            .entry("Panic: a")
-            .replace(vec![int_node(50)], Vec::new());
+        ctx.origins.entry("Panic: a").replace(vec![int_node(50)], Vec::new());
         ctx.record_nd_incumbent("Panic: a").unwrap();
         assert_eq!(
             db.fetch(b"k").len(),
@@ -8880,11 +7981,7 @@ fn a_one_case_budget_generates_a_random_case() {
     let mut executions = 0;
     let mut drawn: Vec<u64> = Vec::new();
     let result = run_main_sync(
-        &Settings::new()
-            .test_cases(1)
-            .database(None)
-            .seed(Some(0))
-            .verbosity(Verbosity::Quiet),
+        &Settings::new().test_cases(1).database(None).seed(Some(0)).verbosity(Verbosity::Quiet),
         None,
         |ds| {
             executions += 1;
@@ -8908,11 +8005,8 @@ fn a_one_case_budget_generates_a_random_case() {
 
 #[test]
 fn derandomize_is_keyed_by_test_identity() {
-    let settings = Settings::new()
-        .test_cases(5)
-        .database(None)
-        .derandomize(true)
-        .verbosity(Verbosity::Quiet);
+    let settings =
+        Settings::new().test_cases(5).database(None).derandomize(true).verbosity(Verbosity::Quiet);
     let draw_with_key = |key: Option<&str>| {
         let mut drawn: Vec<u64> = Vec::new();
         {
@@ -8924,14 +8018,8 @@ fn derandomize_is_keyed_by_test_identity() {
                 }
                 ds.mark_complete(&TestCaseResult::Valid);
             };
-            run_main_sync(
-                &settings,
-                key,
-                &mut run_case,
-                Duration::from_secs(30),
-                Duration::ZERO,
-            )
-            .unwrap();
+            run_main_sync(&settings, key, &mut run_case, Duration::from_secs(30), Duration::ZERO)
+                .unwrap();
         }
         drawn
     };
@@ -8951,9 +8039,7 @@ fn reconciliation_deletes_a_same_run_leftover_absent_from_the_final_failures() {
     let exchange = CaseExchange::new();
     let mut ctx = Engine::new(&settings, Some("k"), &exchange).unwrap();
     ctx.persister.record("Panic: bug", &[int_node(90)]).unwrap();
-    ctx.origins
-        .entry("Panic: bug")
-        .replace(vec![int_node(50)], Vec::new());
+    ctx.origins.entry("Panic: bug").replace(vec![int_node(50)], Vec::new());
     ctx.reconcile_database().unwrap();
 
     assert_eq!(
@@ -8961,10 +8047,7 @@ fn reconciliation_deletes_a_same_run_leftover_absent_from_the_final_failures() {
         vec![serialize_choices(&[ChoiceValue::Integer(BigInt::from(50))]).unwrap()]
     );
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
-    assert!(
-        db.fetch(&secondary).is_empty(),
-        "a same-run leftover is deleted, not demoted"
-    );
+    assert!(db.fetch(&secondary).is_empty(), "a same-run leftover is deleted, not demoted");
 }
 
 /// Regression for issue #78: a test that rejects its input before making
@@ -9003,11 +8086,9 @@ fn shrink_phase_drain_stops_at_entries_above_the_largest_surviving_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
     let db = DirectoryTestCaseDatabase::new(&path);
-    let run_start = serialize_choices(&[
-        ChoiceValue::Integer(BigInt::from(90)),
-        ChoiceValue::Boolean(true),
-    ])
-    .unwrap();
+    let run_start =
+        serialize_choices(&[ChoiceValue::Integer(BigInt::from(90)), ChoiceValue::Boolean(true)])
+            .unwrap();
     db.save(b"k", &run_start);
     let secondary = crate::native::database::sub_key(b"k", b"secondary");
     let small = serialize_choices(&[ChoiceValue::Integer(BigInt::from(10))]).unwrap();
@@ -9085,11 +8166,7 @@ fn a_reuse_replay_that_realizes_any_stored_timeline_is_aligned_and_skips_the_shr
     let db = DirectoryTestCaseDatabase::new(&path);
     let mut graph = Graph::from_run(&branch_t());
     graph.insert(&branch_s());
-    let state = crate::native::blob::NdReproState {
-        graph,
-        entropy: 7,
-        longest: 4,
-    };
+    let state = crate::native::blob::NdReproState { graph, entropy: 7, longest: 4 };
     db.save(b"k", &crate::native::blob::encode_nd_state(&state).unwrap());
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&lines);
@@ -9136,9 +8213,7 @@ fn the_graph_shrink_keeps_both_branches_of_a_branching_failure() {
         let witness = branch_s_witness();
         let origin = ctx.origins.entry("Panic: branch");
         origin.adopt(witness.nodes.clone(), witness.spans.clone());
-        origin
-            .confirm(0.8, Some(witness.clone()), branching_graph(), 4, (20, 20))
-            .unwrap();
+        origin.confirm(0.8, Some(witness.clone()), branching_graph(), 4, (20, 20)).unwrap();
         let output = Output::callback(move |line| sink.lock().unwrap().push(line.to_string()));
         let mut shrunk = crate::native::HashSet::default();
         ctx.shrink_origin(
@@ -9159,18 +8234,8 @@ fn the_graph_shrink_keeps_both_branches_of_a_branching_failure() {
             "each branch reproduces only half the runs, so neither can go: {:?}",
             graph.nodes()
         );
-        assert_eq!(
-            graph.walk_verdict(&branch_s()),
-            Walked::Whole,
-            "{:?}",
-            graph.nodes()
-        );
-        assert_eq!(
-            graph.walk_verdict(&branch_t()),
-            Walked::Whole,
-            "{:?}",
-            graph.nodes()
-        );
+        assert_eq!(graph.walk_verdict(&branch_s()), Walked::Whole, "{:?}", graph.nodes());
+        assert_eq!(graph.walk_verdict(&branch_t()), Walked::Whole, "{:?}", graph.nodes());
     });
     let lines = lines.lock().unwrap();
     assert!(
@@ -9180,9 +8245,7 @@ fn the_graph_shrink_keeps_both_branches_of_a_branching_failure() {
         "{lines:?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("nd shrink done: origin=Panic: branch edges=7")),
+        lines.iter().any(|l| l.starts_with("nd shrink done: origin=Panic: branch edges=7")),
         "{lines:?}"
     );
 }
@@ -9234,9 +8297,7 @@ fn a_graph_shrink_accept_is_installed_and_reported_at_debug_verbosity() {
     );
     let lines = lines.lock().unwrap();
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("nd graph accept: origin=Panic: bug edges=1 anchor=")),
+        lines.iter().any(|l| l.starts_with("nd graph accept: origin=Panic: bug edges=1 anchor=")),
         "{lines:?}"
     );
 }
@@ -9257,22 +8318,13 @@ fn a_boost_winner_the_graph_already_walks_is_installed_over_the_incumbent() {
             let incumbent = interesting_at("Panic: bug", vec![bool_node(true)]);
             ctx.origins
                 .entry("Panic: bug")
-                .confirm(
-                    0.1,
-                    None,
-                    build_graph(&[vec![ChoiceValue::Boolean(false)]]),
-                    1,
-                    (4, 9),
-                )
+                .confirm(0.1, None, build_graph(&[vec![ChoiceValue::Boolean(false)]]), 1, (4, 9))
                 .unwrap();
             ctx.origins
                 .entry("Panic: bug")
                 .replace(incumbent.nodes.clone(), incumbent.spans.clone());
-            let (witness, lcb) = ctx
-                .nd_boost("Panic: bug", &incumbent, 0.0)
-                .await
-                .unwrap()
-                .unwrap();
+            let (witness, lcb) =
+                ctx.nd_boost("Panic: bug", &incumbent, 0.0).await.unwrap().unwrap();
             assert_eq!(witness.nodes, vec![bool_node(false)]);
             let counterexample = ctx.origins.get("Panic: bug").unwrap();
             assert_eq!(

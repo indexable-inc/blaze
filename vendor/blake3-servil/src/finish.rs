@@ -56,7 +56,11 @@ pub(crate) struct Finish {
 
 impl Finish {
     pub(crate) fn new() -> Finish {
-        Finish { published: Line(AtomicUsize::new(0)), state: Line(AtomicUsize::new(0)), owner: Mutex::new(None) }
+        Finish {
+            published: Line(AtomicUsize::new(0)),
+            state: Line(AtomicUsize::new(0)),
+            owner: Mutex::new(None),
+        }
     }
 
     /// The pieces finished so far.
@@ -73,7 +77,9 @@ impl Finish {
     /// one wakes a caller parked for it.
     pub(crate) fn finished(&self, n: usize) {
         let before = self.state.fetch_add(n, Ordering::SeqCst);
-        if before & SLEEPING != 0 && (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {
+        if before & SLEEPING != 0
+            && (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst)
+        {
             if let Some(owner) = &*self.owner.lock().unwrap() {
                 owner.unpark();
             }
@@ -114,10 +120,19 @@ mod tests {
     /// checker assumes; this fires on any other, with the reason above.
     #[test]
     fn every_atomic_in_the_handshake_files_is_seqcst() {
-        for (name, text) in [("finish.rs", include_str!("finish.rs")), ("park.rs", include_str!("park.rs"))] {
+        for (name, text) in
+            [("finish.rs", include_str!("finish.rs")), ("park.rs", include_str!("park.rs"))]
+        {
             for (n, line) in text.lines().enumerate() {
-                if line.contains("Ordering::") && !line.contains("Ordering::SeqCst") && !line.trim_start().starts_with("//") {
-                    panic!("{name}:{}: {} (every atomic here is SeqCst: see finish.rs's head)", n + 1, line.trim());
+                if line.contains("Ordering::")
+                    && !line.contains("Ordering::SeqCst")
+                    && !line.trim_start().starts_with("//")
+                {
+                    panic!(
+                        "{name}:{}: {} (every atomic here is SeqCst: see finish.rs's head)",
+                        n + 1,
+                        line.trim()
+                    );
                 }
             }
         }
@@ -147,7 +162,11 @@ mod tests {
         for _ in 0..20 {
             handle.unpark();
             thread::sleep(std::time::Duration::from_millis(1));
-            assert_eq!(returned.load(Ordering::SeqCst), 0, "the waiter returned before its count was complete");
+            assert_eq!(
+                returned.load(Ordering::SeqCst),
+                0,
+                "the waiter returned before its count was complete"
+            );
         }
         finish.finished(1);
         waiter.join().unwrap();

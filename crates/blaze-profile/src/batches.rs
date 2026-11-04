@@ -113,10 +113,15 @@ fn build_id(build: u32) -> Option<u64> {
 /// The `spans` rows of `spans`, all from `process`.
 pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = spans.len();
-    let (mut threads, mut names, mut targets, mut kinds) = (Dict::new(), Dict::new(), Dict::new(), Dict::new());
+    let (mut threads, mut names, mut targets, mut kinds) =
+        (Dict::new(), Dict::new(), Dict::new(), Dict::new());
     // alloc: a batch's key columns, once a read, never per span written
-    let (mut thread_keys, mut name_keys, mut target_keys, mut kind_keys) =
-        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let (mut thread_keys, mut name_keys, mut target_keys, mut kind_keys) = (
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+    );
     for row in spans {
         // A site of this process, or of a dead one whose rows a postmortem read back.
         let meta = flight::site_text(row.site);
@@ -139,7 +144,9 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         column(UInt32Array::from_iter_values(spans.iter().map(|it| it.thread))),
         threads.finish(UInt32Array::from(thread_keys))?,
         column(UInt64Array::from_iter_values(spans.iter().map(|it| it.span_id))),
-        column(UInt64Array::from_iter(spans.iter().map(|it| (it.parent != 0).then_some(it.parent)))),
+        column(UInt64Array::from_iter(
+            spans.iter().map(|it| (it.parent != 0).then_some(it.parent)),
+        )),
         column(UInt16Array::from_iter_values(spans.iter().map(|it| it.depth))),
         names.finish(UInt32Array::from(name_keys))?,
         targets.finish(UInt32Array::from(target_keys))?,
@@ -158,8 +165,12 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.copies)))),
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.bytes)))),
         // Null where it folded none: most spans.
-        column(UInt64Array::from_iter(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_spans)))),
-        column(Int64Array::from_iter(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_ns)))),
+        column(UInt64Array::from_iter(
+            spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_spans)),
+        )),
+        column(Int64Array::from_iter(
+            spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_ns)),
+        )),
     ]);
     for cells in typed {
         columns.push(span_column(spans, cells)?);
@@ -181,7 +192,9 @@ fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, Arrow
             let mut values = Dict::new();
             let keys: UInt32Array = words
                 .map(|word| {
-                    (word != 0).then(|| values.key(word, || (cells.text)(word).unwrap_or_else(|| "?".into())))
+                    (word != 0).then(|| {
+                        values.key(word, || (cells.text)(word).unwrap_or_else(|| "?".into()))
+                    })
                 })
                 .collect();
             values.finish(keys)?
@@ -200,8 +213,9 @@ fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, Arrow
 pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = counters.len();
     let mut names = Dict::new();
-    let name_keys =
-        UInt32Array::from_iter_values(counters.iter().map(|it| names.key(it.plot as u64, || it.plot.name())));
+    let name_keys = UInt32Array::from_iter_values(
+        counters.iter().map(|it| names.key(it.plot as u64, || it.plot.name())),
+    );
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(counters.iter().map(|it| build_id(it.build)))),
@@ -216,9 +230,15 @@ pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordB
 }
 
 /// The `open` rows of `threads`, read at `at_ns`, all from `process`.
-pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn open(
+    threads: &[ThreadNow],
+    at_ns: i64,
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
     let rows = threads.iter().map(|it| it.open.len()).sum();
-    let spans = || threads.iter().flat_map(|thread| thread.open.iter().enumerate().map(move |it| (thread, it)));
+    let spans = || {
+        threads.iter().flat_map(|thread| thread.open.iter().enumerate().map(move |it| (thread, it)))
+    };
     // alloc: a batch's list of columns, once a read of the threads
     let columns: Vec<ArrayRef> = vec![
         column(UInt32Array::from_value(process.pid, rows)),
@@ -227,8 +247,14 @@ pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<R
         column(UInt16Array::from_iter_values(spans().map(|(_, (depth, _))| depth as u16))),
         dict(spans().map(|(_, (_, span))| span.name)),
         dict(spans().map(|(_, (_, span))| span.target)),
-        column(Int64Array::from_iter_values(spans().map(|(_, (_, span))| at_ns - span.for_ns as i64))),
-        column(spans().map(|(_, (_, span))| span.krate.as_deref()).collect::<DictionaryArray<UInt32Type>>()),
+        column(Int64Array::from_iter_values(
+            spans().map(|(_, (_, span))| at_ns - span.for_ns as i64),
+        )),
+        column(
+            spans()
+                .map(|(_, (_, span))| span.krate.as_deref())
+                .collect::<DictionaryArray<UInt32Type>>(),
+        ),
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.function.as_deref()))),
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.unit.as_deref()))),
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.awaits.as_deref()))),
@@ -342,11 +368,15 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
     let (mut thread_keys, mut event_keys, mut kind_keys) =
         (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in switches {
-        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
+        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+            flight::name(row.thread_name).unwrap_or_else(|| "?".into())
+        }));
         event_keys.push(events.key(row.event as u64, || row.event.name()));
         kind_keys.push(row.waited.map(|(on, _)| kinds.key(on as u64, || on.name())));
     }
-    let value = |row: &SwitchRow| row.waited.filter(|(on, _)| *on != WaitedOn::Moved).map(|(_, value)| value);
+    let value = |row: &SwitchRow| {
+        row.waited.filter(|(on, _)| *on != WaitedOn::Moved).map(|(_, value)| value)
+    };
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(switches.iter().map(|it| build_id(it.build)))),
@@ -372,10 +402,15 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
 /// The `events` rows of `events`, all from `process`.
 pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = events.len();
-    let (mut threads, mut levels, mut targets, mut names) = (Dict::new(), Dict::new(), Dict::new(), Dict::new());
+    let (mut threads, mut levels, mut targets, mut names) =
+        (Dict::new(), Dict::new(), Dict::new(), Dict::new());
     // alloc: a batch's keys, once a read
-    let (mut thread_keys, mut level_keys, mut target_keys, mut name_keys) =
-        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let (mut thread_keys, mut level_keys, mut target_keys, mut name_keys) = (
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+        Vec::with_capacity(rows),
+    );
     for row in events {
         let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
@@ -384,7 +419,8 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
         name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
     }
     // alloc: a batch's messages, once a read
-    let messages: Vec<Option<std::sync::Arc<str>>> = events.iter().map(|it| flight::name(it.message)).collect();
+    let messages: Vec<Option<std::sync::Arc<str>>> =
+        events.iter().map(|it| flight::name(it.message)).collect();
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(events.iter().map(|it| build_id(it.build)))),
@@ -461,9 +497,11 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
     let (mut threads, mut names, mut targets) = (Dict::new(), Dict::new(), Dict::new());
     let (mut parents, mut parent_targets) = (Dict::new(), Dict::new());
     // alloc: a batch's keys, once a read
-    let (mut thread_keys, mut name_keys, mut target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let (mut thread_keys, mut name_keys, mut target_keys) =
+        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     // alloc: a batch's keys, once a read
-    let (mut parent_keys, mut parent_target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let (mut parent_keys, mut parent_target_keys) =
+        (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
         let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
@@ -541,7 +579,10 @@ mod tests {
         assert_eq!(dict("crate", at).as_deref(), Some("app"));
         assert_eq!(dict("commit", at).as_deref(), Some("abc"));
         assert_eq!(dict("query_kind", at), None);
-        assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(at), 9);
+        assert_eq!(
+            column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(at),
+            9
+        );
         let plotted = counters.column(schema::COUNTERS.column("value").unwrap());
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
     }
@@ -595,7 +636,8 @@ mod tests {
     fn a_runs_cpu_steps_peak_and_outcome_are_its_columns_and_null_where_unsaid() {
         use crate::span::{Fields as _, MacroExpanded, Outcome, Said, col};
         let mut typed = Said::EMPTY;
-        MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::Ok }.write(&mut typed);
+        MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::Ok }
+            .write(&mut typed);
         let said = SpanRow {
             build: 1,
             thread: 3,
@@ -618,7 +660,8 @@ mod tests {
         };
         assert_eq!(said.get::<col::Outcome>(), Some(Outcome::Ok));
         let unsaid = SpanRow { span_id: 12, self_cpu_ns: None, typed: Said::EMPTY.typed, ..said };
-        let batch = spans(&[said, unsaid], Process { pid: 7, name: "blaze serve", commit: None }).unwrap();
+        let batch =
+            spans(&[said, unsaid], Process { pid: 7, name: "blaze serve", commit: None }).unwrap();
         let column = |name: &str| batch.column(schema::SPANS.column(name).unwrap());
         let u64s = |name: &str| {
             let it = column(name).as_primitive::<arrow_array::types::UInt64Type>();

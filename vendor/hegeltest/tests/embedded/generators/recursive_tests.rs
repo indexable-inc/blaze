@@ -57,10 +57,9 @@ fn finishing_a_recursive_value_on_an_exhausted_stream_is_an_overrun() {
         depth: 0,
         label: RECURSIVE_LABEL,
     };
-    let payload = catch_unwind(AssertUnwindSafe(|| {
-        root.draw_subtree(&tc, &mut PrettyPrinter::noop())
-    }))
-    .unwrap_err();
+    let payload =
+        catch_unwind(AssertUnwindSafe(|| root.draw_subtree(&tc, &mut PrettyPrinter::noop())))
+            .unwrap_err();
     assert!(
         payload.downcast_ref::<crate::control::StopTest>().is_some(),
         "finishing on an exhausted stream should unwind as StopTest"

@@ -259,8 +259,9 @@ pub(crate) fn evaluate_root_goal<'db>(
     let Some(before) = Mark::of(infcx) else {
         return delegate.evaluate_root_goal(goal, span, None);
     };
-    let (result, reads) =
-        blaze_query::db::capture_reads(interner.db, || delegate.evaluate_root_goal(goal, span, None));
+    let (result, reads) = blaze_query::db::capture_reads(interner.db, || {
+        delegate.evaluate_root_goal(goal, span, None)
+    });
     if let Some(reads) = reads
         && let Some(answer) = Answer::of(resolved, &result)
         && Mark::of(infcx) == Some(before)

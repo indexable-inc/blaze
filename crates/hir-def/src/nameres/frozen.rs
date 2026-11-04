@@ -23,7 +23,6 @@ use base_db::{Crate, Db};
 use base_db::{FileId, VfsPath};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
@@ -44,6 +43,7 @@ use span::{
     Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
     Transparency,
 };
+use std::alloc::Global;
 use syntax::ast;
 use thin_vec::ThinVec;
 use triomphe::Arc as TArc;
@@ -307,10 +307,7 @@ fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
 
 /// What [`crate_lang_items`](crate::lang_item::crate_lang_items) reads for `krate` instead of
 /// finding them, when they are frozen.
-pub(crate) fn served_lang_items(
-    db: &Db,
-    krate: Crate,
-) -> Option<Option<Box<LangItems>>> {
+pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<LangItems>>> {
     let frozen = frozen_lang_items(db, krate).filter(|it| it.mode != Mode::Check)?;
     let read = || {
         let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
@@ -596,12 +593,7 @@ fn hash128(bytes: &[u8]) -> u128 {
     (u128::from(half(0)) << 64) | u128::from(half(1))
 }
 
-fn encode_maps(
-    db: &Db,
-    krate: Crate,
-    def_map: &DefMap,
-    local: &LocalDefMap,
-) -> R<Vec<u8>> {
+fn encode_maps(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
     enc.maps(krate, def_map, local)?;
     enc.finish()
@@ -816,7 +808,9 @@ impl Enc<'_> {
             let owner = root.ok_or_else(|| {
                 let krate = self.closure[0].named(db);
                 // alloc: error path
-                format!("{krate} names an alias of {path} that is the root of no crate it depends on")
+                format!(
+                    "{krate} names an alias of {path} that is the root of no crate it depends on"
+                )
             })?;
             // alloc: encoding, once per crate per image write (not on a build's path)
             let name = (owner as u32, ROOT.to_owned());
@@ -2433,13 +2427,17 @@ impl Dec<'_> {
             let owner = self.u32()?;
             // alloc: the decoded map's own storage, once per crate served
             let path = self.str()?.to_owned();
-            let content = blaze_ids::ContentId(self.r.take(32)?.try_into().map_err(|_| "a content ID")?);
+            let content =
+                blaze_ids::ContentId(self.r.take(32)?.try_into().map_err(|_| "a content ID")?);
             let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
             if path == ROOT {
                 let root = krate.data(self.db).root_file_id;
                 if self.db.files().alias_of(root).is_none() {
                     // alloc: error path
-                    return Err(format!("the root of {} is no alias, as the image's was", krate.named(self.db)));
+                    return Err(format!(
+                        "the root of {} is no alias, as the image's was",
+                        krate.named(self.db)
+                    ));
                 }
                 self.checked(krate, root, &path, content)?;
                 self.files.push(root);
@@ -2701,7 +2699,8 @@ impl Dec<'_> {
                     let kind = self.u8()?;
                     let hashes = self.u8()?;
                     // alloc: error path
-                    let kind = LitKind::from_code(kind, hashes).ok_or_else(|| format!("literal kind {kind}"))?;
+                    let kind = LitKind::from_code(kind, hashes)
+                        .ok_or_else(|| format!("literal kind {kind}"))?;
                     let suffix_len = self.u32()?;
                     let span = self.span()?;
                     TokenTree::Leaf(Leaf::Literal(tt::Literal {
@@ -3357,7 +3356,10 @@ impl Dec<'_> {
                 let path = self.mod_path()?;
                 let err = match self.u8()? {
                     0 => ExpandErrorKind::ProcMacroAttrExpansionDisabled,
-                    1 => ExpandErrorKind::MissingProcMacroExpander { krate: self.krate()?, why: self.str()?.into() },
+                    1 => ExpandErrorKind::MissingProcMacroExpander {
+                        krate: self.krate()?,
+                        why: self.str()?.into(),
+                    },
                     2 => ExpandErrorKind::MacroDisabled,
                     3 => ExpandErrorKind::MacroDefinition,
                     4 => ExpandErrorKind::RecursionOverflow,
@@ -3368,12 +3370,12 @@ impl Dec<'_> {
                         let message = self.str()?.into();
                         let code = self.option(|dec| {
                             // alloc: error path
-                            u16::try_from(dec.u32()?).map_err(|_| "an error code over u16".to_owned())
+                            u16::try_from(dec.u32()?)
+                                .map_err(|_| "an error code over u16".to_owned())
                         })?;
                         let also_at_len = self.len()?;
-                        let also_at = (0..also_at_len)
-                            .map(|_| self.span())
-                            .collect::<R<Box<[Span]>>>()?;
+                        let also_at =
+                            (0..also_at_len).map(|_| self.span()).collect::<R<Box<[Span]>>>()?;
                         let children_len = self.len()?;
                         let children = (0..children_len)
                             .map(|_| {
@@ -3751,7 +3753,8 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     /// The names `script`'s encoder gives its own root and its dependency's, two crates of one
     /// source root, with `script` at `at`.
     fn names_with_script_at(at: &str) -> [(u32, String); 2] {
-        let text = format!("//- {at} crate:script deps:dep\n//- /dep.rs crate:dep\npub fn f() {{}}\n");
+        let text =
+            format!("//- {at} crate:script deps:dep\n//- /dep.rs crate:dep\npub fn f() {{}}\n");
         let db = fixture::db(&text).into_db();
         let (script, dep) = (crate_named(&db, "script"), crate_named(&db, "dep"));
         let mut enc = Enc::new(&db, script);
@@ -3762,7 +3765,11 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     fn a_file_is_named_from_the_nearest_crate_of_its_source_root() {
         let names = names_with_script_at("/build.rs");
         assert_eq!(names, [(0, "build.rs".to_owned()), (1, "dep.rs".to_owned())]);
-        assert_eq!(names_with_script_at("/tools/gen/build.rs"), names, "moving one crate renames none");
+        assert_eq!(
+            names_with_script_at("/tools/gen/build.rs"),
+            names,
+            "moving one crate renames none"
+        );
     }
 
     #[test]
@@ -3835,7 +3842,8 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
             remaining_span: None,
             missing_comma: Some(span),
         })));
-        let binding = ExpandErrorKind::Mbe(MbeErrorKind::BindingError(Box::new("a binding".into())));
+        let binding =
+            ExpandErrorKind::Mbe(MbeErrorKind::BindingError(Box::new("a binding".into())));
         let no_rule = ExpandErrorKind::Mbe(MbeErrorKind::NoMatchingRule);
         let diagnostics = [
             DefDiagnostic::macro_error(root, ast, path.clone(), builtin),

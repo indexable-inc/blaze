@@ -44,9 +44,7 @@ fn grammar_node(grammar_text: &str, simplest: &str, value: &str, forced: bool) -
     let grammar = compile(&built, &["start"]).unwrap();
     let start = grammar.start[0];
     let constraint = GrammarConstraint::new(grammar, start, 64, u32::MAX, None).unwrap();
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest))).unwrap();
     ChoiceNode::string(
         StringChoice {
             intervals: Arc::clone(constraint.intervals()),
@@ -65,11 +63,9 @@ fn shrinker_where(
 ) -> Shrinker<'static> {
     Shrinker::with_probe(
         Box::new(move |run: ShrinkRun<'_>| match run {
-            ShrinkRun::Full(nodes) => (
-                first_text(nodes).is_some_and(|s| interesting(&s)),
-                nodes.to_vec(),
-                Spans::new(),
-            ),
+            ShrinkRun::Full(nodes) => {
+                (first_text(nodes).is_some_and(|s| interesting(&s)), nodes.to_vec(), Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         }),
         nodes,
@@ -157,17 +153,9 @@ fn repetitions_are_deleted_in_windows() {
 /// repeat; the repeat after the one that went is looked at all the same.
 #[test]
 fn a_repeat_that_goes_with_its_repetitions_does_not_hide_the_next() {
-    let node = grammar_node(
-        "start: bs \"c\"* \"d\"\nbs: \"b\"+ |\n",
-        "d",
-        "bbcccd",
-        false,
-    );
+    let node = grammar_node("start: bs \"c\"* \"d\"\nbs: \"b\"+ |\n", "d", "bbcccd", false);
     let mut shrinker = shrinker_where(vec![node], |_| true);
-    assert!(matches!(
-        drive_no_yield(shrinker.delete_repetitions(0)),
-        Ok(true)
-    ));
+    assert!(matches!(drive_no_yield(shrinker.delete_repetitions(0)), Ok(true)));
     assert_eq!(text_of(&shrinker.current_nodes[0].value()), "d");
 }
 
@@ -245,18 +233,13 @@ fn ignored_text_beside_a_placeholder_stays() {
     let spec = from_lark(
         "start: \"a\" X \"b\" \"c\"\n%declare X\nWS: / +/\n%ignore WS\n",
         &NoImports,
-        GrammarOptions {
-            explicit: vec!["X".to_string()],
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: vec!["X".to_string()], ..GrammarOptions::default() },
     )
     .unwrap();
     let constraint = Arc::clone(spec.constraint());
     let marker = placeholder("X");
     let simplest = format!("a {marker} bc");
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(&simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(&simplest))).unwrap();
     let node = ChoiceNode::string(
         StringChoice {
             intervals: Arc::clone(constraint.intervals()),
@@ -287,12 +270,7 @@ fn derived(grammar_text: &str, text: &str) -> Derived {
     };
     let text = cps(text);
     let layout = Layout::new(&constraint.tree(&text).unwrap());
-    Derived {
-        kind,
-        constraint,
-        text,
-        layout,
-    }
+    Derived { kind, constraint, text, layout }
 }
 
 /// After an accepted lowering the text is derived again, and the leaf
@@ -350,9 +328,7 @@ fn a_string_under_an_alphabet_with_a_placeholder_shrinks_within_both() {
     let constraint = Arc::clone(spec.constraint());
     let marker = placeholder("X");
     let simplest = format!("a {marker} a");
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(&simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(&simplest))).unwrap();
     let node = ChoiceNode::string(
         StringChoice {
             intervals: Arc::clone(constraint.intervals()),
@@ -365,8 +341,5 @@ fn a_string_under_an_alphabet_with_a_placeholder_shrinks_within_both() {
     );
     let mut shrinker = shrinker_where(vec![node], |s| s.contains('c'));
     drive_no_yield(shrinker.shrink_grammar_strings()).unwrap();
-    assert_eq!(
-        text_of(&shrinker.current_nodes[0].value()),
-        format!("a {marker} c")
-    );
+    assert_eq!(text_of(&shrinker.current_nodes[0].value()), format!("a {marker} c"));
 }

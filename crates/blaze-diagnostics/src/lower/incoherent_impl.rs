@@ -28,7 +28,10 @@ use syntax::{
 };
 
 use crate::{
-    cx::{Cx, def_range_view as def_range, item_range_view as item_range, signature_range_view as signature_range},
+    cx::{
+        Cx, def_range_view as def_range, item_range_view as item_range,
+        signature_range_view as signature_range,
+    },
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -107,7 +110,12 @@ impl<'db> ImplAt<'db> {
 
 /// blaze's own error where it cannot find the impl hir gave an error of: the program is
 /// refused all the same (no-fallback).
-pub(crate) fn unresolved(cx: &Cx<'_, '_>, file_id: HirFileId, ptr: AstPtr<syntax::ast::Impl>, what: &str) -> Vec<Found> {
+pub(crate) fn unresolved(
+    cx: &Cx<'_, '_>,
+    file_id: HirFileId,
+    ptr: AstPtr<syntax::ast::Impl>,
+    what: &str,
+) -> Vec<Found> {
     let span = cx.span(InFile::new(file_id, ptr.text_range()));
     // alloc: the error's text, for an error hir found
     let diag = Diag::error(None, format!("blaze cannot find the impl {what} is of"), span);
@@ -146,8 +154,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
     };
     let self_ty = at.impl_.self_ty(cx.db);
     let span = at.span(cx);
-    let rustc_attrs =
-        UnstableFeatures::query(cx.db, cx.krate.base()).is_enabled(&sym::rustc_attrs);
+    let rustc_attrs = UnstableFeatures::query(cx.db, cx.krate.base()).is_enabled(&sym::rustc_attrs);
     let first_unallowed = || first_item_without_allow(cx, at.id);
     let mut diag = if is_primitive(&self_ty) {
         if rustc_attrs {
@@ -160,10 +167,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
                 span,
             );
             diag.help("consider moving this inherent impl into `core` if possible");
-            diag.span_help(item, "alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items");
+            diag.span_help(
+                item,
+                "alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items",
+            );
             diag
         } else {
-            let mut diag = Diag::error(Some("E0390"), "cannot define inherent `impl` for primitive types", span);
+            let mut diag = Diag::error(
+                Some("E0390"),
+                "cannot define inherent `impl` for primitive types",
+                span,
+            );
             diag.help("consider using an extension trait instead");
             if let Some((inner, _)) = self_ty.as_reference() {
                 // alloc: the error's text, for an error hir found
@@ -198,7 +212,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
                     span,
                 );
                 diag.help("consider moving this inherent impl into the crate defining the type if possible");
-                diag.span_help(item, "alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items");
+                diag.span_help(
+                    item,
+                    "alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items",
+                );
                 diag
             }
         } else {
@@ -209,13 +226,21 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
         || self_ty.as_impl_traits(cx.db).is_some()
     {
         // clone: on the error path, for an error hir found
-        let mut diag = Diag::error(Some("E0118"), "no nominal type found for inherent implementation", span.clone());
+        let mut diag = Diag::error(
+            Some("E0118"),
+            "no nominal type found for inherent implementation",
+            span.clone(),
+        );
         diag.span_label(span, "impl requires a nominal type");
         diag.note("either implement a trait on it or create a newtype to wrap it instead");
         diag
     } else {
         // clone: on the error path, for an error hir found
-        let mut diag = Diag::error(Some("E0785"), "cannot define inherent `impl` for a dyn auto trait", span.clone());
+        let mut diag = Diag::error(
+            Some("E0785"),
+            "cannot define inherent `impl` for a dyn auto trait",
+            span.clone(),
+        );
         diag.span_label(span, "impl requires at least one non-auto trait");
         diag.note("define and implement a new trait or type instead");
         diag
@@ -226,11 +251,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
     match nominal(&self_ty) {
         Some(Nominal::Adt(adt)) => {
             // alloc: the error's text, for an error hir found
-            diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("where `{ty}` is defined"));
+            diag.fact(
+                Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+                format!("where `{ty}` is defined"),
+            );
         }
         Some(Nominal::Trait(trait_)) => {
             // alloc: the error's text, for an error hir found
-            diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("where `{ty}` is defined"));
+            diag.fact(
+                Fact::Signature(cx.key(ItemId::Trait(trait_.into()))),
+                format!("where `{ty}` is defined"),
+            );
         }
         None => {}
     }
@@ -272,10 +303,15 @@ fn outside_new<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, span: Span) -> Diag {
         diag.span_note(
             alias_span,
             // alloc: the error's text, for an error hir found
-            format!("`{ty_name}` does not define a new type, only an alias of `{alias_ty}` defined here"),
+            format!(
+                "`{ty_name}` does not define a new type, only an alias of `{alias_ty}` defined here"
+            ),
         );
         // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(ItemId::Alias(alias.into()))), format!("what `{ty_name}` is an alias of"));
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Alias(alias.into()))),
+            format!("what `{ty_name}` is an alias of"),
+        );
     }
     diag
 }
@@ -294,15 +330,15 @@ fn has_incoherent_impls(cx: &Cx<'_, '_>, owner: Nominal) -> bool {
     let db = cx.db;
     match owner {
         Nominal::Adt(adt) => match AdtId::from(adt) {
-            AdtId::StructId(id) => {
-                StructSignature::of(db, id).flags.contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
-            }
-            AdtId::UnionId(id) => {
-                UnionSignature::of(db, id).flags.contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
-            }
-            AdtId::EnumId(id) => {
-                EnumSignature::of(db, id).flags.contains(EnumFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
-            }
+            AdtId::StructId(id) => StructSignature::of(db, id)
+                .flags
+                .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+            AdtId::UnionId(id) => UnionSignature::of(db, id)
+                .flags
+                .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+            AdtId::EnumId(id) => EnumSignature::of(db, id)
+                .flags
+                .contains(EnumFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
         },
         Nominal::Trait(trait_) => TraitSignature::of(db, TraitId::from(trait_))
             .flags
@@ -322,9 +358,9 @@ fn first_item_without_allow(cx: &Cx<'_, '_>, id: ImplId) -> Option<Span> {
             hir_def::AssocItemId::ConstId(it) => {
                 ConstSignature::of(db, it).flags.contains(ConstFlags::RUSTC_ALLOW_INCOHERENT_IMPL)
             }
-            hir_def::AssocItemId::TypeAliasId(it) => {
-                TypeAliasSignature::of(db, it).flags.contains(TypeAliasFlags::RUSTC_ALLOW_INCOHERENT_IMPL)
-            }
+            hir_def::AssocItemId::TypeAliasId(it) => TypeAliasSignature::of(db, it)
+                .flags
+                .contains(TypeAliasFlags::RUSTC_ALLOW_INCOHERENT_IMPL),
         };
         (!allowed).then_some(hir::AssocItem::from(item))
     })?;

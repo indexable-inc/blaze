@@ -15,6 +15,13 @@ use rustc_type_ir::{
     TypeVisitableExt, UniverseIndex,
 };
 
+use crate::next_solver::{
+    Binder, DbInterner, GenericArgs, ParamEnv, Ty, TyKind, TypingMode,
+    infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
+    obligation_ctxt::ObligationCtxt,
+    references_non_lt_error,
+    util::PlaceholderReplacer,
+};
 use crate::{
     InferBodyId, ParamEnvAndCrate,
     next_solver::{
@@ -22,15 +29,6 @@ use crate::{
         StoredConst, StoredGenericArgs, StoredTy,
     },
     traits::StoredParamEnvAndCrate,
-};
-use crate::{
-    next_solver::{
-        Binder, DbInterner, GenericArgs, ParamEnv, Ty, TyKind, TypingMode,
-        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
-        obligation_ctxt::ObligationCtxt,
-        references_non_lt_error,
-        util::PlaceholderReplacer,
-    },
 };
 
 use super::{MirBody, MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind};
@@ -44,7 +42,9 @@ pub fn normalize_or_keep<'db>(infcx: &InferCtxt<'db>, env: ParamEnv<'db>, ty: Ty
     if !matches!(ty.kind(), TyKind::Alias(..)) {
         return ty;
     }
-    ObligationCtxt::new(infcx).structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty)
+    ObligationCtxt::new(infcx)
+        .structurally_normalize_ty(&ObligationCause::dummy(), env, ty)
+        .unwrap_or(ty)
 }
 
 struct Filler<'db> {
@@ -117,7 +117,8 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                         shown.truncate(cut);
                         shown.push_str("...");
                     }
-                    return Err(MirLowerError::NotSupported(format!( // alloc: error path
+                    return Err(MirLowerError::NotSupported(format!(
+                        // alloc: error path
                         "E0275: overflow evaluating the requirement `{shown} == _` (the \
                          recursion limit, {limit}, reached normalizing it)"
                     )));
@@ -240,7 +241,8 @@ impl<'db> Filler<'db> {
         self.instantiating = true;
         let t = t.try_fold_with(self)?;
         self.instantiating = false;
-        let t = rustc_type_ir::set_aliases_to_non_rigid(self.infcx.interner, t).skip_normalization();
+        let t =
+            rustc_type_ir::set_aliases_to_non_rigid(self.infcx.interner, t).skip_normalization();
         // Can't deep normalized as that'll try to normalize consts and fail.
         let t = t.try_fold_with(self)?;
         if references_non_lt_error(&t) {
@@ -424,11 +426,13 @@ impl<'db> Filler<'db> {
                 }
                 TerminatorKind::ComptimeNext { .. } if self.replace.is_some() => (),
                 TerminatorKind::ComptimeFor { .. } | TerminatorKind::ComptimeNext { .. } => {
-                    return Err(MirLowerError::ComptimeUnexpanded(hir_ty::mir::ComptimeUnexpanded::new(
-                        hir_ty::mir::MirComptimeForm::of_terminator(&terminator.kind)
-                            .expect("a comptime terminator"),
-                        "monomorphization's fill",
-                    )));
+                    return Err(MirLowerError::ComptimeUnexpanded(
+                        hir_ty::mir::ComptimeUnexpanded::new(
+                            hir_ty::mir::MirComptimeForm::of_terminator(&terminator.kind)
+                                .expect("a comptime terminator"),
+                            "monomorphization's fill",
+                        ),
+                    ));
                 }
             }
         }

@@ -87,12 +87,17 @@ fn value_of(name: &str, var: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Op
 /// What the daemon runs with: each of [`STARTED_WITH`] from its environment (`var`), but the
 /// memory limit as it was told it ([`super::told_limit`]'s `told`, `--memory-gb` first), its
 /// number of GiB.
-pub fn of_daemon(told: Option<&(u64, String)>, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Setting> {
+pub fn of_daemon(
+    told: Option<&(u64, String)>,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<Setting> {
     STARTED_WITH
         .iter()
         .map(|&name| {
             let value = match name == super::MEMORY_VAR {
-                true => told.map(|(_, said)| said.split_once('=').map_or(said.as_str(), |(_, gb)| gb).to_owned()),
+                true => told.map(|(_, said)| {
+                    said.split_once('=').map_or(said.as_str(), |(_, gb)| gb).to_owned()
+                }),
                 false => value_of(name, &var),
             };
             Setting { name: name.to_owned(), value } // alloc: once per daemon start
@@ -150,7 +155,8 @@ pub fn drift(ours: &[Setting], theirs: &[Setting]) -> Vec<Drift> {
     ours.iter()
         .filter_map(|our| {
             let asked = our.value.as_deref()?;
-            let their = theirs.iter().find(|it| it.name == our.name).and_then(|it| it.value.as_deref());
+            let their =
+                theirs.iter().find(|it| it.name == our.name).and_then(|it| it.value.as_deref());
             (!same(&our.name, Some(asked), their)).then(|| Drift {
                 name: our.name.clone(), // clone: an error's, once per setting that differs
                 theirs: their.map(str::to_owned),
@@ -181,8 +187,15 @@ pub fn said(drift: &[Drift]) -> String {
 mod tests {
     use super::*;
 
-    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
-        move |name| pairs.iter().find(|(it, _)| *it == name).map(|(_, value)| std::ffi::OsString::from(*value))
+    fn env(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(it, _)| *it == name)
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        }
     }
 
     /// The client of 2026-11-03 asked for 100 GiB of a daemon told 80 by `--memory-gb`: the
@@ -193,27 +206,45 @@ mod tests {
     #[test]
     fn a_daemon_told_another_limit_drifts_by_that_setting_alone() {
         let told = super::super::told_memory("--memory-gb", "80").unwrap();
-        let daemon = of_daemon(Some(&told), env(&[(super::super::MEMORY_VAR, "60"), ("BLAZE_OPT", "2")]));
+        let daemon =
+            of_daemon(Some(&told), env(&[(super::super::MEMORY_VAR, "60"), ("BLAZE_OPT", "2")]));
         assert_eq!(daemon.len(), STARTED_WITH.len());
         let memory = daemon.iter().find(|it| it.name == super::super::MEMORY_VAR).unwrap();
-        assert_eq!(memory.value.as_deref(), Some("80"), "the flag wins over the variable, as the budget does");
+        assert_eq!(
+            memory.value.as_deref(),
+            Some("80"),
+            "the flag wins over the variable, as the budget does"
+        );
 
         let ours = of_client(env(&[(super::super::MEMORY_VAR, "100"), ("BLAZE_OPT", "2")]));
         let drifted = drift(&ours, &daemon);
         assert_eq!(
             drifted,
-            [Drift { name: super::super::MEMORY_VAR.to_owned(), theirs: Some("80".to_owned()), ours: "100".to_owned() }]
+            [Drift {
+                name: super::super::MEMORY_VAR.to_owned(),
+                theirs: Some("80".to_owned()),
+                ours: "100".to_owned()
+            }]
         );
-        assert_eq!(said(&drifted), "BLAZE_DAEMON_MEMORY_GB: the daemon has `80`, this command `100`");
+        assert_eq!(
+            said(&drifted),
+            "BLAZE_DAEMON_MEMORY_GB: the daemon has `80`, this command `100`"
+        );
 
         let same_limit = of_client(env(&[(super::super::MEMORY_VAR, "80.0"), ("BLAZE_OPT", "2")]));
         assert!(drift(&same_limit, &daemon).is_empty());
 
         let unset = of_client(env(&[]));
-        assert!(drift(&unset, &daemon).is_empty(), "a command that sets nothing takes the daemon's");
+        assert!(
+            drift(&unset, &daemon).is_empty(),
+            "a command that sets nothing takes the daemon's"
+        );
 
         let more = of_client(env(&[("BLAZE_LEAN", "1")]));
-        assert_eq!(said(&drift(&more, &daemon)), "BLAZE_LEAN: the daemon has it unset, this command `1`");
+        assert_eq!(
+            said(&drift(&more, &daemon)),
+            "BLAZE_LEAN: the daemon has it unset, this command `1`"
+        );
     }
 
     /// `BLAZE_CORES` is one of the settings (PR #1669 refused it on its own): a command that
@@ -224,8 +255,13 @@ mod tests {
         let machine = blaze_core::cores::machine().unwrap();
         let default = blaze_core::cores::default_budget(machine).to_string();
         let daemon = of_daemon(None, env(&[]));
-        let ours = of_client(move |name| (name == blaze_core::cores::VAR).then(|| std::ffi::OsString::from(&default)));
-        assert!(drift(&ours, &daemon).is_empty(), "the default budget by number is the daemon's unset");
+        let ours = of_client(move |name| {
+            (name == blaze_core::cores::VAR).then(|| std::ffi::OsString::from(&default))
+        });
+        assert!(
+            drift(&ours, &daemon).is_empty(),
+            "the default budget by number is the daemon's unset"
+        );
         let all = of_client(env(&[(blaze_core::cores::VAR, "all"), ("BLAZE_LEAN", "1")]));
         assert_eq!(
             said(&drift(&all, &daemon)),

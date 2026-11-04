@@ -514,14 +514,19 @@ impl Storage {
     pub fn held_bytes(&self) -> u64 {
         let tables: u64 = self
             .live()
-            .filter_map(|index| ingredient::vtable(index).map(|vtable| (vtable.memory)(self, index).held()))
+            .filter_map(|index| {
+                ingredient::vtable(index).map(|vtable| (vtable.memory)(self, index).held())
+            })
             .sum();
         tables + self.graph_usage().iter().map(MemoryUsage::held).sum::<u64>()
     }
 
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
     fn graph_usage(&self) -> [MemoryUsage; 3] {
-        let live = self.edges_top.load(Ordering::Relaxed).saturating_sub(self.edges_dead.load(Ordering::Relaxed));
+        let live = self
+            .edges_top
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.edges_dead.load(Ordering::Relaxed));
         let nodes = u64::from(self.nodes_made());
         let captured = self.captured_top.load(Ordering::Relaxed);
         [
@@ -543,7 +548,8 @@ impl Storage {
                 name: "captured reads",
                 rows: captured,
                 used: captured,
-                row_bytes: (self.captured.committed_bytes() + self.captures.committed_bytes()) as u64,
+                row_bytes: (self.captured.committed_bytes() + self.captures.committed_bytes())
+                    as u64,
                 value_bytes: 0,
             },
         ]
@@ -593,8 +599,12 @@ impl Storage {
         // Named, so a build's time moving edges is its own, never its writer's self time
         // (rule 14).
         let _settle =
-            tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead).entered();
-        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query, "dependency edges"));
+            tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead)
+                .entered();
+        let old = std::mem::replace(
+            &mut self.edges,
+            Dense::growing(EDGES, Tag::Query, "dependency edges"),
+        );
         let mut moved = Relocate { old, top: 0 };
         for index in 1..=ingredient::registered() {
             if self.tables[index as usize].load(Ordering::Relaxed).is_null() {
@@ -711,7 +721,9 @@ impl Storage {
         let mut has = [false; Tag::COUNT];
         for at in 0..count {
             let index = self.weighed.get_mut()[at];
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             weight[weighed.tag.index()] += (weighed.weight)(self, index);
             has[weighed.tag.index()] = true;
         }
@@ -790,7 +802,9 @@ impl Storage {
         let mut weight = 0;
         for at in 0..count {
             let index = self.weighed.get_mut()[at];
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             if weighed.tag == tag {
                 weight += (weighed.held)(self, index, &mut values);
             }
@@ -801,7 +815,9 @@ impl Storage {
         let (mut evicted, mut freed) = (0, 0);
         for one in victims.chunk_by(|a, b| a.ingredient == b.ingredient) {
             let index = one[0].ingredient;
-            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
             let (n, bytes) = (weighed.evict)(self, index, one);
             evicted += n;
             freed += bytes;
@@ -953,7 +969,9 @@ impl Storage {
         };
         counts::count(index, what);
         if cause != Cause::New && provenance::logging() {
-            let read = read.filter(|&it| it != 0 && it < self.nodes_made()).map_or(0, |it| self.key_of(it));
+            let read = read
+                .filter(|&it| it != 0 && it < self.nodes_made())
+                .map_or(0, |it| self.key_of(it));
             self.run_log.log(key, read, self.view, provenance::Logged::Ran(cause));
         }
     }
@@ -1032,7 +1050,9 @@ impl Storage {
             self.captures_full(start, len, number, owner);
         }
         self.captured.ensure(end as usize);
-        for (place, &entry) in self.captured.slice(start as usize, entries.len()).iter().zip(entries) {
+        for (place, &entry) in
+            self.captured.slice(start as usize, entries.len()).iter().zip(entries)
+        {
             // Relaxed: the capture is published with its `Reads`, by whatever hands that over.
             place.store(entry, Ordering::Relaxed);
         }

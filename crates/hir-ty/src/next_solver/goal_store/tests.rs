@@ -9,7 +9,6 @@ use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
 use blaze_query::db::{Durability, Setter};
@@ -22,6 +21,7 @@ use hir_def::{
 use hir_expand::fixture;
 use parking_lot::Mutex;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
+use std::alloc::Global;
 
 use super::{
     Answer, FactObject, FactRef, Flushed, GoalFacts, install, lookup, lookup_goal, offer,
@@ -102,7 +102,8 @@ const OTHER_BUILD: ContentId = ContentId([8; 32]);
 const CRATE: ContentId = ContentId([5; 32]);
 
 /// The one fact a test's offered goal reads: [`Knob::value`].
-const KNOB: FactRef = FactRef { kind: QueryKind(0x1000), subject: ContentId([3; 32]), object: FactObject::None };
+const KNOB: FactRef =
+    FactRef { kind: QueryKind(0x1000), subject: ContentId([3; 32]), object: FactObject::None };
 
 /// A stand-in for what a goal's evaluation reads: `value` is its fact; `holds`, the answer, is
 /// read outside the capture, as a read the facts would miss.
@@ -213,7 +214,8 @@ impl GoalFacts for TestFacts {
     }
 
     fn value(&self, db: &Db, _: Option<Crate>, fact: FactRef) -> Option<ContentId> {
-        (fact == KNOB).then(|| ContentId::of("blaze v2 goal test knob", &self.knob.value(db).to_le_bytes()))
+        (fact == KNOB)
+            .then(|| ContentId::of("blaze v2 goal test knob", &self.knob.value(db).to_le_bytes()))
     }
 }
 
@@ -289,7 +291,9 @@ impl<'db> Source<'db> for Back<'_, 'db> {
     }
 
     fn adt(&mut self) -> Result<AdtDef, &'static str> {
-        let SolverDefId::AdtId(id) = self.def()? else { return Err("an ADT of another definition") };
+        let SolverDefId::AdtId(id) = self.def()? else {
+            return Err("an ADT of another definition");
+        };
         let bits = u8::try_from(self.word()?).map_err(|_| "ADT flags past a byte")?;
         AdtDef::from_parts(id, bits).ok_or("unknown ADT flags")
     }
@@ -377,14 +381,39 @@ fn kind_name(ty: Ty<'_>) -> &'static str {
 /// types, which make a goal not global (`global_goals::NOT_GLOBAL`), and coroutine witnesses,
 /// which only a coroutine's own goals name.
 const KINDS: [&str; 24] = [
-    "Bool", "Char", "Int", "Uint", "Float", "Adt", "Foreign", "Str", "Array", "Pat", "Slice",
-    "RawPtr", "Ref", "FnDef", "FnPtr", "UnsafeBinder", "Dynamic", "Closure", "CoroutineClosure",
-    "Coroutine", "Never", "Tuple", "Alias", "Param",
+    "Bool",
+    "Char",
+    "Int",
+    "Uint",
+    "Float",
+    "Adt",
+    "Foreign",
+    "Str",
+    "Array",
+    "Pat",
+    "Slice",
+    "RawPtr",
+    "Ref",
+    "FnDef",
+    "FnPtr",
+    "UnsafeBinder",
+    "Dynamic",
+    "Closure",
+    "CoroutineClosure",
+    "Coroutine",
+    "Never",
+    "Tuple",
+    "Alias",
+    "Param",
 ];
 
 /// Every type of the fixture's two bodies, two that no body has, and one long enough that its
 /// stable form spans many of the hash's buffers.
-fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &HashMap<String, FunctionId, Global>) -> Vec<Ty<'db>> {
+fn fixture_types<'db>(
+    db: &'db Db,
+    interner: DbInterner<'db>,
+    functions: &HashMap<String, FunctionId, Global>,
+) -> Vec<Ty<'db>> {
     let mut tys = Vec::new();
     for name in ["every", "generic"] {
         let result = InferenceResult::of(db, functions[name]);
@@ -399,7 +428,10 @@ fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &HashMa
 }
 
 fn well_formed<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Predicate<'db> {
-    Predicate::new(interner, Binder::dummy(PredicateKind::Clause(ClauseKind::WellFormed(ty.into()))))
+    Predicate::new(
+        interner,
+        Binder::dummy(PredicateKind::Clause(ClauseKind::WellFormed(ty.into()))),
+    )
 }
 
 /// The goal the store tests offer and look up.
@@ -442,8 +474,16 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
 
     let read = [
         KNOB,
-        FactRef { kind: QueryKind(0x1001), subject: ContentId([9; 32]), object: FactObject::Field(7) },
-        FactRef { kind: QueryKind(0x1002), subject: ContentId([10; 32]), object: FactObject::Id(ContentId([1; 32])) },
+        FactRef {
+            kind: QueryKind(0x1001),
+            subject: ContentId([9; 32]),
+            object: FactObject::Field(7),
+        },
+        FactRef {
+            kind: QueryKind(0x1002),
+            subject: ContentId([10; 32]),
+            object: FactObject::Id(ContentId([1; 32])),
+        },
     ];
     let version = solver_version(&BUILD);
     let memory = Memory::default();
@@ -455,12 +495,17 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
         assert!(stable::goal_words(interner, &facts, goal, &mut words), "goal {n} is short enough");
         longest = longest.max(words.len());
         let defs = facts.defs.lock().clone();
-        let (head, predicate, clauses) = decode(&words, &defs).unwrap_or_else(|why| panic!("goal {n}: {why}"));
+        let (head, predicate, clauses) =
+            decode(&words, &defs).unwrap_or_else(|why| panic!("goal {n}: {why}"));
         assert_eq!(head, [u32::from(goal.mode), u32::from(interner.regions()), limit], "goal {n}");
         assert_eq!((predicate, clauses), (goal.predicate, goal.clauses), "goal {n}");
 
         let key = stable::goal_key(interner, &facts, &version, &CRATE, goal).expect("short enough");
-        assert_eq!(key, stable::key_of(&version, &CRATE, &words), "goal {n}: streamed and buffered keys");
+        assert_eq!(
+            key,
+            stable::key_of(&version, &CRATE, &words),
+            "goal {n}: streamed and buffered keys"
+        );
         if let Some(earlier) = keys.insert(key, goal) {
             assert_eq!(earlier, goal, "two goals under one key");
         }
@@ -471,10 +516,19 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
         let at = record::shape_key(&key, 0);
         memory.put(at, shape).unwrap();
         let kept = memory.get(&at).unwrap().expect("just put");
-        let opened = ShapeRef::open(kept.bytes(), &key, &version).unwrap_or_else(|why| panic!("goal {n}: {why}"));
-        assert_eq!(opened.to_shape(), Shape { words: words.clone(), facts: read.to_vec() }, "goal {n}");
+        let opened = ShapeRef::open(kept.bytes(), &key, &version)
+            .unwrap_or_else(|why| panic!("goal {n}: {why}"));
+        assert_eq!(
+            opened.to_shape(),
+            Shape { words: words.clone(), facts: read.to_vec() },
+            "goal {n}"
+        );
         let (_, predicate, clauses) = decode(&opened.to_shape().words, &defs).unwrap();
-        assert_eq!((predicate, clauses), (goal.predicate, goal.clauses), "goal {n}, from its record");
+        assert_eq!(
+            (predicate, clauses),
+            (goal.predicate, goal.clauses),
+            "goal {n}, from its record"
+        );
         assert!(ShapeRef::open(kept.bytes(), &key, &solver_version(&OTHER_BUILD)).is_err());
         assert!(ShapeRef::open(kept.bytes(), &ContentId([0; 32]), &version).is_err());
         assert!(ShapeRef::open(&kept.bytes()[..kept.bytes().len() - 1], &key, &version).is_err());
@@ -544,7 +598,8 @@ fn two_answers_under_the_same_facts_stop_the_flush() {
     let krate = local_crate(&db);
     let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
-    let installed = install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
+    let installed =
+        install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
     offered(&db, knob);
     installed.flush().unwrap();
     knob.set_holds(&mut db).to(false);
@@ -577,7 +632,8 @@ fn a_database_finds_only_its_own_store() {
     let krate = local_crate(&db);
     let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
-    let installed = install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
+    let installed =
+        install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
     assert!(install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).is_err());
     offered(&db, knob);
     installed.flush().unwrap();
@@ -590,11 +646,14 @@ fn a_database_finds_only_its_own_store() {
 fn offered_with_no_store(db: &Db, knob: Knob) -> u32 {
     let interner = DbInterner::new_with(db, knob.krate(db));
     let goal = the_goal(interner);
-    let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis).expect("a global goal");
+    let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis)
+        .expect("a global goal");
     let (value, reads) = blaze_query::db::capture_reads(db, || knob.value(db));
     let reads = reads.expect("an input's read is shareable");
     offer(interner, key, Answer::Holds, reads);
-    assert_at_most(0, "a goal-store offer with no store installed", || offer(interner, key, Answer::Holds, reads));
+    assert_at_most(0, "a goal-store offer with no store installed", || {
+        offer(interner, key, Answer::Holds, reads)
+    });
     value
 }
 
@@ -604,12 +663,16 @@ fn a_lookup_or_offer_with_no_store_allocates_nothing() {
     let krate = local_crate(&db);
     let interner = DbInterner::new_with(&db, krate);
     let goal = the_goal(interner);
-    let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis).expect("a global goal");
+    let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis)
+        .expect("a global goal");
     assert_eq!(super::stable::Goal::of(key), goal);
     // Another test's store may be installed: the first lookup registers this thread with
     // `blaze_reclaim`, which allocates once.
     assert!(lookup(interner, key).is_none());
-    assert!(assert_at_most(0, "a goal-store lookup with no store installed", || lookup(interner, key)).is_none());
+    assert!(
+        assert_at_most(0, "a goal-store lookup with no store installed", || lookup(interner, key))
+            .is_none()
+    );
     offered_with_no_store(&db, Knob::new(&db, Durability::LOW, 1, true, krate));
 }
 
@@ -638,7 +701,11 @@ fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
     drop(kept);
     let edited = install(&db, memory.clone(), facts.clone(), after).unwrap();
-    assert_eq!(looked_up(&db, krate), None, "the edited solver finds no answer of the one before it");
+    assert_eq!(
+        looked_up(&db, krate),
+        None,
+        "the edited solver finds no answer of the one before it"
+    );
     drop(edited);
     let again = install(&db, memory.clone(), facts, before).unwrap();
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds), "the solver that kept it finds it");

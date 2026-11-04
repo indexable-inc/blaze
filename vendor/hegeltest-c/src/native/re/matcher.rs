@@ -91,10 +91,7 @@ struct FailedEnds {
 
 impl FailedEnds {
     fn new(active: bool) -> FailedEnds {
-        FailedEnds {
-            active,
-            ends: Vec::new(),
-        }
+        FailedEnds { active, ends: Vec::new() }
     }
 
     fn contains(&self, end: usize) -> bool {
@@ -305,11 +302,7 @@ impl State<'_> {
     /// The marks as they are, to put back with [`State::restore_marks`]
     /// after a failed attempt.
     fn save_marks(&self) -> Vec<Option<(usize, usize)>> {
-        if self.track_marks {
-            self.marks.clone()
-        } else {
-            Vec::new()
-        }
+        if self.track_marks { self.marks.clone() } else { Vec::new() }
     }
 
     fn restore_marks(&mut self, saved: Vec<Option<(usize, usize)>>) {
@@ -348,14 +341,9 @@ fn as_unit(op: &OpCode) -> Option<UnitOp<'_>> {
 /// non-capturing group around one, with the flags in force inside it.
 fn single_unit(p: &SubPattern, flags: u32) -> Option<(UnitOp<'_>, u32)> {
     match p.data.as_slice() {
-        [
-            OpCode::Subpattern {
-                group: None,
-                add_flags,
-                del_flags,
-                p,
-            },
-        ] => single_unit(p, combine_flags(flags, *add_flags, *del_flags)),
+        [OpCode::Subpattern { group: None, add_flags, del_flags, p }] => {
+            single_unit(p, combine_flags(flags, *add_flags, *del_flags))
+        }
         [op] => as_unit(op).map(|unit| (unit, flags)),
         _ => None,
     }
@@ -371,27 +359,17 @@ type UnitSequence<'a> = Vec<(UnitOp<'a>, u32)>;
 /// false, leaving `out` unspecified, when `p` contains anything else.
 fn unit_alternatives<'a>(p: &'a SubPattern, flags: u32, out: &mut Vec<UnitSequence<'a>>) -> bool {
     match p.data.as_slice() {
-        [
-            OpCode::Subpattern {
-                group: None,
-                add_flags,
-                del_flags,
-                p,
-            },
-        ] => unit_alternatives(p, combine_flags(flags, *add_flags, *del_flags), out),
-        [OpCode::Branch(alternatives)] => alternatives
-            .iter()
-            .all(|alternative| unit_alternatives(alternative, flags, out)),
+        [OpCode::Subpattern { group: None, add_flags, del_flags, p }] => {
+            unit_alternatives(p, combine_flags(flags, *add_flags, *del_flags), out)
+        }
+        [OpCode::Branch(alternatives)] => {
+            alternatives.iter().all(|alternative| unit_alternatives(alternative, flags, out))
+        }
         ops => {
             if !ops.iter().all(|op| as_unit(op).is_some()) {
                 return false;
             }
-            out.push(
-                ops.iter()
-                    .filter_map(as_unit)
-                    .map(|unit| (unit, flags))
-                    .collect(),
-            );
+            out.push(ops.iter().filter_map(as_unit).map(|unit| (unit, flags)).collect());
             true
         }
     }
@@ -477,16 +455,10 @@ impl<'p> Matcher<'p> {
         let start = start.min(text.len());
         let mut state = self.state(text);
         let mut end = None;
-        let matched = self.seq(
-            &mut state,
-            &self.pattern.data,
-            start,
-            self.flags,
-            &mut |_, pos| {
-                end = Some(pos);
-                Ok(true)
-            },
-        );
+        let matched = self.seq(&mut state, &self.pattern.data, start, self.flags, &mut |_, pos| {
+            end = Some(pos);
+            Ok(true)
+        });
         let matched = matched?;
         let end = if matched { end } else { None };
         Ok((end, state.touch))
@@ -498,13 +470,7 @@ impl<'p> Matcher<'p> {
     /// match that ends exactly at the end.
     pub fn fullmatch(&self, text: &[char]) -> Result<bool, MatchError> {
         let mut state = self.state(text);
-        self.seq(
-            &mut state,
-            &self.pattern.data,
-            0,
-            self.flags,
-            &mut |_, pos| Ok(pos == text.len()),
-        )
+        self.seq(&mut state, &self.pattern.data, 0, self.flags, &mut |_, pos| Ok(pos == text.len()))
     }
 
     /// Match the sequence `ops` at `pos`, then the continuation `k`.
@@ -582,12 +548,7 @@ impl<'p> Matcher<'p> {
                 }
                 Ok(false)
             }
-            OpCode::Subpattern {
-                group,
-                add_flags,
-                del_flags,
-                p,
-            } => {
+            OpCode::Subpattern { group, add_flags, del_flags, p } => {
                 let inner = combine_flags(flags, *add_flags, *del_flags);
                 match *group {
                     None => self.seq(st, &p.data, pos, inner, &mut |st, end| {
@@ -622,11 +583,7 @@ impl<'p> Matcher<'p> {
                 }
                 self.seq(st, rest, pos + len, flags, k)
             }
-            OpCode::GroupRefExists {
-                cond_group,
-                yes,
-                no,
-            } => {
+            OpCode::GroupRefExists { cond_group, yes, no } => {
                 if st.group(*cond_group).is_some() {
                     self.seq(st, &yes.data, pos, flags, &mut |st, end| {
                         self.seq(st, rest, end, flags, k)
@@ -798,18 +755,8 @@ impl<'p> Matcher<'p> {
                 if failed.contains(end) {
                     return Ok(false);
                 }
-                let result = self.greedy(
-                    st,
-                    item,
-                    min,
-                    max,
-                    count + 1,
-                    Some(pos),
-                    rest,
-                    end,
-                    flags,
-                    k,
-                );
+                let result =
+                    self.greedy(st, item, min, max, count + 1, Some(pos), rest, end, flags, k);
                 failed.record(end, &result);
                 result
             })?
@@ -857,18 +804,7 @@ impl<'p> Matcher<'p> {
             if failed.contains(end) {
                 return Ok(false);
             }
-            let result = self.lazy(
-                st,
-                item,
-                min,
-                max,
-                count + 1,
-                Some(pos),
-                rest,
-                end,
-                flags,
-                k,
-            );
+            let result = self.lazy(st, item, min, max, count + 1, Some(pos), rest, end, flags, k);
             failed.record(end, &result);
             result
         })
@@ -1105,11 +1041,7 @@ impl<'p> Matcher<'p> {
 }
 
 fn repeat_limit(max: u32) -> usize {
-    if max == MAXREPEAT {
-        usize::MAX
-    } else {
-        max as usize
-    }
+    if max == MAXREPEAT { usize::MAX } else { max as usize }
 }
 
 /// Whether another iteration may start at `cur` given the iterations in
@@ -1124,11 +1056,7 @@ fn repeat_allowed(frames: &[(usize, usize)], min: usize, max: u32, cur: usize) -
     if count >= repeat_limit(max) {
         return false;
     }
-    let last_start = if count > min {
-        frames.last().map(|&(start, _)| start)
-    } else {
-        None
-    };
+    let last_start = if count > min { frames.last().map(|&(start, _)| start) } else { None };
     last_start != Some(cur)
 }
 
@@ -1152,15 +1080,7 @@ fn unit_matches(op: UnitOp<'_>, c: char, flags: u32) -> bool {
 pub fn literal_sequence(parsed: &ParsedPattern) -> Option<(Vec<u32>, u32)> {
     let mut ops = parsed.pattern.data.as_slice();
     let mut flags = parsed.flags;
-    while let [
-        OpCode::Subpattern {
-            group: None,
-            add_flags,
-            del_flags,
-            p,
-        },
-    ] = ops
-    {
+    while let [OpCode::Subpattern { group: None, add_flags, del_flags, p }] = ops {
         flags = combine_flags(flags, *add_flags, *del_flags);
         ops = &p.data;
     }
@@ -1192,11 +1112,7 @@ fn unicode(flags: u32) -> bool {
 /// lowercase form of the character, as CPython tests the whole set.
 pub(crate) fn set_matches(items: &[SetItem], c: char, flags: u32) -> bool {
     let negate = matches!(items.first(), Some(SetItem::Negate));
-    let probe = if flags & SRE_FLAG_IGNORECASE != 0 {
-        casefold::lower(c, flags)
-    } else {
-        c
-    };
+    let probe = if flags & SRE_FLAG_IGNORECASE != 0 { casefold::lower(c, flags) } else { c };
     let contained = items.iter().any(|item| match item {
         SetItem::Negate => false,
         SetItem::Literal(cp) => literal_eq(*cp, c, flags),
@@ -1270,12 +1186,7 @@ fn is_word_boundary(text: &[char], pos: usize, flags: u32) -> bool {
 /// `parsed` has no such repeat.
 pub fn run_len(parsed: &ParsedPattern, run_id: usize, text: &[char], from: usize) -> Option<usize> {
     let (unit, flags) = find_run(&parsed.pattern, parsed.flags, run_id)?;
-    Some(
-        text[from.min(text.len())..]
-            .iter()
-            .take_while(|&&c| unit_matches(unit, c, flags))
-            .count(),
-    )
+    Some(text[from.min(text.len())..].iter().take_while(|&&c| unit_matches(unit, c, flags)).count())
 }
 
 /// Whether `probe` (from a [`Touch::Unless`] of a match of `parsed`)
@@ -1306,9 +1217,9 @@ fn find_set(p: &SubPattern, items: usize) -> Option<&[SetItem]> {
             | OpCode::AtomicGroup(p)
             | OpCode::Assert { p, .. }
             | OpCode::AssertNot { p, .. } => find_set(p, items),
-            OpCode::Branch(alternatives) => alternatives
-                .iter()
-                .find_map(|alternative| find_set(alternative, items)),
+            OpCode::Branch(alternatives) => {
+                alternatives.iter().find_map(|alternative| find_set(alternative, items))
+            }
             OpCode::GroupRefExists { yes, no, .. } => {
                 find_set(yes, items).or_else(|| no.as_ref().and_then(|no| find_set(no, items)))
             }
@@ -1334,16 +1245,13 @@ fn find_run(p: &SubPattern, flags: u32, run_id: usize) -> Option<(UnitOp<'_>, u3
             OpCode::MaxRepeat { item, .. }
             | OpCode::MinRepeat { item, .. }
             | OpCode::PossessiveRepeat { item, .. } => find_run(item, flags, run_id),
-            OpCode::Subpattern {
-                add_flags,
-                del_flags,
-                p,
-                ..
-            } => find_run(p, combine_flags(flags, *add_flags, *del_flags), run_id),
+            OpCode::Subpattern { add_flags, del_flags, p, .. } => {
+                find_run(p, combine_flags(flags, *add_flags, *del_flags), run_id)
+            }
             OpCode::AtomicGroup(p) => find_run(p, flags, run_id),
-            OpCode::Branch(alternatives) => alternatives
-                .iter()
-                .find_map(|alternative| find_run(alternative, flags, run_id)),
+            OpCode::Branch(alternatives) => {
+                alternatives.iter().find_map(|alternative| find_run(alternative, flags, run_id))
+            }
             OpCode::GroupRefExists { yes, no, .. } => find_run(yes, flags, run_id)
                 .or_else(|| no.as_ref().and_then(|no| find_run(no, flags, run_id))),
             _ => None,

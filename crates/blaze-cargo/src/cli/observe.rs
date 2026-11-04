@@ -51,7 +51,13 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
         match word.to_str() {
             Some("--dev") => dev = true,
             Some("--print") => print = true,
-            _ => return refused(&format!("{EXPLORE_USAGE}, not `{}`", word.to_string_lossy()), Exit::Usage.code(), color),
+            _ => {
+                return refused(
+                    &format!("{EXPLORE_USAGE}, not `{}`", word.to_string_lossy()),
+                    Exit::Usage.code(),
+                    color,
+                );
+            }
         }
     }
     let mut link = None;
@@ -64,10 +70,19 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
     if let Err(what) = asked {
         return refused(&what, Exit::Failed.code(), color);
     }
-    let Some(link) = link else { return refused("the daemon answered `blaze explore` with no link", Exit::Failed.code(), color) };
+    let Some(link) = link else {
+        return refused(
+            "the daemon answered `blaze explore` with no link",
+            Exit::Failed.code(),
+            color,
+        );
+    };
     println!("{link}");
     if !print && let Err(why) = open(&link) {
-        eprint!("{}", say::warning(&format!("the link was not opened ({why}): open it in a browser"), color));
+        eprint!(
+            "{}",
+            say::warning(&format!("the link was not opened ({why}): open it in a browser"), color)
+        );
     }
     0
 }
@@ -75,7 +90,10 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
 /// The browser asked to open `link`: `open` on macOS, `xdg-open` elsewhere.
 fn open(link: &str) -> Result<(), String> {
     let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let status = std::process::Command::new(program).arg(link).status().map_err(|error| format!("running `{program}`: {error}"))?;
+    let status = std::process::Command::new(program)
+        .arg(link)
+        .status()
+        .map_err(|error| format!("running `{program}`: {error}"))?;
     match status.success() {
         true => Ok(()),
         false => Err(format!("`{program}` exited {status}")),
@@ -90,7 +108,10 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("profile") => profile(words.collect()),
         Some("live") => match words.next() {
             None => watch(),
-            Some(word) => Err(Refusal::Usage(format!("blaze debug live takes nothing, not `{}`", word.to_string_lossy()))),
+            Some(word) => Err(Refusal::Usage(format!(
+                "blaze debug live takes nothing, not `{}`",
+                word.to_string_lossy()
+            ))),
         },
         Some("sql") => query(words.collect()),
         Some("hot") => hot(words.collect()),
@@ -116,7 +137,11 @@ fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
                     .and_then(|it| it.parse().ok())
                     .ok_or_else(|| Refusal::Usage("`--top` takes a number of keys".to_owned()))?;
             }
-            _ => return Err(Refusal::Usage(format!("blaze debug hot [--top N] [--last-build], not `{word}`"))),
+            _ => {
+                return Err(Refusal::Usage(format!(
+                    "blaze debug hot [--top N] [--last-build], not `{word}`"
+                )));
+            }
         }
     }
     let mut text = String::new();
@@ -127,7 +152,9 @@ fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
         Ok(())
     })?;
     if text.is_empty() {
-        return Err(Refusal::Failed("the daemon answered `blaze debug hot` with no answer".to_owned()));
+        return Err(Refusal::Failed(
+            "the daemon answered `blaze debug hot` with no answer".to_owned(),
+        ));
     }
     print!("{text}");
     Ok(())
@@ -142,33 +169,62 @@ fn time(words: Vec<OsString>) -> Result<(), Refusal> {
         ))
     };
     let (mut build, mut by, mut top, mut cores) = (None, By::Unit, 20usize, None);
-    let (mut matching, mut html, mut trace): (Option<String>, Option<PathBuf>, Option<PathBuf>) = (None, None, None);
+    let (mut matching, mut html, mut trace): (Option<String>, Option<PathBuf>, Option<PathBuf>) =
+        (None, None, None);
     let mut words = texts(words)?.into_iter().peekable();
     while let Some(word) = words.next() {
-        let mut value = |what: &str| words.next().ok_or_else(|| usage(&format!("`{word}` takes {what}")));
+        let mut value =
+            |what: &str| words.next().ok_or_else(|| usage(&format!("`{word}` takes {what}")));
         match word.as_str() {
-            "--build" => build = Some(value("a build id")?.parse().map_err(|_| usage("`--build` takes a build id"))?),
+            "--build" => {
+                build = Some(
+                    value("a build id")?
+                        .parse()
+                        .map_err(|_| usage("`--build` takes a build id"))?,
+                )
+            }
             "--by" => {
                 let name = value(By::NAMES)?;
-                by = By::of(&name).ok_or_else(|| usage(&format!("`--by` takes {}, not `{name}`", By::NAMES)))?;
+                by = By::of(&name)
+                    .ok_or_else(|| usage(&format!("`--by` takes {}, not `{name}`", By::NAMES)))?;
             }
-            "--top" => top = value("a number of rows")?.parse().map_err(|_| usage("`--top` takes a number of rows"))?,
+            "--top" => {
+                top = value("a number of rows")?
+                    .parse()
+                    .map_err(|_| usage("`--top` takes a number of rows"))?
+            }
             "--match" => matching = Some(value("a text the rows' keys hold")?),
             "--html" => html = Some(PathBuf::from(value("a file")?)),
             "--trace" => trace = Some(PathBuf::from(value("a file")?)),
             "--cores" => {
-                let lines = words.next_if(|it| it.parse::<usize>().is_ok()).map(|it| it.parse::<usize>());
-                cores = Some(lines.transpose().map_err(|_| usage("`--cores` takes a number of lines"))?.unwrap_or(40));
+                let lines =
+                    words.next_if(|it| it.parse::<usize>().is_ok()).map(|it| it.parse::<usize>());
+                cores = Some(
+                    lines
+                        .transpose()
+                        .map_err(|_| usage("`--cores` takes a number of lines"))?
+                        .unwrap_or(40),
+                );
             }
             _ => return Err(usage(&format!("not `{word}`"))),
         }
     }
     let (duckdb, dir) = history_source()?;
     let source = load::Source { duckdb: &duckdb, history: &dir };
-    let ask = load::Ask { build, by, top, matching: matching.as_deref(), cores, html: html.as_deref(), trace: trace.as_deref() };
+    let ask = load::Ask {
+        build,
+        by,
+        top,
+        matching: matching.as_deref(),
+        cores,
+        html: html.as_deref(),
+        trace: trace.as_deref(),
+    };
     let text = load::run(&source, &ask).map_err(|error| error.to_string())?;
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 /// `blaze explain RULE`: the long text of a rule a report names (`sandbox:link-dir`,
@@ -193,16 +249,22 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         match word.as_str() {
             "--json" => json = true,
             "--all" => all = true,
-            _ if word.starts_with('-') => return Err(Refusal::Usage(format!("{WHY_USAGE}, not `{word}`"))),
+            _ if word.starts_with('-') => {
+                return Err(Refusal::Usage(format!("{WHY_USAGE}, not `{word}`")));
+            }
             _ if item.is_none() => item = Some(word),
             _ => return Err(Refusal::Usage(format!("{WHY_USAGE}: one item, not `{word}` too"))),
         }
     }
     let mut answer = None;
     // The workspace holding this directory is the one whose last build is asked of.
-    let cwd = std::env::current_dir().map_err(|error| format!("`blaze why` reading the current directory: {error}"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("`blaze why` reading the current directory: {error}"))?;
     let Some(cwd) = cwd.to_str().map(str::to_owned) else {
-        return Err(Refusal::Failed(format!("`blaze why`: the current directory {} is not UTF-8", cwd.display())));
+        return Err(Refusal::Failed(format!(
+            "`blaze why`: the current directory {} is not UTF-8",
+            cwd.display()
+        )));
     };
     let cwd = Some(cwd);
     ask(Request::Rebuilt { all, cwd, item }, Start::Never, |response| {
@@ -215,7 +277,11 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         return Err(Refusal::Failed("the daemon answered `blaze why` with no answer".to_owned()));
     };
     if json {
-        println!("{}", serde_json::to_string(&rebuilt).map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?);
+        println!(
+            "{}",
+            serde_json::to_string(&rebuilt)
+                .map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?
+        );
         return Ok(());
     }
     let mut text = String::new();
@@ -236,7 +302,10 @@ fn slowed(words: Vec<OsString>) -> Result<(), Refusal> {
     let mut words = texts(words)?.into_iter();
     while let Some(word) = words.next() {
         let mut number = |what: &str| -> Result<u64, Refusal> {
-            words.next().and_then(|it| it.parse().ok()).ok_or_else(|| Refusal::Usage(format!("{SLOW_USAGE}: `{word}` takes {what}")))
+            words
+                .next()
+                .and_then(|it| it.parse().ok())
+                .ok_or_else(|| Refusal::Usage(format!("{SLOW_USAGE}: `{word}` takes {what}")))
         };
         match word.as_str() {
             "--build" => build = Some(number("a build id")?),
@@ -247,13 +316,20 @@ fn slowed(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     let (duckdb, dir) = history_source()?;
     let source = load::Source { duckdb: &duckdb, history: &dir };
-    let report = slow::load::run(&source, build).map_err(|error| format!("`blaze slow`: {error}"))?;
+    let report =
+        slow::load::run(&source, build).map_err(|error| format!("`blaze slow`: {error}"))?;
     let text = match json {
-        true => serde_json::to_string(&report).map_err(|error| format!("`blaze slow`'s report as JSON: {error}"))? + "\n",
+        true => {
+            serde_json::to_string(&report)
+                .map_err(|error| format!("`blaze slow`'s report as JSON: {error}"))?
+                + "\n"
+        }
         false => slow::text(&report, top),
     };
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 /// `blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]`: the profile's gate
@@ -331,30 +407,39 @@ fn refused(what: &str, code: i32, color: bool) -> i32 {
 fn texts(words: Vec<OsString>) -> Result<Vec<String>, Refusal> {
     words
         .into_iter()
-        .map(|it| it.into_string().map_err(|it| Refusal::Usage(format!("{} is not UTF-8", it.to_string_lossy()))))
+        .map(|it| {
+            it.into_string()
+                .map_err(|it| Refusal::Usage(format!("{} is not UTF-8", it.to_string_lossy())))
+        })
         .collect()
 }
 
 /// `request` asked of the daemon, each response but its errors handed to `on`; the daemon's
 /// errors, and a Done not ok, are the error. With [`Start::Never`], no daemon running is one.
-pub(super) fn ask(request: Request, start: Start, mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>) -> Result<(), String> {
+pub(super) fn ask(
+    request: Request,
+    start: Start,
+    mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut client = match daemon::connect(start) {
         Ok(Some(client)) => client,
-        Ok(None) => return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),
+        Ok(None) => {
+            return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned());
+        }
         Err(error) => return Err(format!("{error:#}")),
     };
     let mut errors = Vec::new();
     let mut failed = None;
     let ok = Api::call(&mut client, request, |response, _| match response {
-            // alloc: error path, the daemon's errors, said once it is done
-            ResponseRef::Error(error) => errors.push(error.what.to_owned()),
-            response => {
-                if failed.is_none()
-                    && let Err(why) = on(response)
-                {
-                    failed = Some(why);
-                }
+        // alloc: error path, the daemon's errors, said once it is done
+        ResponseRef::Error(error) => errors.push(error.what.to_owned()),
+        response => {
+            if failed.is_none()
+                && let Err(why) = on(response)
+            {
+                failed = Some(why);
             }
+        }
     })
     .map_err(|error| error.to_string())?;
     if let Some(why) = failed {
@@ -378,9 +463,9 @@ fn profile(words: Vec<OsString>) -> Result<(), Refusal> {
             Some(rest) => rest.strip_prefix('=').map(str::to_owned),
             None => None,
         };
-        seconds = value
-            .and_then(|it| it.parse().ok())
-            .ok_or_else(|| Refusal::Usage(format!("blaze debug profile takes `--seconds N`, not `{word}`")))?;
+        seconds = value.and_then(|it| it.parse().ok()).ok_or_else(|| {
+            Refusal::Usage(format!("blaze debug profile takes `--seconds N`, not `{word}`"))
+        })?;
     }
     let mut trace = None;
     ask(Request::Profile { seconds }, Start::Never, |response| {
@@ -389,9 +474,12 @@ fn profile(words: Vec<OsString>) -> Result<(), Refusal> {
         }
         Ok(())
     })?;
-    let trace = trace.ok_or_else(|| "the daemon answered `blaze debug profile` with no trace".to_owned())?;
+    let trace = trace
+        .ok_or_else(|| "the daemon answered `blaze debug profile` with no trace".to_owned())?;
     let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_secs());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.as_secs());
     let path = state.join(format!("profile-{now}.json"));
     std::fs::write(&path, trace).map_err(|error| format!("writing {}: {error}", path.display()))?;
     println!("{}", path.display());
@@ -417,7 +505,9 @@ fn watch() -> Result<(), Refusal> {
             .map_err(|error| format!("the live feed: {error}"))?;
         top.render(width, &mut text);
         let mut out = std::io::stdout().lock();
-        write!(out, "\x1b[2J\x1b[H{text}").and_then(|()| out.flush()).map_err(|error| format!("the terminal: {error}"))
+        write!(out, "\x1b[2J\x1b[H{text}")
+            .and_then(|()| out.flush())
+            .map_err(|error| format!("the terminal: {error}"))
     })?;
     Ok(())
 }
@@ -454,7 +544,11 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     let name = words.next().ok_or_else(|| {
         let names: Vec<_> = views::VIEWS.iter().map(|it| it.name).collect();
         let rules: Vec<_> = blaze_report::rules::RULES.iter().map(|it| it.id).collect();
-        Refusal::Usage(format!("{EXPLAIN_USAGE}; the rules are {}; the views are {}", rules.join(", "), names.join(", ")))
+        Refusal::Usage(format!(
+            "{EXPLAIN_USAGE}; the rules are {}; the views are {}",
+            rules.join(", "),
+            names.join(", ")
+        ))
     })?;
     if let Some(rule) = blaze_report::rules::find(&name) {
         let mut text = String::new();
@@ -486,7 +580,9 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
 /// The file the CLI keeps the last build's failures in, for `blaze explain PACKAGE`: a JSON
 /// array of reports (`blaze_report::Report`), in the daemon's state directory.
 pub fn last_failure() -> Result<PathBuf, String> {
-    crate::serve::state().map(|it| it.join("last-failure.json")).map_err(|error| format!("{error:#}"))
+    crate::serve::state()
+        .map(|it| it.join("last-failure.json"))
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// `failures` kept in `file` whole: written beside it, then moved over it.
@@ -497,7 +593,9 @@ pub fn remember(file: &Path, failures: &[blaze_api::Report]) -> Result<(), Strin
         std::fs::create_dir_all(dir).map_err(|error| failed(&error))?;
     }
     let part = file.with_extension("json.part");
-    std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, file)).map_err(|error| failed(&error))
+    std::fs::write(&part, text)
+        .and_then(|()| std::fs::rename(&part, file))
+        .map_err(|error| failed(&error))
 }
 
 /// The last build's failure of package `name` (the package its report is of,
@@ -509,8 +607,8 @@ fn failure_of(name: &str) -> Result<Option<blaze_api::Report>, Refusal> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Refusal::Failed(format!("{}: {error}", file.display()))),
     };
-    let reports: Vec<blaze_api::Report> =
-        serde_json::from_str(&text).map_err(|error| format!("{}: not the reports blaze keeps: {error}", file.display()))?;
+    let reports: Vec<blaze_api::Report> = serde_json::from_str(&text)
+        .map_err(|error| format!("{}: not the reports blaze keeps: {error}", file.display()))?;
     Ok(reports.into_iter().find(|it| it.subject() == Some(name)))
 }
 
@@ -522,7 +620,8 @@ fn failure_text(report: &blaze_api::Report, json: bool) -> String {
         text.push('\n');
         return text;
     }
-    let mut text = blaze_report::render(report, blaze_report::Caps::PLAIN, &blaze_report::Roots::NONE);
+    let mut text =
+        blaze_report::render(report, blaze_report::Caps::PLAIN, &blaze_report::Roots::NONE);
     if let Some(blocks) = &report.blocks {
         // Writing to a String cannot fail.
         let _ = writeln!(text, "\nblocks {} {}:", blocks.count, blocks.what);
@@ -536,20 +635,30 @@ fn failure_text(report: &blaze_api::Report, json: bool) -> String {
 /// `text` on stdout.
 fn stdout(text: &str) -> Result<(), Refusal> {
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 /// `value` as the JSON of argument `key`'s type; a key the view does not take is passed as
 /// text, for the view to refuse by name.
 fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal> {
-    let Some(arg) = view.args.iter().find(|it| it.name == key) else { return Ok(Value::from(value)) };
-    let wrong = || Refusal::Usage(format!("{}'s `{key}` is a {}, and `{value}` is none", view.name, arg.ty.name()));
+    let Some(arg) = view.args.iter().find(|it| it.name == key) else {
+        return Ok(Value::from(value));
+    };
+    let wrong = || {
+        Refusal::Usage(format!(
+            "{}'s `{key}` is a {}, and `{value}` is none",
+            view.name,
+            arg.ty.name()
+        ))
+    };
     Ok(match arg.ty {
         views::ArgType::U64 => Value::from(value.parse::<u64>().map_err(|_| wrong())?),
         views::ArgType::I64 => Value::from(value.parse::<i64>().map_err(|_| wrong())?),
-        views::ArgType::F64 => {
-            serde_json::Number::from_f64(value.parse().map_err(|_| wrong())?).map(Value::Number).ok_or_else(wrong)?
-        }
+        views::ArgType::F64 => serde_json::Number::from_f64(value.parse().map_err(|_| wrong())?)
+            .map(Value::Number)
+            .ok_or_else(wrong)?,
         views::ArgType::Text => Value::from(value),
     })
 }
@@ -614,18 +723,22 @@ fn print(batches: &[RecordBatch], shape: Shape) -> Result<(), Refusal> {
         Shape::Json => json(batches)?,
     };
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 /// The batches as a table: a header of the columns' names, a rule, a line a row, then the
 /// count of rows.
 fn table(batches: &[RecordBatch]) -> Result<String, String> {
     let Some(first) = batches.first() else { return Ok("0 rows\n".to_owned()) };
-    let names: Vec<String> = first.schema().fields().iter().map(|it| it.name().to_owned()).collect();
+    let names: Vec<String> =
+        first.schema().fields().iter().map(|it| it.name().to_owned()).collect();
     let mut rows = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
-            let cells = batch.columns().iter().map(|column| cell(column.as_ref(), row).map(|it| text(&it)));
+            let cells =
+                batch.columns().iter().map(|column| cell(column.as_ref(), row).map(|it| text(&it)));
             rows.push(cells.collect::<Result<Vec<_>, _>>()?);
         }
     }
@@ -735,7 +848,10 @@ fn cell(array: &dyn Array, row: usize) -> Result<Value, String> {
         let key = dictionary.normalized_keys()[row];
         return cell(dictionary.values().as_ref(), key);
     }
-    Err(format!("a column of type {} can't be printed: cast it in the query (`::VARCHAR`)", array.data_type()))
+    Err(format!(
+        "a column of type {} can't be printed: cast it in the query (`::VARCHAR`)",
+        array.data_type()
+    ))
 }
 
 #[cfg(test)]
@@ -747,7 +863,8 @@ mod tests {
     use super::*;
 
     fn batch() -> RecordBatch {
-        let names: DictionaryArray<types::Int32Type> = vec![Some("parse"), None, Some("parse")].into_iter().collect();
+        let names: DictionaryArray<types::Int32Type> =
+            vec![Some("parse"), None, Some("parse")].into_iter().collect();
         let columns: Vec<(&str, ArrayRef)> = vec![
             ("name", Arc::new(names)),
             ("count", Arc::new(Int64Array::from(vec![3, 10, -1]))),
@@ -785,7 +902,13 @@ mod tests {
     fn an_argument_is_read_as_its_views_type() {
         let view = views::find("slowest_queries").unwrap();
         assert_eq!(argument(view, "limit", "5").ok(), Some(Value::from(5u64)));
-        assert!(matches!(argument(view, "limit", "five"), Err(Refusal::Usage(it)) if it.contains("`limit` is a u64")));
-        assert_eq!(argument(view, "nope", "x").ok(), Some(Value::from("x")), "left for the view to refuse");
+        assert!(
+            matches!(argument(view, "limit", "five"), Err(Refusal::Usage(it)) if it.contains("`limit` is a u64"))
+        );
+        assert_eq!(
+            argument(view, "nope", "x").ok(),
+            Some(Value::from("x")),
+            "left for the view to refuse"
+        );
     }
 }

@@ -13,10 +13,10 @@
 //! `max_vis`), `compiler/rustc_middle/src/ty/mod.rs` (`Visibility::to_string`) and
 //! `compiler/rustc_resolve/src/effective_visibilities.rs` (MIT or Apache-2.0).
 
+use blaze_hash::FixedState;
 use hir::{InFile, ModuleDef, view::HasSourceView as _};
 use hir_def::{MacroId, ModuleDefId, ModuleId, visibility::Visibility};
 use hir_expand::{mod_path::ModPath, name::Name};
-use blaze_hash::FixedState;
 use smallvec::SmallVec;
 use syntax::view::{self as ast, AstNode as _, HasVisibility, Node};
 
@@ -53,7 +53,12 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>) -> Vec<Found> {
 
 /// rustc's check that a glob import re-exports something as visibly as it is declared: its
 /// visibility greater than `max_vis`, the greatest of those of what it imports.
-fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tree<'_>) -> Option<Found> {
+fn glob_visibility(
+    cx: &Cx<'_, '_>,
+    uses: &Uses<'_, '_>,
+    item: &UseItem<'_>,
+    tree: &Tree<'_>,
+) -> Option<Found> {
     let db = cx.db;
     let Some(ModuleDefId::ModuleId(from)) = tree.source else { return None };
     // A private import is as visible as anything it can import, so `max_vis` never falls below it.
@@ -111,11 +116,18 @@ fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tre
 
 /// `pub_use_of_private_extern_crate`: a `pub` single import of nothing but an `extern crate`
 /// item less visible than it.
-fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tree<'_>) -> Option<Found> {
+fn private_extern_crate(
+    cx: &Cx<'_, '_>,
+    uses: &Uses<'_, '_>,
+    item: &UseItem<'_>,
+    tree: &Tree<'_>,
+) -> Option<Found> {
     if !item.public || tree.self_import || tree.binding.is_none() {
         return None;
     }
-    let Some(Entry { import: Some(Binding::ExternCrate(id)), .. }) = entry(&tree.imported, Ns::Types) else {
+    let Some(Entry { import: Some(Binding::ExternCrate(id)), .. }) =
+        entry(&tree.imported, Ns::Types)
+    else {
         return None;
     };
     if entry(&tree.imported, Ns::Values).is_some() || entry(&tree.imported, Ns::Macros).is_some() {
@@ -144,7 +156,10 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>
         Applicability::MaybeIncorrect,
     );
     // alloc: the fact of a lint that fires
-    diag.fact(cx.resolves_fact(item.module.into(), &ident), format!("what `{ident}` is imported from"));
+    diag.fact(
+        cx.resolves_fact(item.module.into(), &ident),
+        format!("what `{ident}` is imported from"),
+    );
     let at = InFile::new(item.node.file_id, ast::ptr(tree.node.syntax()));
     Some(Found::lint(diag, Phase::Resolve, at))
 }
@@ -168,7 +183,8 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
     let here = module.def_map(db).module(db, module).scope(db);
     let frame = cx.frame();
     let mut names: Vec<Name, _> = Vec::new_in(frame);
-    let mut seen: hashbrown::HashSet<Name, FixedState, _> = hashbrown::HashSet::with_hasher_in(FixedState, frame);
+    let mut seen: hashbrown::HashSet<Name, FixedState, _> =
+        hashbrown::HashSet::with_hasher_in(FixedState, frame);
     for (_, _, from) in &globs {
         for (name, _) in from.def_map(db).module(db, *from).scope(db).entries() {
             if seen.insert(*name) {
@@ -192,11 +208,14 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
             match it {
                 it if matches!(it.import, Some(Binding::Glob(_))) => {
                     let public = first_item.public && first.vis == Visibility::Public;
-                    let exported = it.import.is_some_and(|it| uses.exported_names.contains(&(it, *name, ns)));
+                    let exported =
+                        it.import.is_some_and(|it| uses.exported_names.contains(&(it, *name, ns)));
                     if !public || !exported {
                         continue;
                     }
-                    let Some(&(_, other_tree, _)) = imported.iter().find(|(_, _, it)| it.def != first.def) else {
+                    let Some(&(_, other_tree, _)) =
+                        imported.iter().find(|(_, _, it)| it.def != first.def)
+                    else {
                         continue;
                     };
                     let root = first_item.trees.first().map(|it| it.node.syntax().text_range());
@@ -205,32 +224,55 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
                     // alloc: the lint fires; the name goes into its labels and fact
                     let text = name.as_str().to_owned();
                     // clone: the lint fires; its span is both the primary span and a label's
-                    let mut diag = Diag::lint("ambiguous_glob_reexports", "ambiguous glob re-exports", span.clone());
+                    let mut diag = Diag::lint(
+                        "ambiguous_glob_reexports",
+                        "ambiguous glob re-exports",
+                        span.clone(),
+                    );
                     diag.span_label(
                         span,
                         // alloc: a label of a lint that fires
-                        format!("the name `{text}` in the {} namespace is first re-exported here", ns.descr()),
+                        format!(
+                            "the name `{text}` in the {} namespace is first re-exported here",
+                            ns.descr()
+                        ),
                     );
-                    let other = cx.span(InFile::new(first_item.node.file_id, other_tree.node.syntax().text_range()));
+                    let other = cx.span(InFile::new(
+                        first_item.node.file_id,
+                        other_tree.node.syntax().text_range(),
+                    ));
                     diag.span_label(
                         other,
                         // alloc: a label of a lint that fires
-                        format!("but the name `{text}` in the {} namespace is also re-exported here", ns.descr()),
+                        format!(
+                            "but the name `{text}` in the {} namespace is also re-exported here",
+                            ns.descr()
+                        ),
                     );
                     // alloc: the fact of a lint that fires
-                    diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
-                    let at = InFile::new(first_item.node.file_id, ast::ptr(first_item.node.value.syntax()));
+                    diag.fact(
+                        cx.resolves_fact(module.into(), &text),
+                        format!("what `{text}` is in the module"),
+                    );
+                    let at = InFile::new(
+                        first_item.node.file_id,
+                        ast::ptr(first_item.node.value.syntax()),
+                    );
                     found.push(Found::lint(diag, Phase::Resolve, at));
                 }
                 it => {
-                    if it.vis == Visibility::Public || matches!(it.def, ModuleDefId::MacroId(MacroId::MacroRulesId(_))) {
+                    if it.vis == Visibility::Public
+                        || matches!(it.def, ModuleDefId::MacroId(MacroId::MacroRulesId(_)))
+                    {
                         continue;
                     }
-                    let Some(&(glob_item, glob_tree, _)) = imported.iter().find(|(item, tree, it)| {
-                        item.public
-                            && it.vis == Visibility::Public
-                            && tree.binding.is_some_and(|it| uses.exported.contains(&it))
-                    }) else {
+                    let Some(&(glob_item, glob_tree, _)) =
+                        imported.iter().find(|(item, tree, it)| {
+                            item.public
+                                && it.vis == Visibility::Public
+                                && tree.binding.is_some_and(|it| uses.exported.contains(&it))
+                        })
+                    else {
                         continue;
                     };
                     let Some(private) = binding_node(cx, uses, it) else { continue };
@@ -240,7 +282,10 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
                     let mut diag =
                         // clone: the lint fires; its span is both the primary span and a note's
                         Diag::lint("hidden_glob_reexports", "private item shadows public glob re-export", span.clone());
-                    let glob = cx.span(InFile::new(glob_item.node.file_id, glob_tree.node.syntax().text_range()));
+                    let glob = cx.span(InFile::new(
+                        glob_item.node.file_id,
+                        glob_tree.node.syntax().text_range(),
+                    ));
                     diag.span_note(
                         glob,
                         // alloc: a note of a lint that fires
@@ -251,7 +296,10 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
                     );
                     diag.span_note(span, "but the private item here shadows it");
                     // alloc: the fact of a lint that fires
-                    diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
+                    diag.fact(
+                        cx.resolves_fact(module.into(), &text),
+                        format!("what `{text}` is in the module"),
+                    );
                     found.push(Found::lint(diag, Phase::Resolve, private.map(ast::ptr)));
                 }
             }
@@ -262,7 +310,11 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
 
 /// The node of what a name is bound to in a module, when it is not a glob's: the item that
 /// defines it, the `use` tree or the `extern crate` item that imports it.
-fn binding_node<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, it: Entry) -> Option<InFile<Node<'db>>> {
+fn binding_node<'db>(
+    cx: &Cx<'_, 'db>,
+    uses: &Uses<'_, 'db>,
+    it: Entry,
+) -> Option<InFile<Node<'db>>> {
     match it.import {
         Some(binding @ Binding::Import(_)) => {
             let (item, tree) = uses.tree(binding)?;
@@ -328,7 +380,8 @@ fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>) -> 
         ast::VisibilityKind::PubSuper => Vis::Module(home.def_map(db).containing_module(db, home)?),
         ast::VisibilityKind::In(path) => {
             let span_map = item.node.file_id.span_map(db);
-            let path = ModPath::from_src_view(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
+            let path =
+                ModPath::from_src_view(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
             match entry(&uses.lookup(cx, home, path.kind, path.segments()), Ns::Types)?.def {
                 ModuleDefId::ModuleId(it) => Vis::module(cx, it),
                 _ => return None,
@@ -358,7 +411,9 @@ impl Vis {
     /// Visible in `module`, the nearest module that is not a block.
     fn module(cx: &Cx<'_, '_>, module: ModuleId) -> Vis {
         let module = nearest_module(cx, module);
-        if module.def_map(cx.db).module(cx.db, module).parent.is_none() && !module.is_block_module(cx.db) {
+        if module.def_map(cx.db).module(cx.db, module).parent.is_none()
+            && !module.is_block_module(cx.db)
+        {
             Vis::Crate
         } else {
             Vis::Module(module)

@@ -52,13 +52,16 @@ impl<'db> Semantics<'db> {
         let _p = tracing::info_span!(target: "blaze", "view::Semantics::analyze_impl").entered();
         let db = self.db;
         let container = self.find_container(node)?;
-        let generic_def = |def| SourceAnalyzer::new_generic_def_view(db, &self.imp, def, node, infer);
+        let generic_def =
+            |def| SourceAnalyzer::new_generic_def_view(db, &self.imp, def, node, infer);
         let resolver = match container {
             ChildContainer::DefWithBodyId(def) => {
                 return Some(SourceAnalyzer::new_for_body_view(db, def, node, infer));
             }
             ChildContainer::VariantId(def) => {
-                return Some(SourceAnalyzer::new_variant_body_view(db, &self.imp, def, node, infer));
+                return Some(SourceAnalyzer::new_variant_body_view(
+                    db, &self.imp, def, node, infer,
+                ));
             }
             ChildContainer::TraitId(it) => return Some(generic_def(it.into())),
             ChildContainer::ImplId(it) => return Some(generic_def(it.into())),
@@ -268,16 +271,19 @@ impl<'db> Semantics<'db> {
         let mut r = SmallVec::new();
         let text = token.text();
         let kind = token.kind();
-        self.descend_into_macros_all(self.wrap_token_infile(token), &mut |InFile { value, .. }, ctx| {
-            let mapped_kind = value.kind();
-            let any_ident_match = kind.is_any_identifier() && mapped_kind.is_any_identifier();
-            if (kind == mapped_kind || any_ident_match)
-                && text == value.text()
-                && !ctx.is_opaque(self.db)
-            {
-                r.push(value);
-            }
-        });
+        self.descend_into_macros_all(
+            self.wrap_token_infile(token),
+            &mut |InFile { value, .. }, ctx| {
+                let mapped_kind = value.kind();
+                let any_ident_match = kind.is_any_identifier() && mapped_kind.is_any_identifier();
+                if (kind == mapped_kind || any_ident_match)
+                    && text == value.text()
+                    && !ctx.is_opaque(self.db)
+                {
+                    r.push(value);
+                }
+            },
+        );
         if r.is_empty() {
             r.push(token);
         }
@@ -302,9 +308,9 @@ impl<'db> Semantics<'db> {
         let mut pending = DescentTokens::new();
         let mut current = DescentTokens::new();
 
-        let include = file_id
-            .file_id()
-            .and_then(|file_id| self.imp.s2d_cache.borrow_mut().get_or_insert_include_for(db, file_id));
+        let include = file_id.file_id().and_then(|file_id| {
+            self.imp.s2d_cache.borrow_mut().get_or_insert_include_for(db, file_id)
+        });
         match include {
             Some(include) => {
                 // include! inputs are always from real files, so they are handled once upfront.
@@ -326,8 +332,14 @@ impl<'db> Semantics<'db> {
             // Reversed so the first tokens come first off the back.
             current.reverse();
             while let Some((token, ctx)) = current.pop() {
-                let remapped =
-                    self.descend_step(expansion, token, span, &mut current, &mut groups, &mut pending);
+                let remapped = self.descend_step(
+                    expansion,
+                    token,
+                    span,
+                    &mut current,
+                    &mut groups,
+                    &mut pending,
+                );
                 if remapped.is_none() {
                     f(InFile::new(expansion, token), ctx);
                 }
@@ -429,18 +441,19 @@ impl<'db> Semantics<'db> {
                         adt
                     }
                     // Otherwise a derive helper on a variant or field.
-                    None => attr.syntax().ancestors().find_map(ast::Item::cast).and_then(
-                        |it| match it {
-                            ast::Item::Struct(it) => Some(ast::Adt::Struct(it)),
-                            ast::Item::Enum(it) => Some(ast::Adt::Enum(it)),
-                            ast::Item::Union(it) => Some(ast::Adt::Union(it)),
-                            _ => None,
-                        },
-                    )?,
+                    None => {
+                        attr.syntax().ancestors().find_map(ast::Item::cast).and_then(
+                            |it| match it {
+                                ast::Item::Struct(it) => Some(ast::Adt::Struct(it)),
+                                ast::Item::Enum(it) => Some(ast::Adt::Enum(it)),
+                                ast::Item::Union(it) => Some(ast::Adt::Union(it)),
+                                _ => None,
+                            },
+                        )?
+                    }
                 };
                 let attr_name = attr.path().and_then(|it| it.as_single_name_ref())?.as_name();
-                let analyzer =
-                    self.analyze_impl(InFile::new(expansion, token.parent()?), false)?;
+                let analyzer = self.analyze_impl(InFile::new(expansion, token.parent()?), false)?;
                 let id = expansion.ast_id_map(db).ast_id_of_view::<tag::Adt>(adt);
                 let helpers = analyzer
                     .resolver

@@ -33,17 +33,23 @@ use crate::{
 pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_, '_>) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
-    let (macros, arms) =
-        (cx.lint_may_fire(LintId::named("unused_macros")), cx.lint_may_fire(LintId::named("unused_macro_rules")));
+    let (macros, arms) = (
+        cx.lint_may_fire(LintId::named("unused_macros")),
+        cx.lint_may_fire(LintId::named("unused_macro_rules")),
+    );
     if !macros && !arms {
         return found;
     }
     for tree in &walk.trees {
-        for node in tree.of_kind(|it| matches!(it, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)) {
+        for node in tree.of_kind(|it| matches!(it, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF))
+        {
             let Some(def) = ast::Macro::cast(node) else { continue };
             let Some(name) = def.name() else { continue };
             let text = name.text();
-            if text.starts_with('_') || uses.macros_unknown.contains(&name.as_name()) || exported(walk, def) {
+            if text.starts_with('_')
+                || uses.macros_unknown.contains(&name.as_name())
+                || exported(walk, def)
+            {
                 continue;
             }
             let Some(it) = cx.vsema.to_def(def) else { continue };
@@ -55,9 +61,13 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_, '_>
                 }
                 let span = cx.span(InFile::new(tree.file, name.syntax().text_range()));
                 // alloc: the message of a lint that fires
-                let mut diag = Diag::lint("unused_macros", format!("unused macro definition: `{text}`"), span);
+                let mut diag =
+                    Diag::lint("unused_macros", format!("unused macro definition: `{text}`"), span);
                 // alloc: the fact of a lint that fires
-                diag.fact(cx.resolves_fact(it.module(cx.db), text), format!("what the calls of `{text}` resolve to"));
+                diag.fact(
+                    cx.resolves_fact(it.module(cx.db), text),
+                    format!("what the calls of `{text}` resolve to"),
+                );
                 found.push(Found::lint(diag, Phase::Resolve, at));
                 continue;
             }
@@ -70,7 +80,8 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_, '_>
                 if rule.compile_error || matched.is_some_and(|it| it.contains(n)) {
                     continue;
                 }
-                let mut spans = rule.spans.into_iter().map(|it| cx.span(InFile::new(tree.file, it)));
+                let mut spans =
+                    rule.spans.into_iter().map(|it| cx.span(InFile::new(tree.file, it)));
                 let Some(first) = spans.next() else { continue };
                 // alloc: the message of a lint that fires
                 let message = format!("rule #{} of macro `{text}` is never used", n + 1);
@@ -99,9 +110,12 @@ fn exported(walk: &Walk<'_>, def: ast::Macro<'_>) -> bool {
                 ast::Meta::KeyValueMeta(it) => it.path(),
                 _ => None,
             };
-            path.and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "macro_export")
+            path.and_then(|it| it.as_single_name_ref())
+                .is_some_and(|it| it.text() == "macro_export")
         }),
-        ast::Macro::MacroDef(it) => it.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub)),
+        ast::Macro::MacroDef(it) => {
+            it.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub))
+        }
     }
 }
 
@@ -148,7 +162,10 @@ fn rules(def: ast::Macro<'_>) -> impl Iterator<Item = Rule> {
                 NodeOrToken::Node(node) if node.kind() == SyntaxKind::TOKEN_TREE => {
                     if after_arrow {
                         after_arrow = false;
-                        return Some(Rule { spans: std::mem::take(&mut spans), compile_error: has_compile_error(node) });
+                        return Some(Rule {
+                            spans: std::mem::take(&mut spans),
+                            compile_error: has_compile_error(node),
+                        });
                     }
                     spans.push(node.text_range());
                 }
@@ -197,13 +214,17 @@ mod tests {
         let def = parse.root().descendants().find_map(ast::Macro::cast).unwrap();
         rules(def)
             .into_iter()
-            .map(|rule| (rule.spans.iter().map(|it| text[*it].to_owned()).collect(), rule.compile_error))
+            .map(|rule| {
+                (rule.spans.iter().map(|it| text[*it].to_owned()).collect(), rule.compile_error)
+            })
             .collect()
     }
 
     #[test]
     fn rules_of_a_macro_rules_are_its_matchers() {
-        let found = spans("macro_rules! m { (a) => {}; [b $x:expr] => { compile_error!(\"no\") }; {} => (()) }");
+        let found = spans(
+            "macro_rules! m { (a) => {}; [b $x:expr] => { compile_error!(\"no\") }; {} => (()) }",
+        );
         assert_eq!(
             found,
             vec![

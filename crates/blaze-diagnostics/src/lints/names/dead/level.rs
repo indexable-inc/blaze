@@ -64,7 +64,11 @@ impl<'a, 'db> Levels<'a, 'db> {
         })
     }
 
-    fn with<T>(&self, cx: &Cx<'a, 'db>, ask: impl FnOnce(&mut LevelCx<'a, 'db>, &mut hir_lint_levels::Levels<'db>) -> T) -> T {
+    fn with<T>(
+        &self,
+        cx: &Cx<'a, 'db>,
+        ask: impl FnOnce(&mut LevelCx<'a, 'db>, &mut hir_lint_levels::Levels<'db>) -> T,
+    ) -> T {
         let mut built = self.built.borrow_mut();
         let (lcx, levels) = built.get_or_insert_with(|| {
             let mut lcx = LevelCx::new(cx.db, cx.krate.base(), &cx.lint_flags().lints);

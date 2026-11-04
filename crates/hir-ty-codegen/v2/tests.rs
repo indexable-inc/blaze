@@ -14,16 +14,16 @@ use blaze_codegen::{
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
+use hir_expand::fixture;
 use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::MirSpan;
-use hir_expand::fixture;
 
 use super::{
     Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, Kind,
     allocator::{self, Forward},
-    by_id::ById,
     backend::{built, compiled_in},
     build::Build,
+    by_id::ById,
     places::{self, Placer, place_requests},
     refs,
 };
@@ -56,7 +56,8 @@ fn stencils() -> Option<String> {
 
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
 fn policy(level: OptLevel) -> Policy {
-    let toolchain = Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
+    let toolchain =
+        Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {
         toolchain,
         profile: Profile {
@@ -98,7 +99,8 @@ fn spec() -> Spec {
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
         crate::Arch::Wasm64 => blaze_codegen::Arch::Wasm64,
     };
-    let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
+    let pic =
+        crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
         toolchain: Toolchain {
             id: ContentId::default(),
@@ -136,7 +138,12 @@ fn o3() -> Build {
 }
 
 /// What the compile of `instance` under `build` built in, by code: its `Function::inlined`.
-fn inlined_by_build(db: &Db, hashes: &HashSource, instance: &HirInstance, build: Build) -> Vec<CodeHash> {
+fn inlined_by_build(
+    db: &Db,
+    hashes: &HashSource,
+    instance: &HirInstance,
+    build: Build,
+) -> Vec<CodeHash> {
     let code = built(db, instance, crate::Target::for_fixtures(), false, build)
         .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
     let built_in = match &code {
@@ -160,14 +167,8 @@ fn unit(spec: &Spec) -> Unit {
 }
 
 /// The instances of `of` that `root` calls, in the order it calls them.
-fn called(
-    db: &Db,
-    root: &HirInstance,
-    of: FunctionId,
-) -> Vec<HirInstance> {
-    let is_of = |instance: &HirInstance| {
-        matches!(&instance.0, Kind::Code(called, _) if called.def == InstanceDef::Fn(of))
-    };
+fn called(db: &Db, root: &HirInstance, of: FunctionId) -> Vec<HirInstance> {
+    let is_of = |instance: &HirInstance| matches!(&instance.0, Kind::Code(called, _) if called.def == InstanceDef::Fn(of));
     refs::walk(db, root, refs::Walking::plain(false))
         .expect("the walk of the root")
         .into_iter()
@@ -179,10 +180,7 @@ fn called(
 }
 
 /// What a backend is given for the references of an instance: one target each.
-fn refs_of(
-    db: &Db,
-    (instance, inlined): (&HirInstance, bool),
-) -> Vec<blaze_codegen::Target> {
+fn refs_of(db: &Db, (instance, inlined): (&HirInstance, bool)) -> Vec<blaze_codegen::Target> {
     let walked = refs::walk(db, instance, refs::Walking::plain(inlined)).expect("the walk");
     (0..walked.len()).map(|at| blaze_codegen::Target::Extern(format!("ref{at}"))).collect()
 }
@@ -191,7 +189,11 @@ fn shape(frontend: &HirFrontend, instance: &HirInstance) -> Shape {
     prepared(frontend, &spec(), instance).0
 }
 
-fn prepared(frontend: &HirFrontend, spec: &Spec, instance: &HirInstance) -> (Shape, super::Prepared) {
+fn prepared(
+    frontend: &HirFrontend,
+    spec: &Spec,
+    instance: &HirInstance,
+) -> (Shape, super::Prepared) {
     frontend.with(|db| {
         let refs = refs_of(db, (instance, inlines(spec)));
         let refs: &Refs = &refs;
@@ -280,7 +282,8 @@ fn instances_with_one_share_key_are_one() {
         let key = |instance: &HirInstance| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            let choice =
+                policy.choose(&described.origin, described.overflow_checks).expect("the plan");
             let settings = choice.first.settings();
             UnitInstance { code: described.code, args: described.args, settings }.key()
         };
@@ -430,15 +433,22 @@ fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
         let planned = |instance: &HirInstance, checked: bool| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-            let choice = (checks_policy(checked).choose(&described.origin, described.overflow_checks))
-                .expect("the plan");
+            let choice = (checks_policy(checked)
+                .choose(&described.origin, described.overflow_checks))
+            .expect("the plan");
             let settings = choice.first.settings();
             let key = UnitInstance { code: described.code, args: described.args, settings }.key();
             (choice.first.overflow_checks, key)
         };
         let (debug, debug_key) = planned(add, true);
-        assert!(debug, "`<u8 as Add>::add` is compiled under std's overflow checks, not its user's");
-        assert!(panics_on_overflow(&frontend, add, debug), "`sum(255u8, 1u8)` wraps in a debug build");
+        assert!(
+            debug,
+            "`<u8 as Add>::add` is compiled under std's overflow checks, not its user's"
+        );
+        assert!(
+            panics_on_overflow(&frontend, add, debug),
+            "`sum(255u8, 1u8)` wraps in a debug build"
+        );
         let (release, release_key) = planned(add, false);
         assert!(!release && !panics_on_overflow(&frontend, add, release));
         assert_ne!(debug_key, release_key, "one key for the add compiled with and without checks");
@@ -467,10 +477,16 @@ fn overflow_checks_reach_an_inheriting_body_through_inline_bodies_without_checks
         let [forward] = &forwards[..] else { panic!("`by_ref` calls {forwards:?}") };
         let adds = frontend.with(|hir| called_named(hir, forward, "add"));
         let [add] = &adds[..] else { panic!("`<u8 as Add<&u8>>::add` calls {adds:?}") };
-        let forwarded = (frontend.describe(forward, &origin)).unwrap_or_else(|e| panic!("{forward:?}: {}", e.what));
-        assert_eq!(forwarded.origin, origin, "`impl Add<&u8> for u8` is compiled for std, not its user");
-        let described = (frontend.describe(add, &forwarded.origin)).unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
-        let choice = (checks_policy(true).choose(&described.origin, described.overflow_checks)).expect("the plan");
+        let forwarded = (frontend.describe(forward, &origin))
+            .unwrap_or_else(|e| panic!("{forward:?}: {}", e.what));
+        assert_eq!(
+            forwarded.origin, origin,
+            "`impl Add<&u8> for u8` is compiled for std, not its user"
+        );
+        let described = (frontend.describe(add, &forwarded.origin))
+            .unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
+        let choice = (checks_policy(true).choose(&described.origin, described.overflow_checks))
+            .expect("the plan");
         assert!(choice.first.overflow_checks, "`255u8 + &1u8` wraps in a debug build");
         assert!(panics_on_overflow(&frontend, add, choice.first.overflow_checks));
     });
@@ -495,13 +511,18 @@ fn an_instance_its_users_compile_is_walked_alike_for_every_asker() {
         let [sum] = &sums[..] else { panic!("{sums:?}") };
         let adds = frontend.with(|hir| called_named(hir, sum, "add"));
         let [add] = &adds[..] else { panic!("`sum::<u8>` calls {adds:?}") };
-        let described = (frontend.describe(add, &origin)).unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
-        let spec = (policy.choose(&described.origin, described.overflow_checks)).expect("the plan").first;
+        let described =
+            (frontend.describe(add, &origin)).unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
+        let spec =
+            (policy.choose(&described.origin, described.overflow_checks)).expect("the plan").first;
         frontend.with(|hir| {
             let walking = frontend.walking(hir, add).expect("the walk");
             for asker in [origin, Origin::Std] {
                 let inlined = frontend.inlines_for(hir, add, &asker).expect("the walk");
-                assert_eq!(inlined, walking.inlined, "described for {asker:?} and prepared, walked apart");
+                assert_eq!(
+                    inlined, walking.inlined,
+                    "described for {asker:?} and prepared, walked apart"
+                );
             }
             let refs: Vec<blaze_codegen::Target> = (0..described.refs.len())
                 .map(|at| blaze_codegen::Target::Extern(format!("ref{at}")))
@@ -550,7 +571,9 @@ pub fn roots() {
 #[test]
 fn equal_share_keys_compile_to_one_shape() {
     use blaze_codegen::backend::Frontend as _;
-    for debuginfo in [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full] {
+    for debuginfo in
+        [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full]
+    {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
@@ -560,8 +583,14 @@ fn equal_share_keys_compile_to_one_shape() {
             let keyed = |instance: &HirInstance| {
                 let described = (frontend.describe(instance, &origin))
                     .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
-                let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
-                let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+                let choice =
+                    policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                let key = UnitInstance {
+                    code: described.code,
+                    args: described.args,
+                    settings: choice.first.settings(),
+                }
+                .key();
                 (key, prepared(&frontend, &choice.first, instance).0)
             };
             // `roots` asks for each body with `A, B, C, W, E1, E3, F, G`, in that order.
@@ -572,7 +601,13 @@ fn equal_share_keys_compile_to_one_shape() {
                 let func = function(db, name);
                 let instances = frontend.with(|hir| called(hir, &root, func));
                 assert_eq!(instances.len(), 8, "{debuginfo:?} `{name}`: {instances:?}");
-                let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
+                let keyed: Vec<_> = instances
+                    .into_iter()
+                    .map(|it| {
+                        let k = keyed(&it);
+                        (it, k)
+                    })
+                    .collect(); // alloc: a test's list
                 let mut shared = Vec::new(); // alloc: a test's list
                 for (at, (_, (key_a, _))) in keyed.iter().enumerate() {
                     for (other, (_, (key_b, _))) in keyed.iter().enumerate().skip(at + 1) {
@@ -589,12 +624,19 @@ fn equal_share_keys_compile_to_one_shape() {
                 let func = function(db, "c");
                 let instances = frontend.with(|hir| called(hir, &root, func));
                 assert_eq!(instances.len(), 3, "{debuginfo:?} `c`: {instances:?}");
-                let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
+                let keyed: Vec<_> = instances
+                    .into_iter()
+                    .map(|it| {
+                        let k = keyed(&it);
+                        (it, k)
+                    })
+                    .collect(); // alloc: a test's list
                 let shared: Vec<(usize, usize)> = (0..keyed.len()) // alloc: a test's list
                     .flat_map(|at| (at + 1..keyed.len()).map(move |other| (at, other)))
                     .filter(|&(at, other)| keyed[at].1.0 == keyed[other].1.0)
                     .collect();
-                let expected: &[(usize, usize)] = if debuginfo.tells_locals() { &[] } else { &[(0, 1)] };
+                let expected: &[(usize, usize)] =
+                    if debuginfo.tells_locals() { &[] } else { &[(0, 1)] };
                 assert_eq!(shared, expected, "{debuginfo:?} `c`: the instances of one key");
                 all.extend(keyed);
             }
@@ -619,7 +661,9 @@ fn equal_share_keys_compile_to_one_shape() {
 #[test]
 fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
     use blaze_codegen::backend::Frontend as _;
-    for debuginfo in [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full] {
+    for debuginfo in
+        [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full]
+    {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
@@ -633,13 +677,23 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
             let keyed = |instance: &HirInstance| {
                 let described = (frontend.describe(instance, &origin))
                     .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-                let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
-                let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+                let choice =
+                    policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                let key = UnitInstance {
+                    code: described.code,
+                    args: described.args,
+                    settings: choice.first.settings(),
+                }
+                .key();
                 (key, prepared(&frontend, &choice.first, instance).0)
             };
             let ((key_a, shape_a), (key_b, shape_b)) = (keyed(a), keyed(b));
             let told = debuginfo.tells_locals();
-            assert_eq!(shape_a == shape_b, !told, "{debuginfo:?}: the told locals' types are in the shape");
+            assert_eq!(
+                shape_a == shape_b,
+                !told,
+                "{debuginfo:?}: the told locals' types are in the shape"
+            );
             assert_eq!(key_a == key_b, !told, "{debuginfo:?}: the key follows the shape");
         });
     }
@@ -671,9 +725,13 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
                     for (at, instance) in instances.iter().enumerate() {
                         let described = (frontend.describe(instance, &origin))
                             .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
-                        let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                        let choice = policy
+                            .choose(&described.origin, described.overflow_checks)
+                            .expect("the plan");
                         let settings = choice.first.settings();
-                        let key = UnitInstance { code: described.code, args: described.args, settings }.key();
+                        let key =
+                            UnitInstance { code: described.code, args: described.args, settings }
+                                .key();
                         let shape = prepared(&frontend, &choice.first, instance).0;
                         all.push((format!("`{name}` #{at}"), key, shape)); // alloc: a test's name
                     }
@@ -684,10 +742,20 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
         .collect();
     for (i, a) in keyed.iter().enumerate() {
         for (j, b) in keyed.iter().enumerate().skip(i + 1) {
-            assert_eq!(a.len(), b.len(), "{:?} and {:?} ask for as many instances", levels[i], levels[j]);
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "{:?} and {:?} ask for as many instances",
+                levels[i],
+                levels[j]
+            );
             for ((name, key_a, shape_a), (_, key_b, shape_b)) in a.iter().zip(b) {
                 if key_a == key_b {
-                    assert_eq!(shape_a, shape_b, "{name} at {:?} and {:?}: one key, two shapes", levels[i], levels[j]);
+                    assert_eq!(
+                        shape_a, shape_b,
+                        "{name} at {:?} and {:?}: one key, two shapes",
+                        levels[i], levels[j]
+                    );
                 }
             }
         }
@@ -712,17 +780,28 @@ pub fn roots() -> u32 { std::via_one() + std::via_two() + via_one() + via_two() 
 /// `described` of the function `name` of crate `krate` as `roots` (of crate `main`) asks for
 /// it, under `policy`, with the items lane's hashes: its template code, its code and whether
 /// it fills its own anchors.
-fn described_in(text: &str, policy: &Policy, krate: &str, name: &str) -> (CodeHash, CodeHash, bool) {
+fn described_in(
+    text: &str,
+    policy: &Policy,
+    krate: &str,
+    name: &str,
+) -> (CodeHash, CodeHash, bool) {
     use base_db::all_crates;
     use blaze_codegen::backend::Frontend as _;
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
     let hashes = HashSource::Items(super::ItemHashes::new(Box::new(|_| None)));
-    let frontend = HirFrontend::new(Databases::new(db), hashes, BuildTime::default()).with_policy(policy);
+    let frontend =
+        HirFrontend::new(Databases::new(db), hashes, BuildTime::default()).with_policy(policy);
     let named = |name: &str| {
         all_crates(db)
             .iter()
             .copied()
-            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .find(|it| {
+                it.extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == name)
+            })
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let main = named("main");
@@ -732,7 +811,8 @@ fn described_in(text: &str, policy: &Policy, krate: &str, name: &str) -> (CodeHa
         let func = hir_def::test_items::function(db, named(krate), name);
         let instances = frontend.with(|hir| called(hir, &root, func));
         let [instance] = &instances[..] else { panic!("`{name}`: {instances:?}") };
-        let described = (frontend.describe(instance, &origin)).unwrap_or_else(|e| panic!("`{name}`: {}", e.what));
+        let described = (frontend.describe(instance, &origin))
+            .unwrap_or_else(|e| panic!("`{name}`: {}", e.what));
         (described.template_code, described.code, described.anchors.is_some())
     })
 }
@@ -794,7 +874,11 @@ fn a_told_locals_type_is_in_its_link_code() {
     let (before, after) = (told(DebugInfo::Full, TOLD_LOCAL), told(DebugInfo::Full, &renamed));
     assert_ne!(before.1, after.1, "the told type's new name is a new link code");
     assert_ne!(before.0, after.0, "and a new template code");
-    assert_ne!(told(DebugInfo::None, TOLD_LOCAL).1, before.1, "untold, its code holds no told type");
+    assert_ne!(
+        told(DebugInfo::None, TOLD_LOCAL).1,
+        before.1,
+        "untold, its code holds no told type"
+    );
 }
 
 /// A function `#[blaze::cache]` made, with `deep` its closure reaches: `{deep}` is its body.
@@ -881,18 +965,29 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     let refusal = "it has no provenance, so const eval did not make it a pointer";
     let named = |what: &str| {
         assert!(what.contains("cached`") && what.contains("can't be built"), "{what}");
-        assert!(what.contains("it reaches `") && what.contains("deep`, which can't be compiled by blaze"), "{what}");
+        assert!(
+            what.contains("it reaches `")
+                && what.contains("deep`, which can't be compiled by blaze"),
+            "{what}"
+        );
         assert!(what.contains(refusal) && what.contains("rule 3"), "{what}");
     };
     let refused = cached_reading(deep, "deep()");
     let (db, front) = frontend(&refused);
     blaze_query::db::attach(db, || {
         let cached = function(db, "cached");
-        let compiled = crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
+        let compiled =
+            crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
         named(&compiled.expect_err("the code generator refuses `cached`"));
         let root = front.root(cached);
         let origin = front.with(|hir| front.origin(hir, fixture::test_crate(&db)));
-        named(&front.describe(&root, &origin).map(|_| ()).expect_err("the frontend refuses `cached`").what);
+        named(
+            &front
+                .describe(&root, &origin)
+                .map(|_| ())
+                .expect_err("the frontend refuses `cached`")
+                .what,
+        );
     });
     for read in ["unsafe { M }", "(unsafe { M }, deep())"] {
         let impure = cached_reading(deep, read);
@@ -919,8 +1014,12 @@ fn a_root_takes_function_items_for_its_type_parameters() {
         assert_ne!(with_mac, root(expand, &[other]).unwrap());
         assert_eq!(with_mac, root(expand, &[mac]).unwrap());
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-        frontend.describe(&with_mac, &origin).unwrap_or_else(|e| panic!("{with_mac:?}: {}", e.what));
-        for (func, items, name) in [(two, &[mac][..], "two"), (expand, &[], "expand"), (sized, &[mac], "sized")] {
+        frontend
+            .describe(&with_mac, &origin)
+            .unwrap_or_else(|e| panic!("{with_mac:?}: {}", e.what));
+        for (func, items, name) in
+            [(two, &[mac][..], "two"), (expand, &[], "expand"), (sized, &[mac], "sized")]
+        {
             let what = root(func, items).unwrap_err();
             assert!(what.contains(&format!("`{name}`")), "{what}");
         }
@@ -941,8 +1040,8 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     let options = |policy: &Policy| {
         let build_time = BuildTime::default();
-        let frontend =
-            HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
+        let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time)
+            .with_policy(policy);
         frontend.body_options(&origin).expect("the options")
     };
     let at = |level, ub_checks, inline| MirOptions {
@@ -1044,16 +1143,26 @@ fn the_walk_lists_what_the_ir_asks_for() {
         while let Some(instance) = seen.get(at).cloned() {
             at += 1;
             let walked = refs::walk(db, &instance, refs::Walking::plain(false)).expect("the walk");
-            assert_eq!(walked, refs::walk(db, &instance, refs::Walking::plain(false)).expect("the walk again"));
-            let mut code = built(db, &instance, crate::Target::for_fixtures(), false, Build::of(&spec))
-                .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
+            assert_eq!(
+                walked,
+                refs::walk(db, &instance, refs::Walking::plain(false)).expect("the walk again")
+            );
+            let mut code =
+                built(db, &instance, crate::Target::for_fixtures(), false, Build::of(&spec))
+                    .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
             let requests = match &mut code {
                 super::Built::Ir(pending) => &mut pending.wants.requests,
                 super::Built::Assembled(_, requests) => requests,
             };
             let mut placer = Placer::listed(walked.clone());
-            place_requests(db, &HashSource::ById(ById), compiled_in(db, &instance), &mut placer, requests)
-                .unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
+            place_requests(
+                db,
+                &HashSource::ById(ById),
+                compiled_in(db, &instance),
+                &mut placer,
+                requests,
+            )
+            .unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
             for it in walked {
                 if let FrontRef::Function(next) = it
                     && matches!(next.0, Kind::Code(..))
@@ -1080,7 +1189,13 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(Vec::new());
         let krate = compiled_in(db, &root);
-        let placed = place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests);
+        let placed = place_requests(
+            db,
+            &HashSource::ById(ById),
+            krate,
+            &mut placer,
+            &mut pending.wants.requests,
+        );
         assert!(placed.is_err());
     });
 }
@@ -1127,9 +1242,17 @@ fn one_function_under_two_settings_builds_two_irs_in_one_database() {
         let unwinds = under(unwinding);
         let aborts = under(aborting);
         let unwinds_again = under(unwinding);
-        assert_ne!(aborts, unwinds, "built after the unwinding IR, the aborting one is its own, not a reuse");
-        assert_eq!(unwinds_again, unwinds, "built after the aborting IR, the unwinding one is its own again");
-        let HirInstance(Kind::Code(instance, env)) = &root else { panic!("{root:?} is no function") };
+        assert_ne!(
+            aborts, unwinds,
+            "built after the unwinding IR, the aborting one is its own, not a reuse"
+        );
+        assert_eq!(
+            unwinds_again, unwinds,
+            "built after the aborting IR, the unwinding one is its own again"
+        );
+        let HirInstance(Kind::Code(instance, env)) = &root else {
+            panic!("{root:?} is no function")
+        };
         let instance = crate::Instance { checked: false, ..*instance };
         let direct = match crate::instance_code(
             db,
@@ -1140,7 +1263,9 @@ fn one_function_under_two_settings_builds_two_irs_in_one_database() {
             &mut None,
         ) {
             Ok(crate::Produced::Pending(pending)) => pending.func.display().to_string(),
-            Ok(crate::Produced::Code(_)) => panic!("a unit's compile leaves its IR to the back end"),
+            Ok(crate::Produced::Code(_)) => {
+                panic!("a unit's compile leaves its IR to the back end")
+            }
             Err(e) => panic!("{root:?}: {e}"),
         };
         assert_eq!(direct, aborts, "the compile's own settings, wherever it is called from");
@@ -1248,49 +1373,79 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
-            frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
+            frontend
+                .describe(instance, &origin)
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
         };
         let rooted = describe(&root);
         let called = |name: &str| {
             (rooted.refs.iter())
                 .find_map(|it| match it {
-                    FrontRef::Function(instance @ HirInstance(Kind::Code(called, _))) => match called.def {
-                        InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == name => {
-                            Some(instance.clone())
+                    FrontRef::Function(instance @ HirInstance(Kind::Code(called, _))) => {
+                        match called.def {
+                            InstanceDef::Fn(func)
+                                if FunctionSignature::of(db, func).name.as_str() == name =>
+                            {
+                                Some(instance.clone())
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    },
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("no `{name}` in {:?}", rooted.refs))
         };
-        assert_eq!(describe(&called("open")).owner, Owner::Workspace, "`safe::open`, over the path crate `sys`");
-        assert_eq!(describe(&called("plain")).owner, Owner::Dependency, "`other::plain`, over no path crate");
+        assert_eq!(
+            describe(&called("open")).owner,
+            Owner::Workspace,
+            "`safe::open`, over the path crate `sys`"
+        );
+        assert_eq!(
+            describe(&called("plain")).owner,
+            Owner::Dependency,
+            "`other::plain`, over no path crate"
+        );
         let table = (rooted.refs.iter())
             .find_map(|it| match it {
                 FrontRef::Static(value) => Some(*value),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no `safe::OPEN` in {:?}", rooted.refs));
-        let table = frontend.describe_static(&table).unwrap_or_else(|e| panic!("`safe::OPEN`: {}", e.what));
+        let table =
+            frontend.describe_static(&table).unwrap_or_else(|e| panic!("`safe::OPEN`: {}", e.what));
         let points_at_open = |it: &FrontRef<HirInstance, super::HirStatic>| match it {
             FrontRef::Function(HirInstance(Kind::Code(called, _))) => {
                 matches!(called.def, InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "open")
             }
             _ => false,
         };
-        assert!(table.refs.iter().any(points_at_open), "`safe::OPEN` points at `safe::open`: {:?}", table.refs);
-        assert_eq!(table.owner, Owner::Workspace, "`safe::OPEN`, a static of `safe`, is its crate's as `safe::open` is");
+        assert!(
+            table.refs.iter().any(points_at_open),
+            "`safe::OPEN` points at `safe::open`: {:?}",
+            table.refs
+        );
+        assert_eq!(
+            table.owner,
+            Owner::Workspace,
+            "`safe::OPEN`, a static of `safe`, is its crate's as `safe::open` is"
+        );
     });
     let (db, frontend) = held_as(fixture::db(OVER_A_PATH_CRATE).into_db(), &policy(OptLevel::O0));
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     blaze_query::db::attach(db, || {
-        let rooted = frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
+        let rooted =
+            frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
         for it in &rooted.refs {
             let FrontRef::Function(instance) = it else { continue };
-            let described = frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-            assert_eq!(described.owner, Owner::Workspace, "a build that links no image: {instance:?}");
+            let described = frontend
+                .describe(instance, &origin)
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            assert_eq!(
+                described.owner,
+                Owner::Workspace,
+                "a build that links no image: {instance:?}"
+            );
         }
     });
 }
@@ -1307,12 +1462,16 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
-            frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
+            frontend
+                .describe(instance, &origin)
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
         };
         let asm = |refs: &[FrontRef<HirInstance, super::HirStatic>]| -> Vec<HirInstance> {
             (refs.iter())
                 .filter_map(|it| match it {
-                    FrontRef::Function(instance @ HirInstance(Kind::Asm(..))) => Some(instance.clone()),
+                    FrontRef::Function(instance @ HirInstance(Kind::Asm(..))) => {
+                        Some(instance.clone())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1321,7 +1480,9 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
         assert_eq!(rooted.owner, Owner::Workspace);
         let fence = (rooted.refs.iter()).find_map(|it| match it {
             FrontRef::Function(instance @ HirInstance(Kind::Code(called, _))) => match called.def {
-                InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "fence" => {
+                InstanceDef::Fn(func)
+                    if FunctionSignature::of(db, func).name.as_str() == "fence" =>
+                {
                     Some(instance.clone())
                 }
                 _ => None,
@@ -1407,8 +1568,14 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, &HashSource::ById(ById), compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
-            .expect("what the walk lists");
+        place_requests(
+            db,
+            &HashSource::ById(ById),
+            compiled_in(db, &ours),
+            &mut placer,
+            &mut pending.wants.requests,
+        )
+        .expect("what the walk lists");
     });
     // The fixture links no `alloc`: its program has no shim.
     assert!(frontend.allocator_shim(krate).expect("the shim").is_empty());
@@ -1479,7 +1646,10 @@ unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 
 /// Whether the program of [`ALLOCATORS`] and `program` declares a global allocator, and what
 /// [`allocator::allocations_unobserved`] says of it.
 fn unobserved(program: &str) -> (bool, Result<bool, String>) {
-    let db = fixture::db(&format!("{ALLOCATORS}//- /main.rs crate:main deps:std\n{program}\nfn main() {{}}\n")).into_db();
+    let db = fixture::db(&format!(
+        "{ALLOCATORS}//- /main.rs crate:main deps:std\n{program}\nfn main() {{}}\n"
+    ))
+    .into_db();
     let krate = fixture::test_crate(&db);
     (crate::declares_global_allocator(&db, krate), allocator::allocations_unobserved(&db, krate))
 }
@@ -1511,7 +1681,8 @@ fn two_allocators_are_named_in_order_of_name() {
         let krate = fixture::test_crate(&db);
         assert_eq!(
             allocator::allocations_unobserved(&db, krate),
-            Err("two `#[global_allocator]`s in one program, in crates `aa_alloc` and `zz_alloc`".to_owned()),
+            Err("two `#[global_allocator]`s in one program, in crates `aa_alloc` and `zz_alloc`"
+                .to_owned()),
             "{first} listed first"
         );
     }
@@ -1639,7 +1810,11 @@ fn a_panic_runtime_of_another_strategy_is_refused_naming_it() {
         "an `extern crate` in a body"
     );
     assert_eq!(
-        linked_runtimes("unwind", ",panic_abort", "macro_rules! m { () => { extern crate panic_abort; } }\nm!();"),
+        linked_runtimes(
+            "unwind",
+            ",panic_abort",
+            "macro_rules! m { () => { extern crate panic_abort; } }\nm!();"
+        ),
         refused,
         "an `extern crate` a macro writes"
     );
@@ -1658,9 +1833,11 @@ fn two_panic_runtimes_named_are_refused_naming_who_named_each() {
     );
     assert_eq!(
         runtimes_of(&text),
-        Err("the program of crate `main` names two panic runtimes, `panic_custom` (named by crate \
+        Err(
+            "the program of crate `main` names two panic runtimes, `panic_custom` (named by crate \
              `mid`) and `panic_unwind` (named by crate `main`): a program links one"
-            .to_owned())
+                .to_owned()
+        )
     );
 }
 
@@ -1676,7 +1853,10 @@ fn crates_built_to_abort_link_only_into_programs_that_abort() {
     let program = |std: &str, strategy: &str, deps: &str, dep_panic: &str| {
         let runtimes = panic_runtimes(std);
         let (dep, call) = match deps.contains("dep") {
-            true => (format!("//- /dep.rs crate:dep cfg:panic={dep_panic}\npub fn f() {{}}\n"), "dep::f();"),
+            true => (
+                format!("//- /dep.rs crate:dep cfg:panic={dep_panic}\npub fn f() {{}}\n"),
+                "dep::f();",
+            ),
             false => (String::new(), ""),
         };
         format!(
@@ -1782,7 +1962,8 @@ fn a_functions_sanitizers_off_are_its_nearest_attributes() {
 #[test]
 fn what_is_unsanitized_is_in_the_shape() {
     let (db, frontend) = frontend(SANITIZED);
-    let (quiet, loud) = (frontend.root(function(&db, "quiet")), frontend.root(function(&db, "loud")));
+    let (quiet, loud) =
+        (frontend.root(function(&db, "quiet")), frontend.root(function(&db, "loud")));
     let address = sanitizing(Sanitizers::ADDRESS, 0);
     let thread = sanitizing(Sanitizers::THREAD, 0);
     assert_ne!(prepared(&frontend, &address, &quiet).0, prepared(&frontend, &address, &loud).0);
@@ -1799,7 +1980,8 @@ fn cranelift_refuses_a_sanitized_unit() {
     let refs = frontend.with(|db| refs_of(db, (&loud, false)));
     let refs: &Refs = &refs;
     for spec in [sanitizing(Sanitizers::ADDRESS, 0), sanitizing(Sanitizers::NONE, 1)] {
-        let Err(e) = Backends::default().prepare(&frontend, &unit(&spec), &spec, &loud, refs) else {
+        let Err(e) = Backends::default().prepare(&frontend, &unit(&spec), &spec, &loud, refs)
+        else {
             panic!("a sanitized Cranelift unit was built");
         };
         assert!(e.what.contains("-Zsanitizer and SanitizerCoverage"), "{e:?}");
@@ -1869,8 +2051,8 @@ fn which_units_inline_is_the_policys() {
     let generic = frontend.with(|db| called(db, &root, outer)).remove(0);
     let inlines = |policy: &Policy, instance: &HirInstance| {
         let build_time = BuildTime::default();
-        let frontend =
-            HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
+        let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time)
+            .with_policy(policy);
         frontend.with(|db| frontend.inlines(db, instance)).expect("the policy")
     };
     assert!(!inlines(&policy(OptLevel::O0), &root));
@@ -1913,21 +2095,30 @@ fn the_walk_lists_what_inlined_code_calls() {
     frontend.with(|db| {
         assert!(frontend.inlines(db, &root).expect("the policy"));
         let plain = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk");
-        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
+        let walked =
+            refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
         assert!(plain.iter().any(|it| is_call(it, f)), "{plain:?}");
         assert!(!plain.iter().any(|it| is_call(it, g)), "{plain:?}");
         assert!(walked.iter().any(|it| is_call(it, g)), "{walked:?}");
         assert_eq!(walked[..plain.len()], plain[..]);
         let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert!(built_in.iter().any(|&at| is_call(&walked[at as usize], f)), "{built_in:?}");
-        assert!(refs::built_in(db, &root, refs::Walking::plain(false)).expect("the walk").is_empty());
+        assert!(
+            refs::built_in(db, &root, refs::Walking::plain(false)).expect("the walk").is_empty()
+        );
         let krate = compiled_in(db, &root);
         let mut place = |refs: Vec<places::Ref>| {
             let mut code = built_as(db, &llvm(2), &root);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
-                .map(drop)
+            place_requests(
+                db,
+                &HashSource::ById(ById),
+                krate,
+                &mut placer,
+                &mut pending.wants.requests,
+            )
+            .map(drop)
         };
         assert!(place(plain).is_err(), "the inlined IR asks only for what the plain walk lists");
         place(walked).expect("the inlined IR asks only for what its walk lists");
@@ -1997,7 +2188,8 @@ fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
         };
         assert!(frontend.inlines(db, &root).expect("the policy"));
         let plain = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk");
-        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
+        let walked =
+            refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
         assert!(!plain.iter().any(|it| named(it, "leaf")), "{plain:?}");
         assert!(walked.iter().any(|it| named(it, "leaf")), "{walked:?}");
         let krate = compiled_in(db, &root);
@@ -2005,8 +2197,14 @@ fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
             let mut code = built_as(db, &llvm(2), &root);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
-                .map(drop)
+            place_requests(
+                db,
+                &HashSource::ById(ById),
+                krate,
+                &mut placer,
+                &mut pending.wants.requests,
+            )
+            .map(drop)
         };
         assert!(place(plain).is_err(), "the unit's IR asks for `leaf`");
         place(walked).expect("the unit's IR asks only for what its walk lists");
@@ -2052,13 +2250,16 @@ fn the_walk_of_a_library_body_lists_what_its_built_in_callees_inlined_call() {
             },
             _ => false,
         };
-        let called = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk of `caller`");
-        let Some(FrontRef::Function(eq)) = called.iter().find(|it| named(it, "eq", true)).cloned() else {
+        let called =
+            refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk of `caller`");
+        let Some(FrontRef::Function(eq)) = called.iter().find(|it| named(it, "eq", true)).cloned()
+        else {
             panic!("`caller` calls core's `eq`: {called:?}")
         };
         assert!(frontend.inlines(db, &eq).expect("the policy"));
         let plain = refs::walk(db, &eq, refs::Walking::plain(false)).expect("the walk");
-        let walked = refs::walk(db, &eq, refs::Walking::plain(true)).expect("the walk for inlining");
+        let walked =
+            refs::walk(db, &eq, refs::Walking::plain(true)).expect("the walk for inlining");
         assert!(plain.iter().any(|it| named(it, "mid", false)), "{plain:?}");
         assert!(!plain.iter().any(|it| named(it, "leaf", false)), "{plain:?}");
         assert!(walked.iter().any(|it| named(it, "leaf", false)), "{walked:?}");
@@ -2068,8 +2269,14 @@ fn the_walk_of_a_library_body_lists_what_its_built_in_callees_inlined_call() {
             let mut code = built_as(db, &llvm(2), &eq);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
-                .map(drop)
+            place_requests(
+                db,
+                &HashSource::ById(ById),
+                krate,
+                &mut placer,
+                &mut pending.wants.requests,
+            )
+            .map(drop)
         };
         assert!(place(plain).is_err(), "the unit's IR asks for `leaf`");
         place(walked).expect("the unit's IR asks only for what its walk lists");
@@ -2124,9 +2331,8 @@ fn inlined_statements_are_written_in_their_callees() {
     let (db, _) = frontend(TWICE);
     let [owner, leaf, mid] =
         ["caller", "leaf", "mid"].map(|it| DefWithBodyId::from(function(db, it)));
-    let expr = |index| {
-        MirSpan::ExprId(hir_def::hir::ExprId::from_raw(la_arena::RawIdx::from_u32(index)))
-    };
+    let expr =
+        |index| MirSpan::ExprId(hir_def::hir::ExprId::from_raw(la_arena::RawIdx::from_u32(index)));
     // `mid` is inlined at 1, and `leaf` into it at its 2.
     let scopes = [
         InlinedScope { callee: 0, call_site: expr(1) },
@@ -2278,26 +2484,45 @@ pub fn bounded<T: P>(at: &T) -> usize {
         .collect();
     let p = p.expect("the trait `P`");
     let [s, inherits] = structs[..] else { panic!("the structs `S` and `Inherits`: {structs:?}") };
-    let method = |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
+    let method =
+        |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
     let (distance, twice) = (method("distance"), method("twice"));
     let (concrete, bounded) = (function(db, "concrete"), function(db, "bounded"));
     blaze_query::db::attach(db, || {
         let interner = DbInterner::new_with(db, krate);
-        let env = |def: FunctionId| ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate };
+        let env = |def: FunctionId| ParamEnvAndCrate {
+            param_env: db.trait_environment(def.into()),
+            krate,
+        };
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
-        let why = crate::impl_method(db, env(concrete), distance, GenericArgs::new_from_slice(&[s.into()]))
-            .expect_err("no impl of `P` is for `S`");
+        let why = crate::impl_method(
+            db,
+            env(concrete),
+            distance,
+            GenericArgs::new_from_slice(&[s.into()]),
+        )
+        .expect_err("no impl of `P` is for `S`");
         assert!(why.starts_with("trait P method distance for [S"), "{why}");
         assert!(why.ends_with(": no impl holds"), "{why}");
 
         let param = GenericArgs::identity_for_item(interner, bounded.into()).type_at(0);
-        let (found, _) = crate::impl_method(db, env(bounded), distance, GenericArgs::new_from_slice(&[param.into()]))
-            .expect("a where clause proves `T: P`");
+        let (found, _) = crate::impl_method(
+            db,
+            env(bounded),
+            distance,
+            GenericArgs::new_from_slice(&[param.into()]),
+        )
+        .expect("a where clause proves `T: P`");
         assert_eq!(found, either::Either::Left(distance));
 
         let inherits = Ty::new_adt(interner, AdtId::StructId(inherits), GenericArgs::empty());
-        let (found, _) = crate::impl_method(db, env(concrete), twice, GenericArgs::new_from_slice(&[inherits.into()]))
-            .expect("`Inherits` inherits `P::twice`");
+        let (found, _) = crate::impl_method(
+            db,
+            env(concrete),
+            twice,
+            GenericArgs::new_from_slice(&[inherits.into()]),
+        )
+        .expect("`Inherits` inherits `P::twice`");
         assert_eq!(found, either::Either::Left(twice));
     });
 }
@@ -2328,8 +2553,14 @@ pub fn roots(x: u32) {
         let key = |instance: &HirInstance| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
-            UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key()
+            let choice =
+                policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            UnitInstance {
+                code: described.code,
+                args: described.args,
+                settings: choice.first.settings(),
+            }
+            .key()
         };
         let glues: Vec<HirInstance> = frontend.with(|hir| {
             refs::walk(hir, &root, refs::Walking::plain(false))
@@ -2392,13 +2623,21 @@ pub fn roots(a: A, b: B) {
         let key = |instance: &HirInstance| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
-            let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+            let choice =
+                policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            let key = UnitInstance {
+                code: described.code,
+                args: described.args,
+                settings: choice.first.settings(),
+            }
+            .key();
             (key, described.code)
         };
         // What the key held in the arguments' place before the placement was mixed in.
         let shared = |instance: &HirInstance| {
-            frontend.with(|hir| frontend.shared_args(hir, &instance.0, &origin)).unwrap_or_else(|e| panic!("{instance:?}: {e}"))
+            frontend
+                .with(|hir| frontend.shared_args(hir, &instance.0, &origin))
+                .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
         };
         let of = |name| {
             let func = function(db, name);
@@ -2485,9 +2724,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
         for (name, of) in cases {
             let root = frontend.root(function(db, name));
             let (vtable, pointers) = frontend.with(|db| {
-                let super::Built::Ir(pending) = built_as(db, &spec(), &root) else {
-                    panic!("asm")
-                };
+                let super::Built::Ir(pending) = built_as(db, &spec(), &root) else { panic!("asm") };
                 let datas = &pending.wants.requests.datas;
                 let vtable = datas.iter().position(|it| {
                     let DataRequest::Vtable { ty, .. } = it else { return false };
@@ -3088,12 +3325,19 @@ fn interleaved_units_keep_their_own_frame_pointers() {
         Spec { toolchain, backend: Backend::Llvm { opt: 1 }, mir_inline: false, ..base }
     };
     let (keeps, omits) = (with(true), with(false));
-    assert_ne!(unit(&keeps).instance.key(), unit(&omits).instance.key(), "the setting is in the unit's key");
+    assert_ne!(
+        unit(&keeps).instance.key(),
+        unit(&omits).instance.key(),
+        "the setting is in the unit's key"
+    );
     let refs: Vec<blaze_codegen::Target> = frontend.with(|db| refs_of(db, (&root, false)));
     let backends = Backends::default();
     let prepare = |spec: &Spec| {
         super::toolchain::select(&spec.toolchain).expect("the toolchain");
-        backends.prepare(&frontend, &unit(spec), spec, &root, &refs).unwrap_or_else(|e| panic!("prepared: {e:?}")).1
+        backends
+            .prepare(&frontend, &unit(spec), spec, &root, &refs)
+            .unwrap_or_else(|e| panic!("prepared: {e:?}"))
+            .1
     };
     let emit = |spec: &Spec, prepared| {
         let emitted = backends.emit(&unit(spec), spec, prepared, &refs, None);
@@ -3104,13 +3348,24 @@ fn interleaved_units_keep_their_own_frame_pointers() {
     // `push rbp; mov rbp, rsp`
     let frame = [0x55, 0x48, 0x89, 0xe5];
     assert!(alone_keeps.starts_with(&frame), "kept frame pointers set up rbp: {alone_keeps:02x?}");
-    assert!(!alone_omits.starts_with(&frame), "omitted frame pointers set up none: {alone_omits:02x?}");
+    assert!(
+        !alone_omits.starts_with(&frame),
+        "omitted frame pointers set up none: {alone_omits:02x?}"
+    );
     // Each order: the second toolchain is selected after the first unit's check, before its emit.
     let (first, second) = (prepare(&keeps), prepare(&omits));
-    assert_eq!(emit(&keeps, first), alone_keeps, "the unit keeping frame pointers, emitted after the other's select");
+    assert_eq!(
+        emit(&keeps, first),
+        alone_keeps,
+        "the unit keeping frame pointers, emitted after the other's select"
+    );
     assert_eq!(emit(&omits, second), alone_omits, "the unit omitting frame pointers");
     let (first, second) = (prepare(&omits), prepare(&keeps));
-    assert_eq!(emit(&omits, first), alone_omits, "the unit omitting frame pointers, emitted after the other's select");
+    assert_eq!(
+        emit(&omits, first),
+        alone_omits,
+        "the unit omitting frame pointers, emitted after the other's select"
+    );
     assert_eq!(emit(&keeps, second), alone_keeps, "the unit keeping frame pointers");
 }
 
@@ -3139,8 +3394,9 @@ fn fuel_meters_a_loop_at(spec: &Spec) {
     let backends = Backends::default();
     let emit = |spec: &Spec| {
         super::toolchain::select(&spec.toolchain).expect("the toolchain");
-        let (shape, prepared) =
-            backends.prepare(&frontend, &unit(spec), spec, &root, &refs).unwrap_or_else(|e| panic!("prepared: {e:?}"));
+        let (shape, prepared) = backends
+            .prepare(&frontend, &unit(spec), spec, &root, &refs)
+            .unwrap_or_else(|e| panic!("prepared: {e:?}"));
         let emitted = backends.emit(&unit(spec), spec, prepared, &refs, None);
         (shape, emitted.unwrap_or_else(|e| panic!("emitted: {e:?}")))
     };
@@ -3151,7 +3407,9 @@ fn fuel_meters_a_loop_at(spec: &Spec) {
             .targets()
             .iter()
             .filter_map(|it| match it {
-                blaze_codegen::Target::Extern(name) if name.starts_with("__blaze_fuel_") => Some(name.clone()),
+                blaze_codegen::Target::Extern(name) if name.starts_with("__blaze_fuel_") => {
+                    Some(name.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -3228,7 +3486,8 @@ fn an_allocation_two_walks_find_in_different_orders_is_one_object() {
     let word = crate::Target::for_host().word() as u32;
     let words = relocated_words(&datas);
     assert!(
-        points_at_vtable(&datas, &words, word, "G") && points_at_vtable(&datas, &words, 3 * word, "F"),
+        points_at_vtable(&datas, &words, word, "G")
+            && points_at_vtable(&datas, &words, 3 * word, "F"),
         "`Reordered`'s vtables are not relocated: {}",
         all_described(&datas)
     );
@@ -3477,12 +3736,20 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
         all_crates(db)
             .iter()
             .copied()
-            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .find(|it| {
+                it.extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == name)
+            })
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let (k, dep, main) = (named("k"), named("dep"), named("main"));
     blaze_query::db::attach(db, || {
-        assert!(!loaded_crates(db, k).contains(&dep), "the fixture's premise: `k` names `dep` only through a macro");
+        assert!(
+            !loaded_crates(db, k).contains(&dep),
+            "the fixture's premise: `k` names `dep` only through a macro"
+        );
         assert!(loaded_crates(db, main).contains(&dep));
     });
     let root = frontend.root(hir_def::test_items::function(db, main, "roots"));
@@ -3496,7 +3763,9 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             .iter()
             .filter_map(|it| match it {
                 FrontRef::Function(HirInstance(Kind::Code(callee, _))) => match callee.def {
-                    InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "go" => {
+                    InstanceDef::Fn(func)
+                        if FunctionSignature::of(db, func).name.as_str() == "go" =>
+                    {
                         Some(func.krate(db))
                     }
                     _ => None,
@@ -3505,7 +3774,12 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             })
             .collect()
     });
-    assert_eq!(go, [dep], "`k::run` compiled in {:?} (`k` is {k:?}, `main` {main:?}) calls `go` of {go:?}", env.krate);
+    assert_eq!(
+        go,
+        [dep],
+        "`k::run` compiled in {:?} (`k` is {k:?}, `main` {main:?}) calls `go` of {go:?}",
+        env.krate
+    );
 }
 
 /// `generic::<u8>`, which `main` asks for and every unit may (walked for inlining, as an
@@ -3541,28 +3815,46 @@ fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
     use base_db::{Crate, all_crates};
     use blaze_codegen::backend::Frontend as _;
     let program = |leaf: u32| {
-        let db: &'static TestDB = Box::leak(Box::new(fixture::db(&built_in_inlined(leaf)).into_db()));
+        let db: &'static TestDB =
+            Box::leak(Box::new(fixture::db(&built_in_inlined(leaf)).into_db()));
         let dep = (all_crates(db).iter().copied())
-            .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "dep"))
+            .find(|it: &Crate| {
+                it.extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == "dep")
+            })
             .expect("the crate `dep`");
         let mut policy = policy(OptLevel::O3);
-        policy.profile.packages.insert("dep".to_owned(), Override { opt_level: Some(OptLevel::O0), ..Override::default() });
+        policy.profile.packages.insert(
+            "dep".to_owned(),
+            Override { opt_level: Some(OptLevel::O0), ..Override::default() },
+        );
         let hashes = super::ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
-        let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
-            .with_policy(&policy);
+        let frontend =
+            HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
+                .with_policy(&policy);
         let root = frontend.root(function(db, "roots"));
-        let (generic, always) =
-            (hir_def::test_items::function(db, dep, "generic"), hir_def::test_items::function(db, dep, "always"));
+        let (generic, always) = (
+            hir_def::test_items::function(db, dep, "generic"),
+            hir_def::test_items::function(db, dep, "always"),
+        );
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
         blaze_query::db::attach(db, || {
-            let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else { panic!("one `generic::<u8>`") };
-            let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+            let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else {
+                panic!("one `generic::<u8>`")
+            };
+            let described = |it: &HirInstance| {
+                frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
+            };
             // What the driver closes the key over: each body built in, by its own description.
             let (mut kept, mut queue, mut seen) = (Vec::new(), vec![caller.clone()], Vec::new());
             while let Some(at) = queue.pop() {
                 let it = described(&at);
                 for &place in &it.built_in {
-                    let FrontRef::Function(callee) = &it.refs[place as usize] else { panic!("{:?}", it.refs[place as usize]) };
+                    let FrontRef::Function(callee) = &it.refs[place as usize] else {
+                        panic!("{:?}", it.refs[place as usize])
+                    };
                     if !seen.contains(callee) {
                         seen.push(callee.clone());
                         kept.push(described(callee).code);
@@ -3572,12 +3864,18 @@ fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
             }
             kept.sort_unstable();
             assert!(
-                seen.iter().any(|it| matches!(&it.0, Kind::Code(it, _) if it.def == InstanceDef::Fn(always))),
+                seen.iter().any(
+                    |it| matches!(&it.0, Kind::Code(it, _) if it.def == InstanceDef::Fn(always))
+                ),
                 "the premise: `always` is built in: {seen:?}"
             );
             let walking = frontend.with(|hir| frontend.walking(hir, caller)).expect("the policy");
-            assert!(walking.inlined, "the premise: a generic is walked for inlining where any unit inlines");
-            let inlined = frontend.with(|hir| inlined_by_build(hir, &frontend.hashes, caller, o3()));
+            assert!(
+                walking.inlined,
+                "the premise: a generic is walked for inlining where any unit inlines"
+            );
+            let inlined =
+                frontend.with(|hir| inlined_by_build(hir, &frontend.hashes, caller, o3()));
             (kept, inlined)
         })
     };
@@ -3618,17 +3916,24 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
     let (db, frontend) = held_as(fixture::db(DYN_FN_BUILT_IN).into_db(), &policy(OptLevel::O3));
     let main = fixture::test_crate(db);
     let dep = (all_crates(db).iter().copied())
-        .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "dep"))
+        .find(|it: &Crate| {
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "dep")
+        })
         .expect("the crate `dep`");
     let resize = hir_def::test_items::function(db, dep, "resize");
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
     blaze_query::db::attach(db, || {
-        let described =
-            |it: &HirInstance, by: &Origin| frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+        let described = |it: &HirInstance, by: &Origin| {
+            frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
+        };
         // The driver's first walk of the program: everything it reaches, then its dyn facts.
         frontend.devirt.makes(super::RootKind::Executable, main);
-        let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) = (Vec::new(), vec![(root.clone(), origin)]);
+        let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) =
+            (Vec::new(), vec![(root.clone(), origin)]);
         while let Some((at, by)) = queue.pop() {
             if reached.iter().any(|(it, _)| *it == at) {
                 continue;
@@ -3642,16 +3947,26 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
             reached.push((at, by));
         }
         frontend.reached(&reached, &[]);
-        assert!(frontend.closed().expect("the program's dyn facts"), "the premise: the program has a world");
-        let [callee] = &frontend.with(|hir| called(hir, &root, resize))[..] else { panic!("one `resize::<K>`") };
+        assert!(
+            frontend.closed().expect("the program's dyn facts"),
+            "the premise: the program has a world"
+        );
+        let [callee] = &frontend.with(|hir| called(hir, &root, resize))[..] else {
+            panic!("one `resize::<K>`")
+        };
         let node = described(callee, &origin);
-        assert_ne!(node.code, node.built_in_code, "the premise: `resize::<K>`'s own code read the program's dyn facts");
+        assert_ne!(
+            node.code, node.built_in_code,
+            "the premise: `resize::<K>`'s own code read the program's dyn facts"
+        );
         // What the driver closes the key over: each body built in, by its own description.
         let (mut kept, mut queue, mut seen) = (Vec::new(), vec![root.clone()], Vec::new());
         while let Some(at) = queue.pop() {
             let it = described(&at, &origin);
             for &place in &it.built_in {
-                let FrontRef::Function(built_in) = &it.refs[place as usize] else { panic!("{:?}", it.refs[place as usize]) };
+                let FrontRef::Function(built_in) = &it.refs[place as usize] else {
+                    panic!("{:?}", it.refs[place as usize])
+                };
                 if !seen.contains(built_in) {
                     seen.push(built_in.clone());
                     kept.extend(described(built_in, &origin).held_codes());
@@ -3663,7 +3978,10 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
         let walking = frontend.with(|hir| frontend.walking(hir, &root)).expect("the policy");
         let build = Build { world: walking.world, ..o3() };
         let inlined = frontend.with(|hir| inlined_by_build(hir, &frontend.hashes, &root, build));
-        assert!(inlined.contains(&node.built_in_code), "the premise: `resize::<K>` is built in as itself: {inlined:?}");
+        assert!(
+            inlined.contains(&node.built_in_code),
+            "the premise: `resize::<K>` is built in as itself: {inlined:?}"
+        );
         let unkept: Vec<_> = inlined.iter().filter(|it| !kept.contains(it)).collect();
         assert!(unkept.is_empty(), "built in, not in the key: {unkept:?} (the key holds {kept:?})");
     });
@@ -3722,8 +4040,14 @@ fn a_walk_lists_what_a_unit_without_debug_assertions_inlines() {
             .unwrap_or_else(|e| panic!("{root:?}: {e}"));
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
-            .expect("the release unit's IR asks only for what the walk lists");
+        place_requests(
+            db,
+            &HashSource::ById(ById),
+            compiled_in(db, &root),
+            &mut placer,
+            &mut pending.wants.requests,
+        )
+        .expect("the release unit's IR asks only for what the walk lists");
     });
 }
 
@@ -3764,8 +4088,10 @@ fn a_copy_built_in_is_built_under_one_rule() {
 fn downstream_debug(derived: bool) -> String {
     let d = match derived {
         true => "#[derive(Debug)]\npub struct D;\n",
-        false => "pub struct D;\nimpl core::fmt::Debug for D {\n    \
-                  fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }\n}\n",
+        false => {
+            "pub struct D;\nimpl core::fmt::Debug for D {\n    \
+                  fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }\n}\n"
+        }
     };
     format!(
         r#"
@@ -3794,17 +4120,27 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
         hir_def::nameres::set_expand_builtin_derives(&mut db, true);
         let db: &'static TestDB = Box::leak(Box::new(db));
         let lib = (all_crates(db).iter().copied())
-            .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "lib"))
+            .find(|it: &Crate| {
+                it.extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == "lib")
+            })
             .expect("the crate `lib`");
         let hashes = super::ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
-        let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
-            .with_policy(&policy(OptLevel::O0));
+        let frontend =
+            HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
+                .with_policy(&policy(OptLevel::O0));
         let root = frontend.root(function(db, "roots"));
         let g = hir_def::test_items::function(db, lib, "g");
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
         blaze_query::db::attach(db, || {
-            let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else { panic!("one `g::<D>`") };
-            let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+            let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else {
+                panic!("one `g::<D>`")
+            };
+            let described = |it: &HirInstance| {
+                frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
+            };
             let it = described(instance);
             // Each ref as the driver gives it to `exec::bound`: a function by a key of its
             // place, which binds to its item. A static or a symbol is the same in both.
@@ -3812,7 +4148,8 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
             let targets: Vec<Target> = (it.refs.iter().enumerate())
                 .map(|(at, front)| match front {
                     FrontRef::Function(callee) => {
-                        let key = InstanceKey(ContentId::of("test ref", &(at as u64).to_le_bytes()));
+                        let key =
+                            InstanceKey(ContentId::of("test ref", &(at as u64).to_le_bytes()));
                         items.push((key, described(callee).item));
                         Target::Function(key)
                     }
@@ -3824,8 +4161,11 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
             (it.bound, targets, items)
         })
     };
-    let exec = |own: &Result<ContentId, String>, targets: &[Target], items: &[(InstanceKey, ItemKey)]| {
-        let item_of = |key: &InstanceKey| items.iter().find(|(it, _)| it == key).map(|(_, item)| *item);
+    let exec = |own: &Result<ContentId, String>,
+                targets: &[Target],
+                items: &[(InstanceKey, ItemKey)]| {
+        let item_of =
+            |key: &InstanceKey| items.iter().find(|(it, _)| it == key).map(|(_, item)| *item);
         blaze_codegen::exec::bound(own, targets, item_of).unwrap_or_else(|e| panic!("g::<D>: {e}"))
     };
     let (derived_own, derived_refs, derived_items) = program(true);
@@ -3884,8 +4224,9 @@ fn a_wasm32_pair_is_returned_as_llvm_returns_it_whatever_blaze_was_built_with() 
             !signature.params.iter().any(|it| it.purpose == ArgumentPurpose::StructReturn),
             "{name}: the IR returns the pair through a pointer of its own: {signature}"
         );
-        let (lowered, _) = crate::wasm::lower(pending.func(), crate::Calls::Direct, Address::of(target))
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (lowered, _) =
+            crate::wasm::lower(pending.func(), crate::Calls::Direct, Address::of(target))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         let llvms = WasmSignature { params: vec![WasmType::I32, WasmType::I32], results: vec![] };
         assert_eq!(lowered.signature, llvms, "{name}: the wasm signature LLVM gives");
     }

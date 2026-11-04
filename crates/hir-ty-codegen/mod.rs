@@ -20,7 +20,6 @@ use frame_map::{FrameHashMap, FrameHashSet, FrameMap};
 use std::cell::Cell;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::{
     ir::{
@@ -61,6 +60,7 @@ use rustc_type_ir::UintTy;
 use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
+use std::alloc::Global;
 use syntax::{TextRange, TextSize};
 use triomphe::Arc;
 
@@ -146,9 +146,9 @@ mod neon;
 mod overlap;
 mod places;
 use self::places::{row_location, source_location};
-mod promote;
 #[allow(unsafe_code)]
 mod lent;
+mod promote;
 use lent::Lent;
 mod spare;
 pub(crate) use spare::with_context;
@@ -182,7 +182,10 @@ pub enum CodegenError {
     Refused(String),
     /// Cranelift's verifier refused the IR blaze made of the function ([`verified`]): a bug
     /// of blaze's IR builder (`stage` "built") or of the passes after it ("settled").
-    InvalidIr { stage: &'static str, errors: String },
+    InvalidIr {
+        stage: &'static str,
+        errors: String,
+    },
 }
 
 impl fmt::Display for CodegenError {
@@ -708,9 +711,9 @@ impl blaze_query::db::NamesIds for InstanceDef {
     fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
         match *self {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => out.push(func.as_id()),
-            InstanceDef::Closure(id) | InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-                out.push(id)
-            }
+            InstanceDef::Closure(id)
+            | InstanceDef::Coroutine(id)
+            | InstanceDef::CoroutineByMove(id) => out.push(id),
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim
@@ -739,7 +742,9 @@ impl Instance {
             InstanceDef::Fn(_)
             | InstanceDef::Closure(_)
             | InstanceDef::Coroutine(_)
-            | InstanceDef::CoroutineByMove(_) => hir_ty_mir::mir::home::is_generic(self.args.as_ref()),
+            | InstanceDef::CoroutineByMove(_) => {
+                hir_ty_mir::mir::home::is_generic(self.args.as_ref())
+            }
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::VtableShim(_)
@@ -784,7 +789,9 @@ impl Instance {
     fn home_env(&self, db: &Db, asked: &StoredParamEnvAndCrate) -> StoredParamEnvAndCrate {
         let code = match self.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
-            InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db).owner.krate(db)),
+            InstanceDef::Closure(id) => {
+                Some(InternedClosureId::from_id(id).loc(db).owner.krate(db))
+            }
             InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
                 Some(InternedCoroutineId::from_id(id).loc(db).owner.krate(db))
             }
@@ -834,7 +841,10 @@ pub(crate) fn isa_for(target: &'static Target) -> Result<&'static isa::OwnedTarg
 }
 
 /// [`isa_for`] with `features`: what a function of that set is compiled with.
-pub(crate) fn target_with(target: &'static Target, features: Features) -> Result<&'static isa::OwnedTargetIsa> {
+pub(crate) fn target_with(
+    target: &'static Target,
+    features: Features,
+) -> Result<&'static isa::OwnedTargetIsa> {
     target_of(target, features, Isa::Usual, false)
 }
 
@@ -845,7 +855,9 @@ pub(crate) fn target_of_crate(db: &Db, krate: Crate) -> Result<&'static Target> 
     match &krate.workspace_data(db).target {
         Ok(data) => Target::of(data.tuple.as_str()).map_err(CodegenError::Backend),
         // alloc: error path
-        Err(error) => Err(CodegenError::Backend(format!("the crate's target did not load: {error}"))),
+        Err(error) => {
+            Err(CodegenError::Backend(format!("the crate's target did not load: {error}")))
+        }
     }
 }
 
@@ -868,7 +880,10 @@ enum Isa {
 /// made once, the first time it is asked for: a few per process, one per set a function is
 /// compiled with (the toolchains' and the `#[target_feature]` sets over them), for each target
 /// a unit names: a set's number is the process's, and the baseline's is every target's.
-#[expect(clippy::disallowed_types, reason = "the process's ISAs, each made once for a target, feature set, kind and speed and shared by every unit")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's ISAs, each made once for a target, feature set, kind and speed and shared by every unit"
+)]
 fn target_of(
     target: &'static Target,
     features: Features,
@@ -876,9 +891,10 @@ fn target_of(
     speed: bool,
 ) -> Result<&'static isa::OwnedTargetIsa> {
     type Made = std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>>;
-    static TARGETS: [[[[Made; 3]; 2]; target::MOST_FEATURE_SETS]; target::MOST_TARGETS] =
-        [const { [const { [const { [const { Made::new() }; 3] }; 2] }; target::MOST_FEATURE_SETS] };
-            target::MOST_TARGETS];
+    static TARGETS: [[[[Made; 3]; 2]; target::MOST_FEATURE_SETS]; target::MOST_TARGETS] = [const {
+        [const { [const { [const { Made::new() }; 3] }; 2] }; target::MOST_FEATURE_SETS]
+    };
+        target::MOST_TARGETS];
     let (regalloc, frame_pointers) = match kind {
         Isa::Usual => (regalloc(), false),
         Isa::Large => ("single_pass", false),
@@ -970,11 +986,7 @@ fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
-fn instance_rows(
-    db: &Db,
-    instance: Instance,
-    env: StoredParamEnvAndCrate,
-) -> Vec<Row> {
+fn instance_rows(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> Vec<Row> {
     compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
@@ -1023,9 +1035,7 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
         _ => None,
     };
     let name = match instance.def {
-        InstanceDef::Fn(func) => {
-            hir_ty_print::rustc_function_name(db, func, args.as_slice())
-        }
+        InstanceDef::Fn(func) => hir_ty_print::rustc_function_name(db, func, args.as_slice()),
         InstanceDef::Closure(id) => {
             let at = InternedClosureId::from_id(id).loc(db);
             of_closure(at.owner, at.expr)
@@ -1159,7 +1169,9 @@ fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Gl
                 PanicStrategy::Unwind => "panic_unwind",
                 PanicStrategy::Abort => "panic_abort",
             };
-            let Some(&runtime) = offered.iter().find(|&&it| it.rust_name(db).is_ok_and(|it| it.as_str() == wanted)) else {
+            let Some(&runtime) =
+                offered.iter().find(|&&it| it.rust_name(db).is_ok_and(|it| it.as_str() == wanted))
+            else {
                 let mut names: Vec<String> = offered.iter().map(|&it| name(it)).collect();
                 names.sort_unstable();
                 // alloc: the error's message
@@ -1224,7 +1236,10 @@ fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Gl
         if required && built != strategy {
             refused.push(name(it));
             found = Some(built);
-        } else if strategy == PanicStrategy::Abort && built == PanicStrategy::Unwind && !it.data(db).origin.is_lang() {
+        } else if strategy == PanicStrategy::Abort
+            && built == PanicStrategy::Unwind
+            && !it.data(db).origin.is_lang()
+        {
             unchecked.push(name(it));
         }
     }
@@ -1282,7 +1297,9 @@ impl fmt::Display for PanicStrategy {
 /// sets.
 fn panic_strategy(db: &Db, krate: Crate) -> std::result::Result<PanicStrategy, String> {
     let cfg = krate.cfg_options(db);
-    let strategy = |value: intern::Symbol| cfg.check_atom(&cfg::CfgAtom::KeyValue { key: intern::sym::panic, value });
+    let strategy = |value: intern::Symbol| {
+        cfg.check_atom(&cfg::CfgAtom::KeyValue { key: intern::sym::panic, value })
+    };
     if strategy(intern::sym::abort) {
         return Ok(PanicStrategy::Abort);
     }
@@ -1774,7 +1791,11 @@ fn instance_body<'db>(
 /// coroutine's by the body it is written in), and the lowering error in words, which for a call
 /// with no function is the callee as written, where the call is and why it resolved to nothing,
 /// in the body it was met in (rule 16).
-fn mir_failed(db: &Db, owner: MirOwner<'_>, error: &hir_ty::mir::MirLowerError<'_>) -> CodegenError {
+fn mir_failed(
+    db: &Db,
+    owner: MirOwner<'_>,
+    error: &hir_ty::mir::MirLowerError<'_>,
+) -> CodegenError {
     use blaze_items::lowering;
     use std::fmt::Write as _;
     let written = owner.written_in(db);
@@ -1783,7 +1804,9 @@ fn mir_failed(db: &Db, owner: MirOwner<'_>, error: &hir_ty::mir::MirLowerError<'
     match owner {
         MirOwner::Body(_) => {}
         MirOwner::Closure(_) => what.push_str(" (a closure in it)"),
-        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => what.push_str(" (a coroutine in it)"),
+        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => {
+            what.push_str(" (a coroutine in it)")
+        }
     }
     what.push_str(" did not lower: ");
     if let hir_ty::mir::MirLowerError::MissingFunctionDefinition(met, _) = error
@@ -1839,11 +1862,7 @@ fn body_types<'db>(
 /// `{async fn body of f()} @coroutine 0,16;0,8,16`. `harness/layoutdiff.py` compares it with
 /// rustc's, which `--layouts` otherwise skips: a future both compilers make and poll has to be
 /// laid out alike to the byte.
-fn coroutine_layout_line<'db>(
-    db: &'db Db,
-    ty: Ty<'db>,
-    layout: &Layout,
-) -> Option<String> {
+fn coroutine_layout_line<'db>(db: &'db Db, ty: Ty<'db>, layout: &Layout) -> Option<String> {
     use hir_def::hir::{ClosureKind, CoroutineSource, Expr};
     let TyKind::Coroutine(id, args) = ty.kind() else { return None };
     if !args.as_coroutine().parent_args().is_empty() {
@@ -1898,14 +1917,15 @@ pub(crate) fn cold_fn(db: &Db, lang_items: &LangItems, func: FunctionId) -> bool
     if flags.contains(AttrFlags::COLD) {
         return true;
     }
-    if [lang_items.PanicImpl, lang_items.BeginPanic, lang_items.EhPersonality].contains(&Some(func)) {
+    if [lang_items.PanicImpl, lang_items.BeginPanic, lang_items.EhPersonality].contains(&Some(func))
+    {
         return true;
     }
     flags.contains(AttrFlags::TRACK_CALLER) && {
         let signature = FunctionSignature::of(db, func);
-        signature
-            .ret_type
-            .is_some_and(|ret| matches!(signature.store.type_ref(ret), hir_def::hir::type_ref::TypeRef::Never))
+        signature.ret_type.is_some_and(|ret| {
+            matches!(signature.store.type_ref(ret), hir_def::hir::type_ref::TypeRef::Never)
+        })
     }
 }
 
@@ -1924,11 +1944,7 @@ fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
 
 /// The `Fn`-trait method (`call`, `call_mut` or `call_once`) that `func` is the impl of,
 /// when it is one written for a type.
-fn implemented_fn_method(
-    db: &Db,
-    lang_items: &LangItems,
-    func: FunctionId,
-) -> Option<FunctionId> {
+fn implemented_fn_method(db: &Db, lang_items: &LangItems, func: FunctionId) -> Option<FunctionId> {
     let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
     let trait_ref = db.impl_trait(impl_)?;
     let name = &FunctionSignature::of(db, func).name;
@@ -2151,7 +2167,10 @@ pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
 /// has no body to compile, where rustc compiles what the derive expands to.
 pub(crate) fn unexpanded_derive(
     db: &Db,
-    (impl_, method): (hir_def::BuiltinDeriveImplId, hir_def::builtin_derive::BuiltinDeriveImplMethod),
+    (impl_, method): (
+        hir_def::BuiltinDeriveImplId,
+        hir_def::builtin_derive::BuiltinDeriveImplMethod,
+    ),
     self_ty: impl std::fmt::Debug,
 ) -> String {
     let derive = impl_.loc(db).trait_.name();
@@ -2199,7 +2218,9 @@ pub(crate) fn no_impl_method(
     // A type's `Debug` reads its interned parts from the attached database.
     blaze_query::db::attach(db, || match trait_ {
         // alloc: the error's message
-        Some(trait_) => format!("trait {} method {method} for {args:?}: {why}", trait_.name.as_str()),
+        Some(trait_) => {
+            format!("trait {} method {method} for {args:?}: {why}", trait_.name.as_str())
+        }
         // alloc: the error's message
         None => format!("method {method} for {args:?}: {why}"),
     })
@@ -2274,7 +2295,10 @@ pub(crate) fn wasm_import(db: &Db, func: FunctionId) -> Option<(Option<String>, 
         None => FunctionSignature::of(db, func).name.as_str(),
     };
     // alloc: the import's module and field, which it keeps
-    Some((AttrFlags::wasm_import_module(db, block).map(|it| it.as_str().to_owned()), field.to_owned()))
+    Some((
+        AttrFlags::wasm_import_module(db, block).map(|it| it.as_str().to_owned()),
+        field.to_owned(),
+    ))
 }
 
 /// The prefix the object writer puts in front of every name declared to it for `target`:
@@ -2360,11 +2384,7 @@ const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
 /// hygienic: the module binds it under a [keyed](hir_expand::name::Name::keyed) name that no
 /// path can write, as rustc's does. Each module's values are matched by the name's text,
 /// whatever its key, and the function must still export `exported`.
-fn global_allocator_export(
-    db: &Db,
-    krate: Crate,
-    exported: &str,
-) -> Option<FunctionId> {
+fn global_allocator_export(db: &Db, krate: Crate, exported: &str) -> Option<FunctionId> {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
     def_map.modules(db).find_map(|(module_id, module)| {
         module.scope(db).values().find_map(|(name, item)| {
@@ -2374,7 +2394,8 @@ fn global_allocator_export(
             }
             let exports =
                 AttrFlags::export_name(db, id.into()).is_some_and(|it| it.as_str() == exported);
-            (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports).then_some(id)
+            (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports)
+                .then_some(id)
         })
     })
 }
@@ -2554,13 +2575,20 @@ fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) 
 /// at all is [`refuse_tail_calls`]'s to say. The verifier's other rules for a tail call (the
 /// callee's convention and results match the caller's) still hold: only the error of that one
 /// rule, on such a call, is dropped.
-fn only_cranelifts_backend(func: &ir::Function, error: &cranelift_codegen::verifier::VerifierError) -> bool {
+fn only_cranelifts_backend(
+    func: &ir::Function,
+    error: &cranelift_codegen::verifier::VerifierError,
+) -> bool {
     let ir::entities::AnyEntity::Inst(inst) = error.location else { return false };
     let sig = match func.dfg.insts[inst] {
         ir::InstructionData::Call { opcode: ir::Opcode::ReturnCall, func_ref, .. } => {
             func.dfg.ext_funcs[func_ref].signature
         }
-        ir::InstructionData::CallIndirect { opcode: ir::Opcode::ReturnCallIndirect, sig_ref, .. } => sig_ref,
+        ir::InstructionData::CallIndirect {
+            opcode: ir::Opcode::ReturnCallIndirect,
+            sig_ref,
+            ..
+        } => sig_ref,
         _ => return false,
     };
     let convention = func.dfg.signatures[sig].call_conv;
@@ -2710,8 +2738,7 @@ fn described<'db>(
 /// before, for whichever the program has, and whatever of theirs is compiled again is in the
 /// program's crates.
 fn panics_abort(db: &Db, krate: Crate) -> bool {
-    let abort =
-        cfg::CfgAtom::KeyValue { key: intern::sym::panic, value: intern::sym::abort };
+    let abort = cfg::CfgAtom::KeyValue { key: intern::sym::panic, value: intern::sym::abort };
     !krate.data(db).origin.is_lang() && krate.cfg_options(db).check_atom(&abort)
 }
 
@@ -3000,9 +3027,7 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
         // body's, and gives them no source location: an `offset`'s mark goes by that order,
         // where every instruction is the one it is made from (a return becomes a jump).
         order.clear();
-        order.extend(
-            dfs.pre_order_iter(body).flat_map(|block| body.layout.block_insts(block)),
-        );
+        order.extend(dfs.pre_order_iter(body).flat_map(|block| body.layout.block_insts(block)));
         let made = |at: usize| ir::Inst::from_u32((put.insts + at) as u32);
         let in_order = order.len() <= end - put.insts
             && order.iter().enumerate().all(|(at, &it)| {
@@ -3040,7 +3065,15 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
 /// (`Backend::emit`, and the shims it defines), and what the tests compile a function with.
 fn emit(ctx: &mut cranelift_codegen::Context, target: &'static Target) -> Result<Code> {
     // alloc: none until the code's rows are written, then exactly that many: the caller keeps them
-    emit_with(ctx, target, false, Features::BASELINE, backend::V1_FRAME_POINTERS, Relocs::default(), Vec::new())
+    emit_with(
+        ctx,
+        target,
+        false,
+        Features::BASELINE,
+        backend::V1_FRAME_POINTERS,
+        Relocs::default(),
+        Vec::new(),
+    )
 }
 
 /// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`), at
@@ -3220,7 +3253,8 @@ fn emit_wasm(
     calls: Calls,
     address: wasm::Address,
 ) -> Result<Code> {
-    let (function, mut relocs) = wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
+    let (function, mut relocs) =
+        wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
     let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
     for reloc in &mut relocs {
         reloc.offset += body;
@@ -3331,7 +3365,9 @@ impl<'db> Relocations<'_, 'db> {
     fn align_of(&self, start: usize) -> Option<u64> {
         match self.map {
             MemoryMap::Simple(_) => Some(1),
-            MemoryMap::Empty | MemoryMap::Complex(_) => self.map.align_at(start).map(|align| align as u64),
+            MemoryMap::Empty | MemoryMap::Complex(_) => {
+                self.map.align_at(start).map(|align| align as u64)
+            }
         }
     }
 
@@ -3377,9 +3413,7 @@ impl<'db> Relocations<'_, 'db> {
 
     /// The union the byte at `at` of the memory at `kept` is in, if a walk went through one.
     fn union_at(&self, kept: Option<usize>, at: usize) -> Option<Ty<'db>> {
-        (self.unions.iter())
-            .find(|it| it.0 == kept && it.1 <= at && at < it.2)
-            .map(|it| it.3)
+        (self.unions.iter()).find(|it| it.0 == kept && it.1 <= at && at < it.2).map(|it| it.3)
     }
 }
 
@@ -3873,17 +3907,27 @@ impl ConstOf<'_> {
             }
             ConstOf::Promoted(promoted) => blaze_query::db::attach(db, || {
                 // alloc: an error's text
-                format!("the promoted constant {:?} of {}", promoted.expr, body_path(db, promoted.owner))
+                format!(
+                    "the promoted constant {:?} of {}",
+                    promoted.expr,
+                    body_path(db, promoted.owner)
+                )
             }),
             // alloc: an error's text
-            ConstOf::InPlace(Some(owner)) => format!("a constant value in {}", body_path(db, owner)),
+            ConstOf::InPlace(Some(owner)) => {
+                format!("a constant value in {}", body_path(db, owner))
+            }
             ConstOf::InPlace(None) => "a constant value of no body".to_owned(), // alloc: an error's text
         }
     }
 }
 
 /// The error of a promoted constant whose MIR does not build, naming it and the body it is of.
-pub(crate) fn no_promoted_mir(db: &Db, promoted: Promoted<'_>, error: impl std::fmt::Debug) -> CodegenError {
+pub(crate) fn no_promoted_mir(
+    db: &Db,
+    promoted: Promoted<'_>,
+    error: impl std::fmt::Debug,
+) -> CodegenError {
     // alloc: the error's message
     CodegenError::Refused(blaze_query::db::attach(db, || {
         format!("{} has no MIR: {error:?}", ConstOf::Promoted(promoted).describe(db))
@@ -3945,9 +3989,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         pointee: Ty<'db>,
     ) -> Result<(Value, Option<Value>)> {
         let at = self.layout(boxed)?.fields.offset(0).bytes() as i32;
-        let meta = self
-            .is_unsized(pointee)
-            .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, addr, at + self.cg.target.meta_at()));
+        let meta = self.is_unsized(pointee).then(|| {
+            self.builder.ins().load(
+                self.cg.target.pointer(),
+                MEM,
+                addr,
+                at + self.cg.target.meta_at(),
+            )
+        });
         Ok((self.builder.ins().load(self.cg.target.pointer(), MEM, addr, at), meta))
     }
 
@@ -4001,7 +4050,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let meta = match meta {
             Some(meta) if self.is_unsized(ty) => meta,
             _ => {
-                let size = self.builder.ins().iconst(self.cg.target.pointer(), layout.size.bytes() as i64);
+                let size =
+                    self.builder.ins().iconst(self.cg.target.pointer(), layout.size.bytes() as i64);
                 return Ok((size, self.builder.ins().iconst(self.cg.target.pointer(), align)));
             }
         };
@@ -4010,12 +4060,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Slice(elem) => {
                 let elem = self.layout(elem)?;
                 let size = self.builder.ins().imul_imm(meta, elem.size.bytes() as i64);
-                Ok((size, self.builder.ins().iconst(self.cg.target.pointer(), elem.align.abi.bytes() as i64)))
+                Ok((
+                    size,
+                    self.builder
+                        .ins()
+                        .iconst(self.cg.target.pointer(), elem.align.abi.bytes() as i64),
+                ))
             }
             // Size and align are the vtable's second and third words.
             TyKind::Dynamic(..) => Ok((
-                self.builder.ins().load(self.cg.target.pointer(), MEM, meta, self.cg.target.meta_at()),
-                self.builder.ins().load(self.cg.target.pointer(), MEM, meta, 2 * self.cg.target.meta_at()),
+                self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    meta,
+                    self.cg.target.meta_at(),
+                ),
+                self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    meta,
+                    2 * self.cg.target.meta_at(),
+                ),
             )),
             _ => {
                 let (field, field_ty) = self.last_field(ty)?;
@@ -4772,26 +4837,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let layout = self.layout(ty)?;
         let size = layout.size;
         let fits = |scalar: Option<Scalar>| scalar.filter(|it| it.size(self.dl()) == size);
-        let fields: smallvec::SmallVec<[Ty<'db>; 8]> = match layout.backend_repr {
-            BackendRepr::Scalar(scalar) => return Ok(fits(Some(scalar))),
-            BackendRepr::Memory { sized: true } => match ty.kind() {
-                TyKind::Tuple(tys) => smallvec::SmallVec::from_iter(tys.iter()),
-                TyKind::Array(element, _) if layout.fields.count() == 1 => {
-                    smallvec::SmallVec::from_slice(&[element])
-                }
-                TyKind::Adt(def, subst) => {
-                    let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
-                    let fields = self.cg.db.field_types(id.into());
-                    smallvec::SmallVec::from_iter(
-                        fields.iter().map(|(_, ty)| {
+        let fields: smallvec::SmallVec<[Ty<'db>; 8]> =
+            match layout.backend_repr {
+                BackendRepr::Scalar(scalar) => return Ok(fits(Some(scalar))),
+                BackendRepr::Memory { sized: true } => match ty.kind() {
+                    TyKind::Tuple(tys) => smallvec::SmallVec::from_iter(tys.iter()),
+                    TyKind::Array(element, _) if layout.fields.count() == 1 => {
+                        smallvec::SmallVec::from_slice(&[element])
+                    }
+                    TyKind::Adt(def, subst) => {
+                        let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
+                        let fields = self.cg.db.field_types(id.into());
+                        smallvec::SmallVec::from_iter(fields.iter().map(|(_, ty)| {
                             ty.ty().instantiate(self.interner, subst).skip_norm_wip()
-                        }),
-                    )
-                }
+                        }))
+                    }
+                    _ => return Ok(None),
+                },
                 _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
+            };
         let mut lone = None;
         for field in fields {
             if self.layout(field)?.is_zst() {
@@ -5013,7 +5077,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn push_abi_params(&self, mode: PassMode, params: &mut Vec<AbiParam>) {
-        let copied = |size| AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructArgument(size));
+        let copied = |size| {
+            AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructArgument(size))
+        };
         match mode {
             PassMode::Ignore => (),
             PassMode::Direct(s) => params.push(s.param()),
@@ -5025,9 +5091,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 params.extend((0..count).map(|_| AbiParam::new(unit)));
             }
             PassMode::Indirect => params.push(AbiParam::new(self.cg.target.pointer())),
-            PassMode::IndirectUnsized => {
-                params.extend([AbiParam::new(self.cg.target.pointer()), AbiParam::new(self.cg.target.pointer())])
-            }
+            PassMode::IndirectUnsized => params.extend([
+                AbiParam::new(self.cg.target.pointer()),
+                AbiParam::new(self.cg.target.pointer()),
+            ]),
             PassMode::Spread { .. } => params.push(AbiParam::new(types::F64)),
             PassMode::OnStack { size, padded } => {
                 params.extend(padded.then(|| copied(8)));
@@ -5056,9 +5123,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
         let mut sig = self.cg.make_signature();
         match ret {
-            PassMode::Indirect => {
-                sig.params.push(AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructReturn))
-            }
+            PassMode::Indirect => sig
+                .params
+                .push(AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructReturn)),
             mode => self.push_abi_params(mode, &mut sig.returns),
         }
         for &arg in args {
@@ -5136,7 +5203,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // place moved out of, whose memory nothing reads again.
             PassMode::IndirectUnsized => {
                 values.push(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0));
-                values.push(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
+                values.push(self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    addr,
+                    self.cg.target.meta_at(),
+                ));
             }
             PassMode::OnStack { padded, .. } => {
                 if padded {
@@ -5340,14 +5412,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(args) = promoted.args(body, self.args.as_ref()) else { return Ok(None) };
         // A promoted constant whose MIR does not build is an error, never left unpromoted:
         // compile identity refuses it too (`hir_ty_identity`'s sites), so the two agree.
-        let constant =
-            monomorphized_promoted_mir_body_query(db, promoted.owner, promoted.expr, args, self.env.store())
-                .map_err(|error| no_promoted_mir(db, promoted, error))?;
-        let Some(allocation) = interpret_mir(db, constant, Some(self.env)).ok().and_then(|it| it.0.ok()) else {
+        let constant = monomorphized_promoted_mir_body_query(
+            db,
+            promoted.owner,
+            promoted.expr,
+            args,
+            self.env.store(),
+        )
+        .map_err(|error| no_promoted_mir(db, promoted, error))?;
+        let Some(allocation) =
+            interpret_mir(db, constant, Some(self.env)).ok().and_then(|it| it.0.ok())
+        else {
             return Ok(None);
         };
         let ty = allocation.ty;
-        let Ok(blob) = self.allocation_blob(allocation, ConstOf::Promoted(promoted), false) else { return Ok(None) };
+        let Ok(blob) = self.allocation_blob(allocation, ConstOf::Promoted(promoted), false) else {
+            return Ok(None);
+        };
         if blob.bytes.len() != layout.size.bytes_usize()
             || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
         {
@@ -5719,7 +5800,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let upvars = args.as_coroutine().tupled_upvars_ty().tuple_fields().len();
                 let held = body.locals_held_across_yields();
                 let frame = CoroutineFrame { upvars };
-                let addr = self.builder.ins().load(self.cg.target.pointer(), MEM, self.locals[receiver].addr, 0);
+                let addr = self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    self.locals[receiver].addr,
+                    0,
+                );
                 Some((frame, self.layout(ty)?, addr, ty, held))
             }
             None => None,
@@ -5783,7 +5869,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // twice in every call's frame (bug D: two such frames overflowed CoreAudio's
             // 512 KB thread). The address is as a value of no size has it.
             if frame.is_none() && unmentioned.contains(&local) && !layout.is_unsized() {
-                let addr = self.builder.ins().iconst(self.cg.target.pointer(), layout.align.abi.bytes() as i64);
+                let addr = self
+                    .builder
+                    .ins()
+                    .iconst(self.cg.target.pointer(), layout.align.abi.bytes() as i64);
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 continue;
             }
@@ -6179,7 +6268,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut meta = None;
         if borrowed {
-            meta = Some(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
+            meta = Some(self.builder.ins().load(
+                self.cg.target.pointer(),
+                MEM,
+                addr,
+                self.cg.target.meta_at(),
+            ));
             addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
         }
         let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
@@ -6209,7 +6303,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     }
                     BackendRepr::ScalarPair { .. } if !matches!(prev.ty.kind(), TyKind::Adt(def, _) if def.is_box()) =>
                     {
-                        meta = Some(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
+                        meta = Some(self.builder.ins().load(
+                            self.cg.target.pointer(),
+                            MEM,
+                            addr,
+                            self.cg.target.meta_at(),
+                        ));
                         addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
                     }
                     BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } if matches!(prev.ty.kind(), TyKind::Adt(def, _) if def.is_box()) =>
@@ -6522,7 +6621,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && (flags.contains(StaticFlags::MUTABLE)
                 || is_thread_local(db, id)
                 || !self.is_freeze(allocation.ty));
-        Ok((self.allocation_blob(allocation, ConstOf::Item(GeneralConstId::StaticId(id)), true)?, writable))
+        Ok((
+            self.allocation_blob(allocation, ConstOf::Item(GeneralConstId::StaticId(id)), true)?,
+            writable,
+        ))
     }
 
     /// Whether `ty` is known to have no `UnsafeCell` outside of indirections.
@@ -6590,7 +6692,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => Some(pointee),
         };
         let plain = |it: Ty<'db>| {
-            hir_ty_share::is_plain_data(self.cg.db, self.interner, &self.infcx, self.env.param_env, it)
+            hir_ty_share::is_plain_data(
+                self.cg.db,
+                self.interner,
+                &self.infcx,
+                self.env.param_env,
+                it,
+            )
         };
         if !element.is_none_or(plain) {
             return Ok(None);
@@ -6637,12 +6745,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
             | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
-                let allocation = db.const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))?;
+                let allocation =
+                    db.const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))?;
                 Ok((allocation, ConstOf::Item(id.into())))
             }
             AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) } => {
-                let allocation =
-                    db.anon_const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))?;
+                let allocation = db
+                    .anon_const_eval(id, args, Some(self.env))
+                    .map_err(|e| frontend(id.into(), e))?;
                 Ok((allocation, ConstOf::Item(id.into())))
             }
             AliasConstKind::InherentSelf { .. } => {
@@ -6935,7 +7045,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let layout = self.layout(ty)?;
                 let (variant, variant_layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
                     AdtId::StructId(id) => (id.into(), Cow::Borrowed(layout)),
-                    AdtId::UnionId(id) => return self.relocate_union(blob, walk, offset, ty, id, map),
+                    AdtId::UnionId(id) => {
+                        return self.relocate_union(blob, walk, offset, ty, id, map);
+                    }
                     AdtId::EnumId(id) => {
                         let Some(bytes) =
                             blob.bytes.get(offset..offset + layout.size.bytes_usize())
@@ -7106,7 +7218,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // walk by provenance relocates; the pointee is walked as that concrete type.
         let mut erased = None;
         if let TyKind::Dynamic(..) = tail.kind() {
-            let Some(concrete) = self.vtable_word(blob, walk, offset + word, ty, Some(tail), map)?
+            let Some(concrete) =
+                self.vtable_word(blob, walk, offset + word, ty, Some(tail), map)?
             else {
                 return Ok(());
             };
@@ -7222,7 +7335,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         map: &Relocations<'_, 'db>,
     ) -> Result<Option<Ty<'db>>> {
         let id = blob.usize_at(at, self.cg.target.word());
-        let entry = id.and_then(|id| map.map.vtable_of(id)).filter(|_| map.provenance(walk.word(at)));
+        let entry =
+            id.and_then(|id| map.map.vtable_of(id)).filter(|_| map.provenance(walk.word(at)));
         let Some((concrete, of)) = entry else {
             if walk.raw {
                 return Ok(None);
@@ -7242,7 +7356,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         if let Some(dyn_ty) = dyn_ty
             && !walk.raw
-            && !hir_ty::mir::same_vtable_trait(DbInterner::new_with(self.cg.db, self.env.krate), of, dyn_ty)
+            && !hir_ty::mir::same_vtable_trait(
+                DbInterner::new_with(self.cg.db, self.env.krate),
+                of,
+                dyn_ty,
+            )
         {
             unsupported!(
                 "a `{}` in {} holds the vtable of `{}` for `{}`, where its type says \
@@ -7602,7 +7720,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if let Ok(of) = map.map.vtable_ty(id) {
                 let place = match kept {
                     Some(start) => format!("memory (at {start:#x})"), // alloc: error path
-                    None => "value".to_owned(), // alloc: error path
+                    None => "value".to_owned(),                       // alloc: error path
                 };
                 let why = match map.union_at(kept, at) {
                     // alloc: error path
@@ -8720,8 +8838,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         {
             let metas = match (l_ref, r_ref) {
                 (Some(l_ref), Some(r_ref)) if self.is_unsized(ty) => Some((
-                    self.builder.ins().load(self.cg.target.pointer(), MEM, l_ref, self.cg.target.meta_at()),
-                    self.builder.ins().load(self.cg.target.pointer(), MEM, r_ref, self.cg.target.meta_at()),
+                    self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        l_ref,
+                        self.cg.target.meta_at(),
+                    ),
+                    self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        r_ref,
+                        self.cg.target.meta_at(),
+                    ),
                 )),
                 _ => None,
             };
@@ -8749,10 +8877,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 BinOp::Ge => IntCC::UnsignedGreaterThanOrEqual,
                 _ => unsupported!("{op:?} on wide pointers"),
             };
-            let [l_ptr, r_ptr] =
-                [l_addr, r_addr].map(|it| self.builder.ins().load(self.cg.target.pointer(), MEM, it, 0));
-            let [l_meta, r_meta] =
-                [l_addr, r_addr].map(|it| self.builder.ins().load(self.cg.target.pointer(), MEM, it, self.cg.target.meta_at()));
+            let [l_ptr, r_ptr] = [l_addr, r_addr]
+                .map(|it| self.builder.ins().load(self.cg.target.pointer(), MEM, it, 0));
+            let [l_meta, r_meta] = [l_addr, r_addr].map(|it| {
+                self.builder.ins().load(self.cg.target.pointer(), MEM, it, self.cg.target.meta_at())
+            });
             let same_ptr = self.builder.ins().icmp(IntCC::Equal, l_ptr, r_ptr);
             let by_meta = self.builder.ins().icmp(cc, l_meta, r_meta);
             let by_ptr = self.builder.ins().icmp(cc, l_ptr, r_ptr);
@@ -9170,7 +9299,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let frame = self.frame;
         // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
         // order: what sorting the keys of a hash map gave.
-        let mut registers: Vec<LocalId, &Frame> = Vec::with_capacity_in(self.registers.len(), frame);
+        let mut registers: Vec<LocalId, &Frame> =
+            Vec::with_capacity_in(self.registers.len(), frame);
         registers.extend(self.registers.keys());
         let count = shareable.len() + registers.len();
         if count < 2 {
@@ -9441,7 +9571,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.store_state(addr, ty, PANICKED);
                 }
                 let slot = self.exception_slot();
-                let exception = self.builder.ins().stack_load(self.cg.target.pointer(), self.cg.target.pointer(), slot, 0);
+                let exception = self.builder.ins().stack_load(
+                    self.cg.target.pointer(),
+                    self.cg.target.pointer(),
+                    slot,
+                    0,
+                );
                 self.resume_unwinding(exception)?;
             }
             // A suspended future has been dropped: its state already says it returned.
@@ -9591,8 +9726,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if let Some(why) = tail_call_refused(db, self.cg.target, self.interner, func) {
                     unsupported!("{why}");
                 }
-                let callee = dispatch::callee(&self.infcx, self.env, func, generic_args)
-                    .map_err(|why| {
+                let callee =
+                    dispatch::callee(&self.infcx, self.env, func, generic_args).map_err(|why| {
                         CodegenError::Refused(no_impl_method(db, func, generic_args, why))
                     })?;
                 match callee {
@@ -9621,13 +9756,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         let Some(&(receiver, receiver_ty)) = values.first() else {
                             unsupported!("vtable call without a receiver");
                         };
-                        let (pointer, thin, thin_ty) =
-                            self.virtual_callee(func, generic_args.type_at(0), receiver, receiver_ty)?;
+                        let (pointer, thin, thin_ty) = self.virtual_callee(
+                            func,
+                            generic_args.type_at(0),
+                            receiver,
+                            receiver_ty,
+                        )?;
                         values[0] = (thin, thin_ty);
                         Callee::Pointer(pointer, ExternAbi::Rust, None)
                     }
                     dispatch::Callee::Derived(impl_, method) => {
-                        let derived = unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
+                        let derived =
+                            unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
                         unsupported!("a tail call (`become`) of {derived}");
                     }
                     dispatch::Callee::CloneBuiltin(_) | dispatch::Callee::FnPtr(_) => unsupported!(
@@ -9665,7 +9805,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // Where this function was handed its own: the return place, and the memory of each
         // parameter passed by reference.
         let entry = self.builder.func.layout.entry_block().expect("the entry block");
-        let incoming = smallvec::SmallVec::<[Value; 16]>::from_slice(self.builder.block_params(entry));
+        let incoming =
+            smallvec::SmallVec::<[Value; 16]>::from_slice(self.builder.block_params(entry));
         let mut at = usize::from(matches!(self.ret_mode, PassMode::Indirect));
         let mut own_memory = smallvec::SmallVec::<[Option<Value>; 8]>::new();
         let mut these = Vec::new(); // alloc: a parameter's few, reused, of a tail call only
@@ -9822,8 +9963,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = generic_args.type_at(0);
             let (src, _) = self.operand(pointer)?;
             let addr = self.builder.ins().load(self.cg.target.pointer(), MEM, src, 0);
-            let meta =
-                self.is_unsized(ty).then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
+            let meta = self.is_unsized(ty).then(|| {
+                self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    src,
+                    self.cg.target.meta_at(),
+                )
+            });
             self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
@@ -10013,7 +10160,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(slot) = self.vtable_layout(trait_ref).method(method) else {
                     unsupported!("method missing from the vtable of {dyn_ty:?}");
                 };
-                let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at());
+                let pointer = self.builder.ins().load(
+                    self.cg.target.pointer(),
+                    MEM,
+                    vtable,
+                    slot as i32 * self.cg.target.meta_at(),
+                );
                 let thin = self.scratch();
                 self.builder.ins().store(MEM, place.addr, thin, 0);
                 let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
@@ -10256,8 +10408,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("method missing from the vtable of {dyn_ty:?}");
         };
         let data = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, 0);
-        let vtable = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, self.cg.target.meta_at());
-        let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at());
+        let vtable = self.builder.ins().load(
+            self.cg.target.pointer(),
+            MEM,
+            receiver,
+            self.cg.target.meta_at(),
+        );
+        let pointer = self.builder.ins().load(
+            self.cg.target.pointer(),
+            MEM,
+            vtable,
+            slot as i32 * self.cg.target.meta_at(),
+        );
         // The method takes the data pointer alone where the caller holds a fat pointer.
         let thin = self.scratch();
         self.builder.ins().store(MEM, data, thin, 0);
@@ -10342,8 +10504,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 TyKind::RawPtr(from_pointee, _) | TyKind::Ref(_, from_pointee, _),
                 TyKind::RawPtr(to_pointee, _) | TyKind::Ref(_, to_pointee, _),
             ) => {
-                let old = (from.size.bytes() == 2 * self.cg.target.word() as u64)
-                    .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
+                let old = (from.size.bytes() == 2 * self.cg.target.word() as u64).then(|| {
+                    self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        src,
+                        self.cg.target.meta_at(),
+                    )
+                });
                 let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
                 let ptr = self.builder.ins().load(self.cg.target.pointer(), MEM, src, 0);
                 self.builder.ins().store(MEM, ptr, dst, 0);
@@ -10407,9 +10575,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 match self.vtable_layout(trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
-                    Some(Upcast::Load(slot)) => {
-                        Ok(self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at()))
-                    }
+                    Some(Upcast::Load(slot)) => Ok(self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        vtable,
+                        slot as i32 * self.cg.target.meta_at(),
+                    )),
                     None => unsupported!("upcast of {from:?} to {to:?}"),
                 }
             }
@@ -10461,7 +10632,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let slots = trait_ref.map_or_else(Vec::new, |it| self.vtable_layout(it).slots);
         // alloc: once per vtable (the key is looked up above), the vtable's bytes
         let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * self.cg.target.word()];
-        bytes[self.cg.target.word()..2 * self.cg.target.word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..self.cg.target.word()]);
+        bytes[self.cg.target.word()..2 * self.cg.target.word()]
+            .copy_from_slice(&layout.size.bytes().to_le_bytes()[..self.cg.target.word()]);
         bytes[2 * self.cg.target.word()..3 * self.cg.target.word()]
             .copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..self.cg.target.word()]);
         let mut blob = ConstBlob {
@@ -10754,14 +10926,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         unsupported!("shim for an intrinsic");
                     }
                     let db = self.cg.db;
-                    let (callee, _) =
-                        impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
+                    let (callee, _) = impl_method(db, self.env, func, generic_args)
+                        .map_err(CodegenError::Refused)?;
                     if let either::Either::Left(callee) = callee
                         && track_caller(db, callee)
                     {
                         let location = self.cg.declaration(callee);
                         let location = self.cg.declare_data_in_func(location, self.builder.func);
-                        self.location = Some(self.builder.ins().symbol_value(self.cg.target.pointer(), location));
+                        self.location = Some(
+                            self.builder.ins().symbol_value(self.cg.target.pointer(), location),
+                        );
                     }
                     self.call_direct(func, generic_args, &values, dst, dst_ty)?;
                 }
@@ -10834,11 +11008,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(entry);
         let (argc, argv) = match *self.builder.block_params(entry) {
             [argc, argv] => (argc, argv),
-            [] => (self.builder.ins().iconst(types::I32, 0), self.builder.ins().iconst(self.cg.target.pointer(), 0)),
+            [] => (
+                self.builder.ins().iconst(types::I32, 0),
+                self.builder.ins().iconst(self.cg.target.pointer(), 0),
+            ),
             _ => unsupported!("`main` is called with a count and the arguments"),
         };
         // `argc` is an `isize` for `lang_start`.
-        let argc = if self.cg.target.pointer() == types::I32 { argc } else { self.builder.ins().sextend(self.cg.target.pointer(), argc) };
+        let argc = if self.cg.target.pointer() == types::I32 {
+            argc
+        } else {
+            self.builder.ins().sextend(self.cg.target.pointer(), argc)
+        };
         let callee = self.fn_item(main_ty)?;
         let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
         let pointer = self.builder.ins().func_addr(self.cg.target.pointer(), callee);
@@ -10862,8 +11043,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let code = self.stack_slot(&layout);
         self.call_direct(start, start_args, &values, code, code_ty)?;
         let code = self.builder.ins().load(self.cg.target.pointer(), MEM, code, 0);
-        let code =
-            if self.cg.target.pointer() == types::I32 { code } else { self.builder.ins().ireduce(types::I32, code) };
+        let code = if self.cg.target.pointer() == types::I32 {
+            code
+        } else {
+            self.builder.ins().ireduce(types::I32, code)
+        };
         self.builder.ins().return_(&[code]);
         Ok(())
     }
@@ -11304,7 +11488,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             TyKind::Array(element, _) => {
                 let size = self.layout(element)?.size.bytes() as i64;
-                let len = self.builder.ins().iconst(self.cg.target.pointer(), layout.fields.count() as i64);
+                let len = self
+                    .builder
+                    .ins()
+                    .iconst(self.cg.target.pointer(), layout.fields.count() as i64);
                 let header = self.builder.create_block();
                 let body = self.builder.create_block();
                 let done = self.builder.create_block();
@@ -11773,10 +11960,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         match (intrinsic, args) {
             (
-                I::WrappingAdd | I::UncheckedAdd | I::WrappingSub | I::UncheckedSub
-                | I::WrappingMul | I::UncheckedMul | I::UncheckedDiv | I::ExactDiv
-                | I::UncheckedRem | I::UncheckedShl | I::UncheckedShr | I::RotateLeft
-                | I::RotateRight | I::SaturatingAdd | I::SaturatingSub | I::ThreeWayCompare,
+                I::WrappingAdd
+                | I::UncheckedAdd
+                | I::WrappingSub
+                | I::UncheckedSub
+                | I::WrappingMul
+                | I::UncheckedMul
+                | I::UncheckedDiv
+                | I::ExactDiv
+                | I::UncheckedRem
+                | I::UncheckedShl
+                | I::UncheckedShr
+                | I::RotateLeft
+                | I::RotateRight
+                | I::SaturatingAdd
+                | I::SaturatingSub
+                | I::ThreeWayCompare,
                 [lhs, rhs],
             ) => {
                 let (l, scalar) = self.load_scalar(lhs)?;
@@ -11852,7 +12051,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 );
             }
             (
-                I::Ctpop | I::Ctlz | I::CtlzNonzero | I::Cttz | I::CttzNonzero | I::Bswap
+                I::Ctpop
+                | I::Ctlz
+                | I::CtlzNonzero
+                | I::Cttz
+                | I::CttzNonzero
+                | I::Bswap
                 | I::Bitreverse,
                 [arg],
             ) => {
@@ -11897,7 +12101,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let len = self.builder.ins().iconst(self.cg.target.pointer(), name.len() as i64);
                 let data = self.cg.define_const(ConstBlob {
                     bytes: name.into_bytes(),
-                    relocs: Vec::new(), // alloc: empty, allocates nothing
+                    relocs: Vec::new(),    // alloc: empty, allocates nothing
                     fn_relocs: Vec::new(), // alloc: empty, allocates nothing
                     align: 1,
                     type_ids: Vec::new(), // alloc: empty, allocates nothing
@@ -11928,7 +12132,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (from_ty, to_ty) = (generic_args.type_at(0), generic_args.type_at(1));
                 let int = |ty: Ty<'db>| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
                 if !int(from_ty) || !int(to_ty) {
-                    unsupported!("intrinsic `blaze_int_cast` from `{from_ty:?}` to `{to_ty:?}`, which are not both integers");
+                    unsupported!(
+                        "intrinsic `blaze_int_cast` from `{from_ty:?}` to `{to_ty:?}`, which are not both integers"
+                    );
                 }
                 let (value, from) = self.load_scalar(arg)?;
                 let to = self.scalar_of(to_ty)?;
@@ -12519,8 +12725,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 } else {
                     // x86-64's LLVM makes `simd_relaxed_fma` (`llvm.fmuladd`) of a CPU without
                     // FMA a multiply and then an add (`mulps`, `addps`), rounded twice.
-                    let unfused = intrinsic == I::Simd(S::RelaxedFma)
-                        && self.cg.target.arch == Arch::X86_64;
+                    let unfused =
+                        intrinsic == I::Simd(S::RelaxedFma) && self.cg.target.arch == Arch::X86_64;
                     let lanes: LaneValues = (0..count)
                         .map(|i| {
                             let offset = (i * lane.ty.bytes() as u64) as i32;
@@ -13050,7 +13256,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (I::PtrMetadata, [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 if let BackendRepr::ScalarPair { .. } = self.layout(ty)?.backend_repr {
-                    let meta = self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at());
+                    let meta = self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        src,
+                        self.cg.target.meta_at(),
+                    );
                     self.builder.ins().store(MEM, meta, dst, 0);
                 }
             }
@@ -13074,16 +13285,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (I::VtableSize | I::VtableAlign, [vtable]) => {
                 let (vtable, _) = self.load_scalar(vtable)?;
-                let offset = if intrinsic == I::VtableSize { self.cg.target.meta_at() } else { 2 * self.cg.target.meta_at() };
+                let offset = if intrinsic == I::VtableSize {
+                    self.cg.target.meta_at()
+                } else {
+                    2 * self.cg.target.meta_at()
+                };
                 let value = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, offset);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             (I::SizeOfVal | I::AlignOfVal, [arg]) => {
                 let (src, _) = self.operand(arg)?;
                 let ty = generic_args.type_at(0);
-                let meta = self
-                    .is_unsized(ty)
-                    .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
+                let meta = self.is_unsized(ty).then(|| {
+                    self.builder.ins().load(
+                        self.cg.target.pointer(),
+                        MEM,
+                        src,
+                        self.cg.target.meta_at(),
+                    )
+                });
                 let (size, align) = self.size_and_align_of_val(ty, meta)?;
                 let value = if intrinsic == I::SizeOfVal { size } else { align };
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -13823,7 +14043,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, addr, slot, 8 * (i as i32 + 1));
             }
         }
-        let text = asm::avx512_function(self.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out);
+        let text = asm::avx512_function(
+            self.cg.target.call_conv,
+            &lowered.loads,
+            &lowered.text,
+            lowered.out,
+        );
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let callee = self.cg.assembly(text, &sig);
@@ -13914,8 +14139,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let to = self.builder.ins().iadd_imm(slot, i64::from(at));
             self.copy(to, from, Size::from_bytes(bytes));
         }
-        let text = asm::x86_function(self.cg.target.call_conv, &text, &reads, &writes, &lowered.clobbers)
-            .map_err(CodegenError::Unsupported)?;
+        let text =
+            asm::x86_function(self.cg.target.call_conv, &text, &reads, &writes, &lowered.clobbers)
+                .map_err(CodegenError::Unsupported)?;
         let mut sig = self.cg.make_signature();
         sig.params.extend([AbiParam::new(self.cg.target.pointer()); 2]);
         let callee = self.cg.assembly(text, &sig);
@@ -14211,7 +14437,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ) => {
                 // alloc: the instruction's text, which is the output
                 let instruction = format!("{} xmm0, xmm1", name.trim_start_matches("x86."));
-                self.vector_assembly(asm::vector_instruction(self.cg.target.call_conv, &instruction, "xmm0"), a, b, dst)?;
+                self.vector_assembly(
+                    asm::vector_instruction(self.cg.target.call_conv, &instruction, "xmm0"),
+                    a,
+                    b,
+                    dst,
+                )?;
             }
             ("x86.sha256rnds2", [a, b, k]) => {
                 let (k, ty) = self.operand(k)?;
@@ -14219,7 +14450,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy_value(dst, k, &layout);
                 // The instruction takes its third vector in `xmm0`.
                 let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
-                self.vector_assembly(asm::vector_instruction(self.cg.target.call_conv, rounds, "xmm3"), a, b, dst)?;
+                self.vector_assembly(
+                    asm::vector_instruction(self.cg.target.call_conv, rounds, "xmm3"),
+                    a,
+                    b,
+                    dst,
+                )?;
             }
             (
                 "aarch64.crypto.sha256su0"
@@ -14410,7 +14646,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;
                 let mut sig = self.cg.make_signature();
-                sig.params.extend([AbiParam::new(self.cg.target.pointer()), AbiParam::new(self.cg.target.pointer())]);
+                sig.params.extend([
+                    AbiParam::new(self.cg.target.pointer()),
+                    AbiParam::new(self.cg.target.pointer()),
+                ]);
                 sig.params.push(AbiParam::new(types::I32));
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
                 let call_conv = self.cg.target.call_conv;
@@ -14686,8 +14925,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let windows = self.cg.target.call_conv == isa::CallConv::WindowsFastcall;
         let wide = |ty: Type| windows && ty == types::I128;
         let mut sig = self.cg.make_signature();
-        sig.params
-            .extend(params.iter().map(|&ty| AbiParam::new(if wide(ty) { self.cg.target.pointer() } else { ty })));
+        sig.params.extend(
+            params
+                .iter()
+                .map(|&ty| AbiParam::new(if wide(ty) { self.cg.target.pointer() } else { ty })),
+        );
         sig.returns.push(AbiParam::new(if wide(ret) { types::I64X2 } else { ret }));
         let callee = self.cg.import(name, &sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -15000,7 +15242,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.at(self.span);
         let results = self.builder.inst_results(call).to_vec(); // alloc: returned as a `Vec`
         let frame = self.builder.ins().get_frame_pointer(self.cg.target.pointer());
-        let exception = self.builder.ins().load(self.cg.target.pointer(), MEM, frame, unwind::seh::ARRIVAL);
+        let exception =
+            self.builder.ins().load(self.cg.target.pointer(), MEM, frame, unwind::seh::ARRIVAL);
         let (unwound, returned) = (self.builder.create_block(), self.builder.create_block());
         self.builder.set_cold_block(unwound);
         self.builder.ins().brif(exception, unwound, &[], returned, &[]);
@@ -15068,7 +15311,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(hir_ty_mir::mir::CoroutineLocals { context, .. }) = body.coroutine else {
             unsupported!("async body without a context");
         };
-        let context = self.builder.ins().load(self.cg.target.pointer(), MEM, self.locals[context].addr, 0);
+        let context =
+            self.builder.ins().load(self.cg.target.pointer(), MEM, self.locals[context].addr, 0);
         let at = self.builder.ins().load(state.ty, MEM, state.addr, 0);
         let at = match state.ty {
             types::I64 => at,
@@ -15144,7 +15388,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut values = smallvec::SmallVec::<[(Value, Ty<'db>); 2]>::new();
         for (param, value) in body.params.iter().zip([Some(addr), None]) {
             let slot = self.scratch();
-            let value = value.unwrap_or_else(|| self.builder.ins().iconst(self.cg.target.pointer(), 0));
+            let value =
+                value.unwrap_or_else(|| self.builder.ins().iconst(self.cg.target.pointer(), 0));
             self.builder.ins().store(MEM, value, slot, 0);
             values.push((slot, param.as_ref()));
         }
@@ -15284,8 +15529,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Ref(_, pointee, _) => {
                 let metas = self.is_unsized(pointee).then(|| {
                     (
-                        self.builder.ins().load(self.cg.target.pointer(), MEM, l, self.cg.target.meta_at()),
-                        self.builder.ins().load(self.cg.target.pointer(), MEM, r, self.cg.target.meta_at()),
+                        self.builder.ins().load(
+                            self.cg.target.pointer(),
+                            MEM,
+                            l,
+                            self.cg.target.meta_at(),
+                        ),
+                        self.builder.ins().load(
+                            self.cg.target.pointer(),
+                            MEM,
+                            r,
+                            self.cg.target.meta_at(),
+                        ),
                     )
                 });
                 let l = self.builder.ins().load(self.cg.target.pointer(), MEM, l, 0);
@@ -15908,7 +16163,10 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
 /// whole by assignments only, that nothing takes the address of.
-fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId, Global>) -> Vec<LocalId> {
+fn register_locals(
+    body: &MirBody<'_>,
+    forwarded: &HashMap<LocalId, LocalId, Global>,
+) -> Vec<LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     // Every mention of the whole local, and the ones that are a value read or an assignment.
     let mut mentions: HashMap<LocalId, (usize, usize), Global> = HashMap::new_in(Global);
@@ -16323,7 +16581,10 @@ mod tests {
             assert!(std::ptr::eq(lent, at));
         }
         kept.keep();
-        assert!(super::spare::layout_list().is_empty(), "a kept list holds a layout past its build");
+        assert!(
+            super::spare::layout_list().is_empty(),
+            "a kept list holds a layout past its build"
+        );
     }
 
     /// The panic of each overflow check is named whole, as core declares it: `call_panic`
@@ -16379,8 +16640,12 @@ mod tests {
             let mut context = cranelift_codegen::Context::for_function(build(2, 41));
             super::emit(&mut context, super::Target::for_host()).unwrap()
         };
-        super::with_context(build(64, 3), |context| super::emit(context, super::Target::for_host()).unwrap());
-        let kept = super::with_context(build(2, 41), |context| super::emit(context, super::Target::for_host()).unwrap());
+        super::with_context(build(64, 3), |context| {
+            super::emit(context, super::Target::for_host()).unwrap()
+        });
+        let kept = super::with_context(build(2, 41), |context| {
+            super::emit(context, super::Target::for_host()).unwrap()
+        });
         assert_eq!(kept.bytes, fresh.bytes);
         assert_eq!(kept.relocs.len(), fresh.relocs.len());
         assert_eq!(kept.align, fresh.align);
@@ -16719,7 +16984,9 @@ mod tests {
     /// its type i64 to i32").
     #[test]
     fn a_wasm32_copys_memcpy_takes_and_gives_32_bit_addresses() {
-        for (triple, pointer) in [("wasm32-wasip1", types::I32), ("wasm64-blaze-wasip1", types::I64)] {
+        for (triple, pointer) in
+            [("wasm32-wasip1", types::I32), ("wasm64-blaze-wasip1", types::I64)]
+        {
             let target = super::Target::of(triple).unwrap();
             let isa = &**super::isa_for(target).unwrap();
             let config = target.frontend_config(isa);
@@ -16738,9 +17005,11 @@ mod tests {
             builder.call_memcpy(config, to, from, bytes);
             builder.ins().return_(&[]);
             builder.finalize(config);
-            cranelift_codegen::verify_function(&func, isa.flags()).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            cranelift_codegen::verify_function(&func, isa.flags())
+                .unwrap_or_else(|e| panic!("{triple}: {e}"));
             assert!(super::copies::lower_small(&mut func), "{triple}");
-            cranelift_codegen::verify_function(&func, isa.flags()).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            cranelift_codegen::verify_function(&func, isa.flags())
+                .unwrap_or_else(|e| panic!("{triple}: {e}"));
         }
     }
 

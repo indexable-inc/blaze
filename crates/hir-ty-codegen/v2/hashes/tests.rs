@@ -7,9 +7,9 @@ mod db;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId};
 use hir_def::{DefWithBodyId, FunctionId, TypeAliasId, expr_store::Body as BodyStore};
+use hir_expand::fixture;
 use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
-use hir_expand::fixture;
 
 use super::ItemHashes;
 use crate::v2::{Body, HashSource, Hashes, by_id::ById};
@@ -51,8 +51,12 @@ fn code(db: &TestDB, name: &str) -> CodeHash {
 #[track_caller]
 fn template_by(hashes: &ItemHashes, db: &TestDB, name: &str) -> CodeHash {
     let body = Body::Item(function(db, name).into());
-    let code = hashes.template_code(db, body).unwrap_or_else(|e| panic!("the template code of `{name}`: {e}"));
-    let (names, whole) = hashes.names_read(db, body, false).unwrap_or_else(|e| panic!("the names `{name}` reads: {e}"));
+    let code = hashes
+        .template_code(db, body)
+        .unwrap_or_else(|e| panic!("the template code of `{name}`: {e}"));
+    let (names, whole) = hashes
+        .names_read(db, body, false)
+        .unwrap_or_else(|e| panic!("the names `{name}` reads: {e}"));
     assert!(whole, "untold, all `{name}` reads of names is keyed");
     let mut h = blaze_ids::Hasher::new("blaze v2 test template with names 1");
     h.id(&code.0).id(&names);
@@ -170,7 +174,10 @@ fn a_drop_impl_of_a_fields_type_is_in_the_type() {
     db.set_file_text(file, &format!("{DROPS}pub fn unrelated() {{}}\n"));
     assert_eq!(ty(&db, "Held"), held, "an item the type does not reach is not in it");
 
-    db.set_file_text(file, &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"));
+    db.set_file_text(
+        file,
+        &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"),
+    );
     assert_ne!(ty(&db, "Held"), held, "drop glue of `Outer` drops an `Inner`");
 }
 
@@ -257,7 +264,12 @@ pub fn here() -> u32 { 1 }
 fn a_function_written_alike_in_two_crates_is_two_codes() {
     let db = fixture::db(WRITTEN_TWICE).into_db();
     let main = fixture::test_crate(&db);
-    let dep = main.data(&db).dependencies.iter().map(|it| it.crate_id).find(|it| !it.data(&db).origin.is_lang());
+    let dep = main
+        .data(&db)
+        .dependencies
+        .iter()
+        .map(|it| it.crate_id)
+        .find(|it| !it.data(&db).origin.is_lang());
     let theirs = hir_def::test_items::function(&db, dep.expect("crate a"), "here");
     let ours = function(&db, "here");
     let code = |func: FunctionId| hashes().code(&db, Body::Item(func.into())).unwrap();
@@ -343,10 +355,21 @@ fn renaming_or_moving_a_function_keeps_its_template_code() {
     assert_ne!(same(&renamed, "renamed", "renamed"), code, "its instance is its store's");
     let moved = PLACED
         .replace("pub fn caller(x: u32) -> u32 { let one = m::callee(x); one * 2 }\n", "")
-        .replace("pub mod m {\n", "pub mod m {\n    pub fn caller(x: u32) -> u32 { let one = callee(x); one * 2 }\n");
-    assert_ne!(same(&moved, "caller", "moved into the callee's module"), code, "its instance is its store's");
+        .replace(
+            "pub mod m {\n",
+            "pub mod m {\n    pub fn caller(x: u32) -> u32 { let one = callee(x); one * 2 }\n",
+        );
+    assert_ne!(
+        same(&moved, "caller", "moved into the callee's module"),
+        code,
+        "its instance is its store's"
+    );
     let callee_renamed = PLACED.replace("callee", "next");
-    assert_eq!(same(&callee_renamed, "caller", "its callee renamed"), code, "a callee is its interface");
+    assert_eq!(
+        same(&callee_renamed, "caller", "its callee renamed"),
+        code,
+        "a callee is its interface"
+    );
     let local_renamed = PLACED.replace("one", "uno");
     assert_eq!(same(&local_renamed, "caller", "a local renamed"), code, "a local is its binding");
 }
@@ -386,7 +409,10 @@ fn a_template_that_reads_its_line_is_keyed_by_it() {
     assert_eq!(after[0], before[0].0, "the line is read where the code runs");
     assert_ne!(after[1], before[1].0, "a `#[track_caller]` function's line is its value");
     assert_ne!(after[2], before[2].0, "a promoted line is its value");
-    let moved = LINED.replace("pub fn here() -> u32 { line!() }", "pub mod m { pub fn here() -> u32 { line!() } }");
+    let moved = LINED.replace(
+        "pub fn here() -> u32 { line!() }",
+        "pub mod m { pub fn here() -> u32 { line!() } }",
+    );
     let (template, code) = both("panic_location", &moved, "here");
     assert_eq!(template, before[0].0, "moved into a module on its own line");
     assert_ne!(code, before[0].1, "its instance is its store's");
@@ -406,8 +432,16 @@ fn a_template_that_reads_its_file_is_keyed_by_its_name() {
     let (db, _) = fixture("sized", FILED);
     let lib = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
     let other = ItemHashes::new(Box::new(|_| Some("src/other.rs".to_owned())));
-    assert_ne!(template_by(&lib, &db, "named"), template_by(&other, &db, "named"), "`file!()` says the new name");
-    assert_eq!(template_by(&lib, &db, "plain"), template_by(&other, &db, "plain"), "what reads no file keeps its template");
+    assert_ne!(
+        template_by(&lib, &db, "named"),
+        template_by(&other, &db, "named"),
+        "`file!()` says the new name"
+    );
+    assert_eq!(
+        template_by(&lib, &db, "plain"),
+        template_by(&other, &db, "plain"),
+        "what reads no file keeps its template"
+    );
 }
 
 const TOLD: &str = r#"
@@ -438,12 +472,25 @@ fn told_template(text: &str, name: &str, told: bool) -> Option<ContentId> {
 fn a_told_locals_type_is_in_its_template_key() {
     let renamed = TOLD.replace("struct A", "struct B").replace("A(1)", "B(1)");
     let (told, quiet) = (told_template(TOLD, "holds", true), told_template(TOLD, "holds", false));
-    assert!(told.is_some() && quiet.is_some(), "a local of a type with no alias is told by its identity");
+    assert!(
+        told.is_some() && quiet.is_some(),
+        "a local of a type with no alias is told by its identity"
+    );
     assert_ne!(told_template(&renamed, "holds", true), told, "the debugger names the new type");
     assert_eq!(told_template(&renamed, "holds", false), quiet, "untold, the name is in no key");
-    let swapped = TOLD.replace("pub fn holds() -> u32 { let held = A(1); held.0 }", "pub fn holds() -> u32 { let held = A(1); let n = 1u32; held.0 + n }");
-    let reordered = TOLD.replace("pub fn holds() -> u32 { let held = A(1); held.0 }", "pub fn holds() -> u32 { let n = 1u32; let held = A(1); held.0 + n }");
-    assert_ne!(told_template(&swapped, "holds", true), told_template(&reordered, "holds", true), "each binding by its own type");
+    let swapped = TOLD.replace(
+        "pub fn holds() -> u32 { let held = A(1); held.0 }",
+        "pub fn holds() -> u32 { let held = A(1); let n = 1u32; held.0 + n }",
+    );
+    let reordered = TOLD.replace(
+        "pub fn holds() -> u32 { let held = A(1); held.0 }",
+        "pub fn holds() -> u32 { let n = 1u32; let held = A(1); held.0 + n }",
+    );
+    assert_ne!(
+        told_template(&swapped, "holds", true),
+        told_template(&reordered, "holds", true),
+        "each binding by its own type"
+    );
     assert_eq!(told_template(TOLD, "projects", true), None, "a told projection keeps its code");
     assert!(told_template(TOLD, "projects", false).is_some(), "untold, the projection is no input");
 }

@@ -65,7 +65,11 @@ fn parse(data: &[u8], most_body: usize, piece: usize) -> Parsed {
         let pushed = parser.push(bytes);
         body.extend(parser.take_body());
         if let Err(failed) = pushed {
-            assert_eq!(parser.push(b"x"), Err(failed.clone()), "a failed parser gives its error again");
+            assert_eq!(
+                parser.push(b"x"),
+                Err(failed.clone()),
+                "a failed parser gives its error again"
+            );
             error = Some(failed);
             // How much of a body over the bound was handed out before the parser saw it was
             // over depends on how its bytes came: a failed response's body is not compared.
@@ -90,30 +94,59 @@ fn check(data: &[u8]) {
 
 fn check_case(data: &[u8], case: usize) {
     let most_body = BODIES[case];
-    let (most, whole) = blaze_fuzz::largest_allocation(|| parse(data, most_body, data.len().max(1)));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "parsing {} bytes asked for {most} at once", data.len());
-    assert_eq!(parse(data, most_body, 1), whole, "a byte at a time the parser reads the same response");
-    assert!(whole.finished || whole.error.is_some(), "an ended stream is a response or an error: {whole:?}");
+    let (most, whole) =
+        blaze_fuzz::largest_allocation(|| parse(data, most_body, data.len().max(1)));
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "parsing {} bytes asked for {most} at once",
+        data.len()
+    );
+    assert_eq!(
+        parse(data, most_body, 1),
+        whole,
+        "a byte at a time the parser reads the same response"
+    );
+    assert!(
+        whole.finished || whole.error.is_some(),
+        "an ended stream is a response or an error: {whole:?}"
+    );
     if let Some((status, headers)) = &whole.head {
         assert!(*status <= 999, "a status of three digits: {status}");
         for (name, _) in headers {
-            assert!(!name.is_empty() && name.bytes().all(is_tchar), "a header name is a token: {name:?}");
+            assert!(
+                !name.is_empty() && name.bytes().all(is_tchar),
+                "a header name is a token: {name:?}"
+            );
         }
     }
-    assert!(whole.body.len() <= most_body, "a body of {} bytes past the bound of {most_body}", whole.body.len());
+    assert!(
+        whole.body.len() <= most_body,
+        "a body of {} bytes past the bound of {most_body}",
+        whole.body.len()
+    );
 
     match (http::read_response(&mut &data[..], most_body), &whole.error) {
         (Ok(response), None) => {
             let head = (response.status, response.headers);
-            assert_eq!(Some(&head), whole.head.as_ref(), "read_response reads the head the parser does");
+            assert_eq!(
+                Some(&head),
+                whole.head.as_ref(),
+                "read_response reads the head the parser does"
+            );
             assert_eq!(response.body, whole.body, "read_response reads the body the parser does");
         }
         (Err(error), Some(failed)) => {
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "read_response fails as InvalidData");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "read_response fails as InvalidData"
+            );
             let inner = error.get_ref().and_then(|it| it.downcast_ref::<HttpError>());
             assert_eq!(inner, Some(failed), "read_response fails with the parser's error");
         }
-        (read, failed) => panic!("read_response gave {read:?} where the parser failed with {failed:?}"),
+        (read, failed) => {
+            panic!("read_response gave {read:?} where the parser failed with {failed:?}")
+        }
     }
 }
 

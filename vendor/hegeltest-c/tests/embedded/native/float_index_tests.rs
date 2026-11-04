@@ -61,10 +61,7 @@ fn update_mantissa_partial_reversal() {
 fn update_mantissa_large_exponent_unchanged() {
     assert_eq!(update_mantissa(52, 0xDEAD_BEEF), 0xDEAD_BEEF);
     assert_eq!(update_mantissa(100, 0), 0);
-    assert_eq!(
-        update_mantissa(1023, 0x000F_FFFF_FFFF_FFFF),
-        0x000F_FFFF_FFFF_FFFF
-    );
+    assert_eq!(update_mantissa(1023, 0x000F_FFFF_FFFF_FFFF), 0x000F_FFFF_FFFF_FFFF);
 }
 
 #[test]

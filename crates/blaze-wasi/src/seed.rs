@@ -33,7 +33,9 @@
 use std::marker::PhantomData;
 
 #[cfg(feature = "seed")]
-use wasmtime::{Caller, Extern, Global, GuestFiber, GuestFiberResumed, Linker, Ref, Store, Table, Val};
+use wasmtime::{
+    Caller, Extern, Global, GuestFiber, GuestFiberResumed, Linker, Ref, Store, Table, Val,
+};
 
 #[cfg(feature = "seed")]
 use crate::{
@@ -109,7 +111,13 @@ pub trait Seed {
     fn hard_link(&mut self, from: &[u8], to: &[u8]) -> Result<(), Errno>;
     /// A symbolic link at `path` holding `target`, uninterpreted.
     fn symlink(&mut self, target: &[u8], path: &[u8]) -> Result<(), Errno>;
-    fn set_times(&mut self, path: &[u8], follow: bool, atime: Time, mtime: Time) -> Result<(), Errno>;
+    fn set_times(
+        &mut self,
+        path: &[u8],
+        follow: bool,
+        atime: Time,
+        mtime: Time,
+    ) -> Result<(), Errno>;
     fn fd_set_times(&mut self, fd: u32, atime: Time, mtime: Time) -> Result<(), Errno>;
     fn set_len(&mut self, fd: u32, len: u64) -> Result<(), Errno>;
     /// Flushes `fd` to its device: its data, and unless `data_only` its metadata.
@@ -171,7 +179,9 @@ impl Fibers {
         match slot {
             Some(slot) if !matches!(slot, Slot::Free) => Ok(slot),
             // alloc: error path
-            _ => Err(wasmtime::Error::msg(format!("`{MODULE}.{call}` of fiber {fiber}, which the seed never made or already dropped"))),
+            _ => Err(wasmtime::Error::msg(format!(
+                "`{MODULE}.{call}` of fiber {fiber}, which the seed never made or already dropped"
+            ))),
         }
     }
 
@@ -181,10 +191,16 @@ impl Fibers {
         match std::mem::replace(slot, Slot::Running) {
             Slot::Idle(it) => Ok(it),
             was => {
-                let why = if matches!(was, Slot::Running) { "it is running" } else { "its function returned or trapped" };
+                let why = if matches!(was, Slot::Running) {
+                    "it is running"
+                } else {
+                    "its function returned or trapped"
+                };
                 *slot = was;
                 // alloc: error path
-                Err(wasmtime::Error::msg(format!("`{MODULE}.fiber_resume` of fiber {fiber}: {why}")))
+                Err(wasmtime::Error::msg(format!(
+                    "`{MODULE}.fiber_resume` of fiber {fiber}: {why}"
+                )))
             }
         }
     }
@@ -225,16 +241,20 @@ fn exports<T: EmbedSeed>(c: &mut Caller<'_, T>) -> wasmtime::Result<(Global, Tab
     let global = match c.get_export("__stack_pointer") {
         Some(Extern::Global(it)) => it,
         // alloc: error path
-        _ => return Err(wasmtime::Error::msg(format!(
-            "`{MODULE}.fiber_new`: the seed exports no global `__stack_pointer`, which blaze-link exports from every wasm64 module"
-        ))),
+        _ => {
+            return Err(wasmtime::Error::msg(format!(
+                "`{MODULE}.fiber_new`: the seed exports no global `__stack_pointer`, which blaze-link exports from every wasm64 module"
+            )));
+        }
     };
     let table = match c.get_export("__indirect_function_table") {
         Some(Extern::Table(it)) => it,
         // alloc: error path
-        _ => return Err(wasmtime::Error::msg(format!(
-            "`{MODULE}.fiber_new`: the seed exports no table `__indirect_function_table`, which blaze-link exports from every wasm64 module"
-        ))),
+        _ => {
+            return Err(wasmtime::Error::msg(format!(
+                "`{MODULE}.fiber_new`: the seed exports no table `__indirect_function_table`, which blaze-link exports from every wasm64 module"
+            )));
+        }
     };
     c.data_mut().fibers().exports = Some((global, table));
     Ok((global, table))
@@ -255,12 +275,21 @@ fn stack_pointer<T>(c: &mut Caller<'_, T>, global: Global) -> wasmtime::Result<u
 
 /// `fiber_new`: a fiber of the function at table slot `entry`, to run as `entry(arg)`.
 #[cfg(feature = "seed")]
-fn fiber_new<T: EmbedSeed>(c: &mut Caller<'_, T>, entry: u64, arg: u64, stack_pointer: u64) -> wasmtime::Result<u64> {
+fn fiber_new<T: EmbedSeed>(
+    c: &mut Caller<'_, T>,
+    entry: u64,
+    arg: u64,
+    stack_pointer: u64,
+) -> wasmtime::Result<u64> {
     let (_, table) = exports(c)?;
     let func = match table.get(&mut *c, entry) {
         Some(Ref::Func(Some(func))) => func,
         // alloc: error path
-        _ => return Err(wasmtime::Error::msg(format!("`{MODULE}.fiber_new`: table slot {entry} holds no function"))),
+        _ => {
+            return Err(wasmtime::Error::msg(format!(
+                "`{MODULE}.fiber_new`: table slot {entry} holds no function"
+            )));
+        }
     };
     let func = func.typed::<u64, ()>(&*c).map_err(|why| {
         // alloc: error path
@@ -268,7 +297,9 @@ fn fiber_new<T: EmbedSeed>(c: &mut Caller<'_, T>, entry: u64, arg: u64, stack_po
     })?;
     let fiber = c.guest_fiber_new(func, arg).map_err(|why| {
         // alloc: error path
-        wasmtime::Error::msg(format!("`{MODULE}.fiber_new` of the function at table slot {entry}: {why:#}"))
+        wasmtime::Error::msg(format!(
+            "`{MODULE}.fiber_new` of the function at table slot {entry}: {why:#}"
+        ))
     })?;
     Ok(c.data_mut().fibers().insert(Fiber { fiber, stack_pointer }))
 }
@@ -310,7 +341,9 @@ fn fiber_drop<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Resu
         Slot::Running => {
             *slot = Slot::Running;
             // alloc: error path
-            return Err(wasmtime::Error::msg(format!("`{MODULE}.fiber_drop` of fiber {fiber}: it is running")));
+            return Err(wasmtime::Error::msg(format!(
+                "`{MODULE}.fiber_drop` of fiber {fiber}: it is running"
+            )));
         }
         Slot::Idle(it) => c.guest_fiber_dispose(it.fiber),
         Slot::Done | Slot::Free => {}
@@ -351,39 +384,65 @@ pub fn link<T: EmbedSeed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
         call(&mut c, "decommit", |mem, seed| seed.decommit(mem.get_mut(ptr, len)?))
     })?;
     l.func_wrap(m, "create_dir", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
-        call(&mut c, "create_dir", |mem, seed| done(path(mem, ptr, len)?.and_then(|p| seed.create_dir(p))))
+        call(&mut c, "create_dir", |mem, seed| {
+            done(path(mem, ptr, len)?.and_then(|p| seed.create_dir(p)))
+        })
     })?;
     l.func_wrap(m, "remove_dir", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
-        call(&mut c, "remove_dir", |mem, seed| done(path(mem, ptr, len)?.and_then(|p| seed.remove_dir(p))))
+        call(&mut c, "remove_dir", |mem, seed| {
+            done(path(mem, ptr, len)?.and_then(|p| seed.remove_dir(p)))
+        })
     })?;
     l.func_wrap(m, "unlink", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
         call(&mut c, "unlink", |mem, seed| done(path(mem, ptr, len)?.and_then(|p| seed.unlink(p))))
     })?;
-    l.func_wrap(m, "rename", |mut c: Caller<'_, T>, from: u64, from_len: u64, to: u64, to_len: u64| {
-        call(&mut c, "rename", |mem, seed| {
-            let (from, to) = (path(mem, from, from_len)?, path(mem, to, to_len)?);
-            done(from.and_then(|from| seed.rename(from, to?)))
-        })
-    })?;
-    l.func_wrap(m, "hard_link", |mut c: Caller<'_, T>, from: u64, from_len: u64, to: u64, to_len: u64| {
-        call(&mut c, "hard_link", |mem, seed| {
-            let (from, to) = (path(mem, from, from_len)?, path(mem, to, to_len)?);
-            done(from.and_then(|from| seed.hard_link(from, to?)))
-        })
-    })?;
-    l.func_wrap(m, "symlink", |mut c: Caller<'_, T>, target: u64, target_len: u64, at: u64, len: u64| {
-        call(&mut c, "symlink", |mem, seed| {
-            let target = mem.get(target, target_len)?;
-            done(path(mem, at, len)?.and_then(|p| seed.symlink(target, p)))
-        })
-    })?;
-    l.func_wrap(m, "set_times", |mut c: Caller<'_, T>, ptr: u64, len: u64, follow: u32, atime: u64, mtime: u64| {
-        call(&mut c, "set_times", |mem, seed| {
-            done(path(mem, ptr, len)?.and_then(|p| seed.set_times(p, follow != 0, Time::of(atime), Time::of(mtime))))
-        })
-    })?;
+    l.func_wrap(
+        m,
+        "rename",
+        |mut c: Caller<'_, T>, from: u64, from_len: u64, to: u64, to_len: u64| {
+            call(&mut c, "rename", |mem, seed| {
+                let (from, to) = (path(mem, from, from_len)?, path(mem, to, to_len)?);
+                done(from.and_then(|from| seed.rename(from, to?)))
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "hard_link",
+        |mut c: Caller<'_, T>, from: u64, from_len: u64, to: u64, to_len: u64| {
+            call(&mut c, "hard_link", |mem, seed| {
+                let (from, to) = (path(mem, from, from_len)?, path(mem, to, to_len)?);
+                done(from.and_then(|from| seed.hard_link(from, to?)))
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "symlink",
+        |mut c: Caller<'_, T>, target: u64, target_len: u64, at: u64, len: u64| {
+            call(&mut c, "symlink", |mem, seed| {
+                let target = mem.get(target, target_len)?;
+                done(path(mem, at, len)?.and_then(|p| seed.symlink(target, p)))
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "set_times",
+        |mut c: Caller<'_, T>, ptr: u64, len: u64, follow: u32, atime: u64, mtime: u64| {
+            call(&mut c, "set_times", |mem, seed| {
+                done(
+                    path(mem, ptr, len)?.and_then(|p| {
+                        seed.set_times(p, follow != 0, Time::of(atime), Time::of(mtime))
+                    }),
+                )
+            })
+        },
+    )?;
     l.func_wrap(m, "fd_set_times", |mut c: Caller<'_, T>, fd: u32, atime: u64, mtime: u64| {
-        call(&mut c, "fd_set_times", |_, seed| done(seed.fd_set_times(fd, Time::of(atime), Time::of(mtime))))
+        call(&mut c, "fd_set_times", |_, seed| {
+            done(seed.fd_set_times(fd, Time::of(atime), Time::of(mtime)))
+        })
     })?;
     l.func_wrap(m, "set_len", |mut c: Caller<'_, T>, fd: u32, len: u64| {
         call(&mut c, "set_len", |_, seed| done(seed.set_len(fd, len)))
@@ -391,24 +450,37 @@ pub fn link<T: EmbedSeed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     l.func_wrap(m, "sync", |mut c: Caller<'_, T>, fd: u32, data_only: u32| {
         call(&mut c, "sync", |_, seed| done(seed.sync(fd, data_only != 0)))
     })?;
-    l.func_wrap(m, "pread", |mut c: Caller<'_, T>, fd: u32, buf: u64, len: u64, offset: u64, out: u64| {
-        call(&mut c, "pread", |mem, seed| {
-            let got = seed.pread(fd, mem.get_mut(buf, len)?, offset);
-            answered(got, |n| mem.put_u64(out, n as u64))
-        })
-    })?;
-    l.func_wrap(m, "pwrite", |mut c: Caller<'_, T>, fd: u32, buf: u64, len: u64, offset: u64, out: u64| {
-        call(&mut c, "pwrite", |mem, seed| {
-            let wrote = seed.pwrite(fd, mem.get(buf, len)?, offset);
-            answered(wrote, |n| mem.put_u64(out, n as u64))
-        })
-    })?;
-    l.func_wrap(m, "fiber_new", |mut c: Caller<'_, T>, entry: u64, arg: u64, stack_pointer: u64| {
-        fiber_new(&mut c, entry, arg, stack_pointer)
-    })?;
+    l.func_wrap(
+        m,
+        "pread",
+        |mut c: Caller<'_, T>, fd: u32, buf: u64, len: u64, offset: u64, out: u64| {
+            call(&mut c, "pread", |mem, seed| {
+                let got = seed.pread(fd, mem.get_mut(buf, len)?, offset);
+                answered(got, |n| mem.put_u64(out, n as u64))
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "pwrite",
+        |mut c: Caller<'_, T>, fd: u32, buf: u64, len: u64, offset: u64, out: u64| {
+            call(&mut c, "pwrite", |mem, seed| {
+                let wrote = seed.pwrite(fd, mem.get(buf, len)?, offset);
+                answered(wrote, |n| mem.put_u64(out, n as u64))
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "fiber_new",
+        |mut c: Caller<'_, T>, entry: u64, arg: u64, stack_pointer: u64| {
+            fiber_new(&mut c, entry, arg, stack_pointer)
+        },
+    )?;
     l.func_wrap(m, "fiber_resume", |mut c: Caller<'_, T>, fiber: u64| fiber_resume(&mut c, fiber))?;
     l.func_wrap(m, "fiber_suspend", |mut c: Caller<'_, T>| {
-        c.guest_fiber_suspend().map_err(|why| wasmtime::Error::msg(format!("`{MODULE}.fiber_suspend`: {why:#}"))) // alloc: error path
+        c.guest_fiber_suspend()
+            .map_err(|why| wasmtime::Error::msg(format!("`{MODULE}.fiber_suspend`: {why:#}"))) // alloc: error path
     })?;
     l.func_wrap(m, "fiber_drop", |mut c: Caller<'_, T>, fiber: u64| fiber_drop(&mut c, fiber))?;
     Ok(())

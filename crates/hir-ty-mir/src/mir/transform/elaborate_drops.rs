@@ -23,8 +23,8 @@ use blaze_mem::Frame;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
-    db::HirDatabase,
     consteval::try_const_usize,
+    db::HirDatabase,
     mir::{
         BasicBlock, BasicBlockId, BorrowKind, FieldIndex, Local, LocalId, MirBody, MirLowerError,
         MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem,
@@ -165,8 +165,7 @@ pub(super) fn elaborate_drops<'db>(
     // (block, statement after which the flags are written, writes)
     let mut writes: Vec<(BasicBlockId, usize, FlagWrite), &Frame> = Vec::new_in(frame);
     // (block, target of its terminator, the paths that edge initializes in `edge_paths`)
-    let mut edge_writes: Vec<(BasicBlockId, BasicBlockId, Range<u32>), &Frame> =
-        Vec::new_in(frame);
+    let mut edge_writes: Vec<(BasicBlockId, BasicBlockId, Range<u32>), &Frame> = Vec::new_in(frame);
     let mut edge_paths: Vec<PathId, &Frame> = Vec::new_in(frame);
     let mut dead_drops = Vec::new_in(frame);
     let mut state = InitState::bottom(len, frame);
@@ -423,10 +422,7 @@ fn set<'db>(
     bool_ty: Ty<'db>,
 ) {
     out.extend(
-        paths
-            .iter()
-            .filter_map(|&path| flags[path])
-            .map(|flag| write_flag(flag, value, bool_ty)),
+        paths.iter().filter_map(|&path| flags[path]).map(|flag| write_flag(flag, value, bool_ty)),
     );
 }
 

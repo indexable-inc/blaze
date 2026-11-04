@@ -8,11 +8,11 @@ use std::hash::Hash;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_type_ir::inherent::GenericArgs as _;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     db::{HirDatabase, InternedClosureId},
@@ -129,10 +129,7 @@ impl<'db> Callgraph<'db> {
 }
 
 #[blaze_query::tracked(returns(ref))]
-pub(super) fn callgraph_cyclic_fn<'db>(
-    db: &'db Db,
-    root: FunctionId,
-) -> Option<Callgraph<'db>> {
+pub(super) fn callgraph_cyclic_fn<'db>(db: &'db Db, root: FunctionId) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Fn(root))
 }
 

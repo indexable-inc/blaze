@@ -143,17 +143,9 @@ fn integer_choice_index_round_trip_asymmetric() {
 #[test]
 fn integer_choice_index_round_trip_full_i128_range() {
     let ic = integer_choice(i128::MIN, i128::MAX);
-    for v in [
-        0i128,
-        1,
-        -1,
-        i128::MIN,
-        i128::MAX,
-        i128::MIN + 1,
-        i128::MAX - 1,
-        1 << 100,
-        -(1 << 100),
-    ] {
+    for v in
+        [0i128, 1, -1, i128::MIN, i128::MAX, i128::MIN + 1, i128::MAX - 1, 1 << 100, -(1 << 100)]
+    {
         let bv = BigInt::from(v);
         let idx = ic.to_index(&bv);
         assert_eq!(ic.from_index(idx), Some(bv), "round-trip failed for v={v}");
@@ -264,10 +256,7 @@ fn float_choice_simplest_errors_when_nothing_valid() {
         smallest_nonzero_magnitude: 5e-324,
     };
     let msg = fc.simplest().unwrap_err().to_string();
-    assert!(
-        msg.contains("FloatChoice::simplest: no valid float"),
-        "{msg}"
-    );
+    assert!(msg.contains("FloatChoice::simplest: no valid float"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
 }
 
@@ -422,10 +411,7 @@ fn float_choice_simplest_respects_smallest_nonzero_magnitude() {
         smallest_nonzero_magnitude: f64::MIN_POSITIVE,
     };
     let s = c2.simplest().unwrap();
-    assert!(
-        c2.validate(s),
-        "simplest {s} must respect the magnitude floor"
-    );
+    assert!(c2.validate(s), "simplest {s} must respect the magnitude floor");
 }
 
 #[test]
@@ -451,9 +437,7 @@ fn float_choice_from_index_rejects_past_max_index() {
     assert!(choice.from_index(choice.max_index()).unwrap().is_some());
     for extra in [1u32, 2, 50] {
         assert_eq!(
-            choice
-                .from_index(choice.max_index() + BigUint::from(extra))
-                .unwrap(),
+            choice.from_index(choice.max_index() + BigUint::from(extra)).unwrap(),
             None,
             "index past max_index must be rejected"
         );
@@ -468,46 +452,31 @@ fn float_choice_from_index_rejects_non_canonical_tag0_ranks() {
 
 #[test]
 fn bytes_choice_simplest_is_min_size_zeros() {
-    let bc = BytesChoice {
-        min_size: 3,
-        max_size: 10,
-    };
+    let bc = BytesChoice { min_size: 3, max_size: 10 };
     assert_eq!(bc.simplest(), vec![0, 0, 0]);
 }
 
 #[test]
 fn bytes_choice_unit_with_zero_min_zero_max_falls_back_to_simplest() {
-    let bc = BytesChoice {
-        min_size: 0,
-        max_size: 0,
-    };
+    let bc = BytesChoice { min_size: 0, max_size: 0 };
     assert_eq!(bc.unit(), Vec::<u8>::new());
 }
 
 #[test]
 fn bytes_choice_unit_with_zero_min_nonzero_max_is_single_one() {
-    let bc = BytesChoice {
-        min_size: 0,
-        max_size: 5,
-    };
+    let bc = BytesChoice { min_size: 0, max_size: 5 };
     assert_eq!(bc.unit(), vec![1u8]);
 }
 
 #[test]
 fn bytes_choice_unit_with_nonzero_min_is_zeros_with_trailing_one() {
-    let bc = BytesChoice {
-        min_size: 3,
-        max_size: 10,
-    };
+    let bc = BytesChoice { min_size: 3, max_size: 10 };
     assert_eq!(bc.unit(), vec![0, 0, 1]);
 }
 
 #[test]
 fn bytes_choice_index_round_trip_across_lengths() {
-    let bc = BytesChoice {
-        min_size: 0,
-        max_size: 3,
-    };
+    let bc = BytesChoice { min_size: 0, max_size: 3 };
     for v in [
         Vec::<u8>::new(),
         vec![0u8],
@@ -525,22 +494,13 @@ fn bytes_choice_index_round_trip_across_lengths() {
 
 #[test]
 fn bytes_choice_from_index_past_max_returns_none() {
-    let bc = BytesChoice {
-        min_size: 0,
-        max_size: 1,
-    };
-    assert!(
-        bc.from_index(crate::native::bignum::BigUint::from(1000u32))
-            .unwrap()
-            .is_none()
-    );
+    let bc = BytesChoice { min_size: 0, max_size: 1 };
+    assert!(bc.from_index(crate::native::bignum::BigUint::from(1000u32)).unwrap().is_none());
 }
 
 fn string_choice(intervals: Vec<(u32, u32)>, min_size: usize, max_size: usize) -> StringChoice {
     StringChoice {
-        intervals: crate::native::intervalsets::IntervalSet::new(intervals)
-            .unwrap()
-            .into(),
+        intervals: crate::native::intervalsets::IntervalSet::new(intervals).unwrap().into(),
         min_size,
         max_size,
         constraint: None,
@@ -608,11 +568,7 @@ fn string_choice_index_round_trip_across_lengths() {
 #[test]
 fn string_choice_from_index_past_max_returns_none() {
     let sc = string_choice(vec![(b'a' as u32, b'b' as u32)], 0, 1);
-    assert!(
-        sc.from_index(crate::native::bignum::BigUint::from(1000u32))
-            .unwrap()
-            .is_none()
-    );
+    assert!(sc.from_index(crate::native::bignum::BigUint::from(1000u32)).unwrap().is_none());
 }
 
 fn integer_node(min: i128, max: i128, value: i128) -> ChoiceNode {
@@ -624,14 +580,7 @@ fn integer_node(min: i128, max: i128, value: i128) -> ChoiceNode {
 }
 
 fn bytes_node(min: usize, max: usize, value: Vec<u8>) -> ChoiceNode {
-    ChoiceNode::bytes(
-        BytesChoice {
-            min_size: min,
-            max_size: max,
-        },
-        value,
-        false,
-    )
+    ChoiceNode::bytes(BytesChoice { min_size: min, max_size: max }, value, false)
 }
 
 fn string_node(intervals: Vec<(u32, u32)>, min: usize, max: usize, value: Vec<u32>) -> ChoiceNode {
@@ -646,10 +595,7 @@ fn node_sort_key_ref_scalar_equality_and_partial_cmp() {
     let c = integer_node(-10, 10, 4);
     assert!(a.sort_key_ref() == b.sort_key_ref());
     assert!(a.sort_key_ref() != c.sort_key_ref());
-    assert_eq!(
-        a.sort_key_ref().partial_cmp(&c.sort_key_ref()),
-        Some(Ordering::Less)
-    );
+    assert_eq!(a.sort_key_ref().partial_cmp(&c.sort_key_ref()), Some(Ordering::Less));
 }
 
 #[test]
@@ -667,25 +613,10 @@ fn node_sort_key_ref_bytes_orders_shortlex() {
 
 #[test]
 fn node_sort_key_ref_string_orders_by_codepoint_key() {
-    let a = string_node(
-        vec![(b'a' as u32, b'z' as u32)],
-        0,
-        4,
-        vec![b'a' as u32, b'a' as u32],
-    );
-    let b = string_node(
-        vec![(b'a' as u32, b'z' as u32)],
-        0,
-        4,
-        vec![b'a' as u32, b'b' as u32],
-    );
+    let a = string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'a' as u32, b'a' as u32]);
+    let b = string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'a' as u32, b'b' as u32]);
     assert!(a.sort_key_ref() < b.sort_key_ref());
-    let a2 = string_node(
-        vec![(b'a' as u32, b'z' as u32)],
-        0,
-        4,
-        vec![b'a' as u32, b'a' as u32],
-    );
+    let a2 = string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'a' as u32, b'a' as u32]);
     assert!(a.sort_key_ref() == a2.sort_key_ref());
 }
 
@@ -718,15 +649,10 @@ fn nodes_sort_key_shortlex_orders_by_length_then_element() {
 #[test]
 fn choice_kind_unit_dispatches_to_each_sub_kind() {
     let ic = IntegerChoice::new(BigInt::from(0), BigInt::from(10), BigInt::from(0));
-    assert_eq!(
-        ChoiceKind::Integer(ic.clone()).unit().unwrap(),
-        ChoiceValue::Integer(ic.unit())
-    );
+    assert_eq!(ChoiceKind::Integer(ic.clone()).unit().unwrap(), ChoiceValue::Integer(ic.unit()));
 
     assert_eq!(
-        ChoiceKind::Boolean(BooleanChoice { p: 0.5 })
-            .unit()
-            .unwrap(),
+        ChoiceKind::Boolean(BooleanChoice { p: 0.5 }).unit().unwrap(),
         ChoiceValue::Boolean(BooleanChoice { p: 0.5 }.unit())
     );
 
@@ -736,14 +662,8 @@ fn choice_kind_unit_dispatches_to_each_sub_kind() {
         ChoiceValue::Float(fch.unit().unwrap())
     );
 
-    let bc = BytesChoice {
-        min_size: 0,
-        max_size: 4,
-    };
-    assert_eq!(
-        ChoiceKind::Bytes(bc.clone()).unit().unwrap(),
-        ChoiceValue::Bytes(bc.unit())
-    );
+    let bc = BytesChoice { min_size: 0, max_size: 4 };
+    assert_eq!(ChoiceKind::Bytes(bc.clone()).unit().unwrap(), ChoiceValue::Bytes(bc.unit()));
 
     let sc = string_choice(vec![(b'a' as u32, b'z' as u32)], 0, 4);
     assert_eq!(
@@ -757,10 +677,7 @@ fn engine_error_display_covers_all_variants() {
     assert!(EngineError::Overrun.to_string().contains("Overrun"));
     assert!(EngineError::InvalidTestCase.to_string().contains("Invalid"));
     assert!(EngineError::AssumeViolation.to_string().contains("Assume"));
-    assert_eq!(
-        EngineError::InvalidArgument("nope".to_string()).to_string(),
-        "nope"
-    );
+    assert_eq!(EngineError::InvalidArgument("nope".to_string()).to_string(), "nope");
     let internal = EngineError::from(crate::control::InternalError::new(format_args!("boom")));
     assert!(matches!(internal, EngineError::Internal(_)));
     let msg = internal.to_string();
@@ -786,23 +703,14 @@ fn node_sort_key_big_integer_orders_correctly() {
     let big_small = vec![big_integer_node(0)];
     let big_large = vec![big_integer_node(7)];
     assert!(sort_key(&big_small) < sort_key(&big_large));
-    let bytes = vec![ChoiceNode::bytes(
-        BytesChoice {
-            min_size: 0,
-            max_size: 4,
-        },
-        vec![1, 2, 3],
-        false,
-    )];
+    let bytes =
+        vec![ChoiceNode::bytes(BytesChoice { min_size: 0, max_size: 4 }, vec![1, 2, 3], false)];
     assert!(sort_key(&big) < sort_key(&bytes));
 }
 
 #[test]
 fn bytes_max_index() {
-    let kind = ChoiceKind::Bytes(BytesChoice {
-        min_size: 0,
-        max_size: 2,
-    });
+    let kind = ChoiceKind::Bytes(BytesChoice { min_size: 0, max_size: 2 });
     assert_eq!(kind.max_index(), Some(bu(65792)));
 }
 
@@ -821,10 +729,7 @@ fn string_max_index() {
 
 #[test]
 fn bytes_to_index_via_dispatch() {
-    let kind = ChoiceKind::Bytes(BytesChoice {
-        min_size: 0,
-        max_size: 4,
-    });
+    let kind = ChoiceKind::Bytes(BytesChoice { min_size: 0, max_size: 4 });
     let data = |v: Vec<u8>| kind.resolve(&ChoiceValue::Bytes(v)).unwrap();
     assert_eq!(data(vec![]).to_index().unwrap(), Some(bu(0)));
     assert_eq!(data(vec![0]).to_index().unwrap(), Some(bu(1)));
@@ -878,10 +783,7 @@ fn string_choice_empty_alphabet_zero_max_size_indexing_round_trips() {
     let sc = string_choice(vec![], 0, 0);
     assert_eq!(sc.max_index(), BigUint::from(0u32));
     assert_eq!(sc.to_index(&[]), BigUint::from(0u32));
-    assert_eq!(
-        sc.from_index(BigUint::from(0u32)).unwrap(),
-        Some(Vec::new())
-    );
+    assert_eq!(sc.from_index(BigUint::from(0u32)).unwrap(), Some(Vec::new()));
     assert_eq!(sc.from_index(BigUint::from(1u32)).unwrap(), None);
 }
 
@@ -898,10 +800,7 @@ fn boolean_node(value: bool) -> ChoiceNode {
 }
 
 fn clone_node(children: Vec<ChoiceNode>) -> ChoiceNode {
-    ChoiceNode::clone_stream(
-        std::sync::Arc::new(RealizedStream::new(children, Vec::new())),
-        false,
-    )
+    ChoiceNode::clone_stream(std::sync::Arc::new(RealizedStream::new(children, Vec::new())), false)
 }
 
 fn values_clone_value(values: Vec<ChoiceValue>) -> ChoiceValue {
@@ -920,21 +819,10 @@ fn clone_data_with_value_accepts_only_realized_clone_values() {
     let data = clone_node(Vec::new()).data;
     assert!(data.with_value(&clone_node(Vec::new()).value()).is_some());
     assert!(data.with_value(&values_clone_value(Vec::new())).is_none());
-    assert!(
-        data.with_value(&ChoiceValue::Integer(BigInt::from(0)))
-            .is_none()
-    );
+    assert!(data.with_value(&ChoiceValue::Integer(BigInt::from(0))).is_none());
     assert!(data.with_value(&ChoiceValue::Boolean(false)).is_none());
-    assert!(
-        boolean_node(false)
-            .with_value(&clone_node(Vec::new()).value())
-            .is_none()
-    );
-    assert!(
-        integer_node(0, 10, 0)
-            .with_value(&clone_node(Vec::new()).value())
-            .is_none()
-    );
+    assert!(boolean_node(false).with_value(&clone_node(Vec::new()).value()).is_none());
+    assert!(integer_node(0, 10, 0).with_value(&clone_node(Vec::new()).value()).is_none());
 }
 
 #[test]
@@ -947,9 +835,7 @@ fn clone_kind_simplest_and_unit_are_the_empty_clone() {
 #[test]
 fn simplest_clone_value_sort_key_compares_equal_to_an_executed_empty_stream() {
     let executed = clone_node(Vec::new());
-    let punned = executed
-        .with_value(&ChoiceKind::Clone.simplest().unwrap())
-        .unwrap();
+    let punned = executed.with_value(&ChoiceKind::Clone.simplest().unwrap()).unwrap();
     assert!(punned.sort_key_ref() == executed.sort_key_ref());
     assert!(executed.sort_key_ref() == punned.sort_key_ref());
 }
@@ -959,14 +845,7 @@ fn clone_value_equality_ignores_realized_info() {
     let children = vec![boolean_node(true), integer_node(0, 10, 3)];
     let realized = ChoiceValue::Clone(std::sync::Arc::new(CloneRecord::from_run(
         children.clone(),
-        vec![Span {
-            start: 0,
-            end: 2,
-            label: 17,
-            depth: 0,
-            parent: None,
-            discarded: false,
-        }],
+        vec![Span { start: 0, end: 2, label: 17, depth: 0, parent: None, discarded: false }],
     )));
     let values_only = values_clone_value(children.iter().map(|n| n.value().clone()).collect());
     assert_eq!(realized, values_only);
@@ -975,21 +854,11 @@ fn clone_value_equality_ignores_realized_info() {
 
 #[test]
 fn clone_value_equality_compares_child_values_recursively() {
-    let a = clone_node(vec![
-        boolean_node(true),
-        clone_node(vec![integer_node(0, 10, 3)]),
-    ])
-    .value();
-    let same = clone_node(vec![
-        boolean_node(true),
-        clone_node(vec![integer_node(0, 10, 3)]),
-    ])
-    .value();
-    let different = clone_node(vec![
-        boolean_node(true),
-        clone_node(vec![integer_node(0, 10, 4)]),
-    ])
-    .value();
+    let a = clone_node(vec![boolean_node(true), clone_node(vec![integer_node(0, 10, 3)])]).value();
+    let same =
+        clone_node(vec![boolean_node(true), clone_node(vec![integer_node(0, 10, 3)])]).value();
+    let different =
+        clone_node(vec![boolean_node(true), clone_node(vec![integer_node(0, 10, 4)])]).value();
     let shorter = clone_node(vec![boolean_node(true)]).value();
     assert_eq!(a, same);
     assert_eq!(value_hash(&a), value_hash(&same));
@@ -1002,10 +871,7 @@ fn clone_value_equality_compares_child_values_recursively() {
 fn flattened_len_counts_clone_children_recursively() {
     let nodes = vec![
         boolean_node(false),
-        clone_node(vec![
-            boolean_node(true),
-            clone_node(vec![integer_node(0, 10, 1)]),
-        ]),
+        clone_node(vec![boolean_node(true), clone_node(vec![integer_node(0, 10, 1)])]),
     ];
     assert_eq!(flattened_len(&nodes), 5);
     assert_eq!(flattened_len(&[boolean_node(true)]), 1);
@@ -1063,11 +929,7 @@ fn nodes_sort_key_shrinking_inside_clone_is_smaller() {
 fn nodes_sort_key_equal_flat_count_shorter_top_level_wins() {
     use crate::native::core::sort_key;
     let nested = vec![clone_node(vec![boolean_node(true)]), boolean_node(true)];
-    let flat = vec![
-        boolean_node(false),
-        boolean_node(false),
-        boolean_node(false),
-    ];
+    let flat = vec![boolean_node(false), boolean_node(false), boolean_node(false)];
     assert_eq!(flattened_len(&nested), flattened_len(&flat));
     assert!(sort_key(&nested) < sort_key(&flat));
 }
@@ -1084,14 +946,7 @@ fn node_sort_key_ref_clone_category_above_scalars_and_sequences() {
 
 #[test]
 fn clone_record_accessors_expose_children_and_realized_info() {
-    let span = Span {
-        start: 0,
-        end: 1,
-        label: 42,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    };
+    let span = Span { start: 0, end: 1, label: 42, depth: 0, parent: None, discarded: false };
     let record = CloneRecord::from_run(vec![boolean_node(true)], vec![span.clone()]);
     assert_eq!(record.len(), 1);
     assert!(!record.is_empty());
@@ -1182,10 +1037,7 @@ fn choice_data_equality_compares_constraint_and_value() {
             ChoiceNode::float(fc(0.0, 1.0, false, false), 0.25, false).data,
             ChoiceNode::float(fc(0.0, 1.0, false, false), 0.5, false).data,
         ),
-        (
-            bytes_node(0, 4, vec![1]).data,
-            bytes_node(0, 4, vec![2]).data,
-        ),
+        (bytes_node(0, 4, vec![1]).data, bytes_node(0, 4, vec![2]).data),
         (
             string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'a' as u32]).data,
             string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'b' as u32]).data,
@@ -1211,10 +1063,7 @@ fn choice_data_equality_differs_on_constraint_with_equal_values() {
         ChoiceNode::float(fc(0.0, 1.0, false, false), 0.5, false).data,
         ChoiceNode::float(fc(0.0, 2.0, false, false), 0.5, false).data
     );
-    assert_ne!(
-        bytes_node(0, 4, vec![1]).data,
-        bytes_node(0, 5, vec![1]).data
-    );
+    assert_ne!(bytes_node(0, 4, vec![1]).data, bytes_node(0, 5, vec![1]).data);
     assert_ne!(
         string_node(vec![(b'a' as u32, b'z' as u32)], 0, 4, vec![b'a' as u32]).data,
         string_node(vec![(b'a' as u32, b'z' as u32)], 0, 5, vec![b'a' as u32]).data
@@ -1224,20 +1073,13 @@ fn choice_data_equality_differs_on_constraint_with_equal_values() {
 #[test]
 fn choice_data_as_float_is_none_for_other_kinds() {
     assert!(integer_node(0, 10, 3).data.as_float().is_none());
-    assert!(
-        ChoiceNode::float(fc(0.0, 1.0, false, false), 0.5, false)
-            .data
-            .as_float()
-            .is_some()
-    );
+    assert!(ChoiceNode::float(fc(0.0, 1.0, false, false), 0.5, false).data.as_float().is_some());
 }
 
 #[test]
 fn clone_kind_has_no_dense_index() {
     assert_eq!(
-        ChoiceKind::Clone
-            .from_index(crate::native::bignum::BigUint::from(0u32))
-            .unwrap(),
+        ChoiceKind::Clone.from_index(crate::native::bignum::BigUint::from(0u32)).unwrap(),
         None
     );
     assert_eq!(ChoiceKind::Clone.max_index(), None);
@@ -1254,14 +1096,8 @@ fn a_choice_node_is_a_few_words() {
     assert_eq!(wide.max_value(), BigInt::from(u128::MAX));
     assert!(wide.validate(&BigInt::from(u64::MAX)) && !wide.validate(&BigInt::from(-1)));
     assert!(small.validate(&BigInt::from(i64::MAX)) && !small.validate(&BigInt::from(u64::MAX)));
-    assert_eq!(
-        small.sort_key(&BigInt::from(-3)),
-        (BigUint::from(3u32), true)
-    );
-    assert_eq!(
-        wide.sort_key(&BigInt::from(-3)),
-        (BigUint::from(3u32), true)
-    );
+    assert_eq!(small.sort_key(&BigInt::from(-3)), (BigUint::from(3u32), true));
+    assert_eq!(wide.sort_key(&BigInt::from(-3)), (BigUint::from(3u32), true));
     assert_eq!(
         IntegerChoice::new(5, 9, 0).clamped_shrink_towards(),
         IntegerChoice::new(BigInt::from(5), BigInt::from(u128::MAX), BigInt::from(0))
@@ -1298,9 +1134,7 @@ fn grammar_constraint(text: &str, max_size: usize, simplest: &str) -> Arc<Gramma
     let grammar = compile(&built, &["start"]).unwrap();
     let start = grammar.start[0];
     let constraint = GrammarConstraint::new(grammar, start, max_size, u32::MAX, None).unwrap();
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest))).unwrap();
     Arc::new(constraint)
 }
 
@@ -1318,9 +1152,7 @@ fn grammar_string_choice(text: &str, max_size: usize, simplest: &str) -> StringC
         .into(),
         min_size: 0,
         max_size,
-        constraint: Some(Constraint::Grammar(grammar_constraint(
-            text, max_size, simplest,
-        ))),
+        constraint: Some(Constraint::Grammar(grammar_constraint(text, max_size, simplest))),
     }
 }
 
@@ -1353,10 +1185,7 @@ fn a_grammar_string_choices_simplest_and_unit_are_the_grammars_simplest_string()
     assert_eq!(kind.simplest().unwrap(), ChoiceValue::String(cps("a")));
     assert_eq!(kind.unit().unwrap(), ChoiceValue::String(cps("a")));
     let node = ChoiceNode::string(sc, cps("ab"), false);
-    assert_eq!(
-        node.data.simplest_value().unwrap(),
-        ChoiceValue::String(cps("a"))
-    );
+    assert_eq!(node.data.simplest_value().unwrap(), ChoiceValue::String(cps("a")));
     assert!(!node.data.is_simplest().unwrap());
     let simplest = node.with_simplest().unwrap();
     assert!(simplest.data.is_simplest().unwrap());
@@ -1407,18 +1236,10 @@ fn grammar_string_choices_compare_by_the_grammars_identity() {
         ChoiceNode::string(b, cps("a"), false)
     );
     assert_ne!(a, grammar_string_choice("start: \"a\" \"c\"*\n", 4, "a"));
-    assert_ne!(
-        a,
-        StringChoice {
-            constraint: None,
-            ..a.clone()
-        }
-    );
+    assert_ne!(a, StringChoice { constraint: None, ..a.clone() });
     let shown = alloc::format!("{a:?}");
-    let identity = alloc::format!(
-        "{:016x}",
-        a.constraint.as_ref().unwrap().grammar().unwrap().identity()
-    );
+    let identity =
+        alloc::format!("{:016x}", a.constraint.as_ref().unwrap().grammar().unwrap().identity());
     assert!(shown.contains("GrammarConstraint"), "{shown}");
     assert!(shown.contains(&identity), "{shown}");
 }
@@ -1428,10 +1249,7 @@ fn a_grammar_strings_value_serialises_like_any_string() {
     let node = ChoiceNode::string(grammar_string_choice(AB, 4, "a"), cps("abb"), false);
     let bytes = crate::native::database::serialize_choices(&[node.value()]).unwrap();
     let plain = string_node(vec![(b'a' as u32, b'b' as u32)], 0, 4, cps("abb"));
-    assert_eq!(
-        bytes,
-        crate::native::database::serialize_choices(&[plain.value()]).unwrap()
-    );
+    assert_eq!(bytes, crate::native::database::serialize_choices(&[plain.value()]).unwrap());
     assert_eq!(
         crate::native::database::deserialize_choices_exact(&bytes).unwrap(),
         vec![ChoiceValue::String(cps("abb"))]

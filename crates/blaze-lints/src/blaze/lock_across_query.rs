@@ -17,7 +17,6 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{AsAssocItem as _, HirDisplay as _, HirFileId};
 use hir_def::{
     DefWithBodyId, FunctionId,
@@ -28,6 +27,7 @@ use hir_expand::{MacroDefKind, proc_macro::ProcMacroKind};
 use hir_ty::{InferBodyId, db::HirDatabase as _, next_solver::GenericArgs};
 use hir_ty_mir::mir::{BasicBlockId, MirBody, MirSpan, TerminatorKind};
 use rustc_type_ir::inherent::GenericArgs as _;
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use super::{
@@ -150,7 +150,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let mut calls: Vec<(ExprId, FunctionId, &Query)> = Vec::new();
         for (block, data) in mir.basic_blocks.iter() {
             let Some(terminator) = &data.terminator else { continue };
-            let (TerminatorKind::Call { .. }, MirSpan::ExprId(expr)) = (&terminator.kind, terminator.span) else {
+            let (TerminatorKind::Call { .. }, MirSpan::ExprId(expr)) =
+                (&terminator.kind, terminator.span)
+            else {
                 continue;
             };
             let Some((_, f, query)) = queries.iter().find(|(it, ..)| *it == expr) else { continue };
@@ -167,10 +169,16 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 let mut guards: Vec<String> = Vec::new();
                 for &local in locals.iter() {
                     let ty = analysis.ty(mir.locals[local].ty.as_ref());
-                    if ty.is_reference() || facts::holds(db, &ty, HOLDS_DEPTH, &mut |adt| is_guard(db, adt)).is_none() {
+                    if ty.is_reference()
+                        || facts::holds(db, &ty, HOLDS_DEPTH, &mut |adt| is_guard(db, adt))
+                            .is_none()
+                    {
                         continue;
                     }
-                    let binding = mir.binding_locals.iter().find_map(|(binding, &it)| (it == local).then_some(binding));
+                    let binding = mir
+                        .binding_locals
+                        .iter()
+                        .find_map(|(binding, &it)| (it == local).then_some(binding));
                     let ty = ty.display(db, target);
                     let said = match binding {
                         Some(binding) => format!("`{}` (`{ty}`)", body[binding].name.as_str()),
@@ -184,7 +192,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 let Some(range) = analysis.expr_range(expr) else { continue };
                 let name = FunctionSignature::of(db, f).name.as_str();
                 let message = match &*guards {
-                    [_] => format!("the lock guard {first} is held across the query `{name}` ({})", query.say()),
+                    [_] => format!(
+                        "the lock guard {first} is held across the query `{name}` ({})",
+                        query.say()
+                    ),
                     _ => format!(
                         "the lock guards {} are held across the query `{name}` ({})",
                         guards.join(", "),
@@ -193,7 +204,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 };
                 let note = "a lock is held for a field update, never across a query call (AGENTS.md rule 9): the query \
                             may run long or wait, and every task that wants the lock queues behind it meanwhile";
-                facts::push(&mut found, Lint::LockAcrossQuery, range, message, Some(note.to_owned()));
+                facts::push(
+                    &mut found,
+                    Lint::LockAcrossQuery,
+                    range,
+                    message,
+                    Some(note.to_owned()),
+                );
             }
         });
     }
@@ -203,11 +220,18 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 fn is_guard(db: &Db, adt: hir::Adt) -> bool {
     let name = adt.name(db);
     let krate = adt.module(db).krate(db);
-    GUARDS.iter().any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it))
+    GUARDS
+        .iter()
+        .any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it))
 }
 
 /// Whether a call of `f` with `args` is a query, and what makes it one.
-pub(super) fn query_of<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, f: FunctionId, args: GenericArgs<'db>) -> Option<Query> {
+pub(super) fn query_of<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    f: FunctionId,
+    args: GenericArgs<'db>,
+) -> Option<Query> {
     if let Some(name) = query_macro(db, f) {
         return Some(Query::Macro(name));
     }
@@ -216,14 +240,19 @@ pub(super) fn query_of<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, f: F
         hir::AssocItemContainer::Trait(trait_) => (trait_, analysis.ty(args.type_at(0))),
         hir::AssocItemContainer::Impl(imp) => (imp.trait_(db)?, imp.self_ty(db)),
     };
-    let on_db = self_ty.strip_references().as_adt().is_some_and(|it| facts::adt_is(db, it, "base_db", "Db"));
+    let on_db = self_ty
+        .strip_references()
+        .as_adt()
+        .is_some_and(|it| facts::adt_is(db, it, "base_db", "Db"));
     on_db.then(|| Query::Database(trait_.name(db).as_str().to_owned()))
 }
 
 /// The attribute macro of `blaze_query_macros` that made `f`, if one of [`QUERY_MACROS`] did:
 /// the macro of the call whose expansion `f` is defined in.
 pub(super) fn query_macro(db: &Db, f: FunctionId) -> Option<&'static str> {
-    let HirFileId::MacroFile(call) = DefWithBodyId::from(f).erased_ast_id(db).file_id else { return None };
+    let HirFileId::MacroFile(call) = DefWithBodyId::from(f).erased_ast_id(db).file_id else {
+        return None;
+    };
     let loc = call.loc(db);
     let &MacroDefKind::ProcMacro(id, _, ProcMacroKind::Attr) = &loc.def.kind else { return None };
     if !facts::crate_is(db, hir::Crate::from(loc.def.krate), "blaze_query_macros") {

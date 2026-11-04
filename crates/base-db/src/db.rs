@@ -23,12 +23,12 @@ use std::{
 
 use crossbeam_queue::SegQueue;
 
+use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
 use blaze_query::db::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
-use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
 
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
@@ -368,7 +368,9 @@ impl Db {
         durability: Option<Durability>,
     ) {
         let files = Arc::clone(&self.files);
-        self.write_crates("Db::set_crate_attr_files", |db| files.set_crate_attr_files(db, krate, gone, durability));
+        self.write_crates("Db::set_crate_attr_files", |db| {
+            files.set_crate_attr_files(db, krate, gone, durability)
+        });
     }
 
     /// A new file with `of`'s path and text, whose appended root module is its own: see
@@ -391,7 +393,9 @@ impl Db {
         appended: Option<(&'static str, &str)>,
     ) -> Result<(), crate::AliasError> {
         let files = Arc::clone(&self.files);
-        self.write_file("Db::set_alias_appended", alias, |db| files.set_alias_appended(db, alias, appended))
+        self.write_file("Db::set_alias_appended", alias, |db| {
+            files.set_alias_appended(db, alias, appended)
+        })
     }
 
     /// Sets the inputs of one view's files, writing only those that changed: see
@@ -536,7 +540,9 @@ impl Db {
     /// caller's file and line in `function`, so a profile says whose tasks a stretch ran.
     #[track_caller]
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
-        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| frame::task(tag, |_| task(db, at)));
+        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| {
+            frame::task(tag, |_| task(db, at))
+        });
     }
 
     /// [`Db::run_all`] for a maintainer's reads, each task in its own frame: under
@@ -588,11 +594,18 @@ impl Db {
                     RunOrder::InOrder | RunOrder::LeftToReaders | RunOrder::OnPool => {
                         items.iter_mut().enumerate().for_each(|(at, item)| once(at, item));
                     }
-                    RunOrder::Reversed => items.iter_mut().enumerate().rev().for_each(|(at, item)| once(at, item)),
+                    RunOrder::Reversed => {
+                        items.iter_mut().enumerate().rev().for_each(|(at, item)| once(at, item))
+                    }
                     RunOrder::Strided(stride) => {
                         let stride = stride.max(1);
                         for first in 0..stride {
-                            items.iter_mut().enumerate().skip(first).step_by(stride).for_each(|(at, item)| once(at, item));
+                            items
+                                .iter_mut()
+                                .enumerate()
+                                .skip(first)
+                                .step_by(stride)
+                                .for_each(|(at, item)| once(at, item));
                         }
                     }
                 }
@@ -624,7 +637,8 @@ impl Db {
         // Each task with its database attached, as a query's run is: it runs between queries,
         // on whichever worker, and formats against the database it was given.
         let run = |db: &Db, at: usize| {
-            let span = tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
+            let span =
+                tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
             let _span = span.entered();
             blaze_query::db::attach(db, || task(db, at))
         };
@@ -673,7 +687,10 @@ impl Db {
     /// On a database not made by [`Db::for_tests`] or [`Db::logged`]: a build's keeps no
     /// events.
     pub fn log(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
-        let log = self.log.as_ref().expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        let log = self
+            .log
+            .as_ref()
+            .expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(f)
     }
 
@@ -681,7 +698,10 @@ impl Db {
     /// what the write-side maintainers ran in it.
     pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event> {
         // clone: one count of the log, tests only, so `f` can borrow the database.
-        let log = self.log.clone().expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        let log = self
+            .log
+            .clone()
+            .expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(|| f(self))
     }
 
@@ -710,9 +730,9 @@ impl Db {
         self.log(f)
             .into_iter()
             .filter_map(|event| match event.kind {
-                blaze_query::db::EventKind::WillExecute { database_key } => Some(
-                    self.storage.ingredient_name(database_key.ingredient_index()).to_owned(),
-                ),
+                blaze_query::db::EventKind::WillExecute { database_key } => {
+                    Some(self.storage.ingredient_name(database_key.ingredient_index()).to_owned())
+                }
                 _ => None,
             })
             .collect() // alloc: tests only
@@ -735,7 +755,12 @@ fn name_row(ingredient: &'static str, id: blaze_query::db::Id, out: &mut String)
         let Some(db) = db else { return false };
         match ingredient {
             "FileText" => {
-                let Some(text) = <FileText as blaze_query::db::FromIdIn>::from_id_in(blaze_query::db::Database::storage(db), id) else { return false };
+                let Some(text) = <FileText as blaze_query::db::FromIdIn>::from_id_in(
+                    blaze_query::db::Database::storage(db),
+                    id,
+                ) else {
+                    return false;
+                };
                 let file = text.file_id(db);
                 match db.path_for_file(file) {
                     Some(path) => _ = write!(out, "{path}"),

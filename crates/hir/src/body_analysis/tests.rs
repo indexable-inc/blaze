@@ -4,17 +4,16 @@
 
 use base_db::Db;
 use hir_def::{ItemContainerId, Lookup as _, hir::ExprId};
+use hir_expand::fixture;
 use hir_expand::{HirFileId, InFile, name::Name};
 use syntax::{
     AstNode, AstPtr, SyntaxKind, ast,
     view::{self, AstNode as _, Typed},
 };
-use hir_expand::fixture;
 
 use super::BodyAnalysis;
 use crate::{
-    Crate, DefWithBody, DisplayTarget, Function, HirDisplay, Local, ModuleDef, PathResolution,
-    Type,
+    Crate, DefWithBody, DisplayTarget, Function, HirDisplay, Local, ModuleDef, PathResolution, Type,
 };
 
 const BODY: &str = r#"

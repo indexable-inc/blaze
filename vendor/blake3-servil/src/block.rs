@@ -28,7 +28,9 @@ impl Block {
     /// The blocks' bytes, in order, for writing.
     pub fn bytes_mut(blocks: &mut [Block]) -> &mut [u8] {
         // Sound: as in bytes, and the borrow is exclusive.
-        unsafe { core::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast(), blocks.len() * BLOCK_LEN) }
+        unsafe {
+            core::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast(), blocks.len() * BLOCK_LEN)
+        }
     }
 
     /// `bytes` as blocks, without a copy, when they start on a 64-byte
@@ -103,7 +105,10 @@ impl Batch<'static> {
     /// making, not as its pages are first touched: make one and refill it.
     #[inline]
     pub fn new(message_len: usize, count: usize) -> Self {
-        Batch { blocks: std::vec![Block::ZERO; blocks_per(message_len) * count].into(), message_len }
+        Batch {
+            blocks: std::vec![Block::ZERO; blocks_per(message_len) * count].into(),
+            message_len,
+        }
     }
 }
 
@@ -130,10 +135,16 @@ impl<'a> Batch<'a> {
     #[cfg(test)]
     pub(crate) fn in_place(blocks: &'a [Block], message_len: usize) -> Self {
         let per = blocks_per(message_len);
-        assert!(blocks.len() % per == 0, "{} blocks hold no whole number of {message_len}-byte messages", blocks.len());
+        assert!(
+            blocks.len() % per == 0,
+            "{} blocks hold no whole number of {message_len}-byte messages",
+            blocks.len()
+        );
         let slot = per * BLOCK_LEN;
         assert!(
-            Block::bytes(blocks).chunks_exact(slot).all(|s| message_len == 0 || s[message_len..].iter().all(|&b| b == 0)),
+            Block::bytes(blocks)
+                .chunks_exact(slot)
+                .all(|s| message_len == 0 || s[message_len..].iter().all(|&b| b == 0)),
             "a test's batch has a nonzero byte past a message"
         );
         Batch { blocks: blocks.into(), message_len }
@@ -184,7 +195,11 @@ impl Batch<'_> {
     /// Every byte for writing, where no message has bytes past its end to
     /// keep zero: `message_len` a multiple of 64 and not 0.
     pub fn blocks_mut(&mut self) -> &mut [Block] {
-        assert!(self.message_len % BLOCK_LEN == 0 && self.message_len > 0, "a batch whose messages leave no bytes past their ends ({} B)", self.message_len);
+        assert!(
+            self.message_len % BLOCK_LEN == 0 && self.message_len > 0,
+            "a batch whose messages leave no bytes past their ends ({} B)",
+            self.message_len
+        );
         self.blocks.to_mut()
     }
 
@@ -193,7 +208,11 @@ impl Batch<'_> {
     /// messages are pairs of children. A layer of an odd count leaves a
     /// digest to spare: slice it, `&mut batch.digests_mut()[..count]`.
     pub fn digests_mut(&mut self) -> &mut [[u8; 32]] {
-        assert!(self.message_len == 2 * 32, "digests_mut takes a batch of 64-byte messages, two digests each, not {} B", self.message_len);
+        assert!(
+            self.message_len == 2 * 32,
+            "digests_mut takes a batch of 64-byte messages, two digests each, not {} B",
+            self.message_len
+        );
         let blocks = self.blocks.to_mut();
         // Sound: a [u8; 32] is 32 bytes with alignment 1; two fill a Block.
         unsafe { core::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast(), blocks.len() * 2) }
@@ -220,12 +239,19 @@ mod test {
                 }
                 let per = len.div_ceil(BLOCK_LEN).max(1) * BLOCK_LEN;
                 for (i, slot) in Block::bytes(batch.blocks()).chunks(per).enumerate() {
-                    assert!(slot[len..].iter().all(|&b| b == 0), "{len} B, message {i}: its padding");
+                    assert!(
+                        slot[len..].iter().all(|&b| b == 0),
+                        "{len} B, message {i}: its padding"
+                    );
                 }
                 let mut out = [[0u8; 32]; 5];
                 hash_many(Mode::Plain, &batch, &mut out);
                 for (i, d) in out.iter().enumerate() {
-                    assert_eq!(*d, *crate::convenience::hash(&std::vec![round * 16 + i as u8; len]).as_bytes(), "{len} B, message {i}, round {round}");
+                    assert_eq!(
+                        *d,
+                        *crate::convenience::hash(&std::vec![round * 16 + i as u8; len]).as_bytes(),
+                        "{len} B, message {i}, round {round}"
+                    );
                 }
             }
         }
@@ -251,13 +277,24 @@ mod test {
         crate::initialize();
         let blocks: std::vec::Vec<Block> = (0..4).map(|i| Block([i as u8; 64])).collect();
         let batch = Batch::from_blocks(&blocks, 128);
-        assert_eq!((batch.len(), batch.blocks().as_ptr()), (2, blocks.as_ptr()), "borrowed, not copied");
+        assert_eq!(
+            (batch.len(), batch.blocks().as_ptr()),
+            (2, blocks.as_ptr()),
+            "borrowed, not copied"
+        );
         let mut out = [[0u8; 32]; 2];
         hash_many(Mode::Plain, &batch, &mut out);
         assert_eq!(out[1], *crate::convenience::hash(Block::bytes(&blocks[2..])).as_bytes());
-        assert!(std::panic::catch_unwind(|| Batch::from_blocks(&blocks, 100)).is_err(), "100-byte messages");
+        assert!(
+            std::panic::catch_unwind(|| Batch::from_blocks(&blocks, 100)).is_err(),
+            "100-byte messages"
+        );
         let partial = Batch::from_blocks(&blocks[..3], 128);
-        assert!(std::panic::catch_unwind(move || hash_many(Mode::Plain, &partial, &mut [[0u8; 32]; 1])).is_err(), "three blocks of 128-byte messages");
+        assert!(
+            std::panic::catch_unwind(move || hash_many(Mode::Plain, &partial, &mut [[0u8; 32]; 1]))
+                .is_err(),
+            "three blocks of 128-byte messages"
+        );
     }
 
     #[test]
@@ -287,7 +324,9 @@ mod test {
         let mut root = [[0u8; 32]; 2];
         hash_many(Mode::Keyed(&key), &parents, &mut root);
         let leaf = |i: u8| *crate::convenience::hash_with(Mode::Keyed(&key), &[i; 256]).as_bytes();
-        let parent = |a: [u8; 32], b: [u8; 32]| *crate::convenience::hash_with(Mode::Keyed(&key), &[a, b].concat()).as_bytes();
+        let parent = |a: [u8; 32], b: [u8; 32]| {
+            *crate::convenience::hash_with(Mode::Keyed(&key), &[a, b].concat()).as_bytes()
+        };
         assert_eq!(root[0], parent(leaf(0), leaf(1)));
         assert_eq!(root[1], parent(leaf(2), leaf(3)));
     }
@@ -306,7 +345,11 @@ mod test {
         let digests = parents.digests_mut();
         assert_eq!(digests.len(), 6);
         digests[5] = [7; 32];
-        assert_eq!(&parents.blocks()[2].0[32..], &[7u8; 32][..], "the sixth digest is block 2's second half");
+        assert_eq!(
+            &parents.blocks()[2].0[32..],
+            &[7u8; 32][..],
+            "the sixth digest is block 2's second half"
+        );
         assert_eq!(&parents.blocks()[2].0[..32], &[0u8; 32][..]);
         assert!(std::format!("{:?}", Block::ZERO).starts_with("Block([00, 00"));
     }

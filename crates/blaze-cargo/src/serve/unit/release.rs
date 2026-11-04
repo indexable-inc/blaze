@@ -239,7 +239,10 @@ impl Release<Crate> {
         // One line each release in the daemon's log, on its standard error as the memory line
         // is: why, what went, blaze's memory before and after against the limit (B5), and the
         // query storage's largest holders.
-        eprintln!("blaze serve: {}", Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage });
+        eprintln!(
+            "blaze serve: {}",
+            Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage }
+        );
     }
 }
 
@@ -329,14 +332,27 @@ impl std::fmt::Display for Said {
         let Said { crates, mir, pressed, ended, dropped, before, after, storage: _ } = self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
-            (true, _) if before.squeezed() => write!(f, "memory: blaze is past the limit's line of {:.2} GiB", gib(before.limit - before.limit / admission::LINE))?,
-            (true, Some(tag)) => write!(f, "memory: {} is past its share of {:.2} GiB", tag.name(), gib(admission::fair_share(tag, before.limit)))?,
+            (true, _) if before.squeezed() => write!(
+                f,
+                "memory: blaze is past the limit's line of {:.2} GiB",
+                gib(before.limit - before.limit / admission::LINE)
+            )?,
+            (true, Some(tag)) => write!(
+                f,
+                "memory: {} is past its share of {:.2} GiB",
+                tag.name(),
+                gib(admission::fair_share(tag, before.limit))
+            )?,
             (true, None) => f.write_str("memory")?,
             (false, _) if *ended => f.write_str("the build is over")?,
             (false, _) if *mir => f.write_str("no unit is open")?,
             (false, _) => f.write_str("crates finished")?,
         }
-        write!(f, "): let go of {} inference results of {} bodies in {crates} crates", dropped.inference, dropped.bodies)?;
+        write!(
+            f,
+            "): let go of {} inference results of {} bodies in {crates} crates",
+            dropped.inference, dropped.bodies
+        )?;
         if *mir {
             write!(f, ", {} MIR bodies, {} constant values", dropped.mir, dropped.const_eval)?;
         }
@@ -347,7 +363,11 @@ impl std::fmt::Display for Said {
         write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
         match before.held.checked_sub(after.held) {
             Some(freed) => write!(f, " ({:.2} freed)", gib(freed))?,
-            None => write!(f, " ({:.2} more: other tasks grew meanwhile)", gib(after.held - before.held))?,
+            None => write!(
+                f,
+                " ({:.2} more: other tasks grew meanwhile)",
+                gib(after.held - before.held)
+            )?,
         }
         match before.limit {
             u64::MAX => f.write_str(", under no limit")?,
@@ -397,7 +417,9 @@ impl<K: Copy + Eq + Hash> Release<K> {
     /// build is over, or the build compiles and no unit is open and a crate is finished (no
     /// reader to wait for).
     pub(crate) fn due(&self) -> bool {
-        self.pressed || self.ended || (self.compiles && self.finished.idle() && self.finished.has_ready())
+        self.pressed
+            || self.ended
+            || (self.compiles && self.finished.idle() && self.finished.has_ready())
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);
@@ -409,7 +431,12 @@ impl<K: Copy + Eq + Hash> Release<K> {
         let pressed = std::mem::take(&mut self.pressed);
         let ended = std::mem::take(&mut self.ended);
         if !self.compiles {
-            return (pressed || ended).then(|| Plan { crates: Vec::new(), mir: true, pressed, ended });
+            return (pressed || ended).then(|| Plan {
+                crates: Vec::new(),
+                mir: true,
+                pressed,
+                ended,
+            });
         }
         let crates = self.finished.take();
         let mir = pressed || ended || self.finished.idle();

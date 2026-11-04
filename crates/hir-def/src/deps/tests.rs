@@ -9,7 +9,6 @@ use std::{
 use base_db::{Crate, CrateOrigin, Db, Env, FileId};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_expand::fixture;
 use hir_expand::proc_macro::{
@@ -17,6 +16,7 @@ use hir_expand::proc_macro::{
     ProcMacroKind, StateUse,
 };
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::*;
 use crate::{nameres::frozen, test_db::TestDB};
@@ -252,17 +252,15 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
     let _turn = TURN.lock();
     for fixture in [FIXTURE, READING] {
         let memory = Memory::default();
-        let open = || if fixture == READING { reading_db() } else { fixture::db(fixture).into_db() };
+        let open =
+            || if fixture == READING { reading_db() } else { fixture::db(fixture).into_db() };
         let mut db = open();
         let crates = all(&db);
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
         let stored = store(&db, &served, &memory).unwrap();
         assert_eq!(stored.filed.len(), stored.written.len());
-        let filed: HashMap<String, ContentId, Global> = stored
-            .filed
-            .iter()
-            .map(|(&krate, &key)| (krate.named(&db).to_string(), key))
-            .collect();
+        let filed: HashMap<String, ContentId, Global> =
+            stored.filed.iter().map(|(&krate, &key)| (krate.named(&db).to_string(), key)).collect();
         let mut db = open();
         let crates = all(&db);
         serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
@@ -386,11 +384,7 @@ fn values_of(shape: &[u8]) -> ContentId {
 struct Reading;
 
 impl ProcMacroExpander for Reading {
-    fn expand(
-        &self,
-        _: &Db,
-        call: ProcMacroCall<'_>,
-    ) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let reads = ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) };
         Ok(Expanded { tree: call.subtree.copy(), reads, state: StateUse::Fixed })
     }
@@ -485,11 +479,7 @@ fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
         assert_ne!(filed, served.keys[&lib], "an image with reads is filed by them, not the key");
         let def_map = crate::nameres::crate_def_map(&db, lib);
         let fresh_map = crate::nameres::crate_def_map(&fresh, live);
-        assert_eq!(
-            def_map.diagnostics(&db).len(),
-            fresh_map.diagnostics(&fresh).len(),
-            "{mode:?}"
-        );
+        assert_eq!(def_map.diagnostics(&db).len(), fresh_map.diagnostics(&fresh).len(), "{mode:?}");
         assert_eq!(frozen::encode(&db, lib), frozen::encode(&fresh, live), "{mode:?}");
         assert_eq!(
             signatures::encode(&db, lib, &mut Vec::new()),
@@ -554,7 +544,11 @@ fn a_read_of_a_proc_macro_among_an_impls_items_files_the_image() {
     };
     let fresh = reading_db_of(READING_IN_IMPL);
     let reads = Reads::of(&fresh, crate_named(&fresh, "lib"), &[]).unwrap();
-    assert_eq!(reads, Reads::for_tests(&[], &[(SHAPE, values_of(SHAPE))]), "the impl's call is read");
+    assert_eq!(
+        reads,
+        Reads::for_tests(&[], &[(SHAPE, values_of(SHAPE))]),
+        "the impl's call is read"
+    );
 
     let (db, served, lib) = serve_lib();
     let stored = store(&db, &served, &memory).unwrap();
@@ -624,9 +618,15 @@ fn the_expansion_log_has_a_crates_reads_whether_they_ran_or_were_served() {
     VALUE.store(0, SeqCst);
     let logged = |db: &TestDB| -> Vec<base_db::ExpansionRead> {
         let lib = crate_named(db, "lib");
-        db.files().expansions_read().into_iter().filter(|(by, _)| *by == lib).map(|(_, it)| it).collect()
+        db.files()
+            .expansions_read()
+            .into_iter()
+            .filter(|(by, _)| *by == lib)
+            .map(|(_, it)| it)
+            .collect()
     };
-    let read = vec![base_db::ExpansionRead::Traced { shape: SHAPE.into(), values: values_of(SHAPE) }];
+    let read =
+        vec![base_db::ExpansionRead::Traced { shape: SHAPE.into(), values: values_of(SHAPE) }];
     let memory = Memory::default();
     store_reading(&memory);
     let ran = reading_db();
@@ -649,11 +649,7 @@ static TRACES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 struct Flaky;
 
 impl ProcMacroExpander for Flaky {
-    fn expand(
-        &self,
-        _: &Db,
-        call: ProcMacroCall<'_>,
-    ) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let reads = match TRACES.load(SeqCst) {
             true => ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) },
             false => ExpansionReads::Unknown("its server could not trace it"),
@@ -712,19 +708,27 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
     let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
     let unknown = |db: &TestDB| {
         let log = db.files().expansions_read();
-        log.iter().any(|(by, read)| *by == lib && matches!(read, base_db::ExpansionRead::Unknown(_)))
+        log.iter()
+            .any(|(by, read)| *by == lib && matches!(read, base_db::ExpansionRead::Unknown(_)))
     };
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(unknown(&db), "the expansion ran and could not be traced");
     let refused = closure_expansion_reads(&db, main).unwrap_err();
-    assert!(matches!(&refused, Refused::ProcMacro { why: "its server could not trace it", .. }), "{refused:?}");
+    assert!(
+        matches!(&refused, Refused::ProcMacro { why: "its server could not trace it", .. }),
+        "{refused:?}"
+    );
 
     TRACES.store(true, SeqCst);
     db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made {}\n");
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(!unknown(&db), "the call's latest expansion traced: its unknown read is replaced");
     let read = closure_expansion_reads(&db, main).unwrap();
-    assert_eq!(read, vec![(lib, vec![(Box::<[u8]>::from(SHAPE), values_of(SHAPE))])], "main's reads are kept again");
+    assert_eq!(
+        read,
+        vec![(lib, vec![(Box::<[u8]>::from(SHAPE), values_of(SHAPE))])],
+        "main's reads are kept again"
+    );
 
     TRACES.store(false, SeqCst);
     db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made;\n");
@@ -733,7 +737,10 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
     db.set_file_text(file, "pub struct Made;\n");
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(unknown(&db), "the call is gone, and what it last read stays in the log");
-    assert!(closure_expansion_reads(&db, main).is_ok(), "the crate's calls as they are now refuse nothing");
+    assert!(
+        closure_expansion_reads(&db, main).is_ok(),
+        "the crate's calls as they are now refuse nothing"
+    );
     TRACES.store(false, SeqCst);
 }
 
@@ -1208,7 +1215,11 @@ fn a_serve_that_finds_nothing_writes_nothing() {
     let passes = db.maintain_passes();
     let served = serve(&mut db, &crates, BUILD, &Memory::default(), Mode::Serve).unwrap();
     assert_eq!(served.hits, Vec::new());
-    assert_eq!(db.maintain_passes(), passes, "a cold store's misses change nothing a maintainer reads");
+    assert_eq!(
+        db.maintain_passes(),
+        passes,
+        "a cold store's misses change nothing a maintainer reads"
+    );
     let raw: &Db = &db;
     assert!(DepImages::try_get(raw).is_none(), "nothing served, nothing given");
 }
@@ -1452,11 +1463,21 @@ fn a_key_made_before_or_after_the_expansions_leaves_the_same_reads() {
             }
         };
         let files = db.files();
-        (key, signature, files.included_by(&db, lib), files.included_files(), files.sources_included_by())
+        (
+            key,
+            signature,
+            files.included_by(&db, lib),
+            files.included_files(),
+            files.sources_included_by(),
+        )
     };
     let key_first = in_order(true);
     assert_eq!(key_first, in_order(false));
-    assert_eq!((&key_first.2, &key_first.3), (&Vec::new(), &Vec::new()), "nothing was read from outside the VFS");
+    assert_eq!(
+        (&key_first.2, &key_first.3),
+        (&Vec::new(), &Vec::new()),
+        "nothing was read from outside the VFS"
+    );
 }
 
 /// A `mod` whose file is not there (rustc's E0583) is refused an image, the refusal naming the
@@ -1564,7 +1585,11 @@ fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_tha
     let resolves_fresh = |db: &TestDB, edited: &str, name: &str| {
         let fresh = fixture::db(edited).into_db();
         let (krate, live) = (crate_named(db, name), crate_named(&fresh, name));
-        assert_eq!(frozen::encode(db, krate), frozen::encode(&fresh, live), "`{name}` resolves as a fresh one");
+        assert_eq!(
+            frozen::encode(db, krate),
+            frozen::encode(&fresh, live),
+            "`{name}` resolves as a fresh one"
+        );
     };
 
     // `deep.rs`, a module of `lib` that is not its root: `lib` loses its image, and `core`,
@@ -1572,7 +1597,8 @@ fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_tha
     let (mut db, deep) = served_db(2);
     let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
     assert_eq!((mode(&db, core), mode(&db, lib)), (Some(Mode::Serve), Some(Mode::Serve)));
-    let text = db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
+    let text =
+        db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
     db.set_file_text(deep, &text);
     assert_eq!(mode(&db, lib), None, "`lib`'s image is withdrawn by the write of its file");
     assert!(image(&db, lib).is_none());
@@ -1582,10 +1608,15 @@ fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_tha
     // `core.rs`: `core` loses its image, and so does `lib`, which depends on it.
     let (mut db, core_rs) = served_db(3);
     let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
-    let more = |text: &str| text.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
+    let more =
+        |text: &str| text.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
     let text = more(&db.file_text(core_rs).text(&db));
     db.set_file_text(core_rs, &text);
-    assert_eq!((mode(&db, core), mode(&db, lib)), (None, None), "`core` and its dependent `lib` are withdrawn");
+    assert_eq!(
+        (mode(&db, core), mode(&db, lib)),
+        (None, None),
+        "`core` and its dependent `lib` are withdrawn"
+    );
     assert!(image(&db, core).is_none() && image(&db, lib).is_none());
     for name in ["core", "lib"] {
         resolves_fresh(&db, &more(FIXTURE), name);
@@ -1607,18 +1638,31 @@ fn a_frozen_def_map_read_against_a_moved_file_stops_the_query_with_an_error_nami
     let deep = deep.file_id(&db);
     let lib = crate_named(&db, "lib");
     let bytes = frozen::encode(&db, lib).unwrap();
-    let text = db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
+    let text =
+        db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
     db.set_file_text(deep, &text);
-    frozen::set(&mut db, [(lib, frozen::Frozen { bytes: bytes.into(), mode: Mode::Serve })].into_iter().collect());
+    frozen::set(
+        &mut db,
+        [(lib, frozen::Frozen { bytes: bytes.into(), mode: Mode::Serve })].into_iter().collect(),
+    );
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         _ = crate::nameres::crate_def_map(&db, lib);
     }));
-    let Err(payload) = caught else { panic!("`lib`'s frozen def map was read against a file it was not made from") };
+    let Err(payload) = caught else {
+        panic!("`lib`'s frozen def map was read against a file it was not made from")
+    };
     let Some(stop) = frozen::Unreadable::of_payload(&*payload) else {
         panic!("the refusal unwound with another payload than `frozen::Unreadable`")
     };
     assert_eq!((stop.krate, stop.kind, stop.name.as_deref()), (lib, "def map", Some("lib")));
-    assert!(stop.why.contains("deep.rs") && stop.why.contains("the image was made from"), "{}", stop.why);
+    assert!(
+        stop.why.contains("deep.rs") && stop.why.contains("the image was made from"),
+        "{}",
+        stop.why
+    );
     let text = crate::nameres::stopped(&*payload).expect("a typed stop of name resolution");
-    assert!(text.contains("`lib`") && text.contains("deep.rs") && text.contains("refused"), "{text}");
+    assert!(
+        text.contains("`lib`") && text.contains("deep.rs") && text.contains("refused"),
+        "{text}"
+    );
 }

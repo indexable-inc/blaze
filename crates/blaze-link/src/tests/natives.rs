@@ -7,9 +7,14 @@ use std::sync::Arc;
 use blaze_codegen::{Arch, Init, Static, Target};
 use blaze_items::ItemKey;
 use object::write::{Object as Builder, Symbol as Def, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+use object::{
+    Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+};
 
-use super::{CALLER, Change, Disk, Image, Native, NativeKind, function, id, key, name, output, rel32, returns};
+use super::{
+    CALLER, Change, Disk, Image, Native, NativeKind, function, id, key, name, output, rel32,
+    returns,
+};
 use crate::output::Platform;
 use crate::{Debug, Format, LinkError, Output, OutputKind};
 
@@ -41,7 +46,9 @@ fn object(format: BinaryFormat, defines: &[&str], directives: &str) -> Vec<u8> {
 /// A GNU-format archive of `members` (name, bytes, the symbols it defines), with its symbol
 /// index: what both ELF and COFF archives may be.
 fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
-    let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644);
+    let header = |name: &str, size: usize| {
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+    };
     let names: Vec<&str> = members.iter().flat_map(|it| it.2.iter().copied()).collect();
     let index_len = 4 + 4 * names.len() + names.iter().map(|it| it.len() + 1).sum::<usize>();
     let mut offsets = Vec::new();
@@ -94,7 +101,12 @@ const LAZY: NativeKind = NativeKind::Archive { whole: false };
 
 /// Stages `_start` (calling `calls`, when given) with `natives`, each `(file, bytes, kind)` in
 /// line order.
-fn stage(output: Output, entry: &str, calls: Option<&str>, natives: &[(&str, &Arc<[u8]>, NativeKind)]) -> Result<(), LinkError> {
+fn stage(
+    output: Output,
+    entry: &str,
+    calls: Option<&str>,
+    natives: &[(&str, &Arc<[u8]>, NativeKind)],
+) -> Result<(), LinkError> {
     let relocs = calls.map(|it| vec![rel32(1, Target::Extern(it.into()))]).unwrap_or_default();
     let code = if calls.is_some() { CALLER } else { returns(0) };
     let start = function(1, &code, relocs);
@@ -106,7 +118,13 @@ fn stage(output: Output, entry: &str, calls: Option<&str>, natives: &[(&str, &Ar
         natives: natives
             .iter()
             .enumerate()
-            .map(|(at, (file, bytes, kind))| Native { id: id(100 + at as u8), name: file, bytes, kind: *kind, order: at as u32 })
+            .map(|(at, (file, bytes, kind))| Native {
+                id: id(100 + at as u8),
+                name: file,
+                bytes,
+                kind: *kind,
+                order: at as u32,
+            })
             .collect(),
         ..Change::default()
     };
@@ -128,13 +146,15 @@ fn debians_libgcc_s_script_finds_libgcc_on_the_line() {
     let gcc_s = ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_s.so", &script, SHARED);
     let so1 = ("/lib/x86_64-linux-gnu/libgcc_s.so.1", &so, SHARED);
     elf(&[gcc_s, so1, ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc.a", &libgcc, LAZY)]).unwrap();
-    elf(&[gcc_s, so1, ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc.so", &so, SHARED)]).expect("a libgcc.so is -lgcc too");
+    elf(&[gcc_s, so1, ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc.so", &so, SHARED)])
+        .expect("a libgcc.so is -lgcc too");
 
     let error = elf(&[gcc_s, so1]).unwrap_err();
     for said in ["-lgcc", "libgcc_s.so", "libgcc.so or libgcc.a"] {
         assert!(error.what.contains(said), "{}", error.what);
     }
-    let error = elf(&[gcc_s, so1, ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_eh.a", &libgcc, LAZY)]).unwrap_err();
+    let error = elf(&[gcc_s, so1, ("/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_eh.a", &libgcc, LAZY)])
+        .unwrap_err();
     assert!(error.what.contains("-lgcc"), "libgcc_eh.a is not -lgcc: {}", error.what);
 }
 
@@ -143,8 +163,14 @@ fn a_scripts_verbatim_library_is_the_file_it_names() {
     let script: Arc<[u8]> = b"INPUT ( -l:libfoo.so.2 )".as_slice().into();
     let so: Arc<[u8]> = empty_shared().into();
     elf(&[("/usr/lib/libfoo.so", &script, SHARED), ("/opt/lib/libfoo.so.2", &so, SHARED)]).unwrap();
-    let error = elf(&[("/usr/lib/libfoo.so", &script, SHARED), ("/opt/lib/libfoo.so.3", &so, SHARED)]).unwrap_err();
-    assert!(error.what.contains("-l:libfoo.so.2") && error.what.contains("has no libfoo.so.2"), "{}", error.what);
+    let error =
+        elf(&[("/usr/lib/libfoo.so", &script, SHARED), ("/opt/lib/libfoo.so.3", &so, SHARED)])
+            .unwrap_err();
+    assert!(
+        error.what.contains("-l:libfoo.so.2") && error.what.contains("has no libfoo.so.2"),
+        "{}",
+        error.what
+    );
 }
 
 #[test]
@@ -164,7 +190,11 @@ fn glibcs_libc_script_is_checked_as_before() {
     ];
     elf(&all).unwrap();
     let error = elf(&all[..3]).unwrap_err();
-    assert!(error.what.contains("names /lib64/ld-linux-x86-64.so.2, which the link line does not have"), "{}", error.what);
+    assert!(
+        error.what.contains("names /lib64/ld-linux-x86-64.so.2, which the link line does not have"),
+        "{}",
+        error.what
+    );
 }
 
 fn windows() -> Output {
@@ -193,7 +223,9 @@ fn windows() -> Output {
 fn pe(directives: &str, more: &[(&str, &Arc<[u8]>, NativeKind)]) -> Result<(), LinkError> {
     let member = object(BinaryFormat::Coff, &["crt_helper"], directives);
     let unused = object(BinaryFormat::Coff, &["crt_unused"], "/DEFAULTLIB:never_taken");
-    let msvcrt: Arc<[u8]> = archive(&[("crt.obj", &member, &["crt_helper"]), ("unused.obj", &unused, &["crt_unused"])]).into();
+    let msvcrt: Arc<[u8]> =
+        archive(&[("crt.obj", &member, &["crt_helper"]), ("unused.obj", &unused, &["crt_unused"])])
+            .into();
     let mut natives = vec![("C:\\VC\\lib\\x64\\msvcrt.lib", &msvcrt, LAZY)];
     natives.extend_from_slice(more);
     stage(windows(), "mainCRTStartup", Some("crt_helper"), &natives)
@@ -210,7 +242,11 @@ fn a_members_default_library_is_taken_from_the_line() {
     for said in ["ucrt.lib", "(/DEFAULTLIB)", "msvcrt.lib(crt.obj)"] {
         assert!(error.what.contains(said), "{}", error.what);
     }
-    assert!(!error.what.contains("never_taken"), "a member not taken asks for nothing: {}", error.what);
+    assert!(
+        !error.what.contains("never_taken"),
+        "a member not taken asks for nothing: {}",
+        error.what
+    );
 }
 
 #[test]
@@ -221,10 +257,17 @@ fn nodefaultlib_takes_a_default_library_out() {
     pe(" /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt /NODEFAULTLIB", &[]).unwrap();
 
     let other: Arc<[u8]> = object(BinaryFormat::Coff, &["other_fn"], "/NODEFAULTLIB:libcmt").into();
-    pe(" /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt", &[vcruntime, ("other.obj", &other, NativeKind::Object)])
-        .expect("another loaded object's /NODEFAULTLIB takes it out of the whole link");
+    pe(
+        " /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt",
+        &[vcruntime, ("other.obj", &other, NativeKind::Object)],
+    )
+    .expect("another loaded object's /NODEFAULTLIB takes it out of the whole link");
     let error = pe(" /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt", &[vcruntime]).unwrap_err();
-    assert!(error.what.contains("libcmt.lib") && error.what.contains("msvcrt.lib(crt.obj)"), "{}", error.what);
+    assert!(
+        error.what.contains("libcmt.lib") && error.what.contains("msvcrt.lib(crt.obj)"),
+        "{}",
+        error.what
+    );
 }
 
 /// A COFF object laying out the TLS template as tlssup.obj does: `_tls_start` in `.tls`,
@@ -270,7 +313,10 @@ fn thread_local(n: u8) -> Static {
 fn a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end() {
     // `lea rax, [rip + _tls_start]; lea rcx, [rip + _tls_end]; ret`
     let code = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0xc3];
-    let relocs = vec![rel32(3, Target::Extern("_tls_start".into())), rel32(10, Target::Extern("_tls_end".into()))];
+    let relocs = vec![
+        rel32(3, Target::Extern("_tls_start".into())),
+        rel32(10, Target::Extern("_tls_end".into())),
+    ];
     let start = function(1, &code, relocs);
     let tlssup: Arc<[u8]> = tlssup().into();
     let (one, two) = (thread_local(10), thread_local(11));
@@ -278,20 +324,33 @@ fn a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end() {
     let mut disk = Disk::default();
     let check = |image: &Image, statics: usize, what: &str| {
         let state = &image.state;
-        let tls: Vec<_> = state.live_pieces().filter(|it| *it.class() == crate::model::Class::Tdata).collect();
-        let native = |it: &crate::state::PieceRef<'_>| matches!(it.what(), crate::state::What::Native { .. });
+        let tls: Vec<_> =
+            state.live_pieces().filter(|it| *it.class() == crate::model::Class::Tdata).collect();
+        let native = |it: &crate::state::PieceRef<'_>| {
+            matches!(it.what(), crate::state::What::Native { .. })
+        };
         let natives: Vec<u64> = tls.iter().filter(|it| native(it)).map(|it| it.addr).collect();
-        let ours: Vec<(u64, u64)> = tls.iter().filter(|it| !native(it)).map(|it| (it.addr, it.size)).collect();
+        let ours: Vec<(u64, u64)> =
+            tls.iter().filter(|it| !native(it)).map(|it| (it.addr, it.size)).collect();
         assert_eq!((natives.len(), ours.len()), (2, statics), "{what}: {natives:x?} {ours:x?}");
         let (first, end) = (natives.iter().min().unwrap(), natives.iter().max().unwrap());
-        assert!(ours.iter().all(|(at, size)| at > first && at + size <= *end), "{what}: {first:#x} {ours:x?} {end:#x}");
+        assert!(
+            ours.iter().all(|(at, size)| at > first && at + size <= *end),
+            "{what}: {first:#x} {ours:x?} {end:#x}"
+        );
     };
     let change = Change {
         added: vec![&start],
         statics: vec![&one],
         names: vec![("mainCRTStartup".into(), Target::Direct(key(1)))],
         debug_names: vec![(key(1), "start".into())],
-        natives: vec![Native { id: id(100), name: "tlssup.obj", bytes: &tlssup, kind: NativeKind::Object, order: 0 }],
+        natives: vec![Native {
+            id: id(100),
+            name: "tlssup.obj",
+            bytes: &tlssup,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         ..Change::default()
     };
     disk.link(&mut image, change).unwrap();
@@ -302,10 +361,16 @@ fn a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end() {
 
 /// `X.dll`'s import library: `A`, then `B`, each with its `__imp_` name.
 fn two_imports() -> Arc<[u8]> {
-    use object::pe::{IMPORT_OBJECT_CODE, IMPORT_OBJECT_NAME};
     use crate::pe::tests::{archive, short_import};
-    let member = |name: &str, hint| short_import(name, "X.dll", hint, IMPORT_OBJECT_CODE.0, IMPORT_OBJECT_NAME.0);
-    archive(&[("x.dll", member("A", 1), &["A", "__imp_A"]), ("x.dll", member("B", 2), &["B", "__imp_B"])]).into()
+    use object::pe::{IMPORT_OBJECT_CODE, IMPORT_OBJECT_NAME};
+    let member = |name: &str, hint| {
+        short_import(name, "X.dll", hint, IMPORT_OBJECT_CODE.0, IMPORT_OBJECT_NAME.0)
+    };
+    archive(&[
+        ("x.dll", member("A", 1), &["A", "__imp_A"]),
+        ("x.dll", member("B", 2), &["B", "__imp_B"]),
+    ])
+    .into()
 }
 
 /// A PE file read back: the bytes at an address, and each import's import address table cell.
@@ -314,7 +379,8 @@ struct PeRead<'a>(object::read::pe::PeFile64<'a>);
 impl<'a> PeRead<'a> {
     fn at(&self, addr: u64, len: usize) -> &'a [u8] {
         use object::{Object as _, ObjectSection as _};
-        let found = self.0.sections().find(|it| (it.address()..it.address() + it.size()).contains(&addr));
+        let found =
+            self.0.sections().find(|it| (it.address()..it.address() + it.size()).contains(&addr));
         let section = found.unwrap_or_else(|| panic!("no section at {addr:#x}"));
         &section.data().unwrap()[(addr - section.address()) as usize..][..len]
     }
@@ -336,11 +402,14 @@ impl<'a> PeRead<'a> {
         let mut descriptors = table.descriptors().unwrap();
         let mut out = Vec::new();
         while let Some(descriptor) = descriptors.next().unwrap() {
-            let dll = String::from_utf8_lossy(table.name(descriptor.name.get(LE)).unwrap()).into_owned();
+            let dll =
+                String::from_utf8_lossy(table.name(descriptor.name.get(LE)).unwrap()).into_owned();
             let mut thunks = table.thunks(descriptor.original_first_thunk.get(LE)).unwrap();
             let mut cell = base + u64::from(descriptor.first_thunk.get(LE));
             while let Some(thunk) = thunks.next::<ImageNtHeaders64>().unwrap() {
-                let Import::Name(_, name) = table.import::<ImageNtHeaders64>(thunk).unwrap() else { panic!("by ordinal") };
+                let Import::Name(_, name) = table.import::<ImageNtHeaders64>(thunk).unwrap() else {
+                    panic!("by ordinal")
+                };
                 out.push((dll.clone(), String::from_utf8_lossy(name).into_owned(), cell));
                 cell += 8;
             }
@@ -368,15 +437,20 @@ fn a_moved_import_address_table_cell_is_read_where_it_went() {
     let lib = two_imports();
     // start (1) calls ca (2), which calls A, and cb (3): `call B; call [rip + __imp_B]; ret`.
     let two_calls = |n: u8, callees: [u8; 2]| {
-        let relocs = callees.iter().zip([1, 6]).map(|(it, at)| rel32(at, Target::Direct(key(*it)))).collect();
+        let relocs = callees
+            .iter()
+            .zip([1, 6])
+            .map(|(it, at)| rel32(at, Target::Direct(key(*it))))
+            .collect();
         function(n, &[0xe8, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0xc3], relocs)
     };
     let start = two_calls(1, [2, 3]);
     let ca = function(2, &CALLER, vec![rel32(1, Target::Extern("A".into()))]);
-    let cb = function(3, &[0xe8, 0, 0, 0, 0, 0xff, 0x15, 0, 0, 0, 0, 0xc3], vec![
-        rel32(1, Target::Extern("B".into())),
-        rel32(7, Target::Extern("__imp_B".into())),
-    ]);
+    let cb = function(
+        3,
+        &[0xe8, 0, 0, 0, 0, 0xff, 0x15, 0, 0, 0, 0, 0xc3],
+        vec![rel32(1, Target::Extern("B".into())), rel32(7, Target::Extern("__imp_B".into()))],
+    );
     // start refilled to call ca2 (4), which calls nothing, and cb; ca goes.
     let (start2, ca2) = (two_calls(1, [4, 3]), function(4, &returns(5), Vec::new()));
     let entry = || vec![("mainCRTStartup".to_string(), Target::Direct(key(1)))];
@@ -386,11 +460,21 @@ fn a_moved_import_address_table_cell_is_read_where_it_went() {
         natives: vec![Native { id: id(100), name: "x.lib", bytes: &lib, kind: SHARED, order: 0 }],
         ..Change::default()
     };
-    let edit = || Change { added: vec![&start2, &ca2], removed: vec![key(1), key(2)], names: entry(), ..Change::default() };
-    let name = |image: &Image, it: &str| image.symbols.find_name(it).and_then(|it| image.symbols.find(SymKey::Name(it))).expect(it);
-    let body = |image: &Image, n: u8| placed(image, SymKey::Body(image.symbols.find_id(&id(n)).unwrap())).unwrap();
+    let edit = || Change {
+        added: vec![&start2, &ca2],
+        removed: vec![key(1), key(2)],
+        names: entry(),
+        ..Change::default()
+    };
+    let name = |image: &Image, it: &str| {
+        image.symbols.find_name(it).and_then(|it| image.symbols.find(SymKey::Name(it))).expect(it)
+    };
+    let body = |image: &Image, n: u8| {
+        placed(image, SymKey::Body(image.symbols.find_id(&id(n)).unwrap())).unwrap()
+    };
 
-    let mut image = Image::new(super::name(super::TO), Output { incremental: true, ..windows() }).unwrap();
+    let mut image =
+        Image::new(super::name(super::TO), Output { incremental: true, ..windows() }).unwrap();
     let mut disk = Disk::default();
     disk.link(&mut image, first()).unwrap();
     let bytes = super::contents(disk.file(super::TO));
@@ -400,12 +484,21 @@ fn a_moved_import_address_table_cell_is_read_where_it_went() {
     assert_eq!(names, ["A", "B"], "{iat:x?}");
     let (cell_a, cell_b) = (iat[0].2, iat[1].2);
     assert_eq!(cell_b, cell_a + 8, "one DLL's cells in a run");
-    let (b, thunk) = (name(&image, "B"), placed(&image, SymKey::Plt(name(&image, "B"))).expect("B's thunk"));
+    let (b, thunk) =
+        (name(&image, "B"), placed(&image, SymKey::Plt(name(&image, "B"))).expect("B's thunk"));
     assert_eq!(placed(&image, SymKey::Got(GotKind::Address, b)), Some(cell_b));
-    assert_eq!((a.at(thunk, 2), a.rel32(thunk + 2)), (&[0xff, 0x25][..], cell_b), "B's thunk: jmp [rip + B's cell]");
+    assert_eq!(
+        (a.at(thunk, 2), a.rel32(thunk + 2)),
+        (&[0xff, 0x25][..], cell_b),
+        "B's thunk: jmp [rip + B's cell]"
+    );
     let cb_at = body(&image, 3);
     assert_eq!(a.rel32(cb_at + 1), thunk, "cb calls B's thunk");
-    assert_eq!((a.at(cb_at + 5, 2), a.rel32(cb_at + 7)), (&[0xff, 0x15][..], cell_b), "call [rip + __imp_B]");
+    assert_eq!(
+        (a.at(cb_at + 5, 2), a.rel32(cb_at + 7)),
+        (&[0xff, 0x15][..], cell_b),
+        "call [rip + __imp_B]"
+    );
 
     disk.link(&mut image, edit()).expect("A's last call goes");
     let bytes = super::contents(disk.file(super::TO));
@@ -419,10 +512,18 @@ fn a_moved_import_address_table_cell_is_read_where_it_went() {
     assert_eq!(placed(&image, SymKey::Got(GotKind::Address, a_sym)), None, "A's cell is gone");
     assert_eq!(placed(&image, SymKey::Got(GotKind::Address, b)), Some(moved));
     assert_eq!(placed(&image, SymKey::Plt(b)), Some(thunk), "B's thunk stays");
-    assert_eq!((c.at(thunk, 2), c.rel32(thunk + 2)), (&[0xff, 0x25][..], moved), "B's thunk reads B's new cell");
+    assert_eq!(
+        (c.at(thunk, 2), c.rel32(thunk + 2)),
+        (&[0xff, 0x25][..], moved),
+        "B's thunk reads B's new cell"
+    );
     assert_eq!(body(&image, 3), cb_at, "cb stays");
     assert_eq!(c.rel32(cb_at + 1), thunk, "cb still calls B's thunk");
-    assert_eq!((c.at(cb_at + 5, 2), c.rel32(cb_at + 7)), (&[0xff, 0x15][..], moved), "cb's __imp_B reads B's new cell");
+    assert_eq!(
+        (c.at(cb_at + 5, 2), c.rel32(cb_at + 7)),
+        (&[0xff, 0x15][..], moved),
+        "cb's __imp_B reads B's new cell"
+    );
 
     // A live image: the running program's loader bound B where its cell was.
     let live = Output { incremental: true, live: Some(crate::Live), ..windows() };
@@ -431,7 +532,9 @@ fn a_moved_import_address_table_cell_is_read_where_it_went() {
     disk.link(&mut image, first()).unwrap();
     let staged = image.stage(edit()).unwrap();
     let message = staged.writes.message.as_deref().expect("a message for programs running 1");
-    let Ok(blaze_live::patch::MessageView::Restart { why, .. }) = blaze_live::patch::Message::view(message) else {
+    let Ok(blaze_live::patch::MessageView::Restart { why, .. }) =
+        blaze_live::patch::Message::view(message)
+    else {
         panic!("not a restart: {:?}", blaze_live::patch::Message::decode(message))
     };
     assert!(why.contains("the GOT cell of the import `B` moved"), "{why}");
@@ -470,12 +573,17 @@ const SDK_SECURITY: &str = "/sdk/System/Library/Frameworks/Security.framework/Se
 
 /// `main` calling `helper`, which `libsec.a`'s `sec.o` defines with `options`, after `glue.o`
 /// (always loaded) asking for `-lz`, with `more` after them on the line.
-fn macho(options: &[&[&'static str]], more: &[(&str, &Arc<[u8]>, NativeKind)]) -> Result<(), LinkError> {
+fn macho(
+    options: &[&[&'static str]],
+    more: &[(&str, &Arc<[u8]>, NativeKind)],
+) -> Result<(), LinkError> {
     let member = autolinking(&["_helper"], options);
     let unused = autolinking(&["_unused"], &[&["-lnever_taken"]]);
-    let libsec: Arc<[u8]> = archive(&[("sec.o", &member, &["_helper"]), ("unused.o", &unused, &["_unused"])]).into();
+    let libsec: Arc<[u8]> =
+        archive(&[("sec.o", &member, &["_helper"]), ("unused.o", &unused, &["_unused"])]).into();
     let glue: Arc<[u8]> = autolinking(&["_glue"], &[&["-lz"]]).into();
-    let mut natives = vec![("/x/glue.o", &glue, NativeKind::Object), ("/x/libsec.a", &libsec, LAZY)];
+    let mut natives =
+        vec![("/x/glue.o", &glue, NativeKind::Object), ("/x/libsec.a", &libsec, LAZY)];
     natives.extend_from_slice(more);
     stage(macos(), "main", Some("helper"), &natives)
 }
@@ -483,11 +591,15 @@ fn macho(options: &[&[&'static str]], more: &[(&str, &Arc<[u8]>, NativeKind)]) -
 #[test]
 fn an_objects_and_a_members_linker_options_are_taken_from_the_line() {
     let libz = tbd("/usr/lib/libz.1.dylib", "_deflate");
-    let security = tbd("/System/Library/Frameworks/Security.framework/Versions/A/Security", "_SecRandomCopyBytes");
+    let security = tbd(
+        "/System/Library/Frameworks/Security.framework/Versions/A/Security",
+        "_SecRandomCopyBytes",
+    );
     let z = (SDK_LIBZ, &libz, MACHO_SHARED);
     let sec = (SDK_SECURITY, &security, MACHO_SHARED);
     macho(&[&["-framework", "Security"]], &[z, sec]).unwrap();
-    macho(&[&["-framework", "Security"], &["-lz"]], &[z, sec]).expect("one library asked twice is checked once");
+    macho(&[&["-framework", "Security"], &["-lz"]], &[z, sec])
+        .expect("one library asked twice is checked once");
     let libz_a: Arc<[u8]> = archive(&[]).into();
     macho(&[], &[("/opt/lib/libz.a", &libz_a, LAZY)]).expect("a libz.a is -lz too");
 
@@ -495,15 +607,29 @@ fn an_objects_and_a_members_linker_options_are_taken_from_the_line() {
     for said in ["-framework Security", "(LC_LINKER_OPTION)", "libsec.a(sec.o)", "does not have"] {
         assert!(error.what.contains(said), "{said}: {}", error.what);
     }
-    assert!(!error.what.contains("never_taken"), "a member not taken asks for nothing: {}", error.what);
+    assert!(
+        !error.what.contains("never_taken"),
+        "a member not taken asks for nothing: {}",
+        error.what
+    );
 
     let error = macho(&[], &[sec]).unwrap_err();
-    assert!(error.what.contains("/x/glue.o asks for -lz (LC_LINKER_OPTION)"), "an object's own: {}", error.what);
+    assert!(
+        error.what.contains("/x/glue.o asks for -lz (LC_LINKER_OPTION)"),
+        "an object's own: {}",
+        error.what
+    );
     let wrong = tbd("/usr/lib/libzz.dylib", "_zz");
     let error = macho(&[], &[("/sdk/usr/lib/libzz.tbd", &wrong, MACHO_SHARED), sec]).unwrap_err();
     assert!(error.what.contains("-lz"), "libzz.tbd is not -lz: {}", error.what);
-    let error = macho(&[&["-framework", "Security"]], &[z, ("/sdk/Security.tbd", &security, MACHO_SHARED)]).unwrap_err();
-    assert!(error.what.contains("-framework Security"), "a framework is its NAME.framework directory's: {}", error.what);
+    let error =
+        macho(&[&["-framework", "Security"]], &[z, ("/sdk/Security.tbd", &security, MACHO_SHARED)])
+            .unwrap_err();
+    assert!(
+        error.what.contains("-framework Security"),
+        "a framework is its NAME.framework directory's: {}",
+        error.what
+    );
 }
 
 #[test]
@@ -511,7 +637,16 @@ fn a_loaded_members_unknown_or_weak_linker_option_is_an_error() {
     let libz = tbd("/usr/lib/libz.1.dylib", "_deflate");
     let z = (SDK_LIBZ, &libz, MACHO_SHARED);
     let error = macho(&[&["-needed_framework", "Security"]], &[z]).unwrap_err();
-    assert!(error.what.contains("libsec.a(sec.o)") && error.what.contains("`-needed_framework Security`"), "{}", error.what);
+    assert!(
+        error.what.contains("libsec.a(sec.o)")
+            && error.what.contains("`-needed_framework Security`"),
+        "{}",
+        error.what
+    );
     let error = macho(&[&["-weak-lsec"]], &[z]).unwrap_err();
-    assert!(error.what.contains("libsec.a(sec.o)") && error.what.contains("no weak library"), "{}", error.what);
+    assert!(
+        error.what.contains("libsec.a(sec.o)") && error.what.contains("no weak library"),
+        "{}",
+        error.what
+    );
 }

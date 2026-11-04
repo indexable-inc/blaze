@@ -93,7 +93,10 @@ fn a_reader_racing_a_merge_reads_each_row_once_and_no_file_goes_from_under_it() 
 #[test]
 fn retirement_checks_and_pins_parse() {
     let mut retired = Retired::default();
-    assert!(retired.retire(["1-00000001.spans.parquet".to_owned(), "1-00000002.spans.parquet".to_owned()]));
+    assert!(
+        retired
+            .retire(["1-00000001.spans.parquet".to_owned(), "1-00000002.spans.parquet".to_owned()])
+    );
     assert!(!retired.retire(["1-00000001.spans.parquet".to_owned()]), "a file is retired once");
     assert!(retired.retire(["0-00000003.folded.parquet".to_owned()]));
     assert_eq!(retired.generation, 2);

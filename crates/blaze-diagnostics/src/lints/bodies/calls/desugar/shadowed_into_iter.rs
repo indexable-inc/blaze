@@ -9,7 +9,6 @@
 //! `compiler/rustc_span/src/lib.rs` (`Span::find_ancestor_in_same_ctxt`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     FunctionId, HasModule as _, ModuleDefId,
@@ -18,6 +17,7 @@ use hir_def::{
 };
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_type_ir::inherent::IntoKind as _;
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode};
 
 use super::for_loop;
@@ -63,11 +63,16 @@ impl LatePass for ShadowedIntoIter {
 
         let receiver_ty = util::ty(b, receiver);
         let adjustments = b.infer.expr_adjustment(receiver).unwrap_or_default();
-        let adjusted = || std::iter::once(receiver_ty).chain(adjustments.iter().map(|it| it.target.as_ref()));
+        let adjusted =
+            || std::iter::once(receiver_ty).chain(adjustments.iter().map(|it| it.target.as_ref()));
         let last = adjustments.last().map_or(receiver_ty, |it| it.target.as_ref());
-        let array_at = || adjusted().take_while(|it| !is_ref_to_array(*it)).position(|it| it.is_array());
-        let boxed_slice_at =
-            || adjusted().take_while(|it| !is_ref_to_boxed_slice(*it)).position(|it| is_boxed_slice(it));
+        let array_at =
+            || adjusted().take_while(|it| !is_ref_to_array(*it)).position(|it| it.is_array());
+        let boxed_slice_at = || {
+            adjusted()
+                .take_while(|it| !is_ref_to_boxed_slice(*it))
+                .position(|it| is_boxed_slice(it))
+        };
         let (lint, target, edition, can_suggest_ufcs) = if is_ref_to_array(last)
             && let Some(index) = array_at()
         {
@@ -80,7 +85,8 @@ impl LatePass for ShadowedIntoIter {
             return;
         };
 
-        let (Some(at), Some(expr_span), Some(name_span)) = (b.expr_node(expr), util::span(b, expr), method_name(b, expr))
+        let (Some(at), Some(expr_span), Some(name_span)) =
+            (b.expr_node(expr), util::span(b, expr), method_name(b, expr))
         else {
             return;
         };
@@ -125,7 +131,10 @@ impl LatePass for ShadowedIntoIter {
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(into_iter).into());
         // alloc: the lint's diagnostic
-        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(into_iter))), format!("the signature of `{called}`"));
+        diag.fact(
+            Fact::Signature(b.cx.key(ItemId::Function(into_iter))),
+            format!("the signature of `{called}`"),
+        );
         out.push(b.lint(diag, Phase::Late, at));
     }
 }

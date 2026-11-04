@@ -3,9 +3,9 @@
 //! into a bitset over the numbering, so that each question the pass asks is a bit test.
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{InFile, ModuleDef};
 use hir_def::{Lookup as _, ModuleId};
+use std::alloc::Global;
 
 use super::defs::{DefIdx, DefSet, Defs, Id};
 use crate::{

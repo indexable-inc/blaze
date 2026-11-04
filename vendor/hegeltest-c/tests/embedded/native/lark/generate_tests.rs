@@ -29,30 +29,19 @@ fn grammar(text: &str) -> GrammarSpec {
 }
 
 fn small(text: &str, max_size: u64) -> GrammarSpec {
-    spec_with(
-        text,
-        GrammarOptions {
-            max_size,
-            ..GrammarOptions::default()
-        },
-    )
-    .unwrap()
+    spec_with(text, GrammarOptions { max_size, ..GrammarOptions::default() }).unwrap()
 }
 
 #[test]
 fn nullable_derivations_have_a_work_limit() {
-    for text in [
-        "start: empty ~ 65536\nempty:\n",
-        "start: a\na: b b\nb: c c\nc: d d\nd: e e\ne: f f\nf:\n",
-    ] {
+    for text in
+        ["start: empty ~ 65536\nempty:\n", "start: a\na: b b\nb: c c\nc: d d\nd: e e\ne: f f\nf:\n"]
+    {
         let spec = grammar(text);
         let mut generation = Generation::new(&spec, 0.0, spec.max_size);
         generation.remaining = 16;
         let mut draws = SimplestDraws::default();
-        assert!(matches!(
-            generation.attempts(&mut draws, 0, 0),
-            Err(EngineError::InvalidTestCase)
-        ));
+        assert!(matches!(generation.attempts(&mut draws, 0, 0), Err(EngineError::InvalidTestCase)));
         assert_eq!(draws.status(), Some(Status::Invalid));
     }
 }
@@ -70,10 +59,7 @@ fn the_work_limit_grows_with_the_caps() {
     );
     let spec = small("start: x ~ 400000\nx: y\ny: \"a\"\n", MAX_MAX_SIZE);
     let generation = Generation::new(&spec, 0.0, spec.max_size);
-    assert_eq!(
-        generation.remaining,
-        work_limit(MAX_MAX_SIZE, DEFAULT_MAX_DEPTH)
-    );
+    assert_eq!(generation.remaining, work_limit(MAX_MAX_SIZE, DEFAULT_MAX_DEPTH));
     assert!(generation.remaining > GENERATION_BUDGET);
     generation.recycle();
     let (drawn, status) = draw(&spec, 0);
@@ -85,26 +71,17 @@ fn the_work_limit_grows_with_the_caps() {
 fn placeholder_text_counts_toward_the_generation_work_limit() {
     let spec = spec_with(
         "start: X ~ 3\n%declare X\n",
-        GrammarOptions {
-            explicit: explicit(&["X"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["X"]), ..GrammarOptions::default() },
     )
     .unwrap();
     let expected = placeholder("X").repeat(3);
     let mut draws = SimplestDraws::default();
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     generation.remaining = expected.len() + 10;
-    assert_eq!(
-        codepoints_to_string(&generation.attempts(&mut draws, 0, 0).unwrap()),
-        expected
-    );
+    assert_eq!(codepoints_to_string(&generation.attempts(&mut draws, 0, 0).unwrap()), expected);
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     generation.remaining = expected.len() - 1;
-    assert!(matches!(
-        generation.attempts(&mut draws, 0, 0),
-        Err(EngineError::InvalidTestCase)
-    ));
+    assert!(matches!(generation.attempts(&mut draws, 0, 0), Err(EngineError::InvalidTestCase)));
     assert!(generation.text.len() < expected.len());
     assert_eq!(draws.status(), Some(Status::Invalid));
 }
@@ -135,10 +112,7 @@ fn samples(spec: &GrammarSpec, n: u64) -> Vec<String> {
 }
 
 fn tid(spec: &GrammarSpec, name: &str) -> TermId {
-    spec.terminal_names()
-        .iter()
-        .position(|n| n == name)
-        .unwrap()
+    spec.terminal_names().iter().position(|n| n == name).unwrap()
 }
 
 /// A token with its text and what the lexers find in it, to lay out
@@ -203,12 +177,7 @@ fn lay_out(toks: &[Tok]) -> (Vec<char>, Vec<Token>, Vec<TokenScans>) {
     for tok in toks {
         let start = text.len();
         text.extend_from_slice(&tok.text);
-        tokens.push(Token {
-            start,
-            end: text.len(),
-            scans: findings.len(),
-            ..tok.token.clone()
-        });
+        tokens.push(Token { start, end: text.len(), scans: findings.len(), ..tok.token.clone() });
         findings.push(tok.scans.clone());
     }
     (text, tokens, findings)
@@ -241,32 +210,20 @@ fn balanced(s: &str) -> bool {
 fn explicit_terminal_the_grammar_does_not_use_is_an_error() {
     let err = spec_with(
         "start: \"a\"\n",
-        GrammarOptions {
-            explicit: explicit(&["NOPE"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["NOPE"]), ..GrammarOptions::default() },
     )
     .err()
     .unwrap();
-    assert_eq!(
-        err.message,
-        "the grammar does not use explicit terminal 'NOPE'"
-    );
+    assert_eq!(err.message, "the grammar does not use explicit terminal 'NOPE'");
 }
 
 #[test]
 fn duplicate_explicit_terminals_are_rejected_by_the_engine() {
     let result = spec_with(
         "start: X\n%declare X\n",
-        GrammarOptions {
-            explicit: explicit(&["X", "X"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["X", "X"]), ..GrammarOptions::default() },
     );
-    assert_eq!(
-        result.err().unwrap().message,
-        "explicit terminal 'X' is listed more than once"
-    );
+    assert_eq!(result.err().unwrap().message, "explicit terminal 'X' is listed more than once");
 }
 
 #[test]
@@ -274,20 +231,14 @@ fn explicit_terminals_are_drawn_as_their_placeholders() {
     assert_eq!(placeholder("WORD"), "<<EXPLICIT_WORD_392f5a5e9326>>");
     let spec = spec_with(
         "start: WORD \"!\" NUM\n%declare WORD\nNUM: /[0-9]+/\n",
-        GrammarOptions {
-            explicit: explicit(&["WORD", "NUM"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["WORD", "NUM"]), ..GrammarOptions::default() },
     )
     .unwrap();
     let expected = format!("{}!{}", placeholder("WORD"), placeholder("NUM"));
     assert!(samples(&spec, 20).iter().all(|s| *s == expected));
     assert_eq!(
         spec.placeholders(),
-        &[
-            ("WORD".to_string(), placeholder("WORD")),
-            ("NUM".to_string(), placeholder("NUM")),
-        ]
+        &[("WORD".to_string(), placeholder("WORD")), ("NUM".to_string(), placeholder("NUM")),]
     );
 }
 
@@ -297,11 +248,7 @@ fn explicit_terminals_are_drawn_as_their_placeholders() {
 fn placeholders_count_for_nothing_toward_the_size_cap() {
     let spec = spec_with(
         "start: \"a\" WORD (\",\" WORD)* \"b\"\n%declare WORD\n",
-        GrammarOptions {
-            explicit: explicit(&["WORD"]),
-            max_size: 3,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["WORD"]), max_size: 3, ..GrammarOptions::default() },
     )
     .unwrap();
     assert_eq!(spec.min_size(), 2);
@@ -321,16 +268,11 @@ fn a_repeated_placeholder_repeats() {
     for (text, min) in [("start: ITEM+\n", 1), ("start: ITEM*\n", 0)] {
         let spec = spec_with(
             &format!("{text}%declare ITEM\n"),
-            GrammarOptions {
-                explicit: explicit(&["ITEM"]),
-                ..GrammarOptions::default()
-            },
+            GrammarOptions { explicit: explicit(&["ITEM"]), ..GrammarOptions::default() },
         )
         .unwrap();
-        let counts: Vec<usize> = samples(&spec, 50)
-            .iter()
-            .map(|s| s.matches(&marker).count())
-            .collect();
+        let counts: Vec<usize> =
+            samples(&spec, 50).iter().map(|s| s.matches(&marker).count()).collect();
         assert!(counts.iter().all(|&n| n >= min), "{counts:?}");
         assert!(counts.iter().any(|&n| n > 1), "{counts:?}");
     }
@@ -364,24 +306,12 @@ fn a_repetition_of_elements_that_cannot_grow_fills_its_budget() {
             })
             .collect()
     };
-    for text in [
-        "start: \"a\"+\n",
-        "start: (\"a\" | \"bb\")+\n",
-        "start: /[ab]/+\n",
-    ] {
+    for text in ["start: \"a\"+\n", "start: (\"a\" | \"bb\")+\n", "start: /[ab]/+\n"] {
         let mut lengths = lengths(text, 8192);
         lengths.sort_unstable();
         assert!(lengths[100] > 3000, "{text}: median {}", lengths[100]);
-        assert!(
-            lengths[180] > 7000,
-            "{text}: 90th percentile {}",
-            lengths[180]
-        );
-        assert!(
-            lengths[60] < 2500,
-            "{text}: 30th percentile {}",
-            lengths[60]
-        );
+        assert!(lengths[180] > 7000, "{text}: 90th percentile {}", lengths[180]);
+        assert!(lengths[60] < 2500, "{text}: 30th percentile {}", lengths[60]);
         assert!(lengths.iter().all(|&n| n <= 8192), "{text}");
     }
     let bounded = lengths("start: \"a\" ~ 1..5\n", 8192);
@@ -390,11 +320,8 @@ fn a_repetition_of_elements_that_cannot_grow_fills_its_budget() {
     }
     assert_eq!(
         codepoints_to_string(
-            &smallest_string(
-                &mut SimplestDraws::default(),
-                &small("start: \"a\"+\n", 8192)
-            )
-            .unwrap()
+            &smallest_string(&mut SimplestDraws::default(), &small("start: \"a\"+\n", 8192))
+                .unwrap()
         ),
         "a"
     );
@@ -409,10 +336,7 @@ fn a_replay_must_respect_the_draws_own_cap() {
         Err(EngineError::InvalidTestCase)
     ));
     assert_eq!(ntc.status(), Some(Status::Invalid));
-    for text in [
-        "start: X /a+/\n%declare X\n",
-        "start: /a+/\n%declare X\n%ignore X\n",
-    ] {
+    for text in ["start: X /a+/\n%declare X\n", "start: /a+/\n%declare X\n%ignore X\n"] {
         let spec = spec_with(
             text,
             GrammarOptions {
@@ -443,18 +367,13 @@ fn a_replay_must_respect_the_draws_own_cap() {
 fn a_placeholder_is_read_as_itself_before_any_other_terminal() {
     let spec = spec_with(
         "start: X TAG\nTAG: /<[^>]*>/\n%declare X\n",
-        GrammarOptions {
-            explicit: explicit(&["X"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["X"]), ..GrammarOptions::default() },
     )
     .unwrap();
     let marker = placeholder("X");
     let strings = samples(&spec, 20);
     assert!(
-        strings
-            .iter()
-            .all(|s| s.starts_with(&marker) && s[marker.len()..].starts_with('<')),
+        strings.iter().all(|s| s.starts_with(&marker) && s[marker.len()..].starts_with('<')),
         "{strings:?}"
     );
     assert_eq!(*tok(&spec, "X", &marker).reading(), Reading::Itself);
@@ -464,11 +383,7 @@ fn a_placeholder_is_read_as_itself_before_any_other_terminal() {
 fn ignorables_go_either_side_of_a_placeholder() {
     let spec = spec_with(
         "start: NAME X NAME\nNAME: /[a-z]+/\n%declare X\n%import common.WS\n%ignore WS\n",
-        GrammarOptions {
-            explicit: explicit(&["X"]),
-            max_size: 200,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["X"]), max_size: 200, ..GrammarOptions::default() },
     )
     .unwrap();
     let marker = placeholder("X");
@@ -480,24 +395,15 @@ fn ignorables_go_either_side_of_a_placeholder() {
     }
     let spec = spec_with(
         "start: \"a\" X \"b\"\n%declare X\n",
-        GrammarOptions {
-            explicit: explicit(&["X"]),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["X"]), ..GrammarOptions::default() },
     )
     .unwrap();
-    assert!(
-        samples(&spec, 10)
-            .iter()
-            .all(|s| *s == format!("a{marker}b"))
-    );
+    assert!(samples(&spec, 10).iter().all(|s| *s == format!("a{marker}b")));
 }
 
 #[test]
 fn declared_terminal_without_a_generator_is_an_error() {
-    let err = spec_with("start: X\n%declare X\n", GrammarOptions::default())
-        .err()
-        .unwrap();
+    let err = spec_with("start: X\n%declare X\n", GrammarOptions::default()).err().unwrap();
     assert_eq!(
         err.message,
         "Terminal 'X' is declared but has no definition: supply a generator for it with \
@@ -525,48 +431,31 @@ fn alphabet_must_be_a_text_generator() {
 
 #[test]
 fn caps_below_the_smallest_string_are_errors() {
-    let err = spec_with(
-        "start: \"abc\"\n",
-        GrammarOptions {
-            max_size: 2,
-            ..GrammarOptions::default()
-        },
-    )
-    .err()
-    .unwrap();
+    let err =
+        spec_with("start: \"abc\"\n", GrammarOptions { max_size: 2, ..GrammarOptions::default() })
+            .err()
+            .unwrap();
     assert_eq!(
         err.message,
         "max_size is 2 but the smallest string 'start' can produce has 3 characters"
     );
     let err = spec_with(
         "start: \"a\"*\n",
-        GrammarOptions {
-            max_size: MAX_MAX_SIZE + 1,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { max_size: MAX_MAX_SIZE + 1, ..GrammarOptions::default() },
     )
     .err()
     .unwrap();
-    assert_eq!(
-        err.message,
-        "max_size is 1048577 but may be at most 1048576"
-    );
+    assert_eq!(err.message, "max_size is 1048577 but may be at most 1048576");
     let err = spec_with(
         "start: \"a\"*\n",
-        GrammarOptions {
-            max_depth: MAX_MAX_DEPTH + 1,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { max_depth: MAX_MAX_DEPTH + 1, ..GrammarOptions::default() },
     )
     .err()
     .unwrap();
     assert_eq!(err.message, "max_depth is 501 but may be at most 500");
     let err = spec_with(
         "start: a\na: b\nb: \"x\"\n",
-        GrammarOptions {
-            max_depth: 2,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { max_depth: 2, ..GrammarOptions::default() },
     )
     .err()
     .unwrap();
@@ -584,11 +473,7 @@ fn budgets_count_terminals_at_their_typical_length() {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
         let mut generation = Generation::new(&spec, 0.0, spec.max_size);
         assert!(generation.run(&mut ntc, 70).is_ok());
-        assert!(
-            generation.tokens.len() <= 10,
-            "seed {seed}: {}",
-            generation.tokens.len()
-        );
+        assert!(generation.tokens.len() <= 10, "seed {seed}: {}", generation.tokens.len());
     }
 }
 
@@ -613,10 +498,7 @@ fn grammar_errors_propagate() {
     assert!(spec_with("start: start \"x\"\n", GrammarOptions::default()).is_err());
     let err = spec_with(
         "start: \"a\"\n",
-        GrammarOptions {
-            start: "nope".to_string(),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { start: "nope".to_string(), ..GrammarOptions::default() },
     )
     .err()
     .unwrap();
@@ -642,10 +524,7 @@ fn generated_strings_are_in_the_grammar_and_within_the_cap() {
 fn depth_cap_bounds_the_nesting() {
     let spec = spec_with(
         "start: \"x\" | \"(\" start \")\"\n",
-        GrammarOptions {
-            max_depth: 4,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { max_depth: 4, ..GrammarOptions::default() },
     )
     .unwrap();
     let strings = samples(&spec, 100);
@@ -662,31 +541,19 @@ fn depth_cap_bounds_the_nesting() {
 /// allows, which the rule takes regardless.
 #[test]
 fn a_rule_none_of_whose_alternatives_fit_the_budget_takes_the_cheapest_the_depth_allows() {
-    let options = || GrammarOptions {
-        max_depth: 1,
-        ..GrammarOptions::default()
-    };
+    let options = || GrammarOptions { max_depth: 1, ..GrammarOptions::default() };
     let text = "start: (\"aa\" | y)\ny: \"b\"\n";
-    assert_eq!(
-        simplest_string(simple_grammar(text), options()),
-        ("aa".to_string(), 1)
-    );
+    assert_eq!(simplest_string(simple_grammar(text), options()), ("aa".to_string(), 1));
     let spec = spec_with(text, options()).unwrap();
     let strings = samples(&spec, 50);
     assert!(strings.iter().all(|s| s == "aa"), "{strings:?}");
     let keywords: Vec<String> = (0..70).map(|i| format!("\"k{i}\"")).collect();
     let text = format!("start: ({} | y)\ny: \"b\"\n", keywords.join(" | "));
-    assert_eq!(
-        simplest_string(simple_grammar(&text), options()),
-        ("k0".to_string(), 1)
-    );
+    assert_eq!(simplest_string(simple_grammar(&text), options()), ("k0".to_string(), 1));
     let spec = spec_with(&text, options()).unwrap();
     let strings = samples(&spec, 50);
     assert!(strings.iter().all(|s| s.starts_with('k')), "{strings:?}");
-    assert!(
-        strings.iter().filter(|s| *s == "k0").count() >= 10,
-        "{strings:?}"
-    );
+    assert!(strings.iter().filter(|s| *s == "k0").count() >= 10, "{strings:?}");
 }
 
 #[test]
@@ -711,11 +578,7 @@ fn repetitions_cover_their_whole_range() {
 fn growing_only_and_closing_only_rules() {
     let spec = small("start: \"a\"*\n", 20);
     let strings = samples(&spec, 50);
-    assert!(
-        strings
-            .iter()
-            .all(|s| s.chars().all(|c| c == 'a') && s.len() <= 20)
-    );
+    assert!(strings.iter().all(|s| s.chars().all(|c| c == 'a') && s.len() <= 20));
     assert!(strings.iter().any(|s| s.len() > 10));
     let spec = grammar("start: \"a\" | \"bb\"\n");
     let strings = samples(&spec, 50);
@@ -763,19 +626,14 @@ fn keyword_only_terminals_are_accepted_after_the_retries() {
     let spec = grammar("start: NAME \"if\" \"iff\"\nNAME: /if|iff/\n%ignore \" \"\n");
     let strings = samples(&spec, 20);
     assert!(
-        strings
-            .iter()
-            .all(|s| ["ifififf", "iffififf"].contains(&s.replace(' ', "").as_str())),
+        strings.iter().all(|s| ["ifififf", "iffififf"].contains(&s.replace(' ', "").as_str())),
         "{strings:?}"
     );
 }
 
 #[test]
 fn separators_are_forced_between_tokens_that_would_merge() {
-    let spec = small(
-        "start: NAME NAME\nNAME: /[a-z]+/\n%ignore WS\nWS: /[ \\t]+/\n",
-        40,
-    );
+    let spec = small("start: NAME NAME\nNAME: /[a-z]+/\n%ignore WS\nWS: /[ \\t]+/\n", 40);
     let strings = samples(&spec, 100);
     for s in &strings {
         assert_eq!(s.split_whitespace().count(), 2, "{s:?}");
@@ -858,11 +716,7 @@ fn comments_without_a_newline_are_dropped_for_whitespace() {
     let strings = samples(&spec, 100);
     for s in &strings {
         let code = s.split('#').next().unwrap();
-        assert_eq!(
-            code.split(' ').filter(|w| !w.is_empty()).count(),
-            2,
-            "{s:?}"
-        );
+        assert_eq!(code.split(' ').filter(|w| !w.is_empty()).count(), 2, "{s:?}");
     }
     assert!(strings.iter().any(|s| s.contains('#')), "{strings:?}");
 }
@@ -871,19 +725,13 @@ fn comments_without_a_newline_are_dropped_for_whitespace() {
 fn declared_ignorables_are_placeholders() {
     let spec = spec_with(
         "start: NAME NAME\nNAME: /[a-z]+/\n%declare WS\n%ignore WS\n",
-        GrammarOptions {
-            explicit: explicit(&["WS"]),
-            max_size: 200,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["WS"]), max_size: 200, ..GrammarOptions::default() },
     )
     .unwrap();
     let marker = placeholder("WS");
     let strings = samples(&spec, 30);
     assert!(
-        strings
-            .iter()
-            .all(|s| s.split(marker.as_str()).filter(|w| !w.is_empty()).count() == 2),
+        strings.iter().all(|s| s.split(marker.as_str()).filter(|w| !w.is_empty()).count() == 2),
         "{strings:?}"
     );
     let ws = tok(&spec, "WS", &marker);
@@ -900,11 +748,7 @@ fn declared_ignorables_are_placeholders() {
 fn an_ignorable_placeholder_a_token_reads_across_is_removed_again() {
     let spec = spec_with(
         "start: NAME NAME\nNAME: /[a-zA-Z0-9_<>]+/\n%declare WS\n%ignore WS\n",
-        GrammarOptions {
-            explicit: explicit(&["WS"]),
-            max_size: 200,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { explicit: explicit(&["WS"]), max_size: 200, ..GrammarOptions::default() },
     )
     .unwrap();
     let (result, _) = draw(&spec, 0);
@@ -915,23 +759,11 @@ fn an_ignorable_placeholder_a_token_reads_across_is_removed_again() {
 fn optional_tokens_may_be_swallowed_by_their_neighbours() {
     let spec = small("start: A B? C\nA: /a/\nB: /b/\nC: /b?c/\n", 10);
     let strings = samples(&spec, 50);
-    assert!(
-        strings
-            .iter()
-            .all(|s| ["ac", "abc", "abbc"].contains(&s.as_str())),
-        "{strings:?}"
-    );
+    assert!(strings.iter().all(|s| ["ac", "abc", "abbc"].contains(&s.as_str())), "{strings:?}");
     assert!(strings.iter().any(|s| s == "abc"));
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
-    (
-        generation.text,
-        generation.tokens,
-        generation.readings.findings,
-    ) = lay_out(&[
-        tok(&spec, "A", "a"),
-        tok(&spec, "B", "b"),
-        tok(&spec, "C", "c"),
-    ]);
+    (generation.text, generation.tokens, generation.readings.findings) =
+        lay_out(&[tok(&spec, "A", "a"), tok(&spec, "B", "b"), tok(&spec, "C", "c")]);
     generation.mark_droppable(0);
     assert!(generation.tokens.iter().all(|t| !t.droppable));
     generation.mark_droppable(3);
@@ -948,19 +780,13 @@ fn readings_of_terminal_texts() {
     let spec = grammar(
         "start: KW NAME\nKW: \"if\"\nNAME: /[a-z]+/\n%ignore WS\n%ignore NL\nWS: / +/\nNL: /\\n/\n",
     );
-    assert_eq!(
-        *tok(&spec, "NAME", "if").reading(),
-        Reading::Tokens(vec![tid(&spec, "KW")])
-    );
+    assert_eq!(*tok(&spec, "NAME", "if").reading(), Reading::Tokens(vec![tid(&spec, "KW")]));
     assert_eq!(*tok(&spec, "NAME", "iffy").reading(), Reading::Itself);
     assert_eq!(*tok(&spec, "WS", "  ").reading(), Reading::Itself);
     let ws = tid(&spec, "WS");
     assert_eq!(*tok(&spec, "WS", " \n").reading(), Reading::Ignorables);
     assert!(tok(&spec, "WS", " \n").lexable());
-    assert_eq!(
-        *tok(&spec, "WS", " x").reading(),
-        Reading::Tokens(vec![ws, tid(&spec, "NAME")])
-    );
+    assert_eq!(*tok(&spec, "WS", " x").reading(), Reading::Tokens(vec![ws, tid(&spec, "NAME")]));
     assert_eq!(*tok(&spec, "NAME", "9").reading(), Reading::Opaque);
     assert_eq!(*tok(&spec, "WS", "").reading(), Reading::Ignorables);
     assert_eq!(*tok(&spec, "NAME", "").reading(), Reading::Tokens(vec![]));
@@ -1000,10 +826,7 @@ fn a_reading_is_how_the_basic_lexer_reads_the_text_afresh() {
                     Reading::Ignorables => {
                         assert!(lexed.is_ok(), "{name} {seed} {text:?}");
                         assert!(spec.is_ignore(token.id), "{name} {seed} {text:?}");
-                        assert!(
-                            ids.iter().all(|&g| spec.is_ignore(g)),
-                            "{name} {seed} {text:?}"
-                        );
+                        assert!(ids.iter().all(|&g| spec.is_ignore(g)), "{name} {seed} {text:?}");
                     }
                     Reading::Tokens(tokens) => {
                         assert!(lexed.is_ok(), "{name} {seed} {text:?}");
@@ -1025,10 +848,7 @@ fn scans_follows_the_dynamic_lexer() {
     let ws = tok(&spec, "WS", " ");
     assert_eq!(fit(&spec, &[a.clone(), b.clone()]), Fit::Wrong);
     assert_eq!(fit(&spec, &[a.clone(), ws.clone(), b.clone()]), Fit::Wrong);
-    assert_eq!(
-        fit(&spec, &[a.clone(), ws.clone(), c.clone()]),
-        Fit::Settled
-    );
+    assert_eq!(fit(&spec, &[a.clone(), ws.clone(), c.clone()]), Fit::Settled);
     assert_eq!(fit(&spec, &[b.clone(), c.clone()]), Fit::Settled);
     assert_eq!(fit(&spec, &[a.clone(), ws.clone()]), Fit::Settled);
     assert_eq!(fit(&spec, &[ws.clone(), ws.clone(), c.clone()]), Fit::Exact);
@@ -1036,34 +856,13 @@ fn scans_follows_the_dynamic_lexer() {
     let mut dropped = b.clone();
     dropped.droppable = true;
     assert_eq!(fit(&spec, &[a.clone(), dropped.clone()]), Fit::Retyped);
+    assert_eq!(fit(&spec, &[a.clone(), dropped.clone(), c.clone()]), Fit::Retyped);
     assert_eq!(
-        fit(&spec, &[a.clone(), dropped.clone(), c.clone()]),
+        fit(&spec, &[a.clone(), ws.clone(), dropped.clone(), ws.clone(), c.clone()]),
         Fit::Retyped
     );
     assert_eq!(
-        fit(
-            &spec,
-            &[
-                a.clone(),
-                ws.clone(),
-                dropped.clone(),
-                ws.clone(),
-                c.clone()
-            ]
-        ),
-        Fit::Retyped
-    );
-    assert_eq!(
-        fit(
-            &spec,
-            &[
-                c.clone(),
-                ws.clone(),
-                dropped.clone(),
-                ws.clone(),
-                c.clone()
-            ]
-        ),
+        fit(&spec, &[c.clone(), ws.clone(), dropped.clone(), ws.clone(), c.clone()]),
         Fit::Retyped
     );
     let (text, tokens, findings) = lay_out(&[c, tok(&spec, "C", "x")]);
@@ -1093,48 +892,24 @@ fn basic_fit_distinguishes_retyped_from_wrong() {
     let i2 = tok(&spec, "I2", "xy");
     assert_eq!(basic_fit(&spec, &[a.clone(), b.clone()]), Fit::Exact);
     assert_eq!(basic_fit(&spec, &[z.clone(), a.clone()]), Fit::Retyped);
-    assert_eq!(
-        basic_fit(&spec, &[a.clone(), i1.clone(), i2.clone(), b.clone()]),
-        Fit::Retyped
-    );
-    assert_eq!(
-        basic_fit(&spec, &[z.clone(), i1.clone(), a.clone()]),
-        Fit::Wrong
-    );
+    assert_eq!(basic_fit(&spec, &[a.clone(), i1.clone(), i2.clone(), b.clone()]), Fit::Retyped);
+    assert_eq!(basic_fit(&spec, &[z.clone(), i1.clone(), a.clone()]), Fit::Wrong);
 }
 
 #[test]
 fn basic_fit_rejects_merged_and_split_tokens() {
     let spec = grammar("start: A B | C\nA: /a/\nB: /b/\nC: /ab/\n");
-    assert_eq!(
-        basic_fit(&spec, &[tok(&spec, "A", "a"), tok(&spec, "B", "b")]),
-        Fit::Wrong
-    );
+    assert_eq!(basic_fit(&spec, &[tok(&spec, "A", "a"), tok(&spec, "B", "b")]), Fit::Wrong);
     let spec = grammar("start: A B | C\nA: /a/\nB: /xb/\nC: /ax/\n");
-    assert_eq!(
-        basic_fit(&spec, &[tok(&spec, "A", "a"), tok(&spec, "B", "xb")]),
-        Fit::Wrong
-    );
+    assert_eq!(basic_fit(&spec, &[tok(&spec, "A", "a"), tok(&spec, "B", "xb")]), Fit::Wrong);
     let spec = grammar(
         "start: P Q A B Z PQ\nP.3: /p/\nQ.3: /q/\nA: /pq/\nB.3: /q+b/\nZ: /z/\nPQ.3: /(?<=z)pq/\n",
     );
     let a = tok(&spec, "A", "pq");
-    assert_eq!(
-        *a.reading(),
-        Reading::Tokens(vec![tid(&spec, "P"), tid(&spec, "Q")])
-    );
-    assert_eq!(
-        basic_fit(&spec, &[a.clone(), tok(&spec, "B", "qb")]),
-        Fit::Wrong
-    );
-    assert_eq!(
-        basic_fit(&spec, &[tok(&spec, "Z", "z"), a.clone()]),
-        Fit::Wrong
-    );
-    assert_eq!(
-        basic_fit(&spec, &[a.clone(), tok(&spec, "Z", "z")]),
-        Fit::Exact
-    );
+    assert_eq!(*a.reading(), Reading::Tokens(vec![tid(&spec, "P"), tid(&spec, "Q")]));
+    assert_eq!(basic_fit(&spec, &[a.clone(), tok(&spec, "B", "qb")]), Fit::Wrong);
+    assert_eq!(basic_fit(&spec, &[tok(&spec, "Z", "z"), a.clone()]), Fit::Wrong);
+    assert_eq!(basic_fit(&spec, &[a.clone(), tok(&spec, "Z", "z")]), Fit::Exact);
 }
 
 #[test]
@@ -1142,14 +917,8 @@ fn basic_fit_reads_ignorable_stretches_loosely() {
     let spec = grammar("start: A B X\nA: /a/\nB.3: /(?<=ax)x+b/\nX.2: /x/\n%ignore I\nI: /x+/\n");
     let a = tok(&spec, "A", "a");
     let i = tok(&spec, "I", "xx");
-    assert_eq!(
-        *i.reading(),
-        Reading::Tokens(vec![tid(&spec, "X"), tid(&spec, "X")])
-    );
-    assert_eq!(
-        basic_fit(&spec, &[a.clone(), i.clone(), tok(&spec, "A", "a")]),
-        Fit::Retyped
-    );
+    assert_eq!(*i.reading(), Reading::Tokens(vec![tid(&spec, "X"), tid(&spec, "X")]));
+    assert_eq!(basic_fit(&spec, &[a.clone(), i.clone(), tok(&spec, "A", "a")]), Fit::Retyped);
     let mut b = tok(&spec, "B", "xxb");
     reread(&mut b, Reading::Itself);
     assert_eq!(basic_fit(&spec, &[a.clone(), i.clone(), b]), Fit::Wrong);
@@ -1189,12 +958,7 @@ fn a_regex_may_run_on_past_the_next_token_to_a_later_one() {
 fn strings_that_do_not_lex_back_whole_are_regenerated() {
     let spec = grammar("start: A B C\nA: /a.*x/\nB: /y/\nC: /x?z/\n");
     let strings = samples(&spec, 30);
-    assert!(
-        strings
-            .iter()
-            .all(|s| s.ends_with("yz") && !s.ends_with("yxz")),
-        "{strings:?}"
-    );
+    assert!(strings.iter().all(|s| s.ends_with("yz") && !s.ends_with("yxz")), "{strings:?}");
     let spec = grammar("start: A B C\nA: /a.*x/\nB: /y/\nC: /x/\n");
     let (result, status) = draw(&spec, 0);
     assert!(matches!(result, Err(EngineError::InvalidArgument(_))));
@@ -1330,18 +1094,11 @@ fn settled_stretches_read_back_exactly_and_settled_strings_lex_as_wholes() {
                 whole_strings += 1;
                 let text = &generation.text;
                 assert!(spec.scans(text, tokens, findings), "{name} {seed} {text:?}");
-                assert!(
-                    tokens
-                        .iter()
-                        .all(|t| spec.single(t, findings) && t.whole(findings))
-                );
+                assert!(tokens.iter().all(|t| spec.single(t, findings) && t.whole(findings)));
             }
         }
     }
-    assert!(
-        settled > 2 * unsettled,
-        "{settled} settled, {unsettled} not"
-    );
+    assert!(settled > 2 * unsettled, "{settled} settled, {unsettled} not");
     assert!(whole_strings > 0);
 }
 
@@ -1382,10 +1139,7 @@ fn settling_a_basic_scan_that_follows_the_own_one_never_changes_the_answer() {
             }
             let checked_findings: Vec<TokenScans> = findings
                 .iter()
-                .map(|scans| TokenScans {
-                    basic_follows_own: false,
-                    ..scans.clone()
-                })
+                .map(|scans| TokenScans { basic_follows_own: false, ..scans.clone() })
                 .collect();
             for width in 2..=3 {
                 for window in tokens.windows(width) {
@@ -1413,9 +1167,7 @@ fn settling_a_basic_scan_that_follows_the_own_one_never_changes_the_answer() {
 fn write_corpus() {
     let dir = std::env::var("HEGEL_LARK_CORPUS_DIR").unwrap();
     let grammars = std::env::var("HEGEL_LARK_CORPUS_GRAMMARS").unwrap();
-    let n: u64 = std::env::var("HEGEL_LARK_CORPUS_N")
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(100);
+    let n: u64 = std::env::var("HEGEL_LARK_CORPUS_N").map(|s| s.parse().unwrap()).unwrap_or(100);
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lark");
     for name in grammars.split(',').filter(|name| !name.is_empty()) {
         let expected = std::fs::read_to_string(fixtures.join(format!("{name}.expected"))).unwrap();
@@ -1467,10 +1219,7 @@ fn draws_work_in_the_buffers_the_spec_has_to_spare() {
         assert!(kept.text.capacity() > 0 && kept.text.capacity() < 1 << 16);
         kept.text.capacity()
     };
-    let roomy = Buffers {
-        text: Vec::with_capacity(1 << 16),
-        ..Buffers::new()
-    };
+    let roomy = Buffers { text: Vec::with_capacity(1 << 16), ..Buffers::new() };
     let displaced = roomy.offer(&mut spec.buffers.lock()).unwrap();
     assert_eq!(displaced.text.capacity(), used);
     draw(&spec, 1).0.unwrap();
@@ -1489,10 +1238,7 @@ fn draws_work_in_the_buffers_the_spec_has_to_spare() {
 fn engine_errors_before_the_walk_propagate() {
     let spec = grammar("start: \"a\" | \"b\"\n");
     let mut ntc = NativeTestCase::for_choices(&[], None, None);
-    assert!(matches!(
-        generate_grammar(&mut ntc, &spec, None),
-        Err(EngineError::Overrun)
-    ));
+    assert!(matches!(generate_grammar(&mut ntc, &spec, None), Err(EngineError::Overrun)));
     assert!(ntc.nodes.is_empty());
 }
 
@@ -1522,10 +1268,7 @@ fn chains_skip_ignorables_the_previous_one_would_swallow() {
     );
     for s in samples(&spec, 100) {
         let body = s.split('#').next().unwrap();
-        assert!(
-            body.chars().all(|c| c.is_ascii_digit() || c == ' '),
-            "{s:?}"
-        );
+        assert!(body.chars().all(|c| c.is_ascii_digit() || c == ' '), "{s:?}");
     }
 }
 
@@ -1565,15 +1308,10 @@ fn chain_pairs_that_keep_failing_are_given_up_on() {
 /// string, as a draw would.
 fn push(generation: &mut Generation, id: TermId, text: &str) {
     let chars: Vec<char> = text.chars().collect();
-    let scans = generation
-        .readings
-        .read_token(generation.spec, id, &chars, None);
+    let scans = generation.readings.read_token(generation.spec, id, &chars, None);
     let token = generation.token(id, generation.text.len(), scans);
     generation.text.extend(chars);
-    generation.tokens.push(Token {
-        end: generation.text.len(),
-        ..token
-    });
+    generation.tokens.push(Token { end: generation.text.len(), ..token });
 }
 
 /// The characters of `generation`'s string.
@@ -1591,10 +1329,7 @@ fn an_ignorable_before_a_pending_token_counts_against_the_whole_string() {
     push(&mut generation, tid(&spec, "A"), "a");
     push(&mut generation, tid(&spec, "B"), "b");
     let mut d = SimplestDraws::default();
-    assert!(matches!(
-        generation.draw_ignore(&mut d, ws, 0, 1, 0).ok().unwrap(),
-        Drawn::Oversize
-    ));
+    assert!(matches!(generation.draw_ignore(&mut d, ws, 0, 1, 0).ok().unwrap(), Drawn::Oversize));
     assert_eq!(text(&generation), "ab");
     assert_eq!(generation.tokens.len(), 2);
     let spec = small("start: A B\nA: /a/\nB: /b/\n%ignore WS\nWS: /  /\n", 4);
@@ -1615,21 +1350,14 @@ fn a_chained_ignorable_the_one_before_it_swallows_the_next_token_through_is_not_
         "start: NUM+\nNUM: /[0-9]/\nWS: / +/\nNL: /\\n/\nCOMMENT: /#[^\\n]*/\n\
          %ignore WS\n%ignore NL\n%ignore COMMENT\n",
     );
-    let (num, ws, nl, comment) = (
-        tid(&spec, "NUM"),
-        tid(&spec, "WS"),
-        tid(&spec, "NL"),
-        tid(&spec, "COMMENT"),
-    );
+    let (num, ws, nl, comment) =
+        (tid(&spec, "NUM"), tid(&spec, "WS"), tid(&spec, "NL"), tid(&spec, "COMMENT"));
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     push(&mut generation, num, "1");
     push(&mut generation, comment, "#");
     push(&mut generation, num, "2");
     let mut d = SimplestDraws::default();
-    assert!(matches!(
-        generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(),
-        Drawn::Swallowed
-    ));
+    assert!(matches!(generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(), Drawn::Swallowed));
     assert_eq!(text(&generation), "1# 2");
     assert_eq!(generation.tokens.len(), 4);
     generation.remove(1);
@@ -1646,25 +1374,16 @@ fn a_chained_ignorable_the_one_before_it_swallows_the_next_token_through_is_not_
     assert_eq!(text(&generation), "1# 2");
     generation.remove(1);
     generation.tokens[2].droppable = true;
-    assert!(matches!(
-        generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(),
-        Drawn::Fits(_)
-    ));
+    assert!(matches!(generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(), Drawn::Fits(_)));
     generation.remove(1);
     generation.tokens.pop();
     generation.text.pop();
     push(&mut generation, ws, " ");
-    assert!(matches!(
-        generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(),
-        Drawn::Swallowed
-    ));
+    assert!(matches!(generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(), Drawn::Swallowed));
     assert_eq!(text(&generation), "1#  ");
     generation.remove(1);
     generation.tokens[2].needed = false;
-    assert!(matches!(
-        generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(),
-        Drawn::Fits(_)
-    ));
+    assert!(matches!(generation.draw_ignore(&mut d, ws, 0, 1, 1).ok().unwrap(), Drawn::Fits(_)));
     assert_eq!(text(&generation), "1#  ");
 }
 
@@ -1680,11 +1399,7 @@ fn a_generation_remembers_the_lexing_of_its_token_texts_until_a_draw_finds_too_m
     };
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     let room = |readings: &ReadingsCache| {
-        (
-            readings.table.capacity(),
-            readings.texts.capacity(),
-            readings.findings.capacity(),
-        )
+        (readings.table.capacity(), readings.texts.capacity(), readings.findings.capacity())
     };
     let fresh = room(&generation.readings);
     assert!(fresh.0 >= READINGS_CAPACITY, "{fresh:?}");
@@ -1693,10 +1408,7 @@ fn a_generation_remembers_the_lexing_of_its_token_texts_until_a_draw_finds_too_m
     let first = generation.readings.read_token(&spec, name, &text(0), None);
     assert_eq!(generation.readings.findings[first].reading, Reading::Itself);
     assert_eq!(generation.readings.len, 1);
-    assert_eq!(
-        generation.readings.read_token(&spec, name, &text(0), None),
-        first
-    );
+    assert_eq!(generation.readings.read_token(&spec, name, &text(0), None), first);
     assert_eq!(generation.readings.len, 1);
     assert_eq!(generation.readings.findings.len(), 1);
     for n in 1..READINGS_CAPACITY - 1 {
@@ -1707,18 +1419,12 @@ fn a_generation_remembers_the_lexing_of_its_token_texts_until_a_draw_finds_too_m
     generation.recycle();
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     assert_eq!(generation.readings.len, READINGS_CAPACITY - 1);
-    assert_eq!(
-        generation.readings.read_token(&spec, name, &text(0), None),
-        first
-    );
+    assert_eq!(generation.readings.read_token(&spec, name, &text(0), None), first);
     for n in READINGS_CAPACITY - 1..=READINGS_CAPACITY {
         generation.readings.read_token(&spec, name, &text(n), None);
     }
     assert_eq!(generation.readings.len, READINGS_CAPACITY + 1);
-    assert_eq!(
-        generation.readings.read_token(&spec, name, &text(0), None),
-        first
-    );
+    assert_eq!(generation.readings.read_token(&spec, name, &text(0), None), first);
     generation.recycle();
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     assert_eq!(generation.readings.len, 0);
@@ -1783,10 +1489,7 @@ fn a_remembered_text_the_pattern_does_not_take_whole_is_cut_like_a_fresh_one() {
     let ab: Vec<char> = "ab".chars().collect();
     let mut generation = Generation::new(&seeded, 0.0, seeded.max_size);
     let remembered = generation.readings.read_token(&seeded, a, &ab, None);
-    assert_eq!(
-        taken(&generation.readings.findings[remembered].own, ab.len()),
-        1
-    );
+    assert_eq!(taken(&generation.readings.findings[remembered].own, ab.len()), 1);
     generation.recycle();
     let strings = samples(&seeded, 50);
     assert_eq!(strings, samples(&fresh, 50));
@@ -1826,23 +1529,13 @@ fn nth_set_bit_counts_from_the_lowest() {
 }
 
 fn alt(min_size: u64, typical_size: u64, max_size: Bound, min_depth: u32) -> Alt {
-    Alt {
-        min_size,
-        typical_size,
-        max_size,
-        min_depth,
-        items: vec![],
-    }
+    Alt { min_size, typical_size, max_size, min_depth, items: vec![] }
 }
 
 #[test]
 fn the_classes_of_alternatives_are_worked_out_once_for_every_budget() {
-    let alts = [
-        alt(1, 2, Some(3), 0),
-        alt(2, 4, None, 3),
-        alt(2, 5, Some(9), 1),
-        alt(7, 7, None, 2),
-    ];
+    let alts =
+        [alt(1, 2, Some(3), 0), alt(2, 4, None, 3), alt(2, 5, Some(9), 1), alt(7, 7, None, 2)];
     let classes = AltClasses::of(&alts).unwrap();
     assert_eq!(
         classes,
@@ -1869,30 +1562,14 @@ fn the_classes_of_alternatives_are_worked_out_once_for_every_budget() {
     assert_eq!(classes.at(&alts, 7, 0, 2), None);
     let unsorted = [alt(2, 2, None, 0), alt(1, 1, None, 0)];
     assert_eq!(AltClasses::of(&unsorted), None);
-    assert_eq!(
-        AltClasses::of(&[]).unwrap(),
-        AltClasses {
-            min_depth: 0,
-            by_prefix: vec![],
-        }
-    );
-    assert_eq!(
-        AltClasses::of(&[]).unwrap().at(&[], 3, 0, 1),
-        Some((0, 0, u64::MAX))
-    );
-    let many: Vec<Alt> = (0..MASKED_ALTS as u64)
-        .map(|i| alt(i, i, None, 0))
-        .collect();
+    assert_eq!(AltClasses::of(&[]).unwrap(), AltClasses { min_depth: 0, by_prefix: vec![] });
+    assert_eq!(AltClasses::of(&[]).unwrap().at(&[], 3, 0, 1), Some((0, 0, u64::MAX)));
+    let many: Vec<Alt> = (0..MASKED_ALTS as u64).map(|i| alt(i, i, None, 0)).collect();
     let classes = AltClasses::of(&many).unwrap();
     assert_eq!(classes.by_prefix.len(), MASKED_ALTS);
     assert_eq!(classes.at(&many, 63, 0, 1), Some((u64::MAX, !1, 1)));
-    assert_eq!(
-        classes.at(&many, 62, 0, 1),
-        Some((u64::MAX >> 1, (u64::MAX >> 1) & !1, 1))
-    );
-    let too_many: Vec<Alt> = (0..=MASKED_ALTS as u64)
-        .map(|i| alt(i, i, None, 0))
-        .collect();
+    assert_eq!(classes.at(&many, 62, 0, 1), Some((u64::MAX >> 1, (u64::MAX >> 1) & !1, 1)));
+    let too_many: Vec<Alt> = (0..=MASKED_ALTS as u64).map(|i| alt(i, i, None, 0)).collect();
     assert_eq!(AltClasses::of(&too_many), None);
 }
 
@@ -1930,14 +1607,9 @@ fn every_group_has_its_classes_by_its_number() {
 
 #[test]
 fn choosing_an_alternative_by_mask_agrees_with_scanning() {
-    let spec = spec_with(
-        "start: \"a\"\n",
-        GrammarOptions {
-            max_depth: 6,
-            ..GrammarOptions::default()
-        },
-    )
-    .unwrap();
+    let spec =
+        spec_with("start: \"a\"\n", GrammarOptions { max_depth: 6, ..GrammarOptions::default() })
+            .unwrap();
     let mut rng = EngineRng::seeded(0);
     let (mut chosen, mut fell_back, mut infeasible, mut beyond_mask, mut grew) = (0, 0, 0, 0, 0);
     let (mut all, mut some, mut too_deep) = (0, 0, 0);
@@ -1954,12 +1626,7 @@ fn choosing_an_alternative_by_mask_agrees_with_scanning() {
                     _ => rng.next_byte() % 2 == 0,
                 };
                 let max_size = (!grows).then_some(typical_size + 3);
-                alt(
-                    min_size,
-                    typical_size,
-                    max_size,
-                    u32::from(rng.next_byte() % 4),
-                )
+                alt(min_size, typical_size, max_size, u32::from(rng.next_byte() % 4))
             })
             .collect();
         alts.sort_by_key(|alt| alt.min_size);
@@ -1970,14 +1637,9 @@ fn choosing_an_alternative_by_mask_agrees_with_scanning() {
         let mut by_scan = NativeTestCase::new_random(EngineRng::seeded(case)).unwrap();
         let mut generation = Generation::new(&spec, 0.0, spec.max_size);
         let position = |alt: &Alt| alts.iter().position(|a| core::ptr::eq(a, alt)).unwrap();
-        let masked = generation
-            .choose_alt(&mut by_mask, &alts, None, budget, depth)
-            .map(position);
+        let masked = generation.choose_alt(&mut by_mask, &alts, None, budget, depth).map(position);
         let classes = AltClasses::of(&alts);
-        match classes
-            .as_ref()
-            .map(|classes| classes.at(&alts, budget, depth, spec.max_depth))
-        {
+        match classes.as_ref().map(|classes| classes.at(&alts, budget, depth, spec.max_depth)) {
             Some(Some((feasible, _, _))) if feasible.count_ones() as usize == n => all += 1,
             Some(Some(_)) => some += 1,
             Some(None) => too_deep += 1,
@@ -1986,9 +1648,8 @@ fn choosing_an_alternative_by_mask_agrees_with_scanning() {
         let classed = generation
             .choose_alt(&mut by_classes, &alts, classes.as_ref(), budget, depth)
             .map(position);
-        let scanned = generation
-            .choose_alt_scanning(&mut by_scan, &alts, budget, depth)
-            .map(position);
+        let scanned =
+            generation.choose_alt_scanning(&mut by_scan, &alts, budget, depth).map(position);
         let in_depth = |alt: &Alt| depth.saturating_add(alt.min_depth) <= spec.max_depth;
         let fits = |alt: &Alt| in_depth(alt) && alt.min_size <= budget;
         match (masked, classed, scanned) {
@@ -1997,10 +1658,8 @@ fn choosing_an_alternative_by_mask_agrees_with_scanning() {
                 if alts.iter().any(fits) {
                     chosen += 1;
                 } else {
-                    let cheapest = alts
-                        .iter()
-                        .filter(|alt| in_depth(alt))
-                        .min_by_key(|alt| alt.min_size);
+                    let cheapest =
+                        alts.iter().filter(|alt| in_depth(alt)).min_by_key(|alt| alt.min_size);
                     assert_eq!(a, position(cheapest.unwrap()));
                     fell_back += 1;
                 }
@@ -2022,20 +1681,15 @@ fn choosing_an_alternative_by_mask_agrees_with_scanning() {
         chosen > 500 && fell_back >= 10 && infeasible >= 1 && beyond_mask > 30 && grew > 200,
         "{chosen} {fell_back} {infeasible} {beyond_mask} {grew}"
     );
-    assert!(
-        all > 50 && some > 50 && too_deep > 50,
-        "{all} {some} {too_deep}"
-    );
+    assert!(all > 50 && some > 50 && too_deep > 50, "{all} {some} {too_deep}");
 }
 
 #[test]
 fn rules_with_more_alternatives_than_a_mask_holds() {
     let keywords: Vec<String> = (0..70).map(|i| format!("\"k{i}\"")).collect();
     let spec = grammar(&format!("start: {}\n", keywords.join(" | ")));
-    let drawn: Vec<usize> = samples(&spec, 40)
-        .iter()
-        .map(|s| s.strip_prefix('k').unwrap().parse().unwrap())
-        .collect();
+    let drawn: Vec<usize> =
+        samples(&spec, 40).iter().map(|s| s.strip_prefix('k').unwrap().parse().unwrap()).collect();
     assert!(drawn.iter().all(|&i| i < 70));
     assert!(drawn.iter().any(|&i| i >= MASKED_ALTS));
 }
@@ -2044,12 +1698,9 @@ fn rules_with_more_alternatives_than_a_mask_holds() {
 fn an_ignorable_skipped_at_a_character_would_not_have_matched_there() {
     let mut skipped = 0;
     let mut tried = 0;
-    for (name, start) in [
-        ("json", "value"),
-        ("features", "start"),
-        ("verilog", "start"),
-        ("template_lark", "start"),
-    ] {
+    for (name, start) in
+        [("json", "value"), ("features", "start"), ("verilog", "start"), ("template_lark", "start")]
+    {
         let spec = fixture_spec(name, start, 400, vec![]);
         for ch in 0u8..128 {
             let ch = char::from(ch);
@@ -2083,10 +1734,7 @@ fn drawing_from_an_rng_gives_the_strings_a_fresh_test_case_draws() {
         ),
         spec_with(
             "start: (TEXT \";\")+\n%declare TEXT",
-            GrammarOptions {
-                explicit: explicit(&["TEXT"]),
-                ..GrammarOptions::default()
-            },
+            GrammarOptions { explicit: explicit(&["TEXT"]), ..GrammarOptions::default() },
         )
         .unwrap(),
         fixture_spec("json", "value", 2000, vec![]),
@@ -2119,10 +1767,7 @@ fn simplest_string(grammar: Grammar, options: GrammarOptions) -> (String, u64) {
     assert_eq!(draws.status(), None);
     assert_eq!(spec.constraint().simplest(), None);
     assert_eq!(codepoints_to_string(spec.ensure_simplest().unwrap()), s);
-    assert_eq!(
-        spec.kind.simplest().unwrap(),
-        spec.constraint().simplest().unwrap()
-    );
+    assert_eq!(spec.kind.simplest().unwrap(), spec.constraint().simplest().unwrap());
     let chars: Vec<char> = s.chars().collect();
     assert!(parser.accepts(&lexer, &chars), "{s:?}");
     (s, spec.min_size())
@@ -2134,10 +1779,7 @@ fn simple_grammar(text: &str) -> Grammar {
 }
 
 fn fixture_options(start: &str) -> GrammarOptions {
-    GrammarOptions {
-        start: start.to_string(),
-        ..GrammarOptions::default()
-    }
+    GrammarOptions { start: start.to_string(), ..GrammarOptions::default() }
 }
 
 /// The simplest source aims for the smallest string and takes the
@@ -2146,10 +1788,8 @@ fn fixture_options(start: &str) -> GrammarOptions {
 /// simplest match is its shortest.
 #[test]
 fn the_simplest_source_draws_the_smallest_string_of_a_grammar() {
-    let (s, min) = simplest_string(
-        simple_grammar("start: \"a\" \"b\"* | \"c\"+"),
-        GrammarOptions::default(),
-    );
+    let (s, min) =
+        simplest_string(simple_grammar("start: \"a\" \"b\"* | \"c\"+"), GrammarOptions::default());
     assert!(s == "a" || s == "c", "{s:?}");
     assert_eq!(min, 1);
     let (s, min) = simplest_string(
@@ -2184,10 +1824,7 @@ fn a_terminal_whose_first_alternative_is_not_its_shortest_draws_its_least() {
     assert_eq!((s.as_str(), min), ("a", 1));
     let spec = grammar(text);
     spec.ensure_simplest().unwrap();
-    assert_eq!(
-        spec.constraint().smallest_for_terminal(tid(&spec, "T")),
-        Some(cps("a"))
-    );
+    assert_eq!(spec.constraint().smallest_for_terminal(tid(&spec, "T")), Some(cps("a")));
 }
 
 #[test]
@@ -2204,10 +1841,7 @@ fn a_grammar_string_is_one_choice_under_the_grammar_constraint() {
             panic!("{node:?}");
         };
         assert_eq!(kind, *spec.kind);
-        assert_eq!(
-            kind.constraint.as_ref().and_then(Constraint::grammar),
-            Some(spec.constraint())
-        );
+        assert_eq!(kind.constraint.as_ref().and_then(Constraint::grammar), Some(spec.constraint()));
         assert!(kind.validate(&cps(&s)));
         assert_eq!(ntc.spans.len(), 1);
         assert_eq!(ntc.spans[0].label, LABEL_GRAMMAR);
@@ -2278,10 +1912,7 @@ fn a_grammar_no_draw_can_generate_from_reports_so_at_the_first_draw() {
     let Err(EngineError::InvalidArgument(message)) = generate_grammar(&mut ntc, &spec, None) else {
         panic!("expected an invalid argument");
     };
-    assert!(
-        message.contains("no string of 'start' could be generated"),
-        "{message}"
-    );
+    assert!(message.contains("no string of 'start' could be generated"), "{message}");
     assert!(ntc.nodes.is_empty());
     assert_eq!(ntc.status(), None);
     assert!(spec.constraint().simplest().is_none());
@@ -2334,10 +1965,7 @@ fn tokens_of_ignored_terminals_that_rules_draw_are_needed() {
     for text in grammars {
         let spec = small(text, 64);
         let simplest = codepoints_to_string(spec.ensure_simplest().unwrap());
-        assert!(
-            spec.constraint().tree(&cps(&simplest)).is_some(),
-            "{text}: {simplest:?}"
-        );
+        assert!(spec.constraint().tree(&cps(&simplest)).is_some(), "{text}: {simplest:?}");
         let mut drawn = 0;
         for seed in 0..300 {
             let (result, status) = draw(&spec, seed);
@@ -2437,30 +2065,18 @@ fn terminals_the_alphabet_cannot_produce_are_errors() {
             "terminal LETTER ([a-z]) cannot be produced over the alphabet '0'..='9'",
         ),
     ] {
-        let err = spec_with(
-            text,
-            GrammarOptions {
-                alphabet: digits(),
-                ..GrammarOptions::default()
-            },
-        )
-        .err()
-        .unwrap();
+        let err =
+            spec_with(text, GrammarOptions { alphabet: digits(), ..GrammarOptions::default() })
+                .err()
+                .unwrap();
         assert_eq!(err.message, message, "{text}");
     }
     let spec = spec_with(
         "start: B\nB: /[0-9]+/\nC: /[a-z]+/\n",
-        GrammarOptions {
-            alphabet: digits(),
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { alphabet: digits(), ..GrammarOptions::default() },
     )
     .unwrap();
-    assert!(
-        samples(&spec, 20)
-            .iter()
-            .all(|s| s.chars().all(|c| c.is_ascii_digit()))
-    );
+    assert!(samples(&spec, 20).iter().all(|s| s.chars().all(|c| c.is_ascii_digit())));
 }
 
 /// The cache is bounded by the characters of the texts it holds as well
@@ -2477,16 +2093,12 @@ fn a_generation_forgets_its_readings_when_their_texts_hold_too_many_characters()
     };
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     for first in ['b', 'c', 'd'] {
-        generation
-            .readings
-            .read_token(&spec, name, &long(first), None);
+        generation.readings.read_token(&spec, name, &long(first), None);
     }
     generation.recycle();
     let mut generation = Generation::new(&spec, 0.0, spec.max_size);
     assert_eq!(generation.readings.len, 3);
-    generation
-        .readings
-        .read_token(&spec, name, &long('e'), None);
+    generation.readings.read_token(&spec, name, &long('e'), None);
     assert!(generation.readings.texts.len() > READINGS_TEXT_CAPACITY);
     generation.recycle();
     let generation = Generation::new(&spec, 0.0, spec.max_size);
@@ -2560,10 +2172,7 @@ fn a_grammar_nesting_as_deeply_as_allowed_is_drawn_on_a_small_stack() {
             text.push_str(&format!("r{last}: \"a\"\n"));
             let spec = spec_with(
                 &text,
-                GrammarOptions {
-                    max_depth: MAX_MAX_DEPTH,
-                    ..GrammarOptions::default()
-                },
+                GrammarOptions { max_depth: MAX_MAX_DEPTH, ..GrammarOptions::default() },
             )
             .unwrap();
             let (drawn, _) = draw(&spec, 1);

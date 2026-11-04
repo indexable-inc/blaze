@@ -25,7 +25,8 @@ pub fn snapshot() -> Option<Vec<Thread>> {
                 // A thread that ended meanwhile has no files: it is left out.
                 let name = std::fs::read_to_string(dir.join("comm")).ok()?.trim_end().to_string();
                 let schedstat = std::fs::read_to_string(dir.join("schedstat")).ok()?;
-                let cpu_ns = schedstat.split(' ').next()?.parse().expect("schedstat starts with an integer");
+                let cpu_ns =
+                    schedstat.split(' ').next()?.parse().expect("schedstat starts with an integer");
                 Some(Thread { id, name, cpu_ns })
             })
             .collect();
@@ -59,7 +60,8 @@ pub fn describe(threads: &[Thread], wall_ns: u64) -> String {
     let parts: Vec<String> = busy
         .iter()
         .map(|t| {
-            let permille = (u128::from(t.cpu_ns) * 1000 + u128::from(wall_ns) / 2) / u128::from(wall_ns);
+            let permille =
+                (u128::from(t.cpu_ns) * 1000 + u128::from(wall_ns) / 2) / u128::from(wall_ns);
             format!("{}/{} {}.{}%", t.name, t.id, permille / 10, permille % 10)
         })
         .collect();
@@ -82,14 +84,21 @@ mod tests {
         let wall = crate::since_ns(t);
         let busy = since(&before, &during);
         let mine = busy.iter().find(|x| x.name == "clocks-busy").expect("the worker saw itself");
-        assert!(mine.cpu_ns >= 15_000_000 && mine.cpu_ns <= wall, "busy 20 ms: {} ns on a CPU in {wall} ns", mine.cpu_ns);
+        assert!(
+            mine.cpu_ns >= 15_000_000 && mine.cpu_ns <= wall,
+            "busy 20 ms: {} ns on a CPU in {wall} ns",
+            mine.cpu_ns
+        );
         assert!(describe(&busy, wall).contains("clocks-busy/"));
     }
 
     #[test]
     fn since_counts_a_new_thread_from_zero() {
         let before = [Thread { id: 1, name: "a".into(), cpu_ns: 5 }];
-        let after = [Thread { id: 1, name: "a".into(), cpu_ns: 9 }, Thread { id: 2, name: "b".into(), cpu_ns: 4 }];
+        let after = [
+            Thread { id: 1, name: "a".into(), cpu_ns: 9 },
+            Thread { id: 2, name: "b".into(), cpu_ns: 4 },
+        ];
         assert_eq!(since(&before, &after).iter().map(|t| t.cpu_ns).collect::<Vec<_>>(), [4, 4]);
         assert_eq!(describe(&since(&before, &after), 8), "a/1 50.0%, b/2 50.0%");
     }

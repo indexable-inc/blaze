@@ -14,10 +14,7 @@ fn cps(s: &str) -> Vec<u32> {
 }
 
 fn text_of(text: &[u32], range: (usize, usize)) -> String {
-    text[range.0..range.1]
-        .iter()
-        .map(|&cp| char::from_u32(cp).unwrap())
-        .collect()
+    text[range.0..range.1].iter().map(|&cp| char::from_u32(cp).unwrap()).collect()
 }
 
 fn laid_out(grammar_text: &str, text: &str) -> (Grammar, GrammarConstraint, Layout, Vec<u32>) {
@@ -34,13 +31,7 @@ const NESTED: &str = "start: \"[\" (start (\",\" start)*)? \"]\" | \"x\"\n";
 
 #[test]
 fn depth_counts_the_rules_nested_on_the_deepest_path() {
-    for (text, depth) in [
-        ("x", 1),
-        ("[]", 1),
-        ("[x]", 2),
-        ("[x,[x,x]]", 3),
-        ("[[[x]],x]", 4),
-    ] {
+    for (text, depth) in [("x", 1), ("[]", 1), ("[x]", 2), ("[x,[x,x]]", 3), ("[[[x]],x]", 4)] {
         let (_, _, layout, _) = laid_out(NESTED, text);
         assert_eq!(layout.depth(), depth, "{text}");
     }
@@ -100,14 +91,9 @@ fn ignored_text_at_the_edges_of_a_node_is_outside_its_range() {
         ]
     );
     assert_eq!(layout.rules()[3].0, item);
-    assert_eq!(
-        layout.ignored(),
-        vec![(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)]
-    );
-    let ranges: Vec<String> = layout.repeats()[0]
-        .iter()
-        .map(|&range| text_of(&text, range))
-        .collect();
+    assert_eq!(layout.ignored(), vec![(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)]);
+    let ranges: Vec<String> =
+        layout.repeats()[0].iter().map(|&range| text_of(&text, range)).collect();
     assert_eq!(ranges, vec![", 3"]);
 }
 
@@ -115,11 +101,7 @@ fn ignored_text_at_the_edges_of_a_node_is_outside_its_range() {
 fn a_node_deriving_no_text_sits_where_it_begins() {
     let (_, _, layout, text) = laid_out("start: \"a\"* \"b\"\n%ignore WS\nWS: / +/\n", " b");
     leaves_cover(&layout, &text);
-    let empty: Vec<&Node> = layout
-        .nodes()
-        .iter()
-        .filter(|n| n.part == Part::Repeat)
-        .collect();
+    let empty: Vec<&Node> = layout.nodes().iter().filter(|n| n.part == Part::Repeat).collect();
     assert_eq!(empty.len(), 1);
     assert_eq!(empty[0].start, empty[0].end);
     assert!(layout.repeats()[0].is_empty());
@@ -130,12 +112,7 @@ fn a_node_deriving_no_text_sits_where_it_begins() {
 fn leaves_cover_the_text_of_a_nested_derivation() {
     let (_, _, layout, text) = laid_out(NESTED, "[x,[x,x],[]]");
     leaves_cover(&layout, &text);
-    assert!(
-        layout
-            .nodes()
-            .iter()
-            .any(|n| n.part == Part::Repeat && n.start == n.end)
-    );
+    assert!(layout.nodes().iter().any(|n| n.part == Part::Repeat && n.start == n.end));
 }
 
 #[test]
@@ -146,21 +123,13 @@ fn hoists_pair_each_rule_node_with_the_smaller_same_rule_nodes_inside_it() {
         .into_iter()
         .map(|(a, d)| {
             let (a, d) = (&layout.nodes()[a], &layout.nodes()[d]);
-            (
-                text_of(&text, (a.start, a.end)),
-                text_of(&text, (d.start, d.end)),
-            )
+            (text_of(&text, (a.start, a.end)), text_of(&text, (d.start, d.end)))
         })
         .collect();
     let pair = |a: &str, d: &str| (String::from(a), String::from(d));
     assert_eq!(
         shown,
-        vec![
-            pair("[x,[x]]", "x"),
-            pair("[x,[x]]", "x"),
-            pair("[x,[x]]", "[x]"),
-            pair("[x]", "x"),
-        ]
+        vec![pair("[x,[x]]", "x"), pair("[x,[x]]", "x"), pair("[x,[x]]", "[x]"), pair("[x]", "x"),]
     );
     let (_, _, flat, _) = laid_out("start: \"a\" b*\nb: \"b\"\n", "abb");
     assert!(flat.hoists().is_empty());
@@ -174,10 +143,7 @@ fn hoists_skip_the_same_rule_nodes_at_distances_that_are_no_power_of_two() {
         .into_iter()
         .map(|(a, d)| {
             let (a, d) = (&layout.nodes()[a], &layout.nodes()[d]);
-            (
-                text_of(&text, (a.start, a.end)),
-                text_of(&text, (d.start, d.end)),
-            )
+            (text_of(&text, (a.start, a.end)), text_of(&text, (d.start, d.end)))
         })
         .collect();
     let pair = |a: &str, d: &str| (String::from(a), String::from(d));
@@ -200,16 +166,11 @@ fn hoists_skip_the_same_rule_nodes_at_distances_that_are_no_power_of_two() {
 fn repeats_list_the_repetitions_of_each_repeat_without_the_ignored_text() {
     let (_, _, layout, text) = laid_out("start: \"a\" (\"b\" | \"cc\")*\n", "abccb");
     assert_eq!(layout.repeats(), vec![vec![(1, 2), (2, 4), (4, 5)]]);
-    let (_, _, spaced, text2) = laid_out(
-        "start: INT (\",\" INT)*\nINT: /[0-9]+/\n%ignore \" \"\n",
-        "1 , 2 ,3",
-    );
+    let (_, _, spaced, text2) =
+        laid_out("start: INT (\",\" INT)*\nINT: /[0-9]+/\n%ignore \" \"\n", "1 , 2 ,3");
     let repeats = spaced.repeats();
     assert_eq!(repeats.len(), 1);
-    let items: Vec<String> = repeats[0]
-        .iter()
-        .map(|&range| text_of(&text2, range))
-        .collect();
+    let items: Vec<String> = repeats[0].iter().map(|&range| text_of(&text2, range)).collect();
     assert_eq!(items, vec![", 2", ",3"]);
     assert_eq!(text_of(&text, (0, 1)), "a");
 }
@@ -256,24 +217,17 @@ fn coarse_candidates_are_each_move_once_and_never_the_text_itself() {
         assert_eq!(candidates.iter().filter(|c| *c == candidate).count(), 1);
     }
     for expected in ["[x]", "[]", "x", "[x,x]", "[y,[x]]", "[x,[y]]"] {
-        assert!(
-            candidates.contains(&String::from(expected)),
-            "{candidates:?}"
-        );
+        assert!(candidates.contains(&String::from(expected)), "{candidates:?}");
     }
     assert!(!constraint.accepts(&cps("[y]")));
 }
 
 #[test]
 fn coarse_candidates_cut_the_ignored_text_and_shorten_repeats() {
-    let (_, _, layout, text) = laid_out(
-        "start: INT (\",\" INT)*\nINT: /[0-9]+/\n%ignore \" \"\n",
-        "1, 2, 3, 4, 5",
-    );
-    let candidates: Vec<String> = layout
-        .coarse_candidates(&text, |_| None)
-        .map(|c| text_of(&c, (0, c.len())))
-        .collect();
+    let (_, _, layout, text) =
+        laid_out("start: INT (\",\" INT)*\nINT: /[0-9]+/\n%ignore \" \"\n", "1, 2, 3, 4, 5");
+    let candidates: Vec<String> =
+        layout.coarse_candidates(&text, |_| None).map(|c| text_of(&c, (0, c.len()))).collect();
     assert_eq!(candidates, vec!["1,2,3,4,5", "1", "1, 2, 3", "1, 2, 3, 4"]);
 }
 

@@ -12,7 +12,10 @@
 //! driver's loop stuck in a turn, as the daemon's was inside a maintain pass on 72e9a0dd; or its
 //! [`Finish`] dropped unreaped) is named, with what waits for its exit, by whoever asks.
 
-#[allow(unsafe_code, reason = "fork, exec and the calls the child makes before exec, which std cannot make")]
+#[allow(
+    unsafe_code,
+    reason = "fork, exec and the calls the child makes before exec, which std cannot make"
+)]
 mod spawn;
 
 #[cfg(test)]
@@ -95,7 +98,9 @@ pub enum Waiter {
 impl fmt::Display for Waiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Waiter::Starter(thread) => write!(f, "the thread that started it ({thread:?}), which reaps it in place"),
+            Waiter::Starter(thread) => {
+                write!(f, "the thread that started it ({thread:?}), which reaps it in place")
+            }
             Waiter::Effect(tag) => write!(
                 f,
                 "the spawn effect tagged {:#x}, reaped only as its driver's loop polls; its asker waits for the completion",
@@ -137,7 +142,14 @@ impl fmt::Display for Unreaped {
             State::Gone => "reaped as it was looked at",
             State::Unknown(_) => "in a state its look could not read",
         };
-        write!(f, "pid {} ({}), {state}, started {} s ago, waited for by {}", self.pid, self.program.display(), self.age.as_secs(), self.waiter)?;
+        write!(
+            f,
+            "pid {} ({}), {state}, started {} s ago, waited for by {}",
+            self.pid,
+            self.program.display(),
+            self.age.as_secs(),
+            self.waiter
+        )?;
         if let State::Unknown(errno) = self.state {
             write!(f, " ({})", io::Error::from_raw_os_error(errno))?;
         }
@@ -151,7 +163,9 @@ impl fmt::Display for Unreaped {
 pub fn unreaped() -> Vec<Unreaped> {
     let now = Instant::now();
     let listed: Vec<(libc::pid_t, PathBuf, Waiter, Duration)> = (CHILDREN.lock().iter())
-        .map(|it| (it.pid, it.program.clone(), it.waiter, now.saturating_duration_since(it.started))) // clone: the program's path, out of the lock, once per report
+        .map(|it| {
+            (it.pid, it.program.clone(), it.waiter, now.saturating_duration_since(it.started))
+        }) // clone: the program's path, out of the lock, once per report
         .collect(); // alloc: a stall report's list, once per report
     listed
         .into_iter()
@@ -178,7 +192,13 @@ struct Listed {
 impl Listed {
     fn new(pid: libc::pid_t, run: u64, program: &Path) -> Listed {
         let program = program.to_path_buf(); // alloc: the program's path, once per spawn, what a stall report names it by
-        let child = Child { pid, run, program, waiter: Waiter::Starter(std::thread::current().id()), started: Instant::now() };
+        let child = Child {
+            pid,
+            run,
+            program,
+            waiter: Waiter::Starter(std::thread::current().id()),
+            started: Instant::now(),
+        };
         CHILDREN.lock().push(child); // alloc: the list grows to the most children in flight at once
         Listed { pid, run }
     }
@@ -255,7 +275,9 @@ pub(crate) fn start(
     let sandbox = confined.as_ref().map(|_| began.elapsed());
     // What the sandbox starts, else the command itself, borrowed either way.
     let program = match &confined {
-        Some(it) => spawn::Program { program: &it.program, args: &it.args, env: &it.env, dir: &it.dir },
+        Some(it) => {
+            spawn::Program { program: &it.program, args: &it.args, env: &it.env, dir: &it.dir }
+        }
         None => spawn::Program {
             program: &command.program,
             args: &command.args,
@@ -450,7 +472,9 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> 
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 // alloc: an error path.
-                format!("reaping process {pid}: it is no child of this process, or was reaped already ({error})"),
+                format!(
+                    "reaping process {pid}: it is no child of this process, or was reaped already ({error})"
+                ),
             ));
         }
         Err(_) => {}
@@ -535,9 +559,10 @@ pub(crate) fn communicate(
                             written += wrote;
                             false
                         }
-                        Err(error) => {
-                            !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
-                        }
+                        Err(error) => !matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ),
                     };
                     // Done, or the process is not reading (EPIPE and the rest): its input ends.
                     if written == input.len() || broken || polled.revents & libc::POLLOUT == 0 {

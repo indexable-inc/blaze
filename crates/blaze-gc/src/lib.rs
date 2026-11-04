@@ -71,5 +71,8 @@ mod tests;
 
 pub use crate::{
     ledger::Ledger,
-    plan::{Class, Collector, Config, Decision, Inventory, Keep, Object, Outcome, Reason, RunReport, Trigger, Verdict},
+    plan::{
+        Class, Collector, Config, Decision, Inventory, Keep, Object, Outcome, Reason, RunReport,
+        Trigger, Verdict,
+    },
 };

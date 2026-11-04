@@ -387,9 +387,9 @@ mod tests {
 
     const KEYWORDS: &[&str] = &[
         "as", "async", "await", "box", "break", "const", "continue", "crate", "do", "dyn", "else",
-        "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro", "match",
-        "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
-        "trait", "true", "try", "type", "unsafe", "use", "where", "while", "yield", "gen",
+        "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro",
+        "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+        "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "yield", "gen",
     ];
     crate::phf_table!(static TABLE = KEYWORDS;);
     const EMPTY_KEYS: &[&str] = &[];
@@ -416,7 +416,10 @@ mod tests {
 
     #[test]
     fn keywords() {
-        check(&TABLE, &["", "f", "fnn", "Fn", "self_", "selfSelf", "unsafe ", "whil", "asyncawait"]);
+        check(
+            &TABLE,
+            &["", "f", "fnn", "Fn", "self_", "selfSelf", "unsafe ", "whil", "asyncawait"],
+        );
         assert_eq!(TABLE.get("Self"), Some(30));
         check(&NONE, &["", "a"]);
         check(&ONE, &["", "a", "\0"]);
@@ -465,7 +468,8 @@ mod tests {
         assert_ne!(hash(b"abc", 0), hash(b"abc", 1));
     }
 
-    const _: () = assert!(bytes_eq(b"lint", b"lint") && !bytes_eq(b"lint", b"lints") && bytes_eq(b"", b""));
+    const _: () =
+        assert!(bytes_eq(b"lint", b"lint") && !bytes_eq(b"lint", b"lints") && bytes_eq(b"", b""));
 
     crate::name_phf_table!(static BY_NAME = KEYWORDS;);
 
@@ -508,7 +512,10 @@ mod tests {
         for name in ["a", "Ok", "self", "Some", "iter_mut", "abcdefgh"] {
             let mut word = [0u8; 8];
             word[..name.len()].copy_from_slice(name.as_bytes());
-            let one = name_hash_finish(name_hash_word(name_hash_start(name.len()), u64::from_le_bytes(word)));
+            let one = name_hash_finish(name_hash_word(
+                name_hash_start(name.len()),
+                u64::from_le_bytes(word),
+            ));
             assert_eq!(one, name_hash(name.as_bytes()), "{name}");
         }
         const AT_COMPILE_TIME: u64 = name_hash(b"iter");
@@ -520,11 +527,17 @@ mod tests {
         for (at, key) in KEYWORDS.iter().enumerate() {
             assert_eq!(BY_NAME.get(key), Some(at), "{key:?}");
             assert_eq!(BY_NAME.index_const(key.as_bytes()), Some(at), "{key:?}");
-            assert_eq!(BY_NAME.index_by_name_hash(name_hash(key.as_bytes()), key.as_bytes()), Some(at));
+            assert_eq!(
+                BY_NAME.index_by_name_hash(name_hash(key.as_bytes()), key.as_bytes()),
+                Some(at)
+            );
         }
         for other in ["", "f", "fnn", "Fn", "self_", "selfSelf", "unsafe ", "whil", "asyncawait"] {
             assert_eq!(BY_NAME.get(other), None, "{other:?}");
-            assert_eq!(BY_NAME.index_by_name_hash(name_hash(other.as_bytes()), other.as_bytes()), None);
+            assert_eq!(
+                BY_NAME.index_by_name_hash(name_hash(other.as_bytes()), other.as_bytes()),
+                None
+            );
         }
         // A hash given for other bytes finds nothing: the key is compared.
         assert_eq!(BY_NAME.index_by_name_hash(name_hash(b"fn"), b"let"), None);

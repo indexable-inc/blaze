@@ -7,8 +7,8 @@ use base_db::EditionedFileId;
 use blaze_alloc_count::assert_at_most;
 use expect_test::expect_file;
 use hir_expand::HirFileId;
-use syntax::view::{self, AstNode as _};
 use hir_expand::fixture;
+use syntax::view::{self, AstNode as _};
 
 use super::{HasSourceView, Semantics};
 use crate::ModuleDef;
@@ -82,7 +82,13 @@ fn roots<'db>(
 }
 
 /// One line of a stored answer: what was asked, of the node at `range` in `file`.
-fn line(out: &mut String, file: HirFileId, range: syntax::TextRange, what: &str, answer: impl std::fmt::Debug) {
+fn line(
+    out: &mut String,
+    file: HirFileId,
+    range: syntax::TextRange,
+    what: &str,
+    answer: impl std::fmt::Debug,
+) {
     use std::fmt::Write as _;
     writeln!(out, "{file:?} {range:?} {what}: {answer:?}").unwrap();
 }
@@ -131,8 +137,10 @@ fn ancestors_ranges_and_scopes_of_every_node() {
             for node in root.descendants() {
                 let at = node.text_range();
                 assert_eq!(vsema.hir_file_for(node), file, "the file of {at:?} in {file:?}");
-                let ancestors: Vec<_> =
-                    vsema.ancestors_with_macros(node).map(|it| (it.kind(), it.text_range())).collect();
+                let ancestors: Vec<_> = vsema
+                    .ancestors_with_macros(node)
+                    .map(|it| (it.kind(), it.text_range()))
+                    .collect();
                 line(&mut out, file, at, "ancestors_with_macros", ancestors);
                 line(&mut out, file, at, "original_range", vsema.original_range(node));
                 line(&mut out, file, at, "original_range_opt", vsema.original_range_opt(node));
@@ -161,9 +169,14 @@ fn types_and_resolutions_of_every_node() {
         for (file, root) in roots(&vsema, file_id) {
             for node in root.descendants() {
                 let at = node.text_range();
-                let mut line = |what: &str, answer: &dyn std::fmt::Debug| line(&mut out, file, at, what, answer);
+                let mut line = |what: &str, answer: &dyn std::fmt::Debug| {
+                    line(&mut out, file, at, what, answer)
+                };
                 if let Some(v) = view::Expr::cast(node) {
-                    line("type_of_expr", &vsema.type_of_expr(v).map(|it| (it.original, it.adjusted)));
+                    line(
+                        "type_of_expr",
+                        &vsema.type_of_expr(v).map(|it| (it.original, it.adjusted)),
+                    );
                     line(
                         "resolve_expr_as_callable",
                         &vsema.resolve_expr_as_callable(v).map(|it| it.return_type()),
@@ -179,7 +192,9 @@ fn types_and_resolutions_of_every_node() {
                 }
                 if let Some(v) = view::Path::cast(node) {
                     line("resolve_path", &vsema.resolve_path(v));
-                    let per_ns = vsema.resolve_path_per_ns(v).map(|it| (it.type_ns, it.value_ns, it.macro_ns));
+                    let per_ns = vsema
+                        .resolve_path_per_ns(v)
+                        .map(|it| (it.type_ns, it.value_ns, it.macro_ns));
                     line("resolve_path_per_ns", &per_ns);
                     let scope = vsema.scope(v.syntax()).expect("a path has a scope");
                     line("speculative_resolve_view", &scope.speculative_resolve_view(v));
@@ -205,7 +220,10 @@ fn types_and_resolutions_of_every_node() {
                     line("resolve_record_pat_field", &vsema.resolve_record_pat_field(v));
                 }
                 if let Some(v) = view::TupleStructPat::cast(node) {
-                    line("resolve_tuple_struct_pat_fields", &vsema.resolve_tuple_struct_pat_fields(v));
+                    line(
+                        "resolve_tuple_struct_pat_fields",
+                        &vsema.resolve_tuple_struct_pat_fields(v),
+                    );
                 }
                 if let Some(v) = view::RecordExpr::cast(node) {
                     line("resolve_variant", &vsema.resolve_variant(v));
@@ -237,7 +255,9 @@ fn descending_every_token() {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let mut into_macros = 0u32;
-        for token in vsema.parse(file_id).syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        for token in
+            vsema.parse(file_id).syntax().descendants_with_tokens().filter_map(|it| it.into_token())
+        {
             if token.text_range().is_empty() {
                 continue;
             }
@@ -277,7 +297,9 @@ fn source_view_of_every_def() {
             writeln!(
                 out,
                 "{module:?} declaration_source_view: {:?}",
-                module.declaration_source_view(&db).map(|it| (it.file_id, it.value.syntax().text_range())),
+                module
+                    .declaration_source_view(&db)
+                    .map(|it| (it.file_id, it.value.syntax().text_range())),
             )
             .unwrap();
             for decl in module.declarations(&db) {
@@ -287,7 +309,11 @@ fn source_view_of_every_def() {
                         writeln!(
                             out,
                             "{def:?} source_view: {:?}",
-                            def.source_view(&db).map(|it| (it.file_id, it.value.syntax().kind(), it.value.syntax().text_range())),
+                            def.source_view(&db).map(|it| (
+                                it.file_id,
+                                it.value.syntax().kind(),
+                                it.value.syntax().text_range()
+                            )),
                         )
                         .unwrap();
                         checked += 1;
@@ -353,8 +379,14 @@ pub fn inner() {
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
-        assert!(vsema.file_to_module_def(m.file_id(&db)).is_some(), "m.rs is the module `m` of `main`'s block");
-        assert!(vsema.find_parent_file(HirFileId::from(m)).is_some(), "the `mod m;` declaring m.rs");
+        assert!(
+            vsema.file_to_module_def(m.file_id(&db)).is_some(),
+            "m.rs is the module `m` of `main`'s block"
+        );
+        assert!(
+            vsema.find_parent_file(HirFileId::from(m)).is_some(),
+            "the `mod m;` declaring m.rs"
+        );
         let root = vsema.parse(m).syntax();
         let path = root
             .descendants()
@@ -362,7 +394,10 @@ pub fn inner() {
             .find(|it| it.qualifier().is_some())
             .expect("`crate::d`");
         assert!(
-            matches!(vsema.resolve_path(path), Some(crate::PathResolution::Def(ModuleDef::Function(_)))),
+            matches!(
+                vsema.resolve_path(path),
+                Some(crate::PathResolution::Def(ModuleDef::Function(_)))
+            ),
             "`crate::d` in m.rs resolves to the function `d`"
         );
     });
@@ -391,10 +426,15 @@ pub fn inner() {
     let m = fx.file_at("/b/tests/m.rs");
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
-        let a = Semantics::new(&db).file_to_module_def(main.file_id(&db)).expect("main.rs is `a`'s root").krate(&db);
-        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([a.base()], std::alloc::Global));
+        let a = Semantics::new(&db)
+            .file_to_module_def(main.file_id(&db))
+            .expect("main.rs is `a`'s root")
+            .krate(&db);
+        let within =
+            std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([a.base()], std::alloc::Global));
         let vsema = Semantics::new_within(&db, within);
-        let module = vsema.file_to_module_def(m.file_id(&db)).expect("m.rs is the module `m` of `a`");
+        let module =
+            vsema.file_to_module_def(m.file_id(&db)).expect("m.rs is the module `m` of `a`");
         assert_eq!(module.krate(&db), a);
         let root = vsema.parse(m).syntax();
         let path = root
@@ -404,7 +444,10 @@ pub fn inner() {
             .expect("`crate::d`");
         assert!(vsema.scope(path.syntax()).is_some(), "`crate::d` in m.rs has a scope");
         assert!(
-            matches!(vsema.resolve_path(path), Some(crate::PathResolution::Def(ModuleDef::Function(_)))),
+            matches!(
+                vsema.resolve_path(path),
+                Some(crate::PathResolution::Def(ModuleDef::Function(_)))
+            ),
             "`crate::d` in m.rs resolves to `a`'s function `d`"
         );
     });

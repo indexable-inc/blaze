@@ -123,7 +123,9 @@ impl Flow<'_, '_, '_> {
         if point < self.cfg.block_end(self.body, location.block) {
             out.push(point + 1);
         } else {
-            out.extend(self.cfg.successors(location.block).iter().map(|&it| self.cfg.block_start(it)));
+            out.extend(
+                self.cfg.successors(location.block).iter().map(|&it| self.cfg.block_start(it)),
+            );
         }
     }
 }
@@ -297,14 +299,21 @@ fn carry_subsets(
             local.sort_unstable();
             local.dedup();
             flow.successors(point, &mut successors);
-            failing |=
-                closure.close(flow, regions, check_universals, &local, &successors, &mut out, fuel)?;
+            failing |= closure.close(
+                flow,
+                regions,
+                check_universals,
+                &local,
+                &successors,
+                &mut out,
+                fuel,
+            )?;
             for &next in successors.iter() {
                 kept.clear();
                 kept.extend(
-                    out.iter()
-                        .copied()
-                        .filter(|&(a, b)| flow.live(a as usize, next) && flow.live(b as usize, next)),
+                    out.iter().copied().filter(|&(a, b)| {
+                        flow.live(a as usize, next) && flow.live(b as usize, next)
+                    }),
                 );
                 if !fuel.take(out.len() + 1) {
                     return None;
@@ -393,8 +402,7 @@ impl<'a> Closure<'a> {
         if local.is_empty() {
             return Some(false);
         }
-        let live_after =
-            |rv: usize| successors.iter().any(|&next| flow.live(rv, next));
+        let live_after = |rv: usize| successors.iter().any(|&next| flow.live(rv, next));
         // The regions that reach the sup of a local edge by constraints that hold everywhere:
         // only a path from one of them uses a local edge.
         let stamp = self.next_stamp();

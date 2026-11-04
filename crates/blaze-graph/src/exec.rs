@@ -26,10 +26,10 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use std::alloc::Global;
 
 use crate::{
     Cancelled, Key,
@@ -143,7 +143,9 @@ where
                     _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
                 };
                 let run = move || loop {
-                    match catch_unwind(AssertUnwindSafe(|| frame::task(MemTag::Other, |_| work(id)))) {
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        frame::task(MemTag::Other, |_| work(id))
+                    })) {
                         Ok(did) => break did,
                         Err(panic) if panic.is::<frame::Cancelled>() => {}
                         Err(panic) => resume_unwind(panic),
@@ -158,8 +160,7 @@ where
         })
     });
     drop((workers, io));
-    if let Some(panic) = first_panic.into_inner()
-    {
+    if let Some(panic) = first_panic.into_inner() {
         resume_unwind(panic);
     }
     over
@@ -288,7 +289,9 @@ pub struct Task<W> {
 pub enum Heard {
     Said(Record),
     /// The last of a request: nothing more comes.
-    Finished { ok: bool },
+    Finished {
+        ok: bool,
+    },
     /// What the opener asked that the plane could not take, which changed nothing.
     Refused(Error),
 }
@@ -299,11 +302,26 @@ pub struct Opened {
 }
 
 enum Msg<W> {
-    Open { request: RequestId, weight: u32, keep_going: bool, heard: Sender<Heard> },
-    Add { request: RequestId, tasks: Vec<Task<W>> },
-    Found { request: RequestId, works: Vec<FoundWork<W>> },
-    Close { request: RequestId },
-    Cancel { request: RequestId },
+    Open {
+        request: RequestId,
+        weight: u32,
+        keep_going: bool,
+        heard: Sender<Heard>,
+    },
+    Add {
+        request: RequestId,
+        tasks: Vec<Task<W>>,
+    },
+    Found {
+        request: RequestId,
+        works: Vec<FoundWork<W>>,
+    },
+    Close {
+        request: RequestId,
+    },
+    Cancel {
+        request: RequestId,
+    },
     Done {
         at_ns: u64,
         /// The run's handle in the owner's [`Table`], as bits, free again once this is taken;
@@ -319,10 +337,14 @@ enum Msg<W> {
         group: Option<u32>,
     },
     /// What the predictor learned, as [`Predict::encode`] gives it.
-    Estimates { reply: Sender<Vec<u8>> },
+    Estimates {
+        reply: Sender<Vec<u8>>,
+    },
     /// How many slots the owner's table has made.
     #[cfg(test)]
-    Slots { reply: Sender<usize> },
+    Slots {
+        reply: Sender<usize>,
+    },
     Stop,
 }
 
@@ -468,7 +490,15 @@ impl<R: Runner> Table<R> {
     ) -> Result<u64, MemError> {
         let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
-        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0), build: AtomicU32::new(0), creator: AtomicU64::new(0) })?;
+        let run = self.cache.try_alloc(Run {
+            header,
+            ctx,
+            at: u64::MAX,
+            live,
+            spawner: AtomicU64::new(0),
+            build: AtomicU32::new(0),
+            creator: AtomicU64::new(0),
+        })?;
         let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
         let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
         slot.run.at = handle.to_bits();
@@ -706,7 +736,8 @@ impl<W> Handle<W> {
     pub fn estimates(&self) -> Vec<u8> {
         let (reply, estimates) = crossbeam_channel::bounded(1);
         _ = self.tx.send(Msg::Estimates { reply });
-        recv_said(&estimates, "the scheduler's estimates").unwrap_or_else(|_| panic!("the scheduler is gone"))
+        recv_said(&estimates, "the scheduler's estimates")
+            .unwrap_or_else(|_| panic!("the scheduler is gone"))
     }
 
     #[cfg(test)]
@@ -850,7 +881,7 @@ impl<W: Send + 'static> Scheduler<W> {
             later: VecDeque::new(),
             io_threads,
             said: Vec::new(), // alloc: none, empty; the owner's buffer, kept across steps
-            new: Vec::new(), // alloc: none, empty; the owner's buffer, kept across adds
+            new: Vec::new(),  // alloc: none, empty; the owner's buffer, kept across adds
             held_due: false,
         };
         let owner = thread::Builder::new()
@@ -1048,9 +1079,10 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     self.predict.observe(kind, key, ran_ns, peak);
                 }
                 let (mut outcome, mut added) = (did.outcome, did.added);
-                let workless = added.iter().map(|spec| spec.id).find(|found| {
-                    !self.works.get(found).is_some_and(|it| it.request == request)
-                });
+                let workless = added
+                    .iter()
+                    .map(|spec| spec.id)
+                    .find(|found| !self.works.get(found).is_some_and(|it| it.request == request));
                 if let Some(found) = workless {
                     outcome = Outcome::Failed {
                         // alloc: the failure's message
@@ -1073,7 +1105,8 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     let why = format!("what node {id} found could not be added to {request}");
                     let outcome = Outcome::Failed { why };
                     // alloc: empty, allocates nothing
-                    let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
+                    let input =
+                        PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
                 self.held_due = self.plane.config().budget.is_some();
@@ -1218,7 +1251,10 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 }
 
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
-#[allow(clippy::needless_pass_by_value, reason = "posting transfers the run's sole ownership to the pool job")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "posting transfers the run's sole ownership to the pool job"
+)]
 fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
     let given = crate::sched::spawner();
     run.run().spawner.store(given.spawner, Ordering::Relaxed);
@@ -1309,11 +1345,11 @@ mod tests {
     };
 
     use blaze_hash::{HashMap, HashSet};
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
     use parking_lot::Mutex;
+    use std::alloc::Global;
 
     use blaze_mem::{Tag as MemTag, frame};
 
@@ -1464,11 +1500,14 @@ mod tests {
         let key = |it: u8| Some(Key([it; 32]));
         let predicted: Vec<_> =
             asked.iter().filter(|it| matches!(it, Asked::Predict(..))).cloned().collect();
-        assert_eq!(predicted, [
-            Asked::Predict(TaskKind(1), None),
-            Asked::Predict(TaskKind(2), key(8)),
-            Asked::Predict(TaskKind(3), key(9)),
-        ]);
+        assert_eq!(
+            predicted,
+            [
+                Asked::Predict(TaskKind(1), None),
+                Asked::Predict(TaskKind(2), key(8)),
+                Asked::Predict(TaskKind(3), key(9)),
+            ]
+        );
         let observed: Vec<(TaskKind, Option<Key>, u64)> = asked
             .iter()
             .filter_map(|it| match *it {
@@ -1519,7 +1558,11 @@ mod tests {
         let work: Work =
             Arc::new(move || Ok(if in_frame() { Did::built() } else { Did::failed("no frame") }));
         let opened = scheduler.open(1, false);
-        let io = Task { spec: spec(71, &[], Pool::Io, None), kind: TaskKind(1), work: Arc::clone(&work) };
+        let io = Task {
+            spec: spec(71, &[], Pool::Io, None),
+            kind: TaskKind(1),
+            work: Arc::clone(&work),
+        };
         scheduler.add(opened.request, vec![io, task(72, &[71], None, work)]);
         scheduler.close(opened.request);
         assert!(finish(&opened).0);
@@ -1594,7 +1637,8 @@ mod tests {
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
             let ran = ran.into_inner();
-            let on = |nodes: &[u32]| -> HashSet<ThreadId, Global> { // alloc: a test's model
+            let on = |nodes: &[u32]| -> HashSet<ThreadId, Global> {
+                // alloc: a test's model
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
             assert_eq!(ran.len(), 4);
@@ -1746,7 +1790,11 @@ mod tests {
         let tries = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&tries);
         let work: Work = Arc::new(move || {
-            if counted.fetch_add(1, Ordering::SeqCst) < 2 { Err(Cancelled) } else { Ok(Did::built()) }
+            if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(Cancelled)
+            } else {
+                Ok(Did::built())
+            }
         });
         let opened = scheduler.open(1, false);
         scheduler.add(opened.request, vec![task(7, &[], None, work)]);
@@ -1754,10 +1802,11 @@ mod tests {
         let (ok, records) = finish(&opened);
         assert!(ok);
         assert_eq!(tries.load(Ordering::SeqCst), 3);
-        assert!(records.iter().any(|it| matches!(
-            it.event,
-            Event::Moved { id: 7, state: NodeState::Built }
-        )));
+        assert!(
+            records
+                .iter()
+                .any(|it| matches!(it.event, Event::Moved { id: 7, state: NodeState::Built }))
+        );
         // Measured once: the tries that gave way taught nothing.
         let estimates = Estimates::decode(&scheduler.estimates()).unwrap();
         assert_eq!(estimates.by_kind.get(&TaskKind(1)).map(|it| it.seen), Some(1));

@@ -56,7 +56,8 @@ impl Value {
 
     pub fn encode(&self) -> Vec<u8> {
         // alloc: the bytes the store keeps, encoded after the magic in one buffer
-        postcard::to_extend(self, b"blaze v2 run value 1".to_vec()).expect("a value is always encodable")
+        postcard::to_extend(self, b"blaze v2 run value 1".to_vec())
+            .expect("a value is always encodable")
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Value, String> {
@@ -67,7 +68,13 @@ impl Value {
     }
 
     fn of(exit: Exit, files: Vec<OutFile>) -> Value {
-        Value { code: exit.code, signal: exit.signal, stdout: exit.stdout, stderr: exit.stderr, files }
+        Value {
+            code: exit.code,
+            signal: exit.signal,
+            stdout: exit.stdout,
+            stderr: exit.stderr,
+            files,
+        }
     }
 }
 
@@ -101,7 +108,11 @@ pub enum RunError<E> {
     /// `retracted` is the ticket of a record that the run depends on where its roots are,
     /// when one landed among them ([`verify::retraction`]): flushed at once, as any
     /// retraction is.
-    Keep { error: KeepError, landed: Vec<Ticket>, retracted: Option<Ticket> },
+    Keep {
+        error: KeepError,
+        landed: Vec<Ticket>,
+        retracted: Option<Ticket>,
+    },
     /// The store's value is not a run's.
     BadValue(String),
     /// Its sandbox did not trace, or the spawn did not start, or ended oddly.
@@ -116,21 +127,39 @@ pub enum RunError<E> {
     /// verified with this one) and must retract or keep that key's value against it as well.
     /// `landed` are the tickets of every put made on the way (the record's, this checkout's
     /// own result's), `retracted` among them.
-    Differs { key: RunKey, what: String, retracted: Option<Ticket>, ran: Box<Value>, landed: Vec<Ticket> },
+    Differs {
+        key: RunKey,
+        what: String,
+        retracted: Option<Ticket>,
+        ran: Box<Value>,
+        landed: Vec<Ticket>,
+    },
     /// It succeeded printing what cargo refuses, so what cargo would watch of it is not known:
     /// nothing is kept.
-    Output { key: RunKey, error: blaze_build_script::Error },
+    Output {
+        key: RunKey,
+        error: blaze_build_script::Error,
+    },
     /// It ran (its key missed, or nothing was found for it) and gave other than the result the
     /// store already keeps under the same key, `stored`, for the same inputs read: it read what
     /// its key misses (randomness, the clock, an input not traced), or it is not a function of
     /// its inputs. `what` is the first field that differs, with both values
     /// ([`differs_with_stderr`]); the kept result is never replaced. `landed` and `retracted`
     /// are as [`RunError::Keep`]'s.
-    Rerun { key: RunKey, stored: Key, what: String, landed: Vec<Ticket>, retracted: Option<Ticket> },
+    Rerun {
+        key: RunKey,
+        stored: Key,
+        what: String,
+        landed: Vec<Ticket>,
+        retracted: Option<Ticket>,
+    },
     /// What its sandbox traced it reading disagrees with what a check of it reads
     /// ([`crate::script::keyed`]): kept, its result would be under a key no check makes again
     /// (rule 18), so nothing is kept.
-    Traced { key: RunKey, error: blaze_build_script::Error },
+    Traced {
+        key: RunKey,
+        error: blaze_build_script::Error,
+    },
 }
 
 impl<E: fmt::Debug> fmt::Display for RunError<E> {
@@ -156,7 +185,11 @@ impl<E: fmt::Debug> fmt::Display for RunError<E> {
                 key.code, key.given
             ),
             RunError::Output { key, error } => {
-                write!(f, "the run of {} given {} printed what cargo refuses: {error}", key.code, key.given)
+                write!(
+                    f,
+                    "the run of {} given {} printed what cargo refuses: {error}",
+                    key.code, key.given
+                )
             }
             RunError::Rerun { key, stored, what, .. } => write!(
                 f,
@@ -168,7 +201,11 @@ impl<E: fmt::Debug> fmt::Display for RunError<E> {
                 key.code, key.given
             ),
             RunError::Traced { key, error } => {
-                write!(f, "keeping the run of {} given {}: {error}; nothing is kept", key.code, key.given)
+                write!(
+                    f,
+                    "keeping the run of {} given {}: {error}; nothing is kept",
+                    key.code, key.given
+                )
             }
         }
     }
@@ -179,7 +216,9 @@ impl<E> RunError<E> {
     /// so the caller waits for them to be durable as for a run that succeeded.
     pub fn landed(&self) -> &[Ticket] {
         match self {
-            RunError::Keep { landed, .. } | RunError::Differs { landed, .. } | RunError::Rerun { landed, .. } => landed,
+            RunError::Keep { landed, .. }
+            | RunError::Differs { landed, .. }
+            | RunError::Rerun { landed, .. } => landed,
             _ => &[],
         }
     }
@@ -188,9 +227,9 @@ impl<E> RunError<E> {
     /// flushes it at once and lets go of what it retracts, as for a run that succeeded.
     pub fn retracted(&self) -> Option<Ticket> {
         match self {
-            RunError::Keep { retracted, .. } | RunError::Differs { retracted, .. } | RunError::Rerun { retracted, .. } => {
-                *retracted
-            }
+            RunError::Keep { retracted, .. }
+            | RunError::Differs { retracted, .. }
+            | RunError::Rerun { retracted, .. } => *retracted,
             _ => None,
         }
     }
@@ -248,12 +287,20 @@ impl Run {
         I::Error: From<NoRoot>,
     {
         let roots = spec.roots.view();
-        let found = index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs)).map_err(RunError::Find)?;
+        let found = index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs))
+            .map_err(RunError::Find)?;
         let (kept, verified) = match found {
             Found::Hit { value, verified, .. } => {
                 let value = Value::decode(value).map_err(RunError::BadValue)?;
                 // What it printed, with this run's roots.
-                (Some(roots.restored(value).map_err(|error| RunError::BadValue(error.to_string()))?), verified)
+                (
+                    Some(
+                        roots
+                            .restored(value)
+                            .map_err(|error| RunError::BadValue(error.to_string()))?,
+                    ),
+                    verified,
+                )
             }
             Found::Miss { .. } => (None, None),
         };
@@ -276,7 +323,8 @@ impl Run {
                 }
             }
             Sandbox::Off => {
-                return Err(RunError::Spawn(format!( // alloc: error path
+                return Err(RunError::Spawn(format!(
+                    // alloc: error path
                     "{}: user code runs in a sandbox that traces; this one is off, so what it \
                      reads can't be known and its result can't be kept",
                     spec.command.program.display()
@@ -325,12 +373,16 @@ impl Run {
             Done::Exited(exit) => *exit,
             Done::Failed(error) => {
                 // alloc: error path
-                return Err(RunError::Spawn(format!("{}: {error}", self.spec.command.program.display())));
+                return Err(RunError::Spawn(format!(
+                    "{}: {error}",
+                    self.spec.command.program.display()
+                )));
             }
             other => return Err(RunError::Spawn(format!("a spawn completed as {other:?}"))), // alloc: error path
         };
         let Some(mut traced) = exit.traced.take() else {
-            return Err(RunError::Spawn(format!( // alloc: error path
+            return Err(RunError::Spawn(format!(
+                // alloc: error path
                 "{}: its sandbox traces, and its exit has no record of what it read",
                 self.spec.command.program.display()
             )));
@@ -345,7 +397,10 @@ impl Run {
             None => Vec::new(), // alloc: none, an empty list
         };
         let key = self.spec.key;
-        let rule = (exit.code == Some(0)).then(|| rule(&exit)).transpose().map_err(|error| RunError::Output { key, error })?;
+        let rule = (exit.code == Some(0))
+            .then(|| rule(&exit))
+            .transpose()
+            .map_err(|error| RunError::Output { key, error })?;
         let value = Value::of(exit, files);
         // One comparison for verify mode, stderr included: the one sharing makes
         // ([`ported_differs`]), so a rerun that differs only in stderr is a difference said
@@ -355,7 +410,13 @@ impl Run {
             let Some(unmarked) = self.verified else {
                 // alloc: error path, what the rerun gave
                 // alloc: none, no puts
-                return Err(RunError::Differs { key, what, retracted: None, ran: Box::new(value), landed: Vec::new() });
+                return Err(RunError::Differs {
+                    key,
+                    what,
+                    retracted: None,
+                    ran: Box::new(value),
+                    landed: Vec::new(),
+                });
             };
             // What it read, widened by cargo's rule before the record is put: that can fail
             // (an input it can't read), and nothing is put yet then.
@@ -366,7 +427,14 @@ impl Run {
             // another checkout's, and no checkout is given it again.
             let record = verify::retraction(&key, &unmarked);
             let mut landed = Vec::new(); // alloc: error path, the tickets of what it puts
-            if let Err(error) = index::keep_into(store, Unit::SHARED, &record.run, &record.traced, &record.value, &mut landed) {
+            if let Err(error) = index::keep_into(
+                store,
+                Unit::SHARED,
+                &record.run,
+                &record.traced,
+                &record.value,
+                &mut landed,
+            ) {
                 // The record's value may have landed before its put failed: its ticket is
                 // the first, and it is a retraction all the same.
                 let retracted = landed.first().copied();
@@ -381,9 +449,18 @@ impl Run {
                 None => what,
                 Some(_) => {
                     let roots = self.spec.roots.view();
-                    let kept = roots.kept(&traced, &value).map_err(|error| KeepError::Scan { run: key, why: error.to_string() });
+                    let kept = roots
+                        .kept(&traced, &value)
+                        .map_err(|error| KeepError::Scan { run: key, why: error.to_string() });
                     let put = kept.and_then(|(marked, stored)| {
-                        index::keep_into(store, Unit::SHARED, &key, &marked.local, &stored.encode(), &mut landed)
+                        index::keep_into(
+                            store,
+                            Unit::SHARED,
+                            &key,
+                            &marked.local,
+                            &stored.encode(),
+                            &mut landed,
+                        )
                     });
                     match put {
                         Ok(()) => what,
@@ -401,19 +478,31 @@ impl Run {
         rule::widen(&mut traced, &rule, inputs).map_err(RunError::Inputs)?;
         let roots = self.spec.roots.view();
         // alloc: error path, why the scan could not be made
-        let (marked, stored) = roots.kept(&traced, &value).map_err(|error| RunError::keep(KeepError::Scan { run: key, why: error.to_string() }))?;
-        let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs).map_err(|it| match it.error {
-            // The store keeps another value under this run's key and trace: said by what
-            // differs, both values named, never by the two hashes alone (rule 16).
-            KeepError::Mismatch(mismatch) => {
-                let what = rerun_differs(store, &mismatch, &stored).unwrap_or_else(|why| {
-                    // alloc: error path
-                    format!("its value hashes {}, not {} as kept; {why}", mismatch.given, mismatch.kept)
-                });
-                RunError::Rerun { key, stored: mismatch.key, what, landed: it.tickets, retracted: it.retracted }
-            }
-            error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
+        let (marked, stored) = roots.kept(&traced, &value).map_err(|error| {
+            RunError::keep(KeepError::Scan { run: key, why: error.to_string() })
         })?;
+        let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs)
+            .map_err(|it| match it.error {
+                // The store keeps another value under this run's key and trace: said by what
+                // differs, both values named, never by the two hashes alone (rule 16).
+                KeepError::Mismatch(mismatch) => {
+                    let what = rerun_differs(store, &mismatch, &stored).unwrap_or_else(|why| {
+                        // alloc: error path
+                        format!(
+                            "its value hashes {}, not {} as kept; {why}",
+                            mismatch.given, mismatch.kept
+                        )
+                    });
+                    RunError::Rerun {
+                        key,
+                        stored: mismatch.key,
+                        what,
+                        landed: it.tickets,
+                        retracted: it.retracted,
+                    }
+                }
+                error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
+            })?;
         // Verify mode: a copy comparison that retracted is a difference too, said as one.
         if self.spec.mode == Mode::Verify
             && let Some(ticket) = kept.retracted
@@ -423,7 +512,13 @@ impl Run {
                 other => format!("{other:?}"), // alloc: error path
             };
             // alloc: error path, what the rerun gave
-            return Err(RunError::Differs { key, what, retracted: Some(ticket), ran: Box::new(value), landed: kept.tickets });
+            return Err(RunError::Differs {
+                key,
+                what,
+                retracted: Some(ticket),
+                ran: Box::new(value),
+                landed: kept.tickets,
+            });
         }
         Ok(Completed { value, traced, tickets: kept.tickets, retracted: kept.retracted })
     }
@@ -432,8 +527,13 @@ impl Run {
 /// How the value the store keeps under `mismatch`'s key differs from `ran` (as kept: ported),
 /// the value a rerun gave: [`differs_with_stderr`], both values named. An error saying why
 /// when the kept bytes are not a run's value, or are equal to it after all.
-fn rerun_differs(store: &Store, mismatch: &blaze_cas::Mismatch, ran: &Value) -> Result<String, String> {
-    let entry = store.get(&mismatch.key).map_err(|error| format!("reading the kept value: {error:?}"))?; // alloc: error path
+fn rerun_differs(
+    store: &Store,
+    mismatch: &blaze_cas::Mismatch,
+    ran: &Value,
+) -> Result<String, String> {
+    let entry =
+        store.get(&mismatch.key).map_err(|error| format!("reading the kept value: {error:?}"))?; // alloc: error path
     let Some(entry) = entry else {
         return Err("the kept value is no longer in the store".to_owned()); // alloc: error path
     };
@@ -469,7 +569,10 @@ pub fn ported_differs(kept: &[u8], ran: &[u8]) -> Result<Option<String>, String>
 pub fn differs(kept: &Value, ran: &Value) -> Option<String> {
     if (kept.code, kept.signal) != (ran.code, ran.signal) {
         // alloc: a difference said
-        return Some(format!("it ended {:?} {:?}, not {:?} {:?}", ran.code, ran.signal, kept.code, kept.signal));
+        return Some(format!(
+            "it ended {:?} {:?}, not {:?} {:?}",
+            ran.code, ran.signal, kept.code, kept.signal
+        ));
     }
     if kept.stdout != ran.stdout {
         let line = first_line_differing(&kept.stdout, &ran.stdout);
@@ -507,7 +610,7 @@ fn shown_line(bytes: &[u8], line: usize) -> String {
             let cut: String = text.chars().take(200).collect(); // alloc: a difference said
             match cut.len() < text.len() {
                 true => format!("{cut:?}..."), // alloc: a difference said
-                false => format!("{cut:?}"), // alloc: a difference said
+                false => format!("{cut:?}"),   // alloc: a difference said
             }
         }
     }
@@ -552,7 +655,8 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
     let mut stack = vec![PathBuf::new()]; // alloc: once per OUT_DIR collected
     while let Some(rel) = stack.pop() {
         let at = dir.join(&rel);
-        let entries = std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?; // alloc: error path
+        let entries =
+            std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?; // alloc: error path
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?; // alloc: error path
             let name = entry.file_name();
@@ -568,7 +672,8 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                 let target = std::fs::canonicalize(&path)
                     .map_err(|error| format!("{}: a link to nothing: {error}", path.display()))?; // alloc: error path
                 if !target.starts_with(&top) {
-                    return Err(format!( // alloc: error path
+                    return Err(format!(
+                        // alloc: error path
                         "{} is a link to {}, outside the OUT_DIR: what is read through it \
                          would be read outside every trace",
                         path.display(),
@@ -578,7 +683,9 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
             }
             let is_dir = match linked {
                 // alloc: error path
-                true => std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?.is_dir(),
+                true => std::fs::metadata(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+                    .is_dir(),
                 false => kind.is_dir(),
             };
             let name = rel_name(&rel);
@@ -596,12 +703,14 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                         let mut file = std::fs::File::open(path)?;
                         let meta = file.metadata()?;
                         // alloc: the file's bytes the value keeps, at their length
-                        let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+                        let mut bytes =
+                            Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
                         file.read_to_end(&mut bytes)?;
                         Ok((executable(&meta), bytes))
                     };
                     // alloc: error path
-                    let (executable, bytes) = read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    let (executable, bytes) =
+                        read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                     out.push(OutFile { path: name, executable, bytes: Some(bytes) });
                 }
             }
@@ -646,7 +755,10 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
     for file in files {
         let ok = !file.path.is_empty()
             && !file.path.starts_with('/')
-            && file.path.split('/').all(|it| !it.is_empty() && it != "." && it != ".." && !it.contains('\\'));
+            && file
+                .path
+                .split('/')
+                .all(|it| !it.is_empty() && it != "." && it != ".." && !it.contains('\\'));
         if !ok {
             return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path)); // alloc: error path
         }
@@ -660,7 +772,8 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
             None => {
                 if made.insert(file.path.as_str()) {
                     // alloc: error path
-                    std::fs::create_dir_all(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    std::fs::create_dir_all(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
                 }
             }
             Some(bytes) => {
@@ -669,7 +782,8 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
                 {
                     let parent = dir.join(parent);
                     // alloc: error path
-                    std::fs::create_dir_all(&parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+                    std::fs::create_dir_all(&parent)
+                        .map_err(|error| format!("{}: {error}", parent.display()))?;
                 }
                 let write = || -> std::io::Result<()> {
                     let mut out = std::fs::File::create(&path)?;
@@ -723,7 +837,9 @@ mod tests {
         fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
             Ok(match (is_dir(path), self.files.get(path)) {
                 (true, _) => crate::trace::Entry::Dir,
-                (false, Some(hash)) => crate::trace::Entry::File(ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, Some(hash)) => {
+                    crate::trace::Entry::File(ContentId(*hash), blaze_vfs::Mode::Regular)
+                }
                 (false, None) => crate::trace::Entry::Missing,
             })
         }
@@ -743,7 +859,11 @@ mod tests {
             self.env.sort();
             &self.env
         }
-        fn names(&mut self, path: &Path, out: &mut crate::trace::Names<'_>) -> Result<bool, String> {
+        fn names(
+            &mut self,
+            path: &Path,
+            out: &mut crate::trace::Names<'_>,
+        ) -> Result<bool, String> {
             if !is_dir(path) {
                 return Ok(false);
             }
@@ -754,7 +874,8 @@ mod tests {
 
     fn opened(sim: &mut Sim) -> Store {
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let config =
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -765,14 +886,23 @@ mod tests {
 
     fn spec(mode: Mode) -> Spec {
         Spec {
-            key: RunKey { code: ContentId::of("blaze v2 test 1", b"script"), given: ContentId::default() },
+            key: RunKey {
+                code: ContentId::of("blaze v2 test 1", b"script"),
+                given: ContentId::default(),
+            },
             command: Command {
                 program: "/script".into(),
                 args: Vec::new(),
                 env: vec![("CC".into(), "cc".into())],
                 dir: "/ws".into(),
                 stdin: Vec::new(),
-                sandbox: Sandbox::On { read: vec!["/ws".into()], write: Vec::new(), network: false, trace: false, services: Vec::new() },
+                sandbox: Sandbox::On {
+                    read: vec!["/ws".into()],
+                    write: Vec::new(),
+                    network: false,
+                    trace: false,
+                    services: Vec::new(),
+                },
                 memory: None,
             },
             out_dir: None,
@@ -782,7 +912,12 @@ mod tests {
     }
 
     /// A script that reads `/ws/data` and `CC` and prints what `printed` holds then.
-    fn script(sim: &mut Sim, data: Rc<RefCell<[u8; 32]>>, printed: Rc<RefCell<Vec<u8>>>, runs: Rc<RefCell<u32>>) {
+    fn script(
+        sim: &mut Sim,
+        data: Rc<RefCell<[u8; 32]>>,
+        printed: Rc<RefCell<Vec<u8>>>,
+        runs: Rc<RefCell<u32>>,
+    ) {
         sim.program("/script", move |command, _| {
             *runs.borrow_mut() += 1;
             let Sandbox::On { trace: true, .. } = command.sandbox else { panic!("a run traces") };
@@ -808,9 +943,15 @@ mod tests {
     fn spec_in(mode: Mode, dir: &str) -> Spec {
         let mut spec = spec(mode);
         spec.command.dir = dir.into();
-        spec.command.sandbox =
-            Sandbox::On { read: vec![dir.into()], write: Vec::new(), network: false, trace: false, services: Vec::new() };
-        spec.roots = crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
+        spec.command.sandbox = Sandbox::On {
+            read: vec![dir.into()],
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        };
+        spec.roots =
+            crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
         spec
     }
 
@@ -838,11 +979,21 @@ mod tests {
         });
     }
 
-    fn go(sim: &mut Sim, store: &mut Store, inputs: &mut Fixed, mode: Mode) -> Result<(Value, bool), RunError<String>> {
+    fn go(
+        sim: &mut Sim,
+        store: &mut Store,
+        inputs: &mut Fixed,
+        mode: Mode,
+    ) -> Result<(Value, bool), RunError<String>> {
         go_with(sim, store, inputs, spec(mode))
     }
 
-    fn go_with(sim: &mut Sim, store: &mut Store, inputs: &mut Fixed, spec: Spec) -> Result<(Value, bool), RunError<String>> {
+    fn go_with(
+        sim: &mut Sim,
+        store: &mut Store,
+        inputs: &mut Fixed,
+        spec: Spec,
+    ) -> Result<(Value, bool), RunError<String>> {
         let mut effects = Vec::new();
         let run = match Run::begin(spec, store, inputs, Tag(1), &mut effects)? {
             Begun::Reused(value) => return Ok((value, false)),
@@ -850,7 +1001,8 @@ mod tests {
         };
         let mut done = None;
         run_until_idle(sim, &mut effects, |completion, _| done = Some(completion));
-        let completed = run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
+        let completed =
+            run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
         Ok((completed.value, true))
     }
 
@@ -862,7 +1014,10 @@ mod tests {
         let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
         let runs = Rc::new(RefCell::new(0));
         script(&mut sim, data.clone(), printed.clone(), runs.clone());
-        let mut inputs = Fixed { files: [("/ws/data".into(), [1; 32])].into(), env: vec![("CC".into(), "cc".into())] };
+        let mut inputs = Fixed {
+            files: [("/ws/data".into(), [1; 32])].into(),
+            env: vec![("CC".into(), "cc".into())],
+        };
 
         let (first, ran) = go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap();
         assert!(ran && first.stdout == b"cargo:rustc-cfg=one\n");
@@ -873,7 +1028,8 @@ mod tests {
         let key = spec(Mode::Normal).key;
         let reader = store.reader();
         let guard = blaze_cas::enter();
-        let Ok(Found::Hit { value: read, .. }) = index::find(&reader, &guard, &key, &mut inputs) else {
+        let Ok(Found::Hit { value: read, .. }) = index::find(&reader, &guard, &key, &mut inputs)
+        else {
             panic!("a reader misses a kept run")
         };
         let Ok(Found::Hit { value: held, .. }) = index::find_held(&store, &key, &mut inputs) else {
@@ -886,9 +1042,10 @@ mod tests {
             let read = blaze_alloc_count::assert_at_most(0, "a warm find by a reader", || {
                 matches!(index::find(&reader, &guard, &key, &mut inputs), Ok(Found::Hit { .. }))
             });
-            let held = blaze_alloc_count::assert_at_most(0, "a warm find on the store's thread", || {
-                matches!(index::find_held(&store, &key, &mut inputs), Ok(Found::Hit { .. }))
-            });
+            let held =
+                blaze_alloc_count::assert_at_most(0, "a warm find on the store's thread", || {
+                    matches!(index::find_held(&store, &key, &mut inputs), Ok(Found::Hit { .. }))
+                });
             assert!(read && held);
         }
         drop(guard);
@@ -903,7 +1060,10 @@ mod tests {
         assert!(ran && second.stdout == b"cargo:rustc-cfg=two\n");
         // Both kept: going back reuses the first.
         inputs.files.insert("/ws/data".into(), [1; 32]);
-        assert_eq!(go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap(), (first.clone(), false));
+        assert_eq!(
+            go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap(),
+            (first.clone(), false)
+        );
         assert_eq!(*runs.borrow(), 2);
 
         *data.borrow_mut() = [1; 32];
@@ -924,9 +1084,12 @@ mod tests {
         let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
         let runs = Rc::new(RefCell::new(0));
         script_in_dir(&mut sim, printed.clone(), runs.clone());
-        let files = ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
+        let files =
+            ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
         let mut inputs = Fixed { files: files.into(), env: vec![("CC".into(), "cc".into())] };
-        let mut go_in = |sim: &mut Sim, store: &mut Store, mode: Mode, dir: &str| go_with(sim, store, &mut inputs, spec_in(mode, dir));
+        let mut go_in = |sim: &mut Sim, store: &mut Store, mode: Mode, dir: &str| {
+            go_with(sim, store, &mut inputs, spec_in(mode, dir))
+        };
 
         // Two checkouts run it and agree: verified.
         assert!(go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap().1);
@@ -969,7 +1132,8 @@ mod tests {
         let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
         let runs = Rc::new(RefCell::new(0));
         script_in_dir(&mut sim, printed.clone(), runs.clone());
-        let files = ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
+        let files =
+            ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
         let mut inputs = Fixed { files: files.into(), env: vec![("CC".into(), "cc".into())] };
         let proof = crate::pure::Proof {
             identity: ContentId::of("blaze v2 test 1", b"pure script"),
@@ -982,33 +1146,61 @@ mod tests {
         let pure_hit = |store: &Store, inputs: &mut Fixed, dir: &str| {
             let reader = store.reader();
             let guard = blaze_cas::enter();
-            crate::pure::find_hit(&reader, &guard, &proof, spec_in(Mode::Normal, dir).roots.view(), inputs).unwrap()
+            crate::pure::find_hit(
+                &reader,
+                &guard,
+                &proof,
+                spec_in(Mode::Normal, dir).roots.view(),
+                inputs,
+            )
+            .unwrap()
         };
 
         // Two checkouts run it, each keeping it under both keys, and agree: both verified.
         for dir in ["/ckout/a", "/ckout/b"] {
-            let (value, ran) = go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, dir)).unwrap();
+            let (value, ran) =
+                go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, dir)).unwrap();
             assert!(ran);
-            crate::pure::keep(&mut store, &proof, spec_in(Mode::Normal, dir).roots.view(), read(dir), &mut inputs, &value).unwrap();
+            crate::pure::keep(
+                &mut store,
+                &proof,
+                spec_in(Mode::Normal, dir).roots.view(),
+                read(dir),
+                &mut inputs,
+                &value,
+            )
+            .unwrap();
         }
-        let hit = pure_hit(&store, &mut inputs, "/ckout/c").expect("a third checkout is given the pure key's value");
+        let hit = pure_hit(&store, &mut inputs, "/ckout/c")
+            .expect("a third checkout is given the pure key's value");
         assert!(hit.verified.is_some(), "verified across the two checkouts");
 
         // The third reruns it on request and gets otherwise: the sandboxed key is retracted,
         // and the error carries what it ran, which differs from the pure key's hit too.
         *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
-        let ran = match go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Verify, "/ckout/c")) {
-            Err(RunError::Differs { retracted: Some(_), ran, .. }) => ran,
-            other => panic!("a verified value that reruns otherwise is retracted, not {other:?}"),
-        };
+        let ran =
+            match go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Verify, "/ckout/c")) {
+                Err(RunError::Differs { retracted: Some(_), ran, .. }) => ran,
+                other => {
+                    panic!("a verified value that reruns otherwise is retracted, not {other:?}")
+                }
+            };
         assert_eq!(ran.stdout, b"cargo:rustc-cfg=other\n");
         let c = spec_in(Mode::Normal, "/ckout/c").roots;
         let retracted = crate::pure::retract(&mut store, &proof, c.view(), &hit, &ran).unwrap();
-        assert!(retracted.is_some_and(|(_, tickets)| !tickets.is_empty()), "the pure key's verified value is retracted too");
+        assert!(
+            retracted.is_some_and(|(_, tickets)| !tickets.is_empty()),
+            "the pure key's verified value is retracted too"
+        );
 
         // A fourth checkout is given neither: its pure key misses, and its sandboxed key runs.
-        assert_eq!(pure_hit(&store, &mut inputs, "/ckout/d"), None, "the pure key's value is not given again");
-        let (fourth, ran) = go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, "/ckout/d")).unwrap();
+        assert_eq!(
+            pure_hit(&store, &mut inputs, "/ckout/d"),
+            None,
+            "the pure key's value is not given again"
+        );
+        let (fourth, ran) =
+            go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, "/ckout/d")).unwrap();
         assert!(ran && fourth.stdout == b"cargo:rustc-cfg=other\n");
     }
 
@@ -1049,12 +1241,17 @@ mod tests {
         printed.stdout = b"cargo:rustc-cfg=a\ncargo:rustc-cfg=c\n".to_vec();
         assert_eq!(
             differs(&value(), &printed).as_deref(),
-            Some(r#"what it printed differs at line 2: "cargo:rustc-cfg=c", not "cargo:rustc-cfg=b""#)
+            Some(
+                r#"what it printed differs at line 2: "cargo:rustc-cfg=c", not "cargo:rustc-cfg=b""#
+            )
         );
         let mut file = value();
         file.files[1].bytes = Some(b"y".to_vec());
         let file_differs = differs(&value(), &file).unwrap();
-        assert!(file_differs.starts_with("gen/a.rs in its OUT_DIR differs: 1 bytes hashing "), "{file_differs}");
+        assert!(
+            file_differs.starts_with("gen/a.rs in its OUT_DIR differs: 1 bytes hashing "),
+            "{file_differs}"
+        );
         assert!(file_differs.contains(", not 1 bytes hashing "), "{file_differs}");
         let mut failed = value();
         failed.code = Some(1);
@@ -1076,7 +1273,11 @@ mod tests {
             std::fs::remove_file(dir.join("out")).unwrap();
             std::os::unix::fs::symlink(dir.join("gen/a.rs"), dir.join("in")).unwrap();
             let files = collect(&dir).unwrap();
-            assert!(files.iter().any(|it| it.path == "in" && it.bytes.as_deref() == Some(b"x".as_slice())));
+            assert!(
+                files
+                    .iter()
+                    .any(|it| it.path == "in" && it.bytes.as_deref() == Some(b"x".as_slice()))
+            );
         }
         _ = std::fs::remove_dir_all(&dir);
     }
@@ -1086,7 +1287,11 @@ mod tests {
     #[test]
     fn a_restore_makes_each_directory_once_and_collect_reads_it_back() {
         let dir = std::env::temp_dir().join(format!("blaze-out-dir-once-{}", std::process::id()));
-        let file = |path: &str, executable: bool, bytes: &[u8]| OutFile { path: path.into(), executable, bytes: Some(bytes.to_vec()) };
+        let file = |path: &str, executable: bool, bytes: &[u8]| OutFile {
+            path: path.into(),
+            executable,
+            bytes: Some(bytes.to_vec()),
+        };
         let listed = |path: &str| OutFile { path: path.into(), executable: false, bytes: None };
         let given = [
             file("a/b/deep.rs", false, b"deep"),

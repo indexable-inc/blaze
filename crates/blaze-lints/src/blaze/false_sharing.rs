@@ -22,8 +22,8 @@
 //! thread) with `#[expect(blaze::false_sharing, reason = "..")]` on the struct.
 
 use base_db::Db;
-use hir_def::{DefWithBodyId, hir::Expr};
 use hir_def::signatures::FunctionSignature;
+use hir_def::{DefWithBodyId, hir::Expr};
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use super::{Lint, alloc::written_callee, facts};
@@ -67,7 +67,8 @@ const ATOMIC_WRITES: &[&str] = &[
 ];
 
 /// The methods that take a lock, each writing its state.
-const LOCK_WRITES: &[&str] = &["lock", "try_lock", "write", "try_write", "read", "try_read", "upgradable_read"];
+const LOCK_WRITES: &[&str] =
+    &["lock", "try_lock", "write", "try_write", "read", "try_read", "upgradable_read"];
 
 /// What a field is that a thread writes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,8 +119,11 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             false => b.offset.saturating_sub(last) < line,
         }
     };
-    let candidate = |a: &Contended, b: &Contended| (a.kind == Kind::Atomic || b.kind == Kind::Atomic) && near(a, b);
-    let any = (0..fields.len()).any(|i| (i + 1..fields.len()).any(|j| candidate(&fields[i], &fields[j])));
+    let candidate = |a: &Contended, b: &Contended| {
+        (a.kind == Kind::Atomic || b.kind == Kind::Atomic) && near(a, b)
+    };
+    let any =
+        (0..fields.len()).any(|i| (i + 1..fields.len()).any(|j| candidate(&fields[i], &fields[j])));
     if !any {
         return;
     }
@@ -180,14 +184,21 @@ fn kind(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Kind> {
     let krate = adt.module(db).krate(db);
     let name = adt.name(db);
     let name = name.as_str();
-    if name.starts_with("Atomic") && ["core", "std"].iter().any(|it| facts::crate_is(db, krate, it)) {
+    if name.starts_with("Atomic") && ["core", "std"].iter().any(|it| facts::crate_is(db, krate, it))
+    {
         return Some(Kind::Atomic);
     }
     if facts::adt_is(db, adt, "crossbeam_utils", "AtomicCell") {
         return Some(Kind::Atomic);
     }
-    let item = |it: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(it)) == Some(adt);
-    if item("Mutex") || item("RwLock") || ["Mutex", "RwLock", "ReentrantMutex"].iter().any(|it| facts::adt_is(db, adt, "lock_api", it)) {
+    let item =
+        |it: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(it)) == Some(adt);
+    if item("Mutex")
+        || item("RwLock")
+        || ["Mutex", "RwLock", "ReentrantMutex"]
+            .iter()
+            .any(|it| facts::adt_is(db, adt, "lock_api", it))
+    {
         return Some(Kind::Lock);
     }
     None
@@ -209,14 +220,19 @@ fn writers(cx: &Cx<'_, '_>, def: hir::Struct, fields: &mut [Contended]) {
             let infer = analysis.infer();
             for (id, expr) in body.exprs() {
                 let Expr::MethodCall { receiver, .. } = expr else { continue };
-                let Expr::Field { expr: of, name: field_name } = body.expr(receiver) else { continue };
+                let Expr::Field { expr: of, name: field_name } = body.expr(receiver) else {
+                    continue;
+                };
                 if analysis.ty(infer.expr_ty(of)).strip_references().as_adt() != Some(adt) {
                     continue;
                 }
                 let Some((callee, _)) = written_callee(infer, body, id) else { continue };
                 let signature = FunctionSignature::of(db, callee);
                 let method = signature.name.as_str();
-                let Some(field) = fields.iter_mut().find(|it| it.field.name(db) == *field_name) else { continue };
+                let Some(field) = fields.iter_mut().find(|it| it.field.name(db) == *field_name)
+                else {
+                    continue;
+                };
                 let writes = match field.kind {
                     Kind::Atomic => ATOMIC_WRITES,
                     Kind::Lock => LOCK_WRITES,
@@ -248,28 +264,32 @@ fn shared(cx: &Cx<'_, '_>, target: hir::Adt) -> Option<String> {
                 return None;
             }
             modules.extend(module.children(db));
-            let holds = |ty: &hir::Type<'_>, shared: bool| reaches(db, ty, target, arc, shared, DEPTH);
+            let holds =
+                |ty: &hir::Type<'_>, shared: bool| reaches(db, ty, target, arc, shared, DEPTH);
             let in_fn = |f: hir::Function| {
-                f.assoc_fn_params(db).iter().any(|it| holds(it.ty(), false)) || holds(&f.ret_type(db), false)
+                f.assoc_fn_params(db).iter().any(|it| holds(it.ty(), false))
+                    || holds(&f.ret_type(db), false)
             };
             for def in module.declarations(db) {
                 let held = match def {
-                    hir::ModuleDef::Static(it) => holds(&it.ty(db), true).then(|| format!("in the static `{}`", it.name(db).as_str())),
+                    hir::ModuleDef::Static(it) => holds(&it.ty(db), true)
+                        .then(|| format!("in the static `{}`", it.name(db).as_str())),
                     hir::ModuleDef::Adt(it) => {
                         let fields = match it {
                             hir::Adt::Struct(s) => s.fields(db),
                             hir::Adt::Union(u) => u.fields(db),
                             // alloc: one enum's fields
-                            hir::Adt::Enum(e) => e.variants(db).into_iter().flat_map(|v| v.fields(db)).collect(),
+                            hir::Adt::Enum(e) => {
+                                e.variants(db).into_iter().flat_map(|v| v.fields(db)).collect()
+                            }
                         };
-                        fields
-                            .iter()
-                            .any(|field| holds(&field.ty(db), false))
-                            .then(|| format!("in an `Arc` in the fields of `{}`", it.name(db).as_str()))
+                        fields.iter().any(|field| holds(&field.ty(db), false)).then(|| {
+                            format!("in an `Arc` in the fields of `{}`", it.name(db).as_str())
+                        })
                     }
-                    hir::ModuleDef::Function(f) => {
-                        in_fn(f).then(|| format!("in an `Arc` in the signature of `fn {}`", f.name(db).as_str()))
-                    }
+                    hir::ModuleDef::Function(f) => in_fn(f).then(|| {
+                        format!("in an `Arc` in the signature of `fn {}`", f.name(db).as_str())
+                    }),
                     _ => None,
                 };
                 if held.is_some() {
@@ -281,7 +301,10 @@ fn shared(cx: &Cx<'_, '_>, target: hir::Adt) -> Option<String> {
                     if let hir::AssocItem::Function(f) = item
                         && in_fn(f)
                     {
-                        return Some(format!("in an `Arc` in the signature of `fn {}`", f.name(db).as_str()));
+                        return Some(format!(
+                            "in an `Arc` in the signature of `fn {}`",
+                            f.name(db).as_str()
+                        ));
                     }
                 }
             }
@@ -293,7 +316,14 @@ fn shared(cx: &Cx<'_, '_>, target: hir::Adt) -> Option<String> {
 /// Whether `ty` holds `target` where threads share it: inside an `Arc`, or anywhere when
 /// `shared` (a static's type), through references, tuples, arrays, slices, type arguments and
 /// struct fields, at most `depth` types deep.
-fn reaches(db: &Db, ty: &hir::Type<'_>, target: hir::Adt, arc: Option<hir::Adt>, shared: bool, depth: u32) -> bool {
+fn reaches(
+    db: &Db,
+    ty: &hir::Type<'_>,
+    target: hir::Adt,
+    arc: Option<hir::Adt>,
+    shared: bool,
+    depth: u32,
+) -> bool {
     if depth == 0 {
         return false;
     }
@@ -305,7 +335,10 @@ fn reaches(db: &Db, ty: &hir::Type<'_>, target: hir::Adt, arc: Option<hir::Adt>,
         return reaches(db, &inner, target, arc, shared, depth - 1);
     }
     if ty.is_tuple() {
-        return ty.tuple_fields(db).iter().any(|it| reaches(db, it, target, arc, shared, depth - 1));
+        return ty
+            .tuple_fields(db)
+            .iter()
+            .any(|it| reaches(db, it, target, arc, shared, depth - 1));
     }
     let Some(adt) = ty.as_adt() else { return false };
     if shared && adt == target {
@@ -361,7 +394,10 @@ pub static GUARDED: Guarded = Guarded { lock: Mutex::new(0), flag: AtomicBool::n
         );
         assert!(found.contains("in an `Arc` in the fields of `Pool`"), "{found}");
         assert!(found.contains("in the static `GUARDED`"), "{found}");
-        assert!(found.contains("`#[repr(align(128))]` wrapper"), "the note says how to pad:\n{found}");
+        assert!(
+            found.contains("`#[repr(align(128))]` wrapper"),
+            "the note says how to pad:\n{found}"
+        );
     }
 
     /// Padded fields, one writer, a struct no thread shares, and two locks: none is found.

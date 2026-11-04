@@ -22,15 +22,12 @@ use std::{
     },
 };
 
+use crate::{FileId, VfsPath};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, scratch};
 use blaze_query::db::{Durability, Setter};
-use crate::{FileId, VfsPath};
 
-use crate::{
-    Db, InputId, SourceRoot, content,
-    table::Table,
-};
+use crate::{Db, InputId, SourceRoot, content, table::Table};
 
 pub(crate) const BUCKETS: usize = 64;
 

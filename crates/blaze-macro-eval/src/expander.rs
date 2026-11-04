@@ -65,8 +65,8 @@ use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
-    roots::{Role, RootMap, Roots, verify},
     index::{self, FindError, Found},
+    roots::{Role, RootMap, Roots, verify},
     trace::{Seen, assemble_seen},
 };
 use hir_def::{FunctionId, StaticId, nameres::crate_def_map, unstable_features::UnstableFeatures};
@@ -76,8 +76,12 @@ use hir_expand::proc_macro::{
 };
 use intern::Symbol;
 use parking_lot::Mutex;
-use proc_macro_api::kept::verdict::{self as verdicts, Left, SETTLES, STATEFUL, STATELESS, Verdict};
-use proc_macro_api::kept::{Call, Keep, Keeping, Keeps, Mode, Put, Spans, checked, given, put, read, written};
+use proc_macro_api::kept::verdict::{
+    self as verdicts, Left, SETTLES, STATEFUL, STATELESS, Verdict,
+};
+use proc_macro_api::kept::{
+    Call, Keep, Keeping, Keeps, Mode, Put, Spans, checked, given, put, read, written,
+};
 
 use crate::{
     code,
@@ -113,7 +117,12 @@ const _: fn() = || {
 impl Macros {
     pub fn new(keeps: Keeps, sources: Option<PathBuf>) -> Arc<Macros> {
         // alloc: once per daemon, or per test that loads macros
-        Arc::new(Macros { keeps, sources, libraries: Mutex::new(Vec::new()), modules: wasm::Modules::new() })
+        Arc::new(Macros {
+            keeps,
+            sources,
+            libraries: Mutex::new(Vec::new()),
+            modules: wasm::Modules::new(),
+        })
     }
 
     /// The daemon's wasm modules, which a proc macro built for wasm loads through
@@ -156,9 +165,12 @@ impl fmt::Debug for Macros {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let keeps = match &self.keeps {
             Keeps::In(keeping) => format!("in a store, {:?}", keeping.mode), // alloc: debug output
-            Keeps::Nothing(why) => format!("nothing: {why}"), // alloc: debug output
+            Keeps::Nothing(why) => format!("nothing: {why}"),                // alloc: debug output
         };
-        f.debug_struct("Macros").field("keeps", &keeps).field("libraries", &self.libraries.lock().len()).finish()
+        f.debug_struct("Macros")
+            .field("keeps", &keeps)
+            .field("libraries", &self.libraries.lock().len())
+            .finish()
     }
 }
 
@@ -256,19 +268,30 @@ fn verdict_run(code: &ContentId, verdict: &[u8]) -> RunKey {
 fn said(keeping: &Keeping, code: &ContentId, verdict: &[u8]) -> Result<bool, String> {
     let guard = blaze_cas::enter();
     let env = base_db::Env::default();
-    match index::find(&keeping.expansions.store, &guard, &verdict_run(code, verdict), &mut Calling::new(&env)) {
+    match index::find(
+        &keeping.expansions.store,
+        &guard,
+        &verdict_run(code, verdict),
+        &mut Calling::new(&env),
+    ) {
         Ok(Found::Hit { value, .. }) if value == verdict => Ok(true),
         // alloc: error path
-        Ok(Found::Hit { value, .. }) => Err(format!("the store keeps {value:?} as its verdict, not {verdict:?}")),
+        Ok(Found::Hit { value, .. }) => {
+            Err(format!("the store keeps {value:?} as its verdict, not {verdict:?}"))
+        }
         Ok(Found::Miss { .. }) => Ok(false),
         // alloc: error path
         Err(FindError::Corrupt(corrupt)) => Err(corrupt.to_string()),
         // alloc: error path
-        Err(FindError::NotAShape { key, why }) => Err(format!("the store's {key:?} is not a shape: {why}")),
+        Err(FindError::NotAShape { key, why }) => {
+            Err(format!("the store's {key:?} is not a shape: {why}"))
+        }
         // alloc: error path
         Err(FindError::Inputs(unreadable)) => Err(unreadable.to_string()),
         // alloc: error path
-        Err(FindError::TooManyShapes { run }) => Err(format!("verdict run {run:?} has more than {} shapes", index::MOST_SHAPES)),
+        Err(FindError::TooManyShapes { run }) => {
+            Err(format!("verdict run {run:?} has more than {} shapes", index::MOST_SHAPES))
+        }
     }
 }
 
@@ -291,7 +314,10 @@ fn tell(library: &Library, verdict: &'static [u8]) {
         return;
     }
     put(Put {
-        keep: Keep::Run { run: verdict_run(&library.runs, verdict), traced: blaze_core::Traced::default() },
+        keep: Keep::Run {
+            run: verdict_run(&library.runs, verdict),
+            traced: blaze_core::Traced::default(),
+        },
         value: verdict.to_vec(), // alloc: once per crate per build, a verdict
         // alloc: as above
         what: format!("the verdict of the proc macros of `{}`", library.name),
@@ -337,10 +363,18 @@ impl Library {
     /// waited for through the scheduler while another call holds it ([`crate::turn`]), the
     /// wait naming the session. An error says why it was not given: a call of the session asked
     /// for inside the run of another on the same job, or one starved of its turn.
-    fn turn<'s>(&'s self, db: &Db, calling: Crate, session: &'s SessionOf) -> Result<SessionTurn<'s>, ProcMacroExpansionError> {
+    fn turn<'s>(
+        &'s self,
+        db: &Db,
+        calling: Crate,
+        session: &'s SessionOf,
+    ) -> Result<SessionTurn<'s>, ProcMacroExpansionError> {
         // alloc: once per call that holds a session's turn, the name its waits and errors say
         let said = format!("the proc-macro session of `{}` for `{}`", self.name, calling.named(db));
-        let turn = self.turns.take(session.turn, &mut |it| it.push_str(&said)).map_err(|why| system(why.said(&said)))?;
+        let turn = self
+            .turns
+            .take(session.turn, &mut |it| it.push_str(&said))
+            .map_err(|why| system(why.said(&said)))?;
         let mut held = session.lock();
         let calls = std::mem::take(&mut held.calls);
         Ok(SessionTurn { session, at: held.at, calls, _turn: turn })
@@ -353,7 +387,9 @@ impl Library {
         let at = db.nonce_and_revision();
         // The sources directory is the daemon's, the same for every call: not in `made_of`.
         let made_of = [roots.get(Role::Package), roots.get(Role::OutDir)];
-        let same = |kept: &KeptRoots| kept.at == at && kept.made_of.iter().map(Option::as_deref).eq(made_of.iter().copied());
+        let same = |kept: &KeptRoots| {
+            kept.at == at && kept.made_of.iter().map(Option::as_deref).eq(made_of.iter().copied())
+        };
         let pinned = self.kept_roots.pin();
         if let Some(kept) = pinned.get(&calling).filter(|it| same(it)) {
             return Arc::clone(kept); // clone: the roots' handle, held for one expansion
@@ -374,7 +410,10 @@ impl Library {
 
 impl fmt::Debug for Library {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Library").field("name", &self.name).field("loaded", &self.loaded).finish_non_exhaustive()
+        f.debug_struct("Library")
+            .field("name", &self.name)
+            .field("loaded", &self.loaded)
+            .finish_non_exhaustive()
     }
 }
 
@@ -557,8 +596,12 @@ fn start_digest(db: &Db, statics: &[(StaticId, Vec<u8>)]) -> Option<ContentId> {
         return None;
     }
     // alloc: once per call with state, its statics in key order
-    let mut keyed: Vec<(blaze_items::ItemKey, &[u8])> =
-        statics.iter().map(|(id, bytes)| (blaze_items::item_key(db, blaze_items::ItemId::Static(*id)), bytes.as_slice())).collect();
+    let mut keyed: Vec<(blaze_items::ItemKey, &[u8])> = statics
+        .iter()
+        .map(|(id, bytes)| {
+            (blaze_items::item_key(db, blaze_items::ItemId::Static(*id)), bytes.as_slice())
+        })
+        .collect();
     keyed.sort_unstable_by(|a, b| a.0.0.0.cmp(&b.0.0.0));
     let mut h = blaze_ids::Hasher::new("the statics a proc macro's session left 1");
     for (key, bytes) in keyed {
@@ -598,7 +641,12 @@ fn refused(why: String) -> ProcMacroLoadingError {
 /// process for a crate built with `toolchain`. An error says why none can run: the crate is no
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks. Its expansions
 /// are kept where the daemon's `macros` keeps them.
-pub fn load(db: &Db, krate: Crate, toolchain: ContentId, macros: &Arc<Macros>) -> ProcMacroLoadResult {
+pub fn load(
+    db: &Db,
+    krate: Crate,
+    toolchain: ContentId,
+    macros: &Arc<Macros>,
+) -> ProcMacroLoadResult {
     load_on(db, krate, toolchain, macros, |_, bridge| Ok(Engine::Evaluator(bridge)))
 }
 
@@ -618,7 +666,8 @@ pub fn load_wasm(
     load_on(db, krate, toolchain, macros, |name, _| {
         // alloc: error path, and once a crate the name its put says
         let what = format!("the wasm module of the proc-macro crate `{name}`");
-        let mut library = wasm::Library::load(modules, &macros.keeps, module, &what).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
+        let mut library = wasm::Library::load(modules, &macros.keeps, module, &what)
+            .map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
         library.watch(db, krate).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
         Ok(Engine::Wasm(library))
     })
@@ -639,18 +688,25 @@ fn load_on(
         return Err(refused(format!("`{name}` is not a proc-macro crate"))); // alloc: error path
     }
     let Some(proc_macro) = protocol::proc_macro_of(db, krate) else {
-        return Err(refused(format!("the proc-macro crate `{name}` does not depend on `proc_macro`"))); // alloc: error path
+        return Err(refused(format!(
+            "the proc-macro crate `{name}` does not depend on `proc_macro`"
+        ))); // alloc: error path
     };
-    protocol::check(db, proc_macro).map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
-    let bridge = Bridge::find(db, proc_macro).map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
+    protocol::check(db, proc_macro)
+        .map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
+    let bridge = Bridge::find(db, proc_macro)
+        .map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
     let code = code::Memo::default();
     let loaded = code.get(db, krate);
     let engine = engine(&name, bridge)?;
     let runs = engine.runs(loaded);
     let verdict = verdict(&macros.keeps, &runs)
         // alloc: error path
-        .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
-    let library = Arc::new(Library { // alloc: once a proc-macro crate loaded
+        .map_err(|why| {
+            refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}"))
+        })?;
+    let library = Arc::new(Library {
+        // alloc: once a proc-macro crate loaded
         macros: Arc::clone(macros), // clone: a refcount, once a proc-macro crate loaded
         krate,
         name,
@@ -684,7 +740,13 @@ fn load_on(
             name: name.clone(), // clone: a symbol, once a macro
             kind,
             // alloc: once a macro loaded
-            expander: Arc::new(Evaluated { library: Arc::clone(&library), name, kind, function, index }),
+            expander: Arc::new(Evaluated {
+                library: Arc::clone(&library),
+                name,
+                kind,
+                function,
+                index,
+            }),
             disabled: false,
         })
         .collect()) // alloc: once a proc-macro crate, its macros
@@ -700,9 +762,12 @@ fn forced_keywords(db: &Db, calling: Crate) -> bool {
 /// or attribute is on (`struct Config`, `fn main`), found by its keyword among the input's
 /// outermost tokens past its attributes and visibility, or a bang macro's input by its length.
 fn input_item(kind: ProcMacroKind, input: &tt::TopSubtree) -> String {
-    const ITEMS: [&str; 11] = ["struct", "enum", "union", "fn", "trait", "impl", "mod", "type", "const", "static", "use"];
+    const ITEMS: [&str; 11] =
+        ["struct", "enum", "union", "fn", "trait", "impl", "mod", "type", "const", "static", "use"];
     let keyword = |it: &tt::TtElement<'_>| match it {
-        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => ITEMS.iter().find(|k| **k == ident.sym.as_str()).copied(),
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => {
+            ITEMS.iter().find(|k| **k == ident.sym.as_str()).copied()
+        }
         _ => None,
     };
     if kind != ProcMacroKind::Bang {
@@ -716,7 +781,9 @@ fn input_item(kind: ProcMacroKind, input: &tt::TopSubtree) -> String {
             }
             return match tokens.next() {
                 // alloc: error path
-                Some(tt::TtElement::Leaf(tt::Leaf::Ident(name))) => format!("`{said} {}`", name.sym.as_str()),
+                Some(tt::TtElement::Leaf(tt::Leaf::Ident(name))) => {
+                    format!("`{said} {}`", name.sym.as_str())
+                }
                 // alloc: error path
                 _ => format!("an item `{said} ...`"),
             };
@@ -763,7 +830,10 @@ impl Evaluated {
         if self.kind == ProcMacroKind::Attr {
             match call.attrs {
                 Some(attrs) => inputs.push(attrs.copy()),
-                None => inputs.push(tt::TopSubtree::empty(tt::DelimSpan { open: call.call_site, close: call.call_site })),
+                None => inputs.push(tt::TopSubtree::empty(tt::DelimSpan {
+                    open: call.call_site,
+                    close: call.call_site,
+                })),
             }
         }
         inputs.push(call.subtree.copy());
@@ -786,7 +856,12 @@ impl Evaluated {
     /// keeps the state it leaves in the session: what it gave, and the state it ran from
     /// ([`From`]). It holds the session's turn while it runs from the session's state; a call
     /// of a session with none gives the turn back while it runs, as its calls run at once.
-    fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(Ran, From), ProcMacroExpansionError> {
+    fn run(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: &ProcMacroCall<'_>,
+    ) -> Result<(Ran, From), ProcMacroExpansionError> {
         let library = &*self.library;
         let this = self.kept(db, calling, call);
         let session = library.session(db, calling);
@@ -801,7 +876,8 @@ impl Evaluated {
             let preset = if held.holds { Vec::new() } else { held.statics.clone() };
             (stateless, held.holds, preset, ahead)
         };
-        let from = From { replayed: holds, start: if holds { None } else { start_digest(db, &preset) } };
+        let from =
+            From { replayed: holds, start: if holds { None } else { start_digest(db, &preset) } };
         let ran = if let Some(ahead) = ahead {
             // Run ahead from the statics the session has now: what a run now would give.
             let ran = match ahead {
@@ -867,7 +943,12 @@ impl Evaluated {
     /// Notes in the session of `calling` that `call`'s turn was found in the store, from the
     /// state the session has: it left that state as it was, and is a call the session's later
     /// ones may run after again.
-    fn found(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(), ProcMacroExpansionError> {
+    fn found(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: &ProcMacroCall<'_>,
+    ) -> Result<(), ProcMacroExpansionError> {
         let session = self.library.session(db, calling);
         let mut turn = self.library.turn(db, calling, &session)?;
         let keeps_calls = {
@@ -920,8 +1001,25 @@ impl Evaluated {
         let what = format!("the proc macro `{path}` for `{calling}`");
         let mut spent = run::Spent::default();
         let ran = match &library.engine {
-            Engine::Evaluator(bridge) => run::run(db, &what, bridge, call.env, preset, call.current_dir, &expansions, &mut spent),
-            Engine::Wasm(module) => module.run(db, call.env, self.index, &expansions, preset, call.current_dir, &mut spent),
+            Engine::Evaluator(bridge) => run::run(
+                db,
+                &what,
+                bridge,
+                call.env,
+                preset,
+                call.current_dir,
+                &expansions,
+                &mut spent,
+            ),
+            Engine::Wasm(module) => module.run(
+                db,
+                call.env,
+                self.index,
+                &expansions,
+                preset,
+                call.current_dir,
+                &mut spent,
+            ),
         };
         run::ran_on(span, &spent, &ran);
         // An expansion that stopped (a budget, a refused call) names what it expanded and where,
@@ -963,7 +1061,9 @@ impl Evaluated {
             self.run_on(db, calling, call, &preset, &[], &this)
         }));
         let ran = match ran {
-            Err(payload) if payload.is::<blaze_query::db::Cancelled>() => std::panic::resume_unwind(payload),
+            Err(payload) if payload.is::<blaze_query::db::Cancelled>() => {
+                std::panic::resume_unwind(payload)
+            }
             ran => ran,
         };
         let mut held = session.lock();
@@ -992,8 +1092,13 @@ impl Evaluated {
     }
 
     /// The output of `ran`, or the error it ends in.
-    fn output(&self, ran: &Ran, call_site: span::Span) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        let errors: Vec<&str> = ran.emitted.iter().filter(|it| it.error).map(|it| it.text.as_str()).collect(); // alloc: once per call, the errors it emitted (none for most)
+    fn output(
+        &self,
+        ran: &Ran,
+        call_site: span::Span,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        let errors: Vec<&str> =
+            ran.emitted.iter().filter(|it| it.error).map(|it| it.text.as_str()).collect(); // alloc: once per call, the errors it emitted (none for most)
         for warning in ran.emitted.iter().filter(|it| !it.error) {
             eprintln!("{}: {}", self.what(), warning.text);
         }
@@ -1020,7 +1125,10 @@ impl Evaluated {
         }));
         // alloc: once per included file, as an expansion is kept
         tracked.extend(included.iter().map(|path| path.to_string_lossy().into_owned()));
-        ran.seen.iter().map(|(seen, what)| (*seen, what.as_str())).chain(tracked.iter().map(|it| (Seen::Read, it.as_str())))
+        ran.seen
+            .iter()
+            .map(|(seen, what)| (*seen, what.as_str()))
+            .chain(tracked.iter().map(|it| (Seen::Read, it.as_str())))
     }
 
     /// For a crate that settles: whether `ran`, which ran from `from` and gave `bytes`, gives
@@ -1059,7 +1167,8 @@ impl Evaluated {
             (false, None) if ran.statics.iter().any(|it| it.2) => return Ok(Err(UNSHOWN)),
             (false, None) if !ran.statics.is_empty() => {
                 // clone: once per first call of a session of a crate that settles
-                let statics: Vec<(StaticId, Vec<u8>)> = ran.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
+                let statics: Vec<(StaticId, Vec<u8>)> =
+                    ran.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
                 let Some(digest) = start_digest(db, &statics) else { return Ok(Err(UNSHOWN)) };
                 let mut settled = wait::lock(&library.settled, SETTLED_STATE);
                 if settled.as_ref().is_some_and(|it| it.digest != digest) {
@@ -1081,7 +1190,10 @@ impl Evaluated {
             },
             // From the settled state: the other is the fresh one.
             (false, Some(digest)) => {
-                if wait::lock(&library.settled, SETTLED_STATE).as_ref().is_some_and(|it| it.digest != digest) {
+                if wait::lock(&library.settled, SETTLED_STATE)
+                    .as_ref()
+                    .is_some_and(|it| it.digest != digest)
+                {
                     if demote {
                         library.saw(Left::Moved)?;
                     }
@@ -1112,7 +1224,8 @@ impl Evaluated {
             false => !again.statics.is_empty(),
             true => {
                 // clone: once per such run, the statics it left, digested
-                let left: Vec<(StaticId, Vec<u8>)> = again.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
+                let left: Vec<(StaticId, Vec<u8>)> =
+                    again.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
                 // Run from the fresh state only for a call that ran from the settled one.
                 let digest = start_digest(db, &left);
                 digest.is_some() && digest != from.start
@@ -1138,7 +1251,12 @@ impl Evaluated {
 
     /// Expands `call` from `calling`'s session, found or run, and states what it read and
     /// whether its session's state took part ([`Expanded`]) on every way out.
-    fn expand_keyed(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand_keyed(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let library = &*self.library;
         // One span per expansion, kept or run: which macro, on what, by which engine. The
         // fields format only when a subscriber records them.
@@ -1160,7 +1278,11 @@ impl Evaluated {
             Keeps::Nothing(why) => {
                 let (ran, _) = self.run(db, calling, &call)?;
                 let tree = self.output(&ran, call.call_site)?;
-                return Ok(Expanded { tree, reads: ExpansionReads::Unknown(*why), state: state_use(verdict, false) });
+                return Ok(Expanded {
+                    tree,
+                    reads: ExpansionReads::Unknown(*why),
+                    state: state_use(verdict, false),
+                });
             }
         };
         let start = self.start(db, calling);
@@ -1222,7 +1344,8 @@ impl Evaluated {
                         // (`Keeping::retractions_now`).
                         Some(unmarked) => {
                             let depends = index::depends_key(&key, &unmarked);
-                            let (shape, values) = proc_macro_api::kept::verified_reads(&depends, shape, values);
+                            let (shape, values) =
+                                proc_macro_api::kept::verified_reads(&depends, shape, values);
                             ExpansionReads::Traced { shape: shape.into(), values }
                         }
                     };
@@ -1234,7 +1357,8 @@ impl Evaluated {
                     };
                     match keeping.mode {
                         Mode::Keep => {
-                            let tree = read(value, &spans).map_err(|why| system(format_args!("{}: {why}", self.what())))?;
+                            let tree = read(value, &spans)
+                                .map_err(|why| system(format_args!("{}: {why}", self.what())))?;
                             self.found(db, calling, &call)?;
                             // Found under its key, which a crate that settles keeps only shown
                             // calls under (`shown`).
@@ -1244,14 +1368,24 @@ impl Evaluated {
                     }
                 }
                 Ok(Found::Hit { values: None, .. }) => {
-                    return Err(system(format_args!("{}: the store's lookup found a hit without its values", self.what())));
+                    return Err(system(format_args!(
+                        "{}: the store's lookup found a hit without its values",
+                        self.what()
+                    )));
                 }
                 Ok(Found::Miss { .. }) => {}
-                Err(FindError::Corrupt(corrupt)) => return Err(system(format_args!("{}: {corrupt}", self.what()))),
-                Err(FindError::NotAShape { key, why }) => {
-                    return Err(system(format_args!("{}: the store's {key:?} is not a shape: {why}", self.what())));
+                Err(FindError::Corrupt(corrupt)) => {
+                    return Err(system(format_args!("{}: {corrupt}", self.what())));
                 }
-                Err(FindError::Inputs(unreadable)) => return Err(system(format_args!("{}: {unreadable}", self.what()))),
+                Err(FindError::NotAShape { key, why }) => {
+                    return Err(system(format_args!(
+                        "{}: the store's {key:?} is not a shape: {why}",
+                        self.what()
+                    )));
+                }
+                Err(FindError::Inputs(unreadable)) => {
+                    return Err(system(format_args!("{}: {unreadable}", self.what())));
+                }
                 Err(FindError::TooManyShapes { run }) => {
                     return Err(system(format_args!(
                         "{}: run {run:?} has more than {} shapes",
@@ -1281,7 +1415,11 @@ impl Evaluated {
                 )));
             };
             let record = verify::retraction(&key, &unmarked);
-            keeping.put(Put { keep: Keep::Durable { run: record.run, traced: record.traced }, value: record.value, what: self.what() });
+            keeping.put(Put {
+                keep: Keep::Durable { run: record.run, traced: record.traced },
+                value: record.value,
+                what: self.what(),
+            });
             retracted = true;
         }
         let done = |tree: tt::TopSubtree, reads: ExpansionReads, state: StateUse| match retracted {
@@ -1322,7 +1460,10 @@ impl Evaluated {
             left_address: ran.statics.iter().any(|it| it.2),
         };
         if session && !session_reads_known(verdict, left) {
-            return unknown(output, "its macro keeps a session that does not settle, or it moved its session's state on: its output depends on the calls before it, which ran in no order a key fixes");
+            return unknown(
+                output,
+                "its macro keeps a session that does not settle, or it moved its session's state on: its output depends on the calls before it, which ran in no order a key fixes",
+            );
         }
         if !ran.emitted.is_empty() {
             return unknown(output, "it emitted a diagnostic");
@@ -1335,8 +1476,11 @@ impl Evaluated {
         // alloc: as above, the files the macro's code included
         let mut included = Vec::new();
         code::included(db, library.krate, &mut included);
-        let traced = assemble_seen(Self::lines(&ran, call.current_dir, &included, &mut tracked), &mut inputs)
-            .map_err(|why| system(format_args!("{}: {why}", self.what())))?;
+        let traced = assemble_seen(
+            Self::lines(&ran, call.current_dir, &included, &mut tracked),
+            &mut inputs,
+        )
+        .map_err(|why| system(format_args!("{}: {why}", self.what())))?;
         if index::untraceable(&traced) {
             return unknown(output, "it read what can't be traced (the clock, randomness)");
         }
@@ -1349,7 +1493,8 @@ impl Evaluated {
         // moved since the memo was made (then it is made again).
         let kept = library.kept_roots(db, calling, roots);
         let view = kept.map.view();
-        let marked = view.kept_bytes(&traced, bytes.as_deref(), proc_macro_api::kept::left(&keyed, &view));
+        let marked =
+            view.kept_bytes(&traced, bytes.as_deref(), proc_macro_api::kept::left(&keyed, &view));
         if marked.relinked {
             library.kept_roots.pin().remove(&calling);
         }
@@ -1364,12 +1509,30 @@ impl Evaluated {
         // crate that settles.
         let (keep, unknown_why, proven) = match verdict {
             Verdict::Stateless => (true, None, false),
-            Verdict::Settles => match self.same_from_either_state(db, calling, &call, &ran, from, bytes.as_deref(), &spans, true)? {
+            Verdict::Settles => match self.same_from_either_state(
+                db,
+                calling,
+                &call,
+                &ran,
+                from,
+                bytes.as_deref(),
+                &spans,
+                true,
+            )? {
                 Ok(()) => (true, None, true),
                 Err(why) => (false, Some(why), false),
             },
             Verdict::Unseen if shown => {
-                let same = self.same_from_either_state(db, calling, &call, &ran, from, bytes.as_deref(), &spans, false)?;
+                let same = self.same_from_either_state(
+                    db,
+                    calling,
+                    &call,
+                    &ran,
+                    from,
+                    bytes.as_deref(),
+                    &spans,
+                    false,
+                )?;
                 (same.is_ok(), Some(UNSETTLED), false)
             }
             Verdict::Unseen | Verdict::Stateful => (true, Some(UNSETTLED), false),
@@ -1403,8 +1566,19 @@ impl Evaluated {
                 let same = |theirs: &[u8], ours: &[u8]| -> Result<Option<String>, String> {
                     Ok((theirs != ours).then(|| "its output differs".to_owned())) // alloc: a difference said
                 };
-                let keeps = verify::keeps(|key| Ok(store.get(&guard, key)?.map(|it| it.bytes)), &view, &key, marked, value, same);
-                keeps.map_err(|error| system(format_args!("{}: keeping it: {error:?}", self.what())))?.0
+                let keeps = verify::keeps(
+                    |key| Ok(store.get(&guard, key)?.map(|it| it.bytes)),
+                    &view,
+                    &key,
+                    marked,
+                    value,
+                    same,
+                );
+                keeps
+                    .map_err(|error| {
+                        system(format_args!("{}: keeping it: {error:?}", self.what()))
+                    })?
+                    .0
             }
         };
         // What it states is the put made under its own key: here, marked with every root, or
@@ -1419,12 +1593,18 @@ impl Evaluated {
                 stated(match index::split_verified(&it.value) {
                     None => ExpansionReads::Traced { shape: shape.into(), values },
                     Some((unmarked, _)) => {
-                        let (shape, values) = proc_macro_api::kept::verified_reads(&index::depends_key(&key, &unmarked), &shape, values);
+                        let (shape, values) = proc_macro_api::kept::verified_reads(
+                            &index::depends_key(&key, &unmarked),
+                            &shape,
+                            values,
+                        );
                         ExpansionReads::Traced { shape: shape.into(), values }
                     }
                 })
             }
-            None => ExpansionReads::Unknown("nothing of it was kept under its own key, so no record names what it read"),
+            None => ExpansionReads::Unknown(
+                "nothing of it was kept under its own key, so no record names what it read",
+            ),
         };
         // A record that a value verified across checkouts depends on where its roots are (another
         // checkout's copy expanded otherwise) is durable before the job is done: a crash
@@ -1464,7 +1644,11 @@ impl ProcMacroExpander for Evaluated {
     }
 
     /// A call with no calling crate is its own session.
-    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
+    fn expand(
+        &self,
+        db: &Db,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let calling = self.library.krate;
         self.expand_keyed(db, calling, call)
     }
@@ -1478,7 +1662,8 @@ impl ProcMacroExpander for Evaluated {
         self.expand_keyed(db, calling_crate, call)
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: the database's expander trait, the edge
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: the database's expander trait, the edge
         (other as &dyn std::any::Any) // dyn: as above, told apart by type
             .downcast_ref::<Evaluated>()
             .is_some_and(|other| {
@@ -1491,8 +1676,10 @@ impl ProcMacroExpander for Evaluated {
 mod tests {
     use super::{SessionRun, Verdict, session_reads_known};
 
-    const FRESH_FIRST: SessionRun = SessionRun { replayed: false, fresh: true, changed: true, left_address: false };
-    const SETTLED: SessionRun = SessionRun { replayed: false, fresh: false, changed: false, left_address: false };
+    const FRESH_FIRST: SessionRun =
+        SessionRun { replayed: false, fresh: true, changed: true, left_address: false };
+    const SETTLED: SessionRun =
+        SessionRun { replayed: false, fresh: false, changed: false, left_address: false };
 
     /// A call of a crate that settles reports its reads, the first call's change of the fresh
     /// state included; a stateful or unseen crate's never does, not even a call that ran from

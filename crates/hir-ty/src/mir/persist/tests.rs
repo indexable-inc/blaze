@@ -14,7 +14,6 @@ use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::{Aligned, FormatError, open_as};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FieldId, FunctionId,
     ModuleDefId, StaticId, StructId, UnionId, VariantId,
@@ -26,6 +25,7 @@ use hir_expand::fixture;
 use la_arena::{Arena, ArenaMap};
 use rustc_type_ir::inherent::Ty as _;
 use smallvec::smallvec;
+use std::alloc::Global;
 
 use super::{Locations, MirRoot, SCHEMA, WriteError, idx, read, write};
 use crate::{
@@ -36,11 +36,11 @@ use crate::{
     intrinsic::Intrinsic,
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind,
-        CastKind, ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody,
-        InlinedCallee, InlinedPromoted, InlinedScope, InlinedSpan, Local, LocalId, MirBody,
-        MirPhase, MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection,
-        ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator,
-        TerminatorKind, UnOp, UnreachableAfterCall,
+        CastKind, ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding,
+        InlinedBody, InlinedCallee, InlinedPromoted, InlinedScope, InlinedSpan, Local, LocalId,
+        MirBody, MirPhase, MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem,
+        Projection, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets,
+        Terminator, TerminatorKind, UnOp, UnreachableAfterCall,
     },
     next_solver::{ConstExt as _, DbInterner, GenericArgs, Ty, abi::Safety, default_types},
 };
@@ -108,7 +108,11 @@ fn items(db: &Db) -> Items<'_> {
         .expect("`owner` has a closure");
     let closure = InternedClosureId::new(
         db,
-        InternedClosure { owner: InferBodyId::DefWithBodyId(def), expr, kind: ClosureKind::Closure },
+        InternedClosure {
+            owner: InferBodyId::DefWithBodyId(def),
+            expr,
+            kind: ClosureKind::Closure,
+        },
     );
     Items { owner, callee, s, variant, u, st, k, closure }
 }
@@ -220,9 +224,17 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         BorrowKind::Mut { kind: MutBorrowKind::Default },
         BorrowKind::Mut { kind: MutBorrowKind::TwoPhasedBorrow },
     ] {
-        statements.push(assign(ret, Rvalue::Ref(kind, place(s, &projections[..2])), MirSpan::Unknown));
+        statements.push(assign(
+            ret,
+            Rvalue::Ref(kind, place(s, &projections[..2])),
+            MirSpan::Unknown,
+        ));
     }
-    statements.push(assign(ret, Rvalue::Len(place(bytes, &[ProjectionElem::Deref])), MirSpan::Unknown));
+    statements.push(assign(
+        ret,
+        Rvalue::Len(place(bytes, &[ProjectionElem::Deref])),
+        MirSpan::Unknown,
+    ));
     for kind in [
         CastKind::PointerExposeAddress,
         CastKind::PointerFromExposedAddress,
@@ -242,11 +254,23 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         CastKind::FnPtrToPtr,
         CastKind::Transmute,
     ] {
-        statements.push(assign(ret, Rvalue::Cast(kind, copy(f), types.u64.store()), MirSpan::Unknown));
+        statements.push(assign(
+            ret,
+            Rvalue::Cast(kind, copy(f), types.u64.store()),
+            MirSpan::Unknown,
+        ));
     }
     for op in all_bin_ops() {
-        statements.push(assign(ret, Rvalue::BinaryOp(op.clone(), copy(ret), copy(ret)), MirSpan::Unknown));
-        statements.push(assign(pair, Rvalue::CheckedBinaryOp(op, copy(ret), copy(ret)), MirSpan::Unknown));
+        statements.push(assign(
+            ret,
+            Rvalue::BinaryOp(op.clone(), copy(ret), copy(ret)),
+            MirSpan::Unknown,
+        ));
+        statements.push(assign(
+            pair,
+            Rvalue::CheckedBinaryOp(op, copy(ret), copy(ret)),
+            MirSpan::Unknown,
+        ));
     }
     statements.push(assign(flag, Rvalue::UnaryOp(UnOp::Not, copy(flag)), MirSpan::Unknown));
     statements.push(assign(ret, Rvalue::UnaryOp(UnOp::Neg, copy(ret)), MirSpan::Unknown));
@@ -255,17 +279,22 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         AggregateKind::Array(types.u32.store()),
         AggregateKind::Tuple(tuple.store()),
         AggregateKind::Adt(VariantId::StructId(it.s), args.store()),
-        AggregateKind::Union(
-            it.u,
-            FieldId { parent: VariantId::UnionId(it.u), local_id: idx(1) },
-        ),
+        AggregateKind::Union(it.u, FieldId { parent: VariantId::UnionId(it.u), local_id: idx(1) }),
         AggregateKind::Closure(fn_ty.store()),
     ] {
         let operands = vec![copy(ret), copy(flag)].into_boxed_slice();
         statements.push(assign(pair, Rvalue::Aggregate(kind, operands), MirSpan::Unknown));
     }
-    statements.push(assign(ret, Rvalue::Aggregate(AggregateKind::Array(types.u32.store()), Box::new([])), MirSpan::Unknown));
-    statements.push(assign(ret, Rvalue::CopyForDeref(place(bytes, &[ProjectionElem::Deref])), MirSpan::Unknown));
+    statements.push(assign(
+        ret,
+        Rvalue::Aggregate(AggregateKind::Array(types.u32.store()), Box::new([])),
+        MirSpan::Unknown,
+    ));
+    statements.push(assign(
+        ret,
+        Rvalue::CopyForDeref(place(bytes, &[ProjectionElem::Deref])),
+        MirSpan::Unknown,
+    ));
     for kind in [
         StatementKind::FakeRead(place(s, &[])),
         StatementKind::Deinit(place(s, &[])),
@@ -305,7 +334,8 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         statements.push(Statement { kind, span: MirSpan::BindingId(idx(0)) });
     }
 
-    let mut blocks: Vec<BasicBlock> = vec![BasicBlock { statements, terminator: None, is_cleanup: false }];
+    let mut blocks: Vec<BasicBlock> =
+        vec![BasicBlock { statements, terminator: None, is_cleanup: false }];
     let block = |n: u32| -> BasicBlockId { idx(n) };
     let terminators = vec![
         TerminatorKind::Goto { target: block(1) },
@@ -316,7 +346,10 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
                 targets: smallvec![block(2), block(3), block(4), block(5)],
             },
         },
-        TerminatorKind::SwitchInt { discr: copy(flag), targets: SwitchTargets::static_if(1, block(2), block(3)) },
+        TerminatorKind::SwitchInt {
+            discr: copy(flag),
+            targets: SwitchTargets::static_if(1, block(2), block(3)),
+        },
         TerminatorKind::UnwindResume,
         TerminatorKind::Abort,
         TerminatorKind::Return,
@@ -358,7 +391,12 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
             resume_arg: place(ret, &[]),
             drop: Some(block(3)),
         },
-        TerminatorKind::Yield { value: copy(ret), resume: block(1), resume_arg: place(ret, &[]), drop: None },
+        TerminatorKind::Yield {
+            value: copy(ret),
+            resume: block(1),
+            resume_arg: place(ret, &[]),
+            drop: None,
+        },
         TerminatorKind::CoroutineDrop,
         TerminatorKind::FalseEdge { real_target: block(1), imaginary_target: block(2) },
         TerminatorKind::FalseUnwind { real_target: block(1), unwind: Some(block(3)) },
@@ -394,7 +432,11 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         let terminator = Some(Terminator { span, kind });
         match blocks.last_mut() {
             Some(last) if last.terminator.is_none() => last.terminator = terminator,
-            _ => blocks.push(BasicBlock { statements: Vec::new(), terminator, is_cleanup: n % 4 == 3 }),
+            _ => blocks.push(BasicBlock {
+                statements: Vec::new(),
+                terminator,
+                is_cleanup: n % 4 == 3,
+            }),
         }
     }
     // A block still being built has no terminator.
@@ -433,7 +475,8 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
             (ret, capture(PlaceBase::Local(idx(2)))),
         ],
     );
-    upvar_locals.insert(idx(1), vec![(f, capture(PlaceBase::Rvalue)), (f, capture(PlaceBase::StaticItem))]);
+    upvar_locals
+        .insert(idx(1), vec![(f, capture(PlaceBase::Rvalue)), (f, capture(PlaceBase::StaticItem))]);
     upvar_locals.insert(idx(0), Vec::new());
 
     MirBody {
@@ -508,7 +551,8 @@ fn written(db: &Db, body: &MirBody<'_>) -> Vec<u8> {
 /// the sample's binding ids index, and no location literals.
 fn locations(db: &Db) -> Locations<'_> {
     let ModuleDefId::FunctionId(owner) = item(db, "owner") else { panic!("`owner` is a function") };
-    let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner)));
+    let store =
+        ExpressionStore::of(db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner)));
     Locations { store, exprs: &[], word: 8 }
 }
 
@@ -607,7 +651,9 @@ fn a_body_with_allocations_moved_into_its_frame_is_refused() {
     let it = items(&db);
     let mut body = sample(&db, &it);
     body.inlined.moved_to_frame = 1;
-    let why = write(&db, &body, None).expect_err("a body with an allocation moved into its frame").to_string();
+    let why = write(&db, &body, None)
+        .expect_err("a body with an allocation moved into its frame")
+        .to_string();
     assert!(why.contains("moved into its frame"), "{why}");
 }
 
@@ -619,7 +665,11 @@ fn an_allocation_into_a_static_is_relocated_in_a_relocating_scope() {
     let mut table = crate::check_cache::ids::Table::default();
     let relocated = crate::check_cache::ids::relocating(&mut table, || write(&db, &body, None))
         .expect("a static an allocation points into is written by its place in the table");
-    assert_ne!(relocated, written(&db, &body), "the static is by its table index, not its own bits");
+    assert_ne!(
+        relocated,
+        written(&db, &body),
+        "the static is by its table index, not its own bits"
+    );
 }
 
 /// Where the words column starts in `bytes`, and how many bytes it has.
@@ -680,7 +730,9 @@ fn out_of_range(db: &Db, body: &MirBody<'_>, store: &ExpressionStore) -> Option<
     }
     for &(block, statement, _) in &body.panic_unwinds {
         let statements = body.basic_blocks[block].statements.len();
-        check.is(statement < statements, || format!("a panic unwind's statement {statement} of {statements}"));
+        check.is(statement < statements, || {
+            format!("a panic unwind's statement {statement} of {statements}")
+        });
     }
     for call in &body.unreachable_after_calls {
         check.span(call.call);
@@ -717,7 +769,9 @@ impl InRange<'_> {
 
     fn span(&mut self, span: MirSpan) {
         let (raw, len, of) = match span {
-            MirSpan::ExprId(it) | MirSpan::ExprEnd(it) => (it.into_raw().into_u32(), self.exprs, "expressions"),
+            MirSpan::ExprId(it) | MirSpan::ExprEnd(it) => {
+                (it.into_raw().into_u32(), self.exprs, "expressions")
+            }
             MirSpan::PatId(it) => (it.into_raw().into_u32(), self.pats, "patterns"),
             MirSpan::BindingId(it) => (it.into_raw().into_u32(), self.bindings, "bindings"),
             MirSpan::Inlined(n) => (n, 0, "inlined spans"),
@@ -737,9 +791,10 @@ impl InRange<'_> {
 
     fn rvalue(&mut self, rvalue: &Rvalue) {
         match rvalue {
-            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) | Rvalue::UnaryOp(_, it) => {
-                self.operand(it)
-            }
+            Rvalue::Use(it)
+            | Rvalue::Repeat(it, _)
+            | Rvalue::Cast(_, it, _)
+            | Rvalue::UnaryOp(_, it) => self.operand(it),
             Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                 self.operand(a);
                 self.operand(b);
@@ -754,8 +809,13 @@ impl InRange<'_> {
                 }
                 operands.iter().for_each(|it| self.operand(it));
             }
-            Rvalue::Ref(..) | Rvalue::Len(_) | Rvalue::Discriminant(_) | Rvalue::CopyForDeref(_) => {}
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::Ref(..)
+            | Rvalue::Len(_)
+            | Rvalue::Discriminant(_)
+            | Rvalue::CopyForDeref(_) => {}
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
         }
     }
 
@@ -770,14 +830,16 @@ impl InRange<'_> {
                 for piece in &asm.template {
                     if let AsmPiece::Operand { index, .. } = *piece {
                         let operands = asm.operands.len();
-                        self.is(index < operands, || format!("an `asm!` operand {index} of {operands}"));
+                        self.is(index < operands, || {
+                            format!("an `asm!` operand {index} of {operands}")
+                        });
                     }
                 }
                 for operand in &asm.operands {
                     match operand {
-                        AsmOperand::Reg { input: Some(it), .. } | AsmOperand::Const(it) | AsmOperand::Sym(it) => {
-                            self.operand(it)
-                        }
+                        AsmOperand::Reg { input: Some(it), .. }
+                        | AsmOperand::Const(it)
+                        | AsmOperand::Sym(it) => self.operand(it),
                         AsmOperand::Reg { input: None, .. } | AsmOperand::Label => {}
                     }
                 }
@@ -787,7 +849,9 @@ impl InRange<'_> {
     }
 
     fn binder(&mut self, ComptimeBinder(universe): ComptimeBinder) {
-        self.is(universe <= rustc_type_ir::UniverseIndex::MAX_AS_U32, || format!("a binder {universe:#x}"));
+        self.is(universe <= rustc_type_ir::UniverseIndex::MAX_AS_U32, || {
+            format!("a binder {universe:#x}")
+        });
     }
 
     fn place(&mut self, place: &StoredPlace) {
@@ -801,7 +865,9 @@ impl InRange<'_> {
     fn terminator(&mut self, kind: &TerminatorKind) {
         if let TerminatorKind::SwitchInt { targets, .. } = kind {
             let (values, targets) = (targets.values.len(), targets.targets.len());
-            self.is(targets == values + 1, || format!("a switch of {values} values and {targets} targets"));
+            self.is(targets == values + 1, || {
+                format!("a switch of {values} values and {targets} targets")
+            });
         }
         if let TerminatorKind::ComptimeFor { binder, .. } = *kind {
             self.binder(binder);
@@ -860,7 +926,8 @@ fn damaged_words_are_errors_never_panics() {
             let damaged = Aligned::copy_from(&damaged);
             let (result, used) = measure(|| {
                 catch_unwind(AssertUnwindSafe(|| {
-                    read(&db, &damaged, locations).map(|body| out_of_range(&db, &body, locations.store))
+                    read(&db, &damaged, locations)
+                        .map(|body| out_of_range(&db, &body, locations.store))
                 }))
             });
             // A damaged length or index is refused before it sizes anything: what a read
@@ -873,7 +940,9 @@ fn damaged_words_are_errors_never_panics() {
             match result {
                 Ok(Ok(None)) => {}
                 Ok(Ok(Some(why))) => {
-                    panic!("the body with byte {at} xor {flip:#x} read as a body past its tables: {why}")
+                    panic!(
+                        "the body with byte {at} xor {flip:#x} read as a body past its tables: {why}"
+                    )
                 }
                 Ok(Err(_)) => errors += 1,
                 Err(_) => panic!("reading the body with byte {at} xor {flip:#x} panicked"),
@@ -916,14 +985,21 @@ fn a_binding_past_the_store_is_refused_before_it_sizes_the_map() {
         let (result, used) = measure(|| read(&db, &damaged, locations).map(drop));
         match result {
             Err(FormatError::Bound { at: byte, what, found, bound }) => {
-                assert_eq!(what, "a binding mapped to a local, below the body's store's binding count");
+                assert_eq!(
+                    what,
+                    "a binding mapped to a local, below the body's store's binding count"
+                );
                 assert_eq!((found, bound), (u64::from(binding), bindings));
                 // The error names the byte its word starts at in the buffer.
                 assert_eq!(byte, at as u64, "binding {binding:#x}'s error is at its word's byte");
             }
             other => panic!("binding {binding:#x} of a store of {bindings} read as {other:?}"),
         }
-        assert!(used.largest <= DAMAGED_READ_LARGEST, "binding {binding:#x} made an allocation of {} bytes", used.largest);
+        assert!(
+            used.largest <= DAMAGED_READ_LARGEST,
+            "binding {binding:#x} made an allocation of {} bytes",
+            used.largest
+        );
     }
 }
 
@@ -957,19 +1033,38 @@ fn a_store_id_past_the_store_is_refused() {
     let db = db();
     let it = items(&db);
     let store = locations(&db).store;
-    let (exprs, pats, bindings) = (store.expr_count() as u32, store.pat_count() as u32, store.bindings().count() as u32);
+    let (exprs, pats, bindings) =
+        (store.expr_count() as u32, store.pat_count() as u32, store.bindings().count() as u32);
     type Damage = Box<dyn Fn(&mut MirBody<'_>)>;
     let first_statement = |span: MirSpan| -> Damage {
         Box::new(move |body: &mut MirBody<'_>| body.basic_blocks[idx(0)].statements[0].span = span)
     };
     let captured = |base: PlaceBase| -> Damage {
-        Box::new(move |body: &mut MirBody<'_>| body.upvar_locals.get_mut(&idx(2)).unwrap()[0].1.base = base)
+        Box::new(move |body: &mut MirBody<'_>| {
+            body.upvar_locals.get_mut(&idx(2)).unwrap()[0].1.base = base
+        })
     };
     let cases: Vec<(Damage, &str, u32)> = vec![
-        (first_statement(MirSpan::ExprId(idx(exprs))), "a span's expression, below the store's expression count", exprs),
-        (first_statement(MirSpan::ExprEnd(idx(exprs))), "a span's expression end, below the store's expression count", exprs),
-        (first_statement(MirSpan::PatId(idx(pats))), "a span's pattern, below the store's pattern count", pats),
-        (first_statement(MirSpan::BindingId(idx(bindings))), "a span's binding, below the store's binding count", bindings),
+        (
+            first_statement(MirSpan::ExprId(idx(exprs))),
+            "a span's expression, below the store's expression count",
+            exprs,
+        ),
+        (
+            first_statement(MirSpan::ExprEnd(idx(exprs))),
+            "a span's expression end, below the store's expression count",
+            exprs,
+        ),
+        (
+            first_statement(MirSpan::PatId(idx(pats))),
+            "a span's pattern, below the store's pattern count",
+            pats,
+        ),
+        (
+            first_statement(MirSpan::BindingId(idx(bindings))),
+            "a span's binding, below the store's binding count",
+            bindings,
+        ),
         (
             Box::new(move |body: &mut MirBody<'_>| body.promoted_locals[0].1 = idx(exprs)),
             "a promoted local's expression, below the store's expression count",
@@ -981,11 +1076,17 @@ fn a_store_id_past_the_store_is_refused() {
             bindings,
         ),
         (
-            Box::new(move |body: &mut MirBody<'_>| drop(body.upvar_locals.insert(idx(bindings), Vec::new()))),
+            Box::new(move |body: &mut MirBody<'_>| {
+                drop(body.upvar_locals.insert(idx(bindings), Vec::new()))
+            }),
             "a captured binding, below the store's binding count",
             bindings,
         ),
-        (captured(PlaceBase::Local(idx(bindings))), "a captured place's binding, below the store's binding count", bindings),
+        (
+            captured(PlaceBase::Local(idx(bindings))),
+            "a captured place's binding, below the store's binding count",
+            bindings,
+        ),
         (
             captured(PlaceBase::Upvar { closure: idx(exprs), var_id: idx(0) }),
             "a captured upvar's closure, below the store's expression count",
@@ -1010,7 +1111,9 @@ fn union_aggregate<'b>(body: &'b mut MirBody<'_>) -> &'b mut FieldId {
         .statements
         .iter_mut()
         .find_map(|it| match &mut it.kind {
-            StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Union(_, field), _)) => Some(field),
+            StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Union(_, field), _)) => {
+                Some(field)
+            }
             _ => None,
         })
         .expect("the sample has a union aggregate")
@@ -1067,7 +1170,9 @@ fn a_body_with_inlined_code_is_refused_on_write() {
         ),
         (
             Box::new(|body: &mut MirBody<'_>| {
-                body.inlined.scopes.push(InlinedScope { callee: 0, call_site: MirSpan::ExprId(idx(1)) })
+                body.inlined
+                    .scopes
+                    .push(InlinedScope { callee: 0, call_site: MirSpan::ExprId(idx(1)) })
             }),
             "a body with inlined scopes, which only optimized MIR has",
         ),
@@ -1094,7 +1199,9 @@ fn a_body_with_inlined_code_is_refused_on_write() {
             "a body with devirtualized calls, which only optimized MIR has",
         ),
         (
-            Box::new(|body: &mut MirBody<'_>| body.basic_blocks[idx(0)].statements[0].span = MirSpan::Inlined(0)),
+            Box::new(|body: &mut MirBody<'_>| {
+                body.basic_blocks[idx(0)].statements[0].span = MirSpan::Inlined(0)
+            }),
             "an inlined span, which only optimized MIR has",
         ),
     ];
@@ -1125,7 +1232,9 @@ fn an_inlined_span_is_refused_on_read() {
         .step_by(4)
         .filter(|&at| bytes[at..at + 4] == MARKER.to_le_bytes())
         .collect(); // alloc: a test's list
-    let [at] = found[..] else { panic!("the marker expression is in {} words, not one", found.len()) };
+    let [at] = found[..] else {
+        panic!("the marker expression is in {} words, not one", found.len())
+    };
     assert_eq!(bytes[at - 4..at], 0u32.to_le_bytes(), "the marker's tag is an expression's");
     bytes[at - 4..at].copy_from_slice(&6u32.to_le_bytes());
     match read_back(&db, &bytes) {
@@ -1146,18 +1255,16 @@ fn a_switch_whose_targets_are_not_one_more_than_its_values_is_refused() {
     let it = items(&db);
     for count in [0, 3, 5] {
         let mut body = sample(&db, &it);
-        let switch = body
-            .basic_blocks
-            .values_mut()
-            .find_map(|block| match &mut block.terminator {
-                Some(Terminator { kind: TerminatorKind::SwitchInt { targets, .. }, .. })
-                    if targets.values.len() == 3 =>
-                {
-                    Some(targets)
-                }
-                _ => None,
-            })
-            .expect("the sample has a switch of three values");
+        let switch =
+            body.basic_blocks
+                .values_mut()
+                .find_map(|block| match &mut block.terminator {
+                    Some(Terminator {
+                        kind: TerminatorKind::SwitchInt { targets, .. }, ..
+                    }) if targets.values.len() == 3 => Some(targets),
+                    _ => None,
+                })
+                .expect("the sample has a switch of three values");
         switch.targets.resize(count, idx(1));
         refused_past(&db, &body, "a switch's targets, one more than its values", count as u64, 4);
     }
@@ -1172,17 +1279,31 @@ fn a_binder_past_the_universes_is_refused() {
     let past = rustc_type_ir::UniverseIndex::MAX_AS_U32 + 1;
     let mut body = sample(&db, &it);
     for block in body.basic_blocks.values_mut() {
-        if let Some(Terminator { kind: TerminatorKind::ComptimeFor { binder, .. }, .. }) = &mut block.terminator {
+        if let Some(Terminator { kind: TerminatorKind::ComptimeFor { binder, .. }, .. }) =
+            &mut block.terminator
+        {
             *binder = ComptimeBinder(past);
         }
     }
-    refused_past(&db, &body, "a `for const` loop's binder, below the universe count", past.into(), past.into());
+    refused_past(
+        &db,
+        &body,
+        "a `for const` loop's binder, below the universe count",
+        past.into(),
+        past.into(),
+    );
 
     let mut body = sample(&db, &it);
     let index = idx(6);
     let reflected = place(index, &[ProjectionElem::ReflectedField(ComptimeBinder(past))]);
     body.basic_blocks[idx(0)].statements[0].kind = StatementKind::FakeRead(reflected);
-    refused_past(&db, &body, "a reflected field's binder, below the universe count", past.into(), past.into());
+    refused_past(
+        &db,
+        &body,
+        "a reflected field's binder, below the universe count",
+        past.into(),
+        past.into(),
+    );
 }
 
 /// An `asm!` template's operand past the block's operands is refused.
@@ -1200,7 +1321,9 @@ fn an_asm_operand_past_the_blocks_operands_is_refused() {
         })
         .expect("the sample has an `asm!` block");
     let operands = asm.operands.len();
-    let Some(AsmPiece::Operand { index, .. }) = asm.template.get_mut(2) else { panic!("piece 2 is an operand") };
+    let Some(AsmPiece::Operand { index, .. }) = asm.template.get_mut(2) else {
+        panic!("piece 2 is an operand")
+    };
     *index = operands;
     let what = "an `asm!` template's operand, below the block's operand count";
     refused_past(&db, &body, what, operands as u64, operands as u64);
@@ -1253,7 +1376,9 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         blocks += block.statements.iter().map(|it| operand_lists(&it.kind)).sum::<u64>();
         if let Some(Terminator { kind, .. }) = &block.terminator {
             blocks += match kind {
-                TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => vec(args),
+                TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => {
+                    vec(args)
+                }
                 TerminatorKind::SwitchInt { targets, .. } => {
                     u64::from(targets.values.spilled()) + u64::from(targets.targets.spilled())
                 }
@@ -1265,8 +1390,16 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
     for places in body.upvar_locals.values() {
         blocks += vec(places) + places.iter().map(|(_, it)| vec(&it.projections)).sum::<u64>();
     }
-    let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: _ } =
-        &body.inlined;
+    let Inlined {
+        callees,
+        scopes,
+        spans,
+        bindings,
+        promoted,
+        devirtualized,
+        specialized,
+        moved_to_frame: _,
+    } = &body.inlined;
     blocks += vec(&body.param_locals)
         + vec(&body.promoted_locals)
         + vec(&body.closures)
@@ -1357,8 +1490,14 @@ fn a_callee_is_read_off_its_operand_as_each_old_copy_read_it() {
         Operand::from_fn(&db, it.callee, empty),
         Operand::from_fn(&db, it.callee, args),
         Operand::const_zst(ctor),
-        Operand { kind: OperandKind::Constant { konst: three.store(), ty: callee.store() }, span: None },
-        Operand { kind: OperandKind::Constant { konst: three.store(), ty: types.u8.store() }, span: None },
+        Operand {
+            kind: OperandKind::Constant { konst: three.store(), ty: callee.store() },
+            span: None,
+        },
+        Operand {
+            kind: OperandKind::Constant { konst: three.store(), ty: types.u8.store() },
+            span: None,
+        },
         Operand::from_bytes(Box::new([1, 0, 0, 0]), types.u32),
         Operand { kind: OperandKind::Static(it.st), span: None },
         copy(LocalId::from_raw(la_arena::RawIdx::from(1))),

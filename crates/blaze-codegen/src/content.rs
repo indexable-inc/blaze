@@ -4,7 +4,9 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{Arch, CompiledFunction, Covered, Data, Line, Profiled, RelocKind, Relocs, Target, Unwind};
+use crate::{
+    Arch, CompiledFunction, Covered, Data, Line, Profiled, RelocKind, Relocs, Target, Unwind,
+};
 
 pub const DATA_DOMAIN: &str = "blaze v2 data 3";
 pub const CODE_DOMAIN: &str = "blaze v2 code 4";
@@ -30,7 +32,13 @@ impl Data {
     /// code writes each call (`promoted_slot` in hir-ty-codegen). One object whatever another
     /// owner's holds, so two owners' equal bytes are two addresses, and another object once its
     /// bytes change.
-    pub fn owned(owner: &ContentId, index: u32, align: u32, bytes: Vec<u8>, relocs: Relocs) -> Data {
+    pub fn owned(
+        owner: &ContentId,
+        index: u32,
+        align: u32,
+        bytes: Vec<u8>,
+        relocs: Relocs,
+    ) -> Data {
         let mut hasher = Hasher::new(OWNED_DATA_DOMAIN);
         hasher.id(owner).update(&index.to_le_bytes()).id(&data_id(align, &bytes, &relocs));
         Data { id: hasher.finish(), align, bytes, relocs, writable: true }
@@ -52,7 +60,15 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
     }
     match &function.unwind {
         None => hasher.update(&[0]),
-        Some(Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
+        Some(Unwind::Dwarf {
+            code_align,
+            data_align,
+            return_address,
+            cie,
+            fde,
+            personality,
+            lsda,
+        }) => {
             hasher.update(&[1]).update(&code_align.to_le_bytes()).update(&data_align.to_le_bytes());
             hasher.update(&return_address.to_le_bytes()).part(cie).part(fde);
             optional_target_into(&mut hasher, personality.as_ref());
@@ -127,7 +143,11 @@ pub(crate) fn lines_into(hasher: &mut Hasher, lines: &[Line]) {
 
 /// A table as it is kept: its rows, each distinct target once, its wide addends. A table has
 /// one form for what it holds, so this is a function of its relocations.
-pub(crate) fn relocs_into<T>(hasher: &mut Hasher, relocs: &Relocs<T>, mut target_into: impl FnMut(&mut Hasher, &T)) {
+pub(crate) fn relocs_into<T>(
+    hasher: &mut Hasher,
+    relocs: &Relocs<T>,
+    mut target_into: impl FnMut(&mut Hasher, &T),
+) {
     hasher.update(&(relocs.len() as u64).to_le_bytes());
     // 64 rows an update: BLAKE3 runs at its streaming rate on whole kilobytes.
     let mut buffer = [0u8; 64 * 16];
@@ -330,7 +350,8 @@ mod tests {
     #[test]
     fn what_pgo_made_of_a_function_is_its_code() {
         let a = function(&[0xc3], Vec::new());
-        let record = crate::ProfileRecord { name: [3; 16], name_ref: 5, hash: 7, counters: 2, version: 10 };
+        let record =
+            crate::ProfileRecord { name: [3; 16], name_ref: 5, hash: 7, counters: 2, version: 10 };
         let profiled = |profile| CompiledFunction { profile: Some(profile), ..a.clone() };
         let counted = profiled(Profiled::Counted(record));
         let ids = [
@@ -399,8 +420,12 @@ mod tests {
         assert_ne!(target_id(&Target::Counter(a)), target_id(&Target::Function(a)));
         let add = [0x48, 0x83, 0x05, 0, 0, 0, 0, 1];
         let counting = |key: InstanceKey| {
-            let reloc =
-                Relocation { at: 3, kind: RelocKind::PcRel32, target: Target::Counter(key), addend: 4 };
+            let reloc = Relocation {
+                at: 3,
+                kind: RelocKind::PcRel32,
+                target: Target::Counter(key),
+                addend: 4,
+            };
             CompiledFunction { key, ..function(&add, vec![reloc]) }
         };
         assert_ne!(code_id(&counting(a)), code_id(&counting(b)));
@@ -480,7 +505,9 @@ mod tests {
     #[test]
     fn writable_data_is_its_statics_own() {
         let (one, two) = (ContentId([1; 32]), ContentId([2; 32]));
-        let owned = |owner: &ContentId, index, bytes: &[u8]| Data::owned(owner, index, 4, bytes.to_vec(), Relocs::new());
+        let owned = |owner: &ContentId, index, bytes: &[u8]| {
+            Data::owned(owner, index, 4, bytes.to_vec(), Relocs::new())
+        };
         let shared = Data::new(4, vec![0; 4], Relocs::new());
         assert!(owned(&one, 0, &[0; 4]).writable && !shared.writable);
         let ids = [

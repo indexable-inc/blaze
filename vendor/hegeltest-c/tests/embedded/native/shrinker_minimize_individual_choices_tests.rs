@@ -106,9 +106,7 @@ fn minimize_individual_choices_truncates_misaligned_string() {
         int_node(3),
         ChoiceNode::string(
             StringChoice {
-                intervals: IntervalSet::new(vec![(b'a' as u32, b'z' as u32)])
-                    .unwrap()
-                    .into(),
+                intervals: IntervalSet::new(vec![(b'a' as u32, b'z' as u32)]).unwrap().into(),
                 min_size: 0,
                 max_size: 16,
                 constraint: None,
@@ -226,14 +224,7 @@ fn minimize_individual_choices_truncates_misaligned_bytes() {
 
     let initial = vec![
         int_node(3),
-        ChoiceNode::bytes(
-            BytesChoice {
-                min_size: 0,
-                max_size: 16,
-            },
-            vec![1, 2, 3],
-            false,
-        ),
+        ChoiceNode::bytes(BytesChoice { min_size: 0, max_size: 16 }, vec![1, 2, 3], false),
     ];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {

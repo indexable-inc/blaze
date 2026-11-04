@@ -91,19 +91,13 @@ fn a_nested_subpattern_takes_the_widths_of_the_groups_closed_before_it() {
         panic!("{:?}", parsed.pattern);
     };
     assert_eq!(get_width(p), (0, None));
-    assert_eq!(
-        get_width_within(p, &[None, Some((2, Some(2)))]),
-        (2, Some(2))
-    );
+    assert_eq!(get_width_within(p, &[None, Some((2, Some(2)))]), (2, Some(2)));
     assert_eq!(get_width_within(p, &[None, Some((1, None))]), (1, None));
 }
 
 #[test]
 fn saturates_instead_of_overflowing() {
-    assert_eq!(
-        width("(?:(?:a{4294967294}){4294967294}){4294967294}"),
-        (u64::MAX, Some(u64::MAX))
-    );
+    assert_eq!(width("(?:(?:a{4294967294}){4294967294}){4294967294}"), (u64::MAX, Some(u64::MAX)));
 }
 
 #[test]
@@ -119,9 +113,7 @@ fn a_part_of_a_pattern_takes_the_widths_of_the_groups_anywhere_in_it() {
 
 #[test]
 fn a_reference_to_no_group_of_the_pattern_is_unbounded() {
-    let reference = SubPattern {
-        data: alloc::vec![OpCode::GroupRef(1)],
-    };
+    let reference = SubPattern { data: alloc::vec![OpCode::GroupRef(1)] };
     let empty = SubPattern { data: Vec::new() };
     assert_eq!(get_width_in(&reference, &empty), (0, None));
 }

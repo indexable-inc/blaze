@@ -7,14 +7,17 @@ use std::any::TypeId;
 
 use base_db::{Db, FileId, all_crates};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::view::Semantics;
 use hir_expand::{
     fixture::{self, Fixture},
-    proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
+    proc_macro::{
+        Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacroKind,
+    },
     tt::{DelimSpan, TopSubtree},
 };
 use intern::Symbol;
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -24,8 +27,7 @@ use crate::{
     level::CommandLine,
 };
 
-const FLAGS: &str =
-    "-A clippy::all --warn=clippy::disallowed_types --warn=clippy::disallowed_methods --warn=clippy::disallowed_macros";
+const FLAGS: &str = "-A clippy::all --warn=clippy::disallowed_types --warn=clippy::disallowed_methods --warn=clippy::disallowed_macros";
 
 /// The workspace's moves (`.clippy.toml`), as entries of the fixture's crates.
 const CLIPPY_TOML: &str = r#"
@@ -139,7 +141,8 @@ pub struct FixedState;
 pub type HashMap<K, V> = std::collections::HashMap<K, V, FixedState>;
 "#;
 
-const MAIN: &str = "//- /src/lib.rs crate:main deps:std,parking_lot,crossbeam_channel,rustc_hash,blaze_hash\n";
+const MAIN: &str =
+    "//- /src/lib.rs crate:main deps:std,parking_lot,crossbeam_channel,rustc_hash,blaze_hash\n";
 
 /// The ported items' names, and the crates the fixed file must resolve them to.
 const MOVED: [(&str, &str); 9] = [
@@ -161,7 +164,10 @@ fn setup() -> Setup {
 fn setup_of(clippy_toml: &str) -> Setup {
     let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
     let table = clippy_toml.parse().expect("the configuration reads");
-    Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf { table, ..Conf::default() } }
+    Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf { table, ..Conf::default() },
+    }
 }
 
 /// The crates of a fixture, the moves its `clippy.toml` makes and the crates the moved names
@@ -174,7 +180,8 @@ struct Ports<'a> {
     give: fn(&mut Fixture),
 }
 
-const LOCKS: Ports<'static> = Ports { crates: CRATES, main: MAIN, clippy_toml: CLIPPY_TOML, moved: &MOVED, give: |_| {} };
+const LOCKS: Ports<'static> =
+    Ports { crates: CRATES, main: MAIN, clippy_toml: CLIPPY_TOML, moved: &MOVED, give: |_| {} };
 
 /// `src/lib.rs` of `main` as the fix leaves it, after checking it is front-end clean, names
 /// what it moved by the counterparts, and lints clean again.
@@ -183,7 +190,8 @@ fn fixed(main: &str) -> Result<String, FixError> {
 }
 
 fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
-    let mut fx = fixture::db(&format!("{}{}{}", ports.crates, ports.main, main.trim_start_matches('\n')));
+    let mut fx =
+        fixture::db(&format!("{}{}{}", ports.crates, ports.main, main.trim_start_matches('\n')));
     (ports.give)(&mut fx);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
@@ -200,18 +208,30 @@ fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
     let setup = setup_of(ports.clippy_toml);
     let made = fix(&mut db, krate, &setup, &name_of)?;
     let text = db.file_text(file).text(&db).to_string();
-    assert!(made.files.iter().all(|(it, new)| *it == file && *new == text), "the fix names the file it changed");
+    assert!(
+        made.files.iter().all(|(it, new)| *it == file && *new == text),
+        "the fix names the file it changed"
+    );
     blaze_query::db::attach(&db, || {
         let mut acc = Vec::new();
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);
         }
-        let errors: Vec<String> = acc.iter().map(|it| format!("{it:?}")).filter(|it| !it.starts_with("InactiveCode")).collect();
+        let errors: Vec<String> = acc
+            .iter()
+            .map(|it| format!("{it:?}"))
+            .filter(|it| !it.starts_with("InactiveCode"))
+            .collect();
         assert!(errors.is_empty(), "the fixed file is front-end clean:\n{text}\n{errors:#?}");
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<(&str, Vec<&str>)> = found
             .iter()
-            .map(|it| (it.diagnostic.message.as_str(), it.diagnostic.children.iter().map(|it| it.message.as_str()).collect()))
+            .map(|it| {
+                (
+                    it.diagnostic.message.as_str(),
+                    it.diagnostic.children.iter().map(|it| it.message.as_str()).collect(),
+                )
+            })
             .collect();
         assert!(left.is_empty(), "the fixed file lints clean:\n{text}\n{left:#?}");
         let sema = Semantics::new(&db);
@@ -219,10 +239,21 @@ fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
         let root = sema.parse(editioned).syntax();
         for path in root.descendants().filter_map(ast::Path::cast) {
             let Some(name) = path.segment().and_then(|it| it.name_ref()) else { continue };
-            let Some(&(_, want)) = ports.moved.iter().find(|(it, _)| *it == name.text()) else { continue };
+            let Some(&(_, want)) = ports.moved.iter().find(|(it, _)| *it == name.text()) else {
+                continue;
+            };
             let [ty, value, mac] = blaze_intent::retarget::names_in(&sema, path);
-            let krate = mac.or(ty).or(value).and_then(|it| it.module(&db)).and_then(|it| it.krate(&db).display_name(&db));
-            assert_eq!(krate.map(|it| it.to_string()).as_deref(), Some(want), "`{}` in:\n{text}", path.syntax().text());
+            let krate = mac
+                .or(ty)
+                .or(value)
+                .and_then(|it| it.module(&db))
+                .and_then(|it| it.krate(&db).display_name(&db));
+            assert_eq!(
+                krate.map(|it| it.to_string()).as_deref(),
+                Some(want),
+                "`{}` in:\n{text}",
+                path.syntax().text()
+            );
         }
     });
     Ok(text)
@@ -437,13 +468,18 @@ pub fn f(m: &Mutex<u8>) -> bool {
             .expect("the fixture has `main`")
     });
     let file = file.file_id(&db);
-    let names: HashMap<FileId, String, Global> = [(file, "src/lib.rs".to_owned())].into_iter().collect();
+    let names: HashMap<FileId, String, Global> =
+        [(file, "src/lib.rs".to_owned())].into_iter().collect();
     let name_of = |file: FileId| names.get(&file).cloned();
     let error = fix(&mut db, krate, &setup(), &name_of).unwrap_err();
     let FixError::Broke { at, by, .. } = &error else { panic!("{error}") };
     assert_eq!(at, "src/lib.rs:3", "{error}");
     assert!(!by.is_empty(), "{error}");
-    assert_eq!(db.file_text(file).text(&db).as_str(), main.trim_start_matches('\n'), "the text is as it was");
+    assert_eq!(
+        db.file_text(file).text(&db).as_str(),
+        main.trim_start_matches('\n'),
+        "the text is as it was"
+    );
 }
 
 /// serde's derives moved to blaze's (`.clippy.toml`'s `disallowed-macros`).
@@ -511,7 +547,8 @@ impl ProcMacroExpander for Nothing {
         Ok(Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -522,7 +559,12 @@ pub(crate) fn give_derives(built: &mut Fixture) {
         let db = built.db();
         let krate = *all_crates(db)
             .iter()
-            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .find(|it| {
+                it.extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == name)
+            })
             .expect("the fixture has the derive crate");
         let macros = ["Serialize", "Deserialize"]
             .map(|it| ProcMacro {

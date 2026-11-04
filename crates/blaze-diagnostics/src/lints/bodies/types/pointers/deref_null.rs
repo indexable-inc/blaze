@@ -6,7 +6,6 @@
 //! `compiler/rustc_lint/src/lints.rs` (`BuiltinDerefNullptr`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_def::hir::{
     Expr, ExprId, UnaryOp,
     type_ref::{Rawness, TypeRef},
@@ -14,6 +13,7 @@ use hir_def::hir::{
 use hir_ty::next_solver::TyKind;
 use intern::sym;
 use rustc_type_ir::inherent::IntoKind as _;
+use std::alloc::Global;
 
 use super::{is_zero, layout, span};
 use crate::{
@@ -47,7 +47,8 @@ impl LatePass for DerefNullPtr {
                 if is_null_ptr(b, pointer) && !self.raw_borrowed.contains(&expr) {
                     let (Some(span), Some(at)) = (span(b, expr), b.expr_node(expr)) else { return };
                     // clone: a lint's span, for a lint found
-                    let mut diag = Diag::lint("deref_nullptr", "dereferencing a null pointer", span.clone());
+                    let mut diag =
+                        Diag::lint("deref_nullptr", "dereferencing a null pointer", span.clone());
                     diag.span_label(span, "this code causes undefined behavior when executed");
                     out.push(b.lint(diag, Phase::Late, at));
                 }
@@ -66,11 +67,11 @@ fn is_null_ptr(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     }
     match b.store().expr(expr) {
         Expr::Cast { expr: inner, type_ref } => {
-            matches!(b.store().type_ref(type_ref), TypeRef::RawPtr(..)) && (is_zero(b, inner) || is_null_ptr(b, inner))
+            matches!(b.store().type_ref(type_ref), TypeRef::RawPtr(..))
+                && (is_zero(b, inner) || is_null_ptr(b, inner))
         }
-        Expr::Call { callee, .. } => {
-            super::callee_item(b, callee).is_some_and(|it| it == sym::ptr_null || it == sym::ptr_null_mut)
-        }
+        Expr::Call { callee, .. } => super::callee_item(b, callee)
+            .is_some_and(|it| it == sym::ptr_null || it == sym::ptr_null_mut),
         _ => false,
     }
 }

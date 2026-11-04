@@ -8,16 +8,15 @@
 use std::marker::PhantomData;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use rustc_index::Idx;
 use rustc_type_ir::InferTy::{self, FloatVar, IntVar, TyVar};
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, DebruijnIndex, Flags, InferConst, PredicateProxy, RegionKind,
-    TyVid, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
-    UniverseIndex,
+    TyVid, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use tracing::debug;
 
 use crate::next_solver::{
@@ -520,7 +519,7 @@ impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
             value: (),
         };
         Canonicalizer::<'_, '_, M>::canonicalize_with_base(base, value, infcx, tcx, query_state)
-        .unchecked_map(|((), val)| val)
+            .unchecked_map(|((), val)| val)
     }
 
     fn canonicalize_with_base<U, V>(

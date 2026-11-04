@@ -745,14 +745,7 @@ fn main() {
 "#;
     assert_reports(
         &ui("E0452.rs", "2015", source),
-        &[
-            error(1, &[]),
-            error(1, &[]),
-            error(1, &[]),
-            error(1, &[]),
-            error(1, &[]),
-            error(1, &[]),
-        ],
+        &[error(1, &[]), error(1, &[]), error(1, &[]), error(1, &[]), error(1, &[]), error(1, &[])],
     );
 }
 
@@ -882,5 +875,16 @@ struct S7;
 
 fn main() {}
 "#;
-    assert_reports(&ui_builtins("cfg_accessible-input-validation.rs", "2015", source), &[error(3, &["`cfg_accessible`"]), error(6, &["`cfg_accessible`"]), error(9, &["`cfg_accessible`"]), error(12, &["`cfg_accessible`"]), error(15, &["`cfg_accessible`"]), error(18, &["`cfg_accessible`"]), error(21, &["`cfg_accessible`"])]);
+    assert_reports(
+        &ui_builtins("cfg_accessible-input-validation.rs", "2015", source),
+        &[
+            error(3, &["`cfg_accessible`"]),
+            error(6, &["`cfg_accessible`"]),
+            error(9, &["`cfg_accessible`"]),
+            error(12, &["`cfg_accessible`"]),
+            error(15, &["`cfg_accessible`"]),
+            error(18, &["`cfg_accessible`"]),
+            error(21, &["`cfg_accessible`"]),
+        ],
+    );
 }
