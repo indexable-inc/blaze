@@ -493,8 +493,6 @@ fn writable(dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use super::*;
 
     /// A tar entry whose name and link target are written as given, with no check: what a
