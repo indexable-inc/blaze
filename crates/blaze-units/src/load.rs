@@ -15,7 +15,7 @@ mod config;
 mod files;
 mod invocation;
 mod manifest;
-mod native;
+pub(crate) mod native;
 mod plan;
 mod resolve;
 mod sandbox;
@@ -110,10 +110,8 @@ pub(crate) struct Spec {
     /// `--locked`, `--frozen`, `--no-locked` and whether the build runs on CI: with the
     /// workspace's `lock = "required"`, whether a lock file may change ([`crate::lock::policy`]).
     pub lock: crate::lock::LockAsk,
-    /// The release of the blaze that serves the build, when `blaze.lock` may record it: a
-    /// release (not a build of the tree), and no `--ignore-pin` for this workspace (checked
-    /// against the root manifest with [`Spec::ignore_pin_for`]). None for a foreign workspace,
-    /// which has no `blaze.lock`.
+    /// The release of the blaze that serves the build ([`crate::lock::Inputs::running`]); none
+    /// for a build of the tree, and for a foreign workspace, which has no `blaze.lock`.
     pub blaze: Option<String>,
     /// `BLAZE_IGNORE_PIN_FOR`, the root manifest `--ignore-pin` was given for.
     pub ignore_pin_for: Option<String>,
@@ -229,7 +227,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         all_features: asked.all_features,
         no_default_features: asked.no_default_features,
         lock: asked.lock_ask(),
-        blaze: crate::lock::is_release(&asked.blaze).then(|| asked.blaze.clone()),
+        blaze: crate::lock::is_version(&asked.blaze).then(|| asked.blaze.clone()),
         ignore_pin_for: asked.ignore_pin_for.clone(),
         offline: asked.offline_flag(false),
         require_optional_deps: true,
@@ -278,7 +276,7 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         all_features: false,
         no_default_features: true,
         // The standard library's own lock file, never written: no `CI`, no `blaze.lock`.
-        lock: crate::lock::LockAsk { flag: ask.locked.then_some("--locked"), no_locked: false, ci: false },
+        lock: crate::lock::LockAsk { flag: ask.locked.then_some("--locked"), no_locked: false, ci: false, env_writes: false },
         blaze: None,
         ignore_pin_for: None,
         offline: Some("--offline"),

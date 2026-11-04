@@ -7,7 +7,6 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -608,25 +607,10 @@ pub fn serialize_resolve(resolve: &Resolve, orig: Option<&str>) -> String {
     out
 }
 
-/// `--locked` or `--frozen`: the lock file may not change.
-#[derive(Clone, Copy)]
-pub struct Locked<'a> {
-    /// The flag as the user wrote it, `--locked` or `--frozen`.
-    pub flag: &'a str,
-    /// Where the lock file is, for the error.
-    pub path: &'a Path,
-    /// The workspace's path packages, to read both lock files back.
-    pub path_deps: &'a PathDeps,
-}
-
-/// The same lock file: the same lines, or under [`Locked`] the same resolve read back from
-/// both, so a lock file differing only in its encoding or its spacing is left alone.
-pub fn are_equal_lockfiles(orig: &str, current: &str, locked: Option<Locked<'_>>) -> bool {
-    are_equal_lockfiles_with(orig, current, locked.map(|it| it.path_deps))
-}
-
-/// [`are_equal_lockfiles`] by the workspace's path packages alone.
-fn are_equal_lockfiles_with(orig: &str, current: &str, path_deps: Option<&PathDeps>) -> bool {
+/// The same lock file: the same lines, or with `path_deps` (the workspace's path packages, as
+/// `--locked` compares) the same resolve read back from both, so a lock file differing only in
+/// its encoding or its spacing is left alone.
+pub fn are_equal_lockfiles(orig: &str, current: &str, path_deps: Option<&PathDeps>) -> bool {
     if orig.lines().eq(current.lines()) {
         return true;
     }
@@ -637,29 +621,6 @@ fn are_equal_lockfiles_with(orig: &str, current: &str, path_deps: Option<&PathDe
         Ok(old == new)
     };
     matches!(same(), Ok(true))
-}
-
-/// What cargo writes to `Cargo.lock` after a resolve: `None` when the lock file there
-/// (`orig`) is already the same, and otherwise the text, raised to the encoding a new lock
-/// file of the workspace would have (from its lowest `rust-version`) if it was older. A lock
-/// file left as it was keeps its encoding. Under [`Locked`] a change is an error.
-pub fn lockfile_to_write(
-    resolve: &mut Resolve,
-    orig: Option<&str>,
-    lowest_rust_version: Option<&RustVersion>,
-    locked: Option<Locked<'_>>,
-) -> Result<Option<String>> {
-    let out = lockfile_change(resolve, orig, lowest_rust_version, locked.map(|it| it.path_deps));
-    if let (Some(_), Some(locked)) = (&out, locked) {
-        let action = if orig.is_some() { "update" } else { "create" };
-        let (path, flag) = (locked.path.display(), locked.flag);
-        bail!(
-            "cannot {action} the lock file {path} because {flag} was passed to prevent this\n\
-             help: to generate the lock file without accessing the network, \
-             remove the {flag} flag and use --offline instead."
-        );
-    }
-    Ok(out)
 }
 
 /// What a resolve changes of `Cargo.lock` (`orig`, the lock file there): `None` when it is
@@ -677,7 +638,7 @@ pub fn lockfile_change(
 ) -> Option<String> {
     let mut out = serialize_resolve(resolve, orig);
     if let Some(orig) = orig
-        && are_equal_lockfiles_with(orig, &out, same_resolve)
+        && are_equal_lockfiles(orig, &out, same_resolve)
     {
         return None;
     }

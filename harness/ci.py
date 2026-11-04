@@ -334,7 +334,8 @@ def run_one(args, env):
     logs under /tmp then)."""
     # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
     home = tempfile.mkdtemp(prefix="rj-ci-", dir="/tmp" if SYSTEM != "windows" else None)
-    own = {"BLAZE_HOME": home}
+    # BLAZE_LOCK: the harnesses make throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    own = {"BLAZE_HOME": home, "BLAZE_LOCK": "write"}
     status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}, check=False).returncode
     # A daemon the harness left running in that home, which nothing after it may talk to.
     blaze_cli = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "blaze")

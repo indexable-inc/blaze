@@ -11,14 +11,20 @@
 //! - [`decide`]: the policy applied to those changes: nothing to do, the files to write with
 //!   what to say, or the refusal.
 //!
-//! Nothing here reads a file or a clock: the load hands in what it read.
+//! - [`after_resolve`]: all of it for one resolve, the one place a command's lock files are
+//!   decided (a build's load, blaze-metadata's commands).
+//!
+//! Nothing here reads a clock, and files only through the [`Files`] it is handed.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use blaze_resolve::{PackageId, Resolve};
+use blaze_manifest::Workspace;
+use blaze_manifest::files::Files;
+use blaze_resolve::lockfile::{self, PathDeps};
+use blaze_resolve::{PackageId, Resolve, RustVersion};
 
-use crate::query::{LockFile, LockWrite};
+use crate::query::{LoadError, LockFile, LockWrite};
 
 /// Where `blaze.lock` is: beside `Cargo.lock`, at the workspace's root.
 pub const BLAZE_LOCK: &str = "blaze.lock";
@@ -31,9 +37,11 @@ pub fn toolchain() -> &'static str {
     TOOLCHAIN.trim()
 }
 
-/// Whether `version` is a release's (`0.YYYYMMDD.N`), as a pin names one; a build of the tree
-/// (`0.0.0-dev`) is not. The launcher's rule is `blaze-engine`'s `pin::is_version`.
-pub fn is_release(version: &str) -> bool {
+/// Whether `version` is a release's version, `0.YYYYMMDD.N`: `0`, a date of eight digits and a
+/// number, so that it names a directory and an asset and nothing else, and its date is always
+/// there to read. A build of the tree (`0.0.0-dev`) is none. The one rule for it: the launcher's
+/// pin (blaze-engine's `pin.rs`) and `blaze.lock` both ask it.
+pub fn is_version(version: &str) -> bool {
     let digits = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit());
     let mut parts = version.split('.');
     let (Some("0"), Some(date), Some(n), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
@@ -59,6 +67,25 @@ pub struct LockAsk {
     pub no_locked: bool,
     /// The build runs on CI ([`ci_says`]).
     pub ci: bool,
+    /// `BLAZE_LOCK=write` ([`LOCK_ENV`]): the environment says every build under it may write
+    /// its lock files, as `--no-locked` would, except that a typed `--locked` or `--frozen`
+    /// wins. A harness that makes throwaway workspaces with no lock says so once, where it
+    /// starts its children, instead of passing `--no-locked` to each command.
+    pub env_writes: bool,
+}
+
+/// The variable a harness sets to `write` so the builds under it may write their lock files
+/// ([`LockAsk::env_writes`]).
+pub const LOCK_ENV: &str = "BLAZE_LOCK";
+
+/// What `BLAZE_LOCK` says: unset or empty is nothing, `write` lets builds write their lock
+/// files, and anything else is an error naming the variable and its one value.
+pub fn env_writes(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("write") => Ok(true),
+        Some(other) => Err(format!("{LOCK_ENV}={other:?}: the one value it takes is `write` (docs/cargo.md, \"Lock files\")")),
+    }
 }
 
 /// Why a build may not change its lock files.
@@ -95,19 +122,20 @@ pub enum Policy {
 /// The decision table (docs/cargo.md, "Lock files"), `required` being the workspace's
 /// `lock = "required"`:
 ///
-/// | `--locked`/`--frozen` | `--no-locked` | CI  | required | policy                 |
-/// |-----------------------|---------------|-----|----------|------------------------|
-/// | yes                   | yes           | any | any      | error: opposite flags  |
-/// | yes                   | no            | any | any      | refuse (the flag)      |
-/// | no                    | yes           | any | any      | write                  |
-/// | no                    | no            | yes | any      | refuse (CI)            |
-/// | no                    | no            | no  | yes      | refuse (required)      |
-/// | no                    | no            | no  | no       | write                  |
+/// | `--locked`/`--frozen` | `--no-locked` or `BLAZE_LOCK=write` | CI  | required | policy                |
+/// |-----------------------|-------------------------------------|-----|----------|-----------------------|
+/// | yes                   | `--no-locked`                       | any | any      | error: opposite flags |
+/// | yes                   | `BLAZE_LOCK=write` or neither       | any | any      | refuse (the flag)     |
+/// | no                    | either                              | any | any      | write                 |
+/// | no                    | neither                             | yes | any      | refuse (CI)           |
+/// | no                    | neither                             | no  | yes      | refuse (required)     |
+/// | no                    | neither                             | no  | no       | write                 |
 pub fn policy(ask: LockAsk, required: bool) -> Result<Policy, String> {
     match (ask.flag, ask.no_locked) {
         (Some(flag), true) => Err(format!("{flag} and --no-locked say opposite things of the lock files: pass one of them")),
         (Some(flag), false) => Ok(Policy::Refuse(Refusal::Flag(flag))),
         (None, true) => Ok(Policy::Write),
+        (None, false) if ask.env_writes => Ok(Policy::Write),
         (None, false) if ask.ci => Ok(Policy::Refuse(Refusal::Ci)),
         (None, false) if required => Ok(Policy::Refuse(Refusal::Required)),
         (None, false) => Ok(Policy::Write),
@@ -611,6 +639,158 @@ pub fn decide(policy: Policy, manifest: &str, changes: &[Change], summary: &Summ
     }
 }
 
+/// What, besides the resolve, decides a workspace's lock files.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Inputs<'a> {
+    /// The command line and the environment ([`policy`]).
+    pub ask: LockAsk,
+    /// The release of the blaze that runs ([`is_version`]); none for a build of the tree.
+    pub running: Option<&'a str>,
+    /// `BLAZE_IGNORE_PIN_FOR`: the root manifest `--ignore-pin` was given for, where the blaze
+    /// that runs is not the one the workspace pins.
+    pub ignore_pin_for: Option<&'a str>,
+    /// A workspace of blaze's own (the standard library's): no `blaze.lock`, and no
+    /// `lock = "required"` read.
+    pub foreign: bool,
+}
+
+/// The lock files of workspace `ws` after its resolve `whole` (`old` and `old_text`: the
+/// `Cargo.lock` there, read and as text), as the policy lets this command leave them: `Ok(None)`
+/// when neither changes, the files to write with what to say, or the refusal naming every move.
+/// The one place a resolve's lock files are decided: a build's load (the daemon's) and
+/// blaze-metadata's commands both ask it. `Cargo.lock` is cargo's, minimal as cargo's resolve
+/// keeps it (every package the lock file pins that the manifests still allow stays); `blaze.lock`
+/// pins the rest ([`BlazeLock`]). Reads only through `files`, and no clock.
+#[allow(clippy::too_many_arguments)] // the resolve's parts the lock files are made of, each once
+pub fn after_resolve<F: Files>(
+    files: &F,
+    ws: &Workspace<'_, F>,
+    inputs: Inputs<'_>,
+    whole: &mut Resolve,
+    old: Option<&Resolve>,
+    old_text: Option<&str>,
+    lowest_rust_version: Option<&RustVersion>,
+    path_deps: &PathDeps,
+) -> Result<Option<LockWrite>, LoadError> {
+    let root = ws.root();
+    let manifest = ws.root_manifest().display().to_string();
+    let metadata = ws.custom_metadata();
+    let required = match inputs.foreign {
+        true => false,
+        false => required(metadata, &manifest).map_err(|what| LoadError { what, at: Some(manifest.clone()) })?,
+    };
+    let policy = policy(inputs.ask, required).map_err(|what| LoadError { what, at: None })?;
+    // Refused, a lock file that reads back to the same resolve is the same (cargo's `--locked`);
+    // written, one whose lines differ is written again.
+    let refusing = matches!(policy, Policy::Refuse(_));
+    let cargo_path = root.join(lockfile::LOCKFILE_NAME);
+    let text = lockfile::lockfile_change(whole, old_text, lowest_rust_version, refusing.then_some(path_deps));
+    let moved = match text.is_some() {
+        true => moves(old, whole),
+        false => Vec::new(),
+    };
+    let cargo = Change {
+        name: lockfile::LOCKFILE_NAME,
+        path: cargo_path.display().to_string(),
+        existed: old_text.is_some(),
+        text,
+        moves: moved,
+    };
+    let mut changes = vec![cargo]; // alloc: the two lock files, once per resolve
+    let mut pins = BlazeLock::default();
+    if !inputs.foreign {
+        let path = root.join(BLAZE_LOCK);
+        let shown = path.display().to_string();
+        let old_text = match files.read(&path) {
+            Ok(bytes) => Some(String::from_utf8(bytes.into_owned()).map_err(|error| LoadError {
+                what: format!("{shown} is not UTF-8 ({error}); `blaze lock` writes it again"),
+                at: Some(shown.clone()),
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(LoadError { what: format!("failed to read `{shown}`: {error}"), at: Some(shown) }),
+        };
+        let old_pins = match &old_text {
+            Some(text) => Some(BlazeLock::parse(text, &shown).map_err(|what| LoadError { what, at: Some(shown.clone()) })?),
+            None => None,
+        };
+        let pin = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("version")).and_then(toml::Value::as_str);
+        let old_blaze = old_pins.as_ref().and_then(|it| it.blaze.as_ref());
+        pins = BlazeLock {
+            blaze: identity(pin, inputs, &manifest, old_blaze, &shown)
+                .map_err(|what| LoadError { what, at: Some(shown.clone()) })?,
+            index: newest(whole, old_pins.as_ref()),
+            native: crate::load::native::locked_pins(files, metadata, ws.root_manifest(), root)?,
+        };
+        let same = match &old_pins {
+            Some(old) => *old == pins,
+            None => pins.is_empty(),
+        };
+        changes.push(Change {
+            name: BLAZE_LOCK,
+            path: shown,
+            existed: old_text.is_some(),
+            text: (!same).then(|| pins.render()),
+            moves: match same {
+                true => Vec::new(),
+                false => pin_moves(old_pins.as_ref(), &pins),
+            },
+        });
+    }
+    let summary = Summary { packages: whole.len(), pins: &pins };
+    match decide(policy, &manifest, &changes, &summary) {
+        Outcome::Same => Ok(None),
+        Outcome::Write(write) => Ok(Some(write)),
+        Outcome::Refused(what) => Err(LoadError { what, at: Some(cargo_path.display().to_string()) }),
+    }
+}
+
+/// Which blaze `blaze.lock` records (`[blaze]`), for a workspace whose root manifest `manifest`
+/// pins `pin` (`[workspace.metadata.blaze] version`) and whose lock recorded `old`:
+///
+/// - No pin, or a channel: nothing. The workspace runs whichever blaze it gets, so a lock that
+///   named one would change with every upgrade.
+/// - A version, run by that release (no `--ignore-pin` for this workspace): the version and the
+///   nightly it ships.
+/// - A version, run by another blaze (a build of the tree, or `--ignore-pin`): what the lock
+///   recorded when it records that version, or nothing when it records none. One that records
+///   another version disagrees with the pin, and this blaze cannot say what the pinned release
+///   ships: an error naming both and the fix, refused under any policy.
+pub fn identity(
+    pin: Option<&str>,
+    inputs: Inputs<'_>,
+    manifest: &str,
+    old: Option<&Identity>,
+    lock_path: &str,
+) -> Result<Option<Identity>, String> {
+    let Some(pin) = pin.filter(|it| is_version(it)) else { return Ok(None) };
+    let runs_pin = inputs.running == Some(pin) && inputs.ignore_pin_for != Some(manifest);
+    if runs_pin {
+        return Ok(Some(Identity { release: pin.to_owned(), toolchain: toolchain().to_owned() }));
+    }
+    match old {
+        None => Ok(None),
+        Some(old) if old.release == pin => Ok(Some(old.clone())),
+        Some(old) => {
+            let this = inputs.running.unwrap_or("a build of blaze's tree");
+            Err(format!(
+                "{lock_path} records blaze {} but {manifest} pins blaze {pin}, and the blaze that runs ({this}) is not \
+                 {pin}, so it cannot record what {pin} builds with\nfix: run `blaze lock` with blaze {pin} (the launcher \
+                 runs it where the pin is, without --ignore-pin) and commit blaze.lock",
+                old.release
+            ))
+        }
+    }
+}
+
+/// The newest publish time of any package `whole` took from a registry's index, or the lock's
+/// when that is newer: a package the lock file pinned was read from its manifest, which has
+/// none, so a resolve that took nothing new keeps what the lock says.
+fn newest(whole: &Resolve, old: Option<&BlazeLock>) -> Option<String> {
+    let picked = whole.summaries().values().filter_map(|it| it.pubtime()).max();
+    let kept = old.and_then(|it| it.index.as_deref());
+    picked.into_iter().chain(kept).max().map(str::to_owned)
+}
+
 /// "package" or "pin" by how many and of which file.
 fn plural(n: usize, file: &str) -> &'static str {
     match (file, n) {
@@ -628,8 +808,13 @@ mod tests {
     /// Every row of [`policy`]'s table, with `CI` as GitHub, Azure and people set it.
     #[test]
     fn the_decision_table() {
-        let ask = |flag, no_locked, ci| LockAsk { flag, no_locked, ci };
-        let rows: [(LockAsk, bool, Result<Policy, ()>); 10] = [
+        let ask = |flag, no_locked, ci| LockAsk { flag, no_locked, ci, env_writes: false };
+        let env = |flag, ci| LockAsk { flag, no_locked: false, ci, env_writes: true };
+        let rows: [(LockAsk, bool, Result<Policy, ()>); 14] = [
+            (env(None, true), true, Ok(Policy::Write)),
+            (env(None, false), false, Ok(Policy::Write)),
+            (env(Some("--locked"), true), false, Ok(Policy::Refuse(Refusal::Flag("--locked")))),
+            (LockAsk { env_writes: true, ..ask(Some("--frozen"), true, false) }, false, Err(())),
             (ask(Some("--locked"), true, false), false, Err(())),
             (ask(Some("--frozen"), true, true), true, Err(())),
             (ask(Some("--locked"), false, false), false, Ok(Policy::Refuse(Refusal::Flag("--locked")))),
@@ -655,11 +840,35 @@ mod tests {
         ] {
             assert_eq!(ci_says(ci, tf), says, "CI={ci:?} TF_BUILD={tf:?}");
         }
+        assert_eq!(env_writes(None), Ok(false));
+        assert_eq!(env_writes(Some("")), Ok(false));
+        assert_eq!(env_writes(Some("write")), Ok(true));
+        assert!(env_writes(Some("1")).unwrap_err().contains("BLAZE_LOCK"));
         let metadata = |text: &str| toml::Value::Table(toml::from_str::<toml::Table>(text).unwrap());
         assert_eq!(required(Some(&metadata("blaze.lock = \"required\"")), "/w/Cargo.toml"), Ok(true));
         assert_eq!(required(Some(&metadata("blaze.lock = \"write\"")), "/w/Cargo.toml"), Ok(false));
         assert_eq!(required(Some(&metadata("blaze.version = \"stable\"")), "/w/Cargo.toml"), Ok(false));
         assert!(required(Some(&metadata("blaze.lock = true")), "/w/Cargo.toml").unwrap_err().contains("/w/Cargo.toml"));
+
+        // Which blaze `blaze.lock` records: only a version pin, and only its own release says
+        // what it ships.
+        let (p, q) = ("0.20261104.0", "0.20261030.1");
+        let m = "/w/Cargo.toml";
+        let runs = |running: Option<&'static str>| Inputs { running, ..Inputs::default() };
+        let id = |release: &str| Identity { release: release.to_owned(), toolchain: toolchain().to_owned() };
+        let old_q = Identity { release: q.to_owned(), toolchain: "nightly-2026-10-01".to_owned() };
+        let at = "/w/blaze.lock";
+        for pin in [None, Some("stable"), Some("canary")] {
+            assert_eq!(identity(pin, runs(Some(p)), m, Some(&old_q), at), Ok(None), "unpinned: {pin:?}");
+        }
+        assert_eq!(identity(Some(p), runs(Some(p)), m, None, at), Ok(Some(id(p))));
+        assert_eq!(identity(Some(p), runs(Some(p)), m, Some(&old_q), at), Ok(Some(id(p))), "a pin bump is a change");
+        let ignored = Inputs { running: Some(p), ignore_pin_for: Some(m), ..Inputs::default() };
+        assert_eq!(identity(Some(p), ignored, m, None, at), Ok(None), "--ignore-pin records nothing");
+        assert_eq!(identity(Some(q), runs(None), m, Some(&old_q), at), Ok(Some(old_q.clone())), "the tree keeps it");
+        assert_eq!(identity(Some(q), runs(None), m, None, at), Ok(None));
+        let disagrees = identity(Some(p), runs(None), m, Some(&old_q), at).unwrap_err();
+        assert!(disagrees.contains(q) && disagrees.contains(p) && disagrees.contains("blaze lock"), "{disagrees}");
     }
 
     /// `blaze.lock` is persisted state: what blaze writes reads back to the same value and

@@ -80,8 +80,8 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`].
-pub const SCHEMA: u32 = 36;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`Request::Lock`].
+pub const SCHEMA: u32 = 37;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -354,6 +354,11 @@ pub enum Request {
         most_bytes: Option<u64>,
         out: Option<String>,
     },
+    /// `blaze lock`: the workspace resolved as `targets` asks and its lock files (`Cargo.lock`,
+    /// `blaze.lock`) written when they change, whatever `CI` or `lock = "required"` says
+    /// (`Targets::cargo` carries `--no-locked`); nothing checked or built, no build script run.
+    /// Answered with what it wrote as note [`Response::Diagnostic`]s, or the load's error.
+    Lock { view: ViewRef, targets: Targets },
 }
 
 /// [`Request::Rebuilt`]'s answer.

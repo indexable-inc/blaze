@@ -83,7 +83,7 @@ pub(crate) struct Version {
 
 impl Version {
     pub(crate) fn parse(text: &str) -> Option<Version> {
-        if !crate::pin::is_version(text) {
+        if !blaze_units::lock::is_version(text) {
             return None;
         }
         let mut parts = text.split('.').skip(1);

@@ -725,7 +725,8 @@ fn command_of(work: &Work) -> Command {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Pack { .. } => Command::Check,
+        | Work::Pack { .. }
+        | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
 }
@@ -746,7 +747,8 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Pack { .. }
-        | Work::Doc { .. } => Goal::Check,
+        | Work::Doc { .. }
+        | Work::Lock(_) => Goal::Check,
     }
 }
 
@@ -773,7 +775,8 @@ fn reads_front_unbuilt(work: &Work) -> bool {
         | Work::Trace(_)
         | Work::Tables
         | Work::Pack { .. }
-        | Work::Doc { .. } => false,
+        | Work::Doc { .. }
+        | Work::Lock(_) => false,
     }
 }
 
@@ -794,6 +797,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
         Work::Ahead { .. } => "ahead",
+        Work::Lock(_) => "lock",
     }
 }
 
@@ -830,7 +834,8 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
         | Work::Pack { targets, .. }
-        | Work::Doc { targets, .. } => Some(targets),
+        | Work::Doc { targets, .. }
+        | Work::Lock(targets) => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
 }
@@ -3351,6 +3356,12 @@ impl<S: Steps> Jobs<S> {
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
         }
+        // `blaze lock` stops here: its plan wrote the lock files; nothing is lowered or built. The
+        // job finishes once those writes are placed ([`Jobs::wind_up`]).
+        if self.jobs.get(key_of(id)).is_some_and(|job| matches!(job.work, Work::Lock(_))) {
+            self.end(w, id, true, None);
+            return;
+        }
         let short = match short(&prep.config.invocation.args) {
             Ok(short) => short,
             Err(why) => {
@@ -5417,6 +5428,7 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
             return Err(ApiError::new("the job's work builds its units, answering nothing on its own", None));
         }
+        Work::Lock(_) => return Err(ApiError::new("a lock job ends once its plan is made, answering nothing more", None)),
     };
     Ok(Step::of(&job.cancelled, does))
 }

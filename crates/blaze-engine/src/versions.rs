@@ -47,7 +47,7 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
 /// and `why` ("which this workspace pins"; `blaze update`'s). Every release blaze runs comes
 /// through here: the pinned ones, the default `blaze update` installs, and `auto`'s.
 pub(crate) fn fetch_for(version: &str, why: &str) -> anyhow::Result<PathBuf> {
-    if !pin::is_version(version) {
+    if !blaze_units::lock::is_version(version) {
         bail!("{version} is not a version of blaze (`0.YYYYMMDD.N`)");
     }
     let exe = pin::installed(version)
@@ -77,7 +77,7 @@ const SUMS: [(&str, &str, fn(&[u8]) -> [u8; 32]); 2] =
 /// every release has it.
 const B3SUMS_SINCE: u32 = 20261031;
 
-/// Whether the release `version` (`0.YYYYMMDD.N`, which [`pin::is_version`] holds every
+/// Whether the release `version` (`0.YYYYMMDD.N`, which [`blaze_units::lock::is_version`] holds every
 /// version to, so the date is always there) is dated [`B3SUMS_SINCE`] or later.
 fn has_b3sums(version: &str) -> bool {
     let date = version.split('.').nth(1).and_then(|it| it.parse::<u32>().ok());
@@ -152,13 +152,13 @@ fn fetched(
 pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
     let given = named(args)?;
     if let Some(given) = &given {
-        if pin::is_version(given) {
+        if blaze_units::lock::is_version(given) {
             fetch_for(given, "which `blaze pin` pins")?;
         } else if !pin::is_channel(given) {
             bail!("`blaze pin {given}`: {given} is not a release of blaze (`0.YYYYMMDD.N`) or a channel (stable, canary)");
         }
     }
-    if given.is_none() && !pin::is_version(pin::OURS) {
+    if given.is_none() && !blaze_units::lock::is_version(pin::OURS) {
         bail!(
             "this blaze is {}, a build of blaze's source tree and no release, so there is \
              nothing to pin: run `blaze pin` with a release (install.sh, or `blaze-v<version>` \
@@ -344,7 +344,7 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
         format!("blaze's releases name no release for the {channel} channel yet")
     })?;
     let version = String::from_utf8_lossy(&bytes).trim().to_owned();
-    if !pin::is_version(&version) {
+    if !blaze_units::lock::is_version(&version) {
         bail!(
             "the {channel} channel of blaze's releases names {version:?}, which is not a version"
         );

@@ -707,7 +707,8 @@ def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, e
     root.mkdir(parents=True)
     env = dict(os.environ)
     env.update(extra)
-    env.update(BLAZE_HOME=str(root / "home"), PATH=on_path(bins, env))
+    # BLAZE_LOCK: the trees are copies (unpacked crates without a lock among them), throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    env.update(BLAZE_HOME=str(root / "home"), PATH=on_path(bins, env), BLAZE_LOCK="write")
     blaze = bins / exe(build.target, "blaze")
     spent = 0.0
     try:

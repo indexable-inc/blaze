@@ -241,7 +241,8 @@ async def main(args: Args) -> None:
     # Short: the daemon's sockets are in it, and macOS allows 104 bytes.
     home = Path(tempfile.mkdtemp(prefix="rj-live-", dir=args.tmp))
     work = Path(tempfile.mkdtemp(prefix="blaze-live-e2e-", dir=args.tmp))
-    env = {**os.environ, "BLAZE_HOME": str(home), "RUST_BACKTRACE": "full", **args.env}
+    # BLAZE_LOCK: the copy leaves Cargo.lock out, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    env = {**os.environ, "BLAZE_HOME": str(home), "RUST_BACKTRACE": "full", "BLAZE_LOCK": "write", **args.env}
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTUP_TOOLCHAIN"):
         env.pop(name, None)
     running: Running | None = None

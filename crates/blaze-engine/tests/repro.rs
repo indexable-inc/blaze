@@ -74,10 +74,13 @@ impl Case {
         fs::write(path, text).unwrap();
     }
 
-    /// `blaze args` in `sub`, a directory of the case's crate (`""` for the crate itself).
+    /// `blaze args` in `sub`, a directory of the case's crate (`""` for the crate itself). A
+    /// case's crate is a throwaway copy, most with no lock file of their own, so every command
+    /// may write one under CI too (`BLAZE_LOCK=write`, docs/cargo.md, "Lock files").
     fn blaze_in(&self, sub: &str, args: &[&str]) -> Out {
         let dir = self.dir.join(sub);
         let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
+            .env("BLAZE_LOCK", "write")
             .args(args)
             .current_dir(&dir)
             .env("BLAZE_HOME", &self.home)

@@ -278,13 +278,22 @@ A build resolves the workspace against `Cargo.lock` and may change two files at 
 |---|---|
 | `--locked` or `--frozen` with `--no-locked` | error: they disagree |
 | `--locked` or `--frozen` | refused |
-| `--no-locked` | writes it, saying what moved |
+| `--no-locked`, or `BLAZE_LOCK=write` in the environment | writes it, saying what moved |
 | `CI` set (not empty, `false` or `0`), or `TF_BUILD` | refused |
 | `[workspace.metadata.blaze] lock = "required"` | refused |
 | none of these | writes it, saying what moved |
 
-`blaze lock` is `blaze check --no-locked`: it resolves, writes both files and says what moved,
-whatever CI or `lock = "required"` says. blaze's own tree sets `lock = "required"`.
+`blaze lock` resolves the workspace (taking `check`'s package and feature flags), writes both
+files and says what moved, whatever CI or `lock = "required"` says, and stops: nothing is
+checked or built and no build script runs. blaze's own tree sets `lock = "required"`.
+blaze-metadata's commands (`metadata`, `remove`, `vendor`, `tree`) decide their lock files in the
+same place (`blaze_units::lock::after_resolve`), so the same table holds for them.
+
+`BLAZE_LOCK=write` is `--no-locked` said once for everything a harness starts: blaze's harnesses,
+e2e tests and release checks make throwaway workspaces with no committed lock, and set it where
+they start their children (`harness/ci.py`, `harness/smoke.py`, `harness/blaze_cli.py`, the repro
+tests) instead of passing `--no-locked` to each command. A typed `--locked` or `--frozen` still
+wins over it; any value but `write` is an error.
 
 A refusal names every move and why, then the fix:
 
@@ -307,9 +316,14 @@ the same resolve (another encoding or spacing) is the same, as cargo's `--locked
 
 `blaze.lock` sits beside `Cargo.lock` and holds, in TOML:
 
-- `[blaze] release`, `toolchain`: the blaze release that builds the workspace and the nightly it
-  ships (`harness/toolchain`). Recorded when that release runs it as its pin says (or nothing
-  pins one); a build of blaze's tree (`0.0.0-dev`), or `--ignore-pin`, keeps what is there.
+- `[blaze] release`, `toolchain`: only for a workspace that pins a blaze version
+  (`[workspace.metadata.blaze] version = "0.YYYYMMDD.N"`): that release and the nightly it ships
+  (`harness/toolchain`), recorded when that release runs it. An unpinned workspace, or one pinned
+  to a channel, has no `[blaze]`: it runs whichever blaze it gets, and a lock naming one would
+  change with every upgrade. Run by another blaze (a build of blaze's tree, or `--ignore-pin`),
+  the entry is kept as it is; one that names another release than the pin disagrees with it and
+  is an error naming both, since only the pinned release can say what it ships: `blaze lock`
+  with the pinned release records it.
 - `[index] newest`: the newest publish time (the sparse index's `pubtime`) of any package the
   resolve took from a registry's index, shown as "index as of": the index as the lock saw it,
   told without a clock. A build that took nothing new keeps it.
@@ -1094,10 +1108,9 @@ its place; `blaze version-resolve <channel>` reads it again. A pin to a
 version stays on that release, whose bytes never change: promotion from canary to stable flips
 the same release.
 
-`blaze.lock` records the release that built the workspace and its nightly ([Lock
-files](#lock-files)); a build by another release is a lock change, refused under CI or
-`lock = "required"` until `blaze lock` records it. The launcher does not yet run the release
-`blaze.lock` names for a channel pin or an unpinned workspace.
+`blaze.lock` records the pinned release and its nightly ([Lock files](#lock-files)); a pin
+moved to another release is a lock change, refused under CI or `lock = "required"` until
+`blaze lock`, run by the newly pinned release, records it.
 
 ## How far a constant's evaluation may go
 
@@ -1123,6 +1136,7 @@ it, for that request alone:
 | Variable | Meaning | Default |
 |---|---|---|
 | `CI`, `TF_BUILD` | `CI` not empty, `false` or `0`, or `TF_BUILD` set: a build may not change `Cargo.lock` or `blaze.lock` (`--no-locked` lets it; [Lock files](#lock-files)) | unset: a build writes them and says so |
+| `BLAZE_LOCK` | `write`: builds may change `Cargo.lock` and `blaze.lock` whatever `CI` or `lock = "required"` says, unless `--locked` or `--frozen` is typed (for harnesses of throwaway workspaces; [Lock files](#lock-files)); any other value is an error | unset |
 | `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |

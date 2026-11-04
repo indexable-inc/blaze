@@ -735,8 +735,17 @@ def retry_after(output: str) -> float | None:
 def run(cmd: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
     log(f"$ {' '.join(cmd)}")
     try:
+        # BLAZE_LOCK: the staged workspace renames crates, so its copied lock moves; it is
+        # thrown away after, and its builds may write lock files under CI (docs/cargo.md,
+        # "Lock files").
         r = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "BLAZE_LOCK": "write"},
         )
     except subprocess.TimeoutExpired:
         fail(f"`{' '.join(cmd)}` did not finish in {timeout:.0f} s")

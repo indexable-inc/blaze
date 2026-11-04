@@ -287,7 +287,7 @@ fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
             it.get(key).and_then(Value::as_str).ok_or_else(|| format!("its `{channel}.{key}` is no string"))
         };
         let version = field("version")?;
-        if !pin::is_version(version) {
+        if !blaze_units::lock::is_version(version) {
             return Err(format!("its `{channel}.version` is {version:?}, not a release's version"));
         }
         let given = field("url")?;
@@ -303,7 +303,7 @@ fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
     if let Some(listed) = value.get("yanked") {
         let listed = listed.as_object().ok_or("its `yanked` is no object")?;
         for (version, reason) in listed {
-            if !pin::is_version(version) {
+            if !blaze_units::lock::is_version(version) {
                 return Err(format!("its `yanked` names {version:?}, not a release's version"));
             }
             let reason = reason.as_str().ok_or_else(|| format!("its `yanked.{version}` is no string"))?;
@@ -494,7 +494,7 @@ fn default(home: &Path) -> Result<Option<String>, UpdateError> {
     let file = default_file(home);
     let Some(text) = text(&file)? else { return Ok(None) };
     let version = text.trim();
-    if !pin::is_version(version) {
+    if !blaze_units::lock::is_version(version) {
         return Err(UpdateError::Default { file, got: version.to_owned() });
     }
     Ok(Some(version.to_owned()))
@@ -511,7 +511,7 @@ fn default(home: &Path) -> Result<Option<String>, UpdateError> {
 ///   release is an error for a command the user ran, naming the file, and no default under a
 ///   blaze a launcher ran ([`launched`]), which must keep working.
 pub(crate) fn runs_unpinned() -> Result<String, UpdateError> {
-    let given = std::env::var(RUN_AS_DEFAULT).ok().filter(|it| pin::is_version(it));
+    let given = std::env::var(RUN_AS_DEFAULT).ok().filter(|it| blaze_units::lock::is_version(it));
     if let Some(given) = given {
         return Ok(policy::runs_unpinned(pin::OURS, Some(given.as_str())).to_owned());
     }
@@ -566,7 +566,7 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
     }
     let latest = state.latest();
     let updated_file = updated_file(&home);
-    let updated = text(&updated_file).ok().flatten().map(|it| it.trim().to_owned()).filter(|it| pin::is_version(it));
+    let updated = text(&updated_file).ok().flatten().map(|it| it.trim().to_owned()).filter(|it| blaze_units::lock::is_version(it));
     let here = Here {
         runs,
         pin,
@@ -754,7 +754,7 @@ fn pinned_here() -> Option<(PathBuf, String)> {
     let cwd = std::env::current_dir().ok()?;
     let manifest = pin::root_manifest(&cwd).ok()??;
     let version = pin::pinned(&manifest).ok()??;
-    pin::is_version(&version).then_some((manifest, version))
+    blaze_units::lock::is_version(&version).then_some((manifest, version))
 }
 
 fn print_notes(newest: &Newest) {

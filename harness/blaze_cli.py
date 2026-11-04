@@ -185,7 +185,8 @@ def write(at, path, text):
 
 
 def base_env(home):
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never")
+    # BLAZE_LOCK: the workspaces are clones and generated ones, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never", BLAZE_LOCK="write")
     # Every side's cargo lays out a build as stable cargo does, as a user's does and as blaze
     # places a test: in nightly's second layout a test is in its unit's directory, from where
     # fd's, ripgrep's and just's tests find no program beside them.

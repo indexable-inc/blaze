@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use blaze_resolve::lockfile::{self, Locked, PathDeps};
+use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::{GitReference, PackageId, Resolve, ResolveVersion, RustVersion, SourceId};
 use url::Url;
 
@@ -81,21 +81,23 @@ fn foo_bar(checksum: Option<&str>, version: ResolveVersion) -> Resolve {
 }
 
 /// What cargo writes for a resolve whose lock file was `orig`, as `write_pkg_lockfile` does
-/// once the resolve took over the lock file's checksums and encoding.
-fn write(new: Resolve, orig: Option<&str>, locked: Option<Locked<'_>>) -> Result<Option<String>> {
-    write_msrv(new, orig, locked, None)
+/// once the resolve took over the lock file's checksums and encoding. `same_resolve` compares
+/// the resolves read back, as `--locked` does (blaze-units' lock policy decides what a change
+/// is then allowed to do).
+fn write(new: Resolve, orig: Option<&str>, same_resolve: Option<&PathDeps>) -> Result<Option<String>> {
+    write_msrv(new, orig, same_resolve, None)
 }
 
 fn write_msrv(
     mut new: Resolve,
     orig: Option<&str>,
-    locked: Option<Locked<'_>>,
+    same_resolve: Option<&PathDeps>,
     msrv: Option<&RustVersion>,
 ) -> Result<Option<String>> {
     if let Some(orig) = orig {
         new.merge_from(&read(orig)?)?;
     }
-    lockfile::lockfile_to_write(&mut new, orig, msrv, locked)
+    Ok(lockfile::lockfile_change(&mut new, orig, msrv, same_resolve))
 }
 
 const FOO_BAR_V4: &str = "\
@@ -199,27 +201,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 "#
     );
     let deps = path_deps(&lockfile::parse(&old).unwrap());
-    let locked =
-        Locked { flag: "--locked", path: Path::new("/ws/foo/Cargo.lock"), path_deps: &deps };
     let new = || foo_bar(Some(CKSUM), ResolveVersion::default());
-    assert_eq!(write(new(), Some(&old), Some(locked)).unwrap(), None);
+    assert_eq!(write(new(), Some(&old), Some(&deps)).unwrap(), None);
     // Without `--locked` the missing header makes it a change, and a change raises the encoding.
     assert_eq!(write(new(), Some(&old), None).unwrap().as_deref(), Some(FOO_BAR_V4));
 }
 
+/// Under `--locked` a missing lock file is a change, whatever the resolve: the lock policy
+/// (blaze-units' `lock::decide`) refuses it, naming it.
 #[test]
-fn locked_correct_error() {
+fn a_missing_lock_file_is_a_change_under_locked() {
     let deps = PathDeps::default();
-    let locked =
-        Locked { flag: "--locked", path: Path::new("/ws/foo/Cargo.lock"), path_deps: &deps };
-    let err =
-        write(foo_bar(Some(CKSUM), ResolveVersion::default()), None, Some(locked)).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "cannot create the lock file /ws/foo/Cargo.lock because --locked was passed to prevent this\n\
-         help: to generate the lock file without accessing the network, remove the --locked flag \
-         and use --offline instead."
-    );
+    let out = write(foo_bar(Some(CKSUM), ResolveVersion::default()), None, Some(&deps)).unwrap();
+    assert_eq!(out.as_deref(), Some(FOO_BAR_V4));
 }
 
 #[test]

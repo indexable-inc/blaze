@@ -14,7 +14,8 @@ left.
 1. **CI refuses.** With `CI` set (not empty, not `false`, not `0`) or `TF_BUILD` set, `--locked`
    is the default. A missing lock file, or a resolve that would change it, is an error naming
    each package added, removed or moved (old → new), why (which requirement of which package
-   asked for it), and the fix (`blaze lock` locally, then commit). `--no-locked` opts out.
+   asked for it), and the fix (`blaze lock` locally, then commit). `--no-locked` opts out;
+   `BLAZE_LOCK=write` opts out once for everything a harness starts (a typed `--locked` wins).
 2. **Locally, never silent.** With no lock file, blaze resolves, writes `Cargo.lock` and says one
    line: `wrote Cargo.lock: 143 packages, index as of 2026-11-04T10:12Z (commit it)`. A change
    forced by a manifest edit says what moved, and stays minimal: the resolve keeps every
@@ -31,7 +32,7 @@ The decision (`crates/blaze-units/src/lock.rs`, `policy`), first row that applie
 |---|---|
 | `--locked`/`--frozen` and `--no-locked` | error naming both flags |
 | `--locked`/`--frozen` | refused |
-| `--no-locked` | written, said |
+| `--no-locked`, or `BLAZE_LOCK=write` | written, said |
 | CI | refused |
 | `lock = "required"` | refused |
 | otherwise | written, said |
@@ -78,11 +79,15 @@ A lock that would pin nothing is not written.
 
 What each entry means, and the choices made:
 
-- **`[blaze]`** is recorded only when the running blaze is a release, it runs as the workspace's
-  pin says (the pin names this release, or a channel, or nothing), and `--ignore-pin` was not
-  given for this workspace. A build of blaze's tree (`0.0.0-dev`) keeps whatever is there: it
-  is not a release anyone can fetch, and recording it would flip the lock between dev and
-  release builds of the same tree.
+- **`[blaze]`** is recorded only for a workspace that pins a blaze version
+  (`[workspace.metadata.blaze] version = "0.YYYYMMDD.N"`), and only by that release, without
+  `--ignore-pin` for this workspace. An unpinned workspace, or one pinned to a channel, gets no
+  `[blaze]` at all, so it is not refused after every blaze upgrade; its toolchain follows the
+  running blaze. Any other blaze (a dev build of the tree, another release under
+  `--ignore-pin`) keeps the entry that is there, or writes none; an entry that names a
+  release other than the pin is the refusal case, an error naming both and the fix (run
+  `blaze lock` with the pinned release). `is_version` is the one rule for a release's
+  version, shared with the launcher's pin (`blaze_units::lock::is_version`).
 - **`[index] newest`** is the newest sparse-index `pubtime` among the packages the resolve took
   from an index. The load is a pure function of its inputs and owns no clock
   (`sans-io-cores`), so it cannot know when the index was fetched; the newest publish time it
@@ -94,45 +99,43 @@ What each entry means, and the choices made:
 
 ## Built (this lane)
 
-- `crates/blaze-units/src/lock.rs`: the policy, `blaze.lock`'s model, render and parse, the move
-  lines with their reasons (`moves`, `pin_moves`), and `decide`, which turns the two files'
-  changes into nothing, a write with what to say, or the refusal. Its two tests: the decision
-  table, and `blaze.lock` round-tripping byte for byte.
-- `crates/blaze-units/src/load/resolve.rs` (`lock_files`): both files after the resolve, read
-  through the load's snapshot, decided as above; a refusal is the load's error at `Cargo.lock`.
-- `crates/blaze-resolve/src/lockfile.rs`: `lockfile_change`, the text without the policy (the
-  old `lockfile_to_write` stays for blaze-metadata and its tests).
+- `crates/blaze-units/src/lock.rs`: the policy (with `BLAZE_LOCK`, `env_writes`), `blaze.lock`'s
+  model, render and parse, the move lines with their reasons (`moves`, `pin_moves`), `decide`,
+  `identity` (which blaze to record), `is_version`, and `after_resolve`, the one function every
+  resolve that may write lock files calls: the daemon's load and blaze-metadata's commands
+  (`metadata`, `remove`, `vendor`, `tree`). Its two tests: the decision table (with the
+  identity rows), and `blaze.lock` round-tripping byte for byte.
+- `crates/blaze-units/src/load/resolve.rs`: calls `after_resolve` through the load's snapshot; a
+  refusal is the load's error.
+- `crates/blaze-resolve/src/lockfile.rs`: `lockfile_change`, the text without the policy;
+  `lockfile_to_write` and its `Locked` are gone, banned in `.clippy.toml`.
+- `crates/blaze-metadata/src/lib.rs`: `Asked::lock` carries the same inputs as a build;
+  `relock` and `vendored` lost their own `locked` flag.
+- `crates/blaze-engine/src/pin.rs` and the update commands: the launcher's version rule is
+  `blaze_units::lock::is_version`; the engine's copy is gone.
 - `crates/blaze-units/src/load/native.rs`: `locked_pins`; reading a pin now checks every
   target's name and digest, not only the host's.
 - `crates/blaze-units/src/load/invocation.rs`: `--no-locked`, `CI`/`TF_BUILD` (read apart from
-  the variables cargo reads, since cargo's `CI` changes `incremental`), the running release
-  (`BuildConfig::blaze`).
-- `crates/blaze-units/src/query.rs`: `LockWrite` is the files to write and the lines to say.
-- `crates/blaze-cargo/src/serve/job.rs`: writes each file and says each line as a note.
-- `crates/blaze-cargo/src/cli/args.rs`: `--no-locked`, and `blaze lock` as `check --no-locked`.
-- Root `Cargo.toml`: `lock = "required"`; `blaze.lock` with the LLVM pin, written by hand from
-  `crates/hir-ty-codegen/llvm.json` in the format `render` writes.
+  the variables cargo reads, since cargo's `CI` changes `incremental`), `BLAZE_LOCK`, the
+  running release (`BuildConfig::blaze`).
+- `crates/blaze-api`: `Request::Lock` and `Work::Lock` (schema 37); `crates/blaze-cargo`'s job
+  writes the lock files and ends the job after the load, so `blaze lock` resolves, writes and
+  stops, checking nothing.
+- Harnesses: `BLAZE_LOCK=write` where children start (`harness/ci.py` `run_one`,
+  `harness/smoke.py`, `harness/blaze_cli.py`, `harness/live_e2e.py`, `harness/live_latency.py`,
+  `tools/pgo/pgo.py`, `.github/scripts/publish_crates.py`, the install and promote workflows,
+  `crates/blaze-engine/tests/repro.rs`); builds of committed workspaces keep `--locked`.
+- Root `Cargo.toml`: `lock = "required"`; `blaze.lock` with the LLVM pin, in the format `render`
+  writes. `blaze lock && git diff --exit-code Cargo.lock blaze.lock` in the tree checks it.
 
 ## Left
 
-- **The launcher does not honour `blaze.lock`.** A workspace pinned to a version runs it; one
-  pinned to a channel, or unpinned, runs whatever release it gets, and a release other than the
-  lock's can only be refused (CI) or recorded (locally). Next: the launcher reads `[blaze]
-  release` for a channel or unpinned workspace and runs that release, as it does a version pin.
-- **`blaze lock` builds.** It is `check --no-locked`, so it checks the workspace too. It should
-  stop after the load (a plan-only request to the daemon).
+- **The launcher does not honour `blaze.lock`** beyond a version pin, which it already runs. A
+  channel-pinned or unpinned workspace records no release and runs whatever it gets; recording
+  and running one for a channel is a launcher change, not a lock one.
 - **Index fetch time.** "index as of" is the newest publish time used, not when the index was
   read. Recording the fetch time needs the sources layer to hand the load a timestamp as an
   input, keyed, which it does not.
-- **Unpinned workspaces under CI** are refused after every blaze upgrade, since the recorded
-  release changes. Intended (the lock says what built it), but a workspace that wants to float
-  should pin a channel once the launcher honours the lock.
 - **blaze's tree at the next pin bump.** `blaze.lock` holds no `[blaze]` yet: the pinned
-  0.20261030.1 predates this policy and dev builds record none. The first pin bump to a release
-  with it must run `blaze lock` and commit `blaze.lock`, or every build of the tree is refused.
-- **Harnesses and e2e that build throwaway workspaces with no lock file under CI** are now
-  refused; each passes `--no-locked` or commits a lock. Not swept in this lane.
-- **`lock::is_release` duplicates blaze-engine's `pin::is_version`.** They should be one function
-  in a crate both depend on.
-- `blaze-metadata`'s commands (`remove`, `vendor`) still take `--locked` only, not CI or
-  `lock = "required"`.
+  0.20261030.1 predates this policy and dev builds record none. The first pin bump must run
+  `blaze lock` with the new release and commit `blaze.lock`, or that release refuses the tree.
