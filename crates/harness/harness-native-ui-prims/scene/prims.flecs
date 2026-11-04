@@ -132,3 +132,63 @@ prefab ui.Divider : ui.Node {
 prefab ui.Label : ui.Words, Muted {
   TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}
 }
+
+// ---- SwiftUI's layout vocabulary (examples in scene/examples, drawn by HARNESS_NATIVE_GALLERY=1) ----
+
+// A table: rows are ui.GridRow, cells their children; columns as wide as their widest cell. A ui.GridColumn child (not a
+// node) per column says its alignment and width; a child that is not a GridRow (a ui.Divider) spans every column.
+prefab ui.Grid : ui.Node {
+  Grid: {hgap: 12, vgap: 6, align: Start, valign: Center}
+}
+prefab ui.GridRow : ui.Node {
+  GridRow
+}
+prefab ui.GridColumn {
+  GridColumn: {align: Start, w: {kind: Fit, value: 0, min: 0, max: 0}}
+}
+
+// Adaptive columns (LazyVGrid's .adaptive): as many columns of at least `min` as fit, each at most `max` (0: no max).
+prefab ui.AdaptiveGrid : ui.Column {
+  GridColumns: {min: 120, max: 0}
+  Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+}
+
+// A virtualized column (LazyVStack): `count` rows `row` tall, of which only those in view (and `overscan` more) exist,
+// kept by harness_native_ui_view::lazy_for_each. Put it in a ui.Scroll.
+prefab ui.LazyColumn : ui.Column {
+  Lazy: {count: 0, row: 24, overscan: 4}
+  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+}
+
+// A lazy adaptive grid: GridColumns and Lazy together (rows of `row` points, as many tiles across as fit).
+prefab ui.LazyGrid : ui.LazyColumn {
+  GridColumns: {min: 120, max: 0}
+  Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+}
+
+// The first child variant that fits the width it is given (widest first); the rest are hidden.
+prefab ui.ViewThatFits : ui.Node {
+  ViewThatFits
+  Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+}
+
+// Words on one line cut in the middle (a path), or at the start (a tail that matters).
+prefab ui.LineMiddle : ui.Line {
+  Truncate: {mode: Middle}
+}
+prefab ui.LineHead : ui.Line {
+  Truncate: {mode: Head}
+}
+
+// The springs the generic motion falls back on when a node has no Motion of its own.
+prefab ui.spring.transition {
+  Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
+}
+prefab ui.spring.matched {
+  Motion: {omega: $spring_matched_omega, zeta: $spring_matched_zeta}
+}
+prefab ui.spring.layout {
+  Motion: {omega: $spring_layout_omega, zeta: $spring_layout_zeta}
+}

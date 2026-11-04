@@ -14,6 +14,20 @@ pub const SCENES: &[(&str, &str)] = &[("06-prims", include_str!("../scene/prims.
 /// The gallery scene: one of each primitive. Loaded by the gallery test and by a dev command, never by the app's scene.
 pub const GALLERY: (&str, &str) = ("90-gallery", include_str!("../scene/gallery.flecs"));
 
+/// The SwiftUI-vocabulary examples, one scene per feature (grid, lazy, alignment, truncation, composition and safe area,
+/// motion), then the gallery that lays them all out (`swiftui_gallery`). Loaded after [`SCENES`] by the host's gallery mode
+/// (`HARNESS_NATIVE_GALLERY=1`), never by the app's scene.
+pub const EXAMPLES: &[(&str, &str)] = &[
+    ("91-ex-card", include_str!("../scene/examples/00-card.flecs")),
+    ("92-ex-grid", include_str!("../scene/examples/grid.flecs")),
+    ("93-ex-lazy", include_str!("../scene/examples/lazy.flecs")),
+    ("94-ex-align", include_str!("../scene/examples/align.flecs")),
+    ("95-ex-truncate", include_str!("../scene/examples/truncate.flecs")),
+    ("96-ex-compose", include_str!("../scene/examples/compose.flecs")),
+    ("97-ex-motion", include_str!("../scene/examples/motion.flecs")),
+    ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
+];
+
 /// Register every api crate's components and relationships, before any scene, query or system uses them.
 pub fn register(world: &World) {
     harness_native_ui_node_api::register(world);

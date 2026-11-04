@@ -18,6 +18,26 @@ pub struct MarkdownText {
     pub fade: f32,
 }
 
+/// Where a truncated line loses its words for the ellipsis.
+#[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TruncateMode {
+    /// "\u{2026}end of the words"
+    Head,
+    /// "start\u{2026}end"
+    Middle,
+    /// "start of the words\u{2026}"
+    #[default]
+    Tail,
+}
+
+/// Its `Text` is one line: when layout gives it less than its natural width (see `LayoutPriority`), the host cuts it to
+/// what fits with an ellipsis at `mode`, measured by its typesetter (`harness_native_ui_layout::typeset::elide`).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Truncate {
+    pub mode: TruncateMode,
+}
+
 /// The `Text` beside it is set on one line, never wrapped: cut with an ellipsis to the width layout gives it (Finder's
 /// sidebar rows). Its height is one line's whatever its width. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -69,6 +89,8 @@ hyperion_api_layouts::api_layouts! {
     "Highlight" => alias Highlight,
     "LineNumbers" => alias LineNumbers,
     "TextRange" => alias TextRange,
+    "Truncate" => alias Truncate,
+    TruncateMode,
 }
 
 /// Register content components before any scene resolves them.
@@ -81,4 +103,5 @@ pub fn register(world: &World) {
     world.component::<Highlight>().writable();
     world.component::<LineNumbers>().writable();
     world.component::<TextRange>().writable();
+    world.component::<Truncate>().writable();
 }

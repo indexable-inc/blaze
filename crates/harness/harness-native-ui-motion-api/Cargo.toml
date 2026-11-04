@@ -10,6 +10,8 @@ publish = false
 harness-native-flecs = { path = "../harness-native-flecs" }
 hyperion-api-layouts = { path = "../../vendor/hyperion-api-layouts" }
 harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
 
 [lints.rust]
 unsafe_code = "forbid"
