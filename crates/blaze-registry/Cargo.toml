@@ -45,10 +45,13 @@ toml.workspace = true
 hyper = { workspace = true, optional = true, features = ["client", "http1"] }
 # The method, status and header names `api` asks with, which the seed has without hyper and tokio.
 http.workspace = true
-hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { workspace = true, optional = true, features = ["http1", "native-tokio", "ring", "tls12"] }
 http-body-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time"] }
+# `http::client`'s own pool of HTTP/1 connections (no hyper-util: it pulls in `tracing`), its TLS
+# with the machine's roots, and the socket under both.
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -57,7 +60,18 @@ libc.workspace = true
 default = ["net"]
 # `http::HyperHttp` over hyper and rustls on ring. Without it (the seed profile, which builds
 # offline from vendored sources) every request is `http::NoNet`, naming its URL.
-net = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http-body-util", "dep:tokio"]
+net = [
+    "dep:hyper",
+    "dep:http-body-util",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:tokio-rustls",
+    "dep:tokio",
+]
+
+[dev-dependencies]
+# The keep-alive server `http::client`'s pool test asks.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [lints]
 workspace = true

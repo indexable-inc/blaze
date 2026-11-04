@@ -449,6 +449,8 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
+# blaze-registry's HTTP/1 client: TLS over a tokio socket, rustls on ring as above, no `logging`.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 # The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a
 # self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;
 # no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).
@@ -580,8 +582,6 @@ http-body-util = "0.1.5"
 # A request's method, status and header names, hyper's own (blaze-registry, with or without `net`).
 http = "1.5.0"
 hyper = { version = "1.12.0", default-features = false }
-hyper-rustls = { version = "0.27.10", default-features = false }
-hyper-util = { version = "0.1.21", default-features = false }
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }
