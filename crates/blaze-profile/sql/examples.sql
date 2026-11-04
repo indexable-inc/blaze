@@ -13,19 +13,15 @@ ORDER BY dur_ns DESC
 LIMIT $limit
 
 -- name: slower_between_commits
--- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either)
-WITH runs AS (
-    SELECT builds.commit AS commit, spans.name AS name, spans.dur_ns AS dur_ns
-    FROM spans
-    JOIN builds ON builds.build_id = spans.build_id
-), earlier AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+-- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either), over each build's summary (`build_summary`): a span's median is the median of its builds' medians, so one long build counts once
+WITH earlier AS (
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $earlier)
     GROUP BY name
 ), later AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $later)
     GROUP BY name
 )
@@ -35,7 +31,9 @@ SELECT
     later.dur_ns / 1e6 AS later_ms,
     (later.dur_ns - earlier.dur_ns) / 1e6 AS slower_ms,
     earlier.runs AS earlier_runs,
-    later.runs AS later_runs
+    later.runs AS later_runs,
+    earlier.builds AS earlier_builds,
+    later.builds AS later_builds
 FROM later
 JOIN earlier ON earlier.name = later.name
 ORDER BY slower_ms DESC
@@ -297,7 +295,7 @@ GROUP BY seconds.second
 ORDER BY seconds.second
 
 -- name: uncovered_time
--- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 5%
+-- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 1% (`gate::UNCOVERED_MAX_PCT`)
 WITH bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds

@@ -30,7 +30,8 @@ const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's lin
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--live] [--last SECONDS] [--json] QUERY \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
-                           [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE]";
+                           [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
+                           | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
 const EXPLAIN_USAGE: &str = "blaze explain VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
@@ -87,6 +88,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("sql") => query(words.collect()),
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
+        Some("gate") => gate(words.collect()),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -243,6 +245,53 @@ fn slowed(words: Vec<OsString>) -> Result<(), Refusal> {
     };
     let mut out = std::io::stdout().lock();
     out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+}
+
+/// `blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]`: the profile's gate
+/// (blaze_profile::gate) over a build of the history (the daemon's, or `--history`'s), each
+/// check's outcome printed, as JSON with `--json`; `--summary` writes the build's per-build
+/// summary (`build_summary`) as Parquet, after the verdict is printed. It exits non-zero unless
+/// every check passed (one that could not run fails it too) and the summary was written.
+fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str = "blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
+    let (mut build, mut dir, mut json, mut summary) = (None, None, false, None);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let mut next = |what: &str| words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes {what}")));
+        match word.as_str() {
+            "--build" => {
+                build = Some(next("a build id")?.parse::<u64>().map_err(|_| Refusal::Usage(format!("{USAGE}: `--build` takes a build id")))?);
+            }
+            "--history" => dir = Some(PathBuf::from(next("a history's directory")?)),
+            "--summary" => summary = Some(PathBuf::from(next("a Parquet file to write")?)),
+            "--json" => json = true,
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    let (duckdb, dir) = match dir {
+        Some(dir) => {
+            let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
+                format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
+            })?;
+            (duckdb, dir)
+        }
+        None => history_source()?,
+    };
+    let verdict = blaze_profile::gate::check(&duckdb, &dir, build).map_err(|error| error.to_string())?;
+    let text = match json {
+        true => serde_json::to_string(&verdict).map_err(|error| format!("the gate's verdict as JSON: {error}"))? + "\n",
+        false => verdict.to_string(),
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))?;
+    // After the verdict is printed, so a summary that fails to write never hides it.
+    if let Some(out) = summary {
+        blaze_profile::gate::summary(&duckdb, &dir, verdict.build, &out).map_err(|error| error.to_string())?;
+    }
+    match verdict.passed() {
+        true => Ok(()),
+        false => Err(Refusal::Failed(format!("the profile's gate: {}", verdict.summary()))),
+    }
 }
 
 enum Refusal {

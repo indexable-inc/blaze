@@ -348,10 +348,15 @@ pub enum Plot {
     /// `never!` that failed. Written by the history with each build's flush and whenever it
     /// grew; each site that reported is also a row of `errors` of kind `blaze-bug`.
     BlazeBugs,
+    /// Nanoseconds of CPU the whole process has used so far, user and system, as the OS counts
+    /// it (`getrusage`): noted by the history as each build starts and ends, tagged with the
+    /// build, so the gate (`gate::check`, `cpu_matches_process`) holds the spans' summed
+    /// `self_cpu_ns` against what the OS says the process spent. None on Windows.
+    ProcessCpu,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 21] = [
+    pub const ALL: [Plot; 22] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -373,6 +378,7 @@ impl Plot {
         Plot::ReservedBytes,
         Plot::ProfileRowsBehind,
         Plot::BlazeBugs,
+        Plot::ProcessCpu,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -398,6 +404,7 @@ impl Plot {
             Plot::ReservedBytes => "reserved bytes",
             Plot::ProfileRowsBehind => "profile rows skipped behind",
             Plot::BlazeBugs => "blaze bugs",
+            Plot::ProcessCpu => "process cpu ns",
         }
     }
 

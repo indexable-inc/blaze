@@ -62,7 +62,7 @@ use parquet::{
     column::writer::ColumnCloseResult,
     errors::ParquetError,
     file::{
-        metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
+        metadata::{KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
         properties::{WriterProperties, WriterVersion},
         writer::SerializedFileWriter,
     },
@@ -81,7 +81,7 @@ use crate::{
     symbols,
 };
 
-mod compact;
+pub(crate) mod compact;
 
 use compact::Name;
 
@@ -117,6 +117,31 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 /// Where the daemon's history goes: `profile/` in its state directory.
 pub fn dir_in(state: &Path) -> PathBuf {
     state.join("profile")
+}
+
+/// The CPU this process has used since it began, user and system, in nanoseconds, as
+/// `getrusage(RUSAGE_SELF)` says it (microseconds, so to the microsecond); `None` where it
+/// fails, and on a platform with no `getrusage`.
+#[cfg(unix)]
+pub fn process_cpu_ns() -> Option<u64> {
+    // SAFETY: all zeros is a `rusage` of nothing, for the call to write over.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is live and writable for the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let ns = |it: libc::timeval| -> Option<u64> {
+        let seconds = u64::try_from(it.tv_sec).ok()?;
+        let micros = u64::try_from(it.tv_usec).ok()?;
+        seconds.checked_mul(1_000_000_000)?.checked_add(micros.checked_mul(1_000)?)
+    };
+    ns(usage.ru_utime)?.checked_add(ns(usage.ru_stime)?)
+}
+
+/// No `getrusage`: the gate says its CPU check could not run.
+#[cfg(not(unix))]
+pub fn process_cpu_ns() -> Option<u64> {
+    None
 }
 
 /// The file in a history's directory whose lock says which daemon writes it, and whose text
@@ -387,6 +412,12 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    /// The writer properties of the table at `table` in [`schema::TABLES`]: what a merge of its
+    /// files writes with.
+    pub(crate) fn properties(&self, table: usize) -> &WriterProperties {
+        &self.properties[table]
+    }
+
     pub(crate) fn new() -> Writer {
         // alloc: once a history
         Writer { properties: schema::TABLES.iter().map(|it| properties(it)).collect(), buf: Vec::with_capacity(1 << 20) }
@@ -526,11 +557,17 @@ struct Job {
     output: Name,
 }
 
+/// The key of a merged file's metadata that says how many rows its merge read from its inputs'
+/// footers, in decimal: what the gate (`gate::check`, `merges_exact`) holds the file's own row
+/// count to, long after the inputs are deleted. A merge of merged files says its own.
+pub(crate) const MERGED_ROWS: &str = "blaze.merged_rows";
+
 /// Writes the rows of the Parquet files `inputs`, all of one schema, as the file `output`,
 /// copying their column chunks as they are, with `properties` (the table's); its size. It is
 /// streamed to a hidden name and renamed into place, so a reader never sees half of it; on a
-/// failure the hidden file is deleted and `output` is not made.
-fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
+/// failure the hidden file is deleted and `output` is not made. Its metadata says the rows the
+/// inputs' footers held ([`MERGED_ROWS`]).
+pub(crate) fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
     let name = output.file_name().and_then(|it| it.to_str()).unwrap_or("history");
     // alloc: a file's name, once a merge
     let hidden = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
@@ -591,11 +628,13 @@ fn concat_into(
     let properties = Arc::new(properties.clone());
     let mut writer = SerializedFileWriter::new(out, Arc::clone(&schema), properties)
         .map_err(|error| fail(hidden, "starting to write", CompactError::Parquet(error)))?;
-    // The Arrow schema and blaze's own keys (`blaze.schema`, `blaze.table`, `blaze.clock`).
-    for kv in first_metadata.file_metadata().key_value_metadata().into_iter().flatten() {
+    // The Arrow schema and blaze's own keys (`blaze.schema`, `blaze.table`, `blaze.clock`); an
+    // input's own count of merged rows is its, not this merge's.
+    for kv in first_metadata.file_metadata().key_value_metadata().into_iter().flatten().filter(|it| it.key != MERGED_ROWS) {
         // clone: a key and its value, a few a merge
         writer.append_key_value_metadata(kv.clone());
     }
+    let mut rows: i64 = 0;
     let mut next = Some((first_file, first_metadata));
     for path in inputs {
         let (file, metadata) = match next.take() {
@@ -605,6 +644,7 @@ fn concat_into(
         if metadata.file_metadata().schema() != &*schema {
             return Err(fail(path, "checking the schema of the input", CompactError::SchemaDiffers));
         }
+        rows += metadata.file_metadata().num_rows();
         for (rg_at, row_group) in metadata.row_groups().iter().enumerate() {
             let index = metadata.page_index_for_row_group(rg_at);
             let mut group = writer
@@ -626,6 +666,8 @@ fn concat_into(
             group.close().map_err(|error| fail(hidden, "ending a row group of", CompactError::Parquet(error)))?;
         }
     }
+    // alloc: a key and its value, once a merge
+    writer.append_key_value_metadata(KeyValue::new(MERGED_ROWS.to_owned(), rows.to_string()));
     writer.close().map_err(|error| fail(hidden, "ending", CompactError::Parquet(error)))?;
     Ok(())
 }
@@ -681,6 +723,10 @@ pub struct History {
     unidentified: Option<HistoryError>,
     /// The threads' open spans the last flush wrote, their times left out ([`same_open`]).
     open_written: Vec<flight::ThreadNow>,
+    /// The process's OS CPU as builds started and ended since the last flush
+    /// ([`Plot::ProcessCpu`]), for the next flush to write: taken here, not in the flush, so a
+    /// build's end is read before the tree's digest and the flush's own work.
+    cpu_marks: Vec<CounterRow>,
 }
 
 impl History {
@@ -786,6 +832,8 @@ impl History {
             unidentified: None,
             // alloc: once a history
             open_written: Vec::new(),
+            // alloc: once a history
+            cpu_marks: Vec::new(),
         };
         history.trim()?;
         Ok(history)
@@ -802,10 +850,20 @@ impl History {
         u32::try_from(self.last_build + 1).unwrap_or(u32::MAX)
     }
 
+    /// Notes the process's OS CPU now ([`process_cpu_ns`]) as a [`Plot::ProcessCpu`] row of
+    /// `build`, for the next flush: a build's start and end each have one, so its CPU is the
+    /// difference. Nothing where the OS can't say (Windows).
+    fn mark_cpu(&mut self, build: u64) {
+        let Some(value) = process_cpu_ns() else { return };
+        let build = u32::try_from(build).unwrap_or(0);
+        self.cpu_marks.push(CounterRow { build, plot: Plot::ProcessCpu, t_ns: clock::mono_ns(), value, fiber: None });
+    }
+
     /// Notes a build that started, `row` its row with outcome running and no duration, for the
     /// next flush to write: a build its daemon never ends (a kill, a crash) is then one row in
     /// the history, which a reader tells from one still running by its process ([`writes`]).
     pub fn build_started(&mut self, mut row: BuildRow) {
+        self.mark_cpu(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
@@ -819,6 +877,7 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
+        self.mark_cpu(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
@@ -879,6 +938,8 @@ impl History {
         // span, so a slow flush read as uncovered time on the history's thread.
         let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
         let (late, behind) = self.drained.take(&mut self.read);
+        // After the take, which swaps `read` with the drain's.
+        self.read.counters.append(&mut self.cpu_marks);
         // The flight recorder's own losses, as counters: a query sees whether a stretch with
         // no span is one the recorder dropped. Written with each build's flush and whenever
         // they grew, so an idle daemon's timer writes no file for them.
@@ -1440,6 +1501,43 @@ mod tests {
     /// Each flush says the process's reported bugs: the counter with each build's flush and
     /// whenever it grew, and a `blaze-bug` row for each site that reported since the last,
     /// naming the value kind, the site and how many more times.
+    #[test]
+    fn a_merge_says_the_rows_its_inputs_held_and_holds_them() {
+        let dir = scratch("merged-rows");
+        let process = Process { pid: 9, name: "blaze test", commit: None };
+        let counters = |n: u64| {
+            let rows: Vec<CounterRow> = (0..n)
+                .map(|i| CounterRow { build: 1, plot: Plot::ProcessCpu, t_ns: i as i64, value: i, fiber: None })
+                .collect();
+            batches::counters(&rows, process).unwrap()
+        };
+        let mut writer = Writer::new();
+        let (a, b) = (dir.join("1-00000001.counters.parquet"), dir.join("1-00000002.counters.parquet"));
+        writer.write(&a, &schema::COUNTERS, &[counters(3)]).unwrap();
+        writer.write(&b, &schema::COUNTERS, &[counters(4)]).unwrap();
+        let table = table_at(&schema::COUNTERS);
+        let footer = |path: &Path| {
+            let metadata = ParquetMetaDataReader::new().parse_and_finish(&fs::File::open(path).unwrap()).unwrap();
+            let said: Vec<Option<String>> = metadata
+                .file_metadata()
+                .key_value_metadata()
+                .into_iter()
+                .flatten()
+                .filter(|it| it.key == MERGED_ROWS)
+                .map(|it| it.value.clone())
+                .collect();
+            (metadata.file_metadata().num_rows(), said)
+        };
+        let merged = dir.join("1-00000001-00000002-1.counters.parquet");
+        concat(&merged, &[a.clone(), b], writer.properties(table)).unwrap();
+        assert_eq!(footer(&merged), (7, vec![Some("7".to_owned())]));
+        // A merge of a merged file says its own count, once.
+        let again = dir.join("1-00000001-00000002-2.counters.parquet");
+        concat(&again, &[merged, a], writer.properties(table)).unwrap();
+        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));
+        _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;

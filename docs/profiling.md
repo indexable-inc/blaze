@@ -156,7 +156,7 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `blaze bugs` (the process's running total of bugs it found in itself and went on past, `stdx::assert::reported`; each site is an `errors` row of kind `blaze-bug`), `profile spans lost`, `profile rows skipped` and `profile rows skipped behind` (the process's running totals of spans the recorder could not record, rows its rings wrote over before the history drained them, and of those the rows skipped while the history's backlog was full, written by the history with each build's flush and whenever they grow; `blaze slow` says them on its third line), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `blaze bugs` (the process's running total of bugs it found in itself and went on past, `stdx::assert::reported`; each site is an `errors` row of kind `blaze-bug`), `profile spans lost`, `profile rows skipped` and `profile rows skipped behind` (the process's running totals of spans the recorder could not record, rows its rings wrote over before the history drained them, and of those the rows skipped while the history's backlog was full, written by the history with each build's flush and whenever they grow; `blaze slow` says them on its third line), `process cpu ns` (the process's own CPU so far, user and system, by `getrusage`, written by the history as each build starts and ends and tagged with the build; none on Windows; the gate's `cpu_matches_process`), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
@@ -590,10 +590,8 @@ row names are summed into `folded` rows (below) instead of a row each; on that s
 the spans were under 2 us, and `find_container` and `Semantics::analyze_impl` (about 3 us) came
 360,000 a second on a worker, more than a ring holds between two reads. The gate counts the folded roots' time as covered. It also fails on every perf sample blocked in a mutex, condition
 variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
-the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
-binary measured, and a history with no such build is an error naming it. Its test runs on a
-profiled self-build named by `BLAZE_PROFILE_FIXTURE` and also fails when that build recorded no
-tree or binary.
+the stack), and on every `wait` span without `awaits`. Its other checks, and how CI runs it, are
+in "The gate" below.
 
 `critical_path` walks a build's wait graph backwards from the span that ended last. On a lane (a
 job, or a thread outside jobs) it steps back to the most recent wait that ended before the
@@ -646,6 +644,61 @@ The build's top-level phases each have a span:
 - the dependencies' image keys: `dependency image keys`, with the crates asked in `crates` and
   the database's view in `function` (`View(1234)`). A serve at the view the same crates were last keyed at, none
   moved, walks nothing and opens no span.
+
+## The gate: what a profile must hold
+
+`blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]` runs the gate
+(crates/blaze-profile/src/gate.rs) over a build of the history: the last that ended unless
+`--build` says, of the daemon's history unless `--history` names a directory. Each check passes,
+fails, or could not run, and says which with a line and its offenders. A check that could not run
+(its rows are missing, or its query failed) never passes: the verdict passes only when every
+check passed, and its last line lists every check it could not run. Each check has one
+threshold, a constant in gate.rs:
+
+| check | holds | bound |
+| --- | --- | --- |
+| `workers_covered` | each pool worker's share of the build inside no span and not idle (`uncovered_per_worker`) | under `UNCOVERED_MAX_PCT`, 1% |
+| `blocks_in_waits` | no sample of a worker blocked in the kernel outside a wait span (`raw_blocks`); could not run where no sample is off-CPU (Linux) | none |
+| `waits_say_what` | every `wait` span has `awaits` | none |
+| `rows_lost` | the recorder's `profile spans lost` and `profile rows skipped` over the build | `ROWS_LOST_MAX`, 0 |
+| `samples_in_spans` | the share of the workers' samples whose `span_id` names a span open as they were taken | at least `SAMPLES_IN_SPANS_MIN_PCT`, 99% |
+| `children_in_parents` | every span with a parent row lies inside it | `CLOCK_SLACK_NS`, 10 us |
+| `self_cpu_in_duration` | `self_cpu_ns` of every span and folded sum is 0 or more and no more than its duration | `CLOCK_SLACK_NS` a span |
+| `cpu_matches_process` | the build's spans' and folded sums' `self_cpu_ns` summed against the process's own CPU over the build (`process cpu ns`) | within `CPU_DIFF_MAX_PCT`, 5% |
+| `slow_deterministic` | `blaze slow --json` of the build gives the same bytes twice | none |
+| `merged_rows_match` | every merged file of the build holds the rows its merge read from its inputs' footers (`blaze.merged_rows`) | none |
+| `merges_exact` | the build's files of each table merged again (`history::concat`) hold exactly their rows: by the footers, and as a multiset of DuckDB's row hashes | none |
+
+`process cpu ns` is a counter the history writes as each build starts and ends
+(`history::process_cpu_ns`, `getrusage(RUSAGE_SELF)`, user and system), tagged with the build;
+there is none on Windows. A merged file's Parquet metadata says the rows its merge read under
+`blaze.merged_rows` (`history::MERGED_ROWS`), so a merge that dropped or doubled a row group is
+caught after its inputs are gone.
+
+The verdict names the build's `tree` and `blaze`, the exact tree and binary measured, and a
+history with no such build is an error naming it. `--json` prints it as one object (version 1;
+each check's `name`, `outcome` of `passed`, `failed` or `unchecked`, `said` and `detail`). The
+command exits non-zero unless every check passed.
+
+CI runs it in blaze-platform.yaml's `profile-gate` job, over the history the build job's
+self-build wrote (the files newer than the build's start, handed over as the `profile-<platform>`
+artifact), with the blaze that build made (harness/profile_gate.py). That history is written by
+the release blaze that builds blaze, so a check of rows only a newer blaze writes cannot run
+until a release writes them: harness/profile-gate-known.toml lists each check known to fail or
+not run, per platform, with an owner and a cause, and the job fails on any other outcome and on a
+listed check that passes. The same job runs the gate over each fixture of
+crates/blaze-profile/fixtures/gate/, a history of one build per check that the check must fail
+(written by harness/profile_fixtures.py; `gate::tests::each_fixture_fails_its_own_check` runs
+them with `BLAZE_DUCKDB` set). `slow_deterministic` and `merges_exact` test blaze's own code over
+any history, so no file can make them fail; history.rs tests the merge's count.
+
+`--summary FILE` writes the build's per-build summary, `build_summary` (views.sql: one row a span
+name, with the build's commit, tree, blaze, its runs, median, total and self CPU), as Parquet.
+The job uploads it, with the verdict, as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`
+(each cut to 12 characters) for 90 days. profile-nightly.yaml takes the newest summaries of main
+on one runner class, one a commit, and runs `slower_between_commits` (over `build_summary`) with
+the newest commit as `later` (harness/profile_trend.py); it fails naming each span whose median
+grew 1.25 times and by 50 ms or more.
 
 ## What made a build slow: `blaze slow`
 
@@ -701,8 +754,9 @@ wait and the owner's serial work under it can both count the same stretch of the
 What the profile could not see is listed after the findings, as blind spots, never skipped:
 - critical-path time the record lost (`unrecorded` links, by reason and lane);
 - job running time inside no span, against the 1% gate;
-- worker running time with no span CPU counted for it. No OS CPU is recorded, so the spans'
-  total can't be checked against the process's;
+- worker running time with no span CPU counted for it. The process's own CPU is recorded only
+  at each build's start and end (`process cpu ns`), which the gate checks the spans' total
+  against (`cpu_matches_process`);
 - waits with no wait span (rule 13), classed by their kind alone (`key wait with no wait span`)
   and sized by the wall they cover, with the recorder's `profile spans lost` over the build
   beside them; and named waits that never name an owner. A class's evidence says its waits'
