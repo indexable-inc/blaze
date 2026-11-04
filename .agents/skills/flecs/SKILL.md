@@ -5,6 +5,8 @@ description: Flecs (v4.1.6) as blaze's site uses it: every page is a Flecs scrip
 
 # Flecs in blaze
 
+Native UI built as Flecs (the harness app, `crates/harness`) is the `flecs-ui` skill. harness vendors its own Flecs, separate from the site's; its version is in `crates/harness/vendor/flecs/SOURCE.md`.
+
 Adapted from den's flecs skill (`den-flecs`, same Flecs version); den's Rust API and app conventions are left out because blaze uses Flecs only through script. Script reference: `script.md`.
 
 ## Where Flecs runs
