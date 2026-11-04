@@ -233,7 +233,7 @@ rests on these numbers.
 | started_ns | i64 | when the daemon took it |
 | dur_ns | i64? | how long it ran; null while it runs |
 | started_unix_ns | i64? | when it was taken, on the wall clock |
-| outcome | dict | ok, failed, cancelled, stalled or running |
+| outcome | dict | ok, failed, cancelled, stalled, running or crashed |
 | hits | u64? | nodes the memo settled without running them |
 | misses | u64? | nodes that ran their task |
 | joined | u64? | nodes that took a task another node ran |
@@ -246,6 +246,13 @@ history flushes at once), and one as it ends, with the same `started_ns`. The `b
 the end row where there is one. A build whose only row is its start, and whose `process` no
 longer writes the history (`owner.lock` does not name it, or its lock is not held), ended by
 its daemon's death: `blaze slow` reports it to that process's last row.
+
+A daemon whose flight recorder was persisted (see "Past a crash" under the flight recorder)
+leaves more: the next history to open, or `blaze slow` when no daemon writes the history,
+writes the rows the dead daemon had not flushed, and for each build it was running an end row
+of outcome `crashed`, `dur_ns` to the last row read back, `blaze` the hash of the blaze that
+ran it and `process` the dead daemon's. `blaze slow` reports a `crashed` build as one whose
+daemon died.
 
 ### `samples`: one row a CPU sample of a running thread
 
@@ -662,6 +669,11 @@ daemon's death" with the pid, and names what each thread was inside at the daemo
 of its open spans: each span, what a wait awaited and the job that ran it (`build.died` in the
 JSON, report version 3).
 
+Before it picks the build, `blaze slow` reads back the flight recorders of daemons that died
+with rows not yet flushed (when no daemon writes the history; a daemon does it as it opens):
+their last seconds become rows of the history, and each build they were running gets a
+`crashed` row. Such a build's report runs to the last row read back, not to the last flush.
+
 A build is its number: its rows are the rows tagged with it, and the rows of no build in its
 `builds` row's window from the same process. When rows of one number come from more than one
 process (daemons of a blaze before 2026-11-03, which could each number a build 1 in one home),
@@ -784,6 +796,42 @@ them, so one worker holds the open spans of hundreds of parked jobs. Until 2026-
 and most workers of a self-build used every one, losing the spans past them (the waits of the
 `key with no awaits` blind spot). A span past the slots is still lost, and counted. Readers take rows with a cursor (`flight::read`): only what is new, and a
 reader slower than the writers skips what was written over, counted.
+
+### Past a crash
+
+The rows the history had not flushed die with the process unless they are somewhere the
+kernel keeps. So the daemon's history persists the recorder (`History::persist_recorder`, as it
+opens) into `flight-<pid>.map` in the history's directory, a file the daemon maps shared and
+holds an exclusive lock on (`flight/postmortem.rs`):
+
+- a header: magic, a byte-order mark, the layout's version, a fingerprint of every constant a
+  row's decoding rests on (row bits, plot bytes, the plots, switches, waits and span columns by
+  number), the pid, the clock's base (a tick, the monotonic clock read with it and the
+  nanoseconds a tick lasts, in two slots so a torn write leaves the last whole one), the time of
+  the last flush, the blaze hash and the process's name;
+- every callsite's name, target and level, written as it registers;
+- the builds running, written as each starts and freed as it ends;
+- a log of the names rows hold, one a shard and one of threads' names, appended as a name is
+  first given and read newest first;
+- each ring's store: its head, the row the history flushed to, its last 64 owners (the tid and
+  name of each thread that wrote it, from which row), and its 32,768 rows.
+
+Recording is unchanged: a thread writes its own store with the same atomics, with no system
+call and no allocation, and no row holds an address. Rings made before the history persisted
+move into the file, each by its own thread as it next writes (a ring no thread holds moves at
+once). The file's disk is reserved before it is mapped (`posix_fallocate` on Linux,
+`F_PREALLOCATE` on macOS), so a full disk is an error at persist time, not a SIGBUS later: about
+19 MiB, and 2 MiB more a ring. On Windows the history says it can't persist and records as
+before.
+
+Each flush marks in every store the row it wrote to. A history that opens (and `blaze slow`
+with no daemon) takes every `flight-*.map` whose lock no one holds, so of a process that died:
+it refuses one of another layout or fingerprint with an error naming the file (the next flush
+answers it; the file stays until a blaze that reads it does, or it is deleted), decodes the rows
+past each store's flushed row with the decoder the live reads use, gives their names and sites
+numbers of its own, writes them as files of the dead process, writes a `crashed` row for each
+build it was running, and deletes the file. The blaze hash is kept but not checked: the file
+describes itself, so a blaze rebuilt after a crash reads it.
 
 ## The live feed
 

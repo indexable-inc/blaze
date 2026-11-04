@@ -38,6 +38,15 @@
 //! thread was inside then (the `open` table). A build whose last row is its start, of a process
 //! that no longer writes the history ([`writes`]), ended by its daemon's death; `blaze slow`
 //! reports it so, with what was open at the last flush.
+//!
+//! And its last seconds: the daemon's history persists the flight recorder into
+//! `flight-<pid>.map` beside the files ([`History::persist_recorder`], [`flight::postmortem`]),
+//! and each flush marks there how far it wrote. A history that opens (and `blaze slow`, when no
+//! daemon writes the history, [`recover_dead`]) reads every such file no live process holds:
+//! the rows past the dead daemon's last flush become files of their own, of the dead process,
+//! and each build it was running gets a `builds` row `crashed`, running to the last row read
+//! back; then the file is deleted. A file of another layout is refused with an error naming
+//! it, answered by the next flush, and stays.
 
 use std::{
     collections::VecDeque,
@@ -177,11 +186,15 @@ pub enum Outcome {
     Cancelled,
     Stalled,
     Running,
+    /// Its daemon died while it ran: a postmortem of the daemon's flight recorder wrote this
+    /// row, running to the last row it read back ([`flight::postmortem`]).
+    Crashed,
 }
 
 impl Outcome {
     /// In the order of their numbers, which are their keys in the column's dictionary.
-    pub const ALL: [Outcome; 5] = [Outcome::Ok, Outcome::Failed, Outcome::Cancelled, Outcome::Stalled, Outcome::Running];
+    pub const ALL: [Outcome; 6] =
+        [Outcome::Ok, Outcome::Failed, Outcome::Cancelled, Outcome::Stalled, Outcome::Running, Outcome::Crashed];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -190,6 +203,7 @@ impl Outcome {
             Outcome::Cancelled => "cancelled",
             Outcome::Stalled => "stalled",
             Outcome::Running => "running",
+            Outcome::Crashed => "crashed",
         }
     }
 }
@@ -264,6 +278,9 @@ pub enum HistoryError {
     /// Merging files into `output` failed at the step `doing`, on `file`: an input, or the
     /// hidden file the output is written to. Every input stays in place.
     Compact { output: PathBuf, file: PathBuf, doing: &'static str, error: CompactError },
+    /// The flight recorder could not be kept past a crash, or a dead daemon's rows could not be
+    /// read back ([`flight::postmortem`]).
+    Postmortem(flight::postmortem::PostmortemError),
 }
 
 /// Why a merge of history files failed.
@@ -314,6 +331,7 @@ impl fmt::Display for HistoryError {
                 output.display(),
                 file.display()
             ),
+            HistoryError::Postmortem(error) => write!(f, "the profile history: {error}"),
         }
     }
 }
@@ -329,6 +347,7 @@ impl std::error::Error for HistoryError {
             HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::Parquet(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::SchemaDiffers, .. } => None,
+            HistoryError::Postmortem(error) => Some(error),
         }
     }
 }
@@ -681,6 +700,16 @@ pub struct History {
     unidentified: Option<HistoryError>,
     /// The threads' open spans the last flush wrote, their times left out ([`same_open`]).
     open_written: Vec<flight::ThreadNow>,
+    /// Where the drain was in the rings as the last flush took its rows: what the flight
+    /// recorder's mapping marks written ([`flight::flushed`]).
+    cursor: Cursor,
+    /// Why a dead daemon's rows could not be read back as this history opened: the next flush
+    /// answers it, so a damaged mapping never stops the daemon from starting.
+    postmortem: Option<HistoryError>,
+    /// The recorder is persisted to this history's directory ([`History::persist_recorder`]),
+    /// and the last flush wrote: a history that drops so deletes the mapping.
+    persisted: bool,
+    clean: bool,
 }
 
 impl History {
@@ -730,10 +759,18 @@ impl History {
             keep
         });
         kept.sort_unstable_by_key(|it| it.name.last);
-        let seq = kept.last().map_or(1, |it| it.name.last + 1);
-        let total = kept.iter().map(|it| it.bytes).sum();
+        let mut seq = kept.last().map_or(1, |it| it.name.last + 1);
+        let mut total: u64 = kept.iter().map(|it| it.bytes).sum();
         let mut writer = Writer::new();
         writer.schemas(dir)?;
+        // The last rows of daemons that died before they flushed them, as files of their own
+        // before this history writes any ([`recover_into`]).
+        let (recovered, postmortem) = recover_into(dir, &mut writer, &mut seq);
+        for file in recovered {
+            last_build = last_build.max(file.name.build);
+            total += file.bytes;
+            kept.push(file);
+        }
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
             what: "hashing blaze's own executable",
             path: std::env::current_exe().unwrap_or_default(),
@@ -786,6 +823,10 @@ impl History {
             unidentified: None,
             // alloc: once a history
             open_written: Vec::new(),
+            cursor: Cursor::default(),
+            postmortem,
+            persisted: false,
+            clean: false,
         };
         history.trim()?;
         Ok(history)
@@ -793,6 +834,16 @@ impl History {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Keeps this process's flight recorder past a crash, in a file of this history's
+    /// directory ([`flight::persist`]): the next history to open here writes the rows this one
+    /// had not, and marks the builds that were running `crashed`. Once a process: the daemon's
+    /// history, as it opens.
+    pub fn persist_recorder(&mut self) -> Result<(), HistoryError> {
+        flight::persist(&self.dir, &self.blaze, self.process.name).map_err(HistoryError::Postmortem)?;
+        self.persisted = true;
+        Ok(())
     }
 
     /// The first build id no file of the history names: where the daemon starts numbering its
@@ -810,6 +861,14 @@ impl History {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
         }
+        flight::postmortem::build_started(&flight::postmortem::RunningBuild {
+            build_id: row.build_id,
+            started_ns: row.started_ns,
+            started_unix_ns: row.started_unix_ns,
+            commit: row.commit.as_deref(),
+            workspace: &row.workspace,
+            command: &row.command,
+        });
         self.ended.push(row);
     }
 
@@ -819,6 +878,7 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
+        flight::postmortem::build_ended(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
@@ -878,7 +938,7 @@ impl History {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.
         let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
-        let (late, behind) = self.drained.take(&mut self.read);
+        let (late, behind) = self.drained.take(&mut self.read, &mut self.cursor);
         // The flight recorder's own losses, as counters: a query sees whether a stretch with
         // no span is one the recorder dropped. Written with each build's flush and whenever
         // they grew, so an idle daemon's timer writes no file for them.
@@ -894,6 +954,7 @@ impl History {
         }
         self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
         let written = self.write(build);
+        self.clean = written.is_ok();
         // Written or not, the rows drained are this flush's: none goes to the next.
         self.read.clear();
         written
@@ -1066,6 +1127,8 @@ impl History {
             flushed.files += 1;
             flushed.bytes += bytes;
         }
+        // The rows are in files now: a postmortem of this process leaves them out.
+        flight::flushed(&self.cursor, self.read.at_ns);
         self.ended.clear();
         self.errors.clear();
         self.links.clear();
@@ -1075,6 +1138,10 @@ impl History {
         let compacted = self.compact(ended, &mut flushed);
         flushed.deleted = self.trim()?;
         compacted?;
+        let postmortem = self.postmortem.take().or_else(|| flight::postmortem::failed().map(HistoryError::Postmortem));
+        if let Some(error) = postmortem {
+            return Err(error);
+        }
         match self.unidentified.take() {
             Some(error) => Err(error),
             None => Ok(flushed),
@@ -1213,6 +1280,11 @@ impl Drop for History {
                 tracing::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.dir.display());
             }
         }
+        // Every row written by the last flush: no postmortem is owed. One that failed leaves
+        // the mapping for the next history to read.
+        if self.persisted && self.clean {
+            flight::postmortem::forget();
+        }
     }
 }
 
@@ -1251,12 +1323,13 @@ impl Draining {
 }
 
 impl Drained {
-    /// Reads the rings up to now and swaps what was drained into `into` (which is clear):
-    /// the rows skipped so far, late and behind.
-    fn take(&self, into: &mut Read) -> (u64, u64) {
+    /// Reads the rings up to now and swaps what was drained into `into` (which is clear),
+    /// with where the drain is now into `cursor`: the rows skipped so far, late and behind.
+    fn take(&self, into: &mut Read, cursor: &mut Cursor) -> (u64, u64) {
         let mut at = self.0.lock();
         at.read_now();
         std::mem::swap(&mut at.read, into);
+        cursor.clone_from(&at.cursor);
         (at.late, at.behind)
     }
 }
@@ -1288,6 +1361,122 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
             _ = full.try_send(());
         }
     }
+}
+
+/// For a reader of the history `dir` with no daemon writing it (`blaze slow`): writes the last
+/// rows of every daemon that died before it flushed them, as [`History::open`] does. Nothing
+/// while a daemon holds the history ([`OWNER`]): it did so as it opened, and numbers its own
+/// files. The files written, counted.
+pub fn recover_dead(dir: &Path) -> Result<usize, HistoryError> {
+    let path = dir.join(OWNER);
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        // No daemon ever wrote here, so none left a mapping.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_error(&path, "opening the owner file of")(error)),
+    };
+    // Held while the files are written, so no daemon starts numbering files meanwhile (one
+    // that starts in these milliseconds is refused as a second writer, and says so).
+    let _owner = match stdx::file_lock::Locked::try_lock(file).map_err(io_error(&path, "locking the owner file of"))? {
+        Ok(owner) => owner,
+        Err(_held) => return Ok(0),
+    };
+    let mut seq = 1;
+    for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
+        let entry = entry.map_err(io_error(dir, "listing"))?;
+        if let Some(named) = entry.file_name().to_str().and_then(Name::parse) {
+            seq = seq.max(named.last + 1);
+        }
+    }
+    let (written, failed) = recover_into(dir, &mut Writer::new(), &mut seq);
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(written.len()),
+    }
+}
+
+/// Writes the rows each dead daemon's flight recorder mapping in `dir` holds past its last
+/// flush ([`flight::postmortem`]), one flush number `seq` a daemon, and deletes each mapping
+/// once its rows are written: the files written, and the first error. A mapping that can't be
+/// read (another layout, a damaged file) stays, and the error names it; the others are read.
+fn recover_into(dir: &Path, writer: &mut Writer, seq: &mut u64) -> (Vec<Kept>, Option<HistoryError>) {
+    // alloc: once a history, a file a table of a dead daemon
+    let mut written = Vec::new();
+    let found = match flight::postmortem::dead(dir) {
+        Ok(found) => found,
+        Err(error) => return (written, Some(HistoryError::Postmortem(error))),
+    };
+    let mut failed = None;
+    for found in found {
+        // Each read holds the postmortem's names until it drops: one at a time.
+        let wrote = match found.read() {
+            Ok(recovered) => write_recovered(dir, writer, *seq, &recovered),
+            Err(error) => Err(HistoryError::Postmortem(error)),
+        };
+        match wrote {
+            Ok(files) => {
+                *seq += 1;
+                written.extend(files);
+                if let Err(error) = found.remove() {
+                    failed.get_or_insert(HistoryError::Postmortem(error));
+                }
+            }
+            Err(error) => _ = failed.get_or_insert(error),
+        }
+    }
+    (written, failed)
+}
+
+/// The rows of `recovered`, a dead daemon's, as files of flush `seq`, written through
+/// `writer` as a flush writes its own: of the dead process (its pid and name), and a `builds`
+/// row `crashed` for each build it was running, from its start to its last row read back.
+fn write_recovered(dir: &Path, writer: &mut Writer, seq: u64, recovered: &flight::postmortem::Recovered) -> Result<Vec<Kept>, HistoryError> {
+    let process = Process { pid: recovered.pid, name: &recovered.process, commit: None };
+    let read = &recovered.read;
+    // alloc: a row a build the dead daemon was running, once a postmortem
+    let crashed: Vec<BuildRow> = recovered
+        .builds
+        .iter()
+        .map(|build| BuildRow {
+            build_id: build.build_id,
+            // clone: a build's texts, once a postmortem
+            commit: build.commit.clone(),
+            workspace: build.workspace.clone(),
+            command: build.command.clone(),
+            started_ns: build.started_ns,
+            dur_ns: Some(recovered.last_ns.max(build.started_ns) - build.started_ns),
+            started_unix_ns: build.started_unix_ns,
+            outcome: Outcome::Crashed,
+            hits: None,
+            misses: None,
+            joined: None,
+            tree: None,
+            // clone: a hash, once a build
+            blaze: (!recovered.blaze.is_empty()).then(|| recovered.blaze.clone()),
+        })
+        .collect();
+    let tables: [(&'static Table, RecordBatch); 6] = [
+        (&schema::SPANS, batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?),
+        (&schema::COUNTERS, batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?),
+        (&schema::BUILDS, builds(&crashed, recovered.pid).map_err(arrow_error(&schema::BUILDS))?),
+        (&schema::SWITCHES, batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?),
+        (&schema::EVENTS, batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?),
+        (&schema::FOLDED, batches::folded(&read.folds, process).map_err(arrow_error(&schema::FOLDED))?),
+    ];
+    let build = read.highest_build().max(crashed.iter().map(|it| it.build_id).max().unwrap_or(0));
+    // alloc: once a postmortem
+    let mut kept = Vec::new();
+    for (table, batch) in tables {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let name = Name { build, table: table_at(table), first: seq, last: seq, level: 0 };
+        let path = dir.join(name.file_name());
+        let bytes = writer.write(&path, table, std::slice::from_ref(&batch))?;
+        // Not this history's to merge: of another process, as a file there before it opened.
+        kept.push(Kept { name, bytes, path, ours: false });
+    }
+    Ok(kept)
 }
 
 /// The last `window` of the rings as `<dir>/live.<table>.parquet`, a file of every table (empty

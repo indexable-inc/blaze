@@ -125,8 +125,9 @@ pub struct Pick {
     /// When it started and how long it ran: to its end row, or to the last row its dead daemon
     /// wrote; `None` while it runs, or when the history has no row of it.
     pub row: Option<(i64, i64)>,
-    /// The process of the daemon whose death ended it: the build's only row is its start and
-    /// that process no longer writes the history ([`history::writes`]).
+    /// The process of the daemon whose death ended it: its row says `crashed` (a postmortem
+    /// read back the daemon's last rows, `flight::postmortem`), or its only row is its start
+    /// and that process no longer writes the history ([`history::writes`]).
     pub died: Option<u32>,
 }
 
@@ -142,7 +143,7 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
     // alloc: a query, once a report
     let sql = format!(
         "SELECT CAST(build_id AS UBIGINT) AS build, CAST(started_ns AS BIGINT) AS started_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
-         CAST(process AS BIGINT) AS process FROM (SELECT * FROM builds UNION ALL BY NAME \
+         CAST(process AS BIGINT) AS process, CAST(outcome AS VARCHAR) AS outcome FROM (SELECT * FROM builds UNION ALL BY NAME \
          SELECT NULL::UINTEGER AS process WHERE false) WHERE {which} ORDER BY build_id DESC, dur_ns DESC NULLS LAST"
     );
     let batches = query(source, &sql, "finding the build: the last that ended or whose daemon died")?;
@@ -150,6 +151,7 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
     for batch in &batches {
         const T: &str = "builds";
         let (ids, started, dur, process) = (uints(batch, T, "build")?, ints(batch, T, "started_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "process")?);
+        let outcome = texts(batch, T, "outcome")?;
         for row in 0..batch.num_rows() {
             let Some(id) = get(ids, row, |it, row| it.value(row)) else { continue };
             // A build's first row in this order says how it ended; its others are its start.
@@ -158,10 +160,12 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
             }
             seen = Some(id);
             let start = get(started, row, |it, row| it.value(row));
-            if let (Some(start), Some(dur)) = (start, get(dur, row, |it, row| it.value(row))) {
-                return Ok(Pick { build: id, row: Some((start, dur)), died: None });
-            }
             let pid = get(process, row, |it, row| it.value(row)).and_then(|it| u32::try_from(it).ok());
+            if let (Some(start), Some(dur)) = (start, get(dur, row, |it, row| it.value(row))) {
+                // A crashed build ran to the last row its daemon's postmortem read back.
+                let crashed = get(outcome, row, |it, row| it.value(row)) == Some(history::Outcome::Crashed.name());
+                return Ok(Pick { build: id, row: Some((start, dur)), died: pid.filter(|_| crashed) });
+            }
             match (start, pid) {
                 (Some(start), Some(pid)) if !history::writes(source.history, pid) => {
                     let last = last_row(source, pid, start)?;

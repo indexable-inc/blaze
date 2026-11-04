@@ -13,6 +13,11 @@ use crate::time::{
 
 /// The report of `build`, or of the last build that ended or whose daemon died.
 pub fn run(source: &Source<'_>, build: Option<u64>) -> Result<Report, TimeError> {
+    // A daemon that died with rows it had not flushed: its last seconds, read back from its
+    // flight recorder's mapping, are rows of the history before the build is picked, and its
+    // running builds `crashed` ([`crate::flight::postmortem`]). Nothing while a daemon writes
+    // the history: it read them as it opened.
+    crate::history::recover_dead(source.history).map_err(TimeError::Postmortem)?;
     let pick = crate::time::load::pick(source, build)?;
     let crate::time::load::Rows { input, process, cut } = crate::time::load::rows(source, pick)?;
     let build = input.build;

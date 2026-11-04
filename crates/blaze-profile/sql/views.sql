@@ -15,7 +15,8 @@ SELECT * FROM read_parquet(@counters, union_by_name = true);
 
 -- One row a build: a build has a row as it starts (outcome `running`, no `dur_ns`) and another
 -- as it ends, with the same `started_ns`, and the view keeps the end's. A build with only its start's row never ended: it
--- runs, or its daemon died (`history::writes` tells which).
+-- runs, or its daemon died (`history::writes` tells which). A build whose daemon died with its flight recorder persisted
+-- has an end row of outcome `crashed`, written by the postmortem (`flight::postmortem`), to the last row read back.
 CREATE OR REPLACE VIEW builds AS
 SELECT * FROM read_parquet(@builds, union_by_name = true)
 QUALIFY row_number() OVER (PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST) = 1;

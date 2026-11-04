@@ -316,7 +316,13 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             // from what this one wrote.
             let _owner = owner;
             match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
-                Ok(history) => {
+                Ok(mut history) => {
+                    // The recorder's rows outlive a crash from here on: the next daemon writes
+                    // what this one had not flushed. One that can't be kept is said, not fatal.
+                    if let Err(error) = history.persist_recorder() {
+                        tracing::warn!("{error}");
+                        _ = failed_to.send(error.to_string());  // alloc: error path, once a daemon
+                    }
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);

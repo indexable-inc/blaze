@@ -367,6 +367,9 @@ pub enum TimeError {
     Arrow { table: &'static str, error: arrow_schema::ArrowError },
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
+    /// The rows of a daemon that died could not be read back from its flight recorder's
+    /// mapping, or written into the history ([`crate::history::recover_dead`]).
+    Postmortem(crate::history::HistoryError),
     Io { path: std::path::PathBuf, doing: &'static str, error: std::io::Error },
     /// The rows of build `build` come from more than one process: each daemon numbered a build
     /// so in one history. Read as one build, their workers and windows would be summed.
@@ -395,6 +398,7 @@ impl fmt::Display for TimeError {
             TimeError::Sql { doing, error } => write!(f, "{doing}: {error}"),
             TimeError::Arrow { table, error } => write!(f, "making the rows of the derived table {table}: {error}"),
             TimeError::History(error) => write!(f, "writing a derived table into the history: {error}"),
+            TimeError::Postmortem(error) => write!(f, "reading back the last rows of a daemon that died: {error}"),
             TimeError::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
             TimeError::ManyProcesses { build, processes } => {
                 write!(f, "build {build}'s rows come from {} processes, so they are no one build:", processes.len())?;
