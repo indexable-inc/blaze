@@ -21,7 +21,7 @@ use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
 use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::{Icon, Text};
+use harness_native_ui_text_api::{Icon, OneLine, Text};
 use harness_native_ui_view::{self as view, View, for_each};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -285,7 +285,7 @@ impl App {
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
-        let side = root.child("hn.Sidebar");
+        let side = root.child("hn.SideClip").child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
         let side_w = crate::prefs::get("sidebar_width").and_then(|v| v.as_f64()).map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
         if let Some(w) = side_w {
@@ -547,7 +547,7 @@ impl App {
             (tone(w, "lost"), "connecting".to_owned())
         };
         if let Some(n) = device.part("name") {
-            n.text(&clip_text(&host, 26));
+            n.text(&host);
         }
         if let Some(n) = device.part("count") {
             n.text(&link_word);
@@ -572,7 +572,6 @@ impl App {
             .collect();
         let me = &*self;
         // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
-        let mut fit: Vec<(u64, String, f32)> = Vec::new();
         let indent = |row: View<'_>, depth: usize| {
             if let Some(p) = row.part("indent") {
                 let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * step, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
@@ -639,18 +638,8 @@ impl App {
             }
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             if let Some(p) = row.part("name") {
-                match run {
-                    // A run's command on one line, cut to the room its row leaves it (measured below).
-                    Some(_) => match name_room(row) {
-                        Some(room) => fit.push((p.id(), name.split_whitespace().collect::<Vec<_>>().join(" "), room)),
-                        None => {
-                            p.text(&clip_text(&name, 14));
-                        }
-                    },
-                    None => {
-                        p.text(&clip_text(&name, (26usize).saturating_sub(depth * 2).max(8)));
-                    }
-                }
+                // One line (the part is `OneLine`: drawing cuts it with an ellipsis to the room its row leaves it).
+                p.text(&name.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             if run.is_some()
                 && let Some(p) = row.part("meta")
@@ -660,11 +649,6 @@ impl App {
                 crate::look::hover_show(p.entity(), row.id(), failed || matches!(status, "lost" | "pending" | "skipped"));
             }
         });
-        for (part, text, room) in fit {
-            let style = self.world.entity_from_id(part).try_cloned::<&TextStyle>().unwrap_or_default();
-            let cut = self.fit_text(&text, &style, room);
-            View::of(self.world.entity_from_id(part)).text(&cut);
-        }
         let w = self.world.world_ref();
         // The window title from the selected object; the main card's header parts are written only when the scene has
         // them (hn.Main has no head row now).
@@ -821,7 +805,7 @@ impl App {
             set_if(row, if sel == Some(e) { chosen } else { clear });
             let o = w.entity_from_id(e);
             if let Some(p) = row.part("name") {
-                p.text(&clip_text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default(), 24));
+                p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
             }
             looks.session(me, row, e, String::new());
         });
@@ -1053,27 +1037,30 @@ impl App {
     /// card from the window's top, its terminal padded down by the strip; the title bar the strip's height, its title at
     /// the card's text inset.
     fn lay_chrome(&mut self, z: f32) {
-        use harness_native_ui_layout_api::Padding;
-        use harness_native_ui_node_api::Clip;
+        use harness_native_ui_layout_api::{Padding, ScrollState};
         let w = self.world.world_ref();
         let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
         let (Some(full), Some(pad)) = (proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
         let x = self.side_x.x.clamp(0.0, 1.0);
-        let width = self.side_w.unwrap_or(full.w.value) * x;
+        let open = self.side_w.unwrap_or(full.w.value);
+        let width = open * x;
         if self.chrome_laid == Some((self.chrome, z, width)) {
             return;
         }
         self.chrome_laid = Some((self.chrome, z, width));
         let top = self.chrome.strip / z;
+        // The sidebar keeps its open width (its rows never relayout mid-fold); its clip takes the spring's width and
+        // slides it left by the part folded away.
         if let Some(side) = w.entity_from_id(self.ids.device).parent() {
             let mut size = side.try_cloned::<&Size>().unwrap_or(full);
-            size.w = Sizing { kind: SizeKind::Fixed, value: width, min: 0.0, max: 0.0 };
+            size.w = Sizing::fixed(open);
             side.set(size);
-            side.set(Padding { l: pad.l * x, r: pad.r * x, t: top + pad.t, b: pad.b });
-            if x < 1.0 {
-                side.add(Clip::id());
-            } else {
-                side.remove(Clip::id());
+            side.set(Padding { t: top + pad.t, ..pad });
+            if let Some(clip) = side.parent() {
+                let mut size = clip.try_cloned::<&Size>().unwrap_or(full);
+                size.w = Sizing::fixed(width);
+                clip.set(size);
+                clip.set(ScrollState { x: open - width, y: 0.0 });
             }
         }
         w.entity_from_id(self.ids.main).set(Padding { l: 0.0, r: 0.0, t: top, b: 0.0 });
@@ -1152,7 +1139,7 @@ impl App {
                 let one = self.layout(&t.text, &t.style, 1.0e5);
                 let w = one.lines.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
                 let at = t.at.unwrap_or(w);
-                let lay = if at + 0.5 >= w { one } else { self.layout(&t.text, &t.style, at) };
+                let lay = if t.one_line || at + 0.5 >= w { one } else { self.layout(&t.text, &t.style, at) };
                 let st = set_of(&t.style);
                 let h = lay.lines.last().map_or(st.line, |l| l.top + l.height).max(st.line);
                 Intrinsic { w, h, at }
@@ -1390,7 +1377,13 @@ impl App {
                     let Some(text) = e.try_cloned::<&Text>() else { continue };
                     let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
                     let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let lay = self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                    let lay = if e.has(OneLine::id()) {
+                        // One line, never wrapped: cut with an ellipsis to the width layout gave it.
+                        let cut = self.fit_text(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                        self.layout(&cut, &style, 1.0e5)
+                    } else {
+                        self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5)
+                    };
                     emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x, laid.y), ink, p.alpha, sc, upload);
                 }
                 PaintKind::Icon => {
@@ -1558,7 +1551,7 @@ impl App {
         self.set_pointer(x, y);
         self.poke();
         // On the sidebar's right edge: drag it wider or narrower.
-        if b == Button::Left && self.palette.is_none() && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
+        if b == Button::Left && self.palette.is_none() && self.side_open && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
             if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
                 self.resizing = true;
                 return;
@@ -1979,34 +1972,11 @@ const SIDE_MIN: f32 = 180.0;
 const SIDE_MAX: f32 = 720.0;
 const SIDE_GRAB: f32 = 5.0;
 
-/// Set the sidebar node's width (a folded-away sidebar, zero wide, stays so).
+/// Set the sidebar node's (open) width; its fold's clip follows in `lay_chrome`.
 fn set_side_width(side: EntityView<'_>, v: f32) {
     let Some(mut size) = side.try_cloned::<&Size>() else { return };
-    if size.w.value == 0.0 && size.w.kind == SizeKind::Fixed && side.has(harness_native_ui_node_api::Clip::id()) {
-        return;
-    }
     size.w = Sizing { kind: SizeKind::Fixed, value: v, min: 0.0, max: 0.0 };
     side.set(size);
-}
-
-/// The room (points) a run row leaves its name, from the row's last layout: its width less its padding, the gaps
-/// between its parts and every part but the name and the spacer. None before the row was laid out.
-fn name_room(row: View<'_>) -> Option<f32> {
-    use harness_native_ui_layout_api::{Flex, Padding};
-    let e = row.entity();
-    let laid = e.try_cloned::<&Laid>().filter(|l| l.w > 0.0)?;
-    let pad = e.try_cloned::<&Padding>().unwrap_or_default();
-    let gap = e.try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
-    let mut others = 0.0;
-    let mut parts = 0usize;
-    for name in ["indent", "glyph", "meta", "badge", "dot", "chevron"] {
-        if let Some(p) = row.part(name) {
-            others += p.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
-            parts += 1;
-        }
-    }
-    // name and spacer are the other two children: gaps sit between all of them.
-    Some((laid.w - pad.l - pad.r - others - gap * (parts + 1) as f32 - 1.0).max(24.0))
 }
 
 /// A duration for a run's row: `340ms`, `4.2s`, `38s`, `3m04s`, `2h05m`.

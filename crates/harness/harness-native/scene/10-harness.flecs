@@ -23,6 +23,16 @@ prefab hn.TitleBar : ui.Row {
   }
 }
 
+// The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
+// full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
+// width. The main card's left edge follows the clip's right edge.
+prefab hn.SideClip : ui.Column {
+  Clip
+  Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+}
+
 // The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
 // title-bar strip (the host adds the strip's height).
 prefab hn.Sidebar : ui.Column {
@@ -67,11 +77,13 @@ prefab hn.ArchiveRow : ui.Row {
     HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
   }
   name : ui.Words, Muted {
+    OneLine
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
   // The count pulses when an object is archived.
   count : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
   }
@@ -95,6 +107,7 @@ prefab hn.Badge : ui.Row {
   Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
   Padding: {l: 0, r: 0, t: 0, b: 0}
   code : ui.Words {
+    OneLine
     Fill: $tone_failed
     TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
   }
@@ -107,11 +120,13 @@ prefab hn.DeviceRow : ui.Row {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   name : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
   }
   dot : hn.Dot {}
   spacer : ui.Spacer {}
   count : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -135,10 +150,12 @@ prefab hn.ObjRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Ink {
+    OneLine
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   badge : hn.Badge {}
@@ -164,10 +181,12 @@ prefab hn.RunRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Muted {
+    OneLine
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -191,10 +210,12 @@ prefab hn.GroupRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
   name : ui.Words, Ink {
+    OneLine
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
   meta : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   chevron : ui.Symbol, Faint {
@@ -220,6 +241,7 @@ prefab hn.MoreRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
   name : ui.Words, Faint {
+    OneLine
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
 }

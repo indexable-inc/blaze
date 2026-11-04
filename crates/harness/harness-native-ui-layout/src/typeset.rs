@@ -5,7 +5,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Intrinsic, Padding};
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_node_api::Laid;
-use harness_native_ui_text_api::Text;
+use harness_native_ui_text_api::{OneLine, Text};
 
 /// The host's typesetter, seen from layout: how wide a string runs on one line and how tall it is wrapped at a width. `node`
 /// is the entity the text is on, for a typesetter that keeps its shaping per node.
@@ -47,6 +47,8 @@ pub struct Wanted {
     pub style: TextStyle,
     /// The width layout last gave the node, less its horizontal padding (none before layout has run).
     pub at: Option<f32>,
+    /// A `OneLine` text: one line tall at any width (the host cuts it with an ellipsis when it draws).
+    pub one_line: bool,
     pub now: Intrinsic,
 }
 
@@ -56,7 +58,8 @@ impl Wanted {
     pub fn measure(&self, m: &mut dyn Measure) -> Intrinsic {
         let w = m.width(self.id, &self.text, &self.style);
         let at = self.at.unwrap_or(w);
-        Intrinsic { w, h: m.height(self.id, &self.text, &self.style, at), at }
+        let h = m.height(self.id, &self.text, &self.style, if self.one_line { f32::MAX } else { at });
+        Intrinsic { w, h, at }
     }
 }
 
@@ -72,6 +75,7 @@ pub fn wanted(world: WorldRef<'_>) -> Vec<Wanted> {
             text: t.s.as_str().to_owned(),
             style: e.try_cloned::<&TextStyle>().unwrap_or_default(),
             at: e.try_cloned::<&Laid>().filter(|l| l.w > 0.0).map(|l| (l.w - pad).max(0.0)),
+            one_line: e.has(OneLine::id()),
             now: *now,
         });
     });

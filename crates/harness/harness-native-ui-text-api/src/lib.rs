@@ -18,6 +18,11 @@ pub struct MarkdownText {
     pub fade: f32,
 }
 
+/// The `Text` beside it is set on one line, never wrapped: cut with an ellipsis to the width layout gives it (Finder's
+/// sidebar rows). Its height is one line's whatever its width. A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct OneLine;
+
 /// The glyph of an `Icon`, by name in den's icon set.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Icon {
@@ -58,6 +63,7 @@ pub struct TextRange {
 hyperion_api_layouts::api_layouts! {
     "Text" => alias Text,
     "MarkdownText" => alias MarkdownText,
+    "OneLine" => alias OneLine,
     "Icon" => alias Icon,
     "Picture" => alias Picture,
     "Highlight" => alias Highlight,
@@ -69,6 +75,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Text>().writable();
     world.component::<MarkdownText>().writable();
+    world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
     world.component::<Picture>().writable();
     world.component::<Highlight>().writable();
