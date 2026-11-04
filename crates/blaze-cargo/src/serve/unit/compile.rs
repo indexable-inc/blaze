@@ -1703,12 +1703,14 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
     }
     let plan = job.plan(unit)?;
     let made = artifact::made(plan);
-    let programs = || kept.outputs.iter().filter(|it| it.executable && made.contains(&it.path.as_str()));
+    let programs =
+        || kept.outputs.iter().filter(|it| it.executable && made.contains(&it.path.as_str()));
     if programs().next().is_none() {
         return Ok(());
     }
     // The question its link asked ([`codegen::policy`]): a live build is a dev executable's.
-    let policy = codegen::toolchain(job, unit).and_then(|toolchain| codegen::policy(job, unit, toolchain));
+    let policy =
+        codegen::toolchain(job, unit).and_then(|toolchain| codegen::policy(job, unit, toolchain));
     if policy.map_err(|what| ApiError::new(what, None))?.mode != blaze_codegen::plan::Mode::Live {
         return Ok(());
     }
@@ -1722,12 +1724,19 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
             None => match job.input.store.get(&guard, &output.key) {
                 Ok(Some(it)) => Ok(it.bytes),
                 // alloc: error path
-                Ok(None) => Err(format!("its record names the output {:x}, which the store does not hold", output.key.0)),
+                Ok(None) => Err(format!(
+                    "its record names the output {:x}, which the store does not hold",
+                    output.key.0
+                )),
                 // alloc: error path
-                Err(corrupt) => Err(format!("reading the output {:x} from the store: {corrupt}", output.key.0)),
+                Err(corrupt) => Err(format!(
+                    "reading the output {:x} from the store: {corrupt}",
+                    output.key.0
+                )),
             },
         };
-        let adopted = job.shared.dev_runs.adopt(path, artifact::uplifted(path, plan), output.key, bytes);
+        let runs_from = artifact::uplifted(path, plan);
+        let adopted = job.shared.dev_runs.adopt(path, runs_from, output.key, bytes);
         match adopted.map_err(|what| ApiError::new(format!("{path}: {what}"), None))? {
             // alloc: a path, once per running program replaced
             super::run::inproc::Told::Restart { why } => told.push((path.to_owned(), why)),
@@ -1740,8 +1749,11 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
     let unit_of = job.unit_of(unit)?;
     for (path, why) in told {
         // alloc: a warning's text, once per restart
-        let what = format!("`{path}` is running and can't take this build as a patch: {why}; start it again to run it");
-        kept.diagnostics.push(say::cargo(Level::Warning, what, Some(unit_of.clone()), job.input.color));
+        let what = format!(
+            "`{path}` is running and can't take this build as a patch: {why}; start it again to run it"
+        );
+        let said = say::cargo(Level::Warning, what, Some(unit_of.clone()), job.input.color);
+        kept.diagnostics.push(said);
     }
     Ok(())
 }
