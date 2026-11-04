@@ -1,6 +1,8 @@
 //! Where each fetched source and the standard library are mounted (docs/v2/plan/lanes/cargo/notes.md
 //! section 3): `at -> root`, kept durable in the VFS's journal as one head per mount, so a
-//! restart recovers every source fetched before and fetches none of them again.
+//! restart recovers every source fetched before and fetches none of them again. A path read
+//! where it is on the disk ([`LocalRead`]) is mounted the same way but kept in memory only:
+//! what is under it may change, so a restart reads it again rather than trusting a head.
 
 #![forbid(unsafe_code)]
 
@@ -10,7 +12,10 @@ use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
 use blaze_vfs::{CommitError, Mode, Op, OpError, Ticket, Vfs};
 
-use crate::serve::{fetch::on_disk_id, work::Source};
+use crate::serve::{
+    fetch::on_disk_id,
+    work::{LocalRead, Source},
+};
 
 /// What every mount's head is named by: `mount:<at>`, a NUL, then what `at` is under the root.
 /// A NUL is in no path.
@@ -34,6 +39,17 @@ fn parse(head: &str) -> Option<(String, String)> {
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Mounts {
     by_at: HashMap<String, Mount, Global>,
+    /// Each path read where it is on the disk, by `at`: its mount, the canonical directory
+    /// whose watch vouches for it ([`LocalRead::watched`]) and the watch's generation as read
+    /// before its files were. Never in the journal.
+    locals: HashMap<String, Local, Global>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Local {
+    mount: Mount,
+    watched: Option<String>,
+    generation: u64,
 }
 
 impl Mounts {
@@ -45,7 +61,7 @@ impl Mounts {
                 by_at.insert(at.clone(), Mount { at, origin: Origin::Root(root), under });
             }
         }
-        Mounts { by_at }
+        Mounts { by_at, locals: HashMap::new_in(Global) }
     }
 
     /// Each recovered package mount under `sources` (a registry package, a git checkout) whose
@@ -93,24 +109,55 @@ impl Mounts {
     }
 
     pub fn get(&self, at: &str) -> Option<&Mount> {
-        self.by_at.get(at)
+        self.by_at.get(at).or_else(|| self.locals.get(at).map(|it| &it.mount))
     }
 
     pub fn has(&self, at: &str) -> bool {
-        self.by_at.contains_key(at)
+        self.by_at.contains_key(at) || self.locals.contains_key(at)
     }
 
     /// Every mount, in no order: sort by `at` where the order shows.
     pub fn all(&self) -> impl Iterator<Item = &Mount> {
-        self.by_at.values()
+        self.by_at.values().chain(self.locals.values().map(|it| &it.mount))
+    }
+
+    /// `read` put into the VFS as a root of its own and mounted where it was read, in memory
+    /// only. A local mounted there before is replaced in place, so a job that opened its view
+    /// before reads the old root and one after the new, and none sees the path unmounted.
+    pub fn mount_local(&mut self, vfs: &mut Vfs, read: LocalRead) -> Result<Mount, String> {
+        let LocalRead { at, source: Source { files, under }, watched, generation } = read;
+        if self.by_at.contains_key(&at) {
+            return Err(format!("`{at}` is read where it is on the disk, but a fetched source is mounted there"));
+        }
+        let files = files.into_iter().map(|file| (file.path, file.bytes, file.mode));
+        let root = vfs
+            .apply_files(vfs.empty(), files)
+            .map_err(|error| format!("the files read at {at} don't make a tree: {}", op_error(&error)))?;
+        let mount = Mount { at: at.clone(), origin: Origin::Root(root), under }; // clone: once per path read
+        self.locals.insert(at, Local { mount: mount.clone(), watched, generation }); // clone: as above
+        Ok(mount)
+    }
+
+    /// Where each local mount is that must be read again before a job reads it, sorted: one
+    /// file or an absent path always (no watch vouches for it), a directory unless
+    /// `unchanged(watched, generation)` says nothing under it changed since it was read.
+    pub fn stale_locals(&self, unchanged: impl Fn(&str, u64) -> bool) -> Vec<String> {
+        // alloc: once per job, the locals to read again
+        let mut stale: Vec<String> = self
+            .locals
+            .iter()
+            .filter(|(_, it)| !it.watched.as_deref().is_some_and(|dir| unchanged(dir, it.generation)))
+            .map(|(at, _)| at.clone()) // clone: once per local read again
+            .collect();
+        stale.sort_unstable();
+        stale
     }
 
     /// The roots the mounts hold, sorted by `at`, for a collection to keep: the collection
     /// renumbers the tree in the order it is given.
     pub fn roots(&self) -> Vec<ContentId> {
         let mut held: Vec<(&str, ContentId)> = self
-            .by_at
-            .values()
+            .all()
             .filter_map(|it| match it.origin {
                 Origin::Root(root) => Some((it.at.as_str(), root)),
                 Origin::View => None,
@@ -131,6 +178,7 @@ impl Mounts {
             .map_err(|error| format!("the files of the source for {at} don't make a tree: {}", op_error(&error)))?;
         let mount = Mount { at: at.to_owned(), origin: Origin::Root(root), under };
         let ticket = vfs.set_head(&head_of(&mount), root).map_err(|error| commit_error(at, &error))?;
+        self.locals.remove(at);
         if let Some(old) = self.by_at.insert(at.to_owned(), mount.clone())
             && old.under != mount.under
         {

@@ -86,9 +86,24 @@ pub fn load_error(error: &anyhow::Error, at: Option<String>) -> LoadError {
     LoadError { what, at }
 }
 
-/// A path the load would read that is under no mount: not fetchable, so an error naming it.
-pub(crate) fn unmounted_error(path: &str) -> LoadError {
-    LoadError { what: format!("`{path}` is under no mount of the view"), at: Some(path.to_owned()) }
+/// What a step that reads files through the mounts came to when it did not come to its value:
+/// cargo's error, or the paths it read that no mount covers, each a [`crate::query::FetchKind::Local`]
+/// the daemon reads from the disk and mounts before the load is asked again. A path under no
+/// mount makes the step's answer this whatever else it answered, since that answer was made
+/// without the path's files.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Unread {
+    Failed(LoadError),
+    Needs(Vec<Fetch>),
+}
+
+impl Unread {
+    pub(crate) fn staged<T>(self) -> Staged<T> {
+        match self {
+            Unread::Failed(error) => Staged::Failed(error),
+            Unread::Needs(fetches) => Staged::Needs(fetches),
+        }
+    }
 }
 
 /// The packages a command selects (cargo's `Packages`).
@@ -311,14 +326,14 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
 fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
     let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
-        Err(error) => return Ok(Staged::Failed(error)),
+        Err(unread) => return Ok(unread.staged()),
     };
     let outcome = in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
         resolve::resolved(ctx, ws, spec, |resolved| units::units(ctx, ws, spec, &read, resolved))
     })?;
     Ok(match outcome {
         Ok(staged) => staged,
-        Err(error) => Staged::Failed(error),
+        Err(unread) => unread.staged(),
     })
 }
 

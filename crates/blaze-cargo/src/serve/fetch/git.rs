@@ -62,7 +62,7 @@ fn checkout<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str
             fetch.at
         );
     }
-    read_tree(&checkout.root)
+    read_tree(&checkout.root, |_| false)
 }
 
 /// One fetch's own `$CARGO_HOME`, removed when the fetch is over.
@@ -113,8 +113,9 @@ pub(super) fn cargo_home<'a>(at: &'a str, ident: &str, commit: &str) -> anyhow::
     Ok(home)
 }
 
-/// Every file under `root`, by its `/`-separated path, none of a `.git`.
-fn read_tree(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+/// Every file under `root`, by its `/`-separated path, none of a `.git` and none under a path
+/// `skip` says (given the path under `root`, a directory's before anything in it).
+pub(super) fn read_tree(root: &Path, skip: impl Fn(&str) -> bool) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
     let mut dirs = vec![(root.to_owned(), String::new())];
     while let Some((dir, under)) = dirs.pop() {
@@ -129,6 +130,9 @@ fn read_tree(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
                 continue;
             }
             let path = if under.is_empty() { name.to_owned() } else { format!("{under}/{name}") };
+            if skip(&path) {
+                continue;
+            }
             let kind =
                 entry.file_type().with_context(|| format!("failed to read `{}`", at.display()))?;
             if kind.is_dir() {

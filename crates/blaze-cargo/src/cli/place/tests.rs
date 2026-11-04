@@ -3,10 +3,11 @@ use std::{ffi::OsString, path::Path};
 use super::*;
 
 /// `w/` with `Cargo.toml`, a member `w/crates/a/` with its own and `src/deep/`, and a
-/// `w/.cargo/config.toml`.
+/// `w/.cargo/config.toml`. `w` is canonical, as [`find`] gives every path (a temporary
+/// directory on macOS is under `/var`, a symlink to `/private/var`).
 fn workspace(git: bool) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let w = dir.path().join("w");
+    let w = dir.path().canonicalize().unwrap().join("w");
     std::fs::create_dir_all(w.join("crates/a/src/deep")).unwrap();
     std::fs::create_dir_all(w.join(".cargo")).unwrap();
     std::fs::write(w.join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -48,7 +49,25 @@ fn a_manifest_path_is_from_cwd() {
     let place = find(dir.path(), Some("w/crates/a/../a/Cargo.toml"), false).unwrap();
     assert_eq!(place.manifest, w.join("crates/a/Cargo.toml"));
     assert_eq!(place.root, w);
-    assert_eq!(place.cwd, dir.path());
+    assert_eq!(place.cwd, dir.path().canonicalize().unwrap());
+}
+
+/// A command run through a symlink to the workspace (`/tmp/x` on macOS, which is
+/// `/private/tmp/x`) finds it by its canonical path: one form of each directory, so the view,
+/// the checkout's watch and the load's paths agree.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_cwd_is_found_by_its_canonical_path() {
+    let (dir, w) = workspace(true);
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&w, &link).unwrap();
+    let place = find(&link.join("crates/a"), None, false).unwrap();
+    assert_eq!(place.cwd, w.join("crates/a"));
+    assert_eq!(place.manifest, w.join("crates/a/Cargo.toml"));
+    assert_eq!(place.root, w);
+    let place = find(dir.path(), Some("link/crates/a/Cargo.toml"), false).unwrap();
+    assert_eq!(place.manifest, w.join("crates/a/Cargo.toml"));
+    assert_eq!(place.root, w);
 }
 
 #[test]
@@ -99,23 +118,24 @@ fn paths_normalized_as_cargo_does() {
 
 #[test]
 fn config_files_outside_the_checkout() {
-    let (dir, w) = workspace(true);
-    std::fs::create_dir(dir.path().join(".cargo")).unwrap();
-    std::fs::write(dir.path().join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
-    let home = dir.path().join("home/.cargo");
+    let (_dir, w) = workspace(true);
+    let dir = w.parent().unwrap();
+    std::fs::create_dir(dir.join(".cargo")).unwrap();
+    std::fs::write(dir.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+    let home = dir.join("home/.cargo");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("config.toml"), "[net]\noffline = true\n").unwrap();
     std::fs::write(home.join("credentials.toml"), "[registry]\ntoken = \"x\"\n").unwrap();
-    std::fs::write(dir.path().join("extra.toml"), "[env]\n").unwrap();
+    std::fs::write(dir.join("extra.toml"), "[env]\n").unwrap();
     let place = find(&w.join("crates/a"), None, false).unwrap();
     let configs = ["../../../extra.toml".to_owned(), "build.jobs=4".to_owned(), "../../.cargo/config.toml".to_owned()];
     let files = config_files(&place, &configs, Some(&home)).unwrap();
     let named: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
     let utf8 = |path: PathBuf| path.to_str().unwrap().to_owned();
     assert_eq!(named, [
-        utf8(dir.path().join(".cargo/config.toml")),
+        utf8(dir.join(".cargo/config.toml")),
         utf8(home.join("config.toml")),
-        utf8(dir.path().join("extra.toml")),
+        utf8(dir.join("extra.toml")),
     ]);
     assert_eq!(files[1].1, b"[net]\noffline = true\n");
 }
