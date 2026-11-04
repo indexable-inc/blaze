@@ -186,7 +186,10 @@ impl Narrow {
             BinOp::Shr => "shift right",
             // alloc: error path
             _ => {
-                return format!("attempt to compute `{op:?}` with overflow at type `{}`", self.name);
+                return format!(
+                    "attempt to compute `{op:?}` with overflow at type `{}`",
+                    self.name
+                );
             }
         };
         format!("attempt to {what} with overflow at type `{}`", self.name) // alloc: error path
