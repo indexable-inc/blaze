@@ -28,8 +28,9 @@ use crate::{
     stream::Stream,
 };
 
-/// The fuel one expansion may spend, about one unit a wasm instruction: a derive of serde's
-/// size runs some hundreds of millions natively, so this is tens of times that.
+/// The fuel one expansion may spend, about one unit a wasm instruction that makes code (locals
+/// and constants are free, `engine::fuel_cost`): a derive of serde's size runs some hundreds of
+/// millions natively, so this is tens of times that.
 pub(crate) const FUEL: u64 = 1 << 34;
 
 /// The most elements a module's tables may hold.
@@ -85,6 +86,8 @@ pub(crate) struct Host {
     cx: Option<NonNull<Cx<'static>>>,
     memory: Option<Memory>,
     limits: Limits,
+    /// The requests its `proc_macro` client sent, which the `macro wasm run` span says.
+    requests: u64,
 }
 
 /// The error a shim's stop ends the instance with; the stop itself is in the [`Cx`].
@@ -126,6 +129,7 @@ pub(crate) fn linker(engine: &Engine) -> wasmtime::Result<Linker<Host>> {
 
 fn bridge(l: &mut Linker<Host>) -> wasmtime::Result<()> {
     l.func_wrap(BRIDGE, "dispatch", |mut c: Caller<'_, Host>, request: u32, len: u32| {
+        c.data_mut().requests += 1;
         with(&mut c, |mem, cx| {
             let request = wasi::bytes(mem, request, len)?;
             cx.server.dispatch(cx.answer, request, &mut cx.reply)?;
@@ -247,7 +251,7 @@ pub(crate) fn expand(
 ) -> (Result<Result<Stream, String>, Stop>, Used) {
     // The pointer is valid until the store drops at this function's end (`with`'s SAFETY).
     let pointer = NonNull::from(&mut *cx).cast::<Cx<'static>>();
-    let host = Host { cx: Some(pointer), memory: None, limits: Limits::default() };
+    let host = Host { cx: Some(pointer), memory: None, limits: Limits::default(), requests: 0 };
     let mut store = Store::new(pre.module().engine(), host);
     store.limiter(|host| &mut host.limits);
     let ran = run(&mut store, pre, index, input, watch);
@@ -384,7 +388,15 @@ fn run(store: &mut Store<Host>, pre: &InstancePre<Host>, index: u32, input: &[u8
     };
     let at = alloc.call(&mut *store, len)?;
     memory.write(&mut *store, at as usize, input)?;
-    match expand.call(&mut *store, (index, at, len))? {
+    // What the macro spent in its module, and how often it asked the server: fuel over the
+    // requests is the module's own work, the rest the bridge's.
+    let running = tracing::info_span!(target: "blaze", "macro wasm run", fuel = tracing::field::Empty, requests = tracing::field::Empty).entered();
+    let called = expand.call(&mut *store, (index, at, len));
+    let left = store.get_fuel().unwrap_or(0);
+    running.record("fuel", FUEL.saturating_sub(left));
+    running.record("requests", store.data().requests);
+    drop(running);
+    match called? {
         0 => Ok(()),
         1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),
         status if status & abi::STATUS == abi::UNENTERED => Err(wasmtime::Error::new(Unentered { errno: status >> 8 })),
