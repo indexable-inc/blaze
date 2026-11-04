@@ -13,6 +13,7 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
+    app.set_gpu_clock(renderer.gpu_clock());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset).
     if std::env::var_os("HARNESS_NATIVE_GALLERY").is_some() {
         crate::gallery::load(&app, 32.0)?;
@@ -141,6 +142,10 @@ pub fn run(path: &str) -> Result<(), String> {
             renderer.render(&draw, Dest::Texture(tex.clone()));
             break;
         }
+        // F3's overlay shown: every frame goes to the GPU, so its GPU time is a real one.
+        if app.stats_shown() {
+            renderer.render(&draw, Dest::Texture(tex.clone()));
+        }
         std::thread::sleep(Duration::from_millis(16));
     }
     let px = renderer.read(&tex);
@@ -178,6 +183,9 @@ fn write_png(path: &str, app: &App, px: &[u8], w: u32, h: u32) -> Result<(), Str
 fn press(app: &mut App, spec: &str) {
     let chord = if spec.contains('+') && spec.len() > 1 {
         crate::keys::Chord::parse(&spec.replace("none+", ""))
+    } else if spec.len() > 1 && crate::keys::code_of(&spec.to_lowercase()).is_some() {
+        // A named key alone (`f3`): no modifiers, as its binding names it.
+        Some(crate::keys::Chord { key: spec.to_lowercase(), ..Default::default() })
     } else {
         Some(crate::keys::Chord { key: spec.to_lowercase(), cmd: true, ..Default::default() })
     };

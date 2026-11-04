@@ -98,11 +98,22 @@ fn wake_from_any_thread() -> Arc<dyn Fn() + Send + Sync> {
         DispatchQueue::main().exec_async(move || {
             p.store(false, Ordering::Release);
             with(|st| {
-                st.app.poke();
+                st.app.poke_why("wake");
                 st.link.setPaused(false);
             });
         });
     })
+}
+
+/// F3's overlay is shown and the app idle: wake once in its tick (about 4 Hz), no sooner.
+fn arm_stats_tick() {
+    let when = dispatch2::DispatchTime::try_from(crate::app::STATS_TICK).expect("a short delay");
+    let _ = DispatchQueue::main().after(when, || {
+        with(|st| {
+            st.app.stats_wake();
+            st.link.setPaused(false);
+        });
+    });
 }
 
 fn mods_of(flags: NSEventModifierFlags) -> KeyMods {
@@ -591,6 +602,9 @@ impl HarnessView {
                 (true, false) => {
                     st.link.setPaused(true);
                     st.last = None;
+                    if st.app.stats_arm() {
+                        arm_stats_tick();
+                    }
                 }
                 (false, _) if st.calm => {
                     st.calm = false;
@@ -729,6 +743,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
     let mut app = App::new(wake_from_any_thread())?;
+    app.set_gpu_clock(renderer.gpu_clock());
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }

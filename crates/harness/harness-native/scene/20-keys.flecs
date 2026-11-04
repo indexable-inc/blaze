@@ -54,6 +54,8 @@ act.ZoomIn : act.Zoom { ZoomStep: {step: 1}
 act.ZoomOut : act.Zoom { ZoomStep: {step: -1}
   MenuItem: {bar: "View", title: "Zoom Out"} }
 act.ZoomReset { MenuItem: {bar: "View", title: "Actual Size"} }
+// F3's debug overlay (src/app/stats.rs), kept across launches in native.json `stats`.
+act.ToggleStats { MenuItem: {bar: "View", title: "Debug Stats", sep: 1} }
 
 // Back to the Archive after opening something from it, else the previous object.
 act.PrevObject { MenuItem: {bar: "Go", title: "Previous Object"} }
@@ -141,6 +143,9 @@ key.zoom_out { Keybind: {key: "-", cmd: 1}
   (Does, act.ZoomOut) }
 key.zoom_reset { Keybind: {key: "0", cmd: 1}
   (Does, act.ZoomReset) }
+// Global (no When): it holds while the terminal has the keyboard too, and F3 never reaches the program.
+key.stats { Keybind: {key: "f3"}
+  (Does, act.ToggleStats) }
 
 key.prev { Keybind: {key: "[", cmd: 1}
   (Does, act.PrevObject) }

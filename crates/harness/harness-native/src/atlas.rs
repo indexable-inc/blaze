@@ -18,6 +18,16 @@ impl Packer {
         Self { width, height, x: 0, y: 0, shelf_h: 0 }
     }
 
+    /// How much of the atlas the shelves have taken (0 to 1): the full shelves and the open one up to its pen.
+    #[must_use]
+    pub fn used(&self) -> f32 {
+        let area = f64::from(self.width) * f64::from(self.height);
+        if area <= 0.0 {
+            return 0.0;
+        }
+        ((f64::from(self.y) * f64::from(self.width) + f64::from(self.x) * f64::from(self.shelf_h)) / area) as f32
+    }
+
     /// Top-left of a free `w` by `h` rectangle, or None when the atlas is full.
     pub fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         let (pw, ph) = (w + 2 * PAD, h + 2 * PAD);

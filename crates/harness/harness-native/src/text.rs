@@ -1554,18 +1554,27 @@ pub struct GlyphCache {
     map: HashMap<(FontId, u16, u32, u32), Option<AtlasGlyph>, std::hash::BuildHasherDefault<Quick>>,
     /// A glyph found no room since the last [`GlyphCache::clear`]: it was left out, not remembered as missing.
     full: bool,
+    /// Lookups found in the map and rasterised anew, since launch (F3's overlay, src/app/stats.rs, reads their rate).
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl GlyphCache {
     #[must_use]
     pub fn new(size: u32) -> Self {
-        Self { size, packer: Packer::new(size, size), map: HashMap::default(), full: false }
+        Self { size, packer: Packer::new(size, size), map: HashMap::default(), full: false, hits: 0, misses: 0 }
     }
 
     /// Whether a glyph was left out for want of room since the last [`GlyphCache::clear`].
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.full
+    }
+
+    /// How full the atlas is (0 to 1).
+    #[must_use]
+    pub fn fill(&self) -> f32 {
+        self.packer.used()
     }
 
     /// Forget every glyph and start the atlas over; entries handed out before are no longer valid.
@@ -1588,8 +1597,10 @@ impl GlyphCache {
     ) -> Option<AtlasGlyph> {
         let key = (font, glyph, scale.to_bits(), sub);
         if let Some(e) = self.map.get(&key) {
+            self.hits += 1;
             return *e;
         }
+        self.misses += 1;
         let e = self.place(font::raster_glyph(fonts.font(font)?, glyph, scale, f64::from(sub) / f64::from(SUBPX)), upload);
         if e.is_some() || !self.full {
             self.map.insert(key, e);
