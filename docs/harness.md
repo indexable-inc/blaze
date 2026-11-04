@@ -273,8 +273,8 @@ written from cargo again, and a change to one is a change to what blaze expects.
 | `doctestonce.py` | `blaze test --doc` on a workspace of three libraries, each step held to what `STEPS` states: the workspace is loaded once for all of them, each library's passed count and failed examples in order, the exit status and the packages named as failed (every example passing, two failing under `--fail-fast`, by default and with `--no-fail-fast`, one failing with it), and no example left to rustdoc. Linux and macOS |
 | `blaze_cli.py` | `blaze` on seven real projects, 22 flag combinations, and 11 daemon lifecycle checks, each held to blaze's own run from nothing (`blaze_cli.Scratch`: a fresh home, store and `target-scratch`) and to what it states: every build but `broken` exits 0, every test passes by its own verdict, each flag case exits as its source says. Needs the network and about 20 minutes; not in CI |
 | `live_e2e.py` | Edits of a running program that links `blaze-live`, each applied as a patch; then another program built meanwhile, a start again from the executable, and a panic that unwinds through the patched code. Linux x86-64 and macOS AArch64 |
-| `live_types.py` | A running program's component types changed as a game changes them, on the daemon's own base: `V2` added beside `V1` with a derive, a static id cache and a trait impl, the code moved to it with the values converted and a static new in the edit, `V1` deleted, each a patch whose answer matches blaze's build of the same stage from nothing and whose statics keep their values; then a field of `V2` changed, which restarts naming `struct V2`. Linux x86-64 and macOS AArch64 ([live.md](live.md#types)) |
-| `live_latency.py` | Edit-to-running time of live edits on `harness/live`, `demo/life`, `harness/live-bevy` and `harness/live-egui`, one edit at a time through `blaze build` (`cargo`). Its modes that sent `edit` lines to daemon.sock (`socket`, `burst`, `replay`, `restart`) are refused by name until they are clients of `blaze_api::client`. Writes p50 to p99 and every sample, with the machine and its battery, to `LATENCY_JSON`. Measures; checks nothing; macOS on AArch64 ([live.md](live.md#latency-under-typing), superseded) |
+| `live_types.py` | A running program's component types changed as a game changes them, on the daemon's own base: `V2` added beside `V1` with a derive, a static id cache and a trait impl, the code moved to it with the values converted and a static new in the edit, `V1` deleted, each a patch whose answer matches blaze's build of the same stage from nothing and whose statics keep their values; then a field of `V2` changed, which restarts naming `struct V2`. One typed JSON input (`blaze`, `env`, `keep`, `tmp`). Linux x86-64 and macOS AArch64 ([live.md](live.md#types)) |
+| `live_latency.py` | Edit-to-running time of live edits on `harness/live`, `demo/life`, `harness/live-bevy` and `harness/live-egui`, one edit at a time through `blaze build`, with one typed JSON input (`blaze`, `program`, `edits`, `json`, `machine`, `tmp`). Writes p50 to p99 and every sample, with the machine and its battery, to the input's `json`. Measures; checks nothing; macOS on AArch64 ([live.md](live.md#latency-under-typing), superseded) |
 | `spaces.py` | A two-crate workspace under a directory whose name has spaces, `$$`, `#` and quotes, built and edited with `blaze build`; every edit has to be applied by the daemon against rustc's symbols ([#14](https://github.com/indexable-inc/blaze/issues/14)) |
 | `nocompact.py` | A program linked with `-no_compact_unwind`, as bun is, which has `__eh_frame` and no `__unwind_info`: its edits are spliced, and the unwinder finds the frame of the edited function where its symbol now is, behind the program's frames and, once a thousand new functions outgrow that room, with all of them moved into the header's ([#33](https://github.com/indexable-inc/blaze/issues/33)). macOS on AArch64 |
 | `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is told the room the unwind information of its objects wants and is linked once ([#173](https://github.com/indexable-inc/blaze/issues/173)), the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/blaze/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/blaze/issues/30)). The daemon's own links. macOS on AArch64 |
@@ -372,17 +372,13 @@ every platform, so one that did not run keeps its last numbers. `benchcharts.py`
 benchmark charts (SVG, a light and a dark version, a bar per platform) from the same results;
 `benchreport.py` regenerates them whenever it writes a table, `--charts` on its own, and
 `--render` every table and chart.
-`live_latency.py` times live edits on macOS on AArch64 one at a time through `blaze build`
-(`cargo`); its JSON goes to `benchhistory.py live`. Its modes that sent the demo's `edit` lines
-to daemon.sock (`socket`, `burst`, `replay`, `restart`) are refused by name: nothing reads those
-lines since the demo's editor commits through blaze-api, and they come back as clients of
-`blaze_api::client`. The numbers once measured on a MacBook are in
-[live.md](live.md#latency-under-typing) (superseded).
-`nix develop .#bench` has everything `bench.py` and `hotpatch.py` need (the nightly, mold, wild,
-`dx`, bevy's libraries; zed's are in `.#bench-zed`, since every library directory slows each
-link cargo makes), and `live_latency.py` runs under it as under rustup's copy of the pinned nightly. Under another
-toolchain the daemon builds nothing, and the harness stops at once with what `blaze`
-says of it.
+`live_latency.py` times live edits on macOS on AArch64 one at a time through `blaze build`, with
+one typed JSON input (`{"blaze": PATH, "program": "probe" | "life" | "bevy" | "egui", "edits": 10,
+"json": PATH}`; the fields are in its docstring); its JSON goes to `benchhistory.py live`. The
+numbers once measured on a MacBook are in [live.md](live.md#latency-under-typing) (superseded).
+`nix develop .#bench` has everything `bench.py` and `live_latency.py` need: blaze's stage 0,
+the pinned LLVM, mold, wild and bevy's libraries, and no Rust toolchain (blaze brings its own);
+zed's libraries are in `.#bench-zed`, since every library directory slows each link.
 
 ### The v2 proof
 

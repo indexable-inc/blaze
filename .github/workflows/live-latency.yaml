@@ -1,4 +1,4 @@
-# Save-to-running latency of live edits on macOS arm64, step by step (harness/live_latency.py).
+# Save-to-running latency of live edits on macOS arm64, edit by edit (harness/live_latency.py).
 # Runs on a push to a live-latency* branch, by hand, and every night on main. A run on main adds
 # a line to docs/benchmarks/history/macos-arm64-live.jsonl (the site's /bench page charts it)
 # and checks it against the runs before it (harness/benchhistory.py): a median past its noise
@@ -11,11 +11,8 @@ on:
     - cron: "41 8 * * *"
   workflow_dispatch:
     inputs:
-      modes:
-        description: "cargo (socket, burst, replay and restart wait on a blaze_api::client port)"
-        default: "cargo"
       edits:
-        description: edits timed per mode
+        description: edits timed
         default: "10"
 
 # A newer push to the branch cancels the run before it; the nightly run and a run by hand are
@@ -23,10 +20,6 @@ on:
 concurrency:
   group: live-latency-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
-
-env:
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
 
 permissions:
   contents: write
@@ -47,37 +40,29 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # cargo, with no cache: the latency timed is of blaze as rustc compiles it, since the blaze
-      # that blaze builds runs about ten times slower until it inlines one function into another
-      # (https://github.com/indexable-inc/blaze/issues/899).
-      - run: cargo build --release -p blaze-engine
+      # This tree's blaze, built by stage 0 (AGENTS.md rule blaze-builds-blaze): the latency
+      # timed is of the blaze this commit makes.
+      - uses: ./.github/actions/blaze
+        with:
+          job: tests
+      - run: blaze build -p blaze-engine --release --locked
+      # The release's daemon ends first; live_latency.py runs the tree's blaze in a home of its own.
+      - run: blaze stop
+      # live_latency.py reads its input with the workspace's typed_input (pyproject.toml, uv.lock).
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: time edits of a running program
         env:
-          LATENCY_EDITS: ${{ inputs.edits || '10' }}
-          # The file has what it ran on (commit, run, host, battery) for benchhistory.py live.
-          LATENCY_JSON: ${{ runner.temp }}/latency.json
-          BLAZE_BENCH_MACHINE: GitHub macos-15 runner
+          EDITS: ${{ inputs.edits || '10' }}
+          PROGRAM: ${{ matrix.program }}
           BLAZE_IDLE_SECS: "0"
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'cargo' }}
-      - name: what the workers said
-        if: always()
+        # The JSON has what it ran on (commit, run, host, battery) for benchhistory.py live.
         run: |
-          for log in "$HOME"/.cache/blaze/workers/*/log "$HOME"/.cache/blaze/spares/*/log; do
-            [ -f "$log" ] || continue
-            echo "::group::$log (filtered)"
-            grep -E "request:|timeline-us|apply-us|splice|steps:|asked:|edit-to-binary|link:|live:|panicked|error" "$log" | cut -c1-400 | tail -300 || true
-            echo "::endgroup::"
-          done
+          uv run --frozen --no-dev python harness/live_latency.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"program\": \"$PROGRAM\", \"edits\": $EDITS, \"json\": \"$RUNNER_TEMP/latency.json\", \"machine\": \"GitHub macos-15 runner\"}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: latency-${{ matrix.program }}
-          path: |
-            ${{ runner.temp }}/latency.json
-            ~/.cache/blaze/daemon.log
-            ~/.cache/blaze/workers/*/log
-            ~/.cache/blaze/spares/*/log
+          path: ${{ runner.temp }}/latency.json
           if-no-files-found: warn
 
   history:
