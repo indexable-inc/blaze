@@ -9,16 +9,29 @@ description: "How blaze is built, checked, tested and measured, and how a lane r
 
 ## blaze-builds-blaze (rule 2)
 
-Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze test`), never `cargo
-build`/`cargo test` or sccache. cargo only bootstraps: it builds the `blaze` binary, and every
-check, test and verdict after that comes from blaze. When blaze fails on blaze (a compile error, a
-link error, a panic, a hang, a wrong result, too slow, too much memory), that failure is the work:
-fix blaze, never route around it through cargo. A crate blaze can't check or test yet is a ranked,
-owned blocker, not a reason to keep using cargo for it.
+Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze test`), never `cargo`,
+`rustc` or sccache, in any place: an agent's loop, a harness, a CI workflow, a benchmark, the
+release build or a doc's instructions. Stage 0 is a blaze binary (the release
+`.github/blaze-version` names, or a blaze built earlier), never cargo, until the wasm seed replaces
+it (docs/future/bootstrap.md). Every build, check, test and verdict comes from blaze. When blaze
+fails on blaze (a compile error, a link error, a panic, a hang, a wrong result, too slow, too much
+memory), that failure is the work: fix blaze, never route around it through cargo. A crate blaze
+can't check or test yet is a ranked, owned blocker, not a reason to keep using cargo for it.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
-## own-nightly (rule 6)
+## verify-on-real-projects (rule 6)
+
+A verdict on blaze comes from real projects built by blaze: blaze itself, then large open-source
+workspaces (ripgrep, nushell, bevy, wasmtime, tokio, ...), each built with `blaze build` and its own
+tests run with `blaze test`. A project whose tests pass under blaze is correct for what they cover;
+a failing test is a blaze bug to fix. Never build a project with rustc or cargo to diff against: no
+reference build, no output comparison with rustc's, no harness that runs cargo for an oracle. A
+test's expectation states what is right, not what rustc printed.
+
+See [docs/harness.md](../../../docs/harness.md).
+
+## own-nightly (rule 7)
 
 blaze is its own toolchain: it builds every project with its pinned nightly (`harness/toolchain`,
 bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN` and `RUSTC`. Projects pin
@@ -26,26 +39,26 @@ the blaze version, not Rust's.
 
 See [docs/toolchain.md](../../../docs/toolchain.md).
 
-## measure-the-exact-tree (rule 19)
+## measure-the-exact-tree (rule 20)
 
 A measurement, bisect or checkpoint names the exact tree it ran on (a content digest of the sources
 and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and
 committing. A result you can't tie to a tree is not evidence.
 
-## test-the-cause (rule 20)
+## test-the-cause (rule 21)
 
 A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
 fast) is tested by removing the cause and watching the effect go, not by checking that its premises
 hold. Pin a load-bearing one with a test named for the property.
 
-## work-in-ix-vms (rule 29)
+## work-in-ix-vms (rule 30)
 
 Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix
 rm`), never on AWS. Where neither can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
-## fan-out-write-only (rule 30)
+## fan-out-write-only (rule 31)
 
 Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
 run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
@@ -55,12 +68,12 @@ It hands each failure back to a fresh subagent for the code that broke, with the
 command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
 show its test fails (test-the-cause), are also run by the main agent, as patches.
 
-## worktree-per-lane (rule 31)
+## worktree-per-lane (rule 32)
 
 One uniquely named worktree per lane; its build directory is its own under blaze's root, never in
 the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 
-## clean-up-lane (rule 34)
+## clean-up-lane (rule 35)
 
 When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
 
