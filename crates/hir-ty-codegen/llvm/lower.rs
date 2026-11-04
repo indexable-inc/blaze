@@ -589,7 +589,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     /// Adds the function `defined` is to `module`, with the attributes of its signature,
-    /// keeping its frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`).
+    /// keeping every frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`,
+    /// `-C force-frame-pointers`) and, where the target's ABI wants one, a frame record in
+    /// every function that calls ([`crate::Target::llvm_frame_pointer`]).
     pub(super) fn add(
         context: &'ctx Context,
         module: &Module<'ctx>,
@@ -614,8 +616,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         });
         let probe = target.stack_probe().map(|probe| ("probe-stack", probe));
         // Without, LLVM gives the frame pointer's register to values, and code that walks the
-        // frames by it reads one of those.
-        let frame = frame_pointers.then_some(("frame-pointer", "all"));
+        // frames by it reads one of those. On Apple's targets every function that calls keeps
+        // a frame record whatever `frame_pointers` says, as the ABI wants and rustc does
+        // (`Target::llvm_frame_pointer`): without it a release function that saves x29/x30
+        // below an unmoved x29 has nothing but its DWARF rows to say where its caller is.
+        let frame = target.llvm_frame_pointer(frame_pointers).map(|it| ("frame-pointer", it));
         for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);

@@ -558,6 +558,31 @@ impl Target {
         !self.exception_in_register() || self.variable_arguments() == Some(VariableArguments::Stack)
     }
 
+    /// Whether the target's ABI wants a frame record in every function that calls, whatever
+    /// the flags say: Apple's (arm64 and x86-64), as rustc's Apple target specs have
+    /// `frame_pointer: NonLeaf`. libunwind's compact `FRAME` mode and every walk by the frame
+    /// chain (sampling profilers, `backtrace` without tables) find the caller through it;
+    /// a function that calls and keeps no frame record leaves its return address where only
+    /// its DWARF rows say. `-C force-frame-pointers=no` cannot take it away, as in rustc
+    /// (`FramePointer::ratchet`).
+    pub(crate) fn requires_frame_pointers(&self) -> bool {
+        self.triple().contains("-apple-")
+    }
+
+    /// LLVM's `"frame-pointer"` attribute of a function of this target: `all` when its unit
+    /// forces them (`forced`, `-C force-frame-pointers=yes`: its `Toolchain::frame_pointers`),
+    /// else `non-leaf` where the ABI wants a frame record in every function that calls
+    /// ([`Target::requires_frame_pointers`]), else none, LLVM's default. rustc's
+    /// `frame_pointer_type_attr`, for every function blaze gives LLVM, whichever path it
+    /// comes by (v1's units and exports have no toolchain and pass `forced: false`).
+    pub(crate) fn llvm_frame_pointer(&self, forced: bool) -> Option<&'static str> {
+        match (forced, self.requires_frame_pointers()) {
+            (true, _) => Some("all"),
+            (false, true) => Some("non-leaf"),
+            (false, false) => None,
+        }
+    }
+
     /// The processor code is made for: the baseline of the target, as rustc compiles for.
     pub fn cpu(&self) -> &'static str {
         match (self.arch, self.object_format) {
@@ -785,6 +810,24 @@ mod tests {
         assert!(!avx2.is_baseline() && Features::BASELINE.is_baseline());
         assert_eq!(avx2.names(), ["+avx", "+avx2"]);
         assert!(Features::BASELINE.names().is_empty());
+    }
+
+    /// rustc's frame pointers: `all` when forced, Apple's `non-leaf` whatever the flags, else
+    /// LLVM's default.
+    #[test]
+    fn frame_pointers_are_forced_or_the_abis() {
+        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let apple = Target::of(apple).expect("a target");
+            assert!(apple.requires_frame_pointers());
+            assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
+            assert_eq!(apple.llvm_frame_pointer(true), Some("all"));
+        }
+        for other in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let other = Target::of(other).expect("a target");
+            assert!(!other.requires_frame_pointers(), "{}", other.triple());
+            assert_eq!(other.llvm_frame_pointer(false), None);
+            assert_eq!(other.llvm_frame_pointer(true), Some("all"));
+        }
     }
 
     #[test]

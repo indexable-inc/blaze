@@ -73,9 +73,11 @@ pub fn sections_of_their_own() -> bool {
     !edits_follow() || LINKS_OWN.load(Ordering::Relaxed)
 }
 
-/// Whether v1's compiles (`Backend::emit`, the tier, LLVM's units and exports) keep every
-/// function's frame pointer: no, as they never did. They have no toolchain to say otherwise,
-/// and keep one only where a function reads its own (`Isa::FramePointer`). v2 reads each
+/// Whether v1's compiles (`Backend::emit`, the tier, LLVM's units and exports) are forced to
+/// keep every function's frame pointer (`-C force-frame-pointers`): no, as they never were.
+/// They have no toolchain to say otherwise, and keep one where a function reads its own
+/// (`Isa::FramePointer`) and where the target's ABI wants a frame record
+/// (`Target::requires_frame_pointers`, `Target::llvm_frame_pointer`). v2 reads each
 /// unit's `Toolchain::frame_pointers` where its code is made (`v2::Function::frame_pointers`):
 /// one process compiles units of several toolchains at once, the target's and its build
 /// scripts', so no process-wide setting can stand for any one of them.

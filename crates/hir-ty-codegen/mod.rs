@@ -3126,8 +3126,12 @@ fn emit_with(
                 .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetReturnAddress)
         })
     };
+    // On Apple's targets every function keeps one, as their ABI wants of every function that
+    // calls (`Target::requires_frame_pointers`): Cranelift has no "non-leaf only", and its
+    // code kept them there before the toolchain stopped saying so for the target.
     if !isa.flags().preserve_frame_pointers()
         && (frame_pointers
+            || target.requires_frame_pointers()
             || func.layout.entry_block().is_some_and(|entry| {
                 func.layout
                     .block_insts(entry)
