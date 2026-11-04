@@ -41,6 +41,9 @@ pub enum Type {
     Dict,
     /// A call stack, outermost frame first, each frame a [`Type::Dict`] string.
     Stack,
+    /// A call stack as raw return addresses, outermost first, each a `u64`: what the image the
+    /// row names (its hash and load base) can name again later.
+    Pcs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -721,8 +724,52 @@ pub const PERF_FUNCTIONS: Table = Table {
     ],
 };
 
+/// One row a panic or a fatal signal of a blaze process, with the stack it was raised on
+/// (`crate::panics`, `crate::crash`). A panic is recorded by the process's panic hook as it is
+/// raised, into a fixed ring the history drains at each flush. A fatal signal (SIGSEGV, SIGBUS,
+/// SIGILL, SIGFPE, SIGABRT) is recorded by a signal handler into `<history>/crash.<pid>`, a file
+/// mapped into the process, which the next daemon to open the history turns into a row of kind
+/// `signal` and deletes. One table for both: each is a thread that failed at a stack, and "what
+/// failed in build N" is one query; the columns only one of them fills are null in the other.
+pub const PANICS: Table = Table {
+    name: "panics",
+    doc: "one row a panic or a fatal signal of a blaze process, with its stack and the spans its thread was inside",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        THREAD,
+        THREAD_NAME,
+        col("t_ns", Type::I64, "when it was raised"),
+        col("kind", Type::Dict, "panic, or signal (a fatal signal, recovered from the process's crash file after it died)"),
+        opt("job", Type::U64, "the job running on the thread, as `switches.job` names it; null on no job and for a signal"),
+        opt("span_id", Type::U64, "the innermost span its thread was inside, as `spans.span_id`; null outside any"),
+        opt(
+            "message",
+            Type::Utf8,
+            "a panic's text (cut at 1 KiB, ending in `...`), null for a payload that is no text; for a signal its name and what it means, then the thread's last panic when it had one (an abort after a panic)",
+        ),
+        opt("location", Type::Utf8, "a panic's `file:line:column`; for a signal, the location of the thread's last panic, if any"),
+        col("stack", Type::Stack, "the call stack, outermost first, each frame named (`function+offset`), the panic machinery's own frames included"),
+        col(
+            "stack_pcs",
+            Type::Pcs,
+            "the same stack as raw return addresses, outermost first, for naming again with the image `image_hash` and `image_base` name",
+        ),
+        opt("image_hash", Type::Utf8, "the BLAKE3 hash of the executable the addresses are of, as `builds.blaze`; null when it could not be read"),
+        opt("image_base", Type::U64, "where that executable was loaded in the process (its first byte); addresses outside it are a shared library's"),
+        col(
+            "caught",
+            Type::U32,
+            "1 when a job's boundary catches it (a plane task's or a pool job's on its fiber), so only that job failed and the daemon kept serving; 0 for a panic nothing catches (the thread ends) and for a signal",
+        ),
+        col("open_spans", Type::Stack, "the names of the spans its thread was inside, outermost first (the first 16)"),
+        opt("signal", Type::Dict, "for a signal: its name (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT); null for a panic"),
+        opt("fault_addr", Type::U64, "for a signal: the address it is about (`si_addr`: the faulting access for SIGSEGV and SIGBUS); null for a panic"),
+    ],
+};
+
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 23] = [
+pub const TABLES: [&Table; 24] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -746,6 +793,7 @@ pub const TABLES: [&Table; 23] = [
     &PERF_FUNCTIONS,
     &OPEN,
     &FOLDED,
+    &PANICS,
 ];
 
 /// The tables that are results, made on request and not kept.

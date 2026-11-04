@@ -1730,6 +1730,29 @@ pub(crate) fn build_of(id: u64) -> u32 {
     by_number(ring_of(id)).and_then(|ring| ring.opened(id)).map_or(0, |it| it.build)
 }
 
+/// The spans the live thread with the operating system's id `tid` is inside now, outermost
+/// first, each given to `each` with its name (the first [`OPEN_MAX`]); the innermost one's id,
+/// 0 for none or a thread with no ring. Atomics and the callsite table only (no lock, no
+/// allocation, no thread-local), so a fatal signal's handler may call it on the thread that
+/// faulted (`crate::crash`), as the panic hook does (`crate::panics`).
+pub(crate) fn open_of_thread(tid: u32, each: &mut dyn FnMut(u64, &'static str)) -> u64 {
+    let ring = BY_NUMBER
+        .iter()
+        .map_while(OnceLock::get)
+        .copied()
+        .find(|ring| ring.live.load(Ordering::Acquire) && ring.current().0 == tid);
+    let Some(ring) = ring else { return 0 };
+    let depth = ring.depth.load(Ordering::Acquire) as usize;
+    let mut innermost = 0;
+    for slot in &ring.entered[..depth.min(OPEN_MAX)] {
+        let id = slot.load(Ordering::Relaxed);
+        innermost = id;
+        let name = site_of(id).and_then(meta).map_or("?", |it| it.name());
+        each(id, name);
+    }
+    innermost
+}
+
 /// The site of the open span `id`.
 pub(crate) fn site_of(id: u64) -> Option<u16> {
     if id == UNRECORDED {

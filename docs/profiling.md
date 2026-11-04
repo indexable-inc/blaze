@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, samples, provenance, inputs, alloc_samples, heap_by_owner; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` / `BLAZE_STATS`.
+summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, samples, provenance, inputs, alloc_samples, heap_by_owner, panics; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` / `BLAZE_STATS`.
 date: 2026-10-31
 ---
 # Profiling blaze
@@ -522,6 +522,53 @@ inside, not only the query's kind, and the history of a daemon that died says wh
 inside at most one flush (5 s) before its end: `blaze slow` reads it for the build the death
 ended, and the CLI a dead daemon hung up on quotes it.
 
+### `panics`: one row a panic, or a fatal signal a daemon died of
+
+Every panic of a daemon, caught or not, and each fatal signal (SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+SIGABRT) a blaze daemon died of, with the stack of the thread it was on. One table for both,
+told apart by `kind`: a fatal signal is a panic the process could not survive, the questions
+asked of them are the same (which thread, inside which spans, at which frames, in which build),
+and an abort a panic led to is one row naming both.
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64? | the build it was in: the thread's job's, or its innermost span's |
+| process, thread | u32 | the process and the OS thread id |
+| thread_name | dict | std's name for the thread, else the system's |
+| t_ns | i64 | when, on the schema's clock |
+| kind | dict | `panic` or `signal` |
+| job, span_id | u64? | the job running on the thread, and its innermost open span |
+| message | utf8? | the panic's text, cut at 1 KiB with `...`; a signal's name and meaning (and the fault address for SIGSEGV and SIGBUS), then the thread's last panic, if it had one |
+| location | utf8? | `file:line:column` the panic was raised at (a signal: its thread's last panic's) |
+| stack | list<dict> | the frames, outermost first, each named |
+| stack_pcs | list<u64> | the same frames as raw return addresses, outermost first, so they can be named again later |
+| image_hash, image_base | utf8?, u64? | the BLAKE3 of the executable the addresses are of, and where it was loaded: the `images` table's key |
+| caught | u32 | 1 when a job's boundary caught it (that job failed, the build went on) |
+| open_spans | list<dict> | the spans the thread was inside, outermost first |
+| signal | dict? | `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` or `SIGABRT`; null for a panic |
+| fault_addr | u64? | the address the signal was about |
+
+A panic is recorded by the process's one panic hook (`blaze_profile::panics::record`, which the
+daemon installs through `plane::record_panics`) into a fixed ring of 64 slots, with no
+allocation and no lock: a seqlock of atomics, its stack walked up the frame pointers with each
+frame record probed readable first (the kernel copies it into a pipe, refusing with `EFAULT`
+where it is unmapped). The task that catches a panic reads where it was raised from the same
+ring, and each flush of the history writes the rows new since the last.
+
+A fatal signal is recorded by an async-signal-safe handler (`blaze_profile::crash`), on the
+alternate signal stack, into `<history>/crash.<pid>`: one page, mapped shared, of a fixed layout
+(magic `BLZCRSH`, layout version, the executable's BLAKE3 and load address, then the signal, its
+code and address, the thread, the faulting PC and each return address up the frame pointers from
+the signal's context, the open spans and the thread's last panic). Then the signal goes on to the
+handler that was there (the line `serve::signals` writes to the log, then std's), and ends the
+process as it would have. The next daemon to open the history turns the record of each process
+that is gone into a row, its addresses named by this executable's symbols at the dead process's
+load slide, and deletes the file once the row is written. A record of another layout or another
+blaze executable is refused with an error naming it and why, and set aside as
+`crash.<pid>.refused`: another binary's symbols would name its addresses wrongly. The CLI a dead
+daemon hung up on reads the record in place and quotes it with its top frames; `blaze slow`
+lists a build's panics, and the signal its daemon died of, with theirs.
+
 ## Utilization: where a build's wall time goes
 
 The standard utilization query is the view `utilization_per_second`. For each second of a build
@@ -660,7 +707,9 @@ A build whose daemon died (killed, as an out-of-memory kill does, crashed, or en
 stop's bound) has no end row; its report runs to the daemon's last row, says "ended by the
 daemon's death" with the pid, and names what each thread was inside at the daemon's last reading
 of its open spans: each span, what a wait awaited and the job that ran it (`build.died` in the
-JSON, report version 3).
+JSON, report version 3). A build's panics, and the fatal signal its daemon died of, are listed
+after it, each with where it was raised, its thread, its message and the top frames of its stack
+past the panic machinery's own (`build.panics`, report version 5).
 
 A build is its number: its rows are the rows tagged with it, and the rows of no build in its
 `builds` row's window from the same process. When rows of one number come from more than one

@@ -4,7 +4,10 @@
 
 use arrow_array::RecordBatch;
 
-use super::{BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, QueryCount, Recorder, Report, SpanKind, ThreadName, analyse};
+use super::{
+    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, QueryCount, Recorder, Report, SpanKind, ThreadName,
+    analyse,
+};
 use crate::time::{
     Model, TimeError,
     load::{Source, get, ints, query, query_many, texts, uints},
@@ -24,6 +27,7 @@ pub fn run(source: &Source<'_>, build: Option<u64>) -> Result<Report, TimeError>
     if let (Some(process), Some((t0, t1))) = (pick.died, window) {
         facts.build.died = Some(died(source, process, t0, t1)?);
     }
+    facts.build.panics = panics(source, build, pick.died)?;
     Ok(analyse(&model, &path, &facts))
 }
 
@@ -60,6 +64,43 @@ fn died(source: &Source<'_>, process: u32, t0: i64, t1: i64) -> Result<Died, Tim
         }
     }
     Ok(it)
+}
+
+/// How many frames of each panic's stack a report keeps.
+const PANIC_FRAMES: usize = 8;
+
+/// The panics of `build`, and the fatal signal of `died`, the daemon that died in it, if any:
+/// its `panics` rows, oldest first.
+fn panics(source: &Source<'_>, build: u64, died: Option<u32>) -> Result<Vec<PanicFacts>, TimeError> {
+    // alloc: a condition, once a report
+    let of_died = died.map_or(String::new(), |it| format!(" OR (kind = 'signal' AND process = {it})"));
+    // The stack as one text, its frames a line each, outermost first.
+    // alloc: a query, once a report
+    let sql = format!(
+        "SELECT CAST(kind AS VARCHAR) AS kind, CAST(caught AS BIGINT) AS caught, CAST(message AS VARCHAR) AS message, \
+         CAST(location AS VARCHAR) AS location, CAST(thread_name AS VARCHAR) AS thread_name, CAST(signal AS VARCHAR) AS signal, \
+         array_to_string(CAST(stack AS VARCHAR[]), chr(10)) AS stack FROM panics \
+         WHERE build_id = {build}{of_died} ORDER BY t_ns, process, thread"
+    );
+    let batches = query(source, &sql, "reading the build's panics and its daemon's fatal signal")?;
+    // alloc: once a report
+    let mut out = Vec::new();
+    for (batch, row) in rows(&batches) {
+        const T: &str = "panics";
+        // alloc: a report's lines
+        let stack: Vec<String> = text(batch, T, "stack", row)?.unwrap_or_default().lines().map(str::to_owned).collect();
+        out.push(PanicFacts {
+            kind: text(batch, T, "kind", row)?.unwrap_or_default(),
+            caught: int(batch, T, "caught", row)?.is_some_and(|it| it != 0),
+            message: text(batch, T, "message", row)?,
+            location: text(batch, T, "location", row)?,
+            thread: text(batch, T, "thread_name", row)?,
+            signal: text(batch, T, "signal", row)?,
+            // alloc: a report's lines
+            top: crate::panics::top_frames(&stack, PANIC_FRAMES).into_iter().map(str::to_owned).collect(),
+        });
+    }
+    Ok(out)
 }
 
 /// The rows of `build` beside its time model; `window` is its `builds` row's start and end, and

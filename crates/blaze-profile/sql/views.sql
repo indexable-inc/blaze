@@ -44,6 +44,10 @@ SELECT * FROM read_parquet(@events, union_by_name = true);
 CREATE OR REPLACE VIEW errors AS
 SELECT * FROM read_parquet(@errors, union_by_name = true);
 
+-- Each panic and fatal signal of a blaze process, with its stack (`kind` panic or signal).
+CREATE OR REPLACE VIEW panics AS
+SELECT * FROM read_parquet(@panics, union_by_name = true);
+
 CREATE OR REPLACE VIEW links AS
 SELECT * FROM read_parquet(@links, union_by_name = true);
 

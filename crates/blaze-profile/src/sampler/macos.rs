@@ -45,8 +45,7 @@ const STATE_COUNT: libc::mach_msg_type_number_t =
     (size_of::<State>() / size_of::<libc::natural_t>()) as _;
 const _: () = assert!(STATE_COUNT == 68);
 
-/// User addresses on arm64 macOS are below 2^47; above are tag bits.
-const ADDRESS: u64 = (1 << 47) - 1;
+use crate::stack::ADDRESS;
 
 /// A thread the sampler may stop: its port and stack, set by the thread itself as it takes a
 /// ring and cleared as it leaves, under the ring's lock, which the sampler holds while the
@@ -172,7 +171,8 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
 }
 
 /// The stopped thread's PC, then the return address of each frame record from its frame
-/// pointer up, each record inside its stack `[low, high)` and above the one before.
+/// pointer up ([`crate::stack::walk`]), each record inside its stack `[low, high)` and above the
+/// one before.
 fn walk(state: &State, low: u64, high: u64, sample: &mut Sample) {
     let mut push = |pc: u64| {
         let pc = pc & ADDRESS;
@@ -184,20 +184,9 @@ fn walk(state: &State, low: u64, high: u64, sample: &mut Sample) {
         true
     };
     push(state.pc);
-    let mut fp = state.fp & ADDRESS;
-    while fp >= low && fp % 16 == 0 && fp.saturating_add(16) <= high {
-        let record = fp as *const u64;
-        // SAFETY: `fp` is 16-aligned and its 16 bytes are inside the stopped thread's stack,
-        // which is mapped for as long as the thread lives (it cannot leave: the caller holds the
-        // lock it takes to), and nothing writes it while it is stopped.
-        let next = unsafe { record.read_volatile() } & ADDRESS;
-        // SAFETY: as above, the second word of the record.
-        let ret = unsafe { record.wrapping_add(1).read_volatile() };
-        if !push(ret) || next <= fp {
-            break;
-        }
-        fp = next;
-    }
+    // The stopped thread's stack is mapped for as long as it lives (it cannot leave: the caller
+    // holds the lock it takes to), and nothing writes it while it is stopped.
+    crate::stack::walk(state.fp, &mut |fp| fp >= low && fp.saturating_add(16) <= high, &mut push);
 }
 
 #[cfg(test)]

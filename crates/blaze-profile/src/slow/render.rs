@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Died, DiedThread, Estimate, Report, s};
+use super::{Died, DiedThread, Estimate, PanicFacts, Report, s};
 
 /// `report` as text, the first `top` findings and blind spots of each.
 pub fn text(report: &Report, top: usize) -> String {
@@ -25,6 +25,7 @@ pub fn text(report: &Report, top: usize) -> String {
     if let Some(died) = &b.died {
         died_text(died, top, &mut out);
     }
+    panics_text(&b.panics, top, &mut out);
     // alloc: a line
     let links: Vec<String> = sum.path_by_link.iter().map(|it| format!("{} {}", it.name, s(it.ns))).collect();
     _ = writeln!(out, "  critical path {} back to {}: {}", s(sum.path_ns), sum.path_reached, links.join(", "));
@@ -88,6 +89,40 @@ fn died_text(died: &Died, top: usize, out: &mut String) {
     let hidden = died.threads.len().saturating_sub(top);
     if hidden > 0 {
         _ = writeln!(out, "    ({hidden} more threads past --top)");
+    }
+}
+
+/// The build's panics and its daemon's fatal signal, the first `top`, each with its stack's top
+/// frames: `panics: 2 (1 caught by its job)`, then `panicked at src/a.rs:3:5 on thread w: oops`
+/// and `at <frame>` lines.
+fn panics_text(panics: &[PanicFacts], top: usize, out: &mut String) {
+    if panics.is_empty() {
+        return;
+    }
+    let caught = panics.iter().filter(|it| it.caught).count();
+    _ = writeln!(out, "  panics: {} ({caught} caught by its job)", panics.len());
+    for it in panics.iter().take(top) {
+        let what = match (it.kind.as_str(), &it.signal) {
+            ("signal", Some(signal)) => format!("the daemon died of {signal}"), // alloc: a line
+            ("signal", None) => "the daemon died of a fatal signal".to_owned(), // alloc: a line
+            (_, _) if it.caught => "panicked, failing its job".to_owned(), // alloc: a line
+            (_, _) => "panicked, caught by no job".to_owned(), // alloc: a line
+        };
+        _ = write!(out, "    {what}");
+        if let Some(at) = &it.location {
+            _ = write!(out, " at {at}");
+        }
+        if let Some(thread) = &it.thread {
+            _ = write!(out, " on thread {thread}");
+        }
+        _ = writeln!(out, ": {}", it.message.as_deref().unwrap_or("(no message)"));
+        for frame in &it.top {
+            _ = writeln!(out, "      at {frame}");
+        }
+    }
+    let hidden = panics.len().saturating_sub(top);
+    if hidden > 0 {
+        _ = writeln!(out, "    ({hidden} more panics past --top)");
     }
 }
 
