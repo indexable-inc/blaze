@@ -1,4 +1,4 @@
-//! The user's Ghostty config, live (crates/harness-ghostty-config): the terminal's colours, font and padding, and the
+//! The user's Ghostty config, live (crates/harness/harness-ghostty-config): the terminal's colours, font and padding, and the
 //! tokens that sit on the terminal's ground (the main card, the title bar's inks, the sidebar's tint, the plates),
 //! derived from the theme's ground and ink for each appearance whose theme sets a background. Where nothing is set the
 //! scene's tokens and the built-in theme stay.

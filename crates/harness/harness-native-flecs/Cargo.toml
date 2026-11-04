@@ -13,11 +13,11 @@ json = []
 
 [dependencies]
 harness-native-flecs-derive = { path = "../harness-native-flecs-derive" }
-hyperion-api-layouts = { path = "../../vendor/hyperion-api-layouts" }
-hyperion-ecs = { path = "../../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
-hyperion-ecs-core = { path = "../../vendor/hyperion-ecs-core" }
-hyperion-layout = { path = "../../vendor/hyperion-layout", package = "hyperion-abi-layout" }
-hyperion-panic = { path = "../../vendor/hyperion-panic" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
+hyperion-ecs-core = { path = "../vendor/hyperion-ecs-core" }
+hyperion-layout = { path = "../vendor/hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-panic = { path = "../vendor/hyperion-panic" }
 inventory = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

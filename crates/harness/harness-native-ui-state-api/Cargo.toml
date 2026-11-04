@@ -8,5 +8,5 @@ publish = false
 
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
-hyperion-api-layouts = { path = "../../vendor/hyperion-api-layouts" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
 

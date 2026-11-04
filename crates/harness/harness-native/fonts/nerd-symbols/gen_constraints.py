@@ -2,7 +2,7 @@
 
 Ghostty generates src/font/nerd_font_tables.zig from the Nerd Fonts patcher (src/font/nerd_font_codegen.py): a 3-level
 lookup from a codepoint to a `Glyph.RenderOptions.Constraint`. This reads that generated file and writes the same data as
-codepoint ranges for crates/harness-native/src/text/nerd.rs.
+codepoint ranges for crates/harness/harness-native/src/text/nerd.rs.
 
     uv run python fonts/nerd-symbols/gen_constraints.py <nerd_font_tables.zig> <ghostty commit> > src/text/nerd.rs
 """

@@ -1,5 +1,5 @@
 //! The daemon link: harnessd's unix socket (`~/.harness/harnessd.sock`, frames of `[type u8][len u32 BE][payload]`, see
-//! crates/harness/src/proto.rs), spoken from plain threads.
+//! crates/harness/harness/src/proto.rs), spoken from plain threads.
 //!
 //! - [`ensure_daemon`] connects, or starts `harness daemon` the way the CLI's `ensure_daemon` does (setsid, output appended
 //!   to `~/.harness/daemon.log`) and waits for the socket.
@@ -81,7 +81,7 @@ fn harness_bin() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("HARNESS_BIN") {
         return Some(p.into());
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     for p in ["target/release/harness", "target/debug/harness"] {
         let p = root.join(p);
         if p.is_file() {

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The zig libghostty-vt (crates/harness-vt) builds with: 0.17.0, as ghostty's build.zig.zon requires,
+# The zig libghostty-vt (crates/harness/harness-vt) builds with: 0.17.0, as ghostty's build.zig.zon requires,
 # from mitchellh/zig-overlay at a pinned rev. Cargo points libghostty-vt-sys's build at this via .cargo/config.toml.
 set -e
 arch=$(uname -m | sed 's/arm64/aarch64/'); os=$(uname -s | tr A-Z a-z)

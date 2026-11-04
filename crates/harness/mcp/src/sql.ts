@@ -1,6 +1,6 @@
 // sql`...`: DuckDB in this process over the harness object store, returning a Table<Row>.
 //
-// Views (see crates/harness/src/db.rs for the index the daemon writes):
+// Views (see crates/harness/harness/src/db.rs for the index the daemon writes):
 //   objects   every object: PTY sessions (s7: claude|codex|cursor|shell), runs (r12: proc), stages (r12.0: stage), REPL cells (repl)
 //   sessions, runs, stages   objects filtered by kind
 //   streams   (object, stream, path, bytes, compacted_ms, archive_path): one raw append-only file per object stream

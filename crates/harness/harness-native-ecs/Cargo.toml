@@ -7,8 +7,8 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-hyperion-ecs = { path = "../../vendor/hyperion-ecs" }
-hyperion-flecs-c = { path = "../../vendor/hyperion-flecs-c" }
+hyperion-ecs = { path = "../vendor/hyperion-ecs" }
+hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c" }
 
 # `Home` (not on wasm32): the oneshot that `Home::run` awaits.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

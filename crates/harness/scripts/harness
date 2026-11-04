@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build (incrementally) and run the harness binary from this checkout.
 set -e
-root=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$root/Cargo.toml" >&2
 exec "$root/target/release/harness" "$@"

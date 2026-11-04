@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
-hyperion-api-layouts = { path = "../../vendor/hyperion-api-layouts" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
 
 [lints.rust]
 unsafe_code = "forbid"

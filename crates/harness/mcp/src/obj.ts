@@ -1,6 +1,6 @@
 // The object API: every agent PTY (s7), process run (r12) and run stage (r12.0) is an object with an
 // id, a name, a parent, append-only streams (read here straight from ~/.harness, or via sql) and RPC
-// through the daemon's one `rpc {id, method, args}` op (see crates/harness/src/object.rs).
+// through the daemon's one `rpc {id, method, args}` op (see crates/harness/harness/src/object.rs).
 import { existsSync, readFileSync } from "node:fs";
 import { req } from "./daemon.ts";
 import { sql } from "./sql.ts";
