@@ -1,5 +1,7 @@
 //! The `messages` stream of an agent object: its conversation, normalized from the agent's own
-//! transcript into JSON lines {object, role, kind: text|thinking|tool_call|tool_result, tool, text, ts_ms}.
+//! transcript into JSON lines {object, role, kind: text|thinking|tool_call|tool_result|turn_end, tool, text, ts_ms}.
+//! `turn_end` (role system) marks the agent going idle after a turn: Claude's `turn_duration` entry,
+//! Codex's `task_complete` event (text = its last agent message). `Obj.reply()` waits on it.
 //!
 //! Claude: started with `--session-id <uuid>` (meta.claude_session), so its transcript is
 //! ~/.claude/projects/<cwd slug>/<uuid>.jsonl (the profile keeps HOME, so it's the user's ~/.claude).
@@ -56,6 +58,10 @@ fn as_text(v: &Value) -> String {
 
 fn claude_rows(o: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
     let ty = o["type"].as_str().unwrap_or("");
+    if ty == "system" && o["subtype"] == "turn_duration" {
+        let ts = o["timestamp"].as_str().and_then(iso_ms);
+        return vec![json!({ "role": "system", "kind": "turn_end", "tool": null, "text": "", "ts_ms": ts })];
+    }
     if ty != "user" && ty != "assistant" {
         return vec![];
     }
@@ -88,6 +94,11 @@ fn claude_rows(o: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
 }
 
 fn codex_rows(o: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
+    if o["type"] == "event_msg" && o["payload"]["type"] == "task_complete" {
+        let ts = o["timestamp"].as_str().and_then(iso_ms);
+        let text = o["payload"]["last_agent_message"].as_str().unwrap_or("");
+        return vec![json!({ "role": "system", "kind": "turn_end", "tool": null, "text": text, "ts_ms": ts })];
+    }
     if o["type"] != "response_item" {
         return vec![];
     }
@@ -170,6 +181,17 @@ pub fn sync(only_running: bool) {
             eprintln!("messages {oid}: {e:#}");
         }
     }
+}
+
+/// Bring one agent's messages stream up to date now (instead of at the next 2s poll).
+pub fn sync_object(oid: &str) -> anyhow::Result<()> {
+    let Some((kind, meta)) = db::object_kind_meta(oid) else { anyhow::bail!("no object {oid}") };
+    if kind != "claude" && kind != "codex" {
+        return Ok(());
+    }
+    let claimed: Vec<PathBuf> =
+        db::agent_sessions(false).iter().filter_map(|(_, _, m)| m["transcript"].as_str().map(PathBuf::from)).collect();
+    sync_one(oid, &kind, &meta, &claimed)
 }
 
 fn sync_one(oid: &str, kind: &str, meta: &Value, claimed: &[PathBuf]) -> anyhow::Result<()> {

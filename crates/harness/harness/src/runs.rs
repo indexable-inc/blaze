@@ -58,6 +58,13 @@ pub enum RunReq {
     },
     RunKill { id: String },
     RunWait { id: String, timeout_ms: Option<u64> },
+    /// Write to a live run's stdin (runs started with `live_stdin`); `close` ends it (EOF).
+    RunStdin {
+        id: String,
+        data: Option<String>,
+        #[serde(default)]
+        close: bool,
+    },
 }
 
 fn default_stream() -> String { "out".into() }
@@ -65,6 +72,10 @@ fn default_stream() -> String { "out".into() }
 struct Live {
     pid: u32,
     done: watch::Receiver<bool>,
+    /// Unique among running objects (get-or-create spawn finds the run by it).
+    name: Option<String>,
+    /// The write end of a live stdin pipe, kept open until `close` or exit.
+    stdin: Mutex<Option<std::io::PipeWriter>>,
 }
 
 struct Store {
@@ -319,9 +330,53 @@ fn script(parts: &[(Op, Vec<String>)], dir: &Path, exe: &Path) -> String {
 
 // ---------------------------------------------------------------- running
 
+/// Start a run as an object (object.rs): optional unique `name`, and with `live_stdin` a pipe the
+/// caller writes through `run_stdin` (else `stdin` text, or /dev/null). Call inside the runtime.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn(
+    cmd: String, cwd: Option<String>, env: BTreeMap<String, String>, clear_env: bool, session: Option<u64>,
+    parent: Option<String>, stdin: Option<String>, name: Option<String>, live_stdin: bool,
+) -> Result<Value> {
+    let _g = tokio::runtime::Handle::current().enter();
+    start(cmd, cwd, env, clear_env, session, parent, stdin, name, live_stdin)
+}
+
+/// The live run holding `name`, if any.
+pub fn live_named(name: &str) -> Option<String> {
+    store().live.lock().unwrap().iter().find(|(_, l)| l.name.as_deref() == Some(name)).map(|(id, _)| id.clone())
+}
+
+/// Write `data` to a live run's stdin (also appended to its `stdin` stream), then close it if asked.
+fn write_stdin(id: &str, data: Option<&str>, close: bool) -> Result<Value> {
+    use std::io::Write;
+    let d = run_dir(id)?;
+    let l = store().live.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("run {id} is not running"))?;
+    let mut w = l.stdin.lock().unwrap();
+    if let Some(data) = data.filter(|s| !s.is_empty()) {
+        let pipe = w.as_mut().ok_or_else(|| anyhow!("run {id} has no open stdin (spawn it with live stdin; closed already?)"))?;
+        pipe.write_all(data.as_bytes()).with_context(|| format!("write stdin of {id}"))?;
+        pipe.flush()?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(d.join("stdin"))?;
+        f.write_all(data.as_bytes())?;
+    }
+    if close {
+        *w = None;
+    }
+    Ok(json!({ "ok": true, "open": w.is_some() }))
+}
+
+/// Send a signal to a live run's process group.
+pub fn signal(id: &str, sig: i32) -> Result<Value> {
+    run_dir(id)?;
+    let Some(l) = store().live.lock().unwrap().get(id).cloned() else { return Ok(json!({ "ok": true, "running": false })) };
+    unsafe { libc::kill(-(l.pid as i32), sig) };
+    Ok(json!({ "ok": true, "running": true }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn start(
     cmd: String, cwd: Option<String>, env: BTreeMap<String, String>, clear_env: bool, session: Option<u64>,
-    parent: Option<String>, stdin: Option<String>,
+    parent: Option<String>, stdin: Option<String>, name: Option<String>, live_stdin: bool,
 ) -> Result<Value> {
     let st = store();
     let n = st.next.fetch_add(1, Ordering::Relaxed);
@@ -342,7 +397,14 @@ fn start(
     let exe = std::env::current_exe()?;
     let body = script(&parts, &d, &exe);
     std::fs::write(d.join("script.sh"), &body)?;
+    let mut stdin_pipe = None;
     let stdin_file = match &stdin {
+        _ if live_stdin => {
+            std::fs::write(d.join("stdin"), stdin.as_deref().unwrap_or(""))?;
+            let (r, w) = std::io::pipe()?;
+            stdin_pipe = Some(w);
+            std::process::Stdio::from(r)
+        }
         Some(s) => {
             std::fs::write(d.join("stdin"), s)?;
             std::process::Stdio::from(std::fs::File::open(d.join("stdin"))?)
@@ -365,14 +427,18 @@ fn start(
     c.process_group(0).kill_on_drop(false);
     let mut child = c.spawn().with_context(|| format!("spawn {bash}"))?;
     let pid = child.id().unwrap_or(0);
+    if let (Some(w), Some(text)) = (stdin_pipe.as_mut(), stdin.as_deref().filter(|_| live_stdin)) {
+        // After spawn, so text past the pipe buffer drains into the child instead of blocking.
+        let _ = std::io::Write::write_all(w, text.as_bytes());
+    }
     let meta = json!({
-        "id": id, "cmd": cmd, "cwd": cwd, "session": session, "parent": parent, "pid": pid, "start_ms": now_ms(),
+        "id": id, "cmd": cmd, "name": name, "cwd": cwd, "session": session, "parent": parent, "pid": pid, "start_ms": now_ms(),
         "end_ms": null, "exit_code": null, "signal": null, "split": parts.len() > 1 || parts[0].1.len() > 1,
         "pipelines": pipelines, "stages": stages,
     });
     write_meta(&d, &meta)?;
     let (tx, rx) = watch::channel(false);
-    st.live.lock().unwrap().insert(id.clone(), Arc::new(Live { pid, done: rx }));
+    st.live.lock().unwrap().insert(id.clone(), Arc::new(Live { pid, done: rx, name, stdin: Mutex::new(stdin_pipe) }));
     index(&id);
     let mut err = child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
     let id2 = id.clone();
@@ -691,8 +757,9 @@ pub fn handle(req: RunReq) -> Result<Value> {
     match req {
         RunReq::Run { cmd, cwd, env, clear_env, session, parent, stdin } => {
             let _g = rt.enter();
-            start(cmd, cwd, env, clear_env, session, parent, stdin)
+            start(cmd, cwd, env, clear_env, session, parent, stdin, None, false)
         }
+        RunReq::RunStdin { id, data, close } => write_stdin(&id, data.as_deref(), close),
         RunReq::RunStatus { id } => status(&id, true),
         RunReq::Runs { session, limit } => list(session, limit.unwrap_or(50)),
         RunReq::RunRead { id, stage, stream, offset, max_bytes, wait_ms } => {

@@ -109,7 +109,7 @@ pub fn upsert_run(m: &Value, dir: &Path) {
         let session = m["session"].as_u64();
         let parent = m["parent"].as_str().map(str::to_string).or(session.map(|s| format!("s{s}")));
         put_obj(&tx, &Obj {
-            id: &id, kind: "proc", parent: parent.as_deref(), cwd: m["cwd"].as_str(), args: json!([m["cmd"]]),
+            id: &id, kind: "proc", name: m["name"].as_str(), parent: parent.as_deref(), cwd: m["cwd"].as_str(), args: json!([m["cmd"]]),
             created_ms: m["start_ms"].as_i64(), ended_ms: m["end_ms"].as_i64(), status: m["status"].as_str(),
             exit_code: m["exit_code"].as_i64(), signal: m["signal"].as_str(),
             meta: json!({ "session": session, "parent_run": m["parent"], "pid": m["pid"], "split": m["split"],
@@ -303,6 +303,45 @@ pub fn set_meta(id: &str, key: &str, v: &Value) {
         params![id, key, v.to_string()],
     );
     log("set_meta", r);
+}
+
+/// (kind, meta) of one object.
+pub fn object_kind_meta(id: &str) -> Option<(String, Value)> {
+    let r = conn()
+        .query_row("select kind, meta from objects where id = ?1", [id], |r| {
+            let meta: Option<String> = r.get(1)?;
+            Ok((r.get::<_, String>(0)?, meta.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null)))
+        })
+        .optional();
+    log("object_kind_meta", r).flatten()
+}
+
+/// The most recent object ever named `name`.
+pub fn object_by_name(name: &str) -> Option<String> {
+    let r = conn()
+        .query_row("select id from objects where name = ?1 order by created_ms desc limit 1", [name], |r| r.get::<_, String>(0))
+        .optional();
+    log("object_by_name", r).flatten()
+}
+
+/// One object's index row as JSON (null when unknown).
+pub fn object(id: &str) -> Value {
+    let r = conn()
+        .query_row(
+            "select id, kind, name, parent, cwd, status, exit_code, signal, created_ms, ended_ms from objects where id = ?1",
+            [id],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
+                    "parent": r.get::<_, Option<String>>(3)?, "cwd": r.get::<_, Option<String>>(4)?,
+                    "status": r.get::<_, Option<String>>(5)?, "exit_code": r.get::<_, Option<i64>>(6)?,
+                    "signal": r.get::<_, Option<String>>(7)?, "created_ms": r.get::<_, Option<i64>>(8)?,
+                    "ended_ms": r.get::<_, Option<i64>>(9)?,
+                }))
+            },
+        )
+        .optional();
+    log("object", r).flatten().unwrap_or(Value::Null)
 }
 
 pub fn index_stream(object: &str, stream: &str, path: &Path) {

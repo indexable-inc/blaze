@@ -373,6 +373,7 @@ pub async fn run(web_port: u16) -> Result<()> {
     std::fs::write(paths::info(), json!({ "pid": std::process::id(), "web": format!("http://127.0.0.1:{web_port}") }).to_string())?;
     eprintln!("harnessd pid {} socket {} web http://127.0.0.1:{web_port}", std::process::id(), sock.display());
     tokio::spawn(web::serve(d.clone(), web));
+    tokio::spawn(crate::wt::serve(d.clone()));
     loop {
         let (stream, _) = listener.accept().await?;
         let d = d.clone();

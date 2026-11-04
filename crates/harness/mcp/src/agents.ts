@@ -1,5 +1,5 @@
-// Talk to harnessd from the REPL: list the agent tree, spawn child agents (they appear in the
-// harness web UI and TUI under this agent), type into sessions, and read their screens.
+// Deprecated: the first agent-tree API, kept as thin aliases over the object API in obj.ts
+// (spawn/obj/objects/tree, Obj.prompt/screen/kill/reply). Ids here are bare session numbers.
 import { table, type Table } from "./table.ts";
 import { req } from "./daemon.ts";
 
@@ -44,13 +44,13 @@ export const agents = {
   /** Start an agent as a child of this one (it shows up under us in the harness UI). */
   async spawn(opts: { kind?: Kind; prompt?: string; args?: string[]; cwd?: string; cols?: number; rows?: number } = {}): Promise<number> {
     const { kind = "claude", prompt, args = [], cwd = process.cwd(), cols = 140, rows = 45 } = opts;
-    const r = await req<{ id: number }>({ op: "spawn", kind, prompt, args, cwd, cols, rows, parent: selfId() });
-    return r.id;
+    const r = await req<{ id: string }>({ op: "spawn_object", kind, prompt, args, cwd, cols, rows, parent: selfId() });
+    return Number(r.id.slice(1));
   },
 
   /** Type a message into a session and press Enter (bracketed paste, so multi-line stays one message). */
   async send(id: number, text: string, opts: { submit?: boolean; raw?: boolean } = {}): Promise<void> {
-    await req({ op: "send", id, text, submit: opts.submit ?? true, raw: opts.raw ?? false });
+    await req({ op: "rpc", id: `s${id}`, method: opts.raw ? "input" : "prompt", args: opts.raw ? { data: text } : { text, submit: opts.submit ?? true } });
   },
 
   /** Message the agent that spawned this one. */
@@ -62,7 +62,7 @@ export const agents = {
 
   /** The session's visible screen as plain text. */
   async screen(id: number): Promise<string> {
-    return (await req<{ text: string }>({ op: "screen", id })).text;
+    return (await req<{ text: string }>({ op: "rpc", id: `s${id}`, method: "screen" })).text;
   },
 
   /** Poll a session's screen until `match` appears (or timeout). Returns the screen. */
@@ -76,7 +76,7 @@ export const agents = {
     }
   },
 
-  async kill(id: number): Promise<void> { await req({ op: "kill", id }); },
+  async kill(id: number): Promise<void> { await req({ op: "rpc", id: `s${id}`, method: "kill" }); },
 
   /** Web UI address, deep-linked to a session if given. */
   async url(id?: number): Promise<string> {

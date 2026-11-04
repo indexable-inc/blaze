@@ -9,6 +9,7 @@ mod proto;
 mod queries;
 mod runs;
 mod web;
+mod wt;
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -28,7 +29,7 @@ harness run '<cmd>'           run a shell command through the daemon (every pipe
 harness runs [N]              list the N (default 20) most recent runs of every agent
 harness out <run> [stage] [--err]
                               print a run's stored output: the caller-visible stdout, or one stage's
-harness web                   print the web UI address
+harness web                   print the web UI addresses and open ix.dev/harness (HARNESS_UI=local: localhost)
 harness daemon [--port N]     run the daemon in the foreground (normally started automatically)
 harness stop                  stop the daemon and every session";
 
@@ -81,8 +82,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("web") => {
-            println!("{}", client::Ctl::connect().await?.req(json!({"op": "info"})).await?["web"].as_str().unwrap_or(""));
-            Ok(())
+            open_web(None).await
         }
         Some("stop") => {
             let mut ctl = client::Ctl::connect().await?;
@@ -131,14 +131,36 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Print the web UI address (deep-linked to a session if given) and open it in the browser.
+/// Print the web UI addresses (deep-linked to a session if given) and open one in the browser:
+/// ix.dev/harness over WebTransport by default, http://localhost:4747 with HARNESS_UI=local.
 async fn open_web(session: Option<u64>) -> Result<()> {
     let base = client::Ctl::connect().await?.req(json!({"op": "info"})).await?["web"].as_str().unwrap_or("").to_string();
-    let url = match session {
+    let local = match session {
         Some(id) => format!("{base}/#{id}"),
         None => base,
     };
-    println!("{url}");
+    // The daemon writes its WebTransport link into daemon.json a moment after it starts listening.
+    let mut remote = None;
+    for _ in 0..20 {
+        let info: serde_json::Value = std::fs::read(paths::info()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        if let Some(link) = info["wt_link"].as_str() {
+            remote = Some(match session {
+                Some(id) => format!("{link}&object=s{id}"),
+                None => link.to_string(),
+            });
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let want_local = std::env::var("HARNESS_UI").is_ok_and(|v| v == "local");
+    let url = match (&remote, want_local) {
+        (Some(r), false) => r.clone(),
+        _ => local.clone(),
+    };
+    if let Some(r) = &remote {
+        println!("{r}");
+    }
+    println!("{local}");
     if std::env::var_os("HARNESS_NO_OPEN").is_none() {
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
         let _ = std::process::Command::new(opener).arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
