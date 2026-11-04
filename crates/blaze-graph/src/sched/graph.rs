@@ -893,6 +893,14 @@ impl Graph {
             if Some(job) == dropper {
                 continue;
             }
+            // A job that stops a pool of its own ([`Graph::wait_member`]) is not parked: its
+            // thread runs the stop and looks for the pool's end itself, so no wake can end its
+            // wait, and one would resume whatever park its stale token names now (another
+            // job's, which then reads a wait as ended that is not). A cycle through it is
+            // broken by that stop, which fails its pool's jobs whose waits lead back to it.
+            if let Target::Member(_) = self.jobs[job.0 as usize].wait {
+                continue;
+            }
             let cycle = match dropper {
                 Some(dropper) => match self.closes_cycle(dropper.0, Target::Job(job.0)) {
                     Some(from) => Some(self.cycle(dropper.0, from)),
@@ -908,10 +916,6 @@ impl Graph {
     /// `job`, waiting, leaves its wait's list of waiters: its wait is over, ended by no one.
     fn unlink(&mut self, job: u32) {
         let target = self.jobs[job as usize].wait;
-        if let Target::Member(_) = target {
-            self.jobs[job as usize].wait = Target::None;
-            return;
-        }
         let next = std::mem::replace(&mut self.jobs[job as usize].next, NONE);
         let mut at = *self.waiters_of(job, target);
         if at == job {

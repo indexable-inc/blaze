@@ -1213,3 +1213,50 @@ fn a_critical_waiter_raises_every_job_along_its_waits() {
     assert!(!sched.is_critical(JobId(3)), "job 3 is along no wait of job 0");
     sched.audit();
 }
+
+/// A job of a pool that stops can itself be stopping a pool of its own (its thread drops a
+/// nested pool, waiting in the graph for that pool's jobs): it is not parked, so the outer
+/// stop must not wake it, even when its wait leads to the outer pool's dropper. A wake there
+/// hands the pool the job's last park token, which by then names another job's park: that job
+/// resumes with its wait read as ended (pump's "a wait on a run's flight ended before the run
+/// wrote its waiters"). The cycle is broken by the inner stop instead, which fails the inner
+/// pool's job whose wait leads back to the stopping job.
+#[test]
+fn a_pool_stop_wakes_no_job_that_is_stopping_a_pool_itself() {
+    let mut world = World::new(16, ids::take_domain());
+    let outer = world.join_own(false);
+    let inner = world.join_own(false);
+    let client = world.join_own(true);
+    // The thread that drops the outer pool, holding a key.
+    let dropper = world.add_own(client, 0x10, None);
+    assert!(world.claim(key(1), Some(dropper)));
+    // A job of the outer pool, which drops the inner pool; its last park's token, stale now.
+    let stopping = world.add_own(outer, 0x20, None);
+    // A job of the inner pool, parked on the dropper's key.
+    let parked = world.add_own(inner, 0x30, None);
+    assert!(matches!(world.suspended(inner, parked, Wait::Key(key(1))), Ok(Suspend::Waiting)));
+    world.stop_begins(stopping, inner);
+    world.stop_begins(dropper, outer);
+
+    // stopping -> inner's jobs -> key 1 -> dropper -> outer's jobs -> stopping: a cycle, but
+    // the outer stop's only waiting job runs, so it wakes nothing.
+    let woke = world.stop_own(outer, StopReason::Dropper { dropper, panicking: false });
+    let mut tokens = Vec::new();
+    world.take_woken(outer, &mut tokens);
+    assert_eq!((woke, tokens.as_slice()), (0, &[][..]), "the outer stop woke a job that is not parked");
+
+    // The inner stop breaks it: its parked job, whose wait leads to the stopping job, fails.
+    let woke = world.stop_own(inner, StopReason::Dropper { dropper: stopping, panicking: false });
+    world.take_woken(inner, &mut tokens);
+    assert_eq!((woke, tokens.as_slice()), (1, &[0x30][..]), "the inner stop fails its parked job");
+    assert!(world.take_failed(parked).is_some(), "the inner pool's job fails with the stop");
+
+    world.stop_ended(stopping);
+    world.stop_ended(dropper);
+    world.done(inner, parked);
+    world.done(outer, stopping);
+    world.done(client, dropper);
+    world.leave_own(inner);
+    world.leave_own(outer);
+    world.leave_own(client);
+}

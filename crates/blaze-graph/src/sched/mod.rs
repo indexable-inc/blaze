@@ -1824,6 +1824,14 @@ impl World {
             let home = self.graph.home(JobId(job));
             if home.member & OWN != 0 {
                 if let Some(own) = find_mut(&mut self.own, home.member) {
+                    // A token is the job's park: a wake of a job that is not parked would hand
+                    // its pool a stale one, naming whatever park reuses its record now.
+                    assert!(
+                        own.state[home.local as usize] == OwnState::Waiting,
+                        "job {job} of member {} woke while not parked ({:?})",
+                        home.member,
+                        own.state[home.local as usize],
+                    );
                     own.state[home.local as usize] = OwnState::Running;
                     own.woken.push(own.token[home.local as usize]);
                     self.touch(home.member);
