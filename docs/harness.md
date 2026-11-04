@@ -101,8 +101,9 @@ harnesses are of three kinds:
   build prints under `--message-format=json-render-diagnostics` (`blaze_cli.Side` adds it, and
   keeps in `stdout` only the program's or the tests' own output after that line; rustc's
   diagnostics stay rendered on stderr), or else its first error. v2 builds only through its
-  daemon, and that no rustc runs is `norustc.py`'s. The daemon's pid is `blaze status --json`'s
-  (`storelib.blaze_status`).
+  daemon, and that no rustc runs is `norustc.py`'s. The daemon's pid is its lock's
+  (`storelib.daemon_pid`), which names a daemon that is busy or stopping too; the rest of what
+  it says of itself is `blaze status --json`'s (`storelib.blaze_status`).
 - **Edit, rebuild, compare with a fresh build**, on `rebuild.py`: an edit gives the program a
   fresh build of the edited source gives, which is what incremental builds rest on. A
   `rebuild.Project` builds a checkout with `blaze build` (or `test`, `run`) under a warm daemon
