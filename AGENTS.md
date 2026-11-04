@@ -20,73 +20,76 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    `compiler-correctness`.
 5. **useful-not-parity**: rustc and cargo are references, not specs: judge output by usefulness and
    match them only where real code or tools depend on it. Skill: `compiler-correctness`.
-6. **verify-on-real-projects**: Judge blaze by building big real projects with blaze and running their
+6. **blaze-uses-its-extensions**: blaze's own crates use blaze's language extensions (`#[blaze::pure]`,
+   effects, contracts, ...) directly, enforced, with no rustc-compatible fallback or cfg guard.
+   Skill: `compiler-correctness`.
+7. **verify-on-real-projects**: Judge blaze by building big real projects with blaze and running their
    own test suites, never by building them with rustc or cargo to compare. Skill: `build-and-test`.
-7. **own-nightly**: blaze builds every project with its own pinned nightly (`harness/toolchain`),
+8. **own-nightly**: blaze builds every project with its own pinned nightly (`harness/toolchain`),
    ignoring rust-toolchain files, rustup and `RUSTC`. Skill: `build-and-test`.
-8. **sandbox-everything**: Build scripts and proc macros always run sandboxed; where no sandbox can be
+9. **sandbox-everything**: Build scripts and proc macros always run sandboxed; where no sandbox can be
    made, blaze stops. Skill: `compiler-correctness`.
-9. **proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` with blaze's own front end and run
-   in Wasmtime; Cranelift never generates native code. Skill: `compiler-correctness`.
-10. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
+10. **proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` with blaze's own front end and run
+    in Wasmtime; Cranelift never generates native code. Skill: `compiler-correctness`.
+11. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
     alloc: <why>` on its line. Skill: `runtime-code`.
-11. **standard-structures**: One standard structure per need (parking_lot locks, papaya and blaze_hash
+12. **standard-structures**: One standard structure per need (parking_lot locks, papaya and blaze_hash
     maps, crossbeam queues and channels, atomics); a wait on a pool thread goes through the
     scheduler. Skill: `runtime-code`.
-12. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
+13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.
-13. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO;
+14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO;
     drivers do the IO and stay thin. Skill: `runtime-code`.
-14. **every-wait-says-what**: Every blocking wait opens a span naming what it waits for. Skill:
+15. **every-wait-says-what**: Every blocking wait opens a span naming what it waits for. Skill:
     `runtime-code`.
-15. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed
+16. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed
     fix, and the fix quotes before and after from the spans. Skill: `perf-and-tracing`.
-16. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome;
+17. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome;
     never an open loop or an uncapped spin. Skill: `runtime-code`.
-17. **errors-name-the-thing**: An error names the item it is about and the rule that refused it. Skill:
+18. **errors-name-the-thing**: An error names the item it is about and the rule that refused it. Skill:
     `runtime-code`.
-18. **panics-fail-one-job**: A panic fails only its job, with a typed error; the daemon keeps serving
+19. **panics-fail-one-job**: A panic fails only its job, with a typed error; the daemon keeps serving
     and the build keeps going. Skill: `runtime-code`.
-19. **keys-cover-every-input**: A key covers every input its value depends on; two values under one key
+20. **keys-cover-every-input**: A key covers every input its value depends on; two values under one key
     is a typed refusal, and the fix is the key. Skill: `compiler-correctness`.
-20. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
+21. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
     ran on. Skill: `build-and-test`.
-21. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
+22. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
     `build-and-test`.
-22. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
+23. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
     the tree compiles at every save point. Skill: `changing-code`.
-23. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
+24. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
-24. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
+25. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
     fresh build; a restore never silently starts empty. Skill: `changing-code`.
-25. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
+26. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
-26. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
+27. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
     proving it right. Skill: `changing-code`.
-27. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
+28. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-28. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
+29. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
     codegen, the store, the daemon and the runtime stay outside. Skill: `compiler-correctness`.
-29. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
+30. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-30. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
+31. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-31. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
+32. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
     runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
-32. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
+33. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
-33. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
+34. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
-34. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
+35. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-35. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
+36. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
     branch. Skill: `build-and-test`.
-36. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
+37. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
-37. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
+38. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
-38. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
+39. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
 
 ## Code Review Rules
