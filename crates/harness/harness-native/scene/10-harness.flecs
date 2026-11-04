@@ -33,7 +33,7 @@ prefab hn.TrashList : ui.Column {
   Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
 }
 
-// The trash row at the sidebar's bottom: a trash can, "Trash", how many objects it holds and a chevron; pressed to fold or
+// The trash row at the sidebar's bottom: a trash can (ui.Symbol, a Nerd Font glyph), "Trash", how many objects it holds and a chevron; pressed to fold or
 // unfold the list over it.
 prefab hn.TrashRow : ui.Row {
   Pressable
@@ -45,8 +45,8 @@ prefab hn.TrashRow : ui.Row {
   Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
   Padding: {l: 8, r: 8, t: 0, b: 0}
-  glyph : ui.Words, Muted {
-    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  icon : ui.Symbol {
+    Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
   }
   name : ui.Words, Muted {
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}

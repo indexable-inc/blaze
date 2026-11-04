@@ -20,7 +20,7 @@ use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
 use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::Text;
+use harness_native_ui_text_api::{Icon, Text};
 use harness_native_ui_view::{self as view, View, for_each};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -687,8 +687,8 @@ impl App {
         let items = model::trashed(w);
         let sel = self.selected();
         let row = View::of(w.entity_from_id(self.ids.trash_row));
-        if let Some(p) = row.part("glyph") {
-            p.text(TRASH_GLYPH);
+        if let Some(p) = row.part("icon").filter(|p| p.entity().try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != TRASH_GLYPH)) {
+            p.set(Icon { glyph: TRASH_GLYPH.into() });
         }
         if let Some(p) = row.part("name") {
             p.text("Trash");
@@ -1185,7 +1185,16 @@ impl App {
                     let lay = self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
                     emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x, laid.y), ink, p.alpha, sc, upload);
                 }
-                PaintKind::Icon | PaintKind::Picture | PaintKind::Ribbon => {}
+                PaintKind::Icon => {
+                    // A ui.Symbol: its glyph (a Nerd Font icon) set by the typesetter, centred in its rect.
+                    let Some(icon) = e.try_cloned::<&Icon>() else { continue };
+                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(f.dark));
+                    let style = TextStyle { size: laid.h.min(laid.w + 2.0) * 0.85, line: laid.h, ..TextStyle::default() };
+                    let lay = self.layout(icon.glyph.as_str(), &style, 1.0e5);
+                    let gw = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                    emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x + (laid.w - gw) * 0.5, laid.y), ink, p.alpha, sc, upload);
+                }
+                PaintKind::Picture | PaintKind::Ribbon => {}
             }
             if p.clipped {
                 let band = [p.clip_y, p.clip_y + p.clip_h];

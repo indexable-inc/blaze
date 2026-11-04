@@ -754,10 +754,8 @@ fn gone(e: EntityView<'_>) -> bool {
 #[must_use]
 pub fn trashed(world: WorldRef<'_>) -> Vec<u64> {
     let mut out: Vec<(u64, u64)> = Vec::new();
-    world.new_query::<&Object>().each_entity(|e, _| {
-        if e.has(Trashed::id()) && !e.has(Hidden::id()) {
-            out.push((e.try_cloned::<&Created>().map_or(0, |c| c.ms), *e.id()));
-        }
+    world.query::<&Object>().with(Trashed::id()).without(Hidden::id()).build().each_entity(|e, _| {
+        out.push((e.try_cloned::<&Created>().map_or(0, |c| c.ms), *e.id()));
     });
     out.sort_unstable();
     out.into_iter().map(|(_, e)| e).collect()
