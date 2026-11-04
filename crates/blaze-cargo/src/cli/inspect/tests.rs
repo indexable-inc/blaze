@@ -88,7 +88,7 @@ fn the_codegen_inputs_are_hex_to_hex() {
 fn a_failed_or_empty_answer_fails() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let refused = vec![
-        Response::Error(blaze_api::ApiError { at: None, what: "no build of /w yet".to_owned() }),
+        Response::Error(blaze_api::ApiError::new("no build of /w yet", None)),
         Response::Done { ok: false },
     ];
     assert_eq!(answer(&mut Answering(refused), Inspected::Tables, tables(), None, &mut out, &mut err, false).unwrap(), Exit::Failed.code());

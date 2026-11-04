@@ -204,6 +204,7 @@ pub fn drive<A: Api>(
 
     let (mut out, mut err) = (Above::new(to_screen.clone()), Above::new(to_screen.clone()));
     let mut printer = Printer::new(shown, &place.root, &mut out, &mut err);
+    printer.place(std::env::var("HOME").ok(), super::observe::last_failure());
     let mut failed_units: HashSet<u32, Global> = HashSet::default(); // alloc: one a command
     let mut unwritten = None;
     let view = |event: Event| {
@@ -230,7 +231,16 @@ pub fn drive<A: Api>(
                 }
                 printer.on(ResponseRef::Diagnostic(diagnostic))
             }
-            ResponseRef::TestReady(artifact) => {
+            ResponseRef::Report { unit, report } => {
+                if report.severity == blaze_api::Severity::Error
+                    && let Some(unit) = &unit
+                    && failed_units.insert(unit.id)
+                {
+                    view(Event::UnitFailed { id: unit.id });
+                }
+                printer.on(ResponseRef::Report { unit, report })
+            }
+                        ResponseRef::TestReady(artifact) => {
                 let _ = to_runner.send(Run::Ready(artifact));
                 Ok(())
             }

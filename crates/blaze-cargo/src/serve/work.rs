@@ -720,8 +720,10 @@ impl std::fmt::Display for Broken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Broken::Panicked(panic) => write!(f, "the daemon {panic}"),
-            Broken::Failed(ApiError { at: Some(at), what }) => write!(f, "it failed at {at}: {what}"),
-            Broken::Failed(ApiError { at: None, what }) => write!(f, "it failed: {what}"),
+            Broken::Failed(error) => match &error.at {
+                Some(at) => write!(f, "it failed at {at}: {}", error.what),
+                None => write!(f, "it failed: {}", error.what),
+            },
         }
     }
 }

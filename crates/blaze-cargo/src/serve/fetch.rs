@@ -406,5 +406,5 @@ fn failed(fetch: &Fetch, texts: &[String], error: Option<&anyhow::Error>) -> Api
             what.push_str(text.trim_end());
         }
     }
-    ApiError { what: scrub(&what), at: Some(fetch.what.clone()) }
+    ApiError::new(scrub(&what), Some(fetch.what.clone()))
 }

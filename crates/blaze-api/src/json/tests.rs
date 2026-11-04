@@ -17,7 +17,17 @@ fn a_response_is_one_line_of_its_envelope() {
         json!({
             "schema": SCHEMA,
             "id": 7,
-            "body": { "Error": { "what": "two\nlines", "at": "src/lib.rs" } },
+            "body": { "Error": {
+                "at": [{ "Plain": "src/lib.rs" }],
+                "log": null,
+                "rule": null,
+                "facts": [],
+                "fixes": [],
+                "blocks": null,
+                "causes": [],
+                "headline": [{ "Plain": "two\nlines" }],
+                "severity": "Error",
+            } },
         })
     );
 }
