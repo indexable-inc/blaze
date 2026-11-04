@@ -73,6 +73,48 @@ fn serial_work_on_the_critical_path_is_charged_its_time_times_the_idle_share_of_
     assert_eq!(it.summary.path_ns, 100 * U);
 }
 
+/// A finding about a span name carries the commonest stacks sampled inside those spans, on
+/// and off the CPU, at most [`STACKS`] of each; the text shows each innermost first.
+#[test]
+fn a_finding_about_a_span_carries_its_top_sampled_stacks_on_and_off_the_cpu() {
+    let mut switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    for it in 2..=4 {
+        switches.extend([switch(it, 0, Event::Started, u64::from(it)), switch(it, 10, Event::Ended, u64::from(it))]);
+    }
+    let stack = |name: &str, on_cpu: bool, frames: &[&str], samples: u64| SpanStack {
+        name: name.to_owned(),
+        on_cpu,
+        frames: frames.iter().map(|it| (*it).to_owned()).collect(),
+        samples,
+    };
+    let mut facts = workers(1..=4);
+    facts.span_stacks = vec![
+        stack("impls publish", true, &["main", "publish", "hash_impls"], 40),
+        stack("impls publish", true, &["main", "publish", "sort_impls"], 30),
+        stack("impls publish", true, &["main", "publish", "alloc"], 20),
+        stack("impls publish", true, &["main", "publish", "free"], 10),
+        stack("impls publish", false, &["main", "publish", "futex_wait"], 5),
+        stack("other span", true, &["main", "other"], 99),
+    ];
+    let it = report(switches, vec![span(1, 1, None, "impls publish", 0, 100, 1)], 100, &facts);
+    let serial = finding(&it, Kind::Serial);
+    let tops: Vec<(&str, u64)> =
+        serial.stacks.on_cpu.iter().map(|it| (it.frames.last().unwrap().as_str(), it.samples)).collect();
+    assert_eq!(tops, [("hash_impls", 40), ("sort_impls", 30), ("alloc", 20)], "the top {STACKS}, most first");
+    assert_eq!(serial.stacks.off_cpu.len(), 1);
+    assert_eq!(serial.stacks.off_cpu[0].frames.last().map(String::as_str), Some("futex_wait"));
+    let said = text(&it, 10);
+    assert!(said.contains("sampled on the CPU inside it 40x: hash_impls < publish < main"), "{said}");
+    assert!(said.contains("sampled blocked inside it 5x: futex_wait < publish < main"), "{said}");
+    assert!(!said.contains("other < main"), "another span's stacks are not this finding's: {said}");
+    let json = serde_json::to_value(serial).unwrap();
+    assert_eq!(json["stacks"]["on_cpu"][0]["samples"], 40);
+    let unsampled = report(vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)], vec![span(1, 1, None, "x", 0, 100, 1)], 100, &workers(1..=1));
+    for finding in &unsampled.findings {
+        assert!(serde_json::to_value(finding).unwrap().get("stacks").is_none(), "no stacks, no field");
+    }
+}
+
 /// The same span counting a tenth of its running time as CPU is starved, not serial: more
 /// workers would not help, CPU would.
 #[test]

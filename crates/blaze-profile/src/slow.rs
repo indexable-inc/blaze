@@ -136,6 +136,9 @@ pub struct Facts {
     /// The build's misses rows, by step and cause.
     pub misses: Vec<MissGroup>,
     pub query_counts: Vec<QueryCount>,
+    /// The commonest sampled stacks inside the build's spans by span name, on and off the CPU,
+    /// at most [`STACKS`] of each, sorted by name, then on before off, then most taken first.
+    pub span_stacks: Vec<SpanStack>,
     pub memory: Memory,
     pub recorder: Recorder,
     /// Which of the build's spans the model read ([`crate::time::load::SPAN_BUDGET`]).
@@ -300,6 +303,46 @@ pub struct Finding {
     pub owner: Option<String>,
     pub title: String,
     pub evidence: Vec<String>,
+    /// For a finding about a span name: the stacks the build's CPU samples inside its spans
+    /// found most often, on and off the CPU, so it says where the time went inside them.
+    #[serde(skip_serializing_if = "Stacks::is_empty")]
+    pub stacks: Stacks,
+}
+
+/// The commonest sampled stacks inside a finding's spans ([`SpanStack`]), the most taken
+/// first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Stacks {
+    /// Of samples on a CPU (running or runnable): where it computed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub on_cpu: Vec<StackSeen>,
+    /// Of samples off it (blocked inside the span): what it waited in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub off_cpu: Vec<StackSeen>,
+}
+
+impl Stacks {
+    pub fn is_empty(&self) -> bool {
+        self.on_cpu.is_empty() && self.off_cpu.is_empty()
+    }
+}
+
+/// A stack and how many samples found it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StackSeen {
+    /// Outermost first, each frame a function (inlined ones their own frames), never an offset.
+    pub frames: Vec<String>,
+    pub samples: u64,
+}
+
+/// One of the commonest stacks of the samples inside the spans of one name in the build, on or
+/// off the CPU ([`Facts::span_stacks`]): what [`Stacks`] is made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpanStack {
+    pub name: String,
+    pub on_cpu: bool,
+    pub frames: Vec<String>,
+    pub samples: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -448,6 +491,7 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     ctx.missed(&mut findings);
     ctx.shed(&mut findings);
     ctx.blind_spots(&mut blind);
+    attach_stacks(&mut findings, &facts.span_stacks);
 
     let cut_ns = (model.bounds.wall_ns() / 100).max(MIN_SAVES_NS);
     let before = findings.len();
@@ -463,6 +507,27 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     blind.retain(|it| it.hidden_ns >= MIN_HIDDEN_NS || it.hidden_ns == 0);
     blind.sort_by(|a, b| b.hidden_ns.cmp(&a.hidden_ns).then(a.kind.cmp(&b.kind)).then_with(|| a.subject.cmp(&b.subject)));
     Report { version: VERSION, build: facts.build.clone(), summary: ctx.summary(smaller, cut_ns), findings, blind_spots: blind }
+}
+
+/// The most stacks on and off the CPU a finding lists.
+pub const STACKS: usize = 3;
+
+/// Gives each finding about a span name (its subject) the commonest stacks sampled inside
+/// those spans. Findings about anything else (a query, a kind of wait, the workers) get none.
+fn attach_stacks(findings: &mut [Finding], stacks: &[SpanStack]) {
+    if stacks.is_empty() {
+        return;
+    }
+    for finding in findings {
+        let at = stacks.partition_point(|it| it.name.as_str() < finding.subject.as_str());
+        for it in stacks[at..].iter().take_while(|it| it.name == finding.subject) {
+            let side = if it.on_cpu { &mut finding.stacks.on_cpu } else { &mut finding.stacks.off_cpu };
+            if side.len() < STACKS {
+                // clone: a stack, once a finding it is attached to
+                side.push(StackSeen { frames: it.frames.clone(), samples: it.samples });
+            }
+        }
+    }
 }
 
 /// Integer seconds to a tenth, for evidence.
@@ -634,6 +699,7 @@ impl<'a> Ctx<'a> {
             let subject = name.to_owned();
             if counted && own_running >= JUDGED_NS && ratio < STARVED_RATIO {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Starved,
                     fix: Fix::GiveCpu,
                     saves_ns: (group.ns as f64 * (1.0 - ratio)) as i64,
@@ -649,6 +715,7 @@ impl<'a> Ctx<'a> {
                 });
             } else if busy < 0.5 * workers as f64 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Serial,
                     fix: Fix::Parallelise,
                     saves_ns: (group.ns as f64 * (1.0 - busy / workers as f64)) as i64,
@@ -737,6 +804,7 @@ impl<'a> Ctx<'a> {
             evidence.push("none of the critical path ran on them".to_owned());
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::StarvedWorkers,
             fix: Fix::GiveCpu,
             saves_ns: saves as i64,
@@ -904,6 +972,7 @@ impl<'a> Ctx<'a> {
             };
             let owner = self.owner(WAIT_SPAN, &name).or_else(|| owners.first().and_then(|it| file_in(&it.0)));
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Wait,
                 fix: Fix::ShortenWait,
                 saves_ns: saves,
@@ -950,6 +1019,7 @@ impl<'a> Ctx<'a> {
             return;
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::Queued,
             fix: Fix::WakeWorkers,
             saves_ns: on_path,
@@ -999,6 +1069,7 @@ impl<'a> Ctx<'a> {
         for (name, (keys, extra, ns, mut examples)) in by_query {
             let examples = top(&mut examples);
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Redone,
                 fix: Fix::KeyForReuse,
                 saves_ns: (ns as f64 / parallelism) as i64,
@@ -1035,6 +1106,7 @@ impl<'a> Ctx<'a> {
             );
             if it.evicted_asked > 0 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Evicted,
                     fix: Fix::KeepInMemory,
                     saves_ns: cost(it.evicted_asked),
@@ -1055,6 +1127,7 @@ impl<'a> Ctx<'a> {
             }
             if it.reran > 0 {
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Reran,
                     fix: Fix::KeyForReuse,
                     saves_ns: cost(it.reran),
@@ -1069,6 +1142,7 @@ impl<'a> Ctx<'a> {
             if it.rereads() {
                 let ratio = it.reads_recorded as f64 / it.reads_kept.max(1) as f64;
                 out.push(Finding {
+                    stacks: Stacks::default(),
                     kind: Kind::Reread,
                     fix: Fix::ReadOnce,
                     saves_ns: 0,
@@ -1100,6 +1174,7 @@ impl<'a> Ctx<'a> {
                 evidence.push(format!("the commonest reason: {what}"));
             }
             out.push(Finding {
+                stacks: Stacks::default(),
                 kind: Kind::Missed,
                 fix: Fix::ExplainMiss,
                 saves_ns: 0,
@@ -1128,6 +1203,7 @@ impl<'a> Ctx<'a> {
             return;
         }
         out.push(Finding {
+            stacks: Stacks::default(),
             kind: Kind::Shed,
             fix: Fix::KeepAcrossBuilds,
             saves_ns: 0,

@@ -1414,6 +1414,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "intern",
+ "ix-prof",
  "libc",
  "parking_lot",
  "parser",

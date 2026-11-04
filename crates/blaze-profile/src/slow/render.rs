@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Died, DiedThread, Estimate, PanicFacts, Report, s};
+use super::{Died, DiedThread, Estimate, PanicFacts, Report, StackSeen, s};
 
 /// `report` as text, the first `top` findings and blind spots of each.
 pub fn text(report: &Report, top: usize) -> String {
@@ -54,6 +54,11 @@ pub fn text(report: &Report, top: usize) -> String {
         for line in &it.evidence {
             _ = writeln!(out, "    - {line}");
         }
+        for (side, stacks) in [("on the CPU", &it.stacks.on_cpu), ("blocked", &it.stacks.off_cpu)] {
+            for stack in stacks {
+                _ = writeln!(out, "    - sampled {side} inside it {}x: {}", stack.samples, innermost(stack));
+            }
+        }
         _ = writeln!(out, "    fix: {}", it.fix.says());
     }
     let hidden = report.findings.len().saturating_sub(top);
@@ -72,6 +77,26 @@ pub fn text(report: &Report, top: usize) -> String {
     }
     _ = writeln!(out, "\n`blaze slow --json` for an agent; `blaze debug time --build {}` for the raw tables", b.id);
     out
+}
+
+/// The frames a stack line shows, innermost first.
+const STACK_FRAMES: usize = 8;
+
+/// A sampled stack's innermost [`STACK_FRAMES`] frames, innermost first, `<` between: where
+/// the time went, then what called it; `< ...` when there are more.
+fn innermost(stack: &StackSeen) -> String {
+    // alloc: a line
+    let mut line = String::new();
+    for (i, frame) in stack.frames.iter().rev().take(STACK_FRAMES).enumerate() {
+        if i > 0 {
+            line.push_str(" < ");
+        }
+        line.push_str(frame);
+    }
+    if stack.frames.len() > STACK_FRAMES {
+        line.push_str(" < ...");
+    }
+    line
 }
 
 /// The death of the build's daemon, and what its threads were inside at its last reading, the

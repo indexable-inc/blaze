@@ -139,6 +139,11 @@ SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
 CREATE OR REPLACE VIEW folded AS
 SELECT * FROM read_parquet(@folded, union_by_name = true);
 
+-- The code images samples' `stack_pcs` are in, one row an image a process (once it held an
+-- address a flush wrote): which file, its build id and BLAKE3, and where it was loaded.
+CREATE OR REPLACE VIEW images AS
+SELECT * FROM read_parquet(@images, union_by_name = true);
+
 -- Every span, as a row of `spans` (`runs` 1) or as a sum of `folded` (`runs` its spans): what a
 -- count, total or longest by name, query kind or thread reads, so the folded ones are counted.
 -- A folded query's kind is its name, as a row's is.

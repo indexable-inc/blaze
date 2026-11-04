@@ -900,6 +900,8 @@ pub struct History {
     sampler: &'static sampler::Ring,
     sampled: u64,
     samples: Vec<Sample>,
+    /// The code images the samples' addresses are in that this history wrote rows of.
+    images: symbols::ImagesWritten,
     /// [`identity::binary`], once a history: every build of this process ran it.
     blaze: String,
     /// A build's identity that could not be told since the last flush: the next flush writes
@@ -1095,6 +1097,7 @@ impl History {
             sampled: 0,
             // alloc: once a history
             samples: Vec::new(),
+            images: symbols::ImagesWritten::new(),
             blaze,
             unidentified: None,
             // alloc: once a history
@@ -1458,6 +1461,8 @@ impl History {
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
+        let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
+        let images = [self.images.batch(stacks, clock::mono_ns(), self.process).map_err(arrow_error(&schema::IMAGES))?];
         let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
         // What every thread is inside, with each flush where that changed: the last reading is
         // what a daemon that died was doing, which no `spans` row holds (they are written as
@@ -1501,7 +1506,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 17] = [
+        let tables: [(&'static Table, &[RecordBatch]); 18] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1519,6 +1524,7 @@ impl History {
             (&schema::EVENT_FIELDS, &event_fields),
             (&schema::PROCESSES, &processes),
             (&schema::TEST_RUNS, &test_runs),
+            (&schema::IMAGES, &images),
         ];
         // The files written, listed in one commit after the last: a reader sees all of the
         // flush or none of it.
@@ -1703,12 +1709,9 @@ impl History {
         if self.samples.is_empty() {
             return Ok(RecordBatch::new_empty(batches::schema_of(&schema::SAMPLES)));
         }
-        let pcs: Vec<u64> =
-            // alloc: a flush's addresses, once a flush
-            self.samples.iter().flat_map(|it| it.pcs[..usize::from(it.depth)].iter().copied()).collect();
-        // Every address gets a name, the bare address at worst.
-        let names = symbols::names(&pcs);
-        batches::samples(&self.samples, &names, (Instant::now(), clock::mono_ns()), self.process)
+        // Every address gets a frame, `[code in no image]` at worst.
+        let frames = symbols::frames(self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        batches::samples(&self.samples, &frames, (Instant::now(), clock::mono_ns()), self.process)
     }
 
     /// Deletes the oldest builds until the rest fit under the cap: a build's files go all at

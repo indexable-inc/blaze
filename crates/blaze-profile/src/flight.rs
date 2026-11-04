@@ -2643,7 +2643,7 @@ pub fn moved() {
 }
 
 /// Every ring now, into `into`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn rings(into: &mut Vec<&'static Ring>) {
     into.clear();
     into.extend(lock(&RINGS).iter().copied());

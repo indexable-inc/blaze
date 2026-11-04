@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, processes, test_runs, samples, provenance, inputs, alloc_samples, heap_by_owner, panics; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the client's rows in it, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` as an export from the history.
-date: 2026-10-31
+summary: blaze's one profiler (lane observe; a plan until each part it describes lands), one span stream into one buffer with several readers. The schema (spans, counters, builds, processes, test_runs, samples, images, provenance, inputs, alloc_samples, heap_by_owner, panics; Arrow, defined once in crates/blaze-profile/src/schema.rs), the flight recorder, the Parquet history with `blaze debug sql` and `nix run .#duckdb`, the client's rows in it, the live feed (`blaze debug live`, the explorer), the stall watchdog, and `BLAZE_PROFILE` as an export from the history.
+date: 2026-11-04
 ---
 # Profiling blaze
 
@@ -10,7 +10,8 @@ several readers.
 
 - **The stream.** Every info-level `tracing` span of a `blaze` target, every rust-analyzer
   `*_query` span, and the counters blaze plots (memo hits and misses, the pool's queue, bytes
-  of frames and of the heap). On Linux, also the CPU sampler's stacks.
+  of frames and of the heap). Beside them, the CPU sampler's stacks (Linux and arm64 macOS), each
+  tagged with the span and build its thread was in.
 - **The buffer.** The flight recorder keeps each thread's recent events in a fixed ring, in
   the schema below. It is always on, in every build of blaze, and allocates nothing and does no
   I/O per span.
@@ -70,7 +71,19 @@ manifest lists, each table's list led by its `schema.<table>.parquet`.
 
 To profile any other Rust program (not blaze's builds), use ix-prof and `blaze pprof`, described in
 [ix-prof.md](ix-prof.md). Its format is specified in [ix-prof-format.md](ix-prof-format.md).
-blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-profile/src/symbols.rs`).
+blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-profile/src/symbols.rs`,
+`ix_prof::symbols::functions`): each frame is a function, never `function+0xoffset`, so all of a
+function's samples are one frame. Where the executable has DWARF, the functions inlined at an
+address are frames of their own, outermost first (the function the symbol names, then each one
+inlined into it); without DWARF a frame is the symbol table's function. A return address is named
+at the instruction before it (the call). A shared library's frame is its nearest exported
+symbol, else `[<file>]`; a live image's slot stub is `stub of <function>`. A proc macro's code,
+which Wasmtime compiled into memory no file holds, is named from the module's code map
+(`ix_prof::jit`, registered by `blaze-macro-eval` as it loads each module): `<function> [wasm]`
+from the module's name section, `wasm function <index> of wasm module <macro>` for a function it
+does not name, `code of wasm module <macro> outside its functions` for Wasmtime's trampolines.
+Any other address is `[code in no image]`. The names exist only in the process: the raw addresses
+are kept in `stack_pcs`, and the `images` table says which file each is in.
 
 ## The schema
 
@@ -93,7 +106,8 @@ it to that clock when it writes, calibrating against the clock at both ends of t
 written. Durations are nanoseconds.
 
 `dict` is a dictionary-encoded string (`u32` keys). `stack` is a list of `dict` frames,
-outermost first. `?` marks a nullable column.
+outermost first. `pcs` is a list of `u64` addresses, outermost first. `?` marks a nullable
+column.
 
 ### `spans`: one row a span, from its start to its close, on the thread that made it
 
@@ -360,13 +374,62 @@ written, but with no unit), children a test's fork server forks, and Windows.
 | process | u32 | the process id |
 | thread | u32 | the thread |
 | t_ns | i64 | when it was taken |
-| stack | stack | the call stack, outermost first, each frame demangled |
+| stack | stack | the call stack, outermost first, each frame a function (inlined ones their own frames) |
 | span_id | u64? | the innermost span its thread was inside |
-| cpu | dict? | `on` when its thread was on a CPU; `off` when blocked (sampled on macOS), so what it blocked in shows |
+| cpu | dict? | `on` when its thread was running or runnable as it was sampled, `off` when blocked inside a span, so what it blocked in shows; the same on Linux and macOS |
+| stack_pcs | pcs? | the stack's addresses, outermost first, one a frame of the unwind (an inlined function's frames in `stack` share one): the last is where the thread was, each other a return address, so the call is the address before it; null in rows of a blaze before it |
 
-On macOS a blocked thread is sampled too, marked `cpu = off`: `raw_blocks` lists the samples of
-pool workers blocked in a mutex, condition, `kevent` or `read` with no `wait` span open above
-them, each a block that bypasses `blaze_graph::wait`.
+Both samplers take 49 samples a second of each thread that records spans (holds a ring): one
+running or runnable, `cpu = on`, and one blocked inside a span, `cpu = off`. A blocked thread
+outside every span is not sampled: no span could be blamed for its wait. `on` means the same on
+both systems: the thread's state as it was sampled (Linux's `R` in `/proc/self/task/<tid>/stat`,
+macOS's `TH_STATE_RUNNING`, both of which count a runnable thread). `raw_blocks` lists the `off`
+samples of pool workers with no `wait` span open above them, each a block that bypasses
+`blaze_graph::wait`.
+
+- **Linux** (`crates/blaze-profile/src/sampler/linux.rs`). Each tick the sampler's thread sends
+  each such thread a realtime signal of its own (`SIGRTMIN+6`, `tgkill`), holding the lock the
+  thread takes to leave its ring, so a thread is never signalled once it has gone. The thread's
+  handler runs on its alternate signal stack (a thread whose own is smaller than 256 KiB, as
+  std's are, is given one of 256 KiB as it takes a ring), walks its frame pointers from the
+  interrupted registers, reads its innermost span and that span's build, and writes the sample
+  into its ring's slot, which the sampler collects on its next tick. The handler allocates
+  nothing and takes no lock; it reads the stack through `process_vm_readv`, one call for the
+  8 KiB above the stack pointer and one per frame record past it, so a garbage frame pointer
+  ends the walk instead of faulting. An answer more than 100 ms after it was asked (a thread in
+  uninterruptible sleep, or runnable but kept off every CPU) is dropped, and a request unanswered
+  for 1 s is asked again; `blaze debug dump`'s sampler state counts both, and threads that could
+  not be given an alternate stack. Until 2026-11-04 Linux sampled through `perf_event_open`,
+  whose samples came from the kernel's buffer after the fact, so every one had span 0 and build
+  0, and a blocked thread was never sampled. There is no fallback: where the signal is taken
+  already, or a seccomp filter refuses `process_vm_readv` (a container's default filter does
+  without `CAP_SYS_PTRACE`), the sampler is off and its state says why.
+- **macOS** (arm64, `sampler/macos.rs`). Each tick the sampler stops each such thread
+  (`thread_suspend`), reads its registers, walks its frame pointers inside its stack, reads its
+  span and build, and lets it go.
+
+### `images`: one row a code image of a process that `stack_pcs` addresses are in
+
+| column | type | |
+|---|---|---|
+| process | u32 | the process id |
+| boot | dict? | the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one |
+| seen_ns | i64 | when it was written |
+| path | utf8 | the file it was loaded from |
+| build_id | utf8? | its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none |
+| blake3 | utf8? | the BLAKE3 of its file, hex; null when it was not hashed, `unhashed` says why |
+| unhashed | utf8? | why `blake3` is null: the file is gone, changed (its build id no longer matches) or not on disk (macOS's shared cache) |
+| base | u64 | the address its code starts at in the process |
+| size | u64 | the bytes of code from `base`: an address in [base, base + size) is in it |
+| slide | u64 | how far it was loaded from the addresses its file gives: a file address is an address less this |
+| names | dict | how blaze named its frames: dwarf (functions and inlined ones), symbols (no DWARF), exports (a shared library's exported symbols) or none |
+
+A history writes an image the first time a flush's samples hold an address in it, once a
+process. To name a `stack_pcs` address after the process is gone: find the row of its `process`
+and `boot` whose `[base, base + size)` holds it, take the file by `blake3` or `build_id`, and
+look up `address - slide` (less 1 for every address but the last of the stack) in it. An
+address in no image is JIT code (a proc macro's wasm, named only in the process, in `stack`) or
+a wild frame.
 
 ### `provenance`: one row a query of a build that was verified or rerun, with the cause
 
@@ -402,6 +465,9 @@ them, each a block that bypasses `blaze_graph::wait`.
 | bytes | u64 | the bytes the sample stands for (the sampling interval) |
 | stack | stack | the call stack, outermost first |
 | span_id | u64? | the innermost span its thread was inside |
+| stack_pcs | pcs? | as in `samples` |
+
+No writer fills `alloc_samples` yet; its `stack_pcs` is there for the one that will.
 
 ### `heap_by_owner`: the live heap at the end of a build, by what holds it
 
@@ -807,9 +873,14 @@ holds `history::FLUSH_ROWS` rows; past `history::BACKLOG_ROWS` it stops reading 
 written over as `profile rows skipped behind`. Spans under `flight::FOLD_BELOW` (20 us) that no
 row names are summed into `folded` rows (below) instead of a row each; on that self-build 64% of
 the spans were under 2 us, and `find_container` and `Semantics::analyze_impl` (about 3 us) came
-360,000 a second on a worker, more than a ring holds between two reads. The gate counts the folded roots' time as covered. It also fails on every perf sample blocked in a mutex, condition
-variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
-the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
+360,000 a second on a worker, more than a ring holds between two reads. The gate counts the folded roots' time as covered. It also fails on every sample of a worker blocked (`cpu = off`) while no wait span is open on its thread (`raw_blocks`, which names
+the stack), and on every `wait` span without `awaits`. A check that saw nothing to judge is
+"not checked", never passed, and the verdict does not pass: no pool worker switched in the build
+(`uncovered workers`), the build has no samples or none off the CPU (`raw blocks`: a build
+profiled with the sampler off would otherwise pass it by having no samples), or no `wait` span
+(`unsaid waits`). Until 2026-11-04 `raw_blocks` matched macOS's symbol names (`psynch_cvwait`,
+`kevent`, `read+0x...`), which matched nothing on Linux and nothing once frames lost their
+offsets. Its verdict names the build's `tree` and `blaze`, the exact tree and
 binary measured, and a history with no such build is an error naming it. Its test runs on a
 profiled self-build named by `BLAZE_PROFILE_FIXTURE` and also fails when that build recorded no
 tree or binary.
@@ -902,7 +973,12 @@ Each finding has these fields:
 - what it is about (a span name, a wait's class, a query);
 - the module or file that owns it, when the spans say (`spans.target`, or a `crates/...rs:N`
   in the subject);
-- its evidence, with numbers.
+- its evidence, with numbers;
+- for a finding about a span name, `stacks`: the three commonest stacks the build's samples
+  found inside those spans (a sample counts for its span and each span it is inside), on the CPU
+  (`on_cpu`, where it computed) and blocked (`off_cpu`, what it waited in), each with its
+  samples; the text shows each stack's innermost 8 frames, innermost first. Left out of the JSON
+  when there are none (no samples, or a finding about a query, a wait class or the workers).
 
 Findings are sorted by saving, then kind, then subject. Ties never depend on hash order, so the
 same rows give the same bytes. Findings that save less than 1% of the wall time (and at least
@@ -993,8 +1069,9 @@ is seen, in generations of 16,384 names a shard: a full one becomes the previous
 before it is let go, so a daemon's thousandth build names its keys as its first did. (Until
 2026-11-01 the names were capped at 262,144 a process and dropped past it: build 24 of the
 round 31 daemon had no `function` on its wait spans and most query spans.)
-Next to it, on Linux, a sampler records every running thread's stack 49 times a second
-through `perf_event_open`. Frames are named only when they are written out.
+Next to it, a sampler records each recording thread's stack 49 times a second, running or
+blocked inside a span, with its span and build (`samples`, above). Frames are named only when
+they are written out.
 
 Each row is 64 bytes (8 words): close and start ticks, span id, parent, a word packing the kind,
 callsite, depth, the ring that made the span and its allocation count, the interned crate and

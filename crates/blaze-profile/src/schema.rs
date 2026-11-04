@@ -440,10 +440,19 @@ pub const SAMPLES: Table = Table {
         opt(
             "cpu",
             Type::Dict,
-            "`on` when its thread was on a CPU; `off` when blocked (sampled on macOS), so what it blocked in shows",
+            "`on` when its thread was running or runnable as it was sampled, `off` when blocked inside a span, so what it blocked in shows; the same on Linux and macOS",
         ),
+        STACK_PCS,
     ],
 };
+
+/// The raw addresses of a sample's stack, kept beside its names so a reader can name them
+/// again (`images` says which file each is in) or join two runs by code, not by name.
+const STACK_PCS: Column = opt(
+    "stack_pcs",
+    Type::Pcs,
+    "the stack's addresses, outermost first, one a frame of the unwind (an inlined function's frames in `stack` share one): the last is where the thread was, each other a return address, so the call is the address before it; null in rows of a blaze before it",
+);
 
 /// Each query of a build that was not a plain memo hit, and why.
 pub const PROVENANCE: Table = Table {
@@ -486,6 +495,28 @@ pub const ALLOC_SAMPLES: Table = Table {
         col("bytes", Type::U64, "the bytes the sample stands for (the sampling interval)"),
         col("stack", Type::Stack, "the call stack, outermost first"),
         opt("span_id", Type::U64, "the innermost span its thread was inside"),
+        STACK_PCS,
+    ],
+};
+
+/// One row a code image (the executable, a shared library) holding an address a flush's
+/// samples wrote in `stack_pcs`, once a process: what names those addresses after the process
+/// is gone.
+pub const IMAGES: Table = Table {
+    name: "images",
+    doc: "one row a code image of a process that `stack_pcs` addresses are in: its file, identity and where it was loaded",
+    columns: &[
+        PROCESS,
+        opt("boot", Type::Dict, "the machine's boot it ran in (Linux's boot_id, macOS's boot session UUID): a process id is unique only within one"),
+        col("seen_ns", Type::I64, "when it was written"),
+        col("path", Type::Utf8, "the file it was loaded from"),
+        opt("build_id", Type::Utf8, "its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none"),
+        opt("blake3", Type::Utf8, "the BLAKE3 of its file, hex; null when it was not hashed, `unhashed` says why"),
+        opt("unhashed", Type::Utf8, "why `blake3` is null: the file is gone, changed (its build id no longer matches) or not on disk (macOS's shared cache)"),
+        col("base", Type::U64, "the address its code starts at in the process"),
+        col("size", Type::U64, "the bytes of code from `base`: an address in [base, base + size) is in it"),
+        col("slide", Type::U64, "how far it was loaded from the addresses its file gives: a file address is an address less this"),
+        col("names", Type::Dict, "how blaze named its frames: dwarf (functions and inlined ones), symbols (no DWARF), exports (a shared library's exported symbols) or none"),
     ],
 };
 
@@ -905,7 +936,7 @@ pub const TEST_RUNS: Table = Table {
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 27] = [
+pub const TABLES: [&Table; 28] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -933,6 +964,7 @@ pub const TABLES: [&Table; 27] = [
     &EVENT_FIELDS,
     &PROCESSES,
     &TEST_RUNS,
+    &IMAGES,
 ];
 
 /// The tables that are results, made on request and not kept.

@@ -5,6 +5,10 @@
 //! kevent, a read) is outside a `wait` span, since such a block bypassed `blaze_graph::wait`; and
 //! every `wait` span says what it awaits. Run over a profiled self-build by the fixture test
 //! below; each failure names the worker, or the blocked stack.
+//!
+//! A check that saw nothing to judge (no pool worker switched, no sample was taken or none off
+//! the CPU, no wait span) is "not checked", never a pass: a build profiled with the sampler off
+//! would otherwise pass the raw-block check by having no samples.
 
 use std::{
     fmt,
@@ -46,6 +50,63 @@ pub struct RawBlock {
     pub frames: String,
 }
 
+/// A check of the gate that saw no rows to judge, so it neither passed nor failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unchecked {
+    /// The check: `uncovered workers`, `raw blocks` or `unsaid waits`.
+    pub check: &'static str,
+    pub why: String,
+}
+
+/// What a build's history holds for each check to judge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// Pool workers that switched during the build (`uncovered_per_worker`'s rows).
+    pub workers: i64,
+    /// CPU samples taken during the build, and of them those off the CPU.
+    pub samples: i64,
+    pub off_cpu: i64,
+    /// `wait` spans of the build, as rows and folded.
+    pub waits: i64,
+}
+
+/// The checks `seen` gives nothing to judge, each saying what was missing.
+pub fn unchecked(seen: Seen) -> Vec<Unchecked> {
+    // alloc: a check's answer
+    let mut out = Vec::new();
+    if seen.workers == 0 {
+        out.push(Unchecked {
+            check: "uncovered workers",
+            // alloc: as above
+            why: "no pool worker switched during the build (no `switches` rows), so no worker's time was measured".to_owned(),
+        });
+    }
+    if seen.samples == 0 {
+        out.push(Unchecked {
+            check: "raw blocks",
+            // alloc: as above
+            why: "the build has no CPU samples (was the sampler on? `blaze debug dump` says its state)".to_owned(),
+        });
+    } else if seen.off_cpu == 0 {
+        out.push(Unchecked {
+            check: "raw blocks",
+            // alloc: as above
+            why: format!(
+                "none of the build's {} CPU samples is of a blocked thread (cpu = 'off'), so no block was seen to judge",
+                seen.samples
+            ),
+        });
+    }
+    if seen.waits == 0 {
+        out.push(Unchecked {
+            check: "unsaid waits",
+            // alloc: as above
+            why: "the build has no `wait` spans, so none was seen to say what it awaits".to_owned(),
+        });
+    }
+    out
+}
+
 /// What the gate found in one build.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Verdict {
@@ -58,11 +119,18 @@ pub struct Verdict {
     pub raw: Vec<RawBlock>,
     /// `wait` spans with no `awaits`.
     pub unsaid_waits: i64,
+    /// The checks that saw nothing to judge: a verdict with any has not passed.
+    pub unchecked: Vec<Unchecked>,
 }
 
 impl Verdict {
+    /// Every check ran on rows and none failed.
     pub fn passed(&self) -> bool {
-        self.uncovered.is_empty() && self.raw.is_empty() && self.unsaid_waits == 0
+        !self.failed() && self.unchecked.is_empty()
+    }
+
+    fn failed(&self) -> bool {
+        !self.uncovered.is_empty() || !self.raw.is_empty() || self.unsaid_waits > 0
     }
 }
 
@@ -77,7 +145,10 @@ impl fmt::Display for Verdict {
                 self.build
             );
         }
-        writeln!(f, "build {} (tree {tree}, blaze {blaze}) fails the profile's gate:", self.build)?;
+        match self.failed() {
+            true => writeln!(f, "build {} (tree {tree}, blaze {blaze}) fails the profile's gate:", self.build)?,
+            false => writeln!(f, "build {} (tree {tree}, blaze {blaze}) is not checked by the profile's gate:", self.build)?,
+        }
         for it in &self.uncovered {
             writeln!(
                 f,
@@ -94,6 +165,9 @@ impl fmt::Display for Verdict {
         }
         if self.unsaid_waits > 0 {
             writeln!(f, "- {} wait spans say nothing of what they await", self.unsaid_waits)?;
+        }
+        for it in &self.unchecked {
+            writeln!(f, "- {}: not checked: {}", it.check, it.why)?;
         }
         Ok(())
     }
@@ -169,6 +243,25 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
     let mut args = Map::new();
     args.insert("build".into(), Value::from(build));
     let uncovered = views::render(views::find("uncovered_per_worker")?, &args)?;
+    // What each check had to judge: a check with nothing is not checked, never passed.
+    // alloc: a query, once a check
+    let seen = run(&format!(
+        "SELECT \
+           (SELECT CAST(count(*) AS BIGINT) FROM ({uncovered})) AS workers, \
+           (SELECT CAST(count(*) AS BIGINT) FROM samples, builds \
+              WHERE builds.build_id = {build} AND samples.t_ns BETWEEN builds.started_ns AND builds.started_ns + builds.dur_ns) AS samples, \
+           (SELECT CAST(count(*) AS BIGINT) FROM samples, builds \
+              WHERE builds.build_id = {build} AND samples.t_ns BETWEEN builds.started_ns AND builds.started_ns + builds.dur_ns \
+                AND samples.cpu = 'off') AS off_cpu, \
+           (SELECT CAST(count(*) AS BIGINT) FROM spans WHERE build_id = {build} AND name = 'wait') \
+             + (SELECT CAST(coalesce(sum(spans), 0) AS BIGINT) FROM folded WHERE build_id = {build} AND name = 'wait') AS waits"
+    ))?;
+    let seen = Seen {
+        workers: i64s(&seen, 0).first().copied().unwrap_or(0),
+        samples: i64s(&seen, 1).first().copied().unwrap_or(0),
+        off_cpu: i64s(&seen, 2).first().copied().unwrap_or(0),
+        waits: i64s(&seen, 3).first().copied().unwrap_or(0),
+    };
     // alloc: a query, once a check
     let uncovered = run(&format!(
         "SELECT CAST(thread AS BIGINT) AS thread, CAST(thread_name AS VARCHAR) AS thread_name, \
@@ -212,6 +305,7 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
             // alloc: a check's failures, once a check
             .collect(),
         unsaid_waits: i64s(&unsaid, 0).first().copied().unwrap_or(0),
+        unchecked: unchecked(seen),
     })
 }
 
@@ -267,6 +361,7 @@ mod tests {
                 frames: "start > blaze_codegen::flight::Flights::wait > __psynch_cvwait".into(),
             }],
             unsaid_waits: 3,
+            unchecked: vec![],
         };
         assert!(!verdict.passed());
         let said = verdict.to_string();
@@ -274,9 +369,38 @@ mod tests {
         assert!(said.contains("blaze_codegen::flight::Flights::wait > __psynch_cvwait"), "{said}");
         assert!(said.contains("3 wait spans"), "{said}");
         assert!(said.contains("build 24 (tree 9f2c, blaze not recorded)"), "{said}");
-        let clean = Verdict { build: 25, tree: None, blaze: None, uncovered: vec![], raw: vec![], unsaid_waits: 0 };
+        let seen = Seen { workers: 8, samples: 4000, off_cpu: 300, waits: 90 };
+        let clean = Verdict {
+            build: 25,
+            tree: None,
+            blaze: None,
+            uncovered: vec![],
+            raw: vec![],
+            unsaid_waits: 0,
+            unchecked: unchecked(seen),
+        };
         assert!(clean.passed());
         assert!(clean.to_string().contains("accounted for"));
+    }
+
+    /// A build with nothing to judge passes no check: each says it was not checked and why,
+    /// and the verdict does not pass.
+    #[test]
+    fn a_check_with_no_rows_is_not_checked_and_does_not_pass() {
+        let none = unchecked(Seen::default());
+        let checks: Vec<&str> = none.iter().map(|it| it.check).collect();
+        assert_eq!(checks, ["uncovered workers", "raw blocks", "unsaid waits"]);
+        let verdict =
+            Verdict { build: 26, tree: None, blaze: None, uncovered: vec![], raw: vec![], unsaid_waits: 0, unchecked: none };
+        assert!(!verdict.passed(), "a gate that saw nothing passed");
+        let said = verdict.to_string();
+        assert!(said.contains("is not checked by the profile's gate"), "{said}");
+        assert!(said.contains("raw blocks: not checked: the build has no CPU samples"), "{said}");
+        assert!(!said.contains("accounted for"), "{said}");
+        // Samples, but none of a blocked thread: still not checked.
+        let on_only = unchecked(Seen { workers: 2, samples: 10, off_cpu: 0, waits: 1 });
+        assert_eq!(on_only.len(), 1);
+        assert!(on_only[0].why.contains("none of the build's 10 CPU samples"), "{:?}", on_only[0]);
     }
 
     /// The gate over a profiled self-build: `BLAZE_PROFILE_FIXTURE` is the daemon's history
