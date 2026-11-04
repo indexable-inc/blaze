@@ -9,7 +9,7 @@
 #       `blaze check --workspace` with the release on Linux x86-64 and macOS,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
-#       `harness/imports.py` and `harness/rustcsites.py`. No `blaze fmt --check`: fmt.yaml
+#       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
 #       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
@@ -123,6 +123,33 @@ jobs:
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
+
+  # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
+  # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
+  # #1691, an unquoted `: ` in a `run:` line). The local actions (.github/actions/*/action.yml) are
+  # parsed where a workflow uses them. actionlint's own checks only: its shellcheck and pyflakes
+  # passes are off. What it is told to ignore is in .github/actionlint.yaml.
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+      # The release binary, checked by its sha256 (rhysd/actionlint's checksums.txt).
+      - name: actionlint 1.7.12
+        run: |
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64 sum=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+            ARM64) arch=arm64 sum=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+            *) echo "::error::no pinned actionlint for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tgz="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_$arch.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
+      - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
 
   linux-x64:
     name: linux x64
@@ -240,7 +267,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, linux-x64, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, linux-x64, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
