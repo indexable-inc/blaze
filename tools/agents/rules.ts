@@ -120,6 +120,14 @@ export const rules = [
 		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" and \"make the rule MORE GENERAL than that not just errors\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful. The plan's \"conformance only where real code depends on it\" (2fb77406fb) said this for behavior; this rule says it for everything.",
 	},
 	{
+		id: "blaze-uses-its-extensions",
+		skill: "compiler-correctness",
+		line: "blaze's own crates use blaze's language extensions (`#[blaze::pure]`, effects, contracts, ...) directly, enforced, with no rustc-compatible fallback or cfg guard.",
+		info: "Only blaze builds blaze, so blaze's own source is blaze-only Rust: use its extensions (`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`, `#[blaze::linear]`, contracts, comptime, sealed traits) wherever they make blaze more correct or more incremental, and rely on them being checked. No `cfg_attr` guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension blaze can't check yet is an error to fix in blaze. The one limit is stage 0: an extension blaze's source uses must be one the stage-0 blaze (`.github/blaze-version`) already reads, so a new extension lands in a release before blaze's source depends on it.",
+		reason: "\"now that we are only blaze can we do proper blaze pure invalidation ... with our custom language features? mention in AGENTS.md we can use custom language features in blaze with no fallback cause building with blaze\" (Andrew, 2026-11-03). Until then `#[blaze::pure]` was written to stay inert under rustc, so it promised nothing the build relied on.",
+		link: "docs/future/bootstrap.md",
+	},
+	{
 		id: "verify-on-real-projects",
 		skill: "build-and-test",
 		line: "Judge blaze by building big real projects with blaze and running their own test suites, never by building them with rustc or cargo to compare.",

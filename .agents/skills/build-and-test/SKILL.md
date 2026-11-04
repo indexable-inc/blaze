@@ -20,7 +20,7 @@ can't check or test yet is a ranked, owned blocker, not a reason to keep using c
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
-## verify-on-real-projects (rule 6)
+## verify-on-real-projects (rule 7)
 
 A verdict on blaze comes from real projects built by blaze: blaze itself, then large open-source
 workspaces (ripgrep, nushell, bevy, wasmtime, tokio, ...), each built with `blaze build` and its own
@@ -31,7 +31,7 @@ test's expectation states what is right, not what rustc printed.
 
 See [docs/harness.md](../../../docs/harness.md).
 
-## own-nightly (rule 7)
+## own-nightly (rule 8)
 
 blaze is its own toolchain: it builds every project with its pinned nightly (`harness/toolchain`,
 bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN` and `RUSTC`. Projects pin
@@ -39,26 +39,26 @@ the blaze version, not Rust's.
 
 See [docs/toolchain.md](../../../docs/toolchain.md).
 
-## measure-the-exact-tree (rule 20)
+## measure-the-exact-tree (rule 21)
 
 A measurement, bisect or checkpoint names the exact tree it ran on (a content digest of the sources
 and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and
 committing. A result you can't tie to a tree is not evidence.
 
-## test-the-cause (rule 21)
+## test-the-cause (rule 22)
 
 A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
 fast) is tested by removing the cause and watching the effect go, not by checking that its premises
 hold. Pin a load-bearing one with a test named for the property.
 
-## work-in-ix-vms (rule 30)
+## work-in-ix-vms (rule 31)
 
 Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix
 rm`), never on AWS. Where neither can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
-## fan-out-write-only (rule 31)
+## fan-out-write-only (rule 32)
 
 Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
 run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
@@ -68,12 +68,12 @@ It hands each failure back to a fresh subagent for the code that broke, with the
 command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
 show its test fails (test-the-cause), are also run by the main agent, as patches.
 
-## worktree-per-lane (rule 32)
+## worktree-per-lane (rule 33)
 
 One uniquely named worktree per lane; its build directory is its own under blaze's root, never in
 the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 
-## clean-up-lane (rule 35)
+## clean-up-lane (rule 36)
 
 When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
 

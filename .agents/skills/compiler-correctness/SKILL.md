@@ -41,7 +41,19 @@ makes the result useful and correct, never that it equals rustc's or cargo's. `s
 unchanged: every program the pinned nightly builds still builds and runs as it does under rustc,
 except one that only builds through a rustc soundness bug.
 
-## sandbox-everything (rule 8)
+## blaze-uses-its-extensions (rule 6)
+
+Only blaze builds blaze, so blaze's own source is blaze-only Rust: use its extensions
+(`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`, `#[blaze::linear]`, contracts, comptime,
+sealed traits) wherever they make blaze more correct or more incremental, and rely on them being
+checked. No `cfg_attr` guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension
+blaze can't check yet is an error to fix in blaze. The one limit is stage 0: an extension blaze's
+source uses must be one the stage-0 blaze (`.github/blaze-version`) already reads, so a new
+extension lands in a release before blaze's source depends on it.
+
+See [docs/future/bootstrap.md](../../../docs/future/bootstrap.md).
+
+## sandbox-everything (rule 9)
 
 Build scripts and proc macros always run sandboxed, on every platform; where no sandbox can be made,
 blaze stops. Sandboxed tests are an opt-in experiment. The only ways out are the documented manifest
@@ -49,7 +61,7 @@ opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code runs outside b
 
 See [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](../../../docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
 
-## proc-macros-on-wasm (rule 9)
+## proc-macros-on-wasm (rule 10)
 
 A proc macro runs as a WebAssembly module: blaze compiles the macro crate to `wasm32-wasip1` with
 its own front end and code generator (never rustc), and Wasmtime runs it in process, Cranelift as
@@ -63,13 +75,13 @@ nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is repla
 
 See [docs/v2/plan/lanes/usercode/macros.md](../../../docs/v2/plan/lanes/usercode/macros.md).
 
-## keys-cover-every-input (rule 19)
+## keys-cover-every-input (rule 20)
 
 A query key, store key, fold key or template key covers every input its value depends on, including
 the data a constant points to and the identity of a closure callee. Two different values under one
 key is a refusal with a typed error, never an overwrite, and the fix is the key, never the check.
 
-## deterministic-output (rule 23)
+## deterministic-output (rule 24)
 
 No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on
 hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds,
@@ -80,7 +92,7 @@ be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run 
 then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
 a test builds twice and compares bytes.
 
-## semantics-in-front-end (rule 28)
+## semantics-in-front-end (rule 29)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
 hashes) go in the front end's salsa crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived
