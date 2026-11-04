@@ -23,13 +23,13 @@ use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
-    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
-    GenericDefId, HasModule, ImplId, ItemContainerId, LoweringMode, ModuleId, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId, VariantId,
+    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId,
+    FunctionId, FxIndexMap, GenericDefId, HasModule, ImplId, ItemContainerId, LoweringMode,
+    ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{
-        body::{BodySyntax, body_syntax},
         ExpressionStore, ExpressionStoreSourceMap, HygieneId, Move, MoveTo,
+        body::{BodySyntax, body_syntax},
         lower::{
             BodyLowering, ExprCollector, ImplTraitLowering, lower_function,
             lower_generic_params_within, lower_impl, lower_trait, lower_type_alias, lower_type_ref,
@@ -161,11 +161,11 @@ macro_rules! signature_queries {
 
             /// The signature with where each part of it is written in its file.
             #[blaze_query::tracked(
-                returns(ref),
-                lru,
-                weigh = with_source_map_bytes,
-                mem_tag = Nameres
-            )]
+                                        returns(ref),
+                                        lru,
+                                        weigh = with_source_map_bytes,
+                                        mem_tag = Nameres
+                                    )]
             pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
                 match Self::relative(db, id) {
                     Some((it, map)) => {
@@ -771,9 +771,9 @@ fn body_anchor_syntax(
     let body = body.unwrap_or_else(|| {
         panic!("{owner:?}: an item anchored at {anchor:?} in its body, which has no syntax")
     });
-    let tree = body_tree(db, owner)
-        .as_ref()
-        .unwrap_or_else(|| panic!("{owner:?}: its body's syntax has no tree, for an item anchored at {anchor:?}"));
+    let tree = body_tree(db, owner).as_ref().unwrap_or_else(|| {
+        panic!("{owner:?}: its body's syntax has no tree, for an item anchored at {anchor:?}")
+    });
     blaze_mem::frame::current(|frame| {
         let source = body_source(body);
         let anchor = anchor_node(source, ast::Node::root(tree), anchor);
@@ -832,7 +832,10 @@ pub(crate) fn body_item<'db, N: AstIdNode + syntax::view::Typed>(
     module: ModuleId,
 ) -> Option<N::Of<'db>> {
     let (_, tree, ptr) = owning_body(db, id.file_id, id.value.erase(), module)?;
-    <N::Of<'db> as syntax::view::AstNode<'db>>::cast(syntax::view::to_node(ptr, ast::Node::root(tree)))
+    <N::Of<'db> as syntax::view::AstNode<'db>>::cast(syntax::view::to_node(
+        ptr,
+        ast::Node::root(tree),
+    ))
 }
 
 /// The node at `id` in its file's [`FileOutline`], when the outline has it: the item's
@@ -853,19 +856,26 @@ pub(crate) fn outline_item<'db, N: AstIdNode + syntax::view::Typed>(
 /// [`FileOutline`] with the outline's spans, and so the same after any edit of a body the
 /// outline leaves out. An item the outline doesn't have (in such a body, or written by a
 /// macro) is lowered off its file, as that body is.
-pub(crate) fn written_visibility<N: AstIdNode>(db: &Db, id: AstId<N>, module: ModuleId) -> RawVisibility {
+pub(crate) fn written_visibility<N: AstIdNode>(
+    db: &Db,
+    id: AstId<N>,
+    module: ModuleId,
+) -> RawVisibility {
     if let HirFileId::FileId(file) = id.file_id {
         let outline = file_outline(db, file);
         if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
             let node = ast::to_node(ptr, ast::Node::root(&outline.tree));
-            return visibility_of(db, node, &mut |range| outline.span_map.span_for_range(range).ctx);
+            return visibility_of(db, node, &mut |range| {
+                outline.span_map.span_for_range(range).ctx
+            });
         }
     }
     if let Some((body, tree, ptr)) = owning_body(db, id.file_id, id.value.erase(), module) {
         let node = ast::to_node(ptr, ast::Node::root(tree));
         return visibility_of(db, node, &mut |range| body.span_map.span_for_range(range).ctx);
     }
-    let node = ast::to_node(id.file_id.ast_id_map(db).get_erased(id.value.erase()), id.file_id.root(db));
+    let node =
+        ast::to_node(id.file_id.ast_id_map(db).get_erased(id.value.erase()), id.file_id.root(db));
     let span_map = id.file_id.span_map(db);
     visibility_of(db, node, &mut |range| span_map.span_for_range(range).ctx)
 }
@@ -875,8 +885,9 @@ fn visibility_of(
     node: ast::Node<'_>,
     span_for_range: &mut impl FnMut(TextRange) -> span::SyntaxContext,
 ) -> RawVisibility {
-    let item = ast::AnyHasVisibility::cast(node)
-        .unwrap_or_else(|| panic!("a {:?} at {:?} has no visibility", node.kind(), node.text_range()));
+    let item = ast::AnyHasVisibility::cast(node).unwrap_or_else(|| {
+        panic!("a {:?} at {:?} has no visibility", node.kind(), node.text_range())
+    });
     visibility_from_ast(db, item.visibility(), span_for_range)
 }
 
@@ -1102,7 +1113,10 @@ impl StructSignature {
             flags |= StructFlags::from_lang_item(&lang);
         }
         let cfg_options = loc.container.krate(db).cfg_options(db);
-        flags.set(StructFlags::HAS_UNSAFE_FIELDS, has_unsafe_field(source.field_list(), cfg_options));
+        flags.set(
+            StructFlags::HAS_UNSAFE_FIELDS,
+            has_unsafe_field(source.field_list(), cfg_options),
+        );
         let shape = adt_shape(source.kind());
 
         let (store, generic_params, source_map) = lower_generic_params_within(
@@ -1347,8 +1361,7 @@ impl ConstSignature {
             RUSTC_ALLOW_INCOHERENT_IMPL => RUSTC_ALLOW_INCOHERENT_IMPL,
         });
         flags.set(ConstFlags::HAS_BODY, source.value.body().is_some());
-        let [default, type_const] =
-            child_tokens(source.value.syntax(), [T![default], T![type]]);
+        let [default, type_const] = child_tokens(source.value.syntax(), [T![default], T![type]]);
         flags.set(ConstFlags::IS_DEFAULT, default);
         flags.set(ConstFlags::TYPE_CONST, type_const);
 
@@ -1565,10 +1578,8 @@ impl TraitSignature {
         let loc = id.lookup(db);
 
         let mut flags = TraitFlags::from_attrs(AttrFlags::query(db, id.into()));
-        let [auto, unsafe_, alias, const_] = child_tokens(
-            source.value.syntax(),
-            [T![auto], T![unsafe], T![=], T![const]],
-        );
+        let [auto, unsafe_, alias, const_] =
+            child_tokens(source.value.syntax(), [T![auto], T![unsafe], T![=], T![const]]);
         if auto {
             flags |= TraitFlags::AUTO | TraitFlags::COINDUCTIVE;
         }
@@ -1692,7 +1703,16 @@ impl FunctionSignature {
         flags.set(FnFlags::HAS_SELF_PARAM, self_param);
         flags.set(FnFlags::HAS_VARARGS, variadic);
         (
-            FunctionSignature { generic_params, store, params, ret_type, abi, flags, name, splatted },
+            FunctionSignature {
+                generic_params,
+                store,
+                params,
+                ret_type,
+                abi,
+                flags,
+                name,
+                splatted,
+            },
             source_map,
         )
     }
@@ -1860,7 +1880,8 @@ pub struct VariantFields {
 // In pointer widths: the array's three words and the shape's byte, padded to a word.
 const _: () = assert!(
     size_of::<VariantFields>()
-        == size_of::<ExpressionStore>() + (3 * size_of::<usize>() + 1).next_multiple_of(align_of::<usize>())
+        == size_of::<ExpressionStore>()
+            + (3 * size_of::<usize>() + 1).next_multiple_of(align_of::<usize>())
 );
 
 /// What the fields of `id` are lowered from: the [`variants_syntax`] of an enum variant's
@@ -1885,10 +1906,7 @@ impl VariantFields {
 
     /// The fields with where each part of them is written in their file.
     #[blaze_query::tracked(returns(ref), lru, weigh = with_source_map_bytes, mem_tag = Nameres)]
-    pub fn with_source_map(
-        db: &Db,
-        id: VariantId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+    pub fn with_source_map(db: &Db, id: VariantId) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let Some((it, map)) = Self::relative(db, id) else {
             let kept = Self::kept(db, id);
             let lowering = kept.lowering(&kept.store);
@@ -1908,10 +1926,7 @@ impl VariantFields {
     /// The fields lowered from their [`variant_syntax`], with the source map of that tree;
     /// `None` for a variant, struct or union a macro writes.
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    pub fn relative(
-        db: &Db,
-        id: VariantId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+    pub fn relative(db: &Db, id: VariantId) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
         let syntax = variant_syntax(db, id)?;
         let kept = Self::kept(db, id);
         let lowering = kept.lowering(&kept.store);
@@ -1951,7 +1966,8 @@ impl VariantFields {
                 let parent = loc.parent.lookup(db);
                 let source = match syntax {
                     Some(syntax) => {
-                        let variant = syntax.tree.ast_id_map.get(loc.id.value).to_view(syntax.root());
+                        let variant =
+                            syntax.tree.ast_id_map.get(loc.id.value).to_view(syntax.root());
                         InFile::new(syntax.file_id, variant)
                     }
                     None => loc.source_view(db),
@@ -2000,7 +2016,9 @@ impl VariantFields {
             }
         };
         match result {
-            Some((fields, store, source_map)) => (VariantFields { fields, store, shape }, source_map),
+            Some((fields, store, source_map)) => {
+                (VariantFields { fields, store, shape }, source_map)
+            }
             None => (
                 VariantFields {
                     fields: Arena::default(),
@@ -2134,7 +2152,10 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
     let mut col =
         ExprCollector::with_maps(db, module, fields.file_id, crate::LoweringMode::Analysis, maps);
     col.set_lowering(lowering);
-    #[expect(clippy::disallowed_types, reason = "override visibility, set once per signature lowering: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "override visibility, set once per signature lowering: not global"
+    )]
     let override_visibility = override_visibility.map(|vis| {
         std::cell::LazyCell::new(move || {
             let span_map = match maps {
@@ -2150,8 +2171,7 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
     for (ty, field) in fields.value {
         match AttrFlags::is_cfg_enabled_for(field, cfg_options) {
             Ok(()) => {
-                let type_ref =
-                    col.lower_type_ref_opt(ty, &mut ImplTraitLowering::Error);
+                let type_ref = col.lower_type_ref_opt(ty, &mut ImplTraitLowering::Error);
                 let visibility = override_visibility.as_ref().map_or_else(
                     || {
                         visibility_from_ast(db, field.visibility(), &mut |range| {
@@ -2236,10 +2256,7 @@ impl Eq for EnumVariants {}
 #[blaze_query::tracked]
 impl EnumVariants {
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    pub(crate) fn of(
-        db: &Db,
-        e: EnumId,
-    ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+    pub(crate) fn of(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
         if let Some(it) = crate::deps::signatures::served_enum_variants(db, e) {
             return it;
         }
@@ -2364,7 +2381,12 @@ impl EnumVariants {
     /// enum's expansion made, as rustc's `resolve_ident_in_module` of the enum's module and
     /// `hygienic_eq` of `lower_type_relative_path` and `resolve_fully_qualified_call` do. A
     /// name with no macros 2.0 mark is looked up as written.
-    pub fn variant_written(db: &Db, e: EnumId, name: &Name, ctxt: span::SyntaxContext) -> Option<EnumVariantId> {
+    pub fn variant_written(
+        db: &Db,
+        e: EnumId,
+        name: &Name,
+        ctxt: span::SyntaxContext,
+    ) -> Option<EnumVariantId> {
         let name = def_site::name_in(db, *name, ctxt, def_site::enum_expansion(db, e));
         e.enum_variants(db).variant(&name)
     }
@@ -2375,7 +2397,11 @@ impl EnumVariants {
         self.variants
             .iter()
             // clone: a `Symbol` count, the name the caller asked for
-            .find_map(|(name, (id, _))| if *id == variant_id { Some(name.clone().unkeyed()) } else { None })
+            .find_map(
+                |(name, (id, _))| {
+                    if *id == variant_id { Some(name.clone().unkeyed()) } else { None }
+                },
+            )
     }
 
     // [Adopted from rustc](https://github.com/rust-lang/rust/blob/bd53aa3bf7a24a70d763182303bd75e5fc51a9af/compiler/rustc_middle/src/ty/adt.rs#L446-L448)
@@ -2584,8 +2610,10 @@ mod tests {
             _ => StructFlags::empty(),
         };
         let others = [sym::sized, sym::copy, sym::non_null, sym::va_list, sym::drop];
-        let interned = ["phantom_data", "owned_box", "ppcf128", "not_a_lang_item"].map(Symbol::intern);
-        for lang in STRUCT_LANG_ITEMS.iter().map(|(it, _)| it.clone()).chain(others).chain(interned) {
+        let interned =
+            ["phantom_data", "owned_box", "ppcf128", "not_a_lang_item"].map(Symbol::intern);
+        for lang in STRUCT_LANG_ITEMS.iter().map(|(it, _)| it.clone()).chain(others).chain(interned)
+        {
             assert_eq!(StructFlags::from_lang_item(&lang), reference(&lang), "{lang:?}");
         }
         for (i, (lang, _)) in STRUCT_LANG_ITEMS.iter().enumerate() {
@@ -2664,8 +2692,7 @@ type const E: u8 = 0;
                 assert_eq!(found, accessors, "{it}");
                 or(&mut seen_static, &found);
             } else if let Some(it) = ast::Impl::cast(node) {
-                let found =
-                    child_tokens(it.syntax(), [T![unsafe], T![!], T![default], T![const]]);
+                let found = child_tokens(it.syntax(), [T![unsafe], T![!], T![default], T![const]]);
                 let accessors = [
                     it.unsafe_token().is_some(),
                     it.excl_token().is_some(),
@@ -2989,7 +3016,10 @@ pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
                 .to_vec()
         };
         assert_eq!(flags(&db), want(false));
-        db.set_file_text(file.file_id(&db), &edited(UNSAFE, &[("A(u8)", "A(u8), C { unsafe c: u8 }")]));
+        db.set_file_text(
+            file.file_id(&db),
+            &edited(UNSAFE, &[("A(u8)", "A(u8), C { unsafe c: u8 }")]),
+        );
         assert_eq!(flags(&db), want(true));
     }
 
@@ -3017,9 +3047,8 @@ pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
         let root = outline.root();
         for cut in &outline.cuts {
             assert!(cut.text_range().is_empty(), "{cut:?}");
-            let item = root
-                .descendants()
-                .find(|&it| left_out(it).is_some_and(|it| ast::ptr(it) == *cut));
+            let item =
+                root.descendants().find(|&it| left_out(it).is_some_and(|it| ast::ptr(it) == *cut));
             assert!(item.is_some(), "{cut:?} is not the body of an item in the outline");
         }
     }
@@ -3061,7 +3090,8 @@ pub const K: u8 = ;
         let before = file_outline(&db, file);
         // clone: the outline before, kept past the edit
         let (text, cuts) = (before.text(), before.cuts.clone());
-        let (span_map, ast_id_map) = (format!("{:?}", before.span_map), format!("{:?}", before.ast_id_map));
+        let (span_map, ast_id_map) =
+            (format!("{:?}", before.span_map), format!("{:?}", before.ast_id_map));
         // clone: a count of the tree before
         let tree = before.tree.clone();
         db.set_file_text(file.file_id(&db), &edited(CODE, &BODY_EDITS));
@@ -3121,7 +3151,10 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
             let syntax = item_syntax(&db, id, root_module, Elide::Nothing)
                 .unwrap_or_else(|| panic!("{name}"));
             assert_eq!(syntax.root().text(), text, "{name}");
-            assert_eq!(syntax.node::<ast::Struct<'_>>().value.syntax().text(), item.syntax().text());
+            assert_eq!(
+                syntax.node::<ast::Struct<'_>>().value.syntax().text(),
+                item.syntax().text()
+            );
             assert_eq!(syntax.tree.ast_id_map.get_erased(id.value.erase()), syntax.item, "{name}");
             assert_eq!(syntax.elided, None, "{name}");
         }
@@ -3145,7 +3178,9 @@ impl S {
         let (signatures, _) = defs(&db);
         let methods: Vec<&SignatureSyntax> = (signatures.iter())
             .filter(|it| matches!(it, GenericDefId::FunctionId(_)))
-            .map(|&def| signature_syntax_of(&db, def).unwrap_or_else(|| panic!("{def:?} has no syntax")))
+            .map(|&def| {
+                signature_syntax_of(&db, def).unwrap_or_else(|| panic!("{def:?} has no syntax"))
+            })
             .collect();
         let &[a, b] = methods.as_slice() else { panic!("two methods, not {}", methods.len()) };
         let text =
@@ -3292,7 +3327,10 @@ impl S {
             db.set_file_text(file.file_id(&db), &text);
             let (signatures, variants) = defs(&db);
             for def in signatures {
-                assert!(signature_syntax_of(&db, def).is_some(), "{def:?} has no syntax of its own");
+                assert!(
+                    signature_syntax_of(&db, def).is_some(),
+                    "{def:?} has no syntax of its own"
+                );
                 match def {
                     GenericDefId::AdtId(AdtId::StructId(it)) => check!(db, StructSignature, it),
                     GenericDefId::AdtId(AdtId::UnionId(it)) => check!(db, UnionSignature, it),

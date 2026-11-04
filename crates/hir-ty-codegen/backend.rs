@@ -143,7 +143,8 @@ impl Optimization {
 impl Backend {
     /// The producer the environment asks for, or what is wrong with what it asks.
     pub fn from_env() -> std::result::Result<Backend, String> {
-        static SELECTED: std::sync::OnceLock<std::result::Result<Backend, String>> = std::sync::OnceLock::new();
+        static SELECTED: std::sync::OnceLock<std::result::Result<Backend, String>> =
+            std::sync::OnceLock::new();
         match SELECTED.get_or_init(Self::read_env) {
             Ok(backend) => Ok(*backend),
             // clone: the error's message
@@ -175,7 +176,9 @@ impl Backend {
             Ok("llvm") if cfg!(feature = "llvm") => Ok(Backend::Llvm(optimization)),
             Ok("llvm") => {
                 // alloc: the error's message
-                Err(format!("BLAZE_BACKEND=llvm: blaze was built without LLVM (blaze-engine's `native` feature)"))
+                Err(format!(
+                    "BLAZE_BACKEND=llvm: blaze was built without LLVM (blaze-engine's `native` feature)"
+                ))
             }
             // alloc: the error's message
             Ok(other) => Err(format!("BLAZE_BACKEND={other}: expected `cranelift` or `llvm`")),
@@ -208,7 +211,8 @@ impl Backend {
             // 17 ms each in LLVM. A tier, which does not come through here, lowers them, as
             // does the build of a whole program, which nothing edits.
             #[cfg(feature = "llvm")]
-            Backend::Llvm(_) if !whole_program() && !super::llvm::plain_handlers(&context.func) => {}
+            Backend::Llvm(_) if !whole_program() && !super::llvm::plain_handlers(&context.func) => {
+            }
             #[cfg(feature = "llvm")]
             Backend::Llvm(optimization) => {
                 let start = Instant::now();
@@ -365,7 +369,10 @@ pub(super) struct Produced(usize);
 /// ([`Registry::claim`]): nothing counted is lost, and there are never more of them than
 /// the most threads alive at once.
 #[repr(C, align(128))]
-#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a link set once, read with an acquire load: the list of the process's per-thread counts"
+)]
 struct Counts {
     words: Lines<[AtomicU64; word::COUNT]>,
     /// What a report read of each word last, written by reports alone.
@@ -385,7 +392,10 @@ struct Lines<T>(T);
 
 const _: () = assert!(size_of::<Lines<[AtomicU64; word::COUNT]>>() == 256);
 
-#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a link set once, read with an acquire load: the list of the process's per-thread counts"
+)]
 impl Counts {
     const fn new(held: bool) -> Counts {
         Counts {
@@ -425,16 +435,21 @@ impl Counts {
 /// Every thread's [`Counts`]: a list that only grows, of counts that are never freed, so a
 /// report reads them with no lock while threads count. A link is set once: reading one is an
 /// acquire load, and a thread appends at the end (once, as it starts).
-#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a link set once, read with an acquire load: the list of the process's per-thread counts"
+)]
 struct Registry {
     head: std::sync::OnceLock<&'static Counts>,
     /// Where a thread counts once its own counts are gone, as it ends.
     late: Counts,
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one profile registry, which every thread's counts join as it starts")]
-static REGISTRY: Registry =
-    Registry { head: std::sync::OnceLock::new(), late: Counts::new(false) };
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one profile registry, which every thread's counts join as it starts"
+)]
+static REGISTRY: Registry = Registry { head: std::sync::OnceLock::new(), late: Counts::new(false) };
 
 impl Registry {
     /// Counts no thread holds, now held by the calling one: those a thread that ended left,
@@ -478,11 +493,7 @@ impl Registry {
 
     /// What every word grew by since the last report, and the reasons counted since.
     fn take(&'static self) -> Taken {
-        let mut taken = Taken {
-            sums: [0; word::COUNT],
-            alone: BTreeMap::new(),
-            passes: None,
-        };
+        let mut taken = Taken { sums: [0; word::COUNT], alone: BTreeMap::new(), passes: None };
         for counts in self.all() {
             counts.take(&mut taken.sums);
             let alone = std::mem::take(&mut *counts.alone.lock());
@@ -700,7 +711,10 @@ impl Tally {
 mod tests {
     use super::*;
 
-    #[expect(clippy::disallowed_types, reason = "a registry of the test's own, built as the process's is")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a registry of the test's own, built as the process's is"
+    )]
     fn registry() -> &'static Registry {
         Box::leak(Box::new(Registry { head: std::sync::OnceLock::new(), late: Counts::new(false) }))
     }

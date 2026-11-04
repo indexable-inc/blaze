@@ -2,10 +2,11 @@
 -- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`, and
 -- `span_sums` over `spans` and `folded`.
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
--- globs of that table's files, `['<dir>/*.<table>.parquet', ...]`: the history's directory and,
--- with `--live`, the recorder's last seconds beside it. Each directory holds an empty
--- `schema.<table>.parquet` of every table, so each glob matches a file with every column: the
--- reader writes those a history older than the table lacks (`history::ensure_schemas`).
+-- that table's files, `['<dir>/<file>.<table>.parquet', ...]`, each named (never a glob): the
+-- files of the history's directory a reader's pin holds (`history::Pin`) and, with `--live`, the
+-- recorder's last seconds beside it. Each directory holds an empty `schema.<table>.parquet` of
+-- every table, so each list holds a file with every column: the reader writes those a history
+-- older than the table lacks (`history::ensure_schemas`).
 
 CREATE OR REPLACE VIEW spans AS
 SELECT * FROM read_parquet(@spans, union_by_name = true);
@@ -23,6 +24,10 @@ QUALIFY row_number() OVER (PARTITION BY build_id, started_ns ORDER BY dur_ns DES
 CREATE OR REPLACE VIEW samples AS
 SELECT * FROM read_parquet(@samples, union_by_name = true);
 
+-- Why the query engine ran what it ran (schema 4 on): a row a run that was not a first one,
+-- with its cause and, for a changed read, the read by name (`cause_key`, which names another
+-- row's `query_key` where the read is a memo), and a row an untracked read by name. Counts of
+-- every run and verify, first runs included, are in `query_counts`.
 CREATE OR REPLACE VIEW provenance AS
 SELECT * FROM read_parquet(@provenance, union_by_name = true);
 
@@ -61,6 +66,11 @@ SELECT * FROM read_parquet(@open, union_by_name = true);
 -- What each build computed again instead of reusing, and why (`blaze why`).
 CREATE OR REPLACE VIEW misses AS
 SELECT * FROM read_parquet(@misses, union_by_name = true);
+
+-- The parts of the key of each miss (schema 4 on): what two builds' keys, or two homes', are
+-- diffed by (`key_part_diff`).
+CREATE OR REPLACE VIEW key_parts AS
+SELECT * FROM read_parquet(@key_parts, union_by_name = true);
 
 -- Profiled runs of programs blaze built (`blaze perf record`, crates/blaze-profile/src/perf.rs).
 CREATE OR REPLACE VIEW perf_runs AS
@@ -137,8 +147,9 @@ FROM spans ASOF LEFT JOIN (
     ON spans.process = runs.process AND spans.thread = runs.thread AND spans.start_ns >= runs.t_ns;
 
 -- One row a span of a query, with what the memo did with that query when provenance has it:
--- `memo` is verified, reran or reran-same-output, matched on the build, the query's kind and
--- its key (the span's `function` field); null where provenance has no row for it.
+-- `memo` is the row's outcome (ran, untracked read) and `cause` its cause, matched on the
+-- build, the query's kind and its key. A query span's `function` is a display name, not the
+-- memo's `` `query`(<key>) ``, so the match finds no row today: read `provenance` itself.
 CREATE OR REPLACE VIEW queries AS
 SELECT spans.*, memo.outcome AS memo, memo.cause AS cause
 FROM spans

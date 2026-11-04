@@ -30,20 +30,29 @@ fn check(item: &Item) -> Result<(), Error> {
         let span = item.ident.span();
         Err(Error::new(span, format!("`{}` ({}): {what}", item.name(), at(span))))
     };
-    let tuple_skip_if = |fields: &Fields| fields.style == Style::Tuple && fields.list.iter().any(|it| it.attrs.skip_serializing_if.is_some());
+    let tuple_skip_if = |fields: &Fields| {
+        fields.style == Style::Tuple
+            && fields.list.iter().any(|it| it.attrs.skip_serializing_if.is_some())
+    };
     match &item.data {
         Data::Struct(fields) => {
             if tuple_skip_if(fields) {
-                return refuse("`#[serde(skip_serializing_if)]` on a tuple field is not supported by blaze-serde-derive");
+                return refuse(
+                    "`#[serde(skip_serializing_if)]` on a tuple field is not supported by blaze-serde-derive",
+                );
             }
         }
         Data::Enum(variants) => {
             for variant in variants {
                 if variant.fields.list.iter().any(|it| it.attrs.flatten) {
-                    return refuse("`#[serde(flatten)]` in a variant is not supported by blaze-serde-derive's `Serialize`");
+                    return refuse(
+                        "`#[serde(flatten)]` in a variant is not supported by blaze-serde-derive's `Serialize`",
+                    );
                 }
                 if tuple_skip_if(&variant.fields) {
-                    return refuse("`#[serde(skip_serializing_if)]` on a tuple field is not supported by blaze-serde-derive");
+                    return refuse(
+                        "`#[serde(skip_serializing_if)]` on a tuple field is not supported by blaze-serde-derive",
+                    );
                 }
             }
         }
@@ -63,7 +72,11 @@ fn bounds(item: &Item) -> Vec<TokenStream> {
     item.generics
         .type_params()
         .filter(|param| {
-            fields.iter().any(|it| !it.attrs.skip && it.attrs.serialize_with.is_none() && generics::mentions(&it.ty, param))
+            fields.iter().any(|it| {
+                !it.attrs.skip
+                    && it.attrs.serialize_with.is_none()
+                    && generics::mentions(&it.ty, param)
+            })
         })
         .map(|param| {
             let mut out = Out::default();
@@ -127,14 +140,18 @@ fn value(out: &mut Out, field: &Field, access: Access<'_>, wrappers: &mut Wrappe
 }
 
 /// The fields that are written at all, with their accesses.
-fn written<'f>(fields: &'f Fields, access: impl Fn(&'f Field) -> Access<'f>) -> Vec<(&'f Field, Access<'f>)> {
+fn written<'f>(
+    fields: &'f Fields,
+    access: impl Fn(&'f Field) -> Access<'f>,
+) -> Vec<(&'f Field, Access<'f>)> {
     fields.list.iter().filter(|it| !it.attrs.skip).map(|it| (it, access(it))).collect()
 }
 
 /// The number of fields written: `n`, plus `if skip(&v) { 0 } else { 1 }` for each field with
 /// `skip_serializing_if`.
 fn length(out: &mut Out, fields: &[(&Field, Access<'_>)], plus: usize) {
-    let fixed = fields.iter().filter(|(it, _)| it.attrs.skip_serializing_if.is_none()).count() + plus;
+    let fixed =
+        fields.iter().filter(|(it, _)| it.attrs.skip_serializing_if.is_none()).count() + plus;
     out.usize(fixed);
     for (field, access) in fields {
         if let Some(path) = &field.attrs.skip_serializing_if {
@@ -145,7 +162,13 @@ fn length(out: &mut Out, fields: &[(&Field, Access<'_>)], plus: usize) {
 
 /// `trait_::serialize_field(&mut __state, "key", value)?;` for each field (no key for a
 /// tuple's), skipped by its `skip_serializing_if` with `skip_field` for a struct's.
-fn fields_of(out: &mut Out, fields: &[(&Field, Access<'_>)], trait_: &str, keyed: bool, wrappers: &mut Wrappers) {
+fn fields_of(
+    out: &mut Out,
+    fields: &[(&Field, Access<'_>)],
+    trait_: &str,
+    keyed: bool,
+    wrappers: &mut Wrappers,
+) {
     let skip_field = keyed;
     for (field, access) in fields {
         let mut write = Out::default();
@@ -166,7 +189,9 @@ fn fields_of(out: &mut Out, fields: &[(&Field, Access<'_>)], trait_: &str, keyed
                 });
                 if skip_field {
                     out.s("else").brace(|out| {
-                        out.s(&format!("{trait_}::skip_field(&mut __state,")).str(&field.key).s(")?;");
+                        out.s(&format!("{trait_}::skip_field(&mut __state,"))
+                            .str(&field.key)
+                            .s(")?;");
                     });
                 }
             }
@@ -198,15 +223,23 @@ fn struct_body(out: &mut Out, item: &Item, fields: &Fields, wrappers: &mut Wrapp
     }
     match fields.style {
         Style::Unit => {
-            out.s(&format!("{SER}::Serializer::serialize_unit_struct(__serializer,")).str(&name).s(")");
+            out.s(&format!("{SER}::Serializer::serialize_unit_struct(__serializer,"))
+                .str(&name)
+                .s(")");
         }
         Style::Tuple if fields.list.len() == 1 && own.len() == 1 => {
-            out.s(&format!("{SER}::Serializer::serialize_newtype_struct(__serializer,")).str(&name).s(",");
+            out.s(&format!("{SER}::Serializer::serialize_newtype_struct(__serializer,"))
+                .str(&name)
+                .s(",");
             value(out, own[0].0, own[0].1, wrappers);
             out.s(")");
         }
         Style::Tuple => {
-            out.s(&format!("let mut __state = {SER}::Serializer::serialize_tuple_struct(__serializer,")).str(&name).s(",");
+            out.s(&format!(
+                "let mut __state = {SER}::Serializer::serialize_tuple_struct(__serializer,"
+            ))
+            .str(&name)
+            .s(",");
             length(out, &own, 0);
             out.s(")?;");
             fields_of(out, &own, &format!("{SER}::SerializeTupleStruct"), false, wrappers);
@@ -222,21 +255,28 @@ fn struct_body(out: &mut Out, item: &Item, fields: &Fields, wrappers: &mut Wrapp
                     continue;
                 }
                 let mut write = Out::default();
-                write.s(&format!("{SER}::SerializeMap::serialize_entry(&mut __state,")).str(&field.key).s(",");
+                write
+                    .s(&format!("{SER}::SerializeMap::serialize_entry(&mut __state,"))
+                    .str(&field.key)
+                    .s(",");
                 value(&mut write, field, *access, wrappers);
                 write.s(")?;");
                 let write = write.finish();
                 match &field.attrs.skip_serializing_if {
                     None => out.tokens(&write),
-                    Some(path) => out.s("if !").tokens(path).paren(|out| access.write(out)).brace(|out| {
-                        out.tokens(&write);
-                    }),
+                    Some(path) => {
+                        out.s("if !").tokens(path).paren(|out| access.write(out)).brace(|out| {
+                            out.tokens(&write);
+                        })
+                    }
                 };
             }
             out.s(&format!("{SER}::SerializeMap::end(__state)"));
         }
         Style::Named => {
-            out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct(__serializer,")).str(&name).s(",");
+            out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct(__serializer,"))
+                .str(&name)
+                .s(",");
             length(out, &own, 0);
             out.s(")?;");
             fields_of(out, &own, &format!("{SER}::SerializeStruct"), true, wrappers);
@@ -283,19 +323,38 @@ fn enum_body(out: &mut Out, item: &Item, variants: &[Variant], wrappers: &mut Wr
     });
 }
 
-fn variant_body(out: &mut Out, item: &Item, name: &str, index: u32, variant: &Variant, wrappers: &mut Wrappers) {
+fn variant_body(
+    out: &mut Out,
+    item: &Item,
+    name: &str,
+    index: u32,
+    variant: &Variant,
+    wrappers: &mut Wrappers,
+) {
     let fields = written(&variant.fields, |it| Access::Bound(it.index));
     let key = variant.key.as_str();
     let variant_name = crate::parse::unraw(&variant.ident);
     if let Some(tag) = &item.attrs.tag {
         match variant.fields.style {
             Style::Unit => {
-                out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct(__serializer,")).str(name).s(", 1)?;");
-                out.s(&format!("{SER}::SerializeStruct::serialize_field(&mut __state,")).str(tag).s(",").str(key).s(")?;");
+                out.s(&format!(
+                    "let mut __state = {SER}::Serializer::serialize_struct(__serializer,"
+                ))
+                .str(name)
+                .s(", 1)?;");
+                out.s(&format!("{SER}::SerializeStruct::serialize_field(&mut __state,"))
+                    .str(tag)
+                    .s(",")
+                    .str(key)
+                    .s(")?;");
                 out.s(&format!("{SER}::SerializeStruct::end(__state)"));
             }
             Style::Tuple => {
-                out.s("::blaze_serde::__private::serialize_tagged_newtype(__serializer,").str(name).s(",").str(&variant_name).s(",");
+                out.s("::blaze_serde::__private::serialize_tagged_newtype(__serializer,")
+                    .str(name)
+                    .s(",")
+                    .str(&variant_name)
+                    .s(",");
                 out.str(tag).s(",").str(key).s(",");
                 match fields.first() {
                     Some((field, access)) => value(out, field, *access, wrappers),
@@ -306,10 +365,18 @@ fn variant_body(out: &mut Out, item: &Item, name: &str, index: u32, variant: &Va
                 out.s(")");
             }
             Style::Named => {
-                out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct(__serializer,")).str(name).s(",");
+                out.s(&format!(
+                    "let mut __state = {SER}::Serializer::serialize_struct(__serializer,"
+                ))
+                .str(name)
+                .s(",");
                 length(out, &fields, 1);
                 out.s(")?;");
-                out.s(&format!("{SER}::SerializeStruct::serialize_field(&mut __state,")).str(tag).s(",").str(key).s(")?;");
+                out.s(&format!("{SER}::SerializeStruct::serialize_field(&mut __state,"))
+                    .str(tag)
+                    .s(",")
+                    .str(key)
+                    .s(")?;");
                 fields_of(out, &fields, &format!("{SER}::SerializeStruct"), true, wrappers);
                 out.s(&format!("{SER}::SerializeStruct::end(__state)"));
             }
@@ -327,7 +394,9 @@ fn variant_body(out: &mut Out, item: &Item, name: &str, index: u32, variant: &Va
                 out.s(", __serializer)");
             }
             Style::Tuple => {
-                out.s(&format!("let mut __state = {SER}::Serializer::serialize_tuple(__serializer,"));
+                out.s(&format!(
+                    "let mut __state = {SER}::Serializer::serialize_tuple(__serializer,"
+                ));
                 length(out, &fields, 0);
                 out.s(")?;");
                 for (field, access) in &fields {
@@ -338,7 +407,11 @@ fn variant_body(out: &mut Out, item: &Item, name: &str, index: u32, variant: &Va
                 out.s(&format!("{SER}::SerializeTuple::end(__state)"));
             }
             Style::Named => {
-                out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct(__serializer,")).str(&variant_name).s(",");
+                out.s(&format!(
+                    "let mut __state = {SER}::Serializer::serialize_struct(__serializer,"
+                ))
+                .str(&variant_name)
+                .s(",");
                 length(out, &fields, 0);
                 out.s(")?;");
                 fields_of(out, &fields, &format!("{SER}::SerializeStruct"), true, wrappers);
@@ -349,22 +422,50 @@ fn variant_body(out: &mut Out, item: &Item, name: &str, index: u32, variant: &Va
     }
     match variant.fields.style {
         Style::Unit => {
-            out.s(&format!("{SER}::Serializer::serialize_unit_variant(__serializer,")).str(name).s(",").u32(index).s(",").str(key).s(")");
+            out.s(&format!("{SER}::Serializer::serialize_unit_variant(__serializer,"))
+                .str(name)
+                .s(",")
+                .u32(index)
+                .s(",")
+                .str(key)
+                .s(")");
         }
         Style::Tuple if variant.fields.list.len() == 1 && fields.len() == 1 => {
-            out.s(&format!("{SER}::Serializer::serialize_newtype_variant(__serializer,")).str(name).s(",").u32(index).s(",").str(key).s(",");
+            out.s(&format!("{SER}::Serializer::serialize_newtype_variant(__serializer,"))
+                .str(name)
+                .s(",")
+                .u32(index)
+                .s(",")
+                .str(key)
+                .s(",");
             value(out, fields[0].0, fields[0].1, wrappers);
             out.s(")");
         }
         Style::Tuple => {
-            out.s(&format!("let mut __state = {SER}::Serializer::serialize_tuple_variant(__serializer,")).str(name).s(",").u32(index).s(",").str(key).s(",");
+            out.s(&format!(
+                "let mut __state = {SER}::Serializer::serialize_tuple_variant(__serializer,"
+            ))
+            .str(name)
+            .s(",")
+            .u32(index)
+            .s(",")
+            .str(key)
+            .s(",");
             length(out, &fields, 0);
             out.s(")?;");
             fields_of(out, &fields, &format!("{SER}::SerializeTupleVariant"), false, wrappers);
             out.s(&format!("{SER}::SerializeTupleVariant::end(__state)"));
         }
         Style::Named => {
-            out.s(&format!("let mut __state = {SER}::Serializer::serialize_struct_variant(__serializer,")).str(name).s(",").u32(index).s(",").str(key).s(",");
+            out.s(&format!(
+                "let mut __state = {SER}::Serializer::serialize_struct_variant(__serializer,"
+            ))
+            .str(name)
+            .s(",")
+            .u32(index)
+            .s(",")
+            .str(key)
+            .s(",");
             length(out, &fields, 0);
             out.s(")?;");
             fields_of(out, &fields, &format!("{SER}::SerializeStructVariant"), true, wrappers);
@@ -403,7 +504,10 @@ impl Wrappers {
             item.generics.write_impl(out, &["'__a"]);
             item.generics.write_where(out, &[]);
             out.brace(|out| {
-                out.s("value: &'__a").tokens(ty).s(", __marker: ::core::marker::PhantomData<fn() ->").ident(&item.ident);
+                out.s("value: &'__a")
+                    .tokens(ty)
+                    .s(", __marker: ::core::marker::PhantomData<fn() ->")
+                    .ident(&item.ident);
                 item.generics.write_args(out);
                 out.s(">,");
             });
@@ -429,7 +533,9 @@ pub(crate) fn write_arg_list(out: &mut Out, item: &Item) {
     for param in &item.generics.params {
         match param {
             generics::Param::Lifetime { name, .. } => out.s(name).s(","),
-            generics::Param::Type { ident, .. } | generics::Param::Const { ident, .. } => out.ident(ident).s(","),
+            generics::Param::Type { ident, .. } | generics::Param::Const { ident, .. } => {
+                out.ident(ident).s(",")
+            }
         };
     }
 }

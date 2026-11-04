@@ -31,7 +31,10 @@ const MARK: &str = "\n// blaze's list of this crate's proc macros and its wasm m
 /// and the glue. An error names the crate when it is no proc-macro crate.
 pub fn wasm_glue(db: &Db, krate: Crate) -> Result<String, String> {
     if !hir_def::nameres::crate_def_map(db, krate).is_proc_macro() {
-        return Err(format!("`{}` is not a proc-macro crate, so it has no wasm module's glue", krate.named(db))); // alloc: error path
+        return Err(format!(
+            "`{}` is not a proc-macro crate, so it has no wasm module's glue",
+            krate.named(db)
+        )); // alloc: error path
     }
     // A proc-macro crate with no macros is one rustc builds (`superset-of-rust`): its list is
     // empty, and a use of a macro it lacks fails at the use, naming it.

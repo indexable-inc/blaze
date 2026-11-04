@@ -359,7 +359,10 @@ mod tests {
 /// kept is the first intern's of each value, every other header is dropped once, equal slices
 /// get one handle, and a handle reads its header, length and items whole.
 #[cfg(all(test, blaze_check))]
-#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
+#[allow(
+    unsafe_code,
+    reason = "each execution's storage is reached through a pointer the test sets and clears"
+)]
 mod model {
     use std::{
         ptr,

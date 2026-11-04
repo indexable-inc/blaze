@@ -71,7 +71,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplMissingAssocItems) -> Vec
             }
         }
     }
-    for (style, items) in [(SuggestionStyle::CompletelyHidden, local), (SuggestionStyle::HideCodeAlways, foreign)] {
+    for (style, items) in
+        [(SuggestionStyle::CompletelyHidden, local), (SuggestionStyle::HideCodeAlways, foreign)]
+    {
         for (snippet, code) in items {
             diag.suggestion_with_style(
                 // alloc: the error's parts, for an error hir found
@@ -170,7 +172,10 @@ fn fn_signature(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function) -> Option<St
                     Mutability::Shared => "",
                 };
                 return match is_method {
-                    true if inner.as_type_param(db).is_some_and(|it| it.name(db).as_str() == "Self") => {
+                    true if inner
+                        .as_type_param(db)
+                        .is_some_and(|it| it.name(db).as_str() == "Self") =>
+                    {
                         // alloc: the error's text, for an error hir found
                         format!("&{mutability}self")
                     }
@@ -217,7 +222,11 @@ fn fn_signature(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function) -> Option<St
 
 /// The arguments of the trait function's type parameters, in order: the trait's `Self` kept,
 /// the trait's own parameters the impl's arguments, the function's own kept.
-fn instantiation<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'_>, f: hir::Function) -> Option<Vec<hir::Type<'db>>> {
+fn instantiation<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'_>,
+    f: hir::Function,
+) -> Option<Vec<hir::Type<'db>>> {
     let db = cx.db;
     let trait_ref = at.impl_.trait_ref(db)?;
     let trait_ = trait_ref.trait_();
@@ -317,7 +326,8 @@ fn plain_generics(node: ast::Node<'_>) -> bool {
         .filter(in_signature)
         .filter_map(ast::Lifetime::cast)
         .any(|it| it.syntax().text() != "'static");
-    let projections = node.descendants().filter(in_signature).any(|it| ast::AssocTypeArg::can_cast(it.kind()));
+    let projections =
+        node.descendants().filter(in_signature).any(|it| ast::AssocTypeArg::can_cast(it.kind()));
     let unsized_ = node
         .descendants()
         .filter(in_signature)
@@ -383,7 +393,8 @@ fn value_of(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
             // alloc: the error's text, for an error hir found
             return Some("None".to_owned());
         }
-        let result = items.ResultOk.map(|it| hir::Adt::Enum(hir::EnumVariant::from(it).parent_enum(db)));
+        let result =
+            items.ResultOk.map(|it| hir::Adt::Enum(hir::EnumVariant::from(it).parent_enum(db)));
         if result == Some(adt) {
             // alloc: the error's text, for an error hir found
             return Some(format!("Ok({})", value_of(cx, args.first()?)?));

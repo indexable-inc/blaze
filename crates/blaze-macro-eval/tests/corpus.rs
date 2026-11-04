@@ -61,10 +61,16 @@ fn expand() -> Result<Expanded, String> {
 fn expand_with(ahead: &Ahead) -> Result<Expanded, String> {
     let config = Corpus::read()?;
     let records = record::Records::default();
-    let keeping = blaze_macro_eval::Macros::nothing("the corpus compares each expansion that runs, so none is kept");
-    let workspace = load::lower(&config.workspace, &config.cargo_home, config.homes(), &keeping, |krate, macros| {
-        Ok(wrap(krate, macros, &records, ahead))
-    })?;
+    let keeping = blaze_macro_eval::Macros::nothing(
+        "the corpus compares each expansion that runs, so none is kept",
+    );
+    let workspace = load::lower(
+        &config.workspace,
+        &config.cargo_home,
+        config.homes(),
+        &keeping,
+        |krate, macros| Ok(wrap(krate, macros, &records, ahead)),
+    )?;
     let calls = workspace.krate("corpus-calls")?;
     let panics = workspace.krate("corpus-panics")?;
     let db = workspace.lowered.db();
@@ -80,23 +86,36 @@ fn expand_with(ahead: &Ahead) -> Result<Expanded, String> {
 }
 
 /// Each of blaze-macro-eval's macros of crate `krate`, recording its calls.
-fn wrap(krate: &str, macros: Vec<ProcMacro>, records: &record::Records, ahead: &Ahead) -> Vec<ProcMacro> {
-    macros.into_iter().map(|eval| Recorder::wrap_ahead(krate, eval, records, ahead.clone())).collect()
+fn wrap(
+    krate: &str,
+    macros: Vec<ProcMacro>,
+    records: &record::Records,
+    ahead: &Ahead,
+) -> Vec<ProcMacro> {
+    macros
+        .into_iter()
+        .map(|eval| Recorder::wrap_ahead(krate, eval, records, ahead.clone()))
+        .collect()
 }
 
 /// The calls of macro `name` of crate `krate` from crate `calling`.
-fn calls_of<'a>(krate: &'a str, name: &'a str, calling: Crate) -> impl Iterator<Item = &'static Record> + 'a {
-    expanded()
-        .records
-        .iter()
-        .filter(move |it| &*it.call.krate == krate && &*it.call.name == name && it.call.calling == Some(calling))
+fn calls_of<'a>(
+    krate: &'a str,
+    name: &'a str,
+    calling: Crate,
+) -> impl Iterator<Item = &'static Record> + 'a {
+    expanded().records.iter().filter(move |it| {
+        &*it.call.krate == krate && &*it.call.name == name && it.call.calling == Some(calling)
+    })
 }
 
 /// The one call of macro `name` of crate `krate` from crate `calling` whose subject (the item
 /// a derive or an attribute is on, the first identifier a function-like macro is given) is
 /// `subject`.
 fn call_on(krate: &str, name: &str, calling: Crate, subject: &str) -> &'static Record {
-    let found: Vec<&Record> = calls_of(krate, name, calling).filter(|it| it.call.subject().as_deref() == Some(subject)).collect();
+    let found: Vec<&Record> = calls_of(krate, name, calling)
+        .filter(|it| it.call.subject().as_deref() == Some(subject))
+        .collect();
     match found.as_slice() {
         [one] => one,
         [] => panic!("no call of `{krate}::{name}` on `{subject}`"),
@@ -176,8 +195,13 @@ fn every_call_is_expanded() {
     for (krate, name, subject) in COVERED {
         output(call_on(krate, name, expanded.calls, subject));
     }
-    let select: Vec<&Record> = calls_of("tokio_macros", "select_priv_declare_output_enum", expanded.calls).collect();
-    assert_eq!(select.len(), 1, "corpus-calls calls tokio's `select_priv_declare_output_enum!` once");
+    let select: Vec<&Record> =
+        calls_of("tokio_macros", "select_priv_declare_output_enum", expanded.calls).collect();
+    assert_eq!(
+        select.len(),
+        1,
+        "corpus-calls calls tokio's `select_priv_declare_output_enum!` once"
+    );
     output(select[0]);
 }
 
@@ -187,9 +211,18 @@ fn a_panic_is_its_message() {
     let panics = expanded().panics;
     let mut boom: Vec<&Record> = calls_of("corpus_macros", "boom", panics).collect();
     boom.sort_by_key(|it| it.call.subtree.as_token_trees().iter_flat_tokens().count());
-    let tokio: Vec<&Record> = calls_of("tokio_macros", "select_priv_declare_output_enum", panics).collect();
-    let expected = [(boom.first(), "boom: 0 tokens"), (boom.last(), "boom: 3 tokens"), (tokio.first(), "unexpected macro input")];
-    assert_eq!((boom.len(), tokio.len()), (2, 1), "corpus-panics makes two calls of `boom` and one of tokio's");
+    let tokio: Vec<&Record> =
+        calls_of("tokio_macros", "select_priv_declare_output_enum", panics).collect();
+    let expected = [
+        (boom.first(), "boom: 0 tokens"),
+        (boom.last(), "boom: 3 tokens"),
+        (tokio.first(), "unexpected macro input"),
+    ];
+    assert_eq!(
+        (boom.len(), tokio.len()),
+        (2, 1),
+        "corpus-panics makes two calls of `boom` and one of tokio's"
+    );
     // The calls of the same crate around them expand: a panic fails its own call alone.
     for subject in ["before", "between", "after", "last"] {
         output(call_on("corpus_macros", "make_fn", panics, subject));
@@ -198,8 +231,13 @@ fn a_panic_is_its_message() {
         let record = record.expect("counted above");
         match &record.eval {
             Outcome::Panicked(said) => assert_eq!(said, message, "{}", record.what()),
-            Outcome::Expanded(tree) => panic!("{} expanded to `{tree}`, and the macro panics with {message:?}", record.what()),
-            Outcome::Failed(why) => panic!("{} failed ({why}), and the macro panics with {message:?}", record.what()),
+            Outcome::Expanded(tree) => panic!(
+                "{} expanded to `{tree}`, and the macro panics with {message:?}",
+                record.what()
+            ),
+            Outcome::Failed(why) => {
+                panic!("{} failed ({why}), and the macro panics with {message:?}", record.what())
+            }
         }
     }
 }
@@ -253,7 +291,9 @@ fn runs_ahead_give_what_turns_give() {
     let turns = expand_with(&Ahead::Off).unwrap_or_else(|why| panic!("{why}"));
     let turns_took = started.elapsed();
     let ran_ahead = count.load(Ordering::Relaxed);
-    let busy = |expanded: &Expanded| expanded.records.iter().map(|it| it.took).sum::<std::time::Duration>();
+    let busy = |expanded: &Expanded| {
+        expanded.records.iter().map(|it| it.took).sum::<std::time::Duration>()
+    };
     eprintln!(
         "{} calls; runs ahead: {ran_ahead}, wall {ahead_took:?}, the calls' turns {:?}; at their turns alone: \
          wall {turns_took:?}, the calls' turns {:?}",
@@ -262,7 +302,11 @@ fn runs_ahead_give_what_turns_give() {
         busy(&turns),
     );
     assert!(ran_ahead > 0, "no call ran ahead of its turn");
-    assert_eq!(text(&ahead), text(&turns), "a call run ahead of its turn gave other than at its turn");
+    assert_eq!(
+        text(&ahead),
+        text(&turns),
+        "a call run ahead of its turn gave other than at its turn"
+    );
 }
 
 #[test]
@@ -275,8 +319,15 @@ fn a_macro_reads_its_callers_file_and_variables() {
         "`include_data!` gave {data:?}, not calls/data.txt"
     );
     let package = output(call_on("corpus_macros", "env_name", calls, "PACKAGE"));
-    assert_eq!(record::literals(package), ["\"corpus-calls\""], "`env_name!` reads the calling package's CARGO_PKG_NAME");
-    assert!(record::has_ident(package, "true"), "`env_name!` finds CORPUS_UNSET unset: `{package}`");
+    assert_eq!(
+        record::literals(package),
+        ["\"corpus-calls\""],
+        "`env_name!` reads the calling package's CARGO_PKG_NAME"
+    );
+    assert!(
+        record::has_ident(package, "true"),
+        "`env_name!` finds CORPUS_UNSET unset: `{package}`"
+    );
 }
 
 #[test]
@@ -285,7 +336,10 @@ fn every_macro_kind_is_called() {
     let expanded = expanded();
     for kind in [ProcMacroKind::CustomDerive, ProcMacroKind::Attr, ProcMacroKind::Bang] {
         assert!(
-            expanded.records.iter().any(|it| it.call.kind == kind && it.call.calling == Some(expanded.calls)),
+            expanded
+                .records
+                .iter()
+                .any(|it| it.call.kind == kind && it.call.calling == Some(expanded.calls)),
             "corpus-calls makes no {kind:?} call"
         );
     }

@@ -27,7 +27,8 @@ use crate::{
 
 /// What mbe's matcher says when no rule matches (`mbe::ExpandErrorKind`'s `Display`), apart
 /// from its binding errors, which all start with `expected `.
-const MATCH_FAILURES: &[&str] = &["no rule matches input tokens", "unexpected token in input", "leftover tokens"];
+const MATCH_FAILURES: &[&str] =
+    &["no rule matches input tokens", "unexpected token in input", "leftover tokens"];
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroError) -> Vec<Found> {
     let file = d.range.file_id;
@@ -56,12 +57,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroError) -> Vec<Found> {
         recursion_limit(cx, file, call.as_ref(), d.range.value)
     } else if let Some(call) = call.as_ref().filter(|it| it.is_builtin(cx, "compile_error")) {
         compile_error(cx, file, call, &d.message)
-    } else if let Some(call) = call.as_ref().filter(|it| it.is_macro_rules(cx) && is_match_failure(&d.message)) {
+    } else if let Some(call) =
+        call.as_ref().filter(|it| it.is_macro_rules(cx) && is_match_failure(&d.message))
+    {
         no_rules(cx, file, call, d.range.value)
     } else {
         let message = match &call {
             // alloc: the error's text, for an error hir found
-            Some(call) => format!("blaze can't expand {} `{}`: {}", call.kind.descr(), call.name, d.message),
+            Some(call) => {
+                format!("blaze can't expand {} `{}`: {}", call.kind.descr(), call.name, d.message)
+            }
             // alloc: the error's text, for an error hir found
             None => format!("blaze can't expand this macro: {}", d.message),
         };
@@ -107,7 +112,8 @@ impl<'db> Call<'db> {
         if let Some(call) = node.ancestors().find_map(ast::MacroCall::cast) {
             let path = call.path()?;
             let args = call.token_tree();
-            let end = args.map_or(path.syntax().text_range().end(), |it| it.syntax().text_range().end());
+            let end =
+                args.map_or(path.syntax().text_range().end(), |it| it.syntax().text_range().end());
             let name = path.segment()?.name_ref()?.text();
             return Some(Call {
                 kind: Kind::Bang,
@@ -124,7 +130,13 @@ impl<'db> Call<'db> {
             let name = &root.text()[range];
             return Some(Call { kind: Kind::Derive, range, name, macro_: None, args: None });
         }
-        Some(Call { kind: Kind::Attr, range: attr.syntax().text_range(), name: path_text, macro_: None, args: None })
+        Some(Call {
+            kind: Kind::Attr,
+            range: attr.syntax().text_range(),
+            name: path_text,
+            macro_: None,
+            args: None,
+        })
     }
 
     fn is_builtin(&self, cx: &Cx<'_, '_>, name: &str) -> bool {
@@ -167,8 +179,11 @@ fn no_rules(cx: &Cx<'_, '_>, file: hir::HirFileId, call: &Call<'_>, at: TextRang
     let span = |range| cx.span(InFile::new(file, range));
     let tokens = call.args.map(arg_tokens).unwrap_or_default();
     let close = call.args.and_then(|it| it.right_delimiter_token());
-    let failed = tokens.iter().find(|it| it.text_range().contains_range(at) && !at.is_empty()).copied();
-    let at_end = close.is_some_and(|it| it.text_range() == at || (at.is_empty() && at.start() == it.text_range().start()));
+    let failed =
+        tokens.iter().find(|it| it.text_range().contains_range(at) && !at.is_empty()).copied();
+    let at_end = close.is_some_and(|it| {
+        it.text_range() == at || (at.is_empty() && at.start() == it.text_range().start())
+    });
     let mut diag = if let Some(token) = failed {
         let (range, text) = glued(token);
         // alloc: the error's text, for an error hir found
@@ -213,7 +228,12 @@ fn compile_error(cx: &Cx<'_, '_>, file: hir::HirFileId, call: &Call<'_>, message
 }
 
 /// rustc's `RecursionLimitReached`.
-fn recursion_limit(cx: &Cx<'_, '_>, file: hir::HirFileId, call: Option<&Call<'_>>, range: TextRange) -> Diag {
+fn recursion_limit(
+    cx: &Cx<'_, '_>,
+    file: hir::HirFileId,
+    call: Option<&Call<'_>>,
+    range: TextRange,
+) -> Diag {
     let limit = hir_def::nameres::crate_def_map(cx.db, cx.krate.into()).recursion_limit();
     let suggested = if limit == 0 { 2 } else { limit * 2 };
     let crate_name = cx.crate_name(cx.krate);
@@ -222,7 +242,11 @@ fn recursion_limit(cx: &Cx<'_, '_>, file: hir::HirFileId, call: Option<&Call<'_>
         None => (String::from("this macro"), range), // alloc: the error's text, for an error hir found
     };
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(None, format!("recursion limit reached while expanding `{descr}`"), cx.span(InFile::new(file, range)));
+    let mut diag = Diag::error(
+        None,
+        format!("recursion limit reached while expanding `{descr}`"),
+        cx.span(InFile::new(file, range)),
+    );
     // alloc: the error's text, for an error hir found
     diag.help(format!(
         "consider increasing the recursion limit by adding a `#![recursion_limit = \"{suggested}\"]` attribute to your crate (`{crate_name}`)"
@@ -231,12 +255,24 @@ fn recursion_limit(cx: &Cx<'_, '_>, file: hir::HirFileId, call: Option<&Call<'_>
 }
 
 /// rustc's `NoDefaultVariant` (E0665), at the `Default` of the derive.
-fn no_default_variant(cx: &Cx<'_, '_>, file: hir::HirFileId, root: Node<'_>, range: TextRange) -> Diag {
+fn no_default_variant(
+    cx: &Cx<'_, '_>,
+    file: hir::HirFileId,
+    root: Node<'_>,
+    range: TextRange,
+) -> Diag {
     let span = |range| cx.span(InFile::new(file, range));
-    let mut diag = Diag::error(Some("E0665"), "`#[derive(Default)]` on enum with no `#[default]`", span(range));
+    let mut diag = Diag::error(
+        Some("E0665"),
+        "`#[derive(Default)]` on enum with no `#[default]`",
+        span(range),
+    );
     let enum_ = root.covering_element(range).ancestors().find_map(ast::Enum::cast);
     let Some(enum_) = enum_ else { return diag };
-    diag.span_label(span(item_range(enum_.syntax())), "this enum needs a unit variant marked with `#[default]`");
+    diag.span_label(
+        span(item_range(enum_.syntax())),
+        "this enum needs a unit variant marked with `#[default]`",
+    );
     for variant in enum_.variant_list().into_iter().flat_map(|it| it.variants()) {
         let non_exhaustive = variant
             .attrs()
@@ -284,7 +320,8 @@ const UNUSED_KEYWORDS: &[&str] = &[
 
 /// rustc's `token_descr` of a token whose text is `text`.
 fn describe(token: Token<'_>, text: &str, edition: span::Edition) -> String {
-    let is_doc = matches!(token.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT);
+    let is_doc =
+        matches!(token.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT);
     let used = USED_KEYWORDS.contains(&text)
         || (edition.at_least_2018() && matches!(text, "async" | "await" | "dyn"));
     let unused = UNUSED_KEYWORDS.contains(&text)

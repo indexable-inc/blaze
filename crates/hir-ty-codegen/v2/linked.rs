@@ -12,12 +12,11 @@ use blaze_codegen::{
 };
 use blaze_format::cursor::Put;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::{
-    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule as _,
-    ItemContainerId, Lookup, ModuleDefId,
+    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule as _, ItemContainerId,
+    Lookup, ModuleDefId,
     attrs::{AttrFlags, NativeLibKind as Written},
     expr_store::Body as BodyStore,
     nameres::crate_def_map,
@@ -25,6 +24,7 @@ use hir_def::{
 };
 use hir_ty_mir::mir::MirSpan;
 use hir_ty_share::code::{self, TABLES};
+use std::alloc::Global;
 
 /// What [`HirFrontend::link_inputs`] gives the link.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -82,7 +82,9 @@ impl HirFrontend<'_> {
             for (at, key) in columns.keys().iter().enumerate() {
                 let hashes = columns.row(at);
                 match (hashes.kind, hashes.layout) {
-                    (blaze_items::ItemKind::Fn, _) => rows.push((*key, Assumed::Signature(hashes.interface.0))),
+                    (blaze_items::ItemKind::Fn, _) => {
+                        rows.push((*key, Assumed::Signature(hashes.interface.0)))
+                    }
                     (_, Some(layout)) => rows.push((*key, Assumed::Layout(layout.0))),
                     _ => {}
                 }
@@ -115,7 +117,12 @@ impl HirFrontend<'_> {
 }
 
 fn error(what: String) -> CodegenError {
-    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what, front: None }
+    CodegenError {
+        unit: InstanceKey(ContentId::default()),
+        item: ItemKey(ContentId::default()),
+        what,
+        front: None,
+    }
 }
 
 fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
@@ -132,7 +139,9 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                 let name = lib.name.as_str();
                 let kind = match lib.kind {
                     Written::Unspecified | Written::Dylib => NativeLibKind::Dylib,
-                    Written::Static => NativeLibKind::Static { whole: lib.whole_archive, bundle: lib.bundle },
+                    Written::Static => {
+                        NativeLibKind::Static { whole: lib.whole_archive, bundle: lib.bundle }
+                    }
                     Written::Framework => NativeLibKind::Framework,
                     Written::RawDylib => {
                         // alloc: an error
@@ -170,7 +179,10 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                 }
                 if name.is_empty() {
                     // alloc: an error
-                    return Err(format!("`#[link(name = \"\")]` in {}: a library has a name", named()));
+                    return Err(format!(
+                        "`#[link(name = \"\")]` in {}: a library has a name",
+                        named()
+                    ));
                 }
                 if lib.whole_archive && !matches!(kind, NativeLibKind::Static { .. }) {
                     // alloc: an error
@@ -215,7 +227,11 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
 
 /// Every span table `built` names, encoded: of each body and function declaration of its
 /// items whose anchor its code names. An anchor of no table found is an error naming it.
-fn span_tables(db: &Db, hashes: &HashSource, built: &Built) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
+fn span_tables(
+    db: &Db,
+    hashes: &HashSource,
+    built: &Built,
+) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
     tables(db, hashes, &built.items, named_anchors(built), &built.debug_names)
 }
 
@@ -293,7 +309,9 @@ fn tables(
     }
     if let Some((anchor, by)) = named.iter().min_by_key(|it| *it.0) {
         let name = match by {
-            NamedBy::Function { key, .. } => debug_names.iter().find(|it| it.0 == *key).map(|it| it.1.as_str()),
+            NamedBy::Function { key, .. } => {
+                debug_names.iter().find(|it| it.0 == *key).map(|it| it.1.as_str())
+            }
             NamedBy::Static(_) | NamedBy::Caller => None,
         };
         // alloc: an error
@@ -330,9 +348,15 @@ fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy, Global> {
     }
     let mut named: HashMap<ContentId, NamedBy, Global> = HashMap::new_in(Global);
     for function in &built.functions {
-        let by = |what: &'static str| move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what });
+        let by = |what: &'static str| {
+            move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what })
+        };
         let code = named_in(function.relocs.targets()).map(by("a position in"));
-        let data = function.data.iter().flat_map(|it| named_in(it.relocs.targets())).map(by("the data of"));
+        let data = function
+            .data
+            .iter()
+            .flat_map(|it| named_in(it.relocs.targets()))
+            .map(by("the data of"));
         let lines = function.lines.iter().map(|it| it.span.anchor).map(by("a line row of"));
         for (anchor, by) in code.chain(data).chain(lines) {
             named.entry(anchor).or_insert(by);
@@ -355,7 +379,10 @@ fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy, Global> {
 #[derive(Clone, Copy, Debug)]
 enum NamedBy {
     /// `what` says where in the function: its code, its data or its line rows.
-    Function { key: InstanceKey, what: &'static str },
+    Function {
+        key: InstanceKey,
+        what: &'static str,
+    },
     Static(ItemKey),
     /// The caller of [`span_tables_of`], which named it.
     Caller,
@@ -401,18 +428,26 @@ pub(super) fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, Stri
     for table in 0..TABLES {
         starts[table] = rows.len() as u32;
         match table {
-            code::EXPRS => for it in store.expr_ids() {
-                rows.push(row(MirSpan::ExprId(it))?);
-            },
-            code::EXPR_ENDS => for it in store.expr_ids() {
-                rows.push(row(MirSpan::ExprEnd(it))?);
-            },
-            code::PATS => for it in store.pat_ids() {
-                rows.push(row(MirSpan::PatId(it))?);
-            },
-            code::BINDINGS => for (it, _) in store.bindings() {
-                rows.push(row(MirSpan::BindingId(it))?);
-            },
+            code::EXPRS => {
+                for it in store.expr_ids() {
+                    rows.push(row(MirSpan::ExprId(it))?);
+                }
+            }
+            code::EXPR_ENDS => {
+                for it in store.expr_ids() {
+                    rows.push(row(MirSpan::ExprEnd(it))?);
+                }
+            }
+            code::PATS => {
+                for it in store.pat_ids() {
+                    rows.push(row(MirSpan::PatId(it))?);
+                }
+            }
+            code::BINDINGS => {
+                for (it, _) in store.bindings() {
+                    rows.push(row(MirSpan::BindingId(it))?);
+                }
+            }
             code::SELF_PARAM => rows.push(row(MirSpan::SelfParam)?),
             code::UNKNOWN => rows.push(row(MirSpan::Unknown)?),
             _ => unreachable!("{TABLES} tables"),
@@ -481,7 +516,9 @@ fn encode(
 /// What a debugger and a backtrace call an instance: rustc's demangled name of it.
 pub(super) fn debug_name(db: &Db, kind: &Kind) -> String {
     match kind {
-        Kind::Code(instance, _) => blaze_query::db::attach(db, || crate::backtrace_name(db, instance)),
+        Kind::Code(instance, _) => {
+            blaze_query::db::attach(db, || crate::backtrace_name(db, instance))
+        }
         Kind::Start(main) => match crate::target_of_crate(db, main.krate(db)) {
             // alloc: per instance described, its debug name
             Ok(target) => target.entry().0.to_owned(),

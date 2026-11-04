@@ -25,12 +25,21 @@ pub(super) struct Layout {
 }
 
 impl Layout {
-    pub fn new(target_dir: &Path, build_dir: &Path, triple: Option<&str>, profile_dir: &str) -> Layout {
+    pub fn new(
+        target_dir: &Path,
+        build_dir: &Path,
+        triple: Option<&str>,
+        profile_dir: &str,
+    ) -> Layout {
         let (root, build_root) = match triple {
             Some(triple) => (target_dir.join(triple), build_dir.join(triple)),
             None => (target_dir.to_path_buf(), build_dir.to_path_buf()),
         };
-        Layout { dest: root.join(profile_dir), build_dest: build_root.join(profile_dir), build_root }
+        Layout {
+            dest: root.join(profile_dir),
+            build_dest: build_root.join(profile_dir),
+            build_root,
+        }
     }
 
     fn build(&self) -> PathBuf {
@@ -93,7 +102,13 @@ pub(super) struct FileType {
 
 impl FileType {
     fn rmeta() -> FileType {
-        FileType { flavor: Flavor::Rmeta, crate_type: None, prefix: "lib".to_owned(), suffix: ".rmeta".to_owned(), replace_hyphens: true }
+        FileType {
+            flavor: Flavor::Rmeta,
+            crate_type: None,
+            prefix: "lib".to_owned(),
+            suffix: ".rmeta".to_owned(),
+            replace_hyphens: true,
+        }
     }
 
     fn output_filename(&self, crate_name: &str, extra: Option<&str>) -> String {
@@ -117,22 +132,33 @@ const MARK: &str = "\u{1}";
 
 /// rustc's file name of a crate type for `triple` (`--print file-names`), as a prefix and a
 /// suffix; `None` for a crate type the target lacks.
-fn prefix_suffix(triple: &str, crate_type: &CrateType) -> Result<Option<(String, String)>, LoadError> {
+fn prefix_suffix(
+    triple: &str,
+    crate_type: &CrateType,
+) -> Result<Option<(String, String)>, LoadError> {
     let name = platform::file_name(triple, crate_type.as_str(), MARK).map_err(error)?;
     Ok(match name {
         None => None,
         Some(name) => {
-            let (prefix, suffix) = name
-                .split_once(MARK)
-                .ok_or_else(|| error(format!("rustc's `{}` file for `{triple}` has no crate name in it", crate_type.as_str())))?;
+            let (prefix, suffix) = name.split_once(MARK).ok_or_else(|| {
+                error(format!(
+                    "rustc's `{}` file for `{triple}` has no crate name in it",
+                    crate_type.as_str()
+                ))
+            })?;
             Some((prefix.to_owned(), suffix.to_owned()))
         }
     })
 }
 
 /// cargo's `TargetInfo::file_types`.
-fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Option<Vec<FileType>>, LoadError> {
-    let crate_type = if *crate_type == CrateType::Lib { CrateType::Rlib } else { crate_type.clone() };
+fn file_types(
+    crate_type: &CrateType,
+    flavor: Flavor,
+    triple: &str,
+) -> Result<Option<Vec<FileType>>, LoadError> {
+    let crate_type =
+        if *crate_type == CrateType::Lib { CrateType::Rlib } else { crate_type.clone() };
     // A proc macro built for the wasm macros' platform ([`crate::load::MACRO_WASM`]) is a WASI
     // reactor, a module named as a `cdylib` of that target is: rustc makes no proc macro for
     // a wasm target, so a proc macro for it is always a wasm macro's unit.
@@ -154,7 +180,9 @@ fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Op
             out.push(file(".dll.lib", &prefix, Flavor::Auxiliary, true));
             out.push(file(".dll.exp", &prefix, Flavor::Auxiliary, true));
         } else if suffix == ".dll"
-            && (triple.ends_with("windows-gnu") || triple.ends_with("windows-gnullvm") || triple.ends_with("cygwin"))
+            && (triple.ends_with("windows-gnu")
+                || triple.ends_with("windows-gnullvm")
+                || triple.ends_with("cygwin"))
         {
             out.push(file(".dll.a", "lib", Flavor::Auxiliary, true));
         }
@@ -163,14 +191,22 @@ fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Op
         out.push(file(".wasm", &prefix, Flavor::Auxiliary, true));
         out.push(file(".wasm.map", &prefix, Flavor::DebugInfo, true));
     }
-    if matches!(crate_type, CrateType::Bin | CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro) {
+    if matches!(
+        crate_type,
+        CrateType::Bin | CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro
+    ) {
         if triple.contains("-apple-") {
             let suffix = if crate_type == CrateType::Bin { ".dSYM" } else { ".dylib.dSYM" };
             out.push(file(suffix, &prefix, Flavor::DebugInfo, false));
         } else if triple.ends_with("-msvc") || triple.ends_with("-uefi") {
             out.push(file(".pdb", &prefix, Flavor::DebugInfo, true));
         } else {
-            out.push(file(&format!("{suffix}.dwp"), &prefix, Flavor::DebugInfo, crate_type != CrateType::Bin));
+            out.push(file(
+                &format!("{suffix}.dwp"),
+                &prefix,
+                Flavor::DebugInfo,
+                crate_type != CrateType::Bin,
+            ));
         }
     }
     Ok(Some(out))
@@ -178,14 +214,20 @@ fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Op
 
 /// cargo's `TargetInfo::rustc_outputs`, with `calc_outputs_rustc`'s errors when the target
 /// has none of the crate types. `embed-metadata` is always on (`-Zno-embed-metadata` unstable).
-pub(super) fn rustc_outputs(mode: CompileMode, kind: &TargetKind, triple: &str, package: &str) -> Result<Vec<FileType>, LoadError> {
+pub(super) fn rustc_outputs(
+    mode: CompileMode,
+    kind: &TargetKind,
+    triple: &str,
+    package: &str,
+) -> Result<Vec<FileType>, LoadError> {
     let (types, unsupported) = match mode {
         CompileMode::Build => {
             let crate_types = kind.rustc_crate_types();
             let mut unsupported = Vec::new();
             let mut types = Vec::new();
             for crate_type in crate_types {
-                let flavor = if crate_type.is_linkable() { Flavor::Linkable } else { Flavor::Normal };
+                let flavor =
+                    if crate_type.is_linkable() { Flavor::Linkable } else { Flavor::Normal };
                 match file_types(crate_type, flavor, triple)? {
                     Some(it) => types.extend(it),
                     None => unsupported.push(crate_type.clone()),
@@ -199,12 +241,16 @@ pub(super) fn rustc_outputs(mode: CompileMode, kind: &TargetKind, triple: &str, 
         // cargo writes nothing for a library's doctests (rustdoc builds each example in a
         // directory it deletes); blaze plans the unit's program where a test's goes, and each
         // example is a program of its own beside it (docs/v2/plan/doctests.md).
-        CompileMode::Test | CompileMode::Doctest => match file_types(&CrateType::Bin, Flavor::Normal, triple)? {
-            Some(it) => (it, Vec::new()),
-            None => (Vec::new(), vec![CrateType::Bin]),
-        },
+        CompileMode::Test | CompileMode::Doctest => {
+            match file_types(&CrateType::Bin, Flavor::Normal, triple)? {
+                Some(it) => (it, Vec::new()),
+                None => (Vec::new(), vec![CrateType::Bin]),
+            }
+        }
         CompileMode::Check { .. } => (vec![FileType::rmeta()], Vec::new()),
-        other => return Err(error(format!("cargo asks rustc for no output of a `{other:?}` unit"))),
+        other => {
+            return Err(error(format!("cargo asks rustc for no output of a `{other:?}` unit")));
+        }
     };
     if types.is_empty() {
         if !unsupported.is_empty() {
@@ -294,7 +340,11 @@ fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<Path
     if file.crate_type == Some(CrateType::Rlib) && it.stop_rlib_uplift {
         return None;
     }
-    if !it.kind.is_bin() && !it.kind.is_custom_build() && file.crate_type != Some(CrateType::Dylib) && !it.is_root {
+    if !it.kind.is_bin()
+        && !it.kind.is_custom_build()
+        && file.crate_type != Some(CrateType::Dylib)
+        && !it.is_root
+    {
         return None;
     }
     let filename = file.uplift_filename(it.name, it.crate_name, it.bin_name);
@@ -344,7 +394,12 @@ pub(super) fn run_files(layout: &Layout, new_layout: bool, pkg_dir: &str) -> (St
 
 /// `bin_link_for_target`: where a bin of the package is uplifted for a unit of `triple`
 /// (`CARGO_BIN_EXE_*`), when the artifact directory is written.
-pub(super) fn bin_link(layout: &Layout, triple: &str, name: &str, bin_name: Option<&str>) -> Result<PathBuf, LoadError> {
+pub(super) fn bin_link(
+    layout: &Layout,
+    triple: &str,
+    name: &str,
+    bin_name: Option<&str>,
+) -> Result<PathBuf, LoadError> {
     let types = rustc_outputs(CompileMode::Build, &TargetKind::Bin, triple, name)?;
     let file = types
         .iter()

@@ -11,13 +11,14 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_ty::{
-    Adjust, Adjustment, AutoBorrow, OverloadedDeref, PointerCast, infer::AutoBorrowMutability, next_solver::TyKind,
+    Adjust, Adjustment, AutoBorrow, OverloadedDeref, PointerCast, infer::AutoBorrowMutability,
+    next_solver::TyKind,
 };
 use rustc_type_ir::{Mutability, UintTy, inherent::IntoKind};
 
 use super::{fn_def_span, has_attr, source_callsite, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
@@ -27,7 +28,8 @@ pub(crate) struct ImplicitAutorefs;
 
 impl LatePass for ImplicitAutorefs {
     const LINTS: LintSet = lint_set(["dangerous_implicit_autorefs"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Ref, ExprKind::Index, ExprKind::MethodCall, ExprKind::Field]);
+    const EXPRS: ExprKinds =
+        ExprKinds::of(&[ExprKind::Ref, ExprKind::Index, ExprKind::MethodCall, ExprKind::Field]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = check(b, expr) {
@@ -60,7 +62,9 @@ fn check(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
     let adjustments = peel_derefs_adjustments(adjustments);
     let [adjustment] = adjustments else { return None };
     let (borrow_mutbl, through_overloaded_deref) = has_implicit_borrow(adjustment)?;
-    let Expr::UnaryOp { expr: dereferenced, op: UnaryOp::Deref } = store.expr(peel_place_mappers(b, inner)) else {
+    let Expr::UnaryOp { expr: dereferenced, op: UnaryOp::Deref } =
+        store.expr(peel_place_mappers(b, inner))
+    else {
         return None;
     };
     if !util::ty(b, dereferenced).is_raw_ptr() {
@@ -101,7 +105,10 @@ fn check(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
         // alloc: the lint's text, for a lint found
         let name = FunctionSignature::of(b.db(), method).name.as_str().to_owned();
         // alloc: the lint's text, for a lint found
-        diag.span_note(fn_def_span(b, method), format!("method calls to `{name}` require a reference"));
+        diag.span_note(
+            fn_def_span(b, method),
+            format!("method calls to `{name}` require a reference"),
+        );
     }
     let mutbl = match borrow_mutbl {
         Mutability::Not => "&",
@@ -142,7 +149,8 @@ fn is_builtin_index(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
 /// `Index::index` took, and the unsizing of an array after it.
 fn without_index_borrow(adjustments: &[Adjustment]) -> &[Adjustment] {
     match adjustments {
-        [rest @ .., _, Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }] | [rest @ .., _] => rest,
+        [rest @ .., _, Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }]
+        | [rest @ .., _] => rest,
         [] => adjustments,
     }
 }
@@ -170,6 +178,9 @@ fn has_implicit_borrow(adjustment: &Adjustment) -> Option<(Mutability, bool)> {
             },
             false,
         )),
-        Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Deref(None) | Adjust::Borrow(AutoBorrow::RawPtr(_)) => None,
+        Adjust::NeverToAny
+        | Adjust::Pointer(_)
+        | Adjust::Deref(None)
+        | Adjust::Borrow(AutoBorrow::RawPtr(_)) => None,
     }
 }

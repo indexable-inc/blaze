@@ -12,8 +12,7 @@ use intern::Symbol;
 
 use crate::{conf::Conf, tests::lint_given};
 
-const MINICORE: &str =
-    "//- minicore: sized, copy, clone, option, fn, iterator, iterators, slice, deref, drop, index, builtin_impls\n";
+const MINICORE: &str = "//- minicore: sized, copy, clone, option, fn, iterator, iterators, slice, deref, drop, index, builtin_impls\n";
 
 const CRATES: &str = r#"
 //- /hashbrown.rs crate:hashbrown
@@ -95,9 +94,15 @@ fn identity() -> ProcMacro {
     let db = built.db();
     let krate = *all_crates(db)
         .iter()
-        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "proc_macros"))
+        .find(|it| {
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "proc_macros")
+        })
         .expect("the fixture has the proc macros' crate");
-    let loaded = ProcMacros::get_for_crate(db, krate).expect("the proc macros' crate has its macros");
+    let loaded =
+        ProcMacros::get_for_crate(db, krate).expect("the proc macros' crate has its macros");
     loaded.macros().expect("they loaded")[0].clone() // clone: a test's macro, once per fixture
 }
 
@@ -108,7 +113,10 @@ fn give_query_macros(built: &mut Fixture) {
     let krate = *all_crates(db)
         .iter()
         .find(|it| {
-            it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
         })
         .expect("the fixture has `blaze_query_macros`");
     let macros = ["tracked", "input", "interned"]
@@ -119,7 +127,12 @@ fn give_query_macros(built: &mut Fixture) {
 
 /// What `blaze::<name>` alone says of `main`, the crate named `krate`.
 fn only(name: &str, krate: &str, main: &str) -> String {
-    lint_given(&fixture(krate, main), &format!("-A clippy::all --warn=blaze::{name}"), Conf::default(), give_query_macros)
+    lint_given(
+        &fixture(krate, main),
+        &format!("-A clippy::all --warn=blaze::{name}"),
+        Conf::default(),
+        give_query_macros,
+    )
 }
 
 /// `hash_twice`: `contains_key` then `insert` is found with the entry API as its fix, a set's
@@ -199,11 +212,17 @@ pub fn opens(paths: [&str; 2]) {
 "#;
     let out = only("syscall_in_loop", "blaze_vfs", main);
     assert_eq!(out.matches("stats or opens a path once per element").count(), 3, "{out}");
-    assert!(out.contains("`size`, which reaches `metadata`,"), "the helper names the stat it reaches:\n{out}");
+    assert!(
+        out.contains("`size`, which reaches `metadata`,"),
+        "the helper names the stat it reaches:\n{out}"
+    );
     assert!(out.contains("the closure given to `map`"), "{out}");
     assert!(out.contains("blaze_core::Effect::Stamp"), "the help names the batch:\n{out}");
     let elsewhere = only("syscall_in_loop", "main", main);
-    assert!(!elsewhere.contains("stats or opens a path"), "a crate not batched is not checked:\n{elsewhere}");
+    assert!(
+        !elsewhere.contains("stats or opens a path"),
+        "a crate not batched is not checked:\n{elsewhere}"
+    );
 }
 
 /// `query_in_loop`: a query called with each element where a batch query beside it returns a

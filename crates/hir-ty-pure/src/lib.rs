@@ -127,7 +127,10 @@ impl Impure {
 pub fn allowed_env(name: &str) -> bool {
     match name.strip_prefix("CARGO_") {
         Some(rest) => !rest.is_empty() && rest != "MAKEFLAGS",
-        None => matches!(name, "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "DEBUG" | "OUT_DIR" | "NUM_JOBS"),
+        None => matches!(
+            name,
+            "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "DEBUG" | "OUT_DIR" | "NUM_JOBS"
+        ),
     }
 }
 
@@ -170,7 +173,9 @@ impl Abs {
         match (self, other) {
             (Abs::Unset, it) | (it, Abs::Unset) => it,
             (a, b) if a == b => a,
-            (Abs::Param(i), Abs::Under(j)) | (Abs::Under(i), Abs::Param(j)) if i == j => Abs::Under(i),
+            (Abs::Param(i), Abs::Under(j)) | (Abs::Under(i), Abs::Param(j)) if i == j => {
+                Abs::Under(i)
+            }
             (a, b) => match (a.as_path(), b.as_path()) {
                 (Some(a), Some(b)) if a == b => Abs::Root(a),
                 _ => Abs::Unknown,

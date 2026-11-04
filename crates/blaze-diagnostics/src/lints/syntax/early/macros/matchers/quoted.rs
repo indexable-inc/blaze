@@ -21,13 +21,17 @@ pub(super) enum Frag {
     Block,
     Stmt,
     /// `pat_param`, or `pat` before 2021 (`inferred`).
-    PatParam { inferred: bool },
+    PatParam {
+        inferred: bool,
+    },
     /// `pat` from 2021 on.
     PatWithOr,
     /// `expr` from 2024 on.
     Expr,
     /// `expr_2021`, or `expr` before 2024 (`inferred`).
-    Expr2021 { inferred: bool },
+    Expr2021 {
+        inferred: bool,
+    },
     Ty,
     Ident,
     Lifetime,
@@ -87,13 +91,32 @@ pub(super) struct Kleene {
 pub(super) enum Mtt {
     Token(Token),
     /// `$x` in a transcriber, or in a matcher of a macro a transcriber defines.
-    MetaVar { range: TextRange, name: Token },
+    MetaVar {
+        range: TextRange,
+        name: Token,
+    },
     /// `$x:frag` in a matcher.
-    MetaVarDecl { range: TextRange, name: Token, kind: Frag },
+    MetaVarDecl {
+        range: TextRange,
+        name: Token,
+        kind: Frag,
+    },
     /// `${..}`: its braces, and the variables it names (in [`Matchers::vars`]).
-    MetaVarExpr { range: TextRange, vars: Ids },
-    Delimited { delim: Delim, open: Token, close: Token, tts: Ids },
-    Sequence { tts: Ids, separator: Option<Token>, kleene: Kleene },
+    MetaVarExpr {
+        range: TextRange,
+        vars: Ids,
+    },
+    Delimited {
+        delim: Delim,
+        open: Token,
+        close: Token,
+        tts: Ids,
+    },
+    Sequence {
+        tts: Ids,
+        separator: Option<Token>,
+        kleene: Kleene,
+    },
 }
 
 /// Whether a token tree is parsed as a matcher or a transcriber: rustc's `RulePart`.
@@ -149,7 +172,11 @@ impl Matchers {
     /// The rules of `tokens`, a `macro_rules!` body (rules separated by `;`) or a `macro`'s (by
     /// `,`), as `compile_declarative_macro` takes them: it stops at the first rule it cannot
     /// read on, and a rule it stopped in has what it read of it.
-    pub(super) fn rules(tokens: &Tokens<'_>, macro_rules: bool, edition: Edition) -> (Matchers, Vec<Rule>) {
+    pub(super) fn rules(
+        tokens: &Tokens<'_>,
+        macro_rules: bool,
+        edition: Edition,
+    ) -> (Matchers, Vec<Rule>) {
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut m = Matchers { tts: Vec::new(), vars: Vec::new(), scratch: Vec::new(), edition };
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
@@ -233,7 +260,8 @@ impl Matchers {
             }
             // A matcher's `$x` without a specifier is an error, read as `$x:tt`.
             let decl = |range, kind| Mtt::MetaVarDecl { range, name, kind };
-            let Some(Tt::Token(colon)) = iter.peek().filter(|it| matches!(it, Tt::Token(t) if t.is(Punct::Colon)))
+            let Some(Tt::Token(colon)) =
+                iter.peek().filter(|it| matches!(it, Tt::Token(t) if t.is(Punct::Colon)))
             else {
                 self.scratch.push(decl(start, Frag::Tt));
                 continue;
@@ -287,9 +315,10 @@ impl Matchers {
             }
             Some(&Tt::Token(second)) if second.is(Punct::Dollar) => Mtt::Token(second),
             // `$` and what is not a name is an error, read as a variable with no name.
-            Some(&Tt::Token(other)) => {
-                Mtt::MetaVar { range: other.range, name: Token { range: TextRange::empty(other.range.start()), ..other } }
-            }
+            Some(&Tt::Token(other)) => Mtt::MetaVar {
+                range: other.range,
+                name: Token { range: TextRange::empty(other.range.start()), ..other },
+            },
             None => Mtt::Token(dollar),
         }
     }
@@ -308,7 +337,9 @@ impl Matchers {
     fn metavar_expr_inner(&mut self, tokens: &Tokens<'_>, input: Ids) -> Option<()> {
         let mut iter = Iter::new(tokens.get(input));
         let ident = plain_ident(iter.next())?;
-        let Some(Tt::Delimited(Group { delim: Delim::Paren, tts: args, .. })) = iter.next() else { return None };
+        let Some(Tt::Delimited(Group { delim: Delim::Paren, tts: args, .. })) = iter.next() else {
+            return None;
+        };
         if iter.peek().is_some() {
             return None;
         }
@@ -438,7 +469,8 @@ mod tests {
     fn rules(file: &Parse<SourceFile>, edition: Edition) -> (Tokens<'_>, Matchers, Vec<Rule>) {
         let def = file.root().descendants().find_map(ast::Macro::cast).unwrap();
         let tokens = Tokens::of(def, &|_| (edition, true)).unwrap();
-        let (m, rules) = Matchers::rules(&tokens, matches!(def, ast::Macro::MacroRules(_)), edition);
+        let (m, rules) =
+            Matchers::rules(&tokens, matches!(def, ast::Macro::MacroRules(_)), edition);
         (tokens, m, rules)
     }
 
@@ -453,13 +485,16 @@ mod tests {
 
     #[test]
     fn a_specifier_is_read_in_its_edition() {
-        let file = SourceFile::parse("macro_rules! m { ($p:pat $e:expr) => {}; }", Edition::Edition2018);
+        let file =
+            SourceFile::parse("macro_rules! m { ($p:pat $e:expr) => {}; }", Edition::Edition2018);
         let (tokens, m, read) = rules(&file, Edition::Edition2018);
         let tts = lhs_tts(&m, &read[0]);
         let kinds: Vec<_> = tts
             .iter()
             .map(|it| match it {
-                Mtt::MetaVarDecl { name, kind, range } => (tokens.name(name.range).to_owned(), *kind, tokens.text(*range).to_owned()),
+                Mtt::MetaVarDecl { name, kind, range } => {
+                    (tokens.name(name.range).to_owned(), *kind, tokens.text(*range).to_owned())
+                }
                 _ => panic!("{it:?}"),
             })
             .collect();
@@ -472,15 +507,23 @@ mod tests {
         );
         let file = SourceFile::parse("macro_rules! m { ($p:pat) => {} }", Edition::Edition2021);
         let (_, m, rules) = rules(&file, Edition::Edition2021);
-        assert!(matches!(lhs_tts(&m, &rules[0])[0], Mtt::MetaVarDecl { kind: Frag::PatWithOr, .. }));
+        assert!(matches!(
+            lhs_tts(&m, &rules[0])[0],
+            Mtt::MetaVarDecl { kind: Frag::PatWithOr, .. }
+        ));
     }
 
     #[test]
     fn a_repetition_has_its_separator_and_operator() {
-        let file = SourceFile::parse("macro_rules! m { ($($x:tt),+ $(;)?) => { $($x)* } }", Edition::Edition2021);
+        let file = SourceFile::parse(
+            "macro_rules! m { ($($x:tt),+ $(;)?) => { $($x)* } }",
+            Edition::Edition2021,
+        );
         let (tokens, m, rules) = rules(&file, Edition::Edition2021);
         let tts = lhs_tts(&m, &rules[0]);
-        let Mtt::Sequence { separator: Some(sep), kleene, .. } = tts[0] else { panic!("{:?}", tts[0]) };
+        let Mtt::Sequence { separator: Some(sep), kleene, .. } = tts[0] else {
+            panic!("{:?}", tts[0])
+        };
         assert_eq!(tokens.text(sep.range), ",");
         assert_eq!(kleene.op, Op::OneOrMore);
         let Mtt::Sequence { separator: None, kleene, .. } = tts[1] else { panic!() };
@@ -493,7 +536,10 @@ mod tests {
 
     #[test]
     fn rules_stop_where_rustc_stops() {
-        let file = SourceFile::parse("macro_rules! m { () => {}; (a) => {} (b) => {} }", Edition::Edition2021);
+        let file = SourceFile::parse(
+            "macro_rules! m { () => {}; (a) => {} (b) => {} }",
+            Edition::Edition2021,
+        );
         let (_, _, all) = rules(&file, Edition::Edition2021);
         assert_eq!(all.len(), 2);
         let file = SourceFile::parse("macro_rules! m { () => {}; (a) }", Edition::Edition2021);
@@ -507,16 +553,22 @@ mod tests {
 
     #[test]
     fn a_metavar_expression_names_its_variables() {
-        let file = SourceFile::parse("macro_rules! m { ($($x:tt)*) => { ${count($x)} ${ignore($y)} ${index()} ${bogus($z)} } }", Edition::Edition2021);
+        let file = SourceFile::parse(
+            "macro_rules! m { ($($x:tt)*) => { ${count($x)} ${ignore($y)} ${index()} ${bogus($z)} } }",
+            Edition::Edition2021,
+        );
         let (tokens, m, rules) = rules(&file, Edition::Edition2021);
         let Mtt::Delimited { tts, .. } = *m.at(rules[0].rhs.unwrap()) else { panic!() };
         let rhs = get(&m, tts);
         let names: Vec<Vec<&str>> = rhs
             .iter()
             .filter_map(|it| match it {
-                Mtt::MetaVarExpr { vars, .. } => {
-                    Some(m.vars[vars.start as usize..vars.end as usize].iter().map(|v| tokens.name(v.range)).collect())
-                }
+                Mtt::MetaVarExpr { vars, .. } => Some(
+                    m.vars[vars.start as usize..vars.end as usize]
+                        .iter()
+                        .map(|v| tokens.name(v.range))
+                        .collect(),
+                ),
                 _ => None,
             })
             .collect();

@@ -54,8 +54,10 @@ pub(crate) fn phase(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Phase {
             return Phase::Mir;
         }
         if ast::Const::can_cast(node.kind()) {
-            let associated = node.parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
-            let generic = ast::Const::cast(node).is_some_and(|it| it.generic_param_list().is_some());
+            let associated =
+                node.parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
+            let generic =
+                ast::Const::cast(node).is_some_and(|it| it.generic_param_list().is_some());
             return match associated || generic {
                 true => Phase::Mir,
                 false => Phase::Bodies,
@@ -97,7 +99,9 @@ fn non_const_call(cx: &Cx<'_, '_>, diag: &mut Diag, node: InFile<SyntaxNodePtr>,
     }
     let Some((_, kind)) = message.rsplit_once(" in ") else { return };
     // alloc: the note's text, once per diagnostic (the edge).
-    diag.note(format!("calls in {kind} are limited to constant functions, tuple structs and tuple variants"));
+    diag.note(format!(
+        "calls in {kind} are limited to constant functions, tuple structs and tuple variants"
+    ));
     if kind == "statics" {
         diag.note("consider wrapping this expression in `std::sync::LazyLock::new(|| ...)`");
     }

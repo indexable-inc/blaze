@@ -1291,7 +1291,8 @@ enum Foo {
                         };
                         check_same(&at_once, &parsed);
                         check_same(&at_once, &one_by_one);
-                        let flat = |it: &Parse<SourceFile>| it.tree.as_ref().unwrap().flat().clone();
+                        let flat =
+                            |it: &Parse<SourceFile>| it.tree.as_ref().unwrap().flat().clone();
                         assert!(*flat(&at_once) == *flat(&one_by_one), "the same tree");
                     }
                 };

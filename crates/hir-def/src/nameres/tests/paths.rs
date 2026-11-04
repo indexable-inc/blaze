@@ -12,13 +12,13 @@ use std::{fmt::Write as _, hint::black_box};
 use base_db::Db;
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::rng::SplitMix64;
+use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
 use span::Edition;
-use hir_expand::fixture;
 
 use crate::{
     AdtId, Lookup, ModuleDefId, ModuleId,
@@ -268,9 +268,9 @@ impl Reference<'_> {
                     let inner = Reference { local: LocalDefMap::EMPTY, ..self };
                     let res = inner.fp(other, m, path.kind, path.segments());
                     let def = match other.data.proc_macro {
-                        true => res
-                            .def
-                            .filter_visibility(|vis| vis.is_visible_from_def_map(db, map, original)),
+                        true => res.def.filter_visibility(|vis| {
+                            vis.is_visible_from_def_map(db, map, original)
+                        }),
                         false => res.def,
                     };
                     return Res {
@@ -331,11 +331,7 @@ fn is_test_harness(db: &Db, module: ModuleId) -> bool {
         .any(|(name, &child)| child == module && name.as_str() == "__blaze_test_harness")
 }
 
-fn adjust<'db>(
-    db: &'db Db,
-    mut map: &'db DefMap,
-    mut module: ModuleId,
-) -> (&'db DefMap, ModuleId) {
+fn adjust<'db>(db: &'db Db, mut map: &'db DefMap, mut module: ModuleId) -> (&'db DefMap, ModuleId) {
     while module == map.root
         && let Some(BlockInfo { parent, .. }) = map.block
     {
@@ -506,17 +502,18 @@ fn gen_fixture(seed: u64) -> String {
 }
 
 fn gen_path(rng: &mut SplitMix64) -> ModPath {
-    let kind = *rng.pick(&[
-        PathKind::Plain,
-        PathKind::Plain,
-        PathKind::Plain,
-        PathKind::Crate,
-        PathKind::SELF,
-        PathKind::Super(1),
-        PathKind::Super(2),
-        PathKind::Abs,
-    ])
-    .unwrap();
+    let kind = *rng
+        .pick(&[
+            PathKind::Plain,
+            PathKind::Plain,
+            PathKind::Plain,
+            PathKind::Crate,
+            PathKind::SELF,
+            PathKind::Super(1),
+            PathKind::Super(2),
+            PathKind::Abs,
+        ])
+        .unwrap();
     let min = match kind {
         PathKind::Plain | PathKind::Abs => 1,
         _ => 0,

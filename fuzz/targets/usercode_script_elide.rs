@@ -100,7 +100,8 @@ fn elided(source: &[u8]) -> Option<Vec<u8>> {
 
 fn is_ident(text: &str) -> bool {
     let mut chars = text.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Whether a comment's text is a doc comment, as rustc tells them.
@@ -119,7 +120,10 @@ fn is_gap(gap: &str) -> bool {
         match bytes[at] {
             b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' => at += 1,
             b'/' if bytes.get(at + 1) == Some(&b'/') => {
-                let end = bytes[at..].iter().position(|it| *it == b'\n').map_or(bytes.len(), |it| at + it);
+                let end = bytes[at..]
+                    .iter()
+                    .position(|it| *it == b'\n')
+                    .map_or(bytes.len(), |it| at + it);
                 if is_doc(&gap[at..end]) {
                     return false;
                 }
@@ -157,19 +161,23 @@ fn check_token(token: &Token<'_>) {
         Kind::RawIdent => text.strip_prefix("r#").is_some_and(is_ident),
         Kind::Lifetime => text.strip_prefix('\'').is_some_and(is_ident),
         Kind::Str { escaped, escaped_brace } => {
-            let between = inner(1, 1).filter(|_| text.len() >= 2 && text.starts_with('"') && text.ends_with('"'));
+            let between = inner(1, 1)
+                .filter(|_| text.len() >= 2 && text.starts_with('"') && text.ends_with('"'));
             match (token.str_value(), between) {
                 (Some(Cow::Borrowed(value)), Some(between)) => {
                     value == between && !between.contains('\\') && !escaped && !escaped_brace
                 }
                 (Some(Cow::Owned(value)), Some(between)) => {
-                    between.contains('\\') && *escaped && (!escaped_brace || value.contains(['{', '}']))
+                    between.contains('\\')
+                        && *escaped
+                        && (!escaped_brace || value.contains(['{', '}']))
                 }
                 (None, _) | (_, None) => false,
             }
         }
         Kind::RawStr { value } => {
-            let hashes = text.strip_prefix('r').map_or(0, |it| it.len() - it.trim_start_matches('#').len());
+            let hashes =
+                text.strip_prefix('r').map_or(0, |it| it.len() - it.trim_start_matches('#').len());
             let close = format!("\"{}", "#".repeat(hashes));
             text.starts_with('r')
                 && text.len() >= 3 + 2 * hashes
@@ -178,7 +186,8 @@ fn check_token(token: &Token<'_>) {
                 && !value.contains(&close)
         }
         Kind::Char(c) => {
-            let between = inner(1, 1).filter(|_| text.len() >= 3 && text.starts_with('\'') && text.ends_with('\''));
+            let between = inner(1, 1)
+                .filter(|_| text.len() >= 3 && text.starts_with('\'') && text.ends_with('\''));
             between.is_some_and(|it| it.starts_with('\\') || it.chars().eq([*c]))
         }
         Kind::Int(value) => {
@@ -201,13 +210,23 @@ fn check_tokens(source: &str, tokens: &[Token<'_>]) {
     for token in tokens {
         let start = (token.text.as_ptr() as usize).checked_sub(base);
         let start = start.filter(|it| *it >= end && it + token.text.len() <= source.len());
-        let Some(start) = start else { panic!("a token is not the source's own, after the last: {token:?}") };
+        let Some(start) = start else {
+            panic!("a token is not the source's own, after the last: {token:?}")
+        };
         assert!(!token.text.is_empty(), "an empty token: {token:?}");
-        assert!(is_gap(&source[end..start]), "not whitespace or a comment before {token:?}: {:?}", &source[end..start]);
+        assert!(
+            is_gap(&source[end..start]),
+            "not whitespace or a comment before {token:?}: {:?}",
+            &source[end..start]
+        );
         check_token(token);
         end = start + token.text.len();
     }
-    assert!(is_gap(&source[end..]), "not whitespace or a comment after the last token: {:?}", &source[end..]);
+    assert!(
+        is_gap(&source[end..]),
+        "not whitespace or a comment after the last token: {:?}",
+        &source[end..]
+    );
 }
 
 /// The changes of the input checked against eliding it, one a run (`blaze_fuzzer::case`):
@@ -231,14 +250,26 @@ fn check_case(data: &[u8], case: usize) {
 
     let files = files(data);
     let (most, printed) = blaze_fuzz::largest_allocation(|| elide::elide(Path::new(ROOT), &files));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "eliding {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "eliding {} bytes asked for {most} at once",
+        data.len()
+    );
 
-    assert_eq!(elide::elide(Path::new("/p/foo/other.rs"), &files), None, "a script whose root is not given is not elided");
+    assert_eq!(
+        elide::elide(Path::new("/p/foo/other.rs"), &files),
+        None,
+        "a script whose root is not given is not elided"
+    );
     match case {
         0 => {
             let mut more = files;
             more.insert(PathBuf::from("/p/foo/src/other.rs"), b"garbage \xff".to_vec());
-            assert_eq!(elide::elide(Path::new(ROOT), &more), printed, "another file changes nothing");
+            assert_eq!(
+                elide::elide(Path::new(ROOT), &more),
+                printed,
+                "another file changes nothing"
+            );
         }
         1 if !data.starts_with("\u{feff}".as_bytes()) => {
             let marked = ["\u{feff}".as_bytes(), data].concat();

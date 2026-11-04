@@ -4,7 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, RelocKind, Relocs, Static, Target, Unwind};
+use blaze_codegen::{
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, RelocKind, Relocs, Static,
+    Target, Unwind,
+};
 use blaze_core::{Completion, Done, Effect, FileName, IoError};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -14,11 +17,14 @@ use blaze_live::patch::{Descriptor, Message, MessageView, Patch, hash};
 use object::read::elf::ElfFile64;
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, ObjectSymbol as _, RelocationFlags,
-    SymbolFlags, SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, ObjectSymbol as _,
+    RelocationFlags, SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
-use crate::{COLUMN, Change, Debug, Format, Image, LINE, Live, LinkError, Native, NativeKind, Output, OutputKind, Position, SpanTable};
+use crate::{
+    COLUMN, Change, Debug, Format, Image, LINE, LinkError, Live, Native, NativeKind, Output,
+    OutputKind, Position, SpanTable,
+};
 
 const TO: &str = "out/app";
 const PAGE: u64 = 4096;
@@ -103,7 +109,13 @@ fn patch_in(message: &[u8], memory: &CodeMemory) -> Patch {
     assert_eq!(Message::decode(message), Ok(Message::Patch(view.to_patch())));
     for code in &patch.code {
         let held = memory.bytes(CodeRange { offset: code.at, len: code.len }).unwrap();
-        assert_eq!(code.hash, hash(held), "{} at {:#x}: the code memory holds other bytes", code.name, code.at);
+        assert_eq!(
+            code.hash,
+            hash(held),
+            "{} at {:#x}: the code memory holds other bytes",
+            code.name,
+            code.at
+        );
     }
     patch
 }
@@ -200,7 +212,11 @@ impl Sparse {
     /// Whether two files have the same bytes.
     fn same(&self, other: &Sparse) -> bool {
         self.len == other.len
-            && self.pages.keys().chain(other.pages.keys()).all(|page| self.page(*page) == other.page(*page))
+            && self
+                .pages
+                .keys()
+                .chain(other.pages.keys())
+                .all(|page| self.page(*page) == other.page(*page))
     }
 
     /// The whole file, in words: `object` reads ELF from 8-aligned bytes only.
@@ -264,7 +280,9 @@ impl Disk {
                 self.modes.insert(file.clone(), *mode);
                 Done::Moded
             }
-            Effect::Rename { .. } if self.fail_rename => Done::Failed(IoError("no space left on the device".into())),
+            Effect::Rename { .. } if self.fail_rename => {
+                Done::Failed(IoError("no space left on the device".into()))
+            }
             Effect::Rename { from, to, .. } => {
                 self.log.push(("rename", 0));
                 let Some(it) = self.files.remove(from) else { return missing(from) };
@@ -496,7 +514,9 @@ fn the_cells_rebase_list_is_every_filled_slot_after_each_edit() {
     let check = |image: &Image, what: &str| {
         let state = &image.state;
         let cells = image.symbols.find(crate::symbols::SymKey::Cells).expect("a cells symbol");
-        let crate::state::Def::Piece { piece, .. } = state.def(cells) else { panic!("the cells are a piece: {what}") };
+        let crate::state::Def::Piece { piece, .. } = state.def(cells) else {
+            panic!("the cells are a piece: {what}")
+        };
         let want: Vec<u64> = state.filled_cells().map(|(slot, _)| u64::from(slot) * 8).collect();
         assert!(!want.is_empty(), "{what}");
         assert_eq!(state.piece(piece).unwrap().rebase(), want, "{what}");
@@ -509,7 +529,12 @@ fn the_cells_rebase_list_is_every_filled_slot_after_each_edit() {
     check(&image, "a new function's slot filled");
     disk.link(&mut image, Change { removed: vec![key(4)], ..Change::default() }).unwrap();
     check(&image, "a slot emptied");
-    let again = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(5))], ..Change::default() };
+    let again = Change {
+        added: vec![&g3],
+        removed: vec![key(3)],
+        slots: vec![(key(2), key(5))],
+        ..Change::default()
+    };
     disk.link(&mut image, again).unwrap();
     check(&image, "a body moved again");
 }
@@ -579,10 +604,18 @@ fn bytes_gives_the_file_a_commit_writes_and_rolls_back_like_one() {
 #[test]
 fn a_function_instrumented_for_pgo_is_refused_until_the_link_places_its_counters() {
     let (start, g) = program(Target::Function);
-    let record = blaze_codegen::ProfileRecord { name: [7; 16], name_ref: 1, hash: 2, counters: 1, version: 10 };
-    let counted = CompiledFunction { profile: Some(blaze_codegen::Profiled::Counted(record)), ..g.clone() };
+    let record = blaze_codegen::ProfileRecord {
+        name: [7; 16],
+        name_ref: 1,
+        hash: 2,
+        counters: 1,
+        version: 10,
+    };
+    let counted =
+        CompiledFunction { profile: Some(blaze_codegen::Profiled::Counted(record)), ..g.clone() };
     let mut image = Image::new(name(TO), output(true)).unwrap();
-    let error = image.stage(first(&start, &counted)).err().expect("an instrumented function is refused");
+    let error =
+        image.stage(first(&start, &counted)).err().expect("an instrumented function is refused");
     assert_eq!(error.function, Some(key(2)));
     assert!(error.what.contains("-Cprofile-generate"), "{error}");
 
@@ -600,7 +633,10 @@ fn bytes_refuses_a_live_link_that_tells_running_programs() {
     assert!(image.bytes(staged).is_ok(), "the first link tells no program");
     let staged = image.stage(edit(&g2)).unwrap();
     let error = image.bytes(staged).unwrap_err();
-    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
+    assert!(
+        error.what.contains("only through the code memory") && error.what.contains("`commit_into`"),
+        "{error}"
+    );
     assert_eq!(image.generation(), 1, "a refused link leaves the image as it was");
 }
 
@@ -644,7 +680,11 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
     assert!(!next.full(), "a refused stage never makes the next one a whole layout");
     let mut effects = Vec::new();
     image.commit(next, &mut effects).unwrap();
-    assert_eq!(disk.run(&mut image, effects), Ok(2), "the next good stage moves the generation by one");
+    assert_eq!(
+        disk.run(&mut image, effects),
+        Ok(2),
+        "the next good stage moves the generation by one"
+    );
     assert_eq!(image.generation(), 2);
     let linked = Linked::of(disk.file(TO));
     assert_eq!(linked.through_stub(linked.rel32(linked.symbol("start") + 1)), linked.symbol("g2"));
@@ -660,7 +700,12 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
 fn a_removed_functions_got_cell_goes_with_it() {
     // `mov rax, [rip + target@GOTPCREL]; ret`
     let through_got = |n: u8, target: u8| {
-        let reloc = blaze_codegen::Relocation { at: 3, kind: RelocKind::GotPcRel32, target: Target::Direct(key(target)), addend: -4 };
+        let reloc = blaze_codegen::Relocation {
+            at: 3,
+            kind: RelocKind::GotPcRel32,
+            target: Target::Direct(key(target)),
+            addend: -4,
+        };
         function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc])
     };
     let (start, g) = (through_got(1, 2), function(2, &returns(1), Vec::new()));
@@ -677,7 +722,10 @@ fn a_removed_functions_got_cell_goes_with_it() {
             && error.what.contains("in the image `app`"),
         "{error}"
     );
-    assert!(!error.what.contains("GOT cell"), "the reader is named, not the linker's cell: {error}");
+    assert!(
+        !error.what.contains("GOT cell"),
+        "the reader is named, not the linker's cell: {error}"
+    );
     assert_eq!(error.function, Some(key(1)), "the error names the reader");
     assert_eq!(image.generation(), 1);
 
@@ -691,7 +739,11 @@ fn a_removed_functions_got_cell_goes_with_it() {
     };
     disk.link(&mut image, rebuilt).unwrap();
     let b = Linked::of(disk.file(TO));
-    assert_eq!(b.u64_at(b.rel32(b.symbol("start2") + 3)), b.symbol("g2"), "the new cell holds the new `g`");
+    assert_eq!(
+        b.u64_at(b.rel32(b.symbol("start2") + 3)),
+        b.symbol("g2"),
+        "the new cell holds the new `g`"
+    );
 }
 
 /// A vtable reached only through a GOT cell from code that goes, and naming a function that
@@ -707,31 +759,59 @@ fn data_only_the_old_body_reached_goes_with_it() {
     use crate::symbols::SymKey;
     // `mov rax, [rip + vtable@GOTPCREL]; ret`
     let reads = |n: u8, data: &Data| {
-        let reloc = blaze_codegen::Relocation { at: 3, kind: RelocKind::GotPcRel32, target: Target::Data(data.id), addend: -4 };
-        CompiledFunction { data: vec![data.clone()], ..function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc]) }
+        let reloc = blaze_codegen::Relocation {
+            at: 3,
+            kind: RelocKind::GotPcRel32,
+            target: Target::Data(data.id),
+            addend: -4,
+        };
+        CompiledFunction {
+            data: vec![data.clone()],
+            ..function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc])
+        }
     };
     let vtable = || {
-        let fmt = blaze_codegen::Relocation { at: 8, kind: RelocKind::Abs64, target: Target::Direct(key(3)), addend: 0 };
+        let fmt = blaze_codegen::Relocation {
+            at: 8,
+            kind: RelocKind::Abs64,
+            target: Target::Direct(key(3)),
+            addend: 0,
+        };
         Data::new(8, vec![0x5a; 16], vec![fmt].into())
     };
     let live = |image: &Image, data: &Data| {
-        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it)));
+        let sym =
+            image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it)));
         let cell = sym.and_then(|it| image.symbols.find(SymKey::Got(GotKind::Address, it)));
-        (sym.and_then(|it| image.state.home(it)).is_some(), cell.and_then(|it| image.state.home(it)).is_some())
+        (
+            sym.and_then(|it| image.state.home(it)).is_some(),
+            cell.and_then(|it| image.state.home(it)).is_some(),
+        )
     };
-    let calls = |n: u8, callee: u8| function(n, &CALLER, vec![rel32(1, Target::Direct(key(callee)))]);
+    let calls =
+        |n: u8, callee: u8| function(n, &CALLER, vec![rel32(1, Target::Direct(key(callee)))]);
     let names = || vec![("_start".to_string(), Target::Direct(key(1)))];
 
     // start (1) calls check (2), which reads the vtable; fmt (3) is what the vtable names.
-    let (start, check, fmt, data) = (calls(1, 2), reads(2, &vtable()), function(3, &returns(1), Vec::new()), vtable());
+    let (start, check, fmt, data) =
+        (calls(1, 2), reads(2, &vtable()), function(3, &returns(1), Vec::new()), vtable());
     let mut image = Image::new(name(TO), output(true)).unwrap();
     let mut disk = Disk::default();
     let added = vec![&start, &check, &fmt];
-    let debug_names = vec![(key(1), "start".into()), (key(2), "check".into()), (key(3), "<&i32 as Debug>::fmt".into())];
-    disk.link(&mut image, Change { added, names: names(), debug_names, ..Change::default() }).unwrap();
+    let debug_names = vec![
+        (key(1), "start".into()),
+        (key(2), "check".into()),
+        (key(3), "<&i32 as Debug>::fmt".into()),
+    ];
+    disk.link(&mut image, Change { added, names: names(), debug_names, ..Change::default() })
+        .unwrap();
     let a = Linked::of(disk.file(TO));
     let cell = a.rel32(a.symbol("check") + 3);
-    assert_eq!(a.u64_at(a.u64_at(cell) + 8), a.symbol("<&i32 as Debug>::fmt"), "the vtable names fmt");
+    assert_eq!(
+        a.u64_at(a.u64_at(cell) + 8),
+        a.symbol("<&i32 as Debug>::fmt"),
+        "the vtable names fmt"
+    );
     assert_eq!(live(&image, &data), (true, true));
 
     // The edit: start refilled under its own key to call check2 (4), which reads nothing;
@@ -751,7 +831,8 @@ fn data_only_the_old_body_reached_goes_with_it() {
 
     // The vtable comes back with two readers, check (2) and other (5). The first goes, and the
     // second keeps the vtable, its cell and the function it names, each where it was.
-    let (check, fmt, other) = (reads(2, &vtable()), function(3, &returns(1), Vec::new()), reads(5, &vtable()));
+    let (check, fmt, other) =
+        (reads(2, &vtable()), function(3, &returns(1), Vec::new()), reads(5, &vtable()));
     let again = Change {
         added: vec![&start, &check, &fmt, &other],
         removed: vec![key(1), key(4)],
@@ -764,18 +845,35 @@ fn data_only_the_old_body_reached_goes_with_it() {
     let c = Linked::of(disk.file(TO));
     let held = c.u64_at(c.rel32(c.symbol("other") + 3));
     let start3 = calls(1, 5);
-    let one_goes = Change { added: vec![&start3], removed: vec![key(1), key(2)], names: names(), ..Change::default() };
+    let one_goes = Change {
+        added: vec![&start3],
+        removed: vec![key(1), key(2)],
+        names: names(),
+        ..Change::default()
+    };
     disk.link(&mut image, one_goes).expect("one of two readers goes");
     assert_eq!(live(&image, &data), (true, true), "the other reader keeps the vtable and its cell");
     let d = Linked::of(disk.file(TO));
     let vtable_at = {
-        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it))).expect("the vtable");
+        let sym = image
+            .symbols
+            .find_id(&data.id)
+            .and_then(|it| image.symbols.find(SymKey::Data(it)))
+            .expect("the vtable");
         let (piece, offset) = image.state.home(sym).expect("placed");
         image.state.piece(piece).expect("live").addr + offset
     };
     let cell = d.rel32(d.symbol("other") + 3);
-    assert_eq!((d.u64_at(cell), held), (vtable_at, vtable_at), "other's cell holds the vtable, which stayed");
-    assert_eq!(d.u64_at(vtable_at + 8), d.symbol("<&i32 as Debug>::fmt"), "the vtable still names fmt");
+    assert_eq!(
+        (d.u64_at(cell), held),
+        (vtable_at, vtable_at),
+        "other's cell holds the vtable, which stayed"
+    );
+    assert_eq!(
+        d.u64_at(vtable_at + 8),
+        d.symbol("<&i32 as Debug>::fmt"),
+        "the vtable still names fmt"
+    );
     assert_eq!(d.at(vtable_at, 8), [0x5a; 8], "the vtable's own bytes");
     assert_eq!(d.rel32(d.symbol("start") + 1), d.symbol("other"));
 
@@ -783,7 +881,9 @@ fn data_only_the_old_body_reached_goes_with_it() {
     let generation = image.generation();
     let error = image.stage(Change { removed: vec![key(3)], ..Change::default() }).unwrap_err();
     assert!(
-        error.what.contains("`<&i32 as Debug>::fmt`") && error.what.contains("is removed") && error.what.contains("the data"),
+        error.what.contains("`<&i32 as Debug>::fmt`")
+            && error.what.contains("is removed")
+            && error.what.contains("the data"),
         "{error}"
     );
     assert_eq!(image.generation(), generation, "a refused stage leaves the image as it was");
@@ -801,7 +901,13 @@ fn a_zero_sized_piece_shares_its_address_with_the_next() {
     // IDs picked, not hashed, so the layout's order (by data ID) is known: the empty object
     // sorts before its neighbour, and the function lists the neighbour first, so the
     // neighbour's piece is made first.
-    let data = |n: u8, bytes: Vec<u8>| Data { id: id(n), align: 1, bytes, relocs: Relocs::new(), writable: false };
+    let data = |n: u8, bytes: Vec<u8>| Data {
+        id: id(n),
+        align: 1,
+        bytes,
+        relocs: Relocs::new(),
+        writable: false,
+    };
     let (filled, empty) = (data(0x20, vec![0x5a; 8]), data(0x10, Vec::new()));
     // `lea rax, [rip + filled]; lea rcx, [rip + empty]; ret`
     let code = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0xc3];
@@ -821,7 +927,11 @@ fn a_zero_sized_piece_shares_its_address_with_the_next() {
     disk.link(&mut image, change).expect("an empty data object overlaps nothing");
 
     let piece = |data: &Data| {
-        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it))).expect("its symbol");
+        let sym = image
+            .symbols
+            .find_id(&data.id)
+            .and_then(|it| image.symbols.find(SymKey::Data(it)))
+            .expect("its symbol");
         let (piece, offset) = image.state.home(sym).expect("placed");
         assert_eq!(offset, 0);
         (piece, image.state.piece(piece).expect("live").addr)
@@ -859,16 +969,27 @@ fn an_imports_stub_goes_with_its_last_caller() {
     let so: std::sync::Arc<[u8]> = contents(disk.file("out/libc.so")).into();
 
     let live = |image: &Image| {
-        let name = image.symbols.find_name("memcmp").and_then(|it| image.symbols.find(SymKey::Name(it))).expect("memcmp named");
+        let name = image
+            .symbols
+            .find_name("memcmp")
+            .and_then(|it| image.symbols.find(SymKey::Name(it)))
+            .expect("memcmp named");
         let home = |key| image.symbols.find(key).and_then(|it| image.state.home(it)).is_some();
         (home(SymKey::Plt(name)), home(SymKey::Got(GotKind::Address, name)))
     };
     let calls = |n: u8, callee: Target| function(n, &CALLER, vec![rel32(1, callee)]);
     let entry = || vec![("_start".to_string(), Target::Direct(key(1)))];
     // start (1) calls check (2), which calls memcmp.
-    let (start, check) = (calls(1, Target::Direct(key(2))), calls(2, Target::Extern("memcmp".into())));
+    let (start, check) =
+        (calls(1, Target::Direct(key(2))), calls(2, Target::Extern("memcmp".into())));
     let mut image = Image::new(name(TO), output(true)).unwrap();
-    let native = Native { id: id(60), name: "libc.so", bytes: &so, kind: NativeKind::Shared { as_needed: true }, order: 0 };
+    let native = Native {
+        id: id(60),
+        name: "libc.so",
+        bytes: &so,
+        kind: NativeKind::Shared { as_needed: true },
+        order: 0,
+    };
     let first = Change {
         added: vec![&start, &check],
         names: entry(),
@@ -893,15 +1014,25 @@ fn an_imports_stub_goes_with_its_last_caller() {
     let b = Linked::of(disk.file(TO));
     assert_eq!(b.rel32(b.symbol("start") + 1), b.symbol("check2"));
 
-    let again = Change { added: vec![&start, &check], removed: vec![key(1), key(4)], names: entry(), ..Change::default() };
+    let again = Change {
+        added: vec![&start, &check],
+        removed: vec![key(1), key(4)],
+        names: entry(),
+        ..Change::default()
+    };
     disk.link(&mut image, again).expect("a call put back");
     assert_eq!(live(&image), (true, true), "the stub is made again");
     // The call reaches the new stub, which jumps through the new cell, the one the loader
     // binds to `memcmp`.
     let c = Linked::of(disk.file(TO));
-    let memcmp = image.symbols.find_name("memcmp").and_then(|it| image.symbols.find(SymKey::Name(it))).expect("memcmp named");
+    let memcmp = image
+        .symbols
+        .find_name("memcmp")
+        .and_then(|it| image.symbols.find(SymKey::Name(it)))
+        .expect("memcmp named");
     let at = |key: SymKey| {
-        let (piece, offset) = image.symbols.find(key).and_then(|it| image.state.home(it)).expect("placed");
+        let (piece, offset) =
+            image.symbols.find(key).and_then(|it| image.state.home(it)).expect("placed");
         image.state.piece(piece).expect("live").addr + offset
     };
     let (stub, cell) = (at(SymKey::Plt(memcmp)), at(SymKey::Got(GotKind::Address, memcmp)));
@@ -915,7 +1046,9 @@ fn an_imports_stub_goes_with_its_last_caller() {
         .filter(|(_, it)| match it.target() {
             object::RelocationTarget::Symbol(index) => {
                 use object::ObjectSymbolTable as _;
-                elf.dynamic_symbol_table().and_then(|it| it.symbol_by_index(index).ok()).and_then(|it| it.name().ok())
+                elf.dynamic_symbol_table()
+                    .and_then(|it| it.symbol_by_index(index).ok())
+                    .and_then(|it| it.name().ok())
                     == Some("memcmp")
             }
             _ => false,
@@ -946,19 +1079,26 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
         imports: Vec::new(),
     };
     let target = Target::Static { item, instance };
-    let at = |at: u32, kind: RelocKind, addend: i64| blaze_codegen::Relocation { at, kind, target: target.clone(), addend };
+    let at = |at: u32, kind: RelocKind, addend: i64| blaze_codegen::Relocation {
+        at,
+        kind,
+        target: target.clone(),
+        addend,
+    };
     // `mov rax, [rip + tls@GOTTPOFF]; lea rdi, [rip + tls@TLSGD]; ret`
     let x86 = (
         output(true),
-        function(2, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xc3], vec![
-            at(3, RelocKind::TlsGotTpOff32, -4),
-            at(10, RelocKind::TlsGd32, -4),
-        ]),
+        function(
+            2,
+            &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xc3],
+            vec![at(3, RelocKind::TlsGotTpOff32, -4), at(10, RelocKind::TlsGd32, -4)],
+        ),
         [GotKind::TpOff, GotKind::TlsGd],
     );
     // `adrp x0, :gottprel:tls; ldr x0, [x0, :gottprel_lo12:tls]; adrp x0, :tlsdesc:tls;
     // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`
-    let words: [u32; 7] = [0x9000_0000, 0xf940_0000, 0x9000_0000, 0xf940_0001, 0x9100_0000, 0xd63f_0020, 0xd65f_03c0];
+    let words: [u32; 7] =
+        [0x9000_0000, 0xf940_0000, 0x9000_0000, 0xf940_0001, 0x9100_0000, 0xd63f_0020, 0xd65f_03c0];
     let a64 = (
         Output {
             arch: Arch::Aarch64,
@@ -968,14 +1108,18 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
         },
         CompiledFunction {
             arch: Arch::Aarch64,
-            ..function(2, &words.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>(), vec![
-                at(0, RelocKind::TlsIePage21, 0),
-                at(4, RelocKind::TlsIeLo12, 0),
-                at(8, RelocKind::TlsDescPage21, 0),
-                at(12, RelocKind::TlsDescLd64Lo12, 0),
-                at(16, RelocKind::TlsDescAddLo12, 0),
-                at(20, RelocKind::TlsDescCall, 0),
-            ])
+            ..function(
+                2,
+                &words.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>(),
+                vec![
+                    at(0, RelocKind::TlsIePage21, 0),
+                    at(4, RelocKind::TlsIeLo12, 0),
+                    at(8, RelocKind::TlsDescPage21, 0),
+                    at(12, RelocKind::TlsDescLd64Lo12, 0),
+                    at(16, RelocKind::TlsDescAddLo12, 0),
+                    at(20, RelocKind::TlsDescCall, 0),
+                ],
+            )
         },
         [GotKind::TpOff, GotKind::TlsDesc],
     );
@@ -984,26 +1128,51 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
         // start (1) calls the reader (2); start2 (1, again) calls nothing.
         let (start, start2) = match arch {
             Arch::Aarch64 => {
-                let call = blaze_codegen::Relocation { at: 0, kind: RelocKind::Call26, target: Target::Direct(key(2)), addend: 0 };
+                let call = blaze_codegen::Relocation {
+                    at: 0,
+                    kind: RelocKind::Call26,
+                    target: Target::Direct(key(2)),
+                    addend: 0,
+                };
                 let bl = [0x94, 0, 0, 0, 0xc0, 0x03, 0x5f, 0xd6];
                 let a = CompiledFunction { arch, ..function(1, &bl, vec![call]) };
-                let b = CompiledFunction { arch, key: key(3), ..function(1, &[0xc0, 0x03, 0x5f, 0xd6], Vec::new()) };
+                let b = CompiledFunction {
+                    arch,
+                    key: key(3),
+                    ..function(1, &[0xc0, 0x03, 0x5f, 0xd6], Vec::new())
+                };
                 (a, b)
             }
-            _ => (function(1, &CALLER, vec![rel32(1, Target::Direct(key(2)))]), function(3, &returns(0), Vec::new())),
+            _ => (
+                function(1, &CALLER, vec![rel32(1, Target::Direct(key(2)))]),
+                function(3, &returns(0), Vec::new()),
+            ),
         };
         let cells = |image: &Image| {
             let sym = image.symbols.find_id(&item.0).zip(image.symbols.find_id(&instance));
-            let sym = sym.and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance))).expect("the static");
+            let sym = sym
+                .and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance)))
+                .expect("the static");
             GotKind::ALL
                 .into_iter()
-                .filter(|kind| image.symbols.find(SymKey::Got(*kind, sym)).and_then(|it| image.state.home(it)).is_some())
+                .filter(|kind| {
+                    image
+                        .symbols
+                        .find(SymKey::Got(*kind, sym))
+                        .and_then(|it| image.state.home(it))
+                        .is_some()
+                })
                 .collect::<Vec<_>>()
         };
         let mut image = Image::new(name(TO), output).unwrap();
         let mut disk = Disk::default();
         let names = || vec![("_start".to_string(), Target::Direct(key(1)))];
-        let change = Change { added: vec![&start, &reader], statics: vec![&tls], names: names(), ..Change::default() };
+        let change = Change {
+            added: vec![&start, &reader],
+            statics: vec![&tls],
+            names: names(),
+            ..Change::default()
+        };
         disk.link(&mut image, change).unwrap_or_else(|it| panic!("{arch:?}: {it}"));
         assert_eq!(cells(&image), kinds, "{arch:?}: a cell of each kind read");
         let edit = Change {
@@ -1013,10 +1182,15 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
             names: vec![("_start".to_string(), Target::Direct(key(3)))],
             ..Change::default()
         };
-        disk.link(&mut image, edit).unwrap_or_else(|it| panic!("{arch:?}: the static goes with its last reader: {it}"));
+        disk.link(&mut image, edit)
+            .unwrap_or_else(|it| panic!("{arch:?}: the static goes with its last reader: {it}"));
         let gone = image.symbols.find_id(&item.0).zip(image.symbols.find_id(&instance));
-        let gone = gone.and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance)));
-        assert!(gone.is_none_or(|it| image.state.home(it).is_none()), "{arch:?}: the static is gone");
+        let gone =
+            gone.and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance)));
+        assert!(
+            gone.is_none_or(|it| image.state.home(it).is_none()),
+            "{arch:?}: the static is gone"
+        );
         assert_eq!(cells(&image), [], "{arch:?}: every cell of it is gone");
     }
 }
@@ -1046,7 +1220,10 @@ fn a_stage_out_of_room_is_a_refusal_the_caller_can_match() {
     let big = function(3, &code, Vec::new());
     let error = image.stage(edit(&big)).unwrap_err();
     assert!(error.what.contains("link the image from scratch"), "{error}");
-    assert!(matches!(error.no_room(), Some(crate::Refusal::NoRoom { need, room }) if need > room), "{error}");
+    assert!(
+        matches!(error.no_room(), Some(crate::Refusal::NoRoom { need, room }) if need > room),
+        "{error}"
+    );
     assert_eq!(image.generation(), 1);
     let g2 = function(3, &returns(2), Vec::new());
     let next = image.stage(edit(&g2)).unwrap();
@@ -1079,13 +1256,17 @@ fn a_live_image_names_its_table_and_patches_say_what_changed() {
 
     let before = disk.file(TO).clone();
     let error = disk.link(&mut image, edit(&g2)).unwrap_err();
-    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
+    assert!(
+        error.what.contains("only through the code memory") && error.what.contains("`commit_into`"),
+        "{error}"
+    );
     assert_eq!(image.generation(), 1, "a refused commit leaves the image as it was");
     assert!(disk.file(TO).same(&before), "and its file");
 
     let Some(mut memory) = memory_of("blaze-link-live-table", disk.file(TO)) else { return };
     let staged = image.stage(edit(&g2)).unwrap();
-    let message = image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
+    let message =
+        image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
     let b = Linked::in_memory(&memory, image.state.file_len);
     let new = b.symbol("g2");
     assert!((code..end).contains(&new));
@@ -1098,18 +1279,33 @@ fn a_live_image_names_its_table_and_patches_say_what_changed() {
     assert!(patch.cells.contains(&(slot.0, new)), "{:?}", patch.cells);
     assert!(patch.frames.is_empty() && patch.windows.is_empty());
     let after = Descriptor::decode(b.at(at, Descriptor::SIZE)).unwrap();
-    assert_eq!((after.id, after.generation), (descriptor.id, 2), "a program started now starts at 2");
+    assert_eq!(
+        (after.id, after.generation),
+        (descriptor.id, 2),
+        "a program started now starts at 2"
+    );
 
     let mut effects = Vec::new();
     let error = image.roll_back(&mut effects).unwrap_err();
-    assert!(error.what.contains("only through the code memory") && error.what.contains("`roll_back_into`"), "{error}");
+    assert!(
+        error.what.contains("only through the code memory")
+            && error.what.contains("`roll_back_into`"),
+        "{error}"
+    );
     assert!(effects.is_empty(), "a refused rollback asks for no effect");
     assert_eq!(image.generation(), 2, "a refused rollback leaves the image as it was");
-    let message = image.roll_back_into(&mut memory).unwrap().expect("a live image's rollback tells its programs");
+    let message = image
+        .roll_back_into(&mut memory)
+        .unwrap()
+        .expect("a live image's rollback tells its programs");
     assert_eq!(Message::decode(&message), Ok(Message::RollBack { id: descriptor.id, to: 1 }));
     assert!(matches!(Message::view(&message), Ok(MessageView::RollBack { to: 1, .. })));
     assert_eq!(image.generation(), 1);
-    assert_eq!(Linked::in_memory(&memory, image.state.file_len).bytes(), a.bytes(), "the first link's file again");
+    assert_eq!(
+        Linked::in_memory(&memory, image.state.file_len).bytes(),
+        a.bytes(),
+        "the first link's file again"
+    );
 }
 
 /// The runtime never slides code, since every run of the program maps one copy of it from the
@@ -1126,25 +1322,43 @@ fn a_patch_whose_code_the_loader_slides_is_a_restart() {
         ..live()
     };
     let mut image = Image::new(name(TO), pe).unwrap();
-    let change = Change { added: vec![&start, &g], names: vec![("mainCRTStartup".into(), Target::Direct(key(1)))], ..Change::default() };
+    let change = Change {
+        added: vec![&start, &g],
+        names: vec![("mainCRTStartup".into(), Target::Direct(key(1)))],
+        ..Change::default()
+    };
     let staged = image.stage(change).unwrap();
     assert!(image.bytes(staged).is_ok(), "the first link tells no program");
     // `mov rax, imm64; ret`, the immediate the address of `_start`'s body.
-    let absolute =
-        blaze_codegen::Relocation { at: 2, kind: RelocKind::Abs64, target: Target::Direct(key(1)), addend: 0 };
+    let absolute = blaze_codegen::Relocation {
+        at: 2,
+        kind: RelocKind::Abs64,
+        target: Target::Direct(key(1)),
+        addend: 0,
+    };
     let g2 = function(3, &[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc3], vec![absolute]);
     let staged = image.stage(edit(&g2)).unwrap();
     let message = staged.writes.message.as_deref().expect("a message for programs running 1");
     let Ok(MessageView::Restart { generation: 2, why, .. }) = Message::view(message) else {
         panic!("not a restart: {:?}", Message::decode(message))
     };
-    assert!(why.contains("holds an address the loader slides, in code") && why.contains("function"), "{why}");
+    assert!(
+        why.contains("holds an address the loader slides, in code") && why.contains("function"),
+        "{why}"
+    );
 }
 
 /// `lea rax, [rip + literal]; ret`, the literal its own data, and a call frame entry.
 fn framed(n: u8) -> CompiledFunction {
-    let mut it = function(n, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![rel32(3, Target::Data(id(60)))]);
-    it.data = vec![Data { id: id(60), align: 1, bytes: b"literal".to_vec(), relocs: Default::default(), writable: false }];
+    let mut it =
+        function(n, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![rel32(3, Target::Data(id(60)))]);
+    it.data = vec![Data {
+        id: id(60),
+        align: 1,
+        bytes: b"literal".to_vec(),
+        relocs: Default::default(),
+        writable: false,
+    }];
     it.unwind = Some(Unwind::Dwarf {
         code_align: 1,
         data_align: -8,
@@ -1181,16 +1395,22 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
     let mut disk = Disk::default();
     disk.link(&mut image, first(&start, &g)).unwrap();
     let a = Linked::of(disk.file(TO));
-    let descriptor = Descriptor::decode(a.at(a.dynamic_symbol(blaze_live::patch::DESCRIPTOR), Descriptor::SIZE)).unwrap();
+    let descriptor =
+        Descriptor::decode(a.at(a.dynamic_symbol(blaze_live::patch::DESCRIPTOR), Descriptor::SIZE))
+            .unwrap();
     let ([code, code_end], [data, data_end]) = (descriptor.patch_code, descriptor.patch_data);
 
     let Some(mut memory) = memory_of("blaze-link-live-frames", disk.file(TO)) else { return };
     let staged = image.stage(edit(&g2)).unwrap();
-    let message = image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
+    let message =
+        image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
     let b = Linked::in_memory(&memory, image.state.file_len);
     let new = b.symbol("g2");
     let literal = b.rel32(new + 3);
-    assert!((data..data_end).contains(&literal), "the literal at {literal:#x}, in the patch data region");
+    assert!(
+        (data..data_end).contains(&literal),
+        "the literal at {literal:#x}, in the patch data region"
+    );
     assert_eq!(b.at(literal, 7), b"literal");
     let patch = patch_in(&message, &memory);
     let [(fde, len)] = patch.frames[..] else { panic!("one FDE: {:?}", patch.frames) };
@@ -1200,12 +1420,20 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
         patch.code
     );
     assert!(patch.data.windows(2).all(|it| it[0].0 < it[1].0), "data writes by address");
-    assert!(code <= new && new < fde && fde + len + 4 <= code_end, "the FDE after the code, in the patch code region");
+    assert!(
+        code <= new && new < fde && fde + len + 4 <= code_end,
+        "the FDE after the code, in the patch code region"
+    );
     assert_eq!(fde_starts(fde, b.at(fde, len as usize)), vec![new], "the FDE covers g2");
     let cie = fde + 4 - u64::from(b.u32_at(fde + 4));
     assert!(new < cie && cie < fde, "the new CIE in the patch code region, before the FDE");
-    let written = |at: u64| patch.code.iter().find(|it| it.at == at).map(|it| (it.len, it.hash, &it.name[..]));
-    assert!(written(cie).is_some() && written(fde).is_some(), "the CIE and the FDE are code the patch names");
+    let written = |at: u64| {
+        patch.code.iter().find(|it| it.at == at).map(|it| (it.len, it.hash, &it.name[..]))
+    };
+    assert!(
+        written(cie).is_some() && written(fde).is_some(),
+        "the CIE and the FDE are code the patch names"
+    );
     assert_eq!(
         written(fde + len),
         Some((4, hash(&[0; 4]), "the call frame entries' end")),
@@ -1214,9 +1442,19 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
     assert_eq!(b.at(fde + len, 4), [0; 4], "written into the code memory");
     let file = b.elf();
     for (at, bytes) in &patch.data {
-        let section = file.sections().find(|it| (it.address()..it.address() + it.size()).contains(at)).unwrap();
-        let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else { panic!("an ELF section") };
-        assert!(sh_flags.contains(elf::SHF_WRITE), "{} bytes written at {at:#x}, in {}", bytes.len(), section.name().unwrap());
+        let section = file
+            .sections()
+            .find(|it| (it.address()..it.address() + it.size()).contains(at))
+            .unwrap();
+        let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else {
+            panic!("an ELF section")
+        };
+        assert!(
+            sh_flags.contains(elf::SHF_WRITE),
+            "{} bytes written at {at:#x}, in {}",
+            bytes.len(),
+            section.name().unwrap()
+        );
     }
 
     // A full link of the same functions puts the FDE in `.eh_frame`.
@@ -1260,8 +1498,14 @@ fn pcs(linked: &Linked) -> Vec<(u64, u64)> {
 
 #[test]
 fn coverage_arrays_and_pcs_are_laid_out_in_the_functions_order() {
-    let start = covered(1, 1, 3, Covered { counters: 3, flags: 5, guards: 0, pcs: vec![(0, 1), (7, 0)] });
-    let g = covered(2, 0, 1, Covered { counters: 2, flags: 2, guards: 8, pcs: vec![(0, 1), (3, 0), (7, 0)] });
+    let start =
+        covered(1, 1, 3, Covered { counters: 3, flags: 5, guards: 0, pcs: vec![(0, 1), (7, 0)] });
+    let g = covered(
+        2,
+        0,
+        1,
+        Covered { counters: 2, flags: 2, guards: 8, pcs: vec![(0, 1), (3, 0), (7, 0)] },
+    );
     let mut image = Image::new(name(TO), output(false)).unwrap();
     let mut disk = Disk::default();
     let change = Change {
@@ -1287,9 +1531,16 @@ fn coverage_arrays_and_pcs_are_laid_out_in_the_functions_order() {
 
     let none = covered(1, 2, 0, Covered { counters: 1, flags: 0, guards: 0, pcs: Vec::new() });
     let mut image = Image::new(name(TO), output(false)).unwrap();
-    let change = Change { added: vec![&none], names: vec![("_start".into(), Target::Direct(key(1)))], ..Change::default() };
+    let change = Change {
+        added: vec![&none],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        ..Change::default()
+    };
     let error = image.stage(change).unwrap_err();
-    assert!(error.what.contains("SanitizerCoverage array 2"), "an array the function has not: {error}");
+    assert!(
+        error.what.contains("SanitizerCoverage array 2"),
+        "an array the function has not: {error}"
+    );
 }
 
 #[test]
@@ -1301,7 +1552,8 @@ fn a_relink_that_drops_a_covered_function_drops_its_entries() {
         vec![rel32(3, Target::Coverage(0)), rel32(8, Target::Function(key(3)))],
     );
     start.coverage = Some(Covered { counters: 1, flags: 0, guards: 0, pcs: vec![(0, 1)] });
-    let g = covered(2, 0, 0, Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1), (7, 0)] });
+    let g =
+        covered(2, 0, 0, Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1), (7, 0)] });
     let h = covered(3, 0, 0, Covered { counters: 4, flags: 0, guards: 0, pcs: vec![(0, 1)] });
     let mut image = Image::new(name(TO), output(true)).unwrap();
     let mut disk = Disk::default();
@@ -1323,7 +1575,11 @@ fn a_relink_that_drops_a_covered_function_drops_its_entries() {
     let b = Linked::of(disk.file(TO));
     assert_eq!(section_of(&b, "__sancov_cntrs"), (counters, 5), "g's counters are gone");
     assert_eq!(b.rel32(s + 3), counters);
-    assert_eq!(b.rel32(h_at + 3), counters + 1, "h's counters moved down, and h was relocated to them");
+    assert_eq!(
+        b.rel32(h_at + 3),
+        counters + 1,
+        "h's counters moved down, and h was relocated to them"
+    );
     assert_eq!(pcs(&b), vec![(s, 1), (h_at, 1)], "g's PC entries are gone, the rest in order");
 }
 
@@ -1332,7 +1588,10 @@ fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     let anchor = id(50);
     let table = |line| SpanTable {
         files: vec!["src/main.rs".into()],
-        spans: vec![Position { file: 0, line: 1, column: 1 }, Position { file: 0, line, column: 9 }],
+        spans: vec![
+            Position { file: 0, line: 1, column: 1 },
+            Position { file: 0, line, column: 9 },
+        ],
     };
     // `lea rax, [rip + location]; ret`
     let start = function(
@@ -1367,7 +1626,11 @@ fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     assert_eq!(b.u32_at(location + LINE as u64), 8);
     assert_eq!(b.u64_at(location), file);
 
-    let missing = function(4, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![rel32(3, Target::Position(SpanRef { anchor: id(51), index: 0 }))]);
+    let missing = function(
+        4,
+        &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3],
+        vec![rel32(3, Target::Position(SpanRef { anchor: id(51), index: 0 }))],
+    );
     let error = image.stage(Change { added: vec![&missing], ..Change::default() }).unwrap_err();
     assert!(error.what.contains("span table"), "{error}");
 }
@@ -1435,12 +1698,20 @@ fn a_statics_writable_data_is_its_own_and_writable() {
     let item = |n: u8| {
         let owned = Data::owned(&id(n), 0, 8, vec![7; 8], Relocs::new());
         let shared = Data::new(8, vec![9; 8], Relocs::new());
-        let at = |at, data: &Data| blaze_codegen::Relocation { at, kind: RelocKind::Abs64, target: Target::Data(data.id), addend: 0 };
+        let at = |at, data: &Data| blaze_codegen::Relocation {
+            at,
+            kind: RelocKind::Abs64,
+            target: Target::Data(data.id),
+            addend: 0,
+        };
         Static {
             item: ItemKey(id(n)),
             instance: ContentId::default(),
             align: 8,
-            init: Init::Bytes { bytes: vec![0; 16], relocs: vec![at(0, &owned), at(8, &shared)].into() },
+            init: Init::Bytes {
+                bytes: vec![0; 16],
+                relocs: vec![at(0, &owned), at(8, &shared)].into(),
+            },
             data: vec![owned, shared],
             mutable: false,
             thread_local: false,
@@ -1476,7 +1747,10 @@ fn a_statics_writable_data_is_its_own_and_writable() {
         let (at, size) = section_of(&linked, name);
         (at..at + size).contains(&addr)
     };
-    assert!(within(".data", one_owned) && within(".data", two_owned), "{one_owned:#x} {two_owned:#x}");
+    assert!(
+        within(".data", one_owned) && within(".data", two_owned),
+        "{one_owned:#x} {two_owned:#x}"
+    );
     assert!(within(".rodata", one_shared), "{one_shared:#x}");
 }
 
@@ -1505,12 +1779,15 @@ fn c_object() -> Vec<u8> {
         section: SymbolSection::Undefined,
         flags: SymbolFlags::None,
     });
-    b.add_relocation(text, Relocation {
-        offset: at + 1,
-        symbol: rust,
-        addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    })
+    b.add_relocation(
+        text,
+        Relocation {
+            offset: at + 1,
+            symbol: rust,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
+        },
+    )
     .unwrap();
     b.write().unwrap()
 }
@@ -1524,9 +1801,18 @@ fn a_c_object_and_rust_code_call_each_other_by_name() {
     let mut disk = Disk::default();
     let change = Change {
         added: vec![&start, &rust],
-        names: vec![("_start".into(), Target::Direct(key(1))), ("rust_fn".into(), Target::Direct(key(2)))],
+        names: vec![
+            ("_start".into(), Target::Direct(key(1))),
+            ("rust_fn".into(), Target::Direct(key(2))),
+        ],
         debug_names: vec![(key(1), "start".into()), (key(2), "rust".into())],
-        natives: vec![Native { id: id(60), name: "helper.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
+        natives: vec![Native {
+            id: id(60),
+            name: "helper.o",
+            bytes: &object,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         ..Change::default()
     };
     disk.link(&mut image, change).unwrap();
@@ -1539,17 +1825,30 @@ fn a_c_object_and_rust_code_call_each_other_by_name() {
     let change = Change {
         added: vec![&start],
         names: vec![("_start".into(), Target::Direct(key(1)))],
-        natives: vec![Native { id: id(60), name: "helper.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
+        natives: vec![Native {
+            id: id(60),
+            name: "helper.o",
+            bytes: &object,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         ..Change::default()
     };
     let error = image.stage(change).unwrap_err();
-    assert!(error.what.contains("undefined symbol `rust_fn`") && error.what.contains("helper.o"), "{error}");
+    assert!(
+        error.what.contains("undefined symbol `rust_fn`") && error.what.contains("helper.o"),
+        "{error}"
+    );
 }
 
 #[test]
 fn line_tables_are_written_from_the_span_tables() {
     let anchor = id(70);
-    let spans = SpanTable { files: vec!["src/lib.rs".into()], spans: vec![Position { file: 0, line: 4, column: 1 }] }.encode();
+    let spans = SpanTable {
+        files: vec!["src/lib.rs".into()],
+        spans: vec![Position { file: 0, line: 4, column: 1 }],
+    }
+    .encode();
     let mut start = function(1, &returns(0), Vec::new());
     start.lines = vec![Line { at: 0, span: SpanRef { anchor, index: 0 } }];
     let mut image = Image::new(name(TO), Output { debug: Debug::Lines, ..output(false) }).unwrap();
@@ -1575,7 +1874,9 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
     let table = |files: &[&str], spans: u32| {
         SpanTable {
             files: files.iter().map(|it| (*it).into()).collect(),
-            spans: (0..spans).map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 }).collect(),
+            spans: (0..spans)
+                .map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                .collect(),
         }
         .encode()
     };
@@ -1584,7 +1885,8 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
     let count = 3 * 1024 + 7;
     let functions: Vec<CompiledFunction> = (0..count)
         .map(|n| {
-            let mut it = CompiledFunction { key: wide_key(n), ..function(1, &returns(0), Vec::new()) };
+            let mut it =
+                CompiledFunction { key: wide_key(n), ..function(1, &returns(0), Vec::new()) };
             it.lines = vec![
                 Line { at: 0, span: SpanRef { anchor: a, index: n * 7 % 9 } },
                 Line { at: 3, span: SpanRef { anchor: b, index: n % 4 } },
@@ -1605,8 +1907,10 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
     let linked = Linked::of(disk.file(TO));
     let elf = linked.elf();
     let get = |name: &str| elf.section_by_name(name).map_or(&[][..], |it| it.data().unwrap());
-    let dwarf = gimli::Dwarf::load(|id| -> Result<_, ()> { Ok(gimli::EndianSlice::new(get(id.name()), gimli::LittleEndian)) })
-        .unwrap();
+    let dwarf = gimli::Dwarf::load(|id| -> Result<_, ()> {
+        Ok(gimli::EndianSlice::new(get(id.name()), gimli::LittleEndian))
+    })
+    .unwrap();
     let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
     let mut rows = unit.line_program.clone().unwrap().rows();
     let mut seen: BTreeMap<u64, (String, u64)> = BTreeMap::new();
@@ -1615,7 +1919,8 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
             continue;
         }
         let file = header.file(row.file_index()).unwrap();
-        let path = dwarf.attr_string(&unit, file.path_name()).unwrap().to_string_lossy().into_owned();
+        let path =
+            dwarf.attr_string(&unit, file.path_name()).unwrap().to_string_lossy().into_owned();
         seen.insert(row.address(), (path, row.line().unwrap().get()));
     }
     assert_eq!(seen.len(), 2 * count as usize);
@@ -1662,11 +1967,13 @@ fn calls(n: u8, fixups: u32) -> CompiledFunction {
 /// replacement grows have grown. The replacement makes `fixups` calls. One worker thread, so
 /// the per-thread count sees all the stage's work.
 fn staged(fillers: u32, fixups: u32) -> blaze_alloc_count::Used {
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let (start, g) = program(Target::Function);
-        let others: Vec<CompiledFunction> =
-            (0..fillers).map(|n| CompiledFunction { key: wide_key(n), ..function(0, &returns(9), Vec::new()) }).collect();
+        let others: Vec<CompiledFunction> = (0..fillers)
+            .map(|n| CompiledFunction { key: wide_key(n), ..function(0, &returns(9), Vec::new()) })
+            .collect();
         let mut change = first(&start, &g);
         change.added.extend(&others);
         let mut image = Image::new(name(TO), output(true)).unwrap();
@@ -1675,7 +1982,12 @@ fn staged(fillers: u32, fixups: u32) -> blaze_alloc_count::Used {
         let g2 = calls(3, fixups);
         disk.link(&mut image, edit(&g2)).unwrap();
         let g3 = calls(4, fixups);
-        let next = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(4))], ..Change::default() };
+        let next = Change {
+            added: vec![&g3],
+            removed: vec![key(3)],
+            slots: vec![(key(2), key(4))],
+            ..Change::default()
+        };
         let (staged, used) = blaze_alloc_count::measure(|| image.stage(next));
         let mut effects = Vec::new();
         image.commit(staged.unwrap(), &mut effects).unwrap();
@@ -1691,7 +2003,10 @@ fn an_incremental_stage_allocates_a_constant_whatever_the_image_holds() {
     let large = staged(4096, 1);
     eprintln!("a one-function stage: {small:?} among 6 functions, {large:?} among 4098");
     for (used, what) in [(small, "6 functions"), (large, "4098 functions")] {
-        assert!(used.allocations <= STAGE_BUDGET, "a one-function stage among {what}: {used:?}, budget {STAGE_BUDGET}");
+        assert!(
+            used.allocations <= STAGE_BUDGET,
+            "a one-function stage among {what}: {used:?}, budget {STAGE_BUDGET}"
+        );
     }
     assert!(
         large.allocations <= small.allocations + GROWTH,
@@ -1705,7 +2020,10 @@ fn relocation_allocates_nothing_per_fixup() {
     let few = staged(4, 64);
     let many = staged(4, 2048);
     eprintln!("a one-function stage: {few:?} with 64 fixups, {many:?} with 2048");
-    assert!(many.allocations <= STAGE_BUDGET, "a stage of 2048 fixups: {many:?}, budget {STAGE_BUDGET}");
+    assert!(
+        many.allocations <= STAGE_BUDGET,
+        "a stage of 2048 fixups: {many:?}, budget {STAGE_BUDGET}"
+    );
     assert!(
         many.allocations <= few.allocations + GROWTH,
         "relocation allocates per fixup: {few:?} with 64 fixups, {many:?} with 2048"
@@ -1716,10 +2034,16 @@ fn relocation_allocates_nothing_per_fixup() {
 /// its PC table `pcs` entries, in an incremental image of `_start` and `g` (covered from the
 /// first link, so the image has the sections), `g` already replaced once. One worker thread.
 fn staged_covered(pcs: u32) -> blaze_alloc_count::Used {
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let covered = |n: u8| CompiledFunction {
-            coverage: Some(Covered { counters: pcs, flags: 0, guards: 0, pcs: vec![(0, 0); pcs as usize] }),
+            coverage: Some(Covered {
+                counters: pcs,
+                flags: 0,
+                guards: 0,
+                pcs: vec![(0, 0); pcs as usize],
+            }),
             ..calls(n, 1)
         };
         let (start, _) = program(Target::Function);
@@ -1730,7 +2054,12 @@ fn staged_covered(pcs: u32) -> blaze_alloc_count::Used {
         let g2 = covered(3);
         disk.link(&mut image, edit(&g2)).unwrap();
         let g3 = covered(4);
-        let next = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(4))], ..Change::default() };
+        let next = Change {
+            added: vec![&g3],
+            removed: vec![key(3)],
+            slots: vec![(key(2), key(4))],
+            ..Change::default()
+        };
         let (staged, used) = blaze_alloc_count::measure(|| image.stage(next));
         let mut effects = Vec::new();
         image.commit(staged.unwrap(), &mut effects).unwrap();
@@ -1745,7 +2074,10 @@ fn coverage_allocates_nothing_per_pc_entry() {
     let few = staged_covered(4);
     let many = staged_covered(2048);
     eprintln!("a covered one-function stage: {few:?} with 4 PC entries, {many:?} with 2048");
-    assert!(many.allocations <= STAGE_BUDGET, "a covered stage of 2048 PC entries: {many:?}, budget {STAGE_BUDGET}");
+    assert!(
+        many.allocations <= STAGE_BUDGET,
+        "a covered stage of 2048 PC entries: {many:?}, budget {STAGE_BUDGET}"
+    );
     assert!(
         many.allocations <= few.allocations + GROWTH,
         "coverage allocates per PC entry: {few:?} with 4, {many:?} with 2048"
@@ -1759,9 +2091,12 @@ fn slot_and_generation_allocate_nothing() {
     Disk::default().link(&mut image, first(&start, &g)).unwrap();
     let slot = blaze_alloc_count::assert_at_most(0, "Image::slot", || image.slot(&key(2)));
     assert!(slot.is_some());
-    let none = blaze_alloc_count::assert_at_most(0, "Image::slot of a function not linked", || image.slot(&key(9)));
+    let none = blaze_alloc_count::assert_at_most(0, "Image::slot of a function not linked", || {
+        image.slot(&key(9))
+    });
     assert_eq!(none, None);
-    let generation = blaze_alloc_count::assert_at_most(0, "Image::generation", || image.generation());
+    let generation =
+        blaze_alloc_count::assert_at_most(0, "Image::generation", || image.generation());
     assert_eq!(generation, 1);
 }
 
@@ -1775,7 +2110,9 @@ fn owning_and_completing_an_effect_allocate_nothing() {
     let mut disk = Disk::default();
     disk.link(&mut image, first(&start, &g)).unwrap();
     let foreign = blaze_core::Tag(2 << 32);
-    let owned = blaze_alloc_count::assert_at_most(0, "Image::owns of another's tag", || image.owns(foreign));
+    let owned = blaze_alloc_count::assert_at_most(0, "Image::owns of another's tag", || {
+        image.owns(foreign)
+    });
     assert!(!owned);
 
     let g2 = function(3, &returns(2), Vec::new());
@@ -1787,10 +2124,11 @@ fn owning_and_completing_an_effect_allocate_nothing() {
     let generation = loop {
         let effect = effects.pop().expect("the commit ended or asked for more");
         let completion = Completion { tag: effect.tag(), done: disk.done(&effect) };
-        let result = blaze_alloc_count::assert_at_most(0, "Image::owns and Image::complete", || {
-            assert!(image.owns(completion.tag));
-            image.complete(&completion, &mut more)
-        });
+        let result =
+            blaze_alloc_count::assert_at_most(0, "Image::owns and Image::complete", || {
+                assert!(image.owns(completion.tag));
+                image.complete(&completion, &mut more)
+            });
         completions += 1;
         if let Some(result) = result {
             break result.unwrap();
@@ -1900,7 +2238,10 @@ mod columns {
         assert_eq!(old.piece_count(), 2);
         assert!(old.piece(three).is_none());
         assert_eq!((refs(&old, c), refs(&old, d)), (vec![one, two], vec![two]));
-        assert_eq!((refs(&new, c), refs(&new, d), refs(&new, a)), (vec![two], vec![two, one], vec![three]));
+        assert_eq!(
+            (refs(&new, c), refs(&new, d), refs(&new, a)),
+            (vec![two], vec![two, one], vec![three])
+        );
     }
 
     #[test]
@@ -1927,7 +2268,14 @@ mod columns {
         let target = symbols.sym_name("target");
         let mut state = State::new();
         let lines = [Line { at: 4, span: SpanRef { anchor: id(9), index: 2 } }];
-        let function = state.add_function(key(1), symbols.id(&id(1)), None, None, &lines, crate::state::NO_MADE);
+        let function = state.add_function(
+            key(1),
+            symbols.id(&id(1)),
+            None,
+            None,
+            &lines,
+            crate::state::NO_MADE,
+        );
         let body = symbols.sym_name("body");
         let kept = add(&mut state, body, &[fixup(0, target)], What::Function(function));
         let mut gone = Vec::new();
@@ -1946,9 +2294,14 @@ mod columns {
         assert_eq!(state.piece(kept).unwrap().fixups(), [fixup(0, target)]);
         assert_eq!(refs(&state, target), [kept]);
         let info = *state.piece(kept).unwrap().function().unwrap();
-        let kept_lines: Vec<(u32, u32)> = state.lines(&info).iter().map(|it| (it.at, it.span.index)).collect();
+        let kept_lines: Vec<(u32, u32)> =
+            state.lines(&info).iter().map(|it| (it.at, it.span.index)).collect();
         assert_eq!(kept_lines, [(4, 2)]);
-        assert_eq!(before.piece(kept).unwrap().fixups(), [fixup(0, target)], "the clone is untouched");
+        assert_eq!(
+            before.piece(kept).unwrap().fixups(),
+            [fixup(0, target)],
+            "the clone is untouched"
+        );
         assert_eq!(state.piece_count(), before.piece_count(), "ids stay as they were");
     }
 
@@ -1974,7 +2327,11 @@ mod columns {
         assert_eq!((of(&state, f), of(&state, g)), (vec![], vec![1, 2]));
         assert_eq!(state.cell(0), None);
         assert_eq!(state.filled_cells().collect::<Vec<_>>(), [(1, g), (2, g)]);
-        assert_eq!(old.filled_cells().collect::<Vec<_>>(), [(0, f), (1, f), (2, g)], "the clone is untouched");
+        assert_eq!(
+            old.filled_cells().collect::<Vec<_>>(),
+            [(0, f), (1, f), (2, g)],
+            "the clone is untouched"
+        );
         assert_eq!(of(&old, f), [0, 1]);
     }
 }
@@ -1984,11 +2341,14 @@ mod resolution {
     use blaze_codegen::Target;
     use object::write::{Object as Builder, Relocation, Symbol as Def, SymbolSection};
     use object::{
-        Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags, SectionFlags,
-        SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
+        Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags,
+        SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
     };
 
-    use super::{CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name, output, returns};
+    use super::{
+        CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name,
+        output, returns,
+    };
     use crate::native::resolution_id;
     use crate::state::What;
 
@@ -2002,7 +2362,8 @@ mod resolution {
         let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
         let mut symbols = Vec::new();
         for (it, value) in functions {
-            let text = b.add_section(Vec::new(), format!(".text.{it}").into_bytes(), SectionKind::Text);
+            let text =
+                b.add_section(Vec::new(), format!(".text.{it}").into_bytes(), SectionKind::Text);
             let at = b.append_section_data(text, &returns(*value), 16);
             let sym = b.add_symbol(Def {
                 name: it.as_bytes().to_vec(),
@@ -2018,16 +2379,22 @@ mod resolution {
         }
         for it in constructors {
             let init = b.add_section(Vec::new(), b".init_array".to_vec(), SectionKind::Data);
-            b.section_mut(init).flags =
-                SectionFlags::Elf { sh_type: elf::SHT_INIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
+            b.section_mut(init).flags = SectionFlags::Elf {
+                sh_type: elf::SHT_INIT_ARRAY,
+                sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE,
+            };
             let at = b.append_section_data(init, &[0; 8], 8);
-            let symbol = symbols.iter().find(|(name, _)| name == it).expect("a constructor's function").1;
-            b.add_relocation(init, Relocation {
-                offset: at,
-                symbol,
-                addend: 0,
-                flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-            })
+            let symbol =
+                symbols.iter().find(|(name, _)| name == it).expect("a constructor's function").1;
+            b.add_relocation(
+                init,
+                Relocation {
+                    offset: at,
+                    symbol,
+                    addend: 0,
+                    flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+                },
+            )
             .unwrap();
         }
         b.write().unwrap()
@@ -2035,7 +2402,9 @@ mod resolution {
 
     /// A GNU archive of `members` (name, bytes, the symbols it defines), with its symbol index.
     fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
-        let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644);
+        let header = |name: &str, size: usize| {
+            format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+        };
         let names: Vec<&str> = members.iter().flat_map(|it| it.2.iter().copied()).collect();
         let index_len = 4 + 4 * names.len() + names.iter().map(|it| it.len() + 1).sum::<usize>();
         let mut offsets = Vec::new();
@@ -2067,7 +2436,12 @@ mod resolution {
         out
     }
 
-    fn native<'a>(n: u8, file: &'a str, bytes: &'a std::sync::Arc<[u8]>, kind: NativeKind) -> Native<'a> {
+    fn native<'a>(
+        n: u8,
+        file: &'a str,
+        bytes: &'a std::sync::Arc<[u8]>,
+        kind: NativeKind,
+    ) -> Native<'a> {
         Native { id: id(n), name: file, bytes, kind, order: u32::from(n) }
     }
 
@@ -2080,12 +2454,16 @@ mod resolution {
     fn a_body_edit_resolves_nothing() {
         let object: std::sync::Arc<[u8]> = super::c_object().into();
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_helper".into()))]);
-        let (rust, rust2) = (function(2, &returns(3), Vec::new()), function(3, &returns(4), Vec::new()));
+        let (rust, rust2) =
+            (function(2, &returns(3), Vec::new()), function(3, &returns(4), Vec::new()));
         let mut image = Image::new(name(TO), incremental()).unwrap();
         let mut disk = Disk::default();
         let change = Change {
             added: vec![&start, &rust],
-            names: vec![("_start".into(), Target::Direct(key(1))), ("rust_fn".into(), Target::Function(key(2)))],
+            names: vec![
+                ("_start".into(), Target::Direct(key(1))),
+                ("rust_fn".into(), Target::Function(key(2))),
+            ],
             debug_names: vec![(key(1), "start".into()), (key(2), "rust".into())],
             natives: vec![native(60, "helper.o", &object, NativeKind::Object)],
             ..Change::default()
@@ -2100,7 +2478,11 @@ mod resolution {
             ..Change::default()
         };
         disk.link(&mut image, edit).unwrap();
-        assert_eq!(resolution_id(&image.state.resolved), before, "an edit of a body resolves nothing");
+        assert_eq!(
+            resolution_id(&image.state.resolved),
+            before,
+            "an edit of a body resolves nothing"
+        );
         let linked = Linked::of(disk.file(TO));
         let helper = linked.rel32(linked.symbol("start") + 1);
         assert_eq!(linked.through_stub(linked.rel32(helper + 1)), linked.symbol("rust2"));
@@ -2118,7 +2500,11 @@ mod resolution {
         };
         disk.link(image, change).unwrap();
         let more = function(4, &CALLER, vec![super::rel32(1, Target::Extern("c_two".into()))]);
-        let change = Change { added: vec![&more], debug_names: vec![(key(4), "more".into())], ..Change::default() };
+        let change = Change {
+            added: vec![&more],
+            debug_names: vec![(key(4), "more".into())],
+            ..Change::default()
+        };
         disk.link(image, change).unwrap();
     }
 
@@ -2142,17 +2528,29 @@ mod resolution {
         assert_eq!(a.at(one, 6), returns(1));
 
         let more = function(4, &CALLER, vec![super::rel32(1, Target::Extern("c_two".into()))]);
-        let change = Change { added: vec![&more], debug_names: vec![(key(4), "more".into())], ..Change::default() };
+        let change = Change {
+            added: vec![&more],
+            debug_names: vec![(key(4), "more".into())],
+            ..Change::default()
+        };
         disk.link(&mut image, change).unwrap();
         let b = Linked::of(disk.file(TO));
         let two = b.rel32(b.symbol("more") + 1);
         assert_eq!(b.at(two, 6), returns(2), "c_two's section is in the image");
         assert_eq!(b.rel32(b.symbol("start") + 1), one, "c_one's section did not move");
-        assert_eq!(resolution_id(&image.state.resolved), first, "a loaded name grows, not rebuilds");
+        assert_eq!(
+            resolution_id(&image.state.resolved),
+            first,
+            "a loaded name grows, not rebuilds"
+        );
         assert_eq!(sections(&image), alone + 1);
 
         disk.link(&mut image, Change { removed: vec![key(4)], ..Change::default() }).unwrap();
-        assert_ne!(resolution_id(&image.state.resolved), first, "dropping the last reference rebuilds");
+        assert_ne!(
+            resolution_id(&image.state.resolved),
+            first,
+            "dropping the last reference rebuilds"
+        );
         assert_eq!(sections(&image), alone, "c_two's section is collected");
     }
 
@@ -2160,7 +2558,8 @@ mod resolution {
     fn an_archive_member_is_pulled_only_while_something_needs_it() {
         let a = object(&[("need_a", 1)], &["need_a"]);
         let b = object(&[("need_b", 2)], &["need_b"]);
-        let library: std::sync::Arc<[u8]> = archive(&[("a.o", &a, &["need_a"]), ("b.o", &b, &["need_b"])]).into();
+        let library: std::sync::Arc<[u8]> =
+            archive(&[("a.o", &a, &["need_a"]), ("b.o", &b, &["need_b"])]).into();
         let mut image = Image::new(name(TO), incremental()).unwrap();
         let mut disk = Disk::default();
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("need_a".into()))]);
@@ -2176,7 +2575,10 @@ mod resolution {
             let elf = linked.elf();
             let Some(init) = elf.section_by_name(".init_array") else { return Vec::new() };
             let data = linked.at(init.address(), init.size() as usize);
-            data.chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap())).filter(|it| *it != 0).collect()
+            data.chunks_exact(8)
+                .map(|it| u64::from_le_bytes(it.try_into().unwrap()))
+                .filter(|it| *it != 0)
+                .collect()
         };
         let first = Linked::of(disk.file(TO));
         let need_a = first.rel32(first.symbol("start") + 1);
@@ -2202,7 +2604,11 @@ mod resolution {
     fn resolution_is_the_same_on_any_number_of_threads() {
         let object: std::sync::Arc<[u8]> = object(&[("c_one", 1), ("c_two", 2)], &[]).into();
         let run = |threads: usize| {
-            let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(threads), false).unwrap();
+            let pool = blaze_graph::pool::Pool::new(
+                &blaze_graph::topology::Topology::flat(threads),
+                false,
+            )
+            .unwrap();
             pool.install(|| {
                 let mut image = Image::new(name(TO), incremental()).unwrap();
                 let mut disk = Disk::default();
@@ -2233,7 +2639,11 @@ fn a_function_refilled_under_its_own_key_relinks() {
         Change {
             added: vec![&start, &call, &log],
             names: names(),
-            debug_names: vec![(key(1), "start".into()), (key(2), "call".into()), (key(3), "log".into())],
+            debug_names: vec![
+                (key(1), "start".into()),
+                (key(2), "call".into()),
+                (key(3), "log".into()),
+            ],
             ..Change::default()
         },
     )
@@ -2261,7 +2671,11 @@ fn a_function_refilled_under_its_own_key_relinks() {
     let (s, new_call, log2_at) = (b.symbol("start"), b.symbol("call"), b.symbol("log2"));
     assert_ne!(new_call, old_call, "new code never goes where old code was");
     assert_eq!(b.rel32(s + 1), new_call, "the direct referrer follows the refilled body");
-    assert_eq!(b.through_stub(b.rel32(new_call + 1)), log2_at, "the refilled body calls the new callee");
+    assert_eq!(
+        b.through_stub(b.rel32(new_call + 1)),
+        log2_at,
+        "the refilled body calls the new callee"
+    );
     assert_eq!(b.at(log2_at, 6), returns(2));
     assert_eq!(b.elf().entry(), s);
 
@@ -2288,7 +2702,9 @@ fn a_function_refilled_under_its_own_key_relinks() {
 
     // Put again without being removed: refused, naming it, never its old code quietly kept.
     let again = function(5, &CALLER, vec![rel32(1, Target::Function(key(4)))]);
-    let error = image.stage(Change { added: vec![&again], names: names(), ..Change::default() }).unwrap_err();
+    let error = image
+        .stage(Change { added: vec![&again], names: names(), ..Change::default() })
+        .unwrap_err();
     assert_eq!(error.function, Some(key(5)));
     assert!(error.what.contains("`call5`") && error.what.contains("already placed"), "{error}");
 }

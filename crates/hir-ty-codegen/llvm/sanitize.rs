@@ -107,7 +107,8 @@ pub(super) fn instrument(
     let Some(wanted) = wanted(sanitize) else { return Ok(()) };
     let triple = machinery.get_triple();
     let triple = triple.as_str().to_string_lossy();
-    if wanted.Memory != 0 && !["-linux", "-freebsd", "-netbsd"].iter().any(|os| triple.contains(os)) {
+    if wanted.Memory != 0 && !["-linux", "-freebsd", "-netbsd"].iter().any(|os| triple.contains(os))
+    {
         // alloc: the error message, once before the build stops
         return Err(Unhandled::Llvm(format!(
             "MemorySanitizer for {triple}, which LLVM has for Linux, FreeBSD and NetBSD only"
@@ -126,7 +127,9 @@ pub(super) fn instrument(
         let runtime = name.starts_with(b"__msan_") || name.starts_with(b"__sancov_");
         if runtime
             && global.is_declaration()
-            && global.get_thread_local_mode().is_some_and(|it| it != ThreadLocalMode::GeneralDynamicTLSModel)
+            && global
+                .get_thread_local_mode()
+                .is_some_and(|it| it != ThreadLocalMode::GeneralDynamicTLSModel)
         {
             global.set_thread_local_mode(Some(ThreadLocalMode::GeneralDynamicTLSModel));
         }
@@ -295,7 +298,10 @@ store:
         let off = Sanitizers::ADDRESS.union(Sanitizers::COVERAGE);
         let text = instrumented(&Sanitize { sanitizers: Sanitizers::ADDRESS, ..fuzzing(3) }, off);
         assert!(text.contains("nosanitize_coverage"), "{text}");
-        assert!(!own(&text).contains("__sanitizer_cov") && !own(&text).contains("__asan_"), "{text}");
+        assert!(
+            !own(&text).contains("__sanitizer_cov") && !own(&text).contains("__asan_"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -326,9 +332,12 @@ store:
         let isa = crate::isa_for(crate::Target::x86_64_linux()).unwrap();
         let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
         let signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
-        let (code, covered) =
-            super::super::emitted::read_covered(object.as_slice(), (OWN, signature.clone()), &mut wants)
-                .unwrap();
+        let (code, covered) = super::super::emitted::read_covered(
+            object.as_slice(),
+            (OWN, signature.clone()),
+            &mut wants,
+        )
+        .unwrap();
         assert_eq!(covered.arrays[1..], [0, 0]);
         assert!(covered.blocks() >= 3, "{covered:?}");
         assert_eq!(covered.pcs.len(), covered.blocks() as usize, "{covered:?}");
@@ -337,7 +346,8 @@ store:
         assert!(covered.pcs.iter().all(|&(at, _)| (at as usize) < code.bytes.len()));
         // Read without coverage, the same object is refused.
         let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
-        let plain = super::super::emitted::read(object.as_slice(), &[(OWN, signature)], &mut wants).unwrap();
+        let plain = super::super::emitted::read(object.as_slice(), &[(OWN, signature)], &mut wants)
+            .unwrap();
         assert!(plain[0].is_err());
     }
 }

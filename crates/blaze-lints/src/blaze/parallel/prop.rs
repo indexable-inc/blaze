@@ -12,8 +12,8 @@
 //! another write overwrites, whose read is dead. Both are misses the notes name.
 
 use blaze_ids::rng::SplitMix64;
-use hegel::generators::{self as gs, Generator as _};
 use hegel::TestCase;
+use hegel::generators::{self as gs, Generator as _};
 
 use super::tests::{FLAGS, MAIN, MINICORE, STD, conf, found};
 use crate::tests::lint_with;
@@ -187,7 +187,8 @@ impl Body {
 }
 
 fn draw_body(tc: &TestCase) -> Body {
-    let reduces = [Reduce::Add, Reduce::Mul, Reduce::Or, Reduce::And, Reduce::Xor, Reduce::Min, Reduce::Max];
+    let reduces =
+        [Reduce::Add, Reduce::Mul, Reduce::Or, Reduce::And, Reduce::Xor, Reduce::Min, Reduce::Max];
     let reduce = tc.draw(gs::vecs(gs::sampled_from(reduces.to_vec())).max_size(3));
     let write = tc.draw(gs::optional(hegel::one_of!(
         gs::integers::<u64>().min_value(1).max_value(15).map(Write::Own),

@@ -84,12 +84,14 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
     // alloc: once a run, its repetitions
     let mut profiles = Vec::with_capacity(reps.len());
     for (at, bytes) in reps.iter().enumerate() {
-        let profile = Profile::from_ixprof(bytes).map_err(|error| format!("repetition {at}: {error}"))?;
+        let profile =
+            Profile::from_ixprof(bytes).map_err(|error| format!("repetition {at}: {error}"))?;
         profiles.push(profile);
     }
     let first = &profiles[0].meta;
     for (at, it) in profiles.iter().enumerate().skip(1) {
-        if it.meta.program != first.program || it.meta.arch != first.arch || it.meta.os != first.os {
+        if it.meta.program != first.program || it.meta.arch != first.arch || it.meta.os != first.os
+        {
             // alloc: an error
             return Err(format!(
                 "repetition {at} is of {} on {}-{}, and repetition 0 of {} on {}-{}: a run is one program on one machine",
@@ -115,7 +117,9 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
     let period = first.cpu_period_ns;
     match period {
         None => {
-            gaps.insert("cpu_period_ns: the sampler was off, so its samples weigh nothing".to_owned());
+            gaps.insert(
+                "cpu_period_ns: the sampler was off, so its samples weigh nothing".to_owned(),
+            );
         }
         Some(period) => {
             for (at, it) in profiles.iter().enumerate() {
@@ -163,16 +167,22 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
             let mut leaf = true;
             let mut leaf_mapped = false;
             while let Some(at) = node {
-                fuel = fuel.checked_sub(1).ok_or_else(|| format!("repetition {rep}: stack {} has a cycle", sample.stack))?;
-                let it = profile
-                    .stacks
-                    .get(at as usize)
-                    .ok_or_else(|| format!("repetition {rep}: stack {} names node {at}, past the table", sample.stack))?;
+                fuel = fuel.checked_sub(1).ok_or_else(|| {
+                    format!("repetition {rep}: stack {} has a cycle", sample.stack)
+                })?;
+                let it = profile.stacks.get(at as usize).ok_or_else(|| {
+                    format!(
+                        "repetition {rep}: stack {} names node {at}, past the table",
+                        sample.stack
+                    )
+                })?;
                 node = it.parent;
-                let frame = profile
-                    .frames
-                    .get(it.frame as usize)
-                    .ok_or_else(|| format!("repetition {rep}: stack node {at} names frame {}, past the table", it.frame))?;
+                let frame = profile.frames.get(it.frame as usize).ok_or_else(|| {
+                    format!(
+                        "repetition {rep}: stack node {at} names frame {}, past the table",
+                        it.frame
+                    )
+                })?;
                 if frame.kind != FrameKind::Native {
                     continue;
                 }
@@ -186,7 +196,9 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
                 }
                 if binary.is_none()
                     && let Some(module) = &frame.module
-                    && Path::new(module).file_name().is_some_and(|it| it.to_str() == Some(first.program.as_str()))
+                    && Path::new(module)
+                        .file_name()
+                        .is_some_and(|it| it.to_str() == Some(first.program.as_str()))
                 {
                     // clone: once a run, the executable's path and build id
                     binary = Some((module.clone(), frame.build_id.clone()));
@@ -195,7 +207,15 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
                     // clone: a resolved name, per frame of a sample
                     Some(name) => name.clone(),
                     None => {
-                        let name = resolve(profile, it.frame, &inputs.perf, &mut maps, &mut slots, &mut gaps, reps_count)?;
+                        let name = resolve(
+                            profile,
+                            it.frame,
+                            &inputs.perf,
+                            &mut maps,
+                            &mut slots,
+                            &mut gaps,
+                            reps_count,
+                        )?;
                         // clone: once per frame of a repetition
                         resolved[it.frame as usize] = Some(name.clone());
                         name
@@ -230,13 +250,17 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
             gaps.insert(format!("binary: no sampled frame is in {}", first.program));
             (None, None)
         }
-        Some((path, build_id)) => (hash_binary(Path::new(path), started, &mut gaps), build_id.clone()),
+        Some((path, build_id)) => {
+            (hash_binary(Path::new(path), started, &mut gaps), build_id.clone())
+        }
     };
     // alloc: once a run, its rows
     let mut rows = Vec::new();
     for (name, function) in &slots {
         let (identity, function_name) = match name {
-            Name::Identity(id) => (Some(hex(id)), function.names.first().cloned().unwrap_or_default()),
+            Name::Identity(id) => {
+                (Some(hex(id)), function.names.first().cloned().unwrap_or_default())
+            }
             // clone: once a row
             Name::Named { function, .. } => (None, function.clone()),
         };
@@ -424,7 +448,10 @@ fn hash_binary(path: &Path, started_unix_ns: i64, gaps: &mut BTreeSet<String>) -
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |it| i64::try_from(it.as_nanos()).unwrap_or(i64::MAX));
     if modified_ns > started_unix_ns {
-        gaps.insert(format!("binary: {} was written after the run began, so what ran is gone", path.display()));
+        gaps.insert(format!(
+            "binary: {} was written after the run began, so what ran is gone",
+            path.display()
+        ));
         return None;
     }
     match blaze_v2_proof::tree::hash_file(path) {

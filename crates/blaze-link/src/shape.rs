@@ -68,7 +68,10 @@ impl RegionShape {
 /// and what it is) after the region it is in, or on a line of its own when it is in none.
 pub(crate) fn render(layout: &[RegionShape], base: u64, marks: &[(u64, &str)], out: &mut String) {
     // Writing to a `String` does not fail.
-    _ = writeln!(out, "the image's regions by address, from its base {base:#x} (size: bytes placed; room: the range kept):");
+    _ = writeln!(
+        out,
+        "the image's regions by address, from its base {base:#x} (size: bytes placed; room: the range kept):"
+    );
     // The headers before the first region are no gap.
     let mut end = layout.first().map_or(base, |it| it.addr);
     for region in layout {
@@ -115,8 +118,12 @@ pub(crate) fn explained(mut error: LinkError, layout: &[RegionShape], base: u64)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 enum Kind {
     Stencil,
-    Cranelift { speed: bool },
-    Llvm { opt: u8 },
+    Cranelift {
+        speed: bool,
+    },
+    Llvm {
+        opt: u8,
+    },
     /// A native object's code (C, assembly, `global_asm!`).
     Native,
     /// The linker's own among the code: thunks, PLT and jump-table stubs, and the call frame
@@ -163,7 +170,9 @@ impl Owner {
         Cow::Borrowed(match self {
             Owner::Origin(Origin::Member(it) | Origin::Dependency(it)) => it.as_str(),
             // alloc: once a stage, a crate's name
-            Owner::Origin(Origin::BuildTime(it)) => return Cow::Owned(format!("{} (build time)", it.as_str())),
+            Owner::Origin(Origin::BuildTime(it)) => {
+                return Cow::Owned(format!("{} (build time)", it.as_str()));
+            }
             Owner::Origin(Origin::Std) => "std",
             Owner::Native => "(native objects)",
             Owner::Linker => "(linker)",
@@ -188,14 +197,23 @@ impl Sum {
 
 /// Whether a class holds code: what `link code` sums.
 fn code(class: &Class) -> bool {
-    matches!(class, Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Named { exec: true, .. })
+    matches!(
+        class,
+        Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Named { exec: true, .. }
+    )
 }
 
 /// `sums` as rows by name, the most bytes first, then by name: one order whatever the map's.
-fn ranked<K>(sums: HashMap<K, Sum, Global>, name: impl Fn(K) -> Cow<'static, str>) -> Vec<(Cow<'static, str>, Sum)> {
+fn ranked<K>(
+    sums: HashMap<K, Sum, Global>,
+    name: impl Fn(K) -> Cow<'static, str>,
+) -> Vec<(Cow<'static, str>, Sum)> {
     // alloc: once a stage, a row a backend or crate
-    let mut rows: Vec<(Cow<'static, str>, Sum)> = sums.into_iter().map(|(key, sum)| (name(key), sum)).collect();
-    rows.sort_unstable_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then_with(|| a.0.cmp(&b.0)).then(a.1.pieces.cmp(&b.1.pieces)));
+    let mut rows: Vec<(Cow<'static, str>, Sum)> =
+        sums.into_iter().map(|(key, sum)| (name(key), sum)).collect();
+    rows.sort_unstable_by(|a, b| {
+        b.1.bytes.cmp(&a.1.bytes).then_with(|| a.0.cmp(&b.0)).then(a.1.pieces.cmp(&b.1.pieces))
+    });
     rows
 }
 
@@ -275,7 +293,9 @@ impl Stage<'_> {
                     Some(made) => (Kind::of(made.backend), Owner::Origin(made.origin)),
                     None => (Kind::Unsaid, Owner::Unsaid),
                 },
-                What::Native { .. } | What::NativeFrame { .. } | What::Common => (Kind::Native, Owner::Native),
+                What::Native { .. } | What::NativeFrame { .. } | What::Common => {
+                    (Kind::Native, Owner::Native)
+                }
                 _ => (Kind::Linker, Owner::Linker),
             };
             backends.entry(kind).or_default().add(piece.size);
@@ -325,12 +345,24 @@ mod tests {
             region("__TEXT,__eh_frame", 0x1_e000_0000, 0x100, 0x100),
         ];
         let mut out = String::new();
-        render(&layout, 0x1_0000_0000, &[(0x1_e000_0008, "from"), (0x1_0000_5000, "to"), (0x5, "nowhere")], &mut out);
+        render(
+            &layout,
+            0x1_0000_0000,
+            &[(0x1_e000_0008, "from"), (0x1_0000_5000, "to"), (0x5, "nowhere")],
+            &mut out,
+        );
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("__TEXT,__blaze_patch") && lines[1].ends_with("<- to 0x100005000"), "{out}");
+        assert!(
+            lines[1].contains("__TEXT,__blaze_patch") && lines[1].ends_with("<- to 0x100005000"),
+            "{out}"
+        );
         assert!(lines[2].contains("__TEXT,__text") && !lines[2].contains("<-"), "{out}");
         assert_eq!(lines[3].trim(), "0xfffc000 bytes unused", "{out}");
-        assert!(lines[4].contains("size 0x100  room 0x100") && lines[4].ends_with("<- from 0x1e0000008"), "{out}");
+        assert!(
+            lines[4].contains("size 0x100  room 0x100")
+                && lines[4].ends_with("<- from 0x1e0000008"),
+            "{out}"
+        );
         assert_eq!(lines[5].trim(), "nowhere 0x5 is in no region (the headers, or a gap)", "{out}");
     }
 
@@ -340,7 +372,12 @@ mod tests {
         let layout = [region("__TEXT,__text", 0x1000, 0x10, 0x10)];
         let error = |refusal| LinkError { function: None, what: "x".into(), refusal };
         let field = explained(error(Some(Refusal::FieldRange)), &layout, 0);
-        assert!(field.what.starts_with("x\nthe image's regions") && field.what.contains("__TEXT,__text"), "{}", field.what);
+        assert!(
+            field.what.starts_with("x\nthe image's regions")
+                && field.what.contains("__TEXT,__text"),
+            "{}",
+            field.what
+        );
         let room = explained(error(Some(Refusal::NoRoom { need: 2, room: 1 })), &layout, 0);
         assert!(room.what.contains("__TEXT,__text"));
         assert_eq!(explained(error(None), &layout, 0).what, "x");

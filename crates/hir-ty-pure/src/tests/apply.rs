@@ -52,7 +52,9 @@ fn env_var_reads_only_what_cargo_gives() {
             Applied::Done { effects: Effects::NONE, env: Some(name), ret: Abs::Env(name) },
         );
     }
-    for name in ["PATH", "RUSTC", "RUSTC_WRAPPER", "CARGO_MAKEFLAGS", "DEP_Z_INCLUDE", "CARGO", "HOME"] {
+    for name in
+        ["PATH", "RUSTC", "RUSTC_WRAPPER", "CARGO_MAKEFLAGS", "DEP_Z_INCLUDE", "CARGO", "HOME"]
+    {
         refused(apply_leaf(Leaf::EnvVar, &[c(name)]), &format!("`{name}`"));
     }
     assert_eq!(apply_leaf(Leaf::EnvVar, &[Abs::Param(0)]), Applied::Deferred);
@@ -64,12 +66,20 @@ fn env_var_reads_only_what_cargo_gives() {
 
 #[test]
 fn reads_and_probes_are_of_package_paths() {
-    for path in [c("Cargo.toml"), c("src/x.rs"), env("CARGO_MANIFEST_DIR"), Abs::Root(Root::Package)] {
+    for path in
+        [c("Cargo.toml"), c("src/x.rs"), env("CARGO_MANIFEST_DIR"), Abs::Root(Root::Package)]
+    {
         assert_eq!(apply_leaf(Leaf::ReadFile, &[path]), done(Effects::READ));
         assert_eq!(apply_leaf(Leaf::Probe, &[path]), done(Effects::PROBE));
     }
-    refused(apply_leaf(Leaf::ReadFile, &[c("../x")]), "reads `../x`, not a path inside its package");
-    refused(apply_leaf(Leaf::ReadFile, &[c("/etc/x")]), "reads `/etc/x`, not a path inside its package");
+    refused(
+        apply_leaf(Leaf::ReadFile, &[c("../x")]),
+        "reads `../x`, not a path inside its package",
+    );
+    refused(
+        apply_leaf(Leaf::ReadFile, &[c("/etc/x")]),
+        "reads `/etc/x`, not a path inside its package",
+    );
     refused(apply_leaf(Leaf::ReadFile, &[c("C:x")]), "`C:x`");
     refused(apply_leaf(Leaf::ReadFile, &[Abs::Root(Root::OutDir)]), "a path in its OUT_DIR");
     refused(apply_leaf(Leaf::ReadFile, &[env("OUT_DIR")]), "a path in its OUT_DIR");
@@ -84,7 +94,10 @@ fn writes_are_of_out_dir_paths() {
     for path in [env("OUT_DIR"), Abs::Root(Root::OutDir)] {
         assert_eq!(apply_leaf(Leaf::WriteFile, &[path]), done(Effects::WRITE));
     }
-    refused(apply_leaf(Leaf::WriteFile, &[c("src/gen.rs")]), "writes `src/gen.rs`, a path in its package");
+    refused(
+        apply_leaf(Leaf::WriteFile, &[c("src/gen.rs")]),
+        "writes `src/gen.rs`, a path in its package",
+    );
     refused(apply_leaf(Leaf::WriteFile, &[Abs::Root(Root::Package)]), "a path in its package");
     refused(apply_leaf(Leaf::WriteFile, &[env("CARGO_MANIFEST_DIR")]), "a path in its package");
     refused(apply_leaf(Leaf::WriteFile, &[c("/tmp/x")]), "`/tmp/x`");
@@ -97,7 +110,10 @@ fn a_copy_reads_the_package_into_out_dir() {
     assert_eq!(apply_leaf(Leaf::Copy, &[c("data.bin"), Abs::Root(Root::OutDir)]), done(both));
     refused(apply_leaf(Leaf::Copy, &[Abs::Root(Root::OutDir), Abs::Root(Root::OutDir)]), "reads");
     refused(apply_leaf(Leaf::Copy, &[c("data.bin"), c("data.bin")]), "writes");
-    assert_eq!(apply_leaf(Leaf::Copy, &[Abs::Param(0), Abs::Root(Root::OutDir)]), Applied::Deferred);
+    assert_eq!(
+        apply_leaf(Leaf::Copy, &[Abs::Param(0), Abs::Root(Root::OutDir)]),
+        Applied::Deferred
+    );
     assert_eq!(apply_leaf(Leaf::Copy, &[c("a"), Abs::Param(1)]), Applied::Deferred);
     // A refusal wins over a parameter that decides nothing it could save.
     refused(apply_leaf(Leaf::Copy, &[Abs::Param(0), c("/etc/x")]), "writes `/etc/x`");
@@ -148,7 +164,11 @@ fn leaves_are_monotone() {
                         );
                     }
                     if !less.iter().any(|it| matches!(it, Abs::Param(_) | Abs::Under(_))) {
-                        assert_ne!(less_known, Applied::Deferred, "{leaf:?} of {less:?} names no parameter");
+                        assert_ne!(
+                            less_known,
+                            Applied::Deferred,
+                            "{leaf:?} of {less:?} names no parameter"
+                        );
                     }
                 }
             }
@@ -196,7 +216,8 @@ fn a_path_under_a_parameter_defers_and_substitutes() {
     }
     assert_eq!(apply_leaf(Leaf::Copy, &[c("a"), Abs::Under(1)]), Applied::Deferred);
     refused(apply_leaf(Leaf::EnvVar, &[Abs::Under(0)]), "a variable named by a value not known");
-    let joined = apply_transfer(Transfer::Join { base: 0, rel: 1 }, &[Abs::Param(0), c("x.rs")]).ret;
+    let joined =
+        apply_transfer(Transfer::Join { base: 0, rel: 1 }, &[Abs::Param(0), c("x.rs")]).ret;
     assert_eq!(joined.substitute(&[env("OUT_DIR")]), Abs::Root(Root::OutDir));
     assert_eq!(joined.substitute(&[c("src")]), Abs::Root(Root::Package));
     assert_eq!(joined.substitute(&[c("/etc")]), Abs::Unknown);
@@ -262,10 +283,13 @@ fn applying_allocates_only_a_refusal() {
         for _ in 0..64 {
             all += matches!(apply_leaf(Leaf::EnvVar, &[name]), Applied::Done { .. }) as usize;
             all += matches!(apply_leaf(Leaf::WriteFile, &[out]), Applied::Done { .. }) as usize;
-            all += matches!(apply_leaf(Leaf::ReadFile, &[Abs::Param(0)]), Applied::Deferred) as usize;
+            all +=
+                matches!(apply_leaf(Leaf::ReadFile, &[Abs::Param(0)]), Applied::Deferred) as usize;
             all += (apply_transfer(Transfer::Join { base: 0, rel: 1 }, &[out, rel]).ret
                 == Abs::Root(Root::OutDir)) as usize;
-            all += apply_transfer(Transfer::Push { target: 0, rel: 1 }, &[out, rel]).update.is_some() as usize;
+            all += apply_transfer(Transfer::Push { target: 0, rel: 1 }, &[out, rel])
+                .update
+                .is_some() as usize;
         }
         assert_eq!(all, 64 * 5);
     });

@@ -13,7 +13,10 @@ fn forty_flushes_make_two_merges_and_leave_eight() {
     assert_eq!(merges[0].output, Name { build: 1, table: 0, first: 1, last: 16, level: 1 });
     assert_eq!(merges[1].inputs, (16..32).collect::<Vec<_>>());
     assert_eq!(merges[1].output, Name { build: 1, table: 0, first: 17, last: 32, level: 1 });
-    assert_eq!(merges[0].output.file_name(), format!("1-00000001-00000016-1.{}.parquet", schema::TABLES[0].name));
+    assert_eq!(
+        merges[0].output.file_name(),
+        format!("1-00000001-00000016-1.{}.parquet", schema::TABLES[0].name)
+    );
     assert_eq!(Name::parse(&merges[0].output.file_name()), Some(merges[0].output));
 }
 
@@ -23,7 +26,13 @@ fn a_builds_end_merges_each_of_its_tables_into_one_and_no_other_builds() {
     files.push(Name { build: 2, table: 0, first: 4, last: 19, level: 1 });
     files.extend(flushes(3, 20..=21));
     let merges = plan(&files, Some(2));
-    assert_eq!(merges, [Merge { inputs: vec![0, 1, 2, 3], output: Name { build: 2, table: 0, first: 1, last: 19, level: 2 } }]);
+    assert_eq!(
+        merges,
+        [Merge {
+            inputs: vec![0, 1, 2, 3],
+            output: Name { build: 2, table: 0, first: 1, last: 19, level: 2 }
+        }]
+    );
     let alone = [Name { build: 2, table: 0, first: 1, last: 1, level: 0 }];
     assert!(plan(&alone, Some(2)).is_empty(), "a single file is never merged");
 }

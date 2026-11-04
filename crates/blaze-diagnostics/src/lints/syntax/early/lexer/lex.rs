@@ -94,7 +94,8 @@ pub(super) fn nfc(ident: &str) -> Cow<'_, str> {
 /// Whether `text` holds a codepoint of [`TEXT_FLOW_CONTROL_CHARS`] (`contains_text_flow_control_chars`).
 pub(super) fn has_text_flow_control(text: &str) -> bool {
     // Each codepoint is three bytes starting with 0xE2 in UTF-8.
-    memchr::memchr(0xE2, text.as_bytes()).is_some() && text.chars().any(|c| TEXT_FLOW_CONTROL_CHARS.contains(&c))
+    memchr::memchr(0xE2, text.as_bytes()).is_some()
+        && text.chars().any(|c| TEXT_FLOW_CONTROL_CHARS.contains(&c))
 }
 
 /// A file's text as rustc's source map holds it, and how to find a position of it in the
@@ -192,7 +193,9 @@ impl<'a> Lexer<'a, '_> {
             self.pos += token.len;
             let next = match token.kind {
                 TokenKind::LineComment { doc_style: None } => self.comment(start),
-                TokenKind::LineComment { doc_style: Some(_) } => self.doc_comment(start, start + 3, self.pos),
+                TokenKind::LineComment { doc_style: Some(_) } => {
+                    self.doc_comment(start, start + 3, self.pos)
+                }
                 TokenKind::BlockComment { terminated: false, .. } => Next::Fatal,
                 TokenKind::BlockComment { doc_style: None, .. } => self.comment(start),
                 TokenKind::BlockComment { doc_style: Some(_), .. } => {
@@ -204,7 +207,9 @@ impl<'a> Lexer<'a, '_> {
                     self.unknown_prefix(start);
                     self.ident(start, false)
                 }
-                TokenKind::ForcedKeywordIdent if self.edition.at_least_2021() => self.ident(start + 2, false),
+                TokenKind::ForcedKeywordIdent if self.edition.at_least_2021() => {
+                    self.ident(start + 2, false)
+                }
                 TokenKind::ForcedKeywordIdent => {
                     // Split into the prefix `k`, an identifier, and `#` and the rest after it.
                     self.pos = start + 1;
@@ -213,21 +218,25 @@ impl<'a> Lexer<'a, '_> {
                     self.ident(start, false)
                 }
                 TokenKind::UnknownPrefixLifetime => self.unknown_prefix(start),
-                TokenKind::Literal { kind: kind @ (LiteralKind::CStr { .. } | LiteralKind::RawCStr { .. }), .. }
-                    if !self.edition.at_least_2021() =>
-                {
+                TokenKind::Literal {
+                    kind: kind @ (LiteralKind::CStr { .. } | LiteralKind::RawCStr { .. }),
+                    ..
+                } if !self.edition.at_least_2021() => {
                     // Split into the prefix, an identifier, and the string literal after it.
                     let prefix_len: u32 = match kind {
                         LiteralKind::CStr { .. } => 1,
                         _ => 2,
                     };
                     self.pos = start + prefix_len;
-                    self.cursor = Cursor::new(&str_before[prefix_len as usize..], FrontmatterAllowed::No);
+                    self.cursor =
+                        Cursor::new(&str_before[prefix_len as usize..], FrontmatterAllowed::No);
                     self.unknown_prefix(start);
                     self.ident(start, false)
                 }
                 TokenKind::GuardedStrPrefix => self.guarded_str(start, str_before),
-                TokenKind::Literal { kind, suffix_start } => self.literal(start, start + suffix_start, kind),
+                TokenKind::Literal { kind, suffix_start } => {
+                    self.literal(start, start + suffix_start, kind)
+                }
                 TokenKind::RawLifetime if !self.edition.at_least_2021() => {
                     // Lexed again as the lifetime `'r`, then `#` and the rest.
                     let range = self.range(start, start + 3);
@@ -293,7 +302,13 @@ impl<'a> Lexer<'a, '_> {
         if has_text_flow_control(content) {
             let chars = self.flow_chars(content, start);
             let range = self.range(start, self.pos);
-            self.out.lexed.push(Lexed::Literal { range, label: "doc comment", chars, inner: false, doc: true });
+            self.out.lexed.push(Lexed::Literal {
+                range,
+                label: "doc comment",
+                chars,
+                inner: false,
+                doc: true,
+            });
         }
         Next::Go
     }
@@ -352,11 +367,15 @@ impl<'a> Lexer<'a, '_> {
             LiteralKind::Str { .. } => (Mode::Str, 1, 1, true),
             LiteralKind::ByteStr { .. } => (Mode::ByteStr, 2, 1, false),
             LiteralKind::CStr { .. } => (Mode::CStr, 2, 1, true),
-            LiteralKind::RawStr { n_hashes: Some(n) } => (Mode::RawStr, 2 + u32::from(n), 1 + u32::from(n), true),
+            LiteralKind::RawStr { n_hashes: Some(n) } => {
+                (Mode::RawStr, 2 + u32::from(n), 1 + u32::from(n), true)
+            }
             LiteralKind::RawByteStr { n_hashes: Some(n) } => {
                 (Mode::RawByteStr, 3 + u32::from(n), 1 + u32::from(n), false)
             }
-            LiteralKind::RawCStr { n_hashes: Some(n) } => (Mode::RawCStr, 3 + u32::from(n), 1 + u32::from(n), true),
+            LiteralKind::RawCStr { n_hashes: Some(n) } => {
+                (Mode::RawCStr, 3 + u32::from(n), 1 + u32::from(n), true)
+            }
         };
         let content_start = start + prefix;
         let content = self.text(content_start, end - postfix);
@@ -397,7 +416,10 @@ mod tests {
     fn a_comment_with_a_codepoint_is_buffered_with_where_the_codepoint_is() {
         let text = "// a\u{202e}b\nfn f() {}";
         let lexed = lex(text, Edition::Edition2021);
-        assert_eq!(lexed.lexed, [Lexed::Comment { range: at(0, 8), chars: vec![('\u{202e}', at(4, 7))] }]);
+        assert_eq!(
+            lexed.lexed,
+            [Lexed::Comment { range: at(0, 8), chars: vec![('\u{202e}', at(4, 7))] }]
+        );
         assert_eq!(symbols(text, &lexed), ["fn", "f"]);
     }
 
@@ -410,13 +432,18 @@ mod tests {
     fn a_literal_points_at_its_codepoints_from_its_text() {
         let lexed = lex("r#\"\u{2066}\"#", Edition::Edition2021);
         let chars = vec![('\u{2066}', at(3, 6))];
-        assert_eq!(lexed.lexed, [Lexed::Literal { range: at(0, 8), label: "literal", chars, inner: true, doc: false }]);
+        assert_eq!(
+            lexed.lexed,
+            [Lexed::Literal { range: at(0, 8), label: "literal", chars, inner: true, doc: false }]
+        );
     }
 
     #[test]
     fn a_doc_comment_is_a_literal_that_does_not_point_at_its_codepoints() {
         let lexed = lex("/// \u{2068}x\nfn f() {}", Edition::Edition2024);
-        let [Lexed::Literal { range, label, inner, doc, .. }] = lexed.lexed.as_slice() else { panic!("{lexed:?}") };
+        let [Lexed::Literal { range, label, inner, doc, .. }] = lexed.lexed.as_slice() else {
+            panic!("{lexed:?}")
+        };
         assert_eq!((*range, *label, *inner, *doc), (at(0, 8), "doc comment", false, true));
     }
 
@@ -428,7 +455,10 @@ mod tests {
     #[test]
     fn unknown_prefixes_are_lints_before_2021_only() {
         let lexed = lex("m!(z\"hey\" hey#1);", Edition::Edition2018);
-        assert_eq!(lexed.lexed, [Lexed::UnknownPrefix { range: at(3, 4) }, Lexed::UnknownPrefix { range: at(10, 13) }]);
+        assert_eq!(
+            lexed.lexed,
+            [Lexed::UnknownPrefix { range: at(3, 4) }, Lexed::UnknownPrefix { range: at(10, 13) }]
+        );
         assert!(lex("m!(z\"hey\");", Edition::Edition2021).lexed.is_empty());
     }
 
@@ -441,7 +471,13 @@ mod tests {
             lexed.lexed,
             [
                 Lexed::UnknownPrefix { range: at(0, 1) },
-                Lexed::Literal { range: at(1, 6), label: "literal", chars, inner: true, doc: false },
+                Lexed::Literal {
+                    range: at(1, 6),
+                    label: "literal",
+                    chars,
+                    inner: true,
+                    doc: false
+                },
             ]
         );
         assert_eq!(symbols(text, &lexed), ["c"]);
@@ -494,7 +530,10 @@ mod tests {
     fn places_are_in_the_files_own_text() {
         let lexed = lex("\u{feff}fn f() {}\r\n// \u{202e}\r\n", Edition::Edition2021);
         assert_eq!(lexed.idents[0].range, at(3, 5));
-        assert_eq!(lexed.lexed, [Lexed::Comment { range: at(14, 20), chars: vec![('\u{202e}', at(17, 20))] }]);
+        assert_eq!(
+            lexed.lexed,
+            [Lexed::Comment { range: at(14, 20), chars: vec![('\u{202e}', at(17, 20))] }]
+        );
     }
 
     #[test]

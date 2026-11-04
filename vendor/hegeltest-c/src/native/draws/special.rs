@@ -51,10 +51,7 @@ fn days_in_month(year: i32, month: u8) -> i64 {
 }
 
 fn draw_i64(ntc: &mut NativeTestCase, min: i64, max: i64) -> Result<i64, EngineError> {
-    Ok(ntc
-        .draw_integer(BigInt::from(min), BigInt::from(max))?
-        .to_i64()
-        .unwrap())
+    Ok(ntc.draw_integer(BigInt::from(min), BigInt::from(max))?.to_i64().unwrap())
 }
 
 /// Inclusive year envelope accepted by the bounded date draws. Wide enough
@@ -86,11 +83,7 @@ pub(crate) fn civil_from_days(z: i64) -> Date {
     let mp = (5 * doy + 2) / 153;
     let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-    Date {
-        year: (y + i64::from(month <= 2)) as i32,
-        month,
-        day,
-    }
+    Date { year: (y + i64::from(month <= 2)) as i32, month, day }
 }
 
 fn validate_date(what: &str, d: &Date) -> Result<(), EngineError> {
@@ -147,12 +140,7 @@ fn draw_date_in(
     min_days: i64,
     max_days: i64,
 ) -> Result<Date, EngineError> {
-    let center = days_from_civil(&Date {
-        year: 2000,
-        month: 1,
-        day: 1,
-    })
-    .clamp(min_days, max_days);
+    let center = days_from_civil(&Date { year: 2000, month: 1, day: 1 }).clamp(min_days, max_days);
     let offset = draw_i64(ntc, min_days - center, max_days - center)?;
     Ok(civil_from_days(center + offset))
 }
@@ -219,11 +207,7 @@ pub fn generate_datetime(
         let date = draw_date_in(ntc, min_days, max_days)?;
         let day = days_from_civil(&date);
         let lo = if day == min_days { min_ns } else { 0 };
-        let hi = if day == max_days {
-            max_ns
-        } else {
-            LAST_NS_OF_DAY
-        };
+        let hi = if day == max_days { max_ns } else { LAST_NS_OF_DAY };
         let time = draw_time_in(ntc, lo, hi)?;
         Ok(DateTime { date, time })
     })
@@ -257,14 +241,8 @@ pub fn generate_uuid(
         }
     }
     spanned(ntc, LABEL_UUID, |ntc| {
-        let hi = ntc
-            .draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?
-            .to_u64()
-            .unwrap();
-        let lo = ntc
-            .draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?
-            .to_u64()
-            .unwrap();
+        let hi = ntc.draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?.to_u64().unwrap();
+        let lo = ntc.draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?.to_u64().unwrap();
         let mut n: u128 = (u128::from(hi) << 64) | u128::from(lo);
 
         if let Some(v) = version {
@@ -345,19 +323,11 @@ struct V6Network {
     size_minus_1: u128,
 }
 
-static SPECIAL_IPV4_NETWORKS: Lazy<Result<Vec<V4Network>, InternalError>> = Lazy::new(|| {
-    SPECIAL_IPV4_CIDRS
-        .iter()
-        .map(|s| parse_v4_cidr(s))
-        .collect()
-});
+static SPECIAL_IPV4_NETWORKS: Lazy<Result<Vec<V4Network>, InternalError>> =
+    Lazy::new(|| SPECIAL_IPV4_CIDRS.iter().map(|s| parse_v4_cidr(s)).collect());
 
-static SPECIAL_IPV6_NETWORKS: Lazy<Result<Vec<V6Network>, InternalError>> = Lazy::new(|| {
-    SPECIAL_IPV6_CIDRS
-        .iter()
-        .map(|s| parse_v6_cidr(s))
-        .collect()
-});
+static SPECIAL_IPV6_NETWORKS: Lazy<Result<Vec<V6Network>, InternalError>> =
+    Lazy::new(|| SPECIAL_IPV6_CIDRS.iter().map(|s| parse_v6_cidr(s)).collect());
 
 fn parse_v4_cidr(s: &str) -> Result<V4Network, InternalError> {
     let (addr, prefix) = s.split_once('/').unwrap();
@@ -423,14 +393,8 @@ fn draw_ipv4(ntc: &mut NativeTestCase) -> Result<Ipv4Addr, EngineError> {
 
 fn draw_ipv6(ntc: &mut NativeTestCase) -> Result<Ipv6Addr, EngineError> {
     let addr_int: u128 = if draw_i64(ntc, 0, 1)? == 0 {
-        let hi = ntc
-            .draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?
-            .to_u64()
-            .unwrap();
-        let lo = ntc
-            .draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?
-            .to_u64()
-            .unwrap();
+        let hi = ntc.draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?.to_u64().unwrap();
+        let lo = ntc.draw_integer(BigInt::from(0u64), BigInt::from(u64::MAX))?.to_u64().unwrap();
         (u128::from(hi) << 64) | u128::from(lo)
     } else {
         let nets = SPECIAL_IPV6_NETWORKS.as_ref().map_err(Clone::clone)?;

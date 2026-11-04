@@ -32,7 +32,9 @@ impl Random {
     fn text(&mut self) -> String {
         let len = self.below(12);
         (0..len)
-            .map(|_| ['a', 'Z', '0', ' ', '\u{e9}', '\u{6c34}', '\u{1f525}'][self.below(7) as usize])
+            .map(|_| {
+                ['a', 'Z', '0', ' ', '\u{e9}', '\u{6c34}', '\u{1f525}'][self.below(7) as usize]
+            })
             .collect()
     }
 
@@ -57,14 +59,26 @@ enum Shape {
     Text(String),
     Bytes(Vec<u8>),
     /// Its length said up front, or not.
-    Seq { said: bool, items: Vec<Shape> },
+    Seq {
+        said: bool,
+        items: Vec<Shape>,
+    },
     Tuple(Vec<Shape>),
     /// The length it says, which may not be its own; its entries in this order.
-    Map { said: Option<usize>, entries: Vec<(Shape, Shape)> },
+    Map {
+        said: Option<usize>,
+        entries: Vec<(Shape, Shape)>,
+    },
     Struct(Vec<(usize, Shape)>),
     /// A unit variant, or a newtype one.
-    Variant { name: usize, of: Option<Box<Shape>> },
-    StructVariant { name: usize, fields: Vec<(usize, Shape)> },
+    Variant {
+        name: usize,
+        of: Option<Box<Shape>>,
+    },
+    StructVariant {
+        name: usize,
+        fields: Vec<(usize, Shape)>,
+    },
 }
 
 impl Serialize for Shape {
@@ -436,13 +450,9 @@ fn what_has_no_encoding_is_refused_as_it_was() {
         }
     }
     let twice_in_a_row = Shape::Struct(vec![(1, Shape::Null), (1, Shape::Null)]);
-    let twice_apart =
-        Shape::Struct(vec![(0, Shape::Null), (1, Shape::Null), (0, Shape::Null)]);
-    let twice_then_wide = Shape::Struct(vec![
-        (1, Shape::Null),
-        (1, Shape::Null),
-        (2, Shape::Wide(i128::MAX)),
-    ]);
+    let twice_apart = Shape::Struct(vec![(0, Shape::Null), (1, Shape::Null), (0, Shape::Null)]);
+    let twice_then_wide =
+        Shape::Struct(vec![(1, Shape::Null), (1, Shape::Null), (2, Shape::Wide(i128::MAX))]);
     assert_eq!(to_vec(&Short), reference::to_vec(&Short));
     assert!(to_vec(&Short).is_err());
     for shape in [twice_in_a_row, twice_apart, twice_then_wide] {
@@ -618,7 +628,11 @@ fn a_list_keeps_the_depth_limit() {
         let owned = from_slice::<Vec<IgnoredAny>>(&bytes).map(drop);
         let lent = from_slice::<List<'_, IgnoredAny>>(&bytes).map(drop);
         assert_eq!(owned, lent, "{depth}");
-        assert_eq!(reference::from_slice::<List<'_, IgnoredAny>>(&bytes).map(drop), lent, "{depth}");
+        assert_eq!(
+            reference::from_slice::<List<'_, IgnoredAny>>(&bytes).map(drop),
+            lent,
+            "{depth}"
+        );
         let mut field = vec![0xa1, 0x66];
         field.extend_from_slice(b"_items");
         field.extend_from_slice(&bytes);
@@ -647,7 +661,8 @@ fn an_offence_is_named_where_the_checker_names_it() {
 /// back is from the one item that encodes it.
 #[test]
 fn a_field_is_named_only_as_text() {
-    let refused = Err(Error::NotDeterministic { at: 1, what: "a field or variant not named as text" });
+    let refused =
+        Err(Error::NotDeterministic { at: 1, what: "a field or variant not named as text" });
     for bytes in [&[0xa1, 0x00, 0x07][..], &[0xa1, 0x42, b'i', b'd', 0x07]] {
         assert_eq!(from_slice::<Typed>(bytes), refused, "{bytes:02x?}");
         assert_eq!(reference::from_slice::<Typed>(bytes), refused, "{bytes:02x?}");

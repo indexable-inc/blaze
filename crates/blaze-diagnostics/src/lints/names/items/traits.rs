@@ -22,8 +22,15 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-pub(super) fn async_fn<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effective, krate: &Krate) -> Option<Found> {
-    let (ast::Item::Fn(f), Container::Trait(_)) = (item.node.value, item.container) else { return None };
+pub(super) fn async_fn<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
+    effective: &Effective,
+    krate: &Krate,
+) -> Option<Found> {
+    let (ast::Item::Fn(f), Container::Trait(_)) = (item.node.value, item.container) else {
+        return None;
+    };
     let async_token = f.async_token()?;
     if krate.return_type_notation {
         return None;
@@ -50,19 +57,26 @@ pub(super) fn async_fn<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effe
             let end = f.param_list().map_or(async_range.end(), |it| it.syntax().text_range().end());
             sugg.push(removed);
             // alloc: a suggestion of a lint that fires
-            sugg.push((span(TextRange::empty(end)), " -> impl std::future::Future<Output = ()> + Send".to_owned()));
+            sugg.push((
+                span(TextRange::empty(end)),
+                " -> impl std::future::Future<Output = ()> + Send".to_owned(),
+            ));
         }
         Some(ty) => {
             let range = ty.syntax().text_range();
             // alloc: a suggestion of a lint that fires
-            sugg.push((span(TextRange::empty(range.start())), "impl std::future::Future<Output = ".to_owned()));
+            sugg.push((
+                span(TextRange::empty(range.start())),
+                "impl std::future::Future<Output = ".to_owned(),
+            ));
             sugg.push((span(TextRange::empty(range.end())), "> + Send".to_owned())); // alloc: a suggestion of a lint that fires
             sugg.push(removed);
         }
     }
     if let Some(body) = f.body() {
         let range = body.syntax().text_range();
-        let inner = TextRange::new(range.start() + TextSize::from(1), range.end() - TextSize::from(1));
+        let inner =
+            TextRange::new(range.start() + TextSize::from(1), range.end() - TextSize::from(1));
         if inner.is_empty() {
             sugg.push((span(inner), " async {} ".to_owned())); // alloc: a suggestion of a lint that fires
         } else {

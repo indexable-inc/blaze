@@ -20,7 +20,6 @@ use std::{
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::bits::AtomicBits;
 use blaze_mem::Tag;
 use hir_def::{
@@ -30,6 +29,7 @@ use hir_def::{
         assoc::{ImplItems, TraitItems},
     },
 };
+use std::alloc::Global;
 
 use super::file_modules;
 use crate::{
@@ -68,7 +68,8 @@ impl Defer<'_> {
     pub(crate) fn take(&mut self, def: DefWithBodyId, at: usize) -> bool {
         match self.expected.get(self.marks.len()) {
             Some(next) if next.def == def => {
-                self.marks.push(u32::try_from(at).expect("a module of fewer than 2^32 diagnostics"));
+                self.marks
+                    .push(u32::try_from(at).expect("a module of fewer than 2^32 diagnostics"));
                 true
             }
             _ => false,
@@ -115,11 +116,16 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         let mut crate_ends = Vec::with_capacity(crates.len());
         for &krate in crates {
             modules.extend(file_modules(db, krate));
-            crate_ends.push(u32::try_from(modules.len()).expect("a check of fewer than 2^31 modules"));
+            crate_ends
+                .push(u32::try_from(modules.len()).expect("a check of fewer than 2^31 modules"));
         }
         assert!(modules.len() < MODULE as usize, "a check of fewer than 2^31 modules");
-        #[expect(clippy::disallowed_types, reason = "body lists, set once per module of the check plan: not global")]
-        let lists: Vec<std::sync::OnceLock<Vec<Planned>>> = modules.iter().map(|_| std::sync::OnceLock::new()).collect();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "body lists, set once per module of the check plan: not global"
+        )]
+        let lists: Vec<std::sync::OnceLock<Vec<Planned>>> =
+            modules.iter().map(|_| std::sync::OnceLock::new()).collect();
         db.run_all(Tag::Infer, modules.len(), |db, at| {
             let mut out = Vec::new();
             list_module(db, modules[at].id, asked, &mut out);
@@ -129,7 +135,9 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         let mut bodies = Vec::new();
         let mut tasks = Vec::with_capacity(modules.len());
         for (at, list) in lists.into_iter().enumerate() {
-            let list = list.into_inner().expect("`run_all` returned before a module of the check was listed");
+            let list = list
+                .into_inner()
+                .expect("`run_all` returned before a module of the check was listed");
             let first = u32::try_from(bodies.len()).expect("a check of fewer than 2^31 bodies");
             starts.push(first);
             tasks.push(MODULE | at as u32);
@@ -188,9 +196,16 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// usable (blaze-cargo's open failure under `--keep-going`).
     pub fn run_marked<'db>(&self, db: &'db Db, style_lints: bool) -> Vec<CrateFound<'db>> {
         assert!(!self.started.swap(true, Ordering::Relaxed), "a plan of a check runs once");
-        #[expect(clippy::disallowed_types, reason = "diagnostics and marks, set once per module of the check: not global")]
-        let modules: Vec<std::sync::OnceLock<Checked<'db>>> = self.modules.iter().map(|_| std::sync::OnceLock::new()).collect();
-        #[expect(clippy::disallowed_types, reason = "diagnostics, set once per body of the check: not global")]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "diagnostics and marks, set once per module of the check: not global"
+        )]
+        let modules: Vec<std::sync::OnceLock<Checked<'db>>> =
+            self.modules.iter().map(|_| std::sync::OnceLock::new()).collect();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "diagnostics, set once per body of the check: not global"
+        )]
         let bodies: Vec<std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>> =
             self.bodies.iter().map(|_| std::sync::OnceLock::new()).collect();
         let slots = Slots { modules: &modules, bodies: &bodies };
@@ -234,14 +249,31 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     }
 
     /// Checks body `body`, claimed, as task `task`.
-    fn body<'db>(&self, db: &'db Db, task: usize, body: u32, style_lints: bool, slots: Slots<'_, 'db>) {
+    fn body<'db>(
+        &self,
+        db: &'db Db,
+        task: usize,
+        body: u32,
+        style_lints: bool,
+        slots: Slots<'_, 'db>,
+    ) {
         self.queue.running[task].store(body, Ordering::Relaxed);
         let planned = self.bodies[body as usize];
         #[cfg(test)]
         self.ran.lock().push(Ran::Body(planned.def));
         let mut found = Vec::new();
-        DiagnosticsCollector::collect_body(db, planned.def, planned.owner, &mut found, style_lints, self.asked);
-        assert!(slots.bodies[body as usize].set(found).is_ok(), "a body of a check was checked twice");
+        DiagnosticsCollector::collect_body(
+            db,
+            planned.def,
+            planned.owner,
+            &mut found,
+            style_lints,
+            self.asked,
+        );
+        assert!(
+            slots.bodies[body as usize].set(found).is_ok(),
+            "a body of a check was checked twice"
+        );
         self.queue.running[task].store(NONE, Ordering::Relaxed);
     }
 
@@ -254,7 +286,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         let mut found = Vec::new();
         let mut marks = Vec::with_capacity(expected.len());
         let defer = Defer { expected, marks: &mut marks };
-        DiagnosticsCollector::collect_deferred(db, self.modules[at].id, &mut found, style_lints, self.asked, defer);
+        DiagnosticsCollector::collect_deferred(
+            db,
+            self.modules[at].id,
+            &mut found,
+            style_lints,
+            self.asked,
+            defer,
+        );
         if let Some(missed) = expected.get(marks.len()) {
             panic!(
                 "the check of module {:?} did not meet body {:?} where the plan lists it: the \
@@ -262,11 +301,17 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                 self.modules[at].id, missed.def
             );
         }
-        assert!(slots.modules[at].set((found, marks)).is_ok(), "a module of a check was checked twice");
+        assert!(
+            slots.modules[at].set((found, marks)).is_ok(),
+            "a module of a check was checked twice"
+        );
     }
 
     /// Each crate's diagnostics: each module's, with each of its bodies' at its mark.
-    #[expect(clippy::disallowed_types, reason = "diagnostic slots, set once per module or body of the check: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "diagnostic slots, set once per module or body of the check: not global"
+    )]
     fn assemble<'db>(
         &self,
         modules: Vec<std::sync::OnceLock<Checked<'db>>>,
@@ -280,7 +325,8 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             // alloc: once a crate checked, a flag per diagnostic; none for a clean crate
             let mut in_body = Vec::new();
             for (at, slot) in modules.by_ref().take((end - from) as usize) {
-                let (own, marks) = slot.into_inner().expect("`run_all` returned before a task of the check ran");
+                let (own, marks) =
+                    slot.into_inner().expect("`run_all` returned before a task of the check ran");
                 let first = self.starts[at] as usize;
                 let mut own = own.into_iter();
                 let mut done = 0;
@@ -288,7 +334,10 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                     found.extend(own.by_ref().take(mark as usize - done));
                     done = mark as usize;
                     let body = bodies[first + nth].take().unwrap_or_else(|| {
-                        panic!("body {:?} of the check was never checked", self.bodies[first + nth].def)
+                        panic!(
+                            "body {:?} of the check was never checked",
+                            self.bodies[first + nth].def
+                        )
                     });
                     in_body.resize(found.len(), false);
                     found.extend(body);
@@ -329,16 +378,27 @@ type Checked<'db> = (Vec<AnyDiagnostic<'db>>, Vec<u32>);
 /// The slots a run's tasks write, each once.
 #[derive(Clone, Copy)]
 struct Slots<'a, 'db> {
-    #[expect(clippy::disallowed_types, reason = "diagnostics and marks, set once per module of the check: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "diagnostics and marks, set once per module of the check: not global"
+    )]
     modules: &'a [std::sync::OnceLock<Checked<'db>>],
-    #[expect(clippy::disallowed_types, reason = "diagnostics, set once per body of the check: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "diagnostics, set once per body of the check: not global"
+    )]
     bodies: &'a [std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>],
 }
 
 /// Appends to `out` the bodies the collector meets at `module`'s level, in its order
 /// (`DiagnosticsCollector::collect_module`): its declarations and unnamed constants, inline
 /// modules within, then its impls' items.
-fn list_module(db: &Db, module: ModuleId, asked: &(impl Fn(DefWithBody) -> bool + ?Sized), out: &mut Vec<Planned>) {
+fn list_module(
+    db: &Db,
+    module: ModuleId,
+    asked: &(impl Fn(DefWithBody) -> bool + ?Sized),
+    out: &mut Vec<Planned>,
+) {
     let def_map = module.def_map(db);
     let scope = def_map.module(db, module).scope(db);
     for def in scope.declarations().chain(scope.unnamed_consts().map(ModuleDefId::ConstId)) {
@@ -458,7 +518,12 @@ impl Queue {
             if at == NONE {
                 return None;
             }
-            if self.head.0.compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if self
+                .head
+                .0
+                .compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 return Some(at);
             }
         }

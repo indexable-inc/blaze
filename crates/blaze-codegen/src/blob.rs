@@ -14,10 +14,11 @@ use blaze_mem::{Frame, Tag, frame};
 use crate::{
     Covered, Line, ProfileRecord, Profiled, Reloc, Relocs,
     content::{arch_of, arch_tag},
-    relocs::RelocsView,
     fold::{Constant, Masked},
+    relocs::RelocsView,
     template::{
-        DataView, Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateUnwind, TemplateView, UnwindView,
+        DataView, Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateUnwind,
+        TemplateView, UnwindView,
     },
     wasm,
 };
@@ -119,7 +120,15 @@ fn put_index(out: &mut Vec<u8>, it: Option<u32>) {
 fn put_unwind(out: &mut Vec<u8>, unwind: Option<&TemplateUnwind>) {
     match unwind {
         None => out.put_u8(0),
-        Some(TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
+        Some(TemplateUnwind::Dwarf {
+            code_align,
+            data_align,
+            return_address,
+            cie,
+            fde,
+            personality,
+            lsda,
+        }) => {
             out.put_u8(1);
             out.put_u32(*code_align);
             out.put_i32(*data_align);
@@ -215,7 +224,8 @@ impl<'a> In<'a> {
     fn string(&mut self) -> Result<String, BlobError> {
         let at = self.0.at();
         // alloc: the template owns its names, moved out of the bytes read for them
-        String::from_utf8(self.bytes()?).map_err(|_| BlobError { at, what: "a name that is not UTF-8" })
+        String::from_utf8(self.bytes()?)
+            .map_err(|_| BlobError { at, what: "a name that is not UTF-8" })
     }
 
     /// A `u32` length, then that many wasm value types, a byte each.
@@ -224,7 +234,10 @@ impl<'a> In<'a> {
         let bytes = self.slice()?;
         bytes
             .iter()
-            .map(|&it| wasm::ValType::from_byte(it).ok_or(BlobError { at, what: "no such wasm value type" }))
+            .map(|&it| {
+                wasm::ValType::from_byte(it)
+                    .ok_or(BlobError { at, what: "no such wasm value type" })
+            })
             // alloc: the template owns its types
             .collect()
     }
@@ -357,7 +370,11 @@ impl<'a> In<'a> {
                 personality: self.index()?,
                 lsda: self.index()?,
             }),
-            2 => Some(UnwindView::Windows { info: self.slice()?, handler: self.index()?, lsda: self.index()? }),
+            2 => Some(UnwindView::Windows {
+                info: self.slice()?,
+                handler: self.index()?,
+                lsda: self.index()?,
+            }),
             _ => return self.fail("no such unwind information"),
         })
     }
@@ -401,8 +418,13 @@ impl<'a> In<'a> {
                 version: self.0.u64()?,
             })),
             2 => match self.0.u8()? {
-                read @ 0..=2 => Some(Profiled::Used { mismatched: read & 1 != 0, applied: read & 2 != 0 }),
-                _ => return self.fail("a profile used both mismatched and applied, or of unknown bits"),
+                read @ 0..=2 => {
+                    Some(Profiled::Used { mismatched: read & 1 != 0, applied: read & 2 != 0 })
+                }
+                _ => {
+                    return self
+                        .fail("a profile used both mismatched and applied, or of unknown bits");
+                }
             },
             _ => return self.fail("no such profile"),
         })
@@ -462,7 +484,11 @@ fn encoded_len(template: &Template) -> usize {
             Ref::Place(_) | Ref::Data(_) | Ref::Extern(_) | Ref::Coverage(_) => 1 + 4,
             Ref::Counter | Ref::ProfileCounters | Ref::Own => 1,
         });
-        4 + RELOC_BYTES * relocs.len() + 4 + targets.sum::<usize>() + 4 + WIDE_BYTES * relocs.wide().len()
+        4 + RELOC_BYTES * relocs.len()
+            + 4
+            + targets.sum::<usize>()
+            + 4
+            + WIDE_BYTES * relocs.wide().len()
     };
     let index = |it: &Option<u32>| if it.is_some() { 1 + 4 } else { 1 };
     let unwind = match &template.unwind {
@@ -470,9 +496,15 @@ fn encoded_len(template: &Template) -> usize {
         Some(TemplateUnwind::Dwarf { cie, fde, personality, lsda, .. }) => {
             1 + 4 + 4 + 2 + bytes(cie) + bytes(fde) + index(personality) + index(lsda)
         }
-        Some(TemplateUnwind::Windows { info, handler, lsda }) => 1 + bytes(info) + index(handler) + index(lsda),
+        Some(TemplateUnwind::Windows { info, handler, lsda }) => {
+            1 + bytes(info) + index(handler) + index(lsda)
+        }
     };
-    let data = 4 + template.data.iter().map(|it| 4 + bytes(&it.bytes) + relocs(&it.relocs) + 1).sum::<usize>();
+    let data = 4 + template
+        .data
+        .iter()
+        .map(|it| 4 + bytes(&it.bytes) + relocs(&it.relocs) + 1)
+        .sum::<usize>();
     let externs = 4 + template.externs.iter().map(|it| bytes(it.as_bytes())).sum::<usize>();
     let coverage = match &template.coverage {
         None => 1,
@@ -632,7 +664,8 @@ pub fn decode_static(bytes: &[u8]) -> Result<StaticTemplate, BlobError> {
         let field = input.string()?;
         let params = input.values()?;
         let results = input.values()?;
-        imports.push((name, wasm::Import { module, field, ty: wasm::Signature { params, results } }));
+        imports
+            .push((name, wasm::Import { module, field, ty: wasm::Signature { params, results } }));
     }
     let refs = input.0.u32()?;
     input.end()?;
@@ -787,7 +820,8 @@ mod tests {
     #[test]
     fn windows_unwinding_and_none_read_back() {
         let mut it = template();
-        it.unwind = Some(TemplateUnwind::Windows { info: vec![1, 2], handler: None, lsda: Some(0) });
+        it.unwind =
+            Some(TemplateUnwind::Windows { info: vec![1, 2], handler: None, lsda: Some(0) });
         assert_eq!(decode(&encode(&it)).unwrap(), it);
         it.unwind = None;
         it.lines.clear();
@@ -808,7 +842,12 @@ mod tests {
             align: 16,
             init: TemplateInit::Bytes { bytes: vec![0; 24], relocs: vec![reloc].into() },
             data: vec![
-                TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new(), writable: false },
+                TemplateData {
+                    align: 1,
+                    bytes: b"hi".to_vec(),
+                    relocs: Relocs::new(),
+                    writable: false,
+                },
                 TemplateData { align: 4, bytes: vec![7; 4], relocs: Relocs::new(), writable: true },
             ],
             mutable: true,
@@ -833,7 +872,11 @@ mod tests {
         for len in 0..bytes.len() {
             assert!(decode_static(&bytes[..len]).is_err(), "{len} bytes read as a static");
         }
-        let zeroed = StaticTemplate { init: TemplateInit::Zeroed { size: 1 << 30 }, section: None, ..template };
+        let zeroed = StaticTemplate {
+            init: TemplateInit::Zeroed { size: 1 << 30 },
+            section: None,
+            ..template
+        };
         assert_eq!(decode_static(&encode_static(&zeroed)).unwrap(), zeroed);
     }
 
@@ -863,7 +906,8 @@ mod tests {
         let at = TEMPLATE_MAGIC.len() + 1;
         let want = BlobError { at, what: "ends early" };
         assert_eq!(decode(&bytes[..at + 2]).unwrap_err(), want);
-        let viewed = frame::task(Tag::Codegen, |frame| decode_view(&bytes[..at + 2], frame).map(|_| ()));
+        let viewed =
+            frame::task(Tag::Codegen, |frame| decode_view(&bytes[..at + 2], frame).map(|_| ()));
         assert_eq!(viewed.unwrap_err(), want);
     }
 
@@ -876,21 +920,29 @@ mod tests {
         let bytes = encode(&template);
         let read = || {
             frame::task(Tag::Codegen, |frame| {
-                decode_view(&bytes, frame)
-                    .map(|view| (view.code.len(), view.relocs.len(), view.data.len(), view.externs.len()))
+                decode_view(&bytes, frame).map(|view| {
+                    (view.code.len(), view.relocs.len(), view.data.len(), view.externs.len())
+                })
             })
         };
         let cold = read().expect("a view");
         let coverage = u64::from(template.coverage.as_ref().is_some_and(|it| !it.pcs.is_empty()));
-        let warm = blaze_alloc_count::assert_at_most(coverage, "a warm read of a stored template", read).expect("a view");
+        let warm =
+            blaze_alloc_count::assert_at_most(coverage, "a warm read of a stored template", read)
+                .expect("a view");
         assert_eq!(cold, warm);
         assert_eq!(decode(&bytes).expect("decoded"), template);
         let mut none = template;
         none.coverage = None;
         let bytes = encode(&none);
-        let read = || frame::task(Tag::Codegen, |frame| decode_view(&bytes, frame).map(|view| view.code.len()));
+        let read = || {
+            frame::task(Tag::Codegen, |frame| {
+                decode_view(&bytes, frame).map(|view| view.code.len())
+            })
+        };
         read().expect("a view");
-        blaze_alloc_count::assert_at_most(0, "a warm read of a template with no coverage", read).expect("a view");
+        blaze_alloc_count::assert_at_most(0, "a warm read of a template with no coverage", read)
+            .expect("a view");
     }
 
     /// `encode` sizes its bytes exactly: one allocation, of `encoded_len`, whatever unwind
@@ -907,7 +959,12 @@ mod tests {
         for unwind in [template().unwind, Some(windows), None] {
             for coverage in [template().coverage, None] {
                 for profile in profiles {
-                    let template = Template { unwind: unwind.clone(), coverage: coverage.clone(), profile, ..template() };
+                    let template = Template {
+                        unwind: unwind.clone(),
+                        coverage: coverage.clone(),
+                        profile,
+                        ..template()
+                    };
                     let (bytes, used) = blaze_alloc_count::measure(|| encode(&template));
                     assert_eq!(bytes.len(), encoded_len(&template));
                     assert_eq!(used.allocations, 1);

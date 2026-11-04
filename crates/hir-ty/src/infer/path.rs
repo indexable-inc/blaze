@@ -10,13 +10,13 @@ use hir_def::{
     signatures::{EnumVariants, StructSignature},
 };
 use hir_expand::name::Name;
-use span::SyntaxContext;
 use rustc_type_ir::inherent::{SliceLike, Ty as _};
+use span::SyntaxContext;
 
 use crate::{
-    db::HirDatabase,
     ExplicitDropMethodUseKind, InferenceDiagnostic, Span, StructPathDef, StructPathFound,
     ValueTyDefId,
+    db::HirDatabase,
     infer::{
         InferenceTyLoweringVarsCtx, diagnostics::InferenceTyLoweringContext as TyLoweringContext,
     },
@@ -143,8 +143,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             return Some(ValuePathResolution::NonGeneric(ty));
         };
 
-        let substs = if self_subst.is_some()
-            && matches!(value_def, ValueTyDefId::EnumVariantId(_))
+        let substs = if self_subst.is_some() && matches!(value_def, ValueTyDefId::EnumVariantId(_))
         {
             // This is something like `TypeAlias::<Args>::EnumVariant`. Do not call `substs_from_path()`,
             // as it'll try to re-lower the previous segment assuming it refers to the enum, but it refers
@@ -402,7 +401,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         let ty = self.table.resolve_projections_within(ty);
 
-        if let Some(result) = self.resolve_enum_variant_on_ty(ty, name, hygiene.syntax_context(), id) {
+        if let Some(result) =
+            self.resolve_enum_variant_on_ty(ty, name, hygiene.syntax_context(), id)
+        {
             return Some(result);
         }
 

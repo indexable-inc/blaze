@@ -17,7 +17,6 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use cfg::CfgAtom;
 use either::Either;
@@ -31,6 +30,7 @@ use hir_expand::{
 use intern::sym;
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, SyntaxContext};
+use std::alloc::Global;
 use syntax::ast;
 use triomphe::Arc;
 
@@ -242,13 +242,20 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     let db = cx.db;
     let krate = cx.krate;
     let module = directive.module;
-    let push_resolved = |resolved: &mut FrameVec<'f, ResolvedCall>, directive: &MacroOp, call_id| {
-        let attr_macro_item = match &directive.kind {
-            MacroOpKind::Attr { ast_id, .. } => Some(ast_id.ast_id),
-            MacroOpKind::FnLike { .. } | MacroOpKind::Derive { .. } => None,
+    let push_resolved =
+        |resolved: &mut FrameVec<'f, ResolvedCall>, directive: &MacroOp, call_id| {
+            let attr_macro_item = match &directive.kind {
+                MacroOpKind::Attr { ast_id, .. } => Some(ast_id.ast_id),
+                MacroOpKind::FnLike { .. } | MacroOpKind::Derive { .. } => None,
+            };
+            resolved.push((
+                directive.module,
+                directive.depth,
+                directive.container,
+                call_id,
+                attr_macro_item,
+            ));
         };
-        resolved.push((directive.module, directive.depth, directive.container, call_id, attr_macro_item));
-    };
 
     match &directive.kind {
         MacroOpKind::FnLike { ast_id, expand_to, ctxt: call_site } => {
@@ -304,13 +311,25 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                     call: Some(call_id),
                 });
                 for (path, def) in named.into_inner() {
-                    sink.apply(DeclOp::ResolvedMacroPath { module, path, bang: true, def, call: None });
+                    sink.apply(DeclOp::ResolvedMacroPath {
+                        module,
+                        path,
+                        bang: true,
+                        def,
+                        call: None,
+                    });
                 }
                 push_resolved(round.resolved, directive, call_id);
                 return Resolved::Yes;
             }
         }
-        MacroOpKind::Derive { ast_id, derive_attr, derive_pos, ctxt: call_site, derive_macro_id } => {
+        MacroOpKind::Derive {
+            ast_id,
+            derive_attr,
+            derive_pos,
+            ctxt: call_site,
+            derive_macro_id,
+        } => {
             let view: &S = sink;
             let id = derive_macro_as_call_id(
                 db,
@@ -342,10 +361,12 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 });
                 // Record its helper attributes.
                 if def_id.krate != krate
-                    && let Some(helpers) = crate_def_map(db, def_id.krate).data.exported_derives.get(&macro_id)
+                    && let Some(helpers) =
+                        crate_def_map(db, def_id.krate).data.exported_derives.get(&macro_id)
                 {
-                    side.derive_helpers_of(ast_id.ast_id.map(|it| it.upcast()))
-                        .extend(helpers.iter().map(|&name| (name, macro_id, Either::Left(call_id))));
+                    side.derive_helpers_of(ast_id.ast_id.map(|it| it.upcast())).extend(
+                        helpers.iter().map(|&name| (name, macro_id, Either::Left(call_id))),
+                    );
                 }
 
                 push_resolved(round.resolved, directive, call_id);
@@ -355,10 +376,13 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
         MacroOpKind::Attr { ast_id: file_ast_id, mod_item, attr_id, attr, tree, .. } => {
             let &AstIdWithPath { ast_id, ref path } = file_ast_id;
             let file_id = ast_id.file_id;
-            let recollect_without = |sink: &mut S, side: &mut SideTables<A>, added: &mut FrameVec<'f, MacroOp>| {
-                recollect(cx, sink, side, added, directive, file_id, *mod_item, *attr_id, *tree);
-                Resolved::Yes
-            };
+            let recollect_without =
+                |sink: &mut S, side: &mut SideTables<A>, added: &mut FrameVec<'f, MacroOp>| {
+                    recollect(
+                        cx, sink, side, added, directive, file_id, *mod_item, *attr_id, *tree,
+                    );
+                    Resolved::Yes
+                };
 
             if let Some(ident) = path.as_ident()
                 && let Some(helpers) = side.derive_helpers.get(&ast_id)
@@ -379,16 +403,21 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
             // rustc's `DeriveHelpersCompat`: a helper of a derive the item's later `#[derive]`s
             // name, which rustc accepts with the `legacy_derive_helpers` lint.
             if let Some(ident) = path.as_ident()
-                && let Some(AttrsOrCfgRef::Enabled { attrs }) = tree.item_tree(db, krate).attrs(*mod_item)
+                && let Some(AttrsOrCfgRef::Enabled { attrs }) =
+                    tree.item_tree(db, krate).attrs(*mod_item)
             {
                 let view: &S = sink;
                 let helper_of = |derive_path: &ModPath, ctxt: SyntaxContext| {
-                    let (macro_id, def) = resolve_macro(view, module, derive_path, MacroSubNs::Attr, ctxt)?;
+                    let (macro_id, def) =
+                        resolve_macro(view, module, derive_path, MacroSubNs::Attr, ctxt)?;
                     if def.krate == krate {
                         return None;
                     }
                     let exported = &crate_def_map(db, def.krate).data.exported_derives;
-                    exported.get(&macro_id).is_some_and(|helpers| helpers.contains(ident)).then_some(macro_id)
+                    exported
+                        .get(&macro_id)
+                        .is_some_and(|helpers| helpers.contains(ident))
+                        .then_some(macro_id)
                 };
                 let derive = attrs
                     .iter_after(Some(*attr_id))
@@ -454,7 +483,8 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
 
                 match attr.parse_path_comma_token_tree(db) {
                     Some(derive_macros) => {
-                        let call_id = attr_call(cx, side, file_ast_id, attr, *attr_id, def, directive.depth);
+                        let call_id =
+                            attr_call(cx, side, file_ast_id, attr, *attr_id, def, directive.depth);
                         sink.apply(DeclOp::ResolvedMacroPath {
                             module,
                             // clone: the attribute's path, kept for `NameRecords`.
@@ -481,7 +511,15 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                                 idx as u32,
                                 call_site.ctx,
                                 krate,
-                                |path| resolve_macro(view, module, path, MacroSubNs::Attr, call_site.ctx),
+                                |path| {
+                                    resolve_macro(
+                                        view,
+                                        module,
+                                        path,
+                                        MacroSubNs::Attr,
+                                        call_site.ctx,
+                                    )
+                                },
                                 call_id,
                                 directive.depth,
                             );
@@ -519,21 +557,27 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                                         .exported_derives
                                         .get(&macro_id)
                                 {
-                                    let derive_helpers =
-                                        side.derive_helpers_of(ast_id_without_path.map(|it| it.upcast()));
+                                    let derive_helpers = side.derive_helpers_of(
+                                        ast_id_without_path.map(|it| it.upcast()),
+                                    );
                                     helpers_start = derive_helpers.len();
                                     derive_helpers.extend(
-                                        helpers.iter().map(|&name| (name, macro_id, Either::Left(call_id))),
+                                        helpers
+                                            .iter()
+                                            .map(|&name| (name, macro_id, Either::Left(call_id))),
                                     );
                                     helpers_end = derive_helpers.len();
                                 }
 
                                 if cx.builtin_derive_fast_path
-                                    && let MacroDefKind::BuiltInDerive(_, builtin_derive) = def_id.kind
-                                    && crate::builtin_derive::has_builtin_derive_impl(builtin_derive)
+                                    && let MacroDefKind::BuiltInDerive(_, builtin_derive) =
+                                        def_id.kind
+                                    && crate::builtin_derive::has_builtin_derive_impl(
+                                        builtin_derive,
+                                    )
                                 {
-                                    side.deferred_derives_of(ast_id_without_path.upcast())
-                                        .push(DeferredDerive {
+                                    side.deferred_derives_of(ast_id_without_path.upcast()).push(
+                                        DeferredDerive {
                                             call_id,
                                             derive: builtin_derive,
                                             module_id: derive.module,
@@ -542,7 +586,8 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                                             derive_attr_id: *attr_id,
                                             derive_index: idx as u32,
                                             helpers_range: helpers_start..helpers_end,
-                                        });
+                                        },
+                                    );
                                 } else {
                                     push_resolved(round.resolved, &derive, call_id);
                                     *derive_call_ids.last_mut().expect("pushed above") =
@@ -678,7 +723,9 @@ fn expand_round(cx: &CollectCx<'_, '_>, limit: u32, resolved: &[ResolvedCall]) {
         return;
     }
     let mut calls = Vec::with_capacity_in(resolved.len(), cx.frame);
-    calls.extend(resolved.iter().filter(|&&(_, depth, ..)| depth <= limit).map(|&(_, _, _, call, _)| call));
+    calls.extend(
+        resolved.iter().filter(|&&(_, depth, ..)| depth <= limit).map(|&(_, _, _, call, _)| call),
+    );
     crate::nameres::batch::expand_round(cx.db, cx.krate, &calls);
 }
 
@@ -706,7 +753,9 @@ pub(crate) fn reseed_at<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     let directive = &pending[at];
     let &MacroOp { module, depth, container, .. } = directive;
     let MacroOpKind::Attr { ast_id, attr_id, attr, mod_item, tree, .. } = &directive.kind else {
-        panic!("nameres facts: the reseed of {module:?} names directive {at}, which is not an attribute")
+        panic!(
+            "nameres facts: the reseed of {module:?} names directive {at}, which is not an attribute"
+        )
     };
     let (mod_item, tree, attr_id) = (*mod_item, *tree, *attr_id);
     sink.apply(DeclOp::Diagnostic(DefDiagnostic::unresolved_macro_call(
@@ -750,7 +799,9 @@ pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
                     cx.krate,
                     directive.depth,
                     view.def_map().recursion_limit(),
-                    |path, ctxt| resolve_macro(view, module, path, MacroSubNs::Bang, ctxt).map(|(_, it)| it),
+                    |path, ctxt| {
+                        resolve_macro(view, module, path, MacroSubNs::Bang, ctxt).map(|(_, it)| it)
+                    },
                     // Global until `macro_call_as_call_id` takes `Vec<EagerCall, A>`.
                     // alloc: none unless an eager input holds macro calls; only the error is kept
                     &mut Vec::new(),
@@ -758,7 +809,11 @@ pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
                 if let Err(UnresolvedMacro { path }) = resolved {
                     sink.apply(DeclOp::Diagnostic(DefDiagnostic::unresolved_macro_call(
                         module,
-                        MacroCallKind::FnLike { ast_id: ast_id.ast_id, expand_to: *expand_to, eager: None },
+                        MacroCallKind::FnLike {
+                            ast_id: ast_id.ast_id,
+                            expand_to: *expand_to,
+                            eager: None,
+                        },
                         path,
                     )));
                 }
@@ -792,7 +847,9 @@ pub(crate) fn macro_step(db: &Db, frame: &Frame, key: FactKey) -> MacroStep {
     let round_key = RoundKey::new(db, krate, round);
     let modules = queries::round_modules(db, round_key);
     let Some(at) = modules.at(module) else {
-        panic!("nameres facts: a macro step of {module:?} at round {round}, which the round does not have")
+        panic!(
+            "nameres facts: a macro step of {module:?} at round {round}, which the round does not have"
+        )
     };
     let row = &modules.rows[at as usize];
     let kind = queries::round_kind(db, round_key);
@@ -977,7 +1034,12 @@ impl<'db, 'f> StepSink<'db, 'f> {
     /// The step of the module at `at` of `round`. A module can step at a round that does not run
     /// its component (its calls wait on a module that does not change): it starts from its
     /// facts as they last changed, and the imports its component's last run left unresolved.
-    fn new(cx: &CollectCx<'db, 'f>, round: RoundKey, at: u32, row: &ModuleRow) -> StepSink<'db, 'f> {
+    fn new(
+        cx: &CollectCx<'db, 'f>,
+        round: RoundKey,
+        at: u32,
+        row: &ModuleRow,
+    ) -> StepSink<'db, 'f> {
         let db = cx.db;
         let frame = cx.frame;
         let krate = round.krate(db);
@@ -1130,7 +1192,8 @@ impl<'db, 'f> StepSink<'db, 'f> {
         let db = self.db;
         if self.marks.is_none() {
             // Before the first write, so the scope is the one the round left.
-            let marks = PerNsGlobImports::of_scope_in(self.module, self.scope(self.module), self.frame);
+            let marks =
+                PerNsGlobImports::of_scope_in(self.module, self.scope(self.module), self.frame);
             self.marks = Some(marks);
         }
         for &(name, res) in resolutions {
@@ -1208,7 +1271,9 @@ impl<'db, 'f> StepSink<'db, 'f> {
             DeclOp::DefineBuiltinDeriveImpl { module, imp } => {
                 self.scope_mut(module).define_builtin_derive_impl(imp);
             }
-            DeclOp::DefineExternBlock { module, id } => self.scope_mut(module).define_extern_block(id),
+            DeclOp::DefineExternBlock { module, id } => {
+                self.scope_mut(module).define_extern_block(id)
+            }
             DeclOp::DefineExternCrateDecl { module, id } => {
                 self.scope_mut(module).define_extern_crate_decl(id);
             }
@@ -1233,7 +1298,9 @@ impl<'db, 'f> StepSink<'db, 'f> {
                 let derive_calls = derive_calls.clone();
                 self.scope_mut(module).init_derive_attribute(adt, attr, attr_call, derive_calls);
             }
-            DeclOp::ExternPrelude { .. } | DeclOp::MacroUsePrelude { .. } | DeclOp::Prelude { .. } => {
+            DeclOp::ExternPrelude { .. }
+            | DeclOp::MacroUsePrelude { .. }
+            | DeclOp::Prelude { .. } => {
                 if let Some(next) = self.env().after(op) {
                     self.local = next.local_def_map();
                     next.install(&mut self.def_map);
@@ -1357,7 +1424,9 @@ mod tests {
             .ops
             .iter()
             .find_map(|op| match op {
-                DeclOp::PushChild { parent, name: it, child } if *parent == root && it.as_str() == name => {
+                DeclOp::PushChild { parent, name: it, child }
+                    if *parent == root && it.as_str() == name =>
+                {
                     Some(*child)
                 }
                 _ => None,
@@ -1395,7 +1464,12 @@ crate::make!();
         let first = step(&db, b, krate, 0);
         assert!(first.progress, "`crate::make!` resolves against round 0's facts");
         assert!(first.pending.is_empty(), "{:?}", first.pending);
-        assert!(first.ops.iter().any(|op| matches!(op, DeclOp::AddMacroInvoc { module, .. } if *module == b)));
+        assert!(
+            first
+                .ops
+                .iter()
+                .any(|op| matches!(op, DeclOp::AddMacroInvoc { module, .. } if *module == b))
+        );
         assert!(first.ops.iter().any(|op| binds(op, b, "Made")), "{:?}", first.ops);
         let gained = module_round(&db, FactKey::new(&db, b, krate, 1));
         assert!(gained.ops.iter().any(|op| binds(op, b, "Made")), "{:?}", gained.ops);

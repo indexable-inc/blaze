@@ -64,10 +64,10 @@ use std::sync::Arc;
 use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     Debug, Format, LinkError, Native, NativeKind, NotFound, Output, OutputKind, Platform, Refusal,
@@ -181,7 +181,11 @@ fn runtime_dir(target: Target, sysroot: &Path) -> PathBuf {
 /// ELF shared library gets none: the executable that loads it has the runtime. MSVC's
 /// AddressSanitizer is MSVC's own runtime (`/INFERASANLIBS`), which the PE link does not
 /// take, and wasm has none; MemorySanitizer is only Linux's.
-fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<[(PathBuf, NativeKind); 1]>, LinkError> {
+fn runtimes(
+    target: Target,
+    output: &Output,
+    sysroot: &Path,
+) -> Result<SmallVec<[(PathBuf, NativeKind); 1]>, LinkError> {
     let mut out = SmallVec::new();
     let sanitizers = output.sanitize.sanitizers;
     if sanitizers.is_empty() {
@@ -205,7 +209,9 @@ fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<
         match target {
             Target::Wasip1 | Target::WasmUnknown | Target::Wasm64Wasip1 => {
                 // alloc: error path
-                return Err(fail(format!("{what} on {triple}: rustc has no sanitizer runtime for wasm")));
+                return Err(fail(format!(
+                    "{what} on {triple}: rustc has no sanitizer runtime for wasm"
+                )));
             }
             Target::Msvc => {
                 return Err(fail(
@@ -218,7 +224,9 @@ fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<
             }
             Target::MacOs if sanitizer == Sanitizers::MEMORY => {
                 // alloc: error path
-                return Err(fail(format!("{what} on {triple}: it has a runtime only on Linux and FreeBSD")));
+                return Err(fail(format!(
+                    "{what} on {triple}: it has a runtime only on Linux and FreeBSD"
+                )));
             }
             _ => {}
         }
@@ -227,7 +235,10 @@ fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<
         }
         let (file, kind) = match target {
             // alloc: once per sanitized link, the runtime's file name
-            Target::MacOs => (format!("librustc-{CHANNEL}_rt.{name}.dylib"), NativeKind::Shared { as_needed: false }),
+            Target::MacOs => (
+                format!("librustc-{CHANNEL}_rt.{name}.dylib"),
+                NativeKind::Shared { as_needed: false },
+            ),
             // alloc: once per sanitized link, the runtime's file name
             _ => (format!("librustc-{CHANNEL}_rt.{name}.a"), NativeKind::Archive { whole: true }),
         };
@@ -258,13 +269,18 @@ fn rpaths(target: Target, output: &Output, sysroot: &Path) -> Result<Vec<String>
     if !dir.is_absolute() {
         return Err(fail(
             // alloc: error path
-            format!("the sanitizer runtimes' directory {} is not absolute, as an rpath must be", dir.display()),
+            format!(
+                "the sanitizer runtimes' directory {} is not absolute, as an rpath must be",
+                dir.display()
+            ),
         ));
     }
     let dir = dir
         .to_str()
         // alloc: error path
-        .ok_or_else(|| fail(format!("the sanitizer runtimes' directory {} is not UTF-8", dir.display())))?;
+        .ok_or_else(|| {
+            fail(format!("the sanitizer runtimes' directory {} is not UTF-8", dir.display()))
+        })?;
     // alloc: once per sanitized link, the one rpath
     Ok(vec![dir.to_owned()])
 }
@@ -281,7 +297,12 @@ pub fn reactor(debug: Debug, incremental: bool) -> Result<Output, LinkError> {
     reactor_with(&CACHE, &System, debug, incremental)
 }
 
-fn reactor_with<A: Ask>(cache: &Cache, ask: &A, debug: Debug, incremental: bool) -> Result<Output, LinkError> {
+fn reactor_with<A: Ask>(
+    cache: &Cache,
+    ask: &A,
+    debug: Debug,
+    incremental: bool,
+) -> Result<Output, LinkError> {
     let mut output = output_with(cache, ask, Target::Wasip1.triple(), None, debug, incremental)?;
     // alloc: once per link, the entry's name
     output.kind = OutputKind::Executable { entry: REACTOR_ENTRY.to_owned() };
@@ -313,11 +334,17 @@ fn output_with<A: Ask>(
     let executable = matches!(kind, OutputKind::Executable { .. });
     let interpreter = match target {
         // clone: once per link, the path kept for the target
-        Target::LinuxX86_64 | Target::LinuxAarch64 if executable => cache.found(ask, target, None)?.interpreter.clone(),
+        Target::LinuxX86_64 | Target::LinuxAarch64 if executable => {
+            cache.found(ask, target, None)?.interpreter.clone()
+        }
         _ => None,
     };
     let platform = match target {
-        Target::MacOs => Some(Platform { platform: MACOS, minimum: minimum(ask)?, sdk: cache.found(ask, target, None)?.sdk }),
+        Target::MacOs => Some(Platform {
+            platform: MACOS,
+            minimum: minimum(ask)?,
+            sdk: cache.found(ask, target, None)?.sdk,
+        }),
         _ => None,
     };
     Ok(Output {
@@ -376,8 +403,14 @@ fn locate_with<A: Ask>(
     }
     let runtimes = runtimes(target, output, sysroot)?;
     let found = cache.found(ask, target, Some(sysroot))?;
-    let mut line =
-        Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8), listings: RefCell::default() };
+    let mut line = Line {
+        cache,
+        output,
+        search,
+        found: &found,
+        out: Vec::with_capacity(libs.len() + 8),
+        listings: RefCell::default(),
+    };
     for name in target.start(&output.kind)? {
         line.object(name)?;
     }
@@ -495,11 +528,21 @@ impl Target {
     /// linker a directory of each, and nix's cc-wrapper the `-L`s of the last.
     fn vars(self) -> &'static [&'static str] {
         match self {
-            Target::LinuxX86_64 => &["CC_x86_64_unknown_linux_gnu", "CC", "PATH", "LIBRARY_PATH", "NIX_LDFLAGS"],
-            Target::LinuxAarch64 => &["CC_aarch64_unknown_linux_gnu", "CC", "PATH", "LIBRARY_PATH", "NIX_LDFLAGS"],
-            Target::MacOs => {
-                &["SDKROOT", "DEVELOPER_DIR", "PATH", "CC_aarch64_apple_darwin", "CC", "LIBRARY_PATH", "NIX_LDFLAGS"]
+            Target::LinuxX86_64 => {
+                &["CC_x86_64_unknown_linux_gnu", "CC", "PATH", "LIBRARY_PATH", "NIX_LDFLAGS"]
             }
+            Target::LinuxAarch64 => {
+                &["CC_aarch64_unknown_linux_gnu", "CC", "PATH", "LIBRARY_PATH", "NIX_LDFLAGS"]
+            }
+            Target::MacOs => &[
+                "SDKROOT",
+                "DEVELOPER_DIR",
+                "PATH",
+                "CC_aarch64_apple_darwin",
+                "CC",
+                "LIBRARY_PATH",
+                "NIX_LDFLAGS",
+            ],
             Target::Msvc => &["LIB", "ProgramFiles(x86)", "PATH"],
             Target::Wasip1 | Target::WasmUnknown | Target::Wasm64Wasip1 => &[],
         }
@@ -513,7 +556,9 @@ impl Target {
             (Target::LinuxX86_64 | Target::LinuxAarch64, OutputKind::Executable { .. }) => {
                 &["Scrt1.o", "crti.o", "crtbeginS.o"]
             }
-            (Target::LinuxX86_64 | Target::LinuxAarch64, OutputKind::Shared { .. }) => &["crti.o", "crtbeginS.o"],
+            (Target::LinuxX86_64 | Target::LinuxAarch64, OutputKind::Shared { .. }) => {
+                &["crti.o", "crtbeginS.o"]
+            }
             (Target::Wasip1, OutputKind::Executable { entry }) => match entry.as_str() {
                 "_start" => &["crt1-command.o"],
                 REACTOR_ENTRY => &["crt1-reactor.o"],
@@ -581,7 +626,9 @@ fn parse_version(text: &str) -> Option<u32> {
     let part = |it: Option<&str>, max: u32| -> Option<u32> {
         match it {
             None => Some(0),
-            Some(it) if it.bytes().all(|b| b.is_ascii_digit()) => it.parse().ok().filter(|it| *it <= max),
+            Some(it) if it.bytes().all(|b| b.is_ascii_digit()) => {
+                it.parse().ok().filter(|it| *it <= max)
+            }
             Some(_) => None,
         }
     };
@@ -687,13 +734,21 @@ impl Ask for System {
         for child in children {
             answers.push((|| {
                 // alloc: error path
-                let done = child.map_err(|error| error.to_string())?.wait_with_output().map_err(|error| error.to_string())?;
+                let done = child
+                    .map_err(|error| error.to_string())?
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
                 if !done.status.success() {
                     // alloc: error path
-                    return Err(format!("{}: {}", done.status, String::from_utf8_lossy(&done.stderr).trim()));
+                    return Err(format!(
+                        "{}: {}",
+                        done.status,
+                        String::from_utf8_lossy(&done.stderr).trim()
+                    ));
                 }
                 // alloc: error path
-                String::from_utf8(done.stdout).map_err(|_| "it printed what is not UTF-8".to_owned())
+                String::from_utf8(done.stdout)
+                    .map_err(|_| "it printed what is not UTF-8".to_owned())
             })());
         }
         answers
@@ -708,7 +763,11 @@ impl Ask for System {
             .map_err(|error| error.to_string())?;
         if !done.status.success() {
             // alloc: error path
-            return Err(format!("{}: {}", done.status, String::from_utf8_lossy(&done.stderr).trim()));
+            return Err(format!(
+                "{}: {}",
+                done.status,
+                String::from_utf8_lossy(&done.stderr).trim()
+            ));
         }
         // alloc: error path
         String::from_utf8(done.stderr).map_err(|_| "it printed what is not UTF-8".to_owned())
@@ -770,7 +829,13 @@ impl Cache {
 
     /// What the PE archive, or the Mach-O object or archive for `arch`, at `path` (`name` on
     /// the line) asks for: read once for each content the file has had.
-    fn asked(&self, path: &Path, name: &str, format: Format, arch: Arch) -> Result<Asked, LinkError> {
+    fn asked(
+        &self,
+        path: &Path,
+        name: &str,
+        format: Format,
+        arch: Arch,
+    ) -> Result<Asked, LinkError> {
         let domain = match (format, arch) {
             (Format::MachO, Arch::X86_64) => AUTOLINKED_X86_64,
             (Format::MachO, _) => AUTOLINKED_AARCH64,
@@ -785,7 +850,13 @@ impl Cache {
     /// The install names the Mach-O library for `arch` and `platform` at `path` (`name` on the
     /// line) re-exports from outside itself, as `("", install)`
     /// ([`crate::macho::reexported`]): read once for each content the file has had.
-    fn reexported(&self, path: &Path, name: &str, arch: Arch, platform: u32) -> Result<Asked, LinkError> {
+    fn reexported(
+        &self,
+        path: &Path,
+        name: &str,
+        arch: Arch,
+        platform: u32,
+    ) -> Result<Asked, LinkError> {
         let domain = match arch {
             Arch::X86_64 => REEXPORTED_X86_64,
             _ => REEXPORTED_AARCH64,
@@ -809,7 +880,9 @@ impl Cache {
         // alloc: error path
         let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
         let id = ContentId::of(domain, &bytes);
-        if let Some((.., asked)) = self.asked.lock().iter().find(|it| it.0 == id && it.1 == platform) {
+        if let Some((.., asked)) =
+            self.asked.lock().iter().find(|it| it.0 == id && it.1 == platform)
+        {
             return Ok(Arc::clone(asked));
         }
         // alloc: once per process and file content, what it asks for
@@ -821,7 +894,12 @@ impl Cache {
     /// The toolchain of `target` as the environment is now, with blaze's toolchain at
     /// `sysroot` for WASI: asked once, then kept. The lock is held while it is asked, so no
     /// two links ask the same thing.
-    fn found<A: Ask>(&self, ask: &A, target: Target, sysroot: Option<&Path>) -> Result<Arc<Found>, LinkError> {
+    fn found<A: Ask>(
+        &self,
+        ask: &A,
+        target: Target,
+        sysroot: Option<&Path>,
+    ) -> Result<Arc<Found>, LinkError> {
         let key = Key::of(ask, target, sysroot)?;
         // Only a whole answer is pushed: one a panic interrupted left nothing.
         let mut kept = self.found.lock();
@@ -868,7 +946,9 @@ impl Found {
             .find(|it| it.0 == name)
             .map(|it| it.1.as_path())
             // alloc: error path
-            .ok_or_else(|| fail(format!("the C runtime's {name} is not among the toolchain's files")))
+            .ok_or_else(|| {
+                fail(format!("the C runtime's {name} is not among the toolchain's files"))
+            })
     }
 }
 
@@ -887,7 +967,9 @@ fn query<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
 /// architecture's multiarch directory name.
 fn loader(target: Target) -> (&'static str, &'static str, &'static str) {
     match target {
-        Target::LinuxAarch64 => ("ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1", "aarch64-linux-gnu"),
+        Target::LinuxAarch64 => {
+            ("ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1", "aarch64-linux-gnu")
+        }
         _ => ("ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2", "x86_64-linux-gnu"),
     }
 }
@@ -932,7 +1014,9 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
             // alloc: error path
             .unwrap_or_else(|| Err("no answer".to_owned()))
             // alloc: error path
-            .map_err(|why| fail(format!("{}: {why}; the C toolchain for {triple} is {said}", shown(at))))
+            .map_err(|why| {
+                fail(format!("{}: {why}; the C toolchain for {triple} is {said}", shown(at)))
+            })
     };
 
     let printed = answer(0)?;
@@ -971,7 +1055,8 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         }
     }
     // alloc: error path
-    let real = std::fs::canonicalize(&libc).map_err(|error| fail(format!("{}: {error}", libc.display())))?;
+    let real = std::fs::canonicalize(&libc)
+        .map_err(|error| fail(format!("{}: {error}", libc.display())))?;
     let interpreter = match real.parent().is_some_and(|it| fhs(it, multiarch)) {
         // alloc: once per toolchain asked, the interpreter's path
         true => abi.to_owned(),
@@ -987,7 +1072,14 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
     let (linker, _) = linker_dirs(ask, &cc, triple)?;
     dirs.retain(|it| !linker.contains(it));
     let unpassed = unpassed(key.named("NIX_LDFLAGS"), &linker);
-    Ok(Found { linker, dirs, objects, interpreter: Some(interpreter), unpassed, ..Found::default() })
+    Ok(Found {
+        linker,
+        dirs,
+        objects,
+        interpreter: Some(interpreter),
+        unpassed,
+        ..Found::default()
+    })
 }
 
 /// The C driver a target's toolchain is asked with: `$CC_<triple with _>`, else `$CC`, else
@@ -1012,7 +1104,9 @@ fn c_driver(key: &Key, at: usize) -> Result<CDriver<'_>, LinkError> {
     };
     let mut words = cc.split_whitespace();
     // alloc: error path
-    let program = words.next().ok_or_else(|| fail(format!("the C toolchain for {triple}: {said} names no program")))?;
+    let program = words
+        .next()
+        .ok_or_else(|| fail(format!("the C toolchain for {triple}: {said} names no program")))?;
     // alloc: none up to four words, which the `SmallVec` holds in place
     let given: SmallVec<[&str; 4]> = words.collect();
     Ok(CDriver { program, given, said })
@@ -1023,10 +1117,16 @@ fn c_driver(key: &Key, at: usize) -> Result<CDriver<'_>, LinkError> {
 /// from `NIX_LDFLAGS`), `LIBRARY_PATH`'s and the driver's own, as rustc's link gets them
 /// through `cc`. One that is not a directory is left out, as the linker passes over it, and so
 /// is a relative one: it names the linker's working directory, which blaze's link has none of.
-fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), LinkError> {
+fn linker_dirs<A: Ask>(
+    ask: &A,
+    cc: &CDriver<'_>,
+    triple: &str,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), LinkError> {
     let mut args = Vec::with_capacity(cc.given.len() + 4);
     // alloc: once per toolchain asked, its command
-    args.extend(cc.given.iter().chain(&["-###", "-x", "c", "/dev/null"]).map(|it| (*it).to_owned()));
+    args.extend(
+        cc.given.iter().chain(&["-###", "-x", "c", "/dev/null"]).map(|it| (*it).to_owned()),
+    );
     // alloc: error path
     let shown = || format!("`{} {}`", cc.program, args.join(" "));
     let printed = ask.said(Path::new(cc.program), &args).map_err(|why| {
@@ -1038,9 +1138,16 @@ fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<P
         .filter(|it| it.starts_with(' '))
         .last()
         // alloc: error path
-        .ok_or_else(|| fail(format!("{} printed no job: the C toolchain for {triple} is {}", shown(), cc.said)))?;
+        .ok_or_else(|| {
+            fail(format!("{} printed no job: the C toolchain for {triple} is {}", shown(), cc.said))
+        })?;
     // alloc: error path
-    let words = quoted_words(job).ok_or_else(|| fail(format!("{} printed a linker job with an unclosed quote or a trailing `\\`: {job}", shown())))?;
+    let words = quoted_words(job).ok_or_else(|| {
+        fail(format!(
+            "{} printed a linker job with an unclosed quote or a trailing `\\`: {job}",
+            shown()
+        ))
+    })?;
     // alloc: once per toolchain asked, its directories
     let (mut dirs, mut frameworks): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
     for (at, word) in words.iter().enumerate() {
@@ -1052,7 +1159,10 @@ fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<P
         let dir = match dir.is_empty() {
             true => words.get(at + 1).map(String::as_str).ok_or_else(|| {
                 // alloc: error path
-                fail(format!("{} printed a linker job ending in {word}, with no directory after it", shown()))
+                fail(format!(
+                    "{} printed a linker job ending in {word}, with no directory after it",
+                    shown()
+                ))
             })?,
             false => dir,
         };
@@ -1156,7 +1266,9 @@ fn apple<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
     let settings = sdk.join("SDKSettings.json");
     let text = std::fs::read_to_string(&settings)
         // alloc: error path
-        .map_err(|error| fail(format!("the macOS SDK's version: {}: {error}", settings.display())))?;
+        .map_err(|error| {
+            fail(format!("the macOS SDK's version: {}: {error}", settings.display()))
+        })?;
     let version = top_level_string(&text, "Version").and_then(parse_version).ok_or_else(|| {
         // alloc: error path
         fail(format!("{}: no `Version` that is `major[.minor[.patch]]`", settings.display()))
@@ -1195,7 +1307,8 @@ fn msvc<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         // alloc: error path
         return Err(missing("ProgramFiles(x86), where vswhere is, is not set".to_owned()));
     };
-    let vswhere = Path::new(programs).join("Microsoft Visual Studio").join("Installer").join("vswhere.exe");
+    let vswhere =
+        Path::new(programs).join("Microsoft Visual Studio").join("Installer").join("vswhere.exe");
     let run = [
         "-latest",
         "-products",
@@ -1220,22 +1333,36 @@ fn msvc<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
     let install = install.trim();
     if install.is_empty() {
         // alloc: error path
-        return Err(missing(format!("{} names no Visual Studio with the MSVC x64 tools", vswhere.display())));
+        return Err(missing(format!(
+            "{} names no Visual Studio with the MSVC x64 tools",
+            vswhere.display()
+        )));
     }
     let install = Path::new(install);
-    let default = install.join("VC").join("Auxiliary").join("Build").join("Microsoft.VCToolsVersion.default.txt");
+    let default = install
+        .join("VC")
+        .join("Auxiliary")
+        .join("Build")
+        .join("Microsoft.VCToolsVersion.default.txt");
     let version = std::fs::read_to_string(&default)
         // alloc: error path
         .map_err(|error| missing(format!("{}: {error}", default.display())))?;
-    let tools = install.join("VC").join("Tools").join("MSVC").join(version.trim()).join("lib").join("x64");
+    let tools =
+        install.join("VC").join("Tools").join("MSVC").join(version.trim()).join("lib").join("x64");
     if !tools.is_dir() {
         // alloc: error path
         return Err(missing(format!("{} is not a directory", tools.display())));
     }
-    let run = ["query", r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots", "/v", "KitsRoot10", "/reg:32"]
-        .map(str::to_owned)
-        // alloc: once per toolchain asked, its command
-        .to_vec();
+    let run = [
+        "query",
+        r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+        "/v",
+        "KitsRoot10",
+        "/reg:32",
+    ]
+    .map(str::to_owned)
+    // alloc: once per toolchain asked, its command
+    .to_vec();
     let printed = asked(Path::new("reg"), &run)?;
     let root = printed
         .lines()
@@ -1250,7 +1377,9 @@ fn msvc<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         // alloc: error path
         .map_err(|error| missing(format!("{}: {error}", lib.display())))?
         // alloc: error path
-        .ok_or_else(|| missing(format!("{} has no SDK with um\\x64\\kernel32.lib", lib.display())))?;
+        .ok_or_else(|| {
+            missing(format!("{} has no SDK with um\\x64\\kernel32.lib", lib.display()))
+        })?;
     let kit = lib.join(kit);
     Ok(Found {
         // alloc: once per toolchain asked, its directories
@@ -1265,7 +1394,10 @@ fn newest_kit(lib: &Path) -> std::io::Result<Option<String>> {
     for entry in std::fs::read_dir(lib)? {
         let entry = entry?;
         let Ok(name) = entry.file_name().into_string() else { continue };
-        let Some(version) = name.split('.').map(|it| it.parse::<u32>().ok()).collect::<Option<SmallVec<[u32; 4]>>>()
+        let Some(version) = name
+            .split('.')
+            .map(|it| it.parse::<u32>().ok())
+            .collect::<Option<SmallVec<[u32; 4]>>>()
         else {
             continue;
         };
@@ -1289,7 +1421,12 @@ fn wasi(key: &Key) -> Result<Found, LinkError> {
                 .to_owned(),
         ));
     };
-    let dir = sysroot.join("lib").join("rustlib").join("wasm32-wasip1").join("lib").join("self-contained");
+    let dir = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join("wasm32-wasip1")
+        .join("lib")
+        .join("self-contained");
     let start = dir.join("crt1-command.o");
     if !start.is_file() {
         return Err(fail(
@@ -1344,7 +1481,9 @@ fn listing(dir: &Path) -> Option<Listing> {
     let mut names = Listing::default();
     for entry in std::fs::read_dir(dir).ok()? {
         // alloc: once per entry of a search directory per link
-        names.insert(entry.ok()?.file_name().as_encoded_bytes().to_ascii_lowercase().into_boxed_slice());
+        names.insert(
+            entry.ok()?.file_name().as_encoded_bytes().to_ascii_lowercase().into_boxed_slice(),
+        );
     }
     Some(names)
 }
@@ -1371,7 +1510,9 @@ impl Line<'_> {
     /// system still finds what a stat finds. A name the listing can't answer for (not ASCII, or
     /// not starting with a plain name) is a maybe.
     fn may_have(&self, dir: &Path, file: &str) -> bool {
-        let Some(Component::Normal(first)) = Path::new(file).components().next() else { return true };
+        let Some(Component::Normal(first)) = Path::new(file).components().next() else {
+            return true;
+        };
         if !file.is_ascii() {
             return true;
         }
@@ -1392,13 +1533,23 @@ impl Line<'_> {
         self.push(path, NativeKind::Object)
     }
 
-    fn library(&mut self, name: &str, kind: NativeLibKind, verbatim: bool) -> Result<(), LinkError> {
+    fn library(
+        &mut self,
+        name: &str,
+        kind: NativeLibKind,
+        verbatim: bool,
+    ) -> Result<(), LinkError> {
         let (path, kind) = self.find(name, kind, verbatim)?;
         self.push(path, kind)
     }
 
     /// The first file in the first directory that has one of those `kind` allows.
-    fn find(&self, name: &str, kind: NativeLibKind, verbatim: bool) -> Result<(PathBuf, NativeKind), LinkError> {
+    fn find(
+        &self,
+        name: &str,
+        kind: NativeLibKind,
+        verbatim: bool,
+    ) -> Result<(PathBuf, NativeKind), LinkError> {
         if name.is_empty() {
             // alloc: error path
             return Err(fail("a native library with no name".to_owned()));
@@ -1424,22 +1575,26 @@ impl Line<'_> {
     /// `LC_LINKER_OPTION`s ask for when it is a Mach-O object or archive.
     fn push(&mut self, path: PathBuf, kind: NativeKind) -> Result<(), LinkError> {
         let pe = self.output.format == Format::Pe;
-        if let Some(it) =
-            self.out.iter_mut().find(|it| it.path == path || (pe && it.path.as_os_str().eq_ignore_ascii_case(path.as_os_str())))
-        {
+        if let Some(it) = self.out.iter_mut().find(|it| {
+            it.path == path || (pe && it.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+        }) {
             // A Mach-O library on the line as a re-export that the link also asks for is loaded
             // as ld64 loads one asked for, used or not.
-            if self.output.format == Format::MachO && kind == (NativeKind::Shared { as_needed: false }) {
+            if self.output.format == Format::MachO
+                && kind == (NativeKind::Shared { as_needed: false })
+            {
                 it.kind = kind;
             }
             return Ok(());
         }
-        let script =
-            self.output.format == Format::Elf && matches!(kind, NativeKind::Shared { .. }) && sniff(&path)? == Sniffed::Text;
+        let script = self.output.format == Format::Elf
+            && matches!(kind, NativeKind::Shared { .. })
+            && sniff(&path)? == Sniffed::Text;
         let archive = pe && matches!(kind, NativeKind::Archive { .. });
-        let autolinks =
-            self.output.format == Format::MachO && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
-        let reexports = self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
+        let autolinks = self.output.format == Format::MachO
+            && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
+        let reexports =
+            self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
         self.out.push(Located { path, name, kind });
@@ -1465,11 +1620,19 @@ impl Line<'_> {
     /// re-exporting library, blaze to the one that defines it, which the loader finds alike.
     fn reexports(&mut self, at: usize) -> Result<(), LinkError> {
         let platform = self.output.platform.as_ref().map_or(0, |it| it.platform);
-        let asked = self.cache.reexported(&self.out[at].path, &self.out[at].name, self.output.arch, platform)?;
+        let asked = self.cache.reexported(
+            &self.out[at].path,
+            &self.out[at].name,
+            self.output.arch,
+            platform,
+        )?;
         for (_, install) in asked.iter() {
             let path = self.reexported(at, install).map_err(|it| LinkError {
                 // alloc: error path
-                what: format!("{} re-exports {install} (LC_REEXPORT_DYLIB), and {}", self.out[at].name, it.what),
+                what: format!(
+                    "{} re-exports {install} (LC_REEXPORT_DYLIB), and {}",
+                    self.out[at].name, it.what
+                ),
                 ..it
             })?;
             self.push(path, NativeKind::Shared { as_needed: true })?;
@@ -1490,17 +1653,25 @@ impl Line<'_> {
                 };
                 let path = parent.join(rest);
                 // alloc: error path
-                let file = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+                let file = path
+                    .file_name()
+                    .map(|it| it.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 (path.parent().map(Path::to_path_buf), file)
             }
             None if install.starts_with('@') => {
                 // alloc: error path
-                return Err(fail(format!("{install} names the image's run, which ld64 does not find a re-export by")));
+                return Err(fail(format!(
+                    "{install} names the image's run, which ld64 does not find a re-export by"
+                )));
             }
             None => {
                 let path = Path::new(install);
                 // alloc: error path
-                let file = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+                let file = path
+                    .file_name()
+                    .map(|it| it.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 (path.parent().filter(|_| path.is_absolute()).map(Path::to_path_buf), file)
             }
         };
@@ -1541,11 +1712,19 @@ impl Line<'_> {
     /// followed, taken or not: a library on the line that nothing is taken from costs nothing,
     /// and the engine checks those of the members it takes.
     fn defaults(&mut self, at: usize) -> Result<(), LinkError> {
-        let asked = self.cache.asked(&self.out[at].path, &self.out[at].name, Format::Pe, self.output.arch)?;
+        let asked = self.cache.asked(
+            &self.out[at].path,
+            &self.out[at].name,
+            Format::Pe,
+            self.output.arch,
+        )?;
         for (member, library) in asked.iter() {
             let path = self.default_library(library).map_err(|it| LinkError {
                 // alloc: error path
-                what: format!("{}({member}) asks for {library} (/DEFAULTLIB), and {}", self.out[at].name, it.what),
+                what: format!(
+                    "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
+                    self.out[at].name, it.what
+                ),
                 ..it
             })?;
             self.push(path, NativeKind::Archive { whole: false })?;
@@ -1561,19 +1740,32 @@ impl Line<'_> {
     /// other option is an error ([`crate::macho::autolink`]). Every member's are followed,
     /// taken or not, and the engine checks those of the objects and members it loads.
     fn autolinks(&mut self, at: usize) -> Result<(), LinkError> {
-        let asked = self.cache.asked(&self.out[at].path, &self.out[at].name, Format::MachO, self.output.arch)?;
+        let asked = self.cache.asked(
+            &self.out[at].path,
+            &self.out[at].name,
+            Format::MachO,
+            self.output.arch,
+        )?;
         for (member, option) in asked.iter() {
             let by = |what: &str| match member.is_empty() {
                 // alloc: error path
-                true => fail(format!("{} asks for {option} (LC_LINKER_OPTION), and {what}", self.out[at].name)),
+                true => fail(format!(
+                    "{} asks for {option} (LC_LINKER_OPTION), and {what}",
+                    self.out[at].name
+                )),
                 // alloc: error path
-                false => fail(format!("{}({member}) asks for {option} (LC_LINKER_OPTION), and {what}", self.out[at].name)),
+                false => fail(format!(
+                    "{}({member}) asks for {option} (LC_LINKER_OPTION), and {what}",
+                    self.out[at].name
+                )),
             };
             let (name, kind) = match crate::macho::autolink(option).map_err(|what| by(&what))? {
                 crate::macho::Autolink::Library(name) => (name, NativeLibKind::Dylib),
                 crate::macho::Autolink::Framework(name) => (name, NativeLibKind::Framework),
             };
-            let (path, kind) = self.find(name, kind, false).map_err(|it| LinkError { what: by(&it.what).what, ..it })?;
+            let (path, kind) = self
+                .find(name, kind, false)
+                .map_err(|it| LinkError { what: by(&it.what).what, ..it })?;
             self.push(path, kind)?;
         }
         Ok(())
@@ -1618,7 +1810,13 @@ impl Line<'_> {
             .into();
         // clone: once per linker script, its name while the line grows
         let name = script.name.clone();
-        let native = Native { id: ContentId::of(SCRIPT, &bytes), name: &name, bytes: &bytes, kind: script.kind, order: at as u32 };
+        let native = Native {
+            id: ContentId::of(SCRIPT, &bytes),
+            name: &name,
+            bytes: &bytes,
+            kind: script.kind,
+            order: at as u32,
+        };
         for input in crate::script_inputs(self.output, &native)? {
             let path = match input.strip_prefix("-l") {
                 Some(lib) => {
@@ -1629,7 +1827,10 @@ impl Line<'_> {
                     let (path, kind) = self
                         .find(lib, NativeLibKind::Dylib, verbatim)
                         // alloc: error path
-                        .map_err(|it| LinkError { what: format!("{name} names {input}, and {}", it.what), ..it })?;
+                        .map_err(|it| LinkError {
+                            what: format!("{name} names {input}, and {}", it.what),
+                            ..it
+                        })?;
                     self.push(path, kind)?;
                     continue;
                 }
@@ -1664,7 +1865,9 @@ fn files(
     match kind {
         NativeLibKind::Framework if format != Format::MachO => {
             // alloc: error path
-            return Err(fail(format!("the framework `{name}`: frameworks are Apple's, and this links {format:?}")));
+            return Err(fail(format!(
+                "the framework `{name}`: frameworks are Apple's, and this links {format:?}"
+            )));
         }
         NativeLibKind::Framework => {
             // alloc: once per library searched, its file names
@@ -1680,7 +1883,9 @@ fn files(
                 // alloc: once per library searched, its file name
                 Format::Pe => files.push((format!("{name}.lib"), archive)),
                 // alloc: once per library searched, its file name
-                Format::Elf | Format::MachO | Format::Wasm => files.push((format!("lib{name}.a"), archive)),
+                Format::Elf | Format::MachO | Format::Wasm => {
+                    files.push((format!("lib{name}.a"), archive))
+                }
             }
         }
         NativeLibKind::Dylib => {
@@ -1734,7 +1939,8 @@ fn not_found<'a>(
     unpassed: &[PathBuf],
 ) -> LinkError {
     // alloc: error path
-    let searched: Vec<(PathBuf, Searched)> = searched.map(|(dir, by)| (dir.to_path_buf(), by)).collect();
+    let searched: Vec<(PathBuf, Searched)> =
+        searched.map(|(dir, by)| (dir.to_path_buf(), by)).collect();
     // alloc: error path
     let mut what = String::new();
     let _ = write!(what, "the native library `{name}` is not found: no ");
@@ -1757,7 +1963,9 @@ fn not_found<'a>(
         what.push_str("any directory: the link, the C driver and the toolchain name none");
     }
     // alloc: error path
-    let there = unpassed.iter().find_map(|dir| files.iter().map(|it| dir.join(&it.0)).find(|it| it.is_file()));
+    let there = unpassed
+        .iter()
+        .find_map(|dir| files.iter().map(|it| dir.join(&it.0)).find(|it| it.is_file()));
     if let Some(there) = there {
         let _ = write!(
             what,
@@ -1828,13 +2036,21 @@ fn sniff(path: &Path) -> Result<Sniffed, LinkError> {
         (Some(1), Some(it)) => u16::from_le_bytes([it[0], it[1]]),
         (Some(2), Some(it)) => u16::from_be_bytes([it[0], it[1]]),
         // alloc: error path
-        _ => return Err(fail(format!("{}: an ELF file too short to say what it is", path.display()))),
+        _ => {
+            return Err(fail(format!(
+                "{}: an ELF file too short to say what it is",
+                path.display()
+            )));
+        }
     };
     match e_type {
         1 => Ok(Sniffed::Object),
         3 => Ok(Sniffed::Shared),
         // alloc: error path
-        other => Err(fail(format!("{}: an ELF file of type {other}, neither an object nor a shared library", path.display()))),
+        other => Err(fail(format!(
+            "{}: an ELF file of type {other}, neither an object nor a shared library",
+            path.display()
+        ))),
     }
 }
 

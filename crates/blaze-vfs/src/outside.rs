@@ -234,7 +234,8 @@ impl Dirs {
     /// An empty table, its columns reserved and nothing committed; stops when the address space
     /// cannot be had.
     pub fn new() -> Dirs {
-        Dirs::try_new().unwrap_or_else(|error| panic!("the table of directories outside views: {error}"))
+        Dirs::try_new()
+            .unwrap_or_else(|error| panic!("the table of directories outside views: {error}"))
     }
 
     pub fn try_new() -> Result<Dirs, MemError> {
@@ -373,9 +374,13 @@ impl Dirs {
         let paths = self.paths.as_slice();
         for other in &self.entries.as_slice()[..raw as usize] {
             let bytes = &paths[other.start as usize..][..other.len as usize];
-            if bytes.len() > key.len() && bytes.starts_with(key) && is_separator(bytes[key.len()])
-            {
-                _ = other.subsumed_by.compare_exchange(0, raw + 1, Ordering::AcqRel, Ordering::Acquire);
+            if bytes.len() > key.len() && bytes.starts_with(key) && is_separator(bytes[key.len()]) {
+                _ = other.subsumed_by.compare_exchange(
+                    0,
+                    raw + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
         }
     }
@@ -419,7 +424,10 @@ impl Dirs {
             match table[place].load(Ordering::Acquire) {
                 0 => return None,
                 entry if (entry >> 32) as u32 == tag => {
-                    let entry = self.entries.get(entry as u32 - 1).expect("an index entry before its directory");
+                    let entry = self
+                        .entries
+                        .get(entry as u32 - 1)
+                        .expect("an index entry before its directory");
                     let dir = self.view(entry);
                     if dir.bytes == key {
                         return Some(dir);
@@ -644,7 +652,10 @@ impl<'d> Outside<'d> {
                     self.left += 1;
                     if watch.flush.is_none() {
                         watch.flush = Some(round);
-                        effects.push(Effect::Flush { watch: self.tag(at, WATCH), tag: self.tag(at, FLUSH) });
+                        effects.push(Effect::Flush {
+                            watch: self.tag(at, WATCH),
+                            tag: self.tag(at, FLUSH),
+                        });
                     }
                 }
                 State::Watching if !watch.stat && watch.retry <= round => self.stat(at, effects),
@@ -731,7 +742,10 @@ impl<'d> Outside<'d> {
                     } else {
                         // Asked in a round before this one: it covers less than this one needs.
                         watch.flush = Some(round);
-                        effects.push(Effect::Flush { watch: self.tag(at, WATCH), tag: self.tag(at, FLUSH) });
+                        effects.push(Effect::Flush {
+                            watch: self.tag(at, WATCH),
+                            tag: self.tag(at, FLUSH),
+                        });
                     }
                 }
             }

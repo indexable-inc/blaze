@@ -32,7 +32,9 @@ fn gated_cfg(name: &str) -> Option<&'static str> {
         "sanitize" => "cfg_sanitize",
         "version" => "cfg_version",
         "relocation_model" => "cfg_relocation_model",
-        "sanitizer_cfi_generalize_pointers" | "sanitizer_cfi_normalize_integers" => "cfg_sanitizer_cfi",
+        "sanitizer_cfi_generalize_pointers" | "sanitizer_cfi_normalize_integers" => {
+            "cfg_sanitizer_cfi"
+        }
         "fmt_debug" => "fmt_debug",
         "target_has_reliable_f16"
         | "target_has_reliable_f16_math"
@@ -46,7 +48,14 @@ fn gated_cfg(name: &str) -> Option<&'static str> {
 
 /// rustc's `try_gate_cfg` of the `cfg` name `name` at `range` of `file`: E0658 when it is gated,
 /// its feature is not enabled and the expansion it comes from is not allowed it.
-pub(crate) fn try_gate(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, name: &str, range: TextRange, out: &mut Vec<Diag>) {
+pub(crate) fn try_gate(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    file: HirFileId,
+    name: &str,
+    range: TextRange,
+    out: &mut Vec<Diag>,
+) {
     let Some(feature) = gated_cfg(name) else { return };
     if features.enabled(feature) || allows_unstable(cx, file, range, feature) {
         return;
@@ -59,7 +68,14 @@ pub(crate) fn try_gate(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, na
 }
 
 /// [`try_gate`] of `target_{key}`, the name a `key = ..` of a compact `target(..)` stands for.
-pub(crate) fn try_gate_target(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, key: &str, range: TextRange, out: &mut Vec<Diag>) {
+pub(crate) fn try_gate_target(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    file: HirFileId,
+    key: &str,
+    range: TextRange,
+    out: &mut Vec<Diag>,
+) {
     const PREFIX: &str = "target_";
     // Longer than every gated name, so a name that does not fit is not gated.
     let mut buf = [0u8; 48];
@@ -72,12 +88,19 @@ pub(crate) fn try_gate_target(cx: &Cx<'_, '_>, features: &Features, file: HirFil
 
 /// `parse_cfg_entry_target`'s gate of `target(..)` at `range`: the feature only, not the
 /// expansion.
-pub(crate) fn target_compact(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, range: TextRange, out: &mut Vec<Diag>) {
+pub(crate) fn target_compact(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    file: HirFileId,
+    range: TextRange,
+    out: &mut Vec<Diag>,
+) {
     if features.enabled("cfg_target_compact") {
         return;
     }
     let explain = "compact `cfg(target(..))` is experimental and subject to change";
-    let mut diag = feature_err(features, "cfg_target_compact", cx.span(InFile::new(file, range)), explain);
+    let mut diag =
+        feature_err(features, "cfg_target_compact", cx.span(InFile::new(file, range)), explain);
     features_fact(cx, &mut diag);
     out.push(diag);
 }
@@ -120,7 +143,14 @@ pub(super) fn predicate(
                         if atom.eq_token().is_none() {
                             continue;
                         }
-                        try_gate_target(cx, features, file, key.text(), atom.syntax().text_range(), out);
+                        try_gate_target(
+                            cx,
+                            features,
+                            file,
+                            key.text(),
+                            atom.syntax().text_range(),
+                            out,
+                        );
                     }
                 }
                 "version" => try_gate(cx, features, file, "version", range, out),
@@ -134,14 +164,25 @@ pub(super) fn predicate(
 /// `#[link(.., cfg(..))]` in `file`: its gates, in order. Called where the attribute's parser
 /// parses the predicate, after the list is checked to have one element; the errors of an
 /// ill-formed predicate are the parser's.
-pub(crate) fn cfg_entry(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, item: &MetaItemOrLit) -> Vec<Diag> {
+pub(crate) fn cfg_entry(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    file: HirFileId,
+    item: &MetaItemOrLit,
+) -> Vec<Diag> {
     // alloc: empty, allocates only when a gate is hit
     let mut out = Vec::new();
     entry(cx, features, file, item, &mut out);
     out
 }
 
-fn entry(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, item: &MetaItemOrLit, out: &mut Vec<Diag>) {
+fn entry(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    file: HirFileId,
+    item: &MetaItemOrLit,
+    out: &mut Vec<Diag>,
+) {
     let MetaItemOrLit::Item(meta) = item else { return };
     match &meta.args {
         ArgParser::List(list) => match meta.path.word_sym() {
@@ -159,7 +200,9 @@ fn entry(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, item: &MetaItemO
                 target_compact(cx, features, file, meta.range(), out);
                 for sub in list.mixed() {
                     let Some(sub_meta) = sub.meta_item() else { continue };
-                    let (Some(name), ArgParser::NameValue(_)) = (sub_meta.path.word_sym(), &sub_meta.args) else {
+                    let (Some(name), ArgParser::NameValue(_)) =
+                        (sub_meta.path.word_sym(), &sub_meta.args)
+                    else {
                         continue;
                     };
                     if is_path_segment_keyword(name) {
@@ -172,7 +215,9 @@ fn entry(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, item: &MetaItemO
             _ => {}
         },
         ArgParser::NoArgs | ArgParser::NameValue(_) => {
-            let Some(name) = meta.path.word_sym().filter(|it| !is_path_segment_keyword(it)) else { return };
+            let Some(name) = meta.path.word_sym().filter(|it| !is_path_segment_keyword(it)) else {
+                return;
+            };
             try_gate(cx, features, file, name, meta.range(), out);
         }
     }
@@ -193,7 +238,10 @@ mod tests {
         assert_eq!(gated_cfg("target_has_atomic_load_store"), Some("cfg_target_has_atomic"));
         assert_eq!(gated_cfg("target_has_atomic"), None);
         assert_eq!(gated_cfg("sanitizer_cfi_normalize_integers"), Some("cfg_sanitizer_cfi"));
-        assert_eq!(gated_cfg("target_has_reliable_f128_math"), Some("cfg_target_has_reliable_f16_f128"));
+        assert_eq!(
+            gated_cfg("target_has_reliable_f128_math"),
+            Some("cfg_target_has_reliable_f16_f128")
+        );
         assert_eq!(gated_cfg("fmt_debug"), Some("fmt_debug"));
         assert_eq!(gated_cfg("unix"), None);
         let features = crate::lints::syntax::attrs::features::table::lang;
@@ -213,7 +261,10 @@ mod tests {
             "target_object_format",
         ] {
             let feature = gated_cfg(name).unwrap();
-            assert!(features(feature).is_some_and(|it| it.kind.is_unstable()), "`{feature}` is no unstable feature");
+            assert!(
+                features(feature).is_some_and(|it| it.kind.is_unstable()),
+                "`{feature}` is no unstable feature"
+            );
         }
     }
 
@@ -223,6 +274,9 @@ mod tests {
     fn every_gated_cfg_fits_the_targets_buffer() {
         assert_eq!(gated_cfg("sanitizer_cfi_normalize_integers"), Some("cfg_sanitizer_cfi"));
         assert!("sanitizer_cfi_normalize_integers".len() <= 48);
-        assert_eq!(gated_cfg("target_has_reliable_f128_math"), Some("cfg_target_has_reliable_f16_f128"));
+        assert_eq!(
+            gated_cfg("target_has_reliable_f128_math"),
+            Some("cfg_target_has_reliable_f16_f128")
+        );
     }
 }

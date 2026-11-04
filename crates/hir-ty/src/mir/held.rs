@@ -275,8 +275,8 @@ fn flow<'f>(
     requires: &Set<'_>,
 ) {
     let at = block_index(to);
-    let changed =
-        join(frame, &mut forward.borrowed[at], borrowed) | join(frame, &mut forward.requires[at], requires);
+    let changed = join(frame, &mut forward.borrowed[at], borrowed)
+        | join(frame, &mut forward.requires[at], requires);
     if changed {
         worklist.push(to);
     }
@@ -404,7 +404,10 @@ impl MirBody<'_> {
             }
             held.clear();
             held.extend(
-                self.locals.iter().map(|(local, _)| local).filter(|&it| live.contains(local_index(it))),
+                self.locals
+                    .iter()
+                    .map(|(local, _)| local)
+                    .filter(|&it| live.contains(local_index(it))),
             );
             &*frame.alloc_slice_copy(&held)
         })
@@ -809,7 +812,12 @@ mod tests {
 
     /// The matrix as it was computed before [`Conflicts`]: a row of every local per local, in
     /// rustc's `DenseBitSet`s.
-    fn model(count: usize, always_live: &[usize], held: &[usize], states: &[Vec<usize>]) -> Vec<bool> {
+    fn model(
+        count: usize,
+        always_live: &[usize],
+        held: &[usize],
+        states: &[Vec<usize>],
+    ) -> Vec<bool> {
         let held_set = dense(count, held);
         let mut ineligible = dense(count, always_live);
         ineligible.intersect(&held_set);
@@ -879,11 +887,19 @@ mod tests {
                 let (mut x, y) = (of(frame, count, &a), of(frame, count, &b));
                 let (mut dx, dy) = (dense(count, &a), dense(count, &b));
                 assert_eq!(x.union_with(&y), dx.union(&dy), "round {round}");
-                assert_eq!(x.iter().collect::<Vec<_>>(), dx.iter().collect::<Vec<_>>(), "round {round}");
+                assert_eq!(
+                    x.iter().collect::<Vec<_>>(),
+                    dx.iter().collect::<Vec<_>>(),
+                    "round {round}"
+                );
                 assert_eq!(x.count(), dx.count(), "round {round}");
                 x.intersect_with(&of(frame, count, &a));
                 dx.intersect(&dense(count, &a));
-                assert_eq!(x.iter().collect::<Vec<_>>(), dx.iter().collect::<Vec<_>>(), "round {round}");
+                assert_eq!(
+                    x.iter().collect::<Vec<_>>(),
+                    dx.iter().collect::<Vec<_>>(),
+                    "round {round}"
+                );
                 assert_eq!(x == of(frame, count, &a), dx == dense(count, &a), "round {round}");
                 let filled = filled_in(frame, count);
                 assert_eq!(

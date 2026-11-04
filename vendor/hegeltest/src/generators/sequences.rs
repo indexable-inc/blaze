@@ -69,10 +69,7 @@ impl<'a, T: Clone + Send + Sync + 'a> Generator<Vec<T>> for SubsequenceGenerator
         let max_size = self.max_size.map_or(n, |m| m.min(n));
         let mut indices = draw_index_sample(tc, n, self.min_size, max_size);
         indices.sort_unstable();
-        indices
-            .into_iter()
-            .map(|i| self.elements[i].clone())
-            .collect()
+        indices.into_iter().map(|i| self.elements[i].clone()).collect()
     }
 }
 
@@ -115,11 +112,7 @@ where
     T: Clone + Send + Sync,
     S: Into<Cow<'a, [T]>>,
 {
-    SubsequenceGenerator {
-        elements: elements.into(),
-        min_size: 0,
-        max_size: None,
-    }
+    SubsequenceGenerator { elements: elements.into(), min_size: 0, max_size: None }
 }
 
 /// Generator that reorders a fixed list of values. Created by
@@ -136,10 +129,7 @@ impl<'a, T: Clone + Send + Sync + 'a> Generator<Vec<T>> for PermutationGenerator
     fn do_draw(&self, tc: &TestCase) -> Vec<T> {
         let n = self.elements.len();
         let indices = draw_index_sample(tc, n, n, n);
-        indices
-            .into_iter()
-            .map(|i| self.elements[i].clone())
-            .collect()
+        indices.into_iter().map(|i| self.elements[i].clone()).collect()
     }
 }
 
@@ -179,9 +169,7 @@ where
     T: Clone + Send + Sync,
     S: Into<Cow<'a, [T]>>,
 {
-    PermutationGenerator {
-        elements: elements.into(),
-    }
+    PermutationGenerator { elements: elements.into() }
 }
 
 /// Generator that samples from a fixed list of values. Created by
@@ -260,10 +248,7 @@ impl<'a, T: Clone + Send + Sync + 'a> Generator<Vec<T>> for SampleGenerator<'a, 
             }
             let max_size = self.max_size.map_or(n, |m| m.min(n));
             let indices = draw_index_sample(tc, n, self.min_size, max_size);
-            indices
-                .into_iter()
-                .map(|i| self.elements[i].clone())
-                .collect()
+            indices.into_iter().map(|i| self.elements[i].clone()).collect()
         }
     }
 }
@@ -315,10 +300,5 @@ where
     T: Clone + Send + Sync,
     S: Into<Cow<'a, [T]>>,
 {
-    SampleGenerator {
-        elements: elements.into(),
-        min_size: 0,
-        max_size: None,
-        replacement: true,
-    }
+    SampleGenerator { elements: elements.into(), min_size: 0, max_size: None, replacement: true }
 }

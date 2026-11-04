@@ -54,8 +54,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, ARCHIVE, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, ARCHIVE, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -73,7 +74,10 @@ fn check_case(data: &[u8], case: usize) {
         }
         _ => {
             let whole = blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, WHOLE, aligned);
-            assert!(!read || whole, "whole archive: an archive accepted without `whole` is refused with it");
+            assert!(
+                !read || whole,
+                "whole archive: an archive accepted without `whole` is refused with it"
+            );
         }
     }
 }
@@ -151,7 +155,9 @@ fn object(functions: &[&str]) -> Vec<u8> {
 }
 
 fn header(out: &mut Vec<u8>, name: &str, size: usize) {
-    out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
+    out.extend_from_slice(
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes(),
+    );
 }
 
 /// `members` (names of at most 15 bytes) after a GNU `/` index naming `symbols` (name,
@@ -283,7 +289,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, WHOLE, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, WHOLE, &bytes),
+                "seed `{what}` is refused"
+            );
             let indexed = !what.contains("without an index");
             assert_eq!(
                 blaze_link::fuzz_read(Format::Wasm, Arch::Wasm32, ARCHIVE, &bytes),

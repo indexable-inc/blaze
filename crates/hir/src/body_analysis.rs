@@ -9,7 +9,6 @@ use std::{iter::once, mem, sync::Arc};
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, BuiltinDeriveImplId, CallableDefId, DefWithBodyId, EnumVariantId,
@@ -42,6 +41,7 @@ use hir_ty::{
 };
 use rustc_type_ir::inherent::IntoKind as _;
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap, SyntaxContext};
+use std::alloc::Global;
 use syntax::{
     AstPtr, FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, ast as tag,
     view::{self as ast, AstNode as _},
@@ -67,16 +67,31 @@ pub struct BodyAnalysis<'db> {
     syntax: Option<&'db BodySyntax>,
     body: &'db Body,
     source_map: &'db BodySourceMap,
-    #[expect(clippy::disallowed_types, reason = "body inference, set once per body analysis: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "body inference, set once per body analysis: not global"
+    )]
     infer: std::cell::OnceCell<&'db InferenceResult<'db>>,
-    #[expect(clippy::disallowed_types, reason = "anchor tree, set once per body analysis: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "anchor tree, set once per body analysis: not global"
+    )]
     anchor: std::cell::OnceCell<Arc<FlatTree>>,
     /// Where each macro call of the body's store is, by its call.
-    #[expect(clippy::disallowed_types, reason = "macro call locations, set once per body analysis: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "macro call locations, set once per body analysis: not global"
+    )]
     calls: std::cell::OnceCell<HashMap<MacroCallId, InFile<SyntaxNodePtr>, Global>>,
-    #[expect(clippy::disallowed_types, reason = "nested items and calls, set once per body analysis: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "nested items and calls, set once per body analysis: not global"
+    )]
     nested: std::cell::OnceCell<Nested>,
-    #[expect(clippy::disallowed_types, reason = "moved bindings, set once per body analysis: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "moved bindings, set once per body analysis: not global"
+    )]
     moved: std::cell::OnceCell<Option<Box<[BindingId]>>>,
 }
 
@@ -367,12 +382,12 @@ impl<'db> BodyAnalysis<'db> {
         &self,
         func: FunctionId,
         args: GenericArgs<'db>,
-    ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>) {
+    ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)
+    {
         let db = self.db;
         let param_env = db.trait_environment(self.def.generic_def(db));
         // With what the body's `for const` loops assume of their binders, as inference had it.
-        let param_env =
-            hir_ty::comptime_env::owner_param_env(db, self.def.into(), param_env);
+        let param_env = hir_ty::comptime_env::owner_param_env(db, self.def.into(), param_env);
         db.lookup_impl_method(ParamEnvAndCrate { param_env, krate: self.def.krate(db) }, func, args)
     }
 
@@ -590,8 +605,8 @@ impl<'db> BodyAnalysis<'db> {
             }
         };
         let assoc = |nested: &mut Nested,
-                         items: &[(Name, AssocItemId)],
-                         calls: &[(AstId<tag::Item>, MacroCallId)]| {
+                     items: &[(Name, AssocItemId)],
+                     calls: &[(AstId<tag::Item>, MacroCallId)]| {
             for &(_, it) in items {
                 let (id, def) = match it {
                     AssocItemId::FunctionId(it) => (erased(it.lookup(db).id), it.into()),

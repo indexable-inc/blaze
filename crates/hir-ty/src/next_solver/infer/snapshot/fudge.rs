@@ -13,8 +13,8 @@ use crate::{
         infer::{
             InferCtxt, iter_idx_range,
             snapshot::VariableLengths,
-            union_find::{UnifyKey, UnifyValue, UnionFind},
             unify_key::ConstVariableValue,
+            union_find::{UnifyKey, UnifyValue, UnionFind},
         },
     },
 };

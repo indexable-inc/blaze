@@ -30,8 +30,7 @@ use hir_expand::{
 use span::{FileId, Span, SyntaxContext};
 use stdx::TupleExt;
 use syntax::{
-    AstPtr, SmolStr, SmolStrBuilder, SyntaxNodePtr, T, TextRange,
-    ast as tag,
+    AstPtr, SmolStr, SmolStrBuilder, SyntaxNodePtr, T, TextRange, ast as tag,
     view::{self as ast, AstNode, HasAttrs as _, HasName as _, Node, Token, Typed},
 };
 
@@ -118,8 +117,11 @@ pub(super) struct ViewCtx<'db, 'a> {
 impl<'db> Semantics<'db> {
     pub(super) fn with_ctx<T>(&self, f: impl FnOnce(&mut ViewCtx<'db, '_>) -> T) -> T {
         let mut cache = self.imp.s2d_cache.borrow_mut();
-        let mut ctx =
-            ViewCtx { sema: self, s2d: SourceToDefCtx { db: self.db, cache: &mut cache }, call_crate: None };
+        let mut ctx = ViewCtx {
+            sema: self,
+            s2d: SourceToDefCtx { db: self.db, cache: &mut cache },
+            call_crate: None,
+        };
         f(&mut ctx)
     }
 
@@ -545,7 +547,10 @@ impl<'db> ViewCtx<'db, '_> {
         let before = out.len();
         out.extend(tokens);
         self.sema.cache(expanded.value, expanded.file_id.into());
-        Some(u32::try_from(out.len() - before).expect("a span mapped down to more than u32::MAX tokens"))
+        Some(
+            u32::try_from(out.len() - before)
+                .expect("a span mapped down to more than u32::MAX tokens"),
+        )
     }
 
     fn file_module(&mut self, file_id: HirFileId) -> Option<ModuleId> {
@@ -568,7 +573,11 @@ impl<'db> ViewCtx<'db, '_> {
     /// their blocks declare, each found module recorded as its file's, so resolving a `mod` in a
     /// file found so reads that record and the search runs once per file.
     #[cold]
-    fn block_declared_module(&mut self, krate: Option<base_db::Crate>, file: FileId) -> Option<ModuleId> {
+    fn block_declared_module(
+        &mut self,
+        krate: Option<base_db::Crate>,
+        file: FileId,
+    ) -> Option<ModuleId> {
         let db = self.db();
         let crates = match krate {
             Some(krate) => smallvec::smallvec![krate],
@@ -579,18 +588,27 @@ impl<'db> ViewCtx<'db, '_> {
             let files = def_map.modules(db).filter_map(|(_, data)| data.origin.file_id());
             let mut pending: Vec<hir_expand::EditionedFileId> = files.collect(); // alloc: the files searched, once per file no crate def map has
             // alloc: as above
-            let mut seen: blaze_hash::HashSet<hir_expand::EditionedFileId, std::alloc::Global> = pending.iter().copied().collect();
+            let mut seen: blaze_hash::HashSet<hir_expand::EditionedFileId, std::alloc::Global> =
+                pending.iter().copied().collect();
             while let Some(searched) = pending.pop() {
                 let root = self.sema.parse(searched).syntax();
                 for node in root.descendants() {
                     let Some(module) = ast::Module::cast(node) else { continue };
-                    let in_block = node.ancestors().any(|it| it.kind() == syntax::SyntaxKind::BLOCK_EXPR);
+                    let in_block =
+                        node.ancestors().any(|it| it.kind() == syntax::SyntaxKind::BLOCK_EXPR);
                     if module.item_list().is_some() || !in_block {
                         continue;
                     }
-                    let Some(child) = self.module_to_def(InFile::new(searched.into(), module)) else { continue };
-                    let Some(child_file) = child.def_map(db).module(db, child).origin.file_id() else { continue };
-                    let recorded = self.s2d.cache.file_to_def_cache.entry(child_file.file_id(db)).or_default();
+                    let Some(child) = self.module_to_def(InFile::new(searched.into(), module))
+                    else {
+                        continue;
+                    };
+                    let Some(child_file) = child.def_map(db).module(db, child).origin.file_id()
+                    else {
+                        continue;
+                    };
+                    let recorded =
+                        self.s2d.cache.file_to_def_cache.entry(child_file.file_id(db)).or_default();
                     if !recorded.contains(&child) {
                         recorded.push(child);
                     }
@@ -842,7 +860,10 @@ impl<'db> ViewCtx<'db, '_> {
         })
     }
 
-    pub(super) fn item_to_macro_call(&mut self, src: InFile<ast::Item<'db>>) -> Option<MacroCallId> {
+    pub(super) fn item_to_macro_call(
+        &mut self,
+        src: InFile<ast::Item<'db>>,
+    ) -> Option<MacroCallId> {
         self.to_def(src, keys::ATTR_MACRO_CALL)
     }
 

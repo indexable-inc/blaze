@@ -5,8 +5,8 @@
 use std::{fmt, marker::PhantomData, slice};
 
 use serde::de::{
-    self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, Expected, MapAccess, SeqAccess, Unexpected,
-    VariantAccess, Visitor,
+    self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, Expected, MapAccess, SeqAccess,
+    Unexpected, VariantAccess, Visitor,
 };
 
 /// Any value, as the input's `deserialize_any` gave it. A string or byte string the input lent
@@ -190,7 +190,10 @@ impl<'de> Visitor<'de> for ContentVisitor {
         Ok(Content::Unit)
     }
 
-    fn visit_newtype_struct<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+    fn visit_newtype_struct<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
         Content::deserialize(deserializer).map(|it| Content::Newtype(Box::new(it)))
     }
 
@@ -296,7 +299,11 @@ impl<'a, 'de, E: de::Error> Deserializer<'de> for ContentRefDeserializer<'a, 'de
         }
     }
 
-    fn deserialize_unit_struct<V: Visitor<'de>>(self, _name: &'static str, visitor: V) -> Result<V::Value, E> {
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, E> {
         match *self.content {
             Content::Map(ref entries) if entries.is_empty() => visitor.visit_unit(),
             Content::Seq(ref items) if items.is_empty() => visitor.visit_unit(),
@@ -304,7 +311,11 @@ impl<'a, 'de, E: de::Error> Deserializer<'de> for ContentRefDeserializer<'a, 'de
         }
     }
 
-    fn deserialize_newtype_struct<V: Visitor<'de>>(self, _name: &'static str, visitor: V) -> Result<V::Value, E> {
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, E> {
         match *self.content {
             Content::Newtype(ref it) => visitor.visit_newtype_struct(self.of(it)),
             _ => visitor.visit_newtype_struct(self),
@@ -384,7 +395,8 @@ fn visit_map<'a, 'de, V: Visitor<'de>, E: de::Error>(
     human: bool,
     visitor: V,
 ) -> Result<V::Value, E> {
-    let mut map = MapRef { entries: entries.iter(), value: None, human, read: 0, error: PhantomData };
+    let mut map =
+        MapRef { entries: entries.iter(), value: None, human, read: 0, error: PhantomData };
     let value = visitor.visit_map(&mut map)?;
     match map.entries.len() {
         0 => Ok(value),
@@ -402,7 +414,10 @@ struct SeqRef<'a, 'de, E> {
 impl<'a, 'de, E: de::Error> SeqAccess<'de> for SeqRef<'a, 'de, E> {
     type Error = E;
 
-    fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, E> {
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, E> {
         match self.items.next() {
             Some(item) => {
                 self.read += 1;
@@ -465,7 +480,10 @@ impl<'a, 'de, E: de::Error> EnumAccess<'de> for EnumRef<'a, 'de, E> {
     type Error = E;
     type Variant = VariantRef<'a, 'de, E>;
 
-    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant), E> {
+    fn variant_seed<V: DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> Result<(V::Value, Self::Variant), E> {
         let variant = seed.deserialize(ContentRefDeserializer::new(self.variant, self.human))?;
         Ok((variant, VariantRef { value: self.value, human: self.human, error: PhantomData }))
     }
@@ -502,7 +520,11 @@ impl<'a, 'de, E: de::Error> VariantAccess<'de> for VariantRef<'a, 'de, E> {
         }
     }
 
-    fn struct_variant<V: Visitor<'de>>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value, E> {
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, E> {
         match self.value {
             Some(Content::Map(entries)) => visit_map(entries, self.human, visitor),
             Some(Content::Seq(items)) => visit_seq(items, self.human, visitor),

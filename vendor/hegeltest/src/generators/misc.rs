@@ -36,10 +36,7 @@ impl<T: Clone + Send + Sync + Debug> PrintableGenerator<T> for JustGenerator<T> 
 
 /// Generate a constant value.
 pub fn just<T: Clone + Send + Sync>(value: T) -> JustGenerator<T> {
-    JustGenerator {
-        value,
-        label: label_from_name(std::any::type_name::<JustGenerator<T>>()),
-    }
+    JustGenerator { value, label: label_from_name(std::any::type_name::<JustGenerator<T>>()) }
 }
 
 /// Generator for boolean values. Created by [`booleans()`] and [`weighted_booleans()`].

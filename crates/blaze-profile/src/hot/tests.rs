@@ -1,6 +1,6 @@
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hegel::{TestCase, generators as gs};
+use std::alloc::Global;
 
 use super::*;
 
@@ -30,7 +30,11 @@ fn count_min_never_undercounts(tc: TestCase) {
     }
     let exact = exact(&stream);
     for (key, ticks) in &exact {
-        assert!(sketch.estimate(*key) >= *ticks, "key {key}: estimate {} under {ticks}", sketch.estimate(*key));
+        assert!(
+            sketch.estimate(*key) >= *ticks,
+            "key {key}: estimate {} under {ticks}",
+            sketch.estimate(*key)
+        );
     }
     assert_eq!(sketch.total(), stream.iter().map(|it| it.1).sum::<u64>());
 }
@@ -42,7 +46,11 @@ fn count_min_merged_is_the_sketch_of_the_union(tc: TestCase) {
     let (mut whole, mut left, mut right) = (CountMin::new(), CountMin::new(), CountMin::new());
     for (at, &(key, ticks)) in stream.iter().enumerate() {
         whole.add(key, ticks);
-        if at < cut { left.add(key, ticks) } else { right.add(key, ticks) };
+        if at < cut {
+            left.add(key, ticks)
+        } else {
+            right.add(key, ticks)
+        };
     }
     let mut merged = CountMin::new();
     merged.merge(&left);
@@ -61,23 +69,32 @@ fn a_key_over_the_floor_is_listed_and_its_exact_ticks_are_never_over(tc: TestCas
         top.offer(key, estimate, ticks);
     }
     let exact = exact(&stream);
-    let listed: HashMap<u64, (u64, u64), Global> = top.entries().map(|(key, estimate, ticks)| (key, (estimate, ticks))).collect();
+    let listed: HashMap<u64, (u64, u64), Global> =
+        top.entries().map(|(key, estimate, ticks)| (key, (estimate, ticks))).collect();
     for (key, ticks) in &exact {
         if *ticks > top.floor() {
-            assert!(listed.contains_key(key), "key {key} has {ticks} ticks, over the floor {}, and is not listed", top.floor());
+            assert!(
+                listed.contains_key(key),
+                "key {key} has {ticks} ticks, over the floor {}, and is not listed",
+                top.floor()
+            );
         }
     }
     for (key, (estimate, counted)) in &listed {
         let ticks = exact[key];
         assert!(*counted <= ticks, "key {key}: listed {counted}, over its {ticks}");
-        assert!(*estimate <= sketch.estimate(*key), "key {key}: its entry's estimate is the sketch's at an offer");
+        assert!(
+            *estimate <= sketch.estimate(*key),
+            "key {key}: its entry's estimate is the sketch's at an offer"
+        );
     }
     assert!(listed.len() <= TOP);
 }
 
 #[hegel::test(test_cases = 300)]
 fn a_ddsketch_quantile_is_within_alpha_of_the_exact(tc: TestCase) {
-    let values: Vec<u64> = tc.draw(gs::vecs(gs::integers::<u64>().max_value(1 << 40)).min_size(1).max_size(500));
+    let values: Vec<u64> =
+        tc.draw(gs::vecs(gs::integers::<u64>().max_value(1 << 40)).min_size(1).max_size(500));
     let per_mille = tc.draw(gs::integers::<u16>().max_value(1000));
     let q = Quantile::per_mille(per_mille).unwrap();
     let mut sketch = DdSketch::new();
@@ -104,7 +121,11 @@ fn a_ddsketch_merged_is_the_sketch_of_the_union(tc: TestCase) {
     let (mut whole, mut left, mut right) = (DdSketch::new(), DdSketch::new(), DdSketch::new());
     for (at, &it) in values.iter().enumerate() {
         whole.add(it);
-        if at < cut { left.add(it) } else { right.add(it) };
+        if at < cut {
+            left.add(it)
+        } else {
+            right.add(it)
+        };
     }
     let mut merged = DdSketch::new();
     merged.merge(&left);

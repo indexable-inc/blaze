@@ -7,19 +7,31 @@ use super::*;
 
 /// The harness's walk, one directory at a time: every file's and link's line, sorted, hashed.
 fn model(root: &Path, skip: &[String]) -> [u8; 32] {
-    fn visit(dir: &Path, rel: &str, skip: &[String], files: &mut Vec<String>, links: &mut Vec<String>) {
+    fn visit(
+        dir: &Path,
+        rel: &str,
+        skip: &[String],
+        files: &mut Vec<String>,
+        links: &mut Vec<String>,
+    ) {
         let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|it| it.unwrap()).collect();
         entries.sort_by_key(|it| it.file_name());
         for entry in entries {
             let name = entry.file_name().into_string().unwrap();
             let path = entry.path();
             let meta = fs::symlink_metadata(&path).unwrap();
-            if rel.is_empty() && skip.contains(&name) && fs::metadata(&path).is_ok_and(|it| it.is_dir()) {
+            if rel.is_empty()
+                && skip.contains(&name)
+                && fs::metadata(&path).is_ok_and(|it| it.is_dir())
+            {
                 continue;
             }
             let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             if meta.file_type().is_symlink() {
-                links.push(format!("l\0{child}\0{}\n", fs::read_link(&path).unwrap().to_str().unwrap()));
+                links.push(format!(
+                    "l\0{child}\0{}\n",
+                    fs::read_link(&path).unwrap().to_str().unwrap()
+                ));
             } else if meta.is_dir() {
                 visit(&path, &child, skip, files, links);
             } else if meta.is_file() {
@@ -27,7 +39,10 @@ fn model(root: &Path, skip: &[String]) -> [u8; 32] {
                 let mut digest = Vec::new();
                 hex(&b3::hash(&bytes), &mut digest);
                 let executable = u8::from(super::executable(&path, &meta));
-                files.push(format!("f\0{child}\0{executable}\0{}\n", String::from_utf8(digest).unwrap()));
+                files.push(format!(
+                    "f\0{child}\0{executable}\0{}\n",
+                    String::from_utf8(digest).unwrap()
+                ));
             }
         }
     }
@@ -44,7 +59,8 @@ fn model(root: &Path, skip: &[String]) -> [u8; 32] {
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-v2-proof-tree-{name}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("blaze-v2-proof-tree-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

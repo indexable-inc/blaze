@@ -27,7 +27,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ReturnOutsideFunction) -> Vec<Foun
     };
     let span = cx.span_of(at);
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0572"), format!("{kind} statement outside of function body"), span);
+    let mut diag =
+        Diag::error(Some("E0572"), format!("{kind} statement outside of function body"), span);
     let mut body = None;
     for (it, child) in edges(cx, cx.syntax_view(at)) {
         if body.is_none() {
@@ -39,7 +40,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ReturnOutsideFunction) -> Vec<Foun
                 });
             if is_body {
                 let range: TextRange = match ast::BlockExpr::cast(it.value) {
-                    Some(block) => block.stmt_list().map_or(it.value.text_range(), |it| it.syntax().text_range()),
+                    Some(block) => block
+                        .stmt_list()
+                        .map_or(it.value.text_range(), |it| it.syntax().text_range()),
                     None if ast::ConstArg::can_cast(it.value.kind()) => it.value.text_range(),
                     None => child.value.text_range(),
                 };
@@ -52,7 +55,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ReturnOutsideFunction) -> Vec<Foun
             {
                 // alloc: the error's text, for an error hir found
                 diag.span_label(cx.span(body), format!("the {kind} is part of this body..."));
-                diag.span_label(cx.span(it.with_value(item_range(item.syntax()))), "...not the enclosing function body");
+                diag.span_label(
+                    cx.span(it.with_value(item_range(item.syntax()))),
+                    "...not the enclosing function body",
+                );
             }
             break;
         }

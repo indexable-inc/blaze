@@ -60,7 +60,9 @@ fn arc_new_arg<'t>(cx: &Cx<'_, 't>, call: ast::CallExpr<'t>) -> Option<ast::Expr
     if path.segment()?.name_ref()?.text() != "new" {
         return None;
     }
-    let PathResolution::Def(hir::ModuleDef::Adt(adt)) = cx.path(path.qualifier()?)? else { return None };
+    let PathResolution::Def(hir::ModuleDef::Adt(adt)) = cx.path(path.qualifier()?)? else {
+        return None;
+    };
     if std_adt(cx, adt) != Some(Std::Arc) {
         return None;
     }
@@ -95,7 +97,12 @@ pub fn g<T>(t: T) -> Arc<T> { Arc::new(t) }
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
-        assert!(found.contains("`Arc<Local>` can't be shared across threads: `Local` is neither `Send` nor `Sync`"), "{found}");
+        assert!(
+            found.contains(
+                "`Arc<Local>` can't be shared across threads: `Local` is neither `Send` nor `Sync`"
+            ),
+            "{found}"
+        );
         assert!(found.contains("`OnlySend` is not `Sync`"), "{found}");
     }
 

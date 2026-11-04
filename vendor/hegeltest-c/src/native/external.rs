@@ -105,15 +105,10 @@ pub(crate) fn encode_report(id: u64, run: &RunResult) -> Vec<u8> {
         Status::EarlyStop => 2,
         Status::Interesting => 3,
     });
-    put_opt(&mut out, run.origin.as_deref(), |out, origin| {
-        put_str(out, origin)
-    });
+    put_opt(&mut out, run.origin.as_deref(), |out, origin| put_str(out, origin));
     put_stream(&mut out, &run.nodes, &run.spans);
-    let mut targets: Vec<(&str, f64)> = run
-        .target_observations
-        .iter()
-        .map(|(label, score)| (label.as_str(), *score))
-        .collect();
+    let mut targets: Vec<(&str, f64)> =
+        run.target_observations.iter().map(|(label, score)| (label.as_str(), *score)).collect();
     targets.sort_by(|a, b| a.0.cmp(b.0));
     put_len(&mut out, targets.len());
     for (label, score) in targets {

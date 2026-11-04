@@ -3,8 +3,8 @@
 use std::{cmp::Ordering, ops::Range};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
+use std::alloc::Global;
 use stdx::format_to;
 use syntax_tree::TextRange;
 
@@ -630,9 +630,12 @@ impl TreeStore {
             .into_iter()
             .filter_map(|path| path.resolve(&new_root))
             .collect::<Vec<_>>();
-        radix::sort_by_key(&mut changed_elements, |element| u32::from(element.text_range().start()));
+        radix::sort_by_key(&mut changed_elements, |element| {
+            u32::from(element.text_range().start())
+        });
 
-        let mut annotations = HashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>, Global>::default();
+        let mut annotations =
+            HashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>, Global>::default();
         for annotation in state.annotations {
             if let Some(element) = annotation.path.resolve(&new_root) {
                 annotations

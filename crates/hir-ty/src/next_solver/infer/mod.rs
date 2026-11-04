@@ -28,8 +28,8 @@ use rustc_type_ir::{
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use traits::{ObligationCause, PredicateObligations};
-use union_find::UnionFind;
 use unify_key::ConstVariableValue;
+use union_find::UnionFind;
 
 pub use crate::next_solver::infer::traits::ObligationInspector;
 use crate::{
@@ -48,8 +48,8 @@ use super::{
     AliasTerm, Binder, CanonicalQueryInput, CanonicalVarValues, Const, ConstKind, DbInterner,
     ErrorGuaranteed, GenericArg, GenericArgs, OpaqueTypeKey, ParamEnv, PolyCoercePredicate,
     PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesClause,
-    PolySubtypePredicate, Region, RegionConstraint, SolverDefId, SubtypePredicate, Term,
-    TraitRef, Ty, TyKind, TypingMode,
+    PolySubtypePredicate, Region, RegionConstraint, SolverDefId, SubtypePredicate, Term, TraitRef,
+    Ty, TyKind, TypingMode,
 };
 
 pub mod at;
@@ -63,8 +63,8 @@ pub mod relate;
 pub mod resolve;
 pub mod select;
 pub(crate) mod snapshot;
-pub mod traits;
 pub(crate) mod touched;
+pub mod traits;
 mod type_variable;
 mod unify_key;
 mod union_find;
@@ -369,8 +369,7 @@ impl<'db> InferTables<'db> {
             + canonicalizer.variables.capacity() * size_of::<GenericArg<'db>>()
             + canonicalizer.var_kinds.capacity()
                 * size_of::<rustc_type_ir::CanonicalVarKind<DbInterner<'db>>>()
-            + canonicalizer.variable_lookup_table.capacity()
-                * size_of::<(GenericArg<'db>, usize)>()
+            + canonicalizer.variable_lookup_table.capacity() * size_of::<(GenericArg<'db>, usize)>()
             + canonicalizer.sub_root_lookup_table.capacity() * size_of::<(TyVid, usize)>()
             + self.placeholder_assumptions.capacity()
                 * (size_of::<(UniverseIndex, Assumptions<DbInterner<'db>>)>() + size_of::<usize>())
@@ -505,7 +504,10 @@ impl<'db> DbInternerInferExt<'db> for DbInterner<'db> {
 
 impl<'db> InferCtxtBuilder<'db> {
     /// Coherence turns this off: a spurious answer there must not change with the limit.
-    pub fn enable_next_solver_overflow_fcw(mut self, enable_next_solver_overflow_fcw: bool) -> Self {
+    pub fn enable_next_solver_overflow_fcw(
+        mut self,
+        enable_next_solver_overflow_fcw: bool,
+    ) -> Self {
         self.enable_next_solver_overflow_fcw = enable_next_solver_overflow_fcw;
         self
     }
@@ -927,14 +929,9 @@ impl<'db> InferCtxt<'db> {
         Ty::new_var(self.interner, vid)
     }
 
-    pub(crate) fn next_ty_var_for_param(
-        &self,
-        span: Span,
-        param: Option<TypeParamId>,
-    ) -> Ty<'db> {
+    pub(crate) fn next_ty_var_for_param(&self, span: Span, param: Option<TypeParamId>) -> Ty<'db> {
         let universe = self.universe();
-        let vid =
-            self.inner.borrow_mut().type_variables().new_var_for_param(universe, span, param);
+        let vid = self.inner.borrow_mut().type_variables().new_var_for_param(universe, span, param);
         Ty::new_var(self.interner, vid)
     }
 
@@ -1238,8 +1235,11 @@ impl<'db> InferCtxt<'db> {
         match ct.kind() {
             ConstKind::Infer(infer_ct) => match infer_ct {
                 InferConst::Var(vid) => {
-                    let (root, value) =
-                        self.inner.borrow_mut().const_unification_table().inlined_probe_key_value(vid);
+                    let (root, value) = self
+                        .inner
+                        .borrow_mut()
+                        .const_unification_table()
+                        .inlined_probe_key_value(vid);
                     value.known().unwrap_or_else(|| {
                         if root == vid { ct } else { Const::new_var(self.interner, root) }
                     })

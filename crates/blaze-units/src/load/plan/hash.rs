@@ -144,8 +144,12 @@ impl TomlDebugInfo {
             schema::DebugInfo::Level(0) => Ok(TomlDebugInfo::None),
             schema::DebugInfo::Level(1) => Ok(TomlDebugInfo::Limited),
             schema::DebugInfo::Level(2) => Ok(TomlDebugInfo::Full),
-            schema::DebugInfo::Named(name) if name == "line-directives-only" => Ok(TomlDebugInfo::LineDirectivesOnly),
-            schema::DebugInfo::Named(name) if name == "line-tables-only" => Ok(TomlDebugInfo::LineTablesOnly),
+            schema::DebugInfo::Named(name) if name == "line-directives-only" => {
+                Ok(TomlDebugInfo::LineDirectivesOnly)
+            }
+            schema::DebugInfo::Named(name) if name == "line-tables-only" => {
+                Ok(TomlDebugInfo::LineTablesOnly)
+            }
             other => Err(error(format!("the debuginfo level `{other:?}` is none cargo has"))),
         }
     }
@@ -169,7 +173,9 @@ impl TrimPaths {
             None | Some((_, Some("none"))) => Ok(TrimPaths::None),
             Some((_, Some("object"))) => Ok(TrimPaths::Object),
             Some((_, Some("all"))) => Ok(TrimPaths::All),
-            Some((other, _)) => Err(error(format!("the profile's `trim-paths` `{other}` is none the pinned cargo has"))),
+            Some((other, _)) => Err(error(format!(
+                "the profile's `trim-paths` `{other}` is none the pinned cargo has"
+            ))),
         }
     }
 }
@@ -268,7 +274,11 @@ fn needs_object(crate_types: &[CrateType]) -> bool {
 }
 
 fn lto_when_needs_object(crate_types: &[CrateType]) -> Lto {
-    if crate_types.iter().all(|it| *it == CrateType::Dylib) { Lto::OnlyObject } else { Lto::ObjectAndBitcode }
+    if crate_types.iter().all(|it| *it == CrateType::Dylib) {
+        Lto::OnlyObject
+    } else {
+        Lto::ObjectAndBitcode
+    }
 }
 
 /// What `lto::generate` is given of each unit.
@@ -336,7 +346,9 @@ fn calculate(units: &[Option<LtoUnit<'_>>], map: &mut [Option<Lto>], at: usize, 
                 (Lto::Run(name), _) | (_, Lto::Run(name)) => Lto::Run(name.clone()),
                 (Lto::Off, _) | (_, Lto::Off) => Lto::Off,
                 (Lto::ObjectAndBitcode, _) | (_, Lto::ObjectAndBitcode) => Lto::ObjectAndBitcode,
-                (Lto::OnlyObject, Lto::OnlyBitcode) | (Lto::OnlyBitcode, Lto::OnlyObject) => Lto::ObjectAndBitcode,
+                (Lto::OnlyObject, Lto::OnlyBitcode) | (Lto::OnlyBitcode, Lto::OnlyObject) => {
+                    Lto::ObjectAndBitcode
+                }
             };
             if result == *before {
                 return;
@@ -352,7 +364,11 @@ fn calculate(units: &[Option<LtoUnit<'_>>], map: &mut [Option<Lto>], at: usize, 
 
 /// cargo's `SourceId::stable_hash`: a path source under `workspace` by its relative path, any
 /// other by its URL (a git one by its canonical URL).
-pub(super) fn source_stable_hash<H: Hasher>(source: SourceId, workspace: &Path, into: &mut H) -> Result<(), LoadError> {
+pub(super) fn source_stable_hash<H: Hasher>(
+    source: SourceId,
+    workspace: &Path,
+    into: &mut H,
+) -> Result<(), LoadError> {
     if source.is_path() {
         let path = source
             .url()
@@ -376,7 +392,11 @@ pub(super) fn source_stable_hash<H: Hasher>(source: SourceId, workspace: &Path, 
 }
 
 /// cargo's `PackageIdStableHash`: the name, the version, the source's stable hash.
-pub(super) fn package_stable_hash<H: Hasher>(id: PackageId, workspace: &Path, into: &mut H) -> Result<(), LoadError> {
+pub(super) fn package_stable_hash<H: Hasher>(
+    id: PackageId,
+    workspace: &Path,
+    into: &mut H,
+) -> Result<(), LoadError> {
     id.name().as_str().hash(into);
     id.version().hash(into);
     source_stable_hash(id.source_id(), workspace, into)
@@ -438,12 +458,15 @@ impl RustcVersion {
     /// Of `rustc -V`'s text after `rustc ` (`1.101.0-nightly (16d1ffac1 2026-10-26)`).
     pub fn of(version: &str, verbose: impl FnOnce() -> String) -> Result<RustcVersion, LoadError> {
         let release = version.split_whitespace().next().unwrap_or_default();
-        let parsed = semver::Version::parse(release)
-            .map_err(|e| error(format!("blaze's rustc version `{version}` is not a version: {e}")))?;
+        let parsed = semver::Version::parse(release).map_err(|e| {
+            error(format!("blaze's rustc version `{version}` is not a version: {e}"))
+        })?;
         Ok(if parsed.pre.is_empty() {
             RustcVersion::Verbose(verbose())
         } else {
-            RustcVersion::Channel(parsed.pre.as_str().split('.').next().unwrap_or_default().to_owned())
+            RustcVersion::Channel(
+                parsed.pre.as_str().split('.').next().unwrap_or_default().to_owned(),
+            )
         })
     }
 
@@ -488,16 +511,28 @@ pub(super) struct Meta {
 impl Meta {
     /// A plan made elsewhere (the standard library's), read back. Only its hashes are read:
     /// `pkg_dir` names a directory of the plan's own, which nothing here makes.
-    pub fn read(metadata: &str, unit_id: &str, extra_filename: &str, what: &str) -> Result<Meta, LoadError> {
+    pub fn read(
+        metadata: &str,
+        unit_id: &str,
+        extra_filename: &str,
+        what: &str,
+    ) -> Result<Meta, LoadError> {
         let hex = |text: &str| {
             u64::from_str_radix(text, 16)
                 .ok()
                 .filter(|_| text.len() == 16)
                 .ok_or_else(|| error(format!("{what}'s hash `{text}` is not 16 hex digits")))
         };
-        let meta = Meta { unit_id: hex(unit_id)?, c_metadata: hex(metadata)?, c_extra_filename: !extra_filename.is_empty(), pkg_dir: true };
+        let meta = Meta {
+            unit_id: hex(unit_id)?,
+            c_metadata: hex(metadata)?,
+            c_extra_filename: !extra_filename.is_empty(),
+            pkg_dir: true,
+        };
         if meta.extra_filename() != extra_filename {
-            return Err(error(format!("{what}'s `-C extra-filename` `{extra_filename}` is not of its unit id `{unit_id}`")));
+            return Err(error(format!(
+                "{what}'s `-C extra-filename` `{extra_filename}` is not of its unit id `{unit_id}`"
+            )));
         }
         Ok(meta)
     }

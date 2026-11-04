@@ -5,10 +5,10 @@
 use parking_lot::Mutex;
 
 use base_db::{Crate, all_crates};
-use hir_def::nameres::frozen::{self as frozen_def, Frozen, Mode};
 use blaze_hash::HashMap;
-use std::alloc::Global;
+use hir_def::nameres::frozen::{self as frozen_def, Frozen, Mode};
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use crate::{method_resolution::frozen as frozen_impls, test_db::TestDB};
 
@@ -104,7 +104,11 @@ fn frozen() -> Bytes {
     })
 }
 
-fn by_crate(db: &TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) -> HashMap<Crate, Frozen, Global> {
+fn by_crate(
+    db: &TestDB,
+    mode: Mode,
+    bytes: &[(String, Vec<u8>)],
+) -> HashMap<Crate, Frozen, Global> {
     let crates = crates(db);
     bytes
         .iter()

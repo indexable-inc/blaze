@@ -29,7 +29,6 @@
 use base_db::{Db, FileId};
 use blaze_api::{ApiError, How};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::{Crate, ItemInNs, ModPath, ModuleDef, Name, PathKind, PathResolution};
 use hir_def::{
     Lookup as _, ModuleDefId, ModuleId,
@@ -37,6 +36,7 @@ use hir_def::{
     resolver::HasResolver as _,
 };
 use memchr::memmem::Finder;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -347,8 +347,10 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
              depending on it would"
         ));
     }
-    let named: Vec<Crate> =
-        Crate::all(db).into_iter().filter(|it| it.base().rust_name(db).is_ok_and(|it| it.as_str() == first)).collect(); // alloc: the crates by one name, once a replace
+    let named: Vec<Crate> = Crate::all(db)
+        .into_iter()
+        .filter(|it| it.base().rust_name(db).is_ok_and(|it| it.as_str() == first))
+        .collect(); // alloc: the crates by one name, once a replace
     let depended = |krate: Crate| {
         view.contains(&krate)
             || view.iter().any(|it| it.dependencies_iter(db).any(|dep| dep.krate == krate))

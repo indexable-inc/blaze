@@ -8,7 +8,7 @@
 
 use std::hash::Hasher;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ImplId,
     ItemContainerId, Lookup, ModuleIdLt, TraitId, TypeAliasId, VariantId,

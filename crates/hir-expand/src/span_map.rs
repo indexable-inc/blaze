@@ -110,10 +110,7 @@ impl HirFileId {
 /// This is an implementation detail of [`HirFileId::span_map`]. Outside this crate, use
 /// `HirFileId::from(file_id).span_map(db)` instead of `real_span_map(db, file_id)`.
 #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
-pub(crate) fn real_span_map(
-    db: &Db,
-    editioned_file_id: base_db::EditionedFileId,
-) -> RealSpanMap {
+pub(crate) fn real_span_map(db: &Db, editioned_file_id: base_db::EditionedFileId) -> RealSpanMap {
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
         real_span_map_in(db, editioned_file_id, frame)
     })
@@ -169,7 +166,8 @@ fn real_span_map_in(
         }
         view::Item::Impl(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(assoc_item_list) = it.assoc_item_list() {
-                pairs.extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
+                pairs
+                    .extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
             }
         }
         view::Item::Module(it) if view::attrs_including_inner(&it).next().is_none() => {
@@ -179,7 +177,8 @@ fn real_span_map_in(
         }
         view::Item::Trait(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(assoc_item_list) = it.assoc_item_list() {
-                pairs.extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
+                pairs
+                    .extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
             }
         }
         _ => (),

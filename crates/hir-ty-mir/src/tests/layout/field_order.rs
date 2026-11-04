@@ -80,7 +80,9 @@ impl Fx {
         self.declarations()
             .into_iter()
             .find_map(|it| match it {
-                ModuleDefId::FunctionId(f) if FunctionSignature::of(db, f).name.as_str() == name => {
+                ModuleDefId::FunctionId(f)
+                    if FunctionSignature::of(db, f).name.as_str() == name =>
+                {
                     Some(f)
                 }
                 _ => None,
@@ -107,7 +109,9 @@ impl Fx {
         blaze_query::db::attach(db, || {
             let interner = DbInterner::new_no_crate(db);
             let (ty, def, krate) = match self.declarations().into_iter().find_map(|it| match it {
-                ModuleDefId::TypeAliasId(t) if TypeAliasSignature::of(db, t).name.as_str() == name => {
+                ModuleDefId::TypeAliasId(t)
+                    if TypeAliasSignature::of(db, t).name.as_str() == name =>
+                {
                     Some(t)
                 }
                 _ => None,

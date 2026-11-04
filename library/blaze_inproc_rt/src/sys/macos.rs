@@ -35,12 +35,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
 pub use super::unix::{
-    Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
+    Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize,
+    wait_answer,
 };
-pub use rendezvous::{Remote, recv_objects, send_objects};
 use crate::channel::Channel;
 use crate::handshake::Overlay;
 use crate::{Access, Error};
+pub use rendezvous::{Remote, recv_objects, send_objects};
 
 type Port = u32;
 type Kern = c_int;
@@ -118,13 +119,26 @@ pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     let micros = u32::try_from(timeout.as_micros()).unwrap_or(u32::MAX).max(1);
     // SAFETY: `word` is live and 8-aligned; the kernel compares its first four bytes, the low
     // half, with `expected` and sleeps on the memory they name.
-    let got = unsafe { __ulock_wait(UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, word.as_ptr().cast(), u64::from(expected), micros) };
+    let got = unsafe {
+        __ulock_wait(
+            UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
+            word.as_ptr().cast(),
+            u64::from(expected),
+            micros,
+        )
+    };
     got != -libc::ETIMEDOUT
 }
 
 pub fn wake(word: &AtomicU64) {
     // SAFETY: as in `wait`; a wake reads nothing of the word.
-    unsafe { __ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL | ULF_NO_ERRNO, word.as_ptr().cast(), 0) };
+    unsafe {
+        __ulock_wake(
+            UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL | ULF_NO_ERRNO,
+            word.as_ptr().cast(),
+            0,
+        )
+    };
 }
 
 fn task() -> Port {
@@ -151,9 +165,21 @@ fn sysctl_int(name: &CStr) -> Result<i64, Error> {
     let mut value = [0u8; 8];
     let mut len = value.len();
     // SAFETY: `name` is NUL-terminated; `value` has `len` writable bytes and `len` is live.
-    let got = unsafe { libc::sysctlbyname(name.as_ptr(), value.as_mut_ptr().cast(), &raw mut len, std::ptr::null_mut(), 0) };
+    let got = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
     if got != 0 {
-        return Err(Error::new(format!("sysctl {}: {}", name.to_string_lossy(), std::io::Error::last_os_error())));
+        return Err(Error::new(format!(
+            "sysctl {}: {}",
+            name.to_string_lossy(),
+            std::io::Error::last_os_error()
+        )));
     }
     match len {
         4 => Ok(i64::from(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]))),
@@ -207,11 +233,16 @@ impl Object {
             )
         };
         if code != KERN_SUCCESS {
-            return Err(kern(&format!("mach_make_memory_entry_64 of memory object {name:?}, {len:#x} bytes"), code));
+            return Err(kern(
+                &format!("mach_make_memory_entry_64 of memory object {name:?}, {len:#x} bytes"),
+                code,
+            ));
         }
         let object = Object { port, len };
         if size < len {
-            return Err(Error::new(format!("memory object {name:?} was made {size:#x} bytes, not {len:#x}")));
+            return Err(Error::new(format!(
+                "memory object {name:?} was made {size:#x} bytes, not {len:#x}"
+            )));
         }
         Ok(object)
     }
@@ -247,14 +278,29 @@ impl Object {
         let mut port = MACH_PORT_NULL;
         // SAFETY: `size` and `port` are live out-pointers; `self.port` is this process's send
         // right to the parent entry, which the new entry ranges over from offset 0.
-        let code = unsafe { mach_make_memory_entry_64(task(), &raw mut size, 0, protection, &raw mut port, self.port) };
+        let code = unsafe {
+            mach_make_memory_entry_64(
+                task(),
+                &raw mut size,
+                0,
+                protection,
+                &raw mut port,
+                self.port,
+            )
+        };
         if code != KERN_SUCCESS {
-            return Err(kern(&format!("mach_make_memory_entry_64 of a sub-entry of protection {protection:#x}"), code));
+            return Err(kern(
+                &format!("mach_make_memory_entry_64 of a sub-entry of protection {protection:#x}"),
+                code,
+            ));
         }
         if size < self.len {
             // SAFETY: `port` is the send right just made, which nothing else refers to.
             unsafe { mach_port_deallocate(task(), port) };
-            return Err(Error::new(format!("a sub-entry was made {size:#x} bytes, not {:#x}", self.len)));
+            return Err(Error::new(format!(
+                "a sub-entry was made {size:#x} bytes, not {:#x}",
+                self.len
+            )));
         }
         Ok(port)
     }
@@ -273,7 +319,9 @@ fn map_entry(
 ) -> Result<u64, Error> {
     let page = page();
     if !offset.is_multiple_of(page) || len == 0 || at.is_some_and(|it| !it.is_multiple_of(page)) {
-        return Err(Error::new(format!("a map of {len:#x} bytes at offset {offset:#x}: not whole pages of {page:#x}")));
+        return Err(Error::new(format!(
+            "a map of {len:#x} bytes at offset {offset:#x}: not whole pages of {page:#x}"
+        )));
     }
     let len = len.next_multiple_of(page);
     let flags = if at.is_some() { VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE } else { VM_FLAGS_ANYWHERE };
@@ -282,18 +330,37 @@ fn map_entry(
     // pointer. With no address the kernel picks free space; a fixed one is an overlay, which
     // replaces only pages its caller proved it may (`overlay`).
     let code = unsafe {
-        mach_vm_map(task(), &raw mut address, len, 0, flags, port, offset, c_int::from(copy), protection, protection, inheritance)
+        mach_vm_map(
+            task(),
+            &raw mut address,
+            len,
+            0,
+            flags,
+            port,
+            offset,
+            c_int::from(copy),
+            protection,
+            protection,
+            inheritance,
+        )
     };
     if code != KERN_SUCCESS {
         let place = at.map(|it| format!(" to {it:#x}")).unwrap_or_default();
-        return Err(kern(&format!("mach_vm_map of {len:#x} bytes at offset {offset:#x}{place}, protection {protection:#x}"), code));
+        return Err(kern(
+            &format!(
+                "mach_vm_map of {len:#x} bytes at offset {offset:#x}{place}, protection {protection:#x}"
+            ),
+            code,
+        ));
     }
     if let Some(at) = at
         && address != at
     {
         // SAFETY: the mapping just made, of `len` bytes, which nothing uses.
         unsafe { mach_vm_deallocate(task(), address, len) };
-        return Err(Error::new(format!("{at:#x} is taken: the kernel mapped {len:#x} bytes at {address:#x} instead")));
+        return Err(Error::new(format!(
+            "{at:#x} is taken: the kernel mapped {len:#x} bytes at {address:#x} instead"
+        )));
     }
     Ok(address)
 }
@@ -367,7 +434,11 @@ impl View {
     }
 
     pub fn word(&self, at: usize) -> &AtomicU64 {
-        assert!(at.is_multiple_of(8) && at + 8 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
+        assert!(
+            at.is_multiple_of(8) && at + 8 <= self.len,
+            "a word at {at:#x} of a view of {:#x}",
+            self.len
+        );
         // SAFETY: `at` is 8-aligned and in the mapping (asserted), page-aligned itself, so the
         // word is aligned; every access to the word, in this process and others, is atomic.
         let ptr = unsafe { self.at.add(at) };
@@ -376,7 +447,11 @@ impl View {
     }
 
     pub fn word32(&self, at: usize) -> &AtomicU32 {
-        assert!(at.is_multiple_of(4) && at + 4 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
+        assert!(
+            at.is_multiple_of(4) && at + 4 <= self.len,
+            "a word at {at:#x} of a view of {:#x}",
+            self.len
+        );
         // SAFETY: as for `word`, 4-aligned.
         let ptr = unsafe { self.at.add(at) };
         // SAFETY: as for `word`, 4-aligned.
@@ -447,7 +522,11 @@ impl Drop for JitWritable {
 }
 
 impl Exec {
-    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(
+        code: usize,
+        data: usize,
+        write: impl FnOnce(&mut [u8], &mut [u8]),
+    ) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let data_pages = data.next_multiple_of(page);
@@ -468,7 +547,13 @@ impl Exec {
                 std::io::Error::last_os_error()
             )));
         }
-        let mut exec = Exec { code: at.cast(), code_pages, data: std::ptr::null_mut(), data_pages, data_len: data };
+        let mut exec = Exec {
+            code: at.cast(),
+            code_pages,
+            data: std::ptr::null_mut(),
+            data_pages,
+            data_len: data,
+        };
         if data_pages != 0 {
             // SAFETY: an anonymous mapping; the address is only a hint, so nothing is replaced,
             // and where the kernel put it is checked below.
@@ -483,10 +568,14 @@ impl Exec {
                 )
             };
             if at == libc::MAP_FAILED {
-                return Err(Error::new(format!("mmap of {data_pages:#x} bytes of data: {}", std::io::Error::last_os_error())));
+                return Err(Error::new(format!(
+                    "mmap of {data_pages:#x} bytes of data: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
             exec.data = at.cast();
-            let far = (exec.data as usize).abs_diff(exec.code as usize) + code_pages.max(data_pages);
+            let far =
+                (exec.data as usize).abs_diff(exec.code as usize) + code_pages.max(data_pages);
             if far >= 1 << 30 {
                 return Err(Error::new(format!(
                     "the data was mapped {far:#x} bytes from the code, past the 1 GiB a PC-relative reference reaches"
@@ -495,7 +584,11 @@ impl Exec {
         }
         {
             let _writable = JitWritable::new();
-            let data_at = if exec.data.is_null() { std::ptr::NonNull::dangling().as_ptr() } else { exec.data };
+            let data_at = if exec.data.is_null() {
+                std::ptr::NonNull::dangling().as_ptr()
+            } else {
+                exec.data
+            };
             // SAFETY: the fresh mappings are readable and writable on this thread while
             // `_writable` lives, nothing else refers to them, and `code <= code_pages`.
             // `write` cannot keep the slice past its return.
@@ -527,7 +620,11 @@ impl Exec {
     }
 
     pub fn data_address(&self) -> u64 {
-        if self.data.is_null() { self.code as u64 + self.code_pages as u64 } else { self.data as u64 }
+        if self.data.is_null() {
+            self.code as u64 + self.code_pages as u64
+        } else {
+            self.data as u64
+        }
     }
 
     pub fn data(&mut self) -> &mut [u8] {
@@ -594,7 +691,11 @@ impl Granted {
         let protection = match access {
             Access::Read => VM_PROT_READ,
             Access::Shared => VM_PROT_READ | VM_PROT_WRITE,
-            other => return Err(Error::new(format!("a whole granted object mapped anywhere as {other:?}"))),
+            other => {
+                return Err(Error::new(format!(
+                    "a whole granted object mapped anywhere as {other:?}"
+                )));
+            }
         };
         map_entry(self.port, 0, self.len, None, protection, false, VM_INHERIT_SHARE)
     }
@@ -605,7 +706,10 @@ impl Granted {
     fn overlay(&self, offset: u64, len: u64, at: u64, access: Access) -> Result<(), Error> {
         let rounded = len.next_multiple_of(page());
         if offset.checked_add(rounded).is_none_or(|end| end > self.len) {
-            return Err(Error::new(format!("an overlay of {len:#x} bytes at offset {offset:#x} of an object of {:#x}", self.len)));
+            return Err(Error::new(format!(
+                "an overlay of {len:#x} bytes at offset {offset:#x} of an object of {:#x}",
+                self.len
+            )));
         }
         let protection = match access {
             Access::Execute => {
@@ -616,12 +720,15 @@ impl Granted {
             Access::Shared => VM_PROT_READ | VM_PROT_WRITE,
             Access::Copy => return self.copy(offset, rounded, at),
         };
-        map_entry(self.port, offset, rounded, Some(at), protection, false, VM_INHERIT_SHARE).map(drop)
+        map_entry(self.port, offset, rounded, Some(at), protection, false, VM_INHERIT_SHARE)
+            .map(drop)
     }
 
     fn copy(&self, offset: u64, len: u64, at: u64) -> Result<(), Error> {
         if !at.is_multiple_of(page()) || len == 0 {
-            return Err(Error::new(format!("a copy of {len:#x} bytes to {at:#x}: not whole pages")));
+            return Err(Error::new(format!(
+                "a copy of {len:#x} bytes to {at:#x}: not whole pages"
+            )));
         }
         let source = map_entry(self.port, offset, len, None, VM_PROT_READ, false, VM_INHERIT_NONE)?;
         let source = View::adopt(source, len, false)?;
@@ -645,7 +752,10 @@ impl Granted {
             )
         };
         if code != KERN_SUCCESS {
-            return Err(kern(&format!("mach_vm_map of {len:#x} bytes of private memory over {at:#x}"), code));
+            return Err(kern(
+                &format!("mach_vm_map of {len:#x} bytes of private memory over {at:#x}"),
+                code,
+            ));
         }
         let bytes = source.bytes(0..source.len())?;
         // SAFETY: `at..at + len` is the writable memory just mapped, which nothing else refers
@@ -661,12 +771,22 @@ pub fn granted(object: &Object, rights: super::Rights) -> Result<Granted, Error>
     Ok(Granted { port: object.entry(rendezvous::protection(rights))?, len: object.len })
 }
 
-pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+pub fn overlay(
+    _: &mut Channel,
+    objects: &[Granted],
+    overlays: &[Overlay],
+    slide: u64,
+) -> Result<(), Error> {
     for overlay in overlays {
-        let object = objects
-            .get(overlay.object as usize)
-            .ok_or_else(|| Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len())))?;
-        object.overlay(overlay.offset, overlay.len, overlay.at.wrapping_add(slide), overlay.access)?;
+        let object = objects.get(overlay.object as usize).ok_or_else(|| {
+            Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len()))
+        })?;
+        object.overlay(
+            overlay.offset,
+            overlay.len,
+            overlay.at.wrapping_add(slide),
+            overlay.access,
+        )?;
     }
     Ok(())
 }
@@ -695,7 +815,10 @@ pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
 }
 
 pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
-    let path = |it: &Path| CString::new(it.as_os_str().as_bytes()).map_err(|_| Error::new(format!("{} has a NUL", it.display())));
+    let path = |it: &Path| {
+        CString::new(it.as_os_str().as_bytes())
+            .map_err(|_| Error::new(format!("{} has a NUL", it.display())))
+    };
     let (source, target) = (path(from)?, path(to)?);
     // SAFETY: both are NUL-terminated paths live for the call; clonefile makes `target` new.
     if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
@@ -714,16 +837,21 @@ pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     let mut capacity = 64usize;
     loop {
         out.resize(capacity, 0);
-        let bytes = c_int::try_from(capacity * 8).map_err(|_| Error::new(format!("{capacity} threads in process {pid}")))?;
+        let bytes = c_int::try_from(capacity * 8)
+            .map_err(|_| Error::new(format!("{capacity} threads in process {pid}")))?;
         // SAFETY: `out` has `capacity` writable u64s, `bytes` bytes, for the IDs.
-        let got = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, out.as_mut_ptr().cast(), bytes) };
+        let got = unsafe {
+            libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, out.as_mut_ptr().cast(), bytes)
+        };
         if got <= 0 {
             let error = std::io::Error::last_os_error();
             out.clear();
             if got == 0 || error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
             }
-            return Err(Error::new(format!("proc_pidinfo PROC_PIDLISTTHREADIDS of process {pid}: {error}")));
+            return Err(Error::new(format!(
+                "proc_pidinfo PROC_PIDLISTTHREADIDS of process {pid}: {error}"
+            )));
         }
         let count = got as usize / 8;
         if count < capacity {

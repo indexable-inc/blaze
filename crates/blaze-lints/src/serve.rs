@@ -11,8 +11,8 @@ use blaze_diagnostics::{
     model::{Child, Diag},
 };
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 use crate::{
     check::{Found, Setup},
@@ -109,7 +109,11 @@ impl Setups {
 
     /// Makes `package`'s setup unless one was made of the same.
     fn load(&mut self, package: &Package) {
-        if self.by_dir.get(package.manifest_dir.as_path()).is_some_and(|it| it.iter().any(|(of, _)| of.is(package))) {
+        if self
+            .by_dir
+            .get(package.manifest_dir.as_path())
+            .is_some_and(|it| it.iter().any(|(of, _)| of.is(package)))
+        {
             return;
         }
         let of = SetupOf {
@@ -161,7 +165,12 @@ pub fn answer_with<P: AsRef<Path>>(
             Err(_) => path.to_string_lossy().into_owned(),
         })
     };
-    let style = Style { short: ask.short, ansi: ask.ansi, width: ask.width.unwrap_or(emit::WIDTH), ui_testing: false };
+    let style = Style {
+        short: ask.short,
+        ansi: ask.ansi,
+        width: ask.width.unwrap_or(emit::WIDTH),
+        ui_testing: false,
+    };
     let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
     let mut sources = Sources::default();
     let mut answer = Answer::default();
@@ -217,7 +226,8 @@ pub fn answer_with<P: AsRef<Path>>(
         };
         let plain: Vec<&Found> = found.iter().filter(|it| !it.test_only).collect();
         let lints = (|| {
-            let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style)).transpose()?;
+            let test =
+                has_tests.then(|| written(found.iter(), &mut sources, &read, style)).transpose()?;
             Ok::<_, Unplaced>((written(plain.into_iter(), &mut sources, &read, style)?, test))
         })();
         match lints {
@@ -304,7 +314,8 @@ fn cargo_order(line: &str) -> String {
 fn sort_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             for (key, mut it) in entries {
                 sort_keys(&mut it);
@@ -357,7 +368,10 @@ mod tests {
         let first = Ok(Some(crate::conf::Version(1, 60, 0)));
         assert_eq!(msrv(&setups, &plain), first);
         assert_eq!(msrv(&setups, &warned), first);
-        assert_eq!(setups.get(&plain).as_ref().unwrap().command_line.lints.opts, setup(&plain).unwrap().command_line.lints.opts);
+        assert_eq!(
+            setups.get(&plain).as_ref().unwrap().command_line.lints.opts,
+            setup(&plain).unwrap().command_line.lints.opts
+        );
         assert_ne!(
             setups.get(&warned).as_ref().unwrap().command_line.lints.opts,
             setups.get(&plain).as_ref().unwrap().command_line.lints.opts,

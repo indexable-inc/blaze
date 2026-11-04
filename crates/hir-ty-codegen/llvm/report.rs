@@ -43,7 +43,8 @@ pub(crate) enum Asked {
 impl Asked {
     /// For a function built with `report`, with debug information if `debug`, for `target`.
     pub(crate) fn of(report: bool, debug: bool, target: &crate::Target) -> Asked {
-        let read_back = matches!(target.object_format, crate::ObjectFormat::Elf | crate::ObjectFormat::Coff);
+        let read_back =
+            matches!(target.object_format, crate::ObjectFormat::Elf | crate::ObjectFormat::Coff);
         match (report, debug && read_back) {
             (false, _) => Asked::No,
             (true, true) => Asked::Lined,
@@ -132,7 +133,11 @@ impl Raw {
             ffi::LLVMBlazeFoundMissed => Found::Missed { name, message },
             ffi::LLVMBlazeFoundAnalysis => Found::Analysis { name, message },
             // alloc: the error's message
-            other => return Err(Unhandled::Llvm(format!("a report row of kind {other}, which blaze's wrapper never makes"))),
+            other => {
+                return Err(Unhandled::Llvm(format!(
+                    "a report row of kind {other}, which blaze's wrapper never makes"
+                )));
+            }
         };
         let heat = match heat {
             ffi::LLVMBlazeHeatUnprofiled => Heat::Unprofiled,
@@ -140,7 +145,11 @@ impl Raw {
             ffi::LLVMBlazeHeatCold => Heat::Cold(count),
             ffi::LLVMBlazeHeatHot => Heat::Hot(count),
             // alloc: the error's message
-            other => return Err(Unhandled::Llvm(format!("a report row of heat {other}, which blaze's wrapper never makes"))),
+            other => {
+                return Err(Unhandled::Llvm(format!(
+                    "a report row of heat {other}, which blaze's wrapper never makes"
+                )));
+            }
         };
         Ok(Raw { found, line, loop_line, heat })
     }
@@ -148,7 +157,9 @@ impl Raw {
 
 #[cfg(test)]
 mod tests {
-    use inkwell::{context::Context, memory_buffer::MemoryBuffer, module::Module, targets::FileType};
+    use inkwell::{
+        context::Context, memory_buffer::MemoryBuffer, module::Module, targets::FileType,
+    };
 
     use super::*;
     use crate::{
@@ -163,7 +174,8 @@ mod tests {
     }
 
     fn machine() -> Machinery {
-        let optimization = Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
+        let optimization =
+            Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
         Machinery::new(Machine::create(crate::Target::x86_64_linux(), optimization).unwrap())
     }
 
@@ -231,7 +243,8 @@ done:
     #[test]
     fn a_check_kept_in_a_loop_is_found_at_its_call() {
         let found = report(&format!("{CHECKED}{LINES}"), "function(simplifycfg)");
-        let kept: Vec<_> = found.iter().filter(|it| matches!(it.found, Found::Kept { .. })).collect();
+        let kept: Vec<_> =
+            found.iter().filter(|it| matches!(it.found, Found::Kept { .. })).collect();
         assert_eq!(kept.len(), 1, "{found:?}");
         assert_eq!(kept[0].found, Found::Kept { callee: Called::Request(1) });
         assert_eq!((kept[0].line, kept[0].loop_line), (7, 3));
@@ -249,7 +262,10 @@ done:
              short:\n  call void @\"blaze.f.1\"(i64 %n, i64 %len), !dbg !7\n  call void @llvm.trap(), !dbg !7\n  \
              unreachable, !dbg !7",
         );
-        let found = report(&format!("{proven}{LINES}"), "function(instcombine,simplifycfg,indvars,constraint-elimination,instcombine,simplifycfg)");
+        let found = report(
+            &format!("{proven}{LINES}"),
+            "function(instcombine,simplifycfg,indvars,constraint-elimination,instcombine,simplifycfg)",
+        );
         assert!(!found.iter().any(|it| matches!(it.found, Found::Kept { .. })), "{found:?}");
     }
 
@@ -300,7 +316,12 @@ done:
             let started = std::time::Instant::now();
             if reporting {
                 machine
-                    .reported(|| Ok((machine.run(&module, "default<O3>", true)?, module.get_function(OWN).unwrap())))
+                    .reported(|| {
+                        Ok((
+                            machine.run(&module, "default<O3>", true)?,
+                            module.get_function(OWN).unwrap(),
+                        ))
+                    })
                     .unwrap();
             } else {
                 machine.run(&module, "default<O3>", true).unwrap();
@@ -313,7 +334,9 @@ done:
             reported += once(true);
         }
         let ratio = reported.as_secs_f64() / plain.as_secs_f64();
-        println!("vecreport: {ROUNDS} runs, plain {plain:?}, reported {reported:?}, ratio {ratio:.3}");
+        println!(
+            "vecreport: {ROUNDS} runs, plain {plain:?}, reported {reported:?}, ratio {ratio:.3}"
+        );
         assert!(ratio < 2.0, "the report took {ratio:.2} times the passes alone");
     }
 
@@ -348,9 +371,13 @@ done:
             let machine = machine();
             let run = || machine.run(&module, "default<O3>", true);
             if reporting {
-                let ((), found) =
-                    machine.reported(|| Ok((run()?, module.get_function(OWN).expect("its function")))).unwrap();
-                assert!(!found.iter().any(|it| matches!(it.found, Found::Missed { .. })), "{found:?}");
+                let ((), found) = machine
+                    .reported(|| Ok((run()?, module.get_function(OWN).expect("its function"))))
+                    .unwrap();
+                assert!(
+                    !found.iter().any(|it| matches!(it.found, Found::Missed { .. })),
+                    "{found:?}"
+                );
             } else {
                 run().unwrap();
             }

@@ -362,7 +362,10 @@ fn reads_and_writes_into_room_allocate_nothing() {
         );
         (read, padded_u32(5), padded_i32(-1), put_u64(&mut place, u64::MAX))
     });
-    assert_eq!(read, ((Ok(624_485), Ok(-123_456), Ok(0), Ok(())), padded_u32(5), padded_i32(-1), 10));
+    assert_eq!(
+        read,
+        ((Ok(624_485), Ok(-123_456), Ok(0), Ok(())), padded_u32(5), padded_i32(-1), 10)
+    );
     assert_eq!(out[..6], [0xe5, 0x8e, 0x26, 0xc0, 0xbb, 0x78]);
 }
 
@@ -384,9 +387,11 @@ fn an_exactly_sized_vector_never_grows() {
 
 /// A value of every length: `bits` random bits, so short encodings are drawn as often as long.
 fn sized() -> impl PrintableGenerator<u64> {
-    gs::tuples!(gs::integers::<u32>().max_value(64), gs::integers::<u64>()).map(|(bits, value)| match bits {
-        64 => value,
-        bits => value & ((1 << bits) - 1),
+    gs::tuples!(gs::integers::<u32>().max_value(64), gs::integers::<u64>()).map(|(bits, value)| {
+        match bits {
+            64 => value,
+            bits => value & ((1 << bits) - 1),
+        }
     })
 }
 

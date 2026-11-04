@@ -10,8 +10,8 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::FunctionSignature,
 };
-use rustc_ast_ir::Mutability;
 use hir_expand::fixture;
+use rustc_ast_ir::Mutability;
 
 use crate::{BindingMode, ByRef, InferBodyId, InferenceResult, utils::pat_has_ref_mut_binding};
 
@@ -45,7 +45,11 @@ fn function(db: &Db, name: &str) -> FunctionId {
 }
 
 /// The copies inference and MIR lowering had, one body over either's binding modes.
-fn reference(store: &ExpressionStore, pat: PatId, mode: impl Fn(PatId) -> Option<BindingMode>) -> bool {
+fn reference(
+    store: &ExpressionStore,
+    pat: PatId,
+    mode: impl Fn(PatId) -> Option<BindingMode>,
+) -> bool {
     let mut found = false;
     store.walk_pats(pat, &mut |pat| {
         if let Some(BindingMode(ByRef::Yes(Mutability::Mut), _)) = mode(pat) {

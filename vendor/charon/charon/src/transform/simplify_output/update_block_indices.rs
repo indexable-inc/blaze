@@ -23,9 +23,7 @@ impl UllbcPass for Transform {
 
         let mut old_blocks = mem::take(&mut b.body);
         let mut id_map: IndexVec<BlockId, Option<BlockId>> = old_blocks.map_ref(|_| None);
-        let postorder = DfsPostOrder::new(&graph, START_BLOCK_ID)
-            .iter(&graph)
-            .collect_vec();
+        let postorder = DfsPostOrder::new(&graph, START_BLOCK_ID).iter(&graph).collect_vec();
         for id in postorder.into_iter().rev() {
             let new_id = b.body.push(old_blocks[id].take());
             id_map[id] = Some(new_id);

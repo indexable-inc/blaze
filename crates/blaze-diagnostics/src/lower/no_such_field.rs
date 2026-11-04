@@ -23,16 +23,13 @@ use syntax::{
     view::{self as ast, AstNode as _, HasName as _},
 };
 
-use stdx::list::Join;
 use crate::{
     cx::{Cx, item_range_view as item_range},
     lints::code_fact,
-    lower::{
-        Found, Phase,
-        unresolved_field::name_series_display,
-    },
+    lower::{Found, Phase, unresolved_field::name_series_display},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
+use stdx::list::Join;
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NoSuchField) -> Vec<Found> {
     let node = cx.node_view(d.field);
@@ -91,7 +88,10 @@ impl<'db> Record<'db> {
         }
     }
 
-    pub(crate) fn of(file: HirFileId, record: Either<ast::RecordExpr<'db>, ast::RecordPat<'db>>) -> Option<Record<'db>> {
+    pub(crate) fn of(
+        file: HirFileId,
+        record: Either<ast::RecordExpr<'db>, ast::RecordPat<'db>>,
+    ) -> Option<Record<'db>> {
         Some(match record {
             Either::Left(expr) => {
                 let list = expr.record_expr_field_list()?;
@@ -253,7 +253,12 @@ fn adt_fact(cx: &Cx<'_, '_>, diag: &mut Diag, variant: hir::Variant) {
 }
 
 /// E0560 and E0559 (`report_unknown_field`).
-fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant: hir::Variant) -> Option<(Diag, Phase)> {
+fn unknown_field<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    at: usize,
+    variant: hir::Variant,
+) -> Option<(Diag, Phase)> {
     let field = &record.fields[at];
     let ident = record.span(cx, field.ident);
     let kind_name = variant_descr(variant);
@@ -274,7 +279,11 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
             ident.clone(),
         ),
         // alloc: the error's text, for an error hir found
-        _ => Diag::error(Some("E0560"), format!("{kind_name} `{ty}` has no field named `{name}`"), ident.clone()),
+        _ => Diag::error(
+            Some("E0560"),
+            format!("{kind_name} `{ty}` has no field named `{name}`"),
+            ident.clone(),
+        ),
     };
     let tuple = match variant {
         hir::Variant::Struct(it) => it.kind(cx.db) == hir::StructKind::Tuple,
@@ -300,7 +309,9 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
                 diag.suggestion_verbose(
                     record.span(cx, TextRange::new(from, record.node.text_range().end())),
                     // alloc: the error's text, for an error hir found
-                    format!("`{ty}::{variant_name}` is a tuple {kind_name}, use the appropriate syntax"),
+                    format!(
+                        "`{ty}::{variant_name}` is a tuple {kind_name}, use the appropriate syntax"
+                    ),
                     fields,
                     Applicability::HasPlaceholders,
                 );
@@ -327,7 +338,8 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
             .fields_iter(cx.db)
             .filter(|it| {
                 let field_name = it.name(cx.db);
-                record.fields.iter().all(|skip| skip.name != field_name.as_str()) && suggestable(cx, *it, module)
+                record.fields.iter().all(|skip| skip.name != field_name.as_str())
+                    && suggestable(cx, *it, module)
             })
             // alloc: the error's text, for an error hir found
             .map(|it| it.name(cx.db).as_str().to_owned())
@@ -339,12 +351,20 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
         if let Some(similar) = similar {
             // clone: on the error path, for an error hir found
             diag.span_label(ident.clone(), "unknown field");
-            diag.suggestion_verbose(ident, "a field with a similar name exists", similar, Applicability::MaybeIncorrect);
+            diag.suggestion_verbose(
+                ident,
+                "a field with a similar name exists",
+                similar,
+                Applicability::MaybeIncorrect,
+            );
         } else {
             match variant {
                 hir::Variant::EnumVariant(_) => {
                     // alloc: the error's text, for an error hir found
-                    diag.span_label(ident, format!("`{ty}::{variant_name}` does not have this field"))
+                    diag.span_label(
+                        ident,
+                        format!("`{ty}::{variant_name}` does not have this field"),
+                    )
                 }
                 // alloc: the error's text, for an error hir found
                 _ => diag.span_label(ident, format!("`{ty}` does not have this field")),
@@ -352,7 +372,9 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
             match available.is_empty() {
                 true => diag.note("all struct fields are already assigned"),
                 // alloc: the error's text, for an error hir found
-                false => diag.note(format!("available fields are: {}", name_series_display(&available))),
+                false => {
+                    diag.note(format!("available fields are: {}", name_series_display(&available)))
+                }
             };
         }
     }
@@ -363,9 +385,15 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
 /// rustc's `def_ident_span` of a variant: the name of the struct, union or enum variant.
 fn variant_ident_span(cx: &Cx<'_, '_>, variant: hir::Variant) -> Option<Span> {
     let name = match variant {
-        hir::Variant::Struct(it) => cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose()),
-        hir::Variant::Union(it) => cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose()),
-        hir::Variant::EnumVariant(it) => cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose()),
+        hir::Variant::Struct(it) => {
+            cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose())
+        }
+        hir::Variant::Union(it) => {
+            cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose())
+        }
+        hir::Variant::EnumVariant(it) => {
+            cx.vsema.source(it).and_then(|it| it.map(|it| it.name()).transpose())
+        }
     }?;
     Some(cx.span(name.map(|it| it.syntax().text_range())))
 }
@@ -381,7 +409,11 @@ pub(crate) struct PatFields {
     pub(crate) similar: Option<String>,
 }
 
-pub(crate) fn pat_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant) -> PatFields {
+pub(crate) fn pat_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    variant: hir::Variant,
+) -> PatFields {
     let fields = variant.fields(cx.db);
     // alloc: the error's parts, for an error hir found
     let names: Vec<hir::Name> = fields.iter().map(|it| it.name(cx.db)).collect();
@@ -397,7 +429,8 @@ pub(crate) fn pat_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: h
         .map(|(field, _)| *field)
         // alloc: the error's parts, for an error hir found
         .collect();
-    let reported = !inexistent.is_empty() && inexistent.iter().all(|&i| record.fields[i].name != "_");
+    let reported =
+        !inexistent.is_empty() && inexistent.iter().all(|&i| record.fields[i].name != "_");
     let mut similar = None;
     if reported
         && let Some(&last) = inexistent.last()
@@ -406,7 +439,12 @@ pub(crate) fn pat_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: h
     {
         // alloc: the error's text, for an error hir found
         let candidate = only.name(cx.db).as_str().to_owned();
-        similar = find_best_match_for_name(std::slice::from_ref(&candidate), &record.fields[last].name, None).cloned();
+        similar = find_best_match_for_name(
+            std::slice::from_ref(&candidate),
+            &record.fields[last].name,
+            None,
+        )
+        .cloned();
         if similar.as_ref().is_some_and(|it| it.parse::<usize>().is_err()) {
             unmentioned.clear();
         }
@@ -417,13 +455,23 @@ pub(crate) fn pat_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: h
 
 /// Whether rustc reports `pattern does not mention ...` (or its form for inaccessible fields)
 /// of the pattern: a struct's or a variant's, without `..`, not mentioning a field.
-pub(crate) fn has_unmentioned_error(record: &Record<'_>, variant: hir::Variant, found: &PatFields) -> bool {
-    !matches!(variant, hir::Variant::Union(_)) && !found.unmentioned.is_empty() && record.rest.is_none()
+pub(crate) fn has_unmentioned_error(
+    record: &Record<'_>,
+    variant: hir::Variant,
+    found: &PatFields,
+) -> bool {
+    !matches!(variant, hir::Variant::Union(_))
+        && !found.unmentioned.is_empty()
+        && record.rest.is_none()
 }
 
 /// E0769 (`error_tuple_variant_as_struct_pat`): a tuple struct or variant's pattern written
 /// with names; rustc gives it in place of E0026 and E0027 when there is an E0027 to give.
-pub(crate) fn tuple_variant_as_struct(cx: &Cx<'_, '_>, record: &Record<'_>, variant: hir::Variant) -> Option<Diag> {
+pub(crate) fn tuple_variant_as_struct(
+    cx: &Cx<'_, '_>,
+    record: &Record<'_>,
+    variant: hir::Variant,
+) -> Option<Diag> {
     let tuple = match variant {
         hir::Variant::Struct(it) => it.kind(cx.db) == hir::StructKind::Tuple,
         hir::Variant::EnumVariant(it) => it.kind(cx.db) == hir::StructKind::Tuple,
@@ -441,7 +489,11 @@ pub(crate) fn tuple_variant_as_struct(cx: &Cx<'_, '_>, record: &Record<'_>, vari
     let written: String = path.syntax().text().split_whitespace().collect();
     let whole = record.span(cx, record.node.text_range());
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0769"), format!("tuple variant `{written}` written as struct variant"), whole);
+    let mut diag = Diag::error(
+        Some("E0769"),
+        format!("tuple variant `{written}` written as struct variant"),
+        whole,
+    );
     let fields = variant.fields(cx.db);
     let (sugg, applicability) = if record.fields.len() == fields.len() {
         // alloc: the error's parts, for an error hir found
@@ -452,12 +504,16 @@ pub(crate) fn tuple_variant_as_struct(cx: &Cx<'_, '_>, record: &Record<'_>, vari
             .map(|field| match names.iter().any(|it| it.as_str() == field.name) {
                 // alloc: the error's text, for an error hir found
                 true => "_".to_owned(),
-                false => match field.value.and_then(|it| cx.snippet(&record.span(cx, it.text_range()))) {
-                    // alloc: the error's text, for an error hir found
-                    Some(text) => text.to_owned(),
-                    // alloc: the error's text, for an error hir found
-                    None => field.value.map_or_else(|| field.name.clone(), |it| it.text().to_owned()),
-                },
+                false => {
+                    match field.value.and_then(|it| cx.snippet(&record.span(cx, it.text_range()))) {
+                        // alloc: the error's text, for an error hir found
+                        Some(text) => text.to_owned(),
+                        // alloc: the error's text, for an error hir found
+                        None => field
+                            .value
+                            .map_or_else(|| field.name.clone(), |it| it.text().to_owned()),
+                    }
+                }
             })
             // alloc: the error's parts, for an error hir found
             .collect();
@@ -483,16 +539,24 @@ pub(crate) fn is_number(text: &str) -> bool {
 }
 
 /// E0026 (`error_inexistent_fields`), once for a pattern's fields, at its first.
-fn inexistent_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant: hir::Variant) -> Option<(Diag, Phase)> {
+fn inexistent_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    at: usize,
+    variant: hir::Variant,
+) -> Option<(Diag, Phase)> {
     let found = pat_fields(cx, record, variant);
     if found.inexistent.first() != Some(&at) {
         return None;
     }
-    if has_unmentioned_error(record, variant, &found) && tuple_variant_as_struct(cx, record, variant).is_some() {
+    if has_unmentioned_error(record, variant, &found)
+        && tuple_variant_as_struct(cx, record, variant).is_some()
+    {
         return None;
     }
     // alloc: the error's parts, for an error hir found
-    let inexistent: Vec<&RecordField<'db>> = found.inexistent.iter().map(|&i| &record.fields[i]).collect();
+    let inexistent: Vec<&RecordField<'db>> =
+        found.inexistent.iter().map(|&i| &record.fields[i]).collect();
     let (field_names, this, plural) = match inexistent.as_slice() {
         // alloc: the error's text, for an error hir found
         [only] => (format!("a field named `{}`", only.name), "this", ""),
@@ -508,14 +572,21 @@ fn inexistent_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, var
     let mut spans = inexistent.iter().map(|it| record.span(cx, it.ident));
     let first = spans.next()?;
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0026"), format!("{kind_name} `{path}` does not have {field_names}"), first);
+    let mut diag = Diag::error(
+        Some("E0026"),
+        format!("{kind_name} `{path}` does not have {field_names}"),
+        first,
+    );
     for span in spans {
         diag.primary(span);
     }
     let last = inexistent.last()?;
     let last_span = record.span(cx, last.ident);
     // alloc: the error's text, for an error hir found
-    diag.span_label(last_span.clone(), format!("{kind_name} `{path}` does not have {this} field{plural}"));
+    diag.span_label(
+        last_span.clone(),
+        format!("{kind_name} `{path}` does not have {this} field{plural}"),
+    );
     let module = record.module(cx);
     let unmentioned = unmentioned_before_suggestion(cx, record, variant);
     if let [only] = unmentioned.as_slice()
@@ -548,7 +619,11 @@ fn inexistent_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, var
 
 /// The fields of the variant the pattern does not mention, before E0026 takes one as the one
 /// meant.
-fn unmentioned_before_suggestion(cx: &Cx<'_, '_>, record: &Record<'_>, variant: hir::Variant) -> Vec<hir::Field> {
+fn unmentioned_before_suggestion(
+    cx: &Cx<'_, '_>,
+    record: &Record<'_>,
+    variant: hir::Variant,
+) -> Vec<hir::Field> {
     variant
         .fields_iter(cx.db)
         .filter(|field| {
@@ -561,14 +636,24 @@ fn unmentioned_before_suggestion(cx: &Cx<'_, '_>, record: &Record<'_>, variant: 
 
 /// rustc's test before "`S` has a field named `x`": a field whose pattern is a literal or a
 /// constant (`PatKind::Expr`) must have a type that coerces to the other field's.
-fn coerces<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, field: &RecordField<'db>, other: hir::Field) -> bool {
+fn coerces<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    field: &RecordField<'db>,
+    other: hir::Field,
+) -> bool {
     let Some(value) = field.value else { return true };
     let pat = match ast::Pat::cast(value) {
-        Some(pat @ (ast::Pat::LiteralPat(_) | ast::Pat::PathPat(_) | ast::Pat::ConstBlockPat(_))) => pat,
+        Some(
+            pat @ (ast::Pat::LiteralPat(_) | ast::Pat::PathPat(_) | ast::Pat::ConstBlockPat(_)),
+        ) => pat,
         _ => return true,
     };
-    let (Some(pat_ty), Some(record_ty)) = (cx.vsema.type_of_pat(pat), record.ty(cx)) else { return true };
-    let Some((_, field_ty)) = record_ty.fields(cx.db).into_iter().find(|(it, _)| *it == other) else {
+    let (Some(pat_ty), Some(record_ty)) = (cx.vsema.type_of_pat(pat), record.ty(cx)) else {
+        return true;
+    };
+    let Some((_, field_ty)) = record_ty.fields(cx.db).into_iter().find(|(it, _)| *it == other)
+    else {
         return true;
     };
     pat_ty.original.could_coerce_to(cx.db, &field_ty)
@@ -576,7 +661,12 @@ fn coerces<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, field: &RecordField<'db>
 
 /// E0451 (`emit_unreachable_field_error`), once for an expression's or a pattern's private
 /// fields, at the first.
-fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant: hir::Variant) -> Option<(Diag, Phase)> {
+fn private_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
+    at: usize,
+    variant: hir::Variant,
+) -> Option<(Diag, Phase)> {
     let adt = variant.adt(cx.db);
     if matches!(adt, hir::Adt::Enum(_)) {
         return None;
@@ -584,7 +674,10 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, varian
     let module = record.module(cx)?;
     let fields = variant.fields(cx.db);
     let private = |name: &str| {
-        fields.iter().find(|it| it.name(cx.db).as_str() == name).filter(|it| !it.is_visible_from(cx.db, module))
+        fields
+            .iter()
+            .find(|it| it.name(cx.db).as_str() == name)
+            .filter(|it| !it.is_visible_from(cx.db, module))
     };
     let expanded = record.rest.filter(|_| !record.is_pat);
     // (name, range, present, field)
@@ -623,7 +716,10 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, varian
     let descr = variant_descr(variant);
     let path = cx.def_path(hir::ModuleDef::Adt(adt));
     // alloc: the error's text, for an error hir found
-    let message = format!("{field_s} {} of {descr} `{path}` {is_are} private", stdx::list::list(names.iter(), Join::AndNoSerialComma, true));
+    let message = format!(
+        "{field_s} {} of {descr} `{path}` {is_are} private",
+        stdx::list::list(names.iter(), Join::AndNoSerialComma, true)
+    );
     let mut spans = failed.iter().map(|it| record.span(cx, it.1));
     let mut diag = Diag::error(Some("E0451"), message, spans.next()?);
     for span in spans {
@@ -647,13 +743,18 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, varian
     }
     if let Some((rest, base)) = expanded {
         // alloc: the error's parts, for an error hir found
-        let rest_names: Vec<&str> = failed.iter().filter(|it| !it.2).map(|it| it.0.as_str()).collect();
+        let rest_names: Vec<&str> =
+            failed.iter().filter(|it| !it.2).map(|it| it.0.as_str()).collect();
         if !rest_names.is_empty() {
-            let (field_s, is_are) = if rest_names.len() == 1 { ("field", "is") } else { ("fields", "are") };
+            let (field_s, is_are) =
+                if rest_names.len() == 1 { ("field", "is") } else { ("fields", "are") };
             diag.span_label(
                 record.span(cx, base.unwrap_or(rest)),
                 // alloc: the error's text, for an error hir found
-                format!("{field_s} {} {is_are} private", stdx::list::list(rest_names.iter(), Join::AndNoSerialComma, true)),
+                format!(
+                    "{field_s} {} {is_are} private",
+                    stdx::list::list(rest_names.iter(), Join::AndNoSerialComma, true)
+                ),
             );
         }
     }

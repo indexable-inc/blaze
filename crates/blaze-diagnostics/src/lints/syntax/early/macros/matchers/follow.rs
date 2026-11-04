@@ -9,8 +9,8 @@
 //! Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::TextRange;
 
 use super::{
@@ -134,7 +134,10 @@ impl Follow<'_> {
         let mut first = TokenSet::empty();
         for id in tts.iter().rev() {
             match *m.at(id) {
-                Mtt::Token(_) | Mtt::MetaVar { .. } | Mtt::MetaVarDecl { .. } | Mtt::MetaVarExpr { .. } => {
+                Mtt::Token(_)
+                | Mtt::MetaVar { .. }
+                | Mtt::MetaVarDecl { .. }
+                | Mtt::MetaVarExpr { .. } => {
                     first.replace_with(Handle::Tt(id));
                 }
                 Mtt::Delimited { open, tts, .. } => {
@@ -166,7 +169,10 @@ impl Follow<'_> {
         let mut first = TokenSet::empty();
         for id in tts.iter() {
             match *self.m.at(id) {
-                Mtt::Token(_) | Mtt::MetaVar { .. } | Mtt::MetaVarDecl { .. } | Mtt::MetaVarExpr { .. } => {
+                Mtt::Token(_)
+                | Mtt::MetaVar { .. }
+                | Mtt::MetaVarDecl { .. }
+                | Mtt::MetaVarExpr { .. } => {
                     first.add_one(Handle::Tt(id));
                     return first;
                 }
@@ -209,7 +215,10 @@ impl Follow<'_> {
                 first
             };
             let suffix_first = match *m.at(id) {
-                Mtt::Token(_) | Mtt::MetaVar { .. } | Mtt::MetaVarDecl { .. } | Mtt::MetaVarExpr { .. } => {
+                Mtt::Token(_)
+                | Mtt::MetaVar { .. }
+                | Mtt::MetaVarDecl { .. }
+                | Mtt::MetaVarExpr { .. } => {
                     if followed_by_any(m.at(id)) {
                         last.replace_with_irrelevant();
                         continue;
@@ -262,20 +271,34 @@ impl Follow<'_> {
         if token.is_some_and(|it| matches!(it.kind, Kind::Close(_))) {
             return true;
         }
-        let punct = |puncts: &[Punct]| token.is_some_and(|it| matches!(it.kind, Kind::Punct(p) if puncts.contains(&p)));
+        let punct = |puncts: &[Punct]| {
+            token.is_some_and(|it| matches!(it.kind, Kind::Punct(p) if puncts.contains(&p)))
+        };
         let word = |words: &[&str]| {
-            token.is_some_and(|it| it.kind == (Kind::Ident { raw: false }) && words.contains(&self.tokens.text(it.range)))
+            token.is_some_and(|it| {
+                it.kind == (Kind::Ident { raw: false })
+                    && words.contains(&self.tokens.text(it.range))
+            })
         };
         let decl = |kinds: &[Frag]| self.decl(next).is_some_and(|(_, _, it)| kinds.contains(&it));
         match kind {
             Frag::Item | Frag::Block => true,
-            Frag::Stmt | Frag::Expr | Frag::Expr2021 { .. } => punct(&[Punct::FatArrow, Punct::Comma, Punct::Semi]),
-            Frag::PatParam { .. } => {
-                punct(&[Punct::FatArrow, Punct::Comma, Punct::Eq, Punct::Or]) || word(&["if", "in"]) || decl(&[Frag::Guard])
+            Frag::Stmt | Frag::Expr | Frag::Expr2021 { .. } => {
+                punct(&[Punct::FatArrow, Punct::Comma, Punct::Semi])
             }
-            Frag::PatWithOr => punct(&[Punct::FatArrow, Punct::Comma, Punct::Eq]) || word(&["if", "in"]) || decl(&[Frag::Guard]),
+            Frag::PatParam { .. } => {
+                punct(&[Punct::FatArrow, Punct::Comma, Punct::Eq, Punct::Or])
+                    || word(&["if", "in"])
+                    || decl(&[Frag::Guard])
+            }
+            Frag::PatWithOr => {
+                punct(&[Punct::FatArrow, Punct::Comma, Punct::Eq])
+                    || word(&["if", "in"])
+                    || decl(&[Frag::Guard])
+            }
             Frag::Guard => {
-                punct(&[Punct::FatArrow, Punct::Comma]) || token.is_some_and(|it| it.kind == Kind::Open(Delim::Brace))
+                punct(&[Punct::FatArrow, Punct::Comma])
+                    || token.is_some_and(|it| it.kind == Kind::Open(Delim::Brace))
             }
             Frag::Path | Frag::Ty => {
                 token.is_some_and(|it| matches!(it.kind, Kind::Open(Delim::Brace | Delim::Bracket)))
@@ -312,7 +335,13 @@ fn followed_by_any(tt: &Mtt) -> bool {
     match *tt {
         Mtt::MetaVarDecl { kind, .. } => matches!(
             kind,
-            Frag::Item | Frag::Block | Frag::Ident | Frag::Literal | Frag::Meta | Frag::Lifetime | Frag::Tt
+            Frag::Item
+                | Frag::Block
+                | Frag::Ident
+                | Frag::Literal
+                | Frag::Meta
+                | Frag::Lifetime
+                | Frag::Tt
         ),
         _ => true,
     }
@@ -364,32 +393,63 @@ mod tests {
 
     #[test]
     fn a_pat_before_2021_that_an_or_may_follow() {
-        assert_eq!(or_patterns("macro_rules! foo { ($x:pat | $y:pat) => {} }", Edition::Edition2015), ["$x:pat"]);
-        assert_eq!(or_patterns("macro_rules! bar { ($($x:pat)+ | $($y:pat)+) => {} }", Edition::Edition2015), [
-            "$x:pat"
-        ]);
         assert_eq!(
-            or_patterns("macro_rules! m { ( $expr:expr , $( $( $pat:pat )|+ => $expr_arm:expr ),+ ) => {}; }", Edition::Edition2018),
+            or_patterns("macro_rules! foo { ($x:pat | $y:pat) => {} }", Edition::Edition2015),
+            ["$x:pat"]
+        );
+        assert_eq!(
+            or_patterns(
+                "macro_rules! bar { ($($x:pat)+ | $($y:pat)+) => {} }",
+                Edition::Edition2015
+            ),
+            ["$x:pat"]
+        );
+        assert_eq!(
+            or_patterns(
+                "macro_rules! m { ( $expr:expr , $( $( $pat:pat )|+ => $expr_arm:expr ),+ ) => {}; }",
+                Edition::Edition2018
+            ),
             ["$pat:pat"],
         );
     }
 
     #[test]
     fn a_pat_is_linted_for_each_or_that_may_follow_it() {
-        assert_eq!(or_patterns("macro_rules! m { ($($x:pat)|* |) => {} }", Edition::Edition2015), ["$x:pat", "$x:pat"]);
+        assert_eq!(
+            or_patterns("macro_rules! m { ($($x:pat)|* |) => {} }", Edition::Edition2015),
+            ["$x:pat", "$x:pat"]
+        );
     }
 
     #[test]
     fn no_pat_param_nor_pat_of_2021_is_linted() {
-        assert!(or_patterns("macro_rules! baz { ($x:pat_param | $y:pat_param) => {} }", Edition::Edition2015).is_empty());
-        assert!(or_patterns("macro_rules! foo { ($x:pat | $y:pat) => {} }", Edition::Edition2021).is_empty());
-        assert!(or_patterns("macro_rules! foo { ($x:pat || $y:pat) => {} }", Edition::Edition2015).is_empty());
+        assert!(
+            or_patterns(
+                "macro_rules! baz { ($x:pat_param | $y:pat_param) => {} }",
+                Edition::Edition2015
+            )
+            .is_empty()
+        );
+        assert!(
+            or_patterns("macro_rules! foo { ($x:pat | $y:pat) => {} }", Edition::Edition2021)
+                .is_empty()
+        );
+        assert!(
+            or_patterns("macro_rules! foo { ($x:pat || $y:pat) => {} }", Edition::Edition2015)
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_follow_set_error_in_a_group_stops_the_walk() {
         // `$e:expr` followed by `)` is fine; by `+` it is an error, and rustc stops there.
-        assert!(or_patterns("macro_rules! m { (($e:expr +) $x:pat | ) => {} }", Edition::Edition2015).is_empty());
-        assert_eq!(or_patterns("macro_rules! m { (($e:expr) $x:pat | ) => {} }", Edition::Edition2015), ["$x:pat"]);
+        assert!(
+            or_patterns("macro_rules! m { (($e:expr +) $x:pat | ) => {} }", Edition::Edition2015)
+                .is_empty()
+        );
+        assert_eq!(
+            or_patterns("macro_rules! m { (($e:expr) $x:pat | ) => {} }", Edition::Edition2015),
+            ["$x:pat"]
+        );
     }
 }

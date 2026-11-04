@@ -499,7 +499,8 @@ fn passes<E: Copy, K: Key, C: Count>(
     scratch.clear();
     scratch.extend_from_slice(items);
     let (mut src, mut dst) = (&mut *items, &mut scratch[..]);
-    for (pass, (starts, &shift)) in counts.chunks_exact_mut(buckets).zip(plan.shifts()).enumerate() {
+    for (pass, (starts, &shift)) in counts.chunks_exact_mut(buckets).zip(plan.shifts()).enumerate()
+    {
         let mut sum = 0;
         for (start, end) in starts.iter_mut().zip(ends.iter_mut()) {
             let count = start.get();
@@ -654,25 +655,27 @@ fn parallel<E: Copy + Send + Sync, K: Key>(
         }
         let scattered = {
             let (starts, ends) = (Parts::new(&mut starts), &ends);
-            catch_unwind(AssertUnwindSafe(|| workers.run(jobs, &|job| {
-                let row = job * buckets..(job + 1) * buckets;
-                // SAFETY: as in the count above.
-                let starts = unsafe { starts.part(row.clone()) };
-                let ends = &ends[row];
-                for item in &src[range(job)] {
-                    let digit = key(item).digit(shift, plan.mask);
-                    let at = starts[digit];
-                    if at >= ends[digit] {
-                        changed();
+            catch_unwind(AssertUnwindSafe(|| {
+                workers.run(jobs, &|job| {
+                    let row = job * buckets..(job + 1) * buckets;
+                    // SAFETY: as in the count above.
+                    let starts = unsafe { starts.part(row.clone()) };
+                    let ends = &ends[row];
+                    for item in &src[range(job)] {
+                        let digit = key(item).digit(shift, plan.mask);
+                        let at = starts[digit];
+                        if at >= ends[digit] {
+                            changed();
+                        }
+                        starts[digit] = at + 1;
+                        // SAFETY: `at` is in `starts[digit]..ends[digit]` as the prefix sum set
+                        // them, a range of this job's alone (the sums give each job and bucket its
+                        // own) within `0..n`, the length of `to`'s buffer, which outlives the run
+                        // and which nothing reads this pass.
+                        unsafe { to.write(at, *item) };
                     }
-                    starts[digit] = at + 1;
-                    // SAFETY: `at` is in `starts[digit]..ends[digit]` as the prefix sum set
-                    // them, a range of this job's alone (the sums give each job and bucket its
-                    // own) within `0..n`, the length of `to`'s buffer, which outlives the run
-                    // and which nothing reads this pass.
-                    unsafe { to.write(at, *item) };
-                }
-            })))
+                })
+            }))
         };
         if let Err(panic) = scattered {
             // Every job has stopped (`run`'s promise); an odd pass was writing `items`, which

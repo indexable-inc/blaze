@@ -8,9 +8,9 @@ use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
 };
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_mem::Slab;
+use std::alloc::Global;
 
 use super::Watched;
 use crate::{
@@ -140,7 +140,9 @@ impl Batch {
     /// slot each), and each file the head had that left its path (gone, or another inode is
     /// there now) is kept by its inode for [`Batch::moved`].
     fn went(&mut self, disk: Option<&Disk>, tree: &Tree, head: NodeId, below: usize) {
-        let gone_dir = |it: &Slot| matches!(it.look, Some(Look::Gone)) && it.saved.is_some_and(|it| it.is_dir());
+        let gone_dir = |it: &Slot| {
+            matches!(it.look, Some(Look::Gone)) && it.saved.is_some_and(|it| it.is_dir())
+        };
         if let Some(disk) = disk
             && self.slots.iter().any(gone_dir)
         {
@@ -159,7 +161,14 @@ impl Batch {
                     let was = seen(tree, head, &path);
                     self.index.insert(name.into(), self.slots.len());
                     let look = Some(Look::Gone);
-                    self.slots.push(Slot { path, file, was, saved: Some(saved), stamp: Some(Stamp::GONE), look });
+                    self.slots.push(Slot {
+                        path,
+                        file,
+                        was,
+                        saved: Some(saved),
+                        stamp: Some(Stamp::GONE),
+                        look,
+                    });
                 });
             }
         }
@@ -293,7 +302,8 @@ impl Watcher {
     /// The look `tag` was asked for, out of its slot: each tag completes once.
     fn take(&mut self, tag: Tag) -> Pending {
         let index = tag.0 - self.tags - FIRST;
-        let Some(handle) = u32::try_from(index).ok().and_then(|it| self.pending.handle_at(it)) else {
+        let Some(handle) = u32::try_from(index).ok().and_then(|it| self.pending.handle_at(it))
+        else {
             unreachable!("a completion {tag:?} of nothing asked")
         };
         let Some(pending) = self.pending.remove(handle) else { unreachable!("an occupied slot") };
@@ -477,11 +487,17 @@ impl Watcher {
         batch.names = Some(Arc::new(names));
         let inside = |path: &str| {
             root.is_empty()
-                || path.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                || path
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         };
         let mut add = |path: &str, batch: &mut Batch| {
             // alloc: per changed path, beside its read and hash.
-            let name = if path.is_empty() { self.dir.to_string() } else { format!("{}{path}", self.below) };
+            let name = if path.is_empty() {
+                self.dir.to_string()
+            } else {
+                format!("{}{path}", self.below)
+            };
             match batch.swept(&name) {
                 Ok(at) => batch.forced.push(at as u32),
                 Err(_) if batch.index.contains_key(name.as_str()) => {}
@@ -490,7 +506,14 @@ impl Watcher {
                     let was = seen(&vfs.tree, head, path);
                     batch.index.insert(name.into(), batch.slots.len());
                     // alloc: per changed path, beside its read and hash.
-                    batch.slots.push(Slot { path: path.to_owned(), file, was, saved: None, stamp: None, look: None });
+                    batch.slots.push(Slot {
+                        path: path.to_owned(),
+                        file,
+                        was,
+                        saved: None,
+                        stamp: None,
+                        look: None,
+                    });
                 }
             }
         };
@@ -574,7 +597,12 @@ impl Watcher {
     }
 
     /// A batch of `slots`, and the stamp of each asked for in one effect. Returns its number.
-    fn ask_stamps(&mut self, slots: Vec<Slot>, rescan: Option<String>, effects: &mut Vec<Effect>) -> u64 {
+    fn ask_stamps(
+        &mut self,
+        slots: Vec<Slot>,
+        rescan: Option<String>,
+        effects: &mut Vec<Effect>,
+    ) -> u64 {
         let mut names = Names::with_capacity(slots.len(), slots.len() * 32);
         for slot in &slots {
             names.push(&slot.file);
@@ -626,7 +654,8 @@ impl Watcher {
                 // alloc: per changed path, beside its read and hash.
                 let path = name.get(below..).unwrap_or_default().to_owned();
                 let was = seen(&vfs.tree, head, &path);
-                let slot = Slot { path, file, was, saved: Some(*saved), stamp: Some(*now), look: None };
+                let slot =
+                    Slot { path, file, was, saved: Some(*saved), stamp: Some(*now), look: None };
                 batch.slots.push(slot);
             }
             // alloc: none unless a path changed.
@@ -685,7 +714,11 @@ impl Watcher {
         }
         for (at, file, link) in reads {
             let tag = self.tag(Pending::Read(number, at));
-            effects.push(if link { Effect::ReadLink { file, tag } } else { Effect::ReadAll { file, tag } });
+            effects.push(if link {
+                Effect::ReadLink { file, tag }
+            } else {
+                Effect::ReadAll { file, tag }
+            });
         }
         for dir in lists {
             // clone: per directory whose stamp moved.
@@ -722,7 +755,9 @@ impl Watcher {
                 let there: HashMap<&str, Stamp, Global> =
                     // alloc: once per batch.
                     entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
-                for (at, slot) in batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none()) {
+                for (at, slot) in
+                    batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none())
+                {
                     let Some(&now) = there.get(slot.file.as_str()) else {
                         slot.stamp = Some(Stamp::GONE);
                         slot.look = Some(Look::Gone);
@@ -775,7 +810,11 @@ impl Watcher {
             match at {
                 Some((at, link)) => {
                     let tag = self.tag(Pending::Read(number, at));
-                    effects.push(if link { Effect::ReadLink { file, tag } } else { Effect::ReadAll { file, tag } });
+                    effects.push(if link {
+                        Effect::ReadLink { file, tag }
+                    } else {
+                        Effect::ReadAll { file, tag }
+                    });
                 }
                 None => {
                     // clone: per new directory.
@@ -806,7 +845,8 @@ impl Watcher {
             for file in again {
                 vfs.disks.of(&self.head, &self.dir).set(file.as_str(), Stamp::GONE);
                 // alloc: per changed path, beside its read and hash.
-                let path = self.rel(&file).expect("a slot's name is under the directory").to_owned();
+                let path =
+                    self.rel(&file).expect("a slot's name is under the directory").to_owned();
                 out.push(Watched::Lost { path, why: Lost::Rescan });
                 self.rescan(vfs, &file, effects);
             }
@@ -874,7 +914,9 @@ impl Watcher {
                     // Compared in place, not hashed: the commit hashes what it writes, once. A
                     // blob of the image that fails its check compares unequal, so it is replaced.
                     let same = had == Some(mode)
-                        && node.is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
+                        && node.is_some_and(
+                            |it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes),
+                        );
                     if !same {
                         // alloc: per changed path, beside its read and hash.
                         writes.push((slot.path.clone(), bytes, mode));
@@ -892,7 +934,9 @@ impl Watcher {
         let mut renamed = HashSet::new_in(Global);
         for (at, from) in moves {
             let (target, source) = (&batch.slots[at], &batch.slots[from]);
-            let Some((id, mode)) = source.was else { unreachable!("a move is from a file the head had") };
+            let Some((id, mode)) = source.was else {
+                unreachable!("a move is from a file the head had")
+            };
             let entry = tree.entry(base, &target.path);
             if entry.is_some_and(|(node, _)| tree.id(node) == id) {
                 // alloc: per changed path, beside its read and hash.
@@ -900,7 +944,8 @@ impl Watcher {
                 continue;
             }
             let clear = entry.is_none()
-                && !ancestors(&target.path).any(|up| tree.lookup(base, up).is_some_and(|it| !tree.is_dir(it)));
+                && !ancestors(&target.path)
+                    .any(|up| tree.lookup(base, up).is_some_and(|it| !tree.is_dir(it)));
             if deleting[from] && clear && renamed.insert(from) {
                 // alloc: per changed path, beside its read and hash.
                 renames.push((source.path.clone(), target.path.clone()));

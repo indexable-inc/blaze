@@ -27,7 +27,8 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
         kind => return Err(format!("{name}: a {kind:?} archive, not an archive of ELF objects")), // alloc: error path
     }
 
-    let special = |name: &[u8]| matches!(name, b"/" | b"//" | b"/SYM64/") || name.starts_with(b"__.SYMDEF");
+    let special =
+        |name: &[u8]| matches!(name, b"/" | b"//" | b"/SYM64/") || name.starts_with(b"__.SYMDEF");
     // Every name of the index lies in its strings, each before a NUL: they are read as one
     // string table. Measured first, with the members, so each column is sized once.
     let symbols = file.symbols().map_err(error)?;
@@ -71,7 +72,9 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
             .ok_or_else(|| format!("{name}: member {member_name} runs past the archive's end"))?; // alloc: error path
         if members.last().is_some_and(|last| last.bytes.start >= range.start) {
             // alloc: error path
-            return Err(format!("{name}: member {member_name} does not follow the member before it"));
+            return Err(format!(
+                "{name}: member {member_name} does not follow the member before it"
+            ));
         }
         members.push(Member { name: push(&mut names, &member_name, name, limit)?, bytes: range });
     }
@@ -96,9 +99,9 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
                             format!("{name}: archive symbol {}: {error}", symbol_name())
                         })?;
                         let start = usize::try_from(header.file_range().0).ok();
-                        let Some(member) = start
-                            .and_then(|start| members.binary_search_by_key(&start, |it| it.bytes.start).ok())
-                        else {
+                        let Some(member) = start.and_then(|start| {
+                            members.binary_search_by_key(&start, |it| it.bytes.start).ok()
+                        }) else {
                             // alloc: error path
                             return Err(format!(
                                 "{name}: archive symbol {} names a member at offset {}, which is \
@@ -125,11 +128,14 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
                 let at = &bytes[member.bytes.start..member.bytes.end];
                 super::defined(arch, "", at).map_err(in_member(name, &names, member))
             }); // alloc: once per archive without an index, in member order
-            index.reserve(defined.iter().map(|it| it.as_ref().map_or(0, |(_, offsets)| offsets.len())).sum());
+            index.reserve(
+                defined.iter().map(|it| it.as_ref().map_or(0, |(_, offsets)| offsets.len())).sum(),
+            );
             // Then the names, in member order, each string of a member's `.strtab` pushed once:
             // the arena is at most the archive (`limit` holds without a check), and at most
             // the `.strtab`s, so it grows once, here, not by doubling.
-            let strtabs: usize = defined.iter().map(|it| it.as_ref().map_or(0, |(strtab, _)| strtab.len())).sum();
+            let strtabs: usize =
+                defined.iter().map(|it| it.as_ref().map_or(0, |(strtab, _)| strtab.len())).sum();
             names.reserve(strtabs.min(limit.saturating_sub(names.bytes())));
             for (number, found) in defined.into_iter().enumerate() {
                 let (strtab, offsets) = found?;
@@ -149,7 +155,11 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
 
 /// Names the member in an error the member's reader made with an empty file name (`": why"`):
 /// `archive(member): why`, as when the member is read on its own.
-fn in_member<'a>(name: &'a str, names: &'a Names, member: &'a Member) -> impl FnOnce(String) -> String + 'a {
+fn in_member<'a>(
+    name: &'a str,
+    names: &'a Names,
+    member: &'a Member,
+) -> impl FnOnce(String) -> String + 'a {
     // alloc: an error's message.
     move |why| format!("{name}({}){why}", names.at(member.name))
 }

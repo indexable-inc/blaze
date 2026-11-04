@@ -185,14 +185,23 @@ pub mod inner {
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
-    let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
+    let setup = Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    };
     fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let text = db.file_text(file).text(&db).to_string();
     assert_eq!(text, want.trim_start_matches('\n'));
     blaze_query::db::attach(&db, || {
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
-        let left: Vec<&str> =
-            found.iter().map(|it| it.diagnostic.message.as_str()).filter(|it| it.contains(MESSAGE)).collect();
-        assert!(left.is_empty(), "the fixed file has nothing left for the lint:\n{text}\n{left:#?}");
+        let left: Vec<&str> = found
+            .iter()
+            .map(|it| it.diagnostic.message.as_str())
+            .filter(|it| it.contains(MESSAGE))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "the fixed file has nothing left for the lint:\n{text}\n{left:#?}"
+        );
     });
 }

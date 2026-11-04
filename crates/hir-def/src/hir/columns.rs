@@ -80,16 +80,16 @@
 
 use std::ops::Deref;
 
-use la_arena::{Idx, RawIdx};
 use blaze_query::db::{AsId, FromId};
+use la_arena::{Idx, RawIdx};
 
 use crate::{
     BlockId,
     expr_store::path::{GenericArgsIdx, Names, PathColumns, PathIdx, slot},
     hir::{
         Array, AsmOperand, BindingId, CaptureBy, ClosureKind, CoroutineKind, CoroutineSource, Expr,
-        ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf,
-        Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Statements, Unsafe,
+        ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf, Pat,
+        PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Statements, Unsafe,
         UnsafeBinderCastKind,
         col::{Col, SlabLayout, SlabWriter},
     },
@@ -298,10 +298,42 @@ impl ExprKind {
     pub const ALL: [ExprKind; 36] = {
         use ExprKind::*;
         [
-            Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
-            Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
-            Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
-            IncludeBytes, UnsafeBinderCast, ComptimeFor, ReflectedField,
+            Missing,
+            Path,
+            If,
+            Let,
+            Block,
+            Const,
+            Loop,
+            Call,
+            MethodCall,
+            Match,
+            Continue,
+            Break,
+            Return,
+            Become,
+            Yield,
+            Yeet,
+            RecordLit,
+            Field,
+            Await,
+            Cast,
+            Ref,
+            UnaryOp,
+            BinaryOp,
+            Assignment,
+            Index,
+            Closure,
+            Tuple,
+            Array,
+            Literal,
+            Underscore,
+            OffsetOf,
+            InlineAsm,
+            IncludeBytes,
+            UnsafeBinderCast,
+            ComptimeFor,
+            ReflectedField,
         ]
     };
 
@@ -354,8 +386,23 @@ impl PatKind {
     pub const ALL: [PatKind; 17] = {
         use PatKind::*;
         [
-            Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
-            Box, Deref, NotNull, Expr,
+            Missing,
+            Rest,
+            Wild,
+            Tuple,
+            Or,
+            Record,
+            Range,
+            Slice,
+            Path,
+            Lit,
+            Bind,
+            TupleStruct,
+            Ref,
+            Box,
+            Deref,
+            NotNull,
+            Expr,
         ]
     };
 
@@ -430,8 +477,11 @@ fn let_words(
 ) -> ([u32; LET_WORDS], usize) {
     let mut words = [0; LET_WORDS];
     let (mut flags, mut count) = (is_super as u32, 1);
-    let optional =
-        [(LET_TYPE, type_ref.map(raw)), (LET_INIT, initializer.map(raw)), (LET_ELSE, else_branch.map(raw))];
+    let optional = [
+        (LET_TYPE, type_ref.map(raw)),
+        (LET_INIT, initializer.map(raw)),
+        (LET_ELSE, else_branch.map(raw)),
+    ];
     for (flag, id) in optional {
         if let Some(id) = id {
             flags |= flag;
@@ -911,9 +961,9 @@ impl<V: ColumnVec> HirColumns<V> {
                 Expr::Tuple { exprs: list(exprs, start, count, EXPR_LIST)? }
             }
             ExprKind::Array => match self.node::<3>(d)? {
-                [0, start, count] => {
-                    Expr::Array(Array::ElementList { elements: list(exprs, start, count, EXPR_LIST)? })
-                }
+                [0, start, count] => Expr::Array(Array::ElementList {
+                    elements: list(exprs, start, count, EXPR_LIST)?,
+                }),
                 [1, initializer, repeat] => Expr::Array(Array::Repeat {
                     initializer: idx(initializer),
                     repeat: idx(repeat),
@@ -928,7 +978,11 @@ impl<V: ColumnVec> HirColumns<V> {
             ExprKind::UnsafeBinderCast => {
                 let [expr, word] = self.node::<2>(d)?;
                 Expr::UnsafeBinderCast {
-                    kind: from_table(&UNSAFE_BINDER_CASTS, word & 1, "an unsafe binder cast out of range")?,
+                    kind: from_table(
+                        &UNSAFE_BINDER_CASTS,
+                        word & 1,
+                        "an unsafe binder cast out of range",
+                    )?,
                     expr: idx(expr),
                     ty: unopt(word >> 1),
                 }
@@ -1193,7 +1247,11 @@ impl HirColumns<Growing> {
     /// A block's statements over the rows `old` of the block it replaces when they fit there,
     /// else appended. `statements` are rows of other columns (lowering's stack), as a block
     /// can't be given statements borrowed from the columns it is written to.
-    fn put_statements(&mut self, statements: Statements<'_>, old: Option<(u32, u32)>) -> (u32, u32) {
+    fn put_statements(
+        &mut self,
+        statements: Statements<'_>,
+        old: Option<(u32, u32)>,
+    ) -> (u32, u32) {
         let count = len(statements.len());
         match old {
             Some((start, old_count)) if count <= old_count => {
@@ -1773,19 +1831,23 @@ impl Bounds {
                 self.expr(initializer)?;
                 self.expr(repeat)
             }
-            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => self.type_ref(*container),
-            Expr::InlineAsm(asm) => asm.operands.iter().try_for_each(|(_, operand)| match *operand {
-                AsmOperand::In { expr, reg: _ }
-                | AsmOperand::InOut { expr, late: _, reg: _ }
-                | AsmOperand::Label(expr)
-                | AsmOperand::Const(expr) => self.expr(expr),
-                AsmOperand::Out { expr, late: _, reg: _ } => self.expr_opt(expr),
-                AsmOperand::SplitInOut { in_expr, out_expr, late: _, reg: _ } => {
-                    self.expr(in_expr)?;
-                    self.expr_opt(out_expr)
-                }
-                AsmOperand::Sym(_) => Ok(()),
-            }),
+            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => {
+                self.type_ref(*container)
+            }
+            Expr::InlineAsm(asm) => {
+                asm.operands.iter().try_for_each(|(_, operand)| match *operand {
+                    AsmOperand::In { expr, reg: _ }
+                    | AsmOperand::InOut { expr, late: _, reg: _ }
+                    | AsmOperand::Label(expr)
+                    | AsmOperand::Const(expr) => self.expr(expr),
+                    AsmOperand::Out { expr, late: _, reg: _ } => self.expr_opt(expr),
+                    AsmOperand::SplitInOut { in_expr, out_expr, late: _, reg: _ } => {
+                        self.expr(in_expr)?;
+                        self.expr_opt(out_expr)
+                    }
+                    AsmOperand::Sym(_) => Ok(()),
+                })
+            }
         }
     }
 
@@ -1972,9 +2034,7 @@ mod tests {
     use super::*;
     use crate::{
         expr_store::path::{GenericArg, GenericArgs, GenericArgsParentheses, Path},
-        hir::{
-            AsmOptions, FloatTypeWrapper, InlineAsmKind, InlineAsmRegOrRegClass, Item,
-        },
+        hir::{AsmOptions, FloatTypeWrapper, InlineAsmKind, InlineAsmRegOrRegClass, Item},
         type_ref::ConstRef,
     };
 
@@ -2103,7 +2163,13 @@ mod tests {
             },
             asm: InlineAsm {
                 operands: Box::new([
-                    (None, AsmOperand::In { reg: InlineAsmRegOrRegClass::Reg(Symbol::intern("x0")), expr: E0 }),
+                    (
+                        None,
+                        AsmOperand::In {
+                            reg: InlineAsmRegOrRegClass::Reg(Symbol::intern("x0")),
+                            expr: E0,
+                        },
+                    ),
                     (
                         Some(name("o")),
                         AsmOperand::SplitInOut {
@@ -2141,8 +2207,7 @@ mod tests {
     /// at its ends and every list empty and not.
     fn every_expr(v: &Values) -> Vec<Expr<'_>> {
         let arith = ArithOp::ALL.into_iter().map(|op| Some(BinaryOp::ArithOp(op)));
-        let assign =
-            ArithOp::ALL.into_iter().map(|op| Some(BinaryOp::Assignment { op: Some(op) }));
+        let assign = ArithOp::ALL.into_iter().map(|op| Some(BinaryOp::Assignment { op: Some(op) }));
         let ops = [
             None,
             Some(BinaryOp::LogicOp(LogicOp::And)),
@@ -2199,7 +2264,12 @@ mod tests {
                 args: &[E0],
                 generic_args: Some(v.generic_args()),
             },
-            Expr::MethodCall { receiver: E0, method_name: &v.names[1], args: &[], generic_args: None },
+            Expr::MethodCall {
+                receiver: E0,
+                method_name: &v.names[1],
+                args: &[],
+                generic_args: None,
+            },
             Expr::Match { expr: E0, arms: &v.arms },
             Expr::Continue { label: some_label },
             Expr::Continue { label: None },
@@ -2801,7 +2871,8 @@ mod tests {
     fn every_statement_reads_back_as_pushed() {
         let v = values();
         let statements = every_statement(&v);
-        let kinds: std::collections::HashSet<_> = statements.iter().map(StatementKind::of).collect();
+        let kinds: std::collections::HashSet<_> =
+            statements.iter().map(StatementKind::of).collect();
         assert_eq!(kinds.len(), StatementKind::ALL.len(), "every statement kind is tested");
 
         let mut paths = PathColumns::default();
@@ -2837,7 +2908,10 @@ mod tests {
         let all = columns.statements(0, len(statements.len())).unwrap();
         assert_eq!(all.len(), statements.len());
         assert_eq!(all.iter().collect::<Vec<_>>(), statements);
-        assert_eq!(all.iter().rev().collect::<Vec<_>>(), statements.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(
+            all.iter().rev().collect::<Vec<_>>(),
+            statements.iter().rev().copied().collect::<Vec<_>>()
+        );
         assert_eq!(all.first(), statements.first().copied());
         assert_eq!(all.last(), statements.last().copied());
         assert_eq!(all.get(statements.len()), None);
@@ -2871,7 +2945,8 @@ mod tests {
         let expr = columns.push_statement(Statement::Expr { expr: E0, has_semi: false });
         let def = columns.push_statement(Statement::Item(Item::MacroDef(&v.macro_defs[0])));
         let other = columns.push_statement(Statement::Item(Item::Other));
-        let sizes = |c: &HirColumns<Growing>| (c.extra.len(), c.stmt_kind.len(), c.macro_defs.len());
+        let sizes =
+            |c: &HirColumns<Growing>| (c.extra.len(), c.stmt_kind.len(), c.macro_defs.len());
         let before = sizes(&columns);
 
         let fewer = Statement::Let {
@@ -2930,7 +3005,11 @@ mod tests {
         assert_eq!(columns.statement(at), Statement::Expr { expr: E1, has_semi: true });
         columns.set_statement(at, bare);
         assert_eq!(columns.statement(at), bare);
-        assert_eq!(columns.extra.len(), words + LET_WORDS + 1, "a `let` from an expression appends");
+        assert_eq!(
+            columns.extra.len(),
+            words + LET_WORDS + 1,
+            "a `let` from an expression appends"
+        );
         assert_eq!(columns.stmt_kind.len(), 1, "rows are set in place");
 
         let block = columns.push_expr(

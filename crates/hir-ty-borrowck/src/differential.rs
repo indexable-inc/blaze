@@ -8,10 +8,10 @@
 use std::ops::Range;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
 use blaze_mem::{Tag, frame};
 use hir_ty_mir::mir::BasicBlockId;
+use std::alloc::Global;
 
 use crate::{
     bitset::{Transfer, iter_words, words_for},
@@ -126,12 +126,7 @@ fn new_edge<'a>(
 }
 
 /// Each row of `load` against the old matrix, bit for bit.
-fn same_rows(
-    what: &str,
-    want: &old::BitMatrix,
-    case: &Case<'_>,
-    load: impl Fn(usize, &mut [u64]),
-) {
+fn same_rows(what: &str, want: &old::BitMatrix, case: &Case<'_>, load: impl Fn(usize, &mut [u64])) {
     let mut row = vec![0u64; case.words()];
     for b in 0..case.blocks.len() {
         row.fill(!0);
@@ -207,9 +202,8 @@ fn agree(frame: &Frame, what: &str, case: &Case<'_>) {
         new_edge(case, edges, from, to)
     });
     same_rows(&format!("{what}, backward, lined"), &want, case, |b, out| lined.load(b, out));
-    let picked = dataflow::backward(frame, &case.cfg, &blocks, |from, to| {
-        new_edge(case, edges, from, to)
-    });
+    let picked =
+        dataflow::backward(frame, &case.cfg, &blocks, |from, to| new_edge(case, edges, from, to));
     picks_by_size(what, case, &picked);
     same_rows(&format!("{what}, backward, picked"), &want, case, |b, out| picked.load(b, out));
 }
@@ -368,7 +362,13 @@ const SHAPES: [Shape; 6] =
 
 /// Edges over blocks `lo..hi`, every one reachable from `lo` and `hi - 1` reachable from all
 /// of them that reach anything.
-fn shaped(rng: &mut SplitMix64, shape: Shape, lo: usize, hi: usize, edges: &mut Vec<(usize, usize)>) {
+fn shaped(
+    rng: &mut SplitMix64,
+    shape: Shape,
+    lo: usize,
+    hi: usize,
+    edges: &mut Vec<(usize, usize)>,
+) {
     let chain = |from: usize, edges: &mut Vec<(usize, usize)>| {
         edges.extend((from..hi.saturating_sub(1)).map(|b| (b, b + 1)));
     };

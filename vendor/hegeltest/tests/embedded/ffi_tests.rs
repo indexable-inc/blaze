@@ -20,11 +20,7 @@ fn ffi_settings_builds_with_each_explicit_backend() {
 
 /// A deterministic, database-free settings for tests.
 fn test_settings(seed: u64) -> Settings {
-    Settings::new()
-        .test_cases(25)
-        .database(None)
-        .derandomize(true)
-        .seed(Some(seed))
+    Settings::new().test_cases(25).database(None).derandomize(true).seed(Some(seed))
 }
 
 const VALID: hegel_c::hegel_status_t = hegel_c::hegel_status_t::HEGEL_STATUS_VALID;
@@ -141,8 +137,7 @@ fn ffi_reads_the_structured_kind_of_a_run_error() {
     let run = RunHandle::start(&sh, None).unwrap();
     while let Some(tc) = run.next_test_case() {
         tc.generate_integer(0, 1_000_000).unwrap();
-        tc.mark_complete(hegel_c::hegel_status_t::HEGEL_STATUS_INVALID, None)
-            .unwrap();
+        tc.mark_complete(hegel_c::hegel_status_t::HEGEL_STATUS_INVALID, None).unwrap();
     }
     let result = run.result();
     assert!(result.status() == hegel_c::hegel_run_status_t::HEGEL_RUN_STATUS_ERROR);
@@ -160,10 +155,7 @@ fn ffi_reads_the_structured_kind_of_a_run_error() {
     drive_run(&run, |_| Ok(()));
     let result = run.result();
     assert!(result.error().is_none());
-    assert_eq!(
-        error_kind(&result),
-        (hegel_c::hegel_run_error_kind_t::HEGEL_RUN_ERROR_NONE, 0)
-    );
+    assert_eq!(error_kind(&result), (hegel_c::hegel_run_error_kind_t::HEGEL_RUN_ERROR_NONE, 0));
 }
 
 /// The collection / pool / state-machine constructors surface libhegel's
@@ -178,10 +170,7 @@ fn ffi_object_constructors_error_on_a_completed_case() {
     let run = RunHandle::start(&sh, None).unwrap();
     while let Some(tc) = run.next_test_case() {
         tc.mark_complete(VALID, None).unwrap();
-        assert!(matches!(
-            tc.new_collection(0, Some(3)),
-            Err(ALREADY_COMPLETE)
-        ));
+        assert!(matches!(tc.new_collection(0, Some(3)), Err(ALREADY_COMPLETE)));
         assert!(matches!(tc.new_pool(), Err(ALREADY_COMPLETE)));
         assert!(matches!(
             tc.new_state_machine(&["only"], &[0], &[1.0], &[], &[], 1, 1, 50),
@@ -215,10 +204,7 @@ fn ffi_grammar_construction_reports_engine_diagnostics() {
     )
     .unwrap();
     let marker = grammar.placeholder("NUM").unwrap();
-    assert!(
-        marker.starts_with("<<EXPLICIT_NUM_") && marker.ends_with(">>"),
-        "{marker}"
-    );
+    assert!(marker.starts_with("<<EXPLICIT_NUM_") && marker.ends_with(">>"), "{marker}");
     let err = grammar.placeholder("WORD").unwrap_err();
     assert!(err.contains("not an explicit terminal"), "{err}");
 }
@@ -236,23 +222,14 @@ fn ffi_grammar_imports_are_read_from_the_import_dir() {
     new(text, Some(dir.path())).unwrap();
 
     let err = new(text, None).unwrap_err();
-    assert!(
-        err.contains("Could not find grammar `sub/lib.lark`"),
-        "{err}"
-    );
+    assert!(err.contains("Could not find grammar `sub/lib.lark`"), "{err}");
 
     let err = new("%import .common.WS\nstart: WS", Some(dir.path())).unwrap_err();
-    assert!(
-        err.contains("Could not find grammar `common.lark`"),
-        "{err}"
-    );
+    assert!(err.contains("Could not find grammar `common.lark`"), "{err}");
 
     std::fs::write(dir.path().join("file"), "not a directory").unwrap();
     let err = new("%import file.lib.X\nstart: X", Some(dir.path())).unwrap_err();
-    assert!(
-        err.contains("Could not find grammar `file/lib.lark`"),
-        "{err}"
-    );
+    assert!(err.contains("Could not find grammar `file/lib.lark`"), "{err}");
 
     std::fs::write(sub.join("inner.lark"), b"DIGIT: \"\xff\"\n").unwrap();
     let err = new(text, Some(dir.path())).unwrap_err();
@@ -298,19 +275,10 @@ fn ffi_string_generator_constructors_cover_every_kind() {
     assert!(err.contains("invalid regex pattern"), "{err}");
     let err = StringGenerator::domain(3).unwrap_err();
     assert!(err.contains("no eligible TLDs"), "{err}");
-    let err = StringGenerator::text(
-        0,
-        1,
-        None,
-        0,
-        None,
-        Some(&["Nd".to_string()]),
-        None,
-        None,
-        None,
-    )
-    .and_then(|nd| StringGenerator::regex(r"\d", false, Some(&nd)).map(|_| ()))
-    .map(|_| String::new());
+    let err =
+        StringGenerator::text(0, 1, None, 0, None, Some(&["Nd".to_string()]), None, None, None)
+            .and_then(|nd| StringGenerator::regex(r"\d", false, Some(&nd)).map(|_| ()))
+            .map(|_| String::new());
     assert!(err.is_ok(), "a text alphabet is accepted for regex");
 }
 
@@ -345,9 +313,7 @@ fn ffi_reports_failure_with_blob_then_replays_it() {
         failure.origin, origin,
         "the engine reports the origin the failure was marked complete with"
     );
-    let blob = failure
-        .reproduce_blob
-        .expect("a shrunk failure carries a blob");
+    let blob = failure.reproduce_blob.expect("a shrunk failure carries a blob");
 
     let sh2 = SettingsHandle::build(&settings, None, None);
     let replay_run = RunHandle::start_blob(&sh2, &blob, None);
@@ -476,10 +442,7 @@ fn ffi_settings_round_trip_every_field_through_registration() {
     assert!(restored.show_statistics);
     assert!(restored.print_blob);
     assert_eq!(restored.backend, Backend::Urandom);
-    assert_eq!(
-        restored.nondeterminism_strictness,
-        NondeterminismStrictness::Error
-    );
+    assert_eq!(restored.nondeterminism_strictness, NondeterminismStrictness::Error);
 }
 
 #[test]
@@ -518,10 +481,7 @@ fn ffi_settings_build_preserves_an_unset_database() {
 #[test]
 fn ffi_settings_from_profile_reports_engine_errors() {
     let e = settings_from_profile(Some("ffi_tests_no_such_profile")).unwrap_err();
-    assert!(
-        e.contains("unknown settings profile \"ffi_tests_no_such_profile\""),
-        "got: {e}"
-    );
+    assert!(e.contains("unknown settings profile \"ffi_tests_no_such_profile\""), "got: {e}");
 }
 
 #[test]

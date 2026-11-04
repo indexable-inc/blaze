@@ -22,7 +22,10 @@ impl Masks {
 
     /// The masks every build of this process keeps.
     pub fn shared() -> &'static Masks {
-        #[expect(clippy::disallowed_types, reason = "the daemon's one set of folded forms, kept across its builds so a form is hashed once")]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the daemon's one set of folded forms, kept across its builds so a form is hashed once"
+        )]
         static SHARED: std::sync::LazyLock<Masks> = std::sync::LazyLock::new(Masks::new);
         &SHARED
     }

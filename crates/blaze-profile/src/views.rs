@@ -1,17 +1,17 @@
 //! The named views over the history, as data: the one list both the explorer's `views` and
 //! `view` ops and `blaze explain <view> <args>` read. Each view's SQL is a section of
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
-//! and views that SQL reads, over the directories [`prelude`] is given.
+//! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _, path::Path};
+use std::{fmt, fmt::Write as _};
 
 use serde_json::{Map, Value};
 
-use crate::schema;
+use crate::{history::Snapshot, schema};
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
 /// `fiber_stacks`, `job_waits`, `job_spans` and `span_sums`. Each
-/// `@<table>` in it is a list of globs, filled in by [`prelude`].
+/// `@<table>` in it is a list of files, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
 const EXAMPLES: &str = include_str!("../sql/examples.sql");
@@ -63,11 +63,8 @@ impl ArgType {
     }
 }
 
-const BUILD: Arg = Arg {
-    name: "build",
-    ty: ArgType::U64,
-    default: Some("(SELECT max(build_id) FROM spans)"),
-};
+const BUILD: Arg =
+    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM spans)") };
 /// A build for a view over its wall time: by default the last to end, as one still running has
 /// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
@@ -78,14 +75,30 @@ const ENDED_BUILD: Arg = Arg {
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
+/// The build a key is diffed against: by default, the last at or before the one before the
+/// last build with key parts (`key_part_diff` takes the last that computed the same thing).
+const BEFORE: Arg = Arg {
+    name: "before",
+    ty: ArgType::U64,
+    default: Some("(SELECT max(build_id) - 1 FROM key_parts)"),
+};
+/// The build whose key is diffed: by default, the last with key parts.
+const AFTER: Arg =
+    Arg { name: "after", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM key_parts)") };
 
 pub const VIEWS: &[View] = &[
     view("slowest_queries", &[BUILD, LIMIT]),
     view("slower_between_commits", &[EARLIER, LATER, LIMIT]),
-    view("memo_hit_rate_per_crate", &[BUILD]),
+    view("memo_hit_rate_per_query_kind", &[BUILD, LIMIT]),
     view("critical_path", &[ENDED_BUILD, LIMIT]),
     view("allocations_per_query_kind", &[BUILD]),
     view("what_reran", &[BUILD, LIMIT]),
+    view("why_reran", &[BUILD, LIMIT]),
+    view("untracked_reads", &[BUILD, LIMIT]),
+    view("cycle_reruns", &[BUILD, LIMIT]),
+    view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
+    view("task_memory", &[BUILD]),
+    view("admission_waits", &[BUILD, LIMIT]),
     view("busiest_threads", &[BUILD, LIMIT]),
     view("longest_gaps", &[BUILD, LIMIT]),
     view("top_cpu_stacks", &[BUILD, LIMIT]),
@@ -180,7 +193,9 @@ const fn section(file: &'static str, name: &'static str) -> (&'static str, &'sta
     }
     let says = line_end(bytes, at) + 1;
     if !starts(bytes, says, SAYS) {
-        panic!("a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line");
+        panic!(
+            "a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line"
+        );
     }
     let says_end = line_end(bytes, says);
     let sql = says_end + 1;
@@ -193,18 +208,37 @@ const fn section(file: &'static str, name: &'static str) -> (&'static str, &'sta
 
 #[derive(Debug, PartialEq)]
 pub enum ViewError {
-    NoSuchView { name: String },
+    NoSuchView {
+        name: String,
+    },
     /// An argument the view does not take.
-    UnknownArg { view: &'static str, arg: String },
+    UnknownArg {
+        view: &'static str,
+        arg: String,
+    },
     /// An argument the view needs, with no default, not given.
-    MissingArg { view: &'static str, arg: &'static str },
+    MissingArg {
+        view: &'static str,
+        arg: &'static str,
+    },
     /// An argument given as a JSON value its type does not take.
-    BadArg { view: &'static str, arg: &'static str, want: ArgType, got: String },
+    BadArg {
+        view: &'static str,
+        arg: &'static str,
+        want: ArgType,
+        got: String,
+    },
     /// `$<name>` in the view's SQL, or `@<name>` in the prelude, that names no argument or
     /// table: a bug in the SQL files.
-    Undeclared { view: &'static str, name: String },
-    /// A directory a glob can't be made of.
-    BadPath { path: String, why: &'static str },
+    Undeclared {
+        view: &'static str,
+        name: String,
+    },
+    /// A history directory or file DuckDB can't be given by its path.
+    BadPath {
+        path: String,
+        why: &'static str,
+    },
 }
 
 impl ViewError {
@@ -212,7 +246,9 @@ impl ViewError {
     pub fn kind(&self) -> &'static str {
         match self {
             ViewError::NoSuchView { .. } => "no_such_view",
-            ViewError::UnknownArg { .. } | ViewError::MissingArg { .. } | ViewError::BadArg { .. } => "bad_args",
+            ViewError::UnknownArg { .. }
+            | ViewError::MissingArg { .. }
+            | ViewError::BadArg { .. } => "bad_args",
             ViewError::Undeclared { .. } | ViewError::BadPath { .. } => "sql",
         }
     }
@@ -234,20 +270,28 @@ impl fmt::Display for ViewError {
                     Ok([]) | Err(_) => write!(f, " none"),
                     Ok(args) => {
                         for (i, it) in args.iter().enumerate() {
-                            write!(f, "{} {} ({})", if i == 0 { "" } else { "," }, it.name, it.ty.name())?;
+                            write!(
+                                f,
+                                "{} {} ({})",
+                                if i == 0 { "" } else { "," },
+                                it.name,
+                                it.ty.name()
+                            )?;
                         }
                         Ok(())
                     }
                 }
             }
-            ViewError::MissingArg { view, arg } => write!(f, "the view {view} needs the argument `{arg}`"),
+            ViewError::MissingArg { view, arg } => {
+                write!(f, "the view {view} needs the argument `{arg}`")
+            }
             ViewError::BadArg { view, arg, want, got } => {
                 write!(f, "the view {view}'s argument `{arg}` is a {}, not {got}", want.name())
             }
             ViewError::Undeclared { view, name } => {
                 write!(f, "the SQL of {view} names `{name}`, which is no argument or table of it")
             }
-            ViewError::BadPath { path, why } => write!(f, "the directory {path} {why}"),
+            ViewError::BadPath { path, why } => write!(f, "the history path {path} {why}"),
         }
     }
 }
@@ -263,7 +307,10 @@ struct Sigil<'a> {
 }
 
 /// Each `$name` and `@name` of `sql` outside its comments and string literals, in order.
-fn scan(sql: &str, mut each: impl FnMut(Sigil<'_>) -> Result<(), ViewError>) -> Result<(), ViewError> {
+fn scan(
+    sql: &str,
+    mut each: impl FnMut(Sigil<'_>) -> Result<(), ViewError>,
+) -> Result<(), ViewError> {
     let bytes = sql.as_bytes();
     let mut at = 0;
     while at < bytes.len() {
@@ -279,7 +326,9 @@ fn scan(sql: &str, mut each: impl FnMut(Sigil<'_>) -> Result<(), ViewError>) -> 
             sigil @ (b'$' | b'@') => {
                 let start = at + 1;
                 let mut end = start;
-                while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
                     end += 1;
                 }
                 each(Sigil { at, end, sigil, name: &sql[start..end] })?;
@@ -320,7 +369,12 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
     Ok(out)
 }
 
-fn literal(view: &View, arg: &Arg, value: Option<&Value>, out: &mut String) -> Result<(), ViewError> {
+fn literal(
+    view: &View,
+    arg: &Arg,
+    value: Option<&Value>,
+    out: &mut String,
+) -> Result<(), ViewError> {
     let bad = |got: &Value| ViewError::BadArg {
         view: view.name,
         arg: arg.name,
@@ -329,7 +383,8 @@ fn literal(view: &View, arg: &Arg, value: Option<&Value>, out: &mut String) -> R
         got: got.to_string(),
     };
     let Some(value) = value else {
-        let default = arg.default.ok_or(ViewError::MissingArg { view: view.name, arg: arg.name })?;
+        let default =
+            arg.default.ok_or(ViewError::MissingArg { view: view.name, arg: arg.name })?;
         out.push_str(default);
         return Ok(());
     };
@@ -362,44 +417,60 @@ pub(crate) fn quote(text: &str, out: &mut String) {
     out.push('\'');
 }
 
-/// [`PRELUDE`] reading each table from `<dir>/*.<table>.parquet` of every directory of `dirs`,
-/// then each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name
-/// (the latest build, the default limit), so a query can say `FROM uncovered_time`. Other
+/// [`PRELUDE`] reading each table from the files of it of every snapshot of `snapshots` (each a
+/// directory a reader pinned, [`crate::history::Pin`]), named one by one: never a glob, which
+/// DuckDB would expand again at each query and could find files the pin does not hold. Then
+/// each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name (the
+/// latest build, the default limit), so a query can say `FROM uncovered_time`. Other
 /// arguments take `blaze explain <view> <args>`.
-pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
+pub fn prelude(snapshots: &[&Snapshot]) -> Result<String, ViewError> {
     // alloc: the prelude, once a query
-    let mut globs: Vec<&str> = Vec::with_capacity(dirs.len());
-    for dir in dirs {
+    let mut dirs: Vec<&str> = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let dir = snapshot.dir();
         let path = dir.to_str().ok_or_else(|| ViewError::BadPath {
             // alloc: an error, once a request
             path: dir.display().to_string(),
-            why: "is not UTF-8, and DuckDB's globs are",
+            why: "is not UTF-8, and the paths DuckDB is given are",
         })?;
-        if path.contains(['*', '?', '[', ']', '{', '}']) {
-            // alloc: an error, once a request
-            return Err(ViewError::BadPath { path: path.to_owned(), why: "has a character DuckDB's globs expand" });
-        }
-        globs.push(path.trim_end_matches('/'));
+        dirs.push(path.trim_end_matches('/'));
     }
+    let files: usize = snapshots
+        .iter()
+        .map(|it| (0..schema::TABLES.len()).map(|at| it.files(at).len()).sum::<usize>())
+        .sum();
     // alloc: the prelude, once a query
-    let mut out = String::with_capacity(PRELUDE.len() + 256 * dirs.len());
+    let mut out = String::with_capacity(PRELUDE.len() + 64 * files);
     let mut copied = 0;
     scan(PRELUDE, |it| {
         if it.sigil != b'@' {
             return Ok(());
         }
-        let Some(table) = schema::TABLES.iter().find(|table| table.name == it.name) else {
+        let Some(table) = schema::TABLES.iter().position(|table| table.name == it.name) else {
             // alloc: an error, a bug in views.sql
             return Err(ViewError::Undeclared { view: "views.sql", name: it.name.to_owned() });
         };
         out.push_str(&PRELUDE[copied..it.at]);
         out.push('[');
-        for (i, dir) in globs.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
+        let mut first = true;
+        for (snapshot, dir) in snapshots.iter().zip(&dirs) {
+            for name in snapshot.files(table) {
+                // alloc: a file's path, once a file a query
+                let path = format!("{dir}/{name}");
+                // DuckDB expands a glob in any path of the list, so a path holding one would
+                // read other files, or none.
+                if path.contains(['*', '?', '[', ']', '{', '}']) {
+                    return Err(ViewError::BadPath {
+                        path,
+                        why: "has a character DuckDB's globs expand",
+                    });
+                }
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                quote(&path, &mut out);
             }
-            // alloc: the prelude, once a query
-            quote(&format!("{dir}/*.{}.parquet", table.name), &mut out);
         }
         out.push(']');
         copied = it.end;
@@ -409,7 +480,12 @@ pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
     for view in VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
         // Writing to a `String` does not fail; a section may end in a comment, so `;` goes on a
         // line of its own.
-        _ = write!(out, "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n", view.name, render(view, &Map::new())?);
+        _ = write!(
+            out,
+            "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n",
+            view.name,
+            render(view, &Map::new())?
+        );
     }
     crate::span::views(&mut out);
     Ok(out)
@@ -463,10 +539,23 @@ mod tests {
         let names: BTreeSet<&str> = VIEWS.iter().map(|it| it.name).collect();
         assert_eq!(names.len(), VIEWS.len(), "no two views share a name");
         for view in VIEWS {
-            assert!(!view.title.is_empty() && !view.title.contains('\n'), "{} says what it is in a line", view.name);
-            assert!(view.sql.starts_with("SELECT") || view.sql.starts_with("WITH"), "{}: {}", view.name, view.sql);
+            assert!(
+                !view.title.is_empty() && !view.title.contains('\n'),
+                "{} says what it is in a line",
+                view.name
+            );
+            assert!(
+                view.sql.starts_with("SELECT") || view.sql.starts_with("WITH"),
+                "{}: {}",
+                view.name,
+                view.sql
+            );
             assert!(!view.sql.contains("-- name:"), "{} holds one section", view.name);
-            assert!(!view.sql.trim_end().ends_with(';'), "{} is one statement DuckDB can wrap in COPY", view.name);
+            assert!(
+                !view.sql.trim_end().ends_with(';'),
+                "{} is one statement DuckDB can wrap in COPY",
+                view.name
+            );
         }
     }
 
@@ -480,7 +569,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-            let declared: BTreeSet<String> = view.args.iter().map(|it| it.name.to_owned()).collect();
+            let declared: BTreeSet<String> =
+                view.args.iter().map(|it| it.name.to_owned()).collect();
             assert_eq!(used, declared, "{}", view.name);
         }
     }
@@ -488,7 +578,8 @@ mod tests {
     #[test]
     fn render_binds_each_type_as_its_literal() {
         let view = find("slower_between_commits").unwrap();
-        let sql = render(view, &args(json!({"earlier": "it's", "later": "a\\b", "limit": 5}))).unwrap();
+        let sql =
+            render(view, &args(json!({"earlier": "it's", "later": "a\\b", "limit": 5}))).unwrap();
         assert!(sql.contains("starts_with(commit, 'it''s')"), "{sql}");
         assert!(sql.contains("starts_with(commit, 'a\\b')"), "{sql}");
         assert!(sql.ends_with("LIMIT 5"), "{sql}");
@@ -496,7 +587,10 @@ mod tests {
 
         let view = find("slowest_queries").unwrap();
         let sql = render(view, &args(json!({}))).unwrap();
-        assert!(sql.contains("build_id = (SELECT max(build_id) FROM spans)"), "a missing argument takes its default: {sql}");
+        assert!(
+            sql.contains("build_id = (SELECT max(build_id) FROM spans)"),
+            "a missing argument takes its default: {sql}"
+        );
         assert!(sql.ends_with("LIMIT 20"), "{sql}");
         let sql = render(view, &args(json!({"build": 41}))).unwrap();
         assert!(sql.contains("build_id = 41"), "{sql}");
@@ -508,7 +602,10 @@ mod tests {
             args: &[Arg { name: "x", ty: ArgType::F64, default: None }],
         };
         let sql = render(&FLOAT, &args(json!({"x": 0.5}))).unwrap();
-        assert_eq!(sql, "SELECT 5e-1 AS x, '$x' AS text -- $x\n", "only arguments outside strings and comments are bound");
+        assert_eq!(
+            sql, "SELECT 5e-1 AS x, '$x' AS text -- $x\n",
+            "only arguments outside strings and comments are bound"
+        );
         let sql = render(&FLOAT, &args(json!({"x": -3}))).unwrap();
         assert!(sql.starts_with("SELECT -3e0 AS x"), "{sql}");
     }
@@ -525,7 +622,10 @@ mod tests {
             Err(ViewError::MissingArg { view: view.name, arg: "later" })
         );
         let error = render(view, &args(json!({"earlier": 3, "later": "b"}))).unwrap_err();
-        assert!(matches!(error, ViewError::BadArg { arg: "earlier", want: ArgType::Text, .. }), "{error:?}");
+        assert!(
+            matches!(error, ViewError::BadArg { arg: "earlier", want: ArgType::Text, .. }),
+            "{error:?}"
+        );
         assert_eq!(error.kind(), "bad_args");
         let error = render(view, &args(json!({"earlier": "a\u{0}", "later": "b"}))).unwrap_err();
         assert!(matches!(error, ViewError::BadArg { arg: "earlier", .. }), "{error:?}");
@@ -533,20 +633,48 @@ mod tests {
         let view = find("slowest_queries").unwrap();
         for bad in [json!(-1), json!(1.5), json!("1"), json!(null), json!([1])] {
             let error = render(view, &args(json!({ "build": bad }))).unwrap_err();
-            assert!(matches!(error, ViewError::BadArg { arg: "build", want: ArgType::U64, .. }), "{bad}: {error:?}");
+            assert!(
+                matches!(error, ViewError::BadArg { arg: "build", want: ArgType::U64, .. }),
+                "{bad}: {error:?}"
+            );
         }
         assert_eq!(find("nope").unwrap_err().kind(), "no_such_view");
     }
 
     #[test]
     fn the_prelude_lists_each_tables_files_in_every_directory() {
-        let sql = prelude(&[Path::new("/state/profile/"), Path::new("/tmp/it's live")]).unwrap();
+        use std::path::Path;
+
+        use crate::history::retire::Retired;
+        let names = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<String>>();
+        let state = Snapshot::resolve(
+            Path::new("/state/profile/"),
+            &names(&[
+                "schema.spans.parquet",
+                "1-00000002.spans.parquet",
+                "1-00000001.counters.parquet",
+                "owner.lock",
+            ]),
+            &Retired::default(),
+        );
+        let live = Snapshot::resolve(
+            Path::new("/tmp/it's live"),
+            &names(&["live.spans.parquet"]),
+            &Retired::default(),
+        );
+        let sql = prelude(&[&state, &live]).unwrap();
         assert!(sql.contains(
-            "read_parquet(['/state/profile/*.spans.parquet', '/tmp/it''s live/*.spans.parquet'], union_by_name = true)"
-        ));
+            "read_parquet(['/state/profile/1-00000002.spans.parquet', '/state/profile/schema.spans.parquet', \
+             '/tmp/it''s live/live.spans.parquet'], union_by_name = true)"
+        ), "{sql}");
         assert!(!sql.contains("@spans") && !sql.contains("@heap_by_owner"));
         assert!(sql.contains("`@<table>`"), "a comment's text is left alone");
-        let error = prelude(&[Path::new("/tmp/a*b")]).unwrap_err();
+        let bad = Snapshot::resolve(
+            Path::new("/tmp/a*b"),
+            &names(&["schema.spans.parquet"]),
+            &Retired::default(),
+        );
+        let error = prelude(&[&bad]).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
     }
 
@@ -561,18 +689,92 @@ mod tests {
 
     /// DuckDB's words the SQL files use: keywords, types and named parameters.
     const KEYWORDS: &[&str] = &[
-        "all", "and", "any", "as", "asc", "asof", "between", "by", "case", "cast", "create", "desc",
-        "distinct", "double", "else", "end", "exists", "filter", "first", "from", "group",
-        "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
-        "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
-        "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar",
+        "all",
+        "and",
+        "any",
+        "as",
+        "asc",
+        "asof",
+        "between",
+        "by",
+        "case",
+        "cast",
+        "create",
+        "desc",
+        "distinct",
+        "double",
+        "else",
+        "end",
+        "exists",
+        "filter",
+        "first",
+        "from",
+        "group",
+        "having",
+        "in",
+        "is",
+        "join",
+        "last",
+        "left",
+        "like",
+        "limit",
+        "not",
+        "null",
+        "nulls",
+        "on",
+        "or",
+        "order",
+        "over",
+        "partition",
+        "qualify",
+        "recursive",
+        "replace",
+        "select",
+        "then",
+        "union",
+        "union_by_name",
+        "using",
+        "view",
+        "when",
+        "where",
+        "with",
+        "true",
+        "false",
+        "rows",
+        "unbounded",
+        "preceding",
+        "bigint",
+        "cross",
+        "ubigint",
+        "varchar",
+        "full",
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[
-        "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
-        "rank", "read_parquet", "round", "starts_with", "sum", "unnest", "range", "least", "greatest",
-        "coalesce", "string_agg", "regexp_matches", "row_number", "regexp_extract", "ends_with",
+        "any_value",
+        "arg_max",
+        "array_to_string",
+        "count",
+        "lag",
+        "lead",
+        "max",
+        "median",
+        "min",
+        "rank",
+        "read_parquet",
+        "round",
+        "starts_with",
+        "sum",
+        "unnest",
+        "range",
+        "least",
+        "greatest",
+        "coalesce",
+        "string_agg",
+        "regexp_matches",
+        "row_number",
+        "regexp_extract",
+        "ends_with",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with
@@ -596,7 +798,9 @@ mod tests {
             } else if c.is_ascii_digit() || c == b'$' || c == b'@' {
                 at += 1;
                 while at < bytes.len()
-                    && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || (bytes[at] == b'.' && c.is_ascii_digit()))
+                    && (bytes[at].is_ascii_alphanumeric()
+                        || bytes[at] == b'_'
+                        || (bytes[at] == b'.' && c.is_ascii_digit()))
                 {
                     at += 1;
                 }

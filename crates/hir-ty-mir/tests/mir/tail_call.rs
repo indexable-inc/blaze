@@ -3,8 +3,8 @@
 //! chain of tail calls runs, a call through a function pointer works, and a bottom frame's
 //! tail call returns to the evaluation. Each program runs on Linux x86-64 under [`Plain`] with minicore.
 
-use hir_ty_mir::mir::{Plain, run_function};
 use hir_expand::fixture;
+use hir_ty_mir::mir::{Plain, run_function};
 
 use crate::function;
 

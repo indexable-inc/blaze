@@ -90,7 +90,8 @@ impl Query<'_> {
 
         // How `write_key` shows a key ([`Function::write_key`]): each argument's `Debug`, its
         // ID, or `_`, the first that applies to its type.
-        let key_text = quote!(use #plumbing::{KeyTextDebug as _, KeyTextId as _, KeyTextOther as _};);
+        let key_text =
+            quote!(use #plumbing::{KeyTextDebug as _, KeyTextId as _, KeyTextOther as _};);
 
         // The key type, how a key is made of the arguments in `fetch`, how `execute` and the
         // cycle functions get the arguments back from `key`, and how `write_key` shows it.

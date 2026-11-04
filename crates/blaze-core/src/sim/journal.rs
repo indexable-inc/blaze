@@ -84,7 +84,11 @@ impl Disk {
     /// move as on a real disk (a directory's mtime moves when a name in it is made or goes; a
     /// directory is there while a file is under it), and the journal records it. Returns the
     /// cursor after the change.
-    pub(super) fn touched(&mut self, file: &FileName, files: &HashMap<FileName, SimFile, Global>) -> Cursor {
+    pub(super) fn touched(
+        &mut self,
+        file: &FileName,
+        files: &HashMap<FileName, SimFile, Global>,
+    ) -> Cursor {
         let there = files.contains_key(file);
         let now = self.tick();
         let renamed = self.renamed_to.as_ref() == Some(file);
@@ -205,7 +209,11 @@ impl Disk {
     }
 
     /// What `name` is now.
-    pub(super) fn stamp(&mut self, name: &FileName, files: &HashMap<FileName, SimFile, Global>) -> Stamp {
+    pub(super) fn stamp(
+        &mut self,
+        name: &FileName,
+        files: &HashMap<FileName, SimFile, Global>,
+    ) -> Stamp {
         if let Some(file) = files.get(name) {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
@@ -292,7 +300,9 @@ impl Disk {
             Cursor::None => return vec![whole(None)],
             Cursor::Sim { journal, next } if journal == self.id && next <= self.end() => next,
             // alloc: the batches' payload.
-            Cursor::Sim { journal, .. } if journal == self.id => return vec![whole(Some(Lost::Reset))],
+            Cursor::Sim { journal, .. } if journal == self.id => {
+                return vec![whole(Some(Lost::Reset))];
+            }
             // alloc: the batches' payload.
             _ => return vec![whole(Some(Lost::Reset))],
         };
@@ -338,7 +348,9 @@ impl Disk {
             // clone: the batch's payload, a name of it.
             Entry::Changed(file) if file.is_under(dir) => batch.files.push(file.clone()),
             // clone: as above.
-            Entry::Lost(under, why) if under.is_under(dir) => batch.lost.push((under.clone(), *why)),
+            Entry::Lost(under, why) if under.is_under(dir) => {
+                batch.lost.push((under.clone(), *why))
+            }
             // clone: as above.
             Entry::Lost(under, why) if dir.is_under(under) => batch.lost.push((dir.clone(), *why)),
             Entry::Changed(_) | Entry::Lost(..) => {}
@@ -429,7 +441,8 @@ mod tests {
         let mut sim = Sim::new(1, Faults::default());
         sim.change(&name("src/a/one.rs"), b"1");
         sim.change(&name("src/b.rs"), b"2");
-        let (file, dir, top) = (stamp(&mut sim, "src/a/one.rs"), stamp(&mut sim, "src/a"), stamp(&mut sim, "src"));
+        let (file, dir, top) =
+            (stamp(&mut sim, "src/a/one.rs"), stamp(&mut sim, "src/a"), stamp(&mut sim, "src"));
         assert!(file.is_file() && dir.is_dir() && top.is_dir());
         assert_eq!(stamp(&mut sim, "src/none"), Stamp::GONE);
         // A write moves the file's times, not its directory's.
@@ -488,7 +501,8 @@ mod tests {
                 sim.crash();
                 let told = journal(&mut sim, cursor);
                 assert!(told.iter().rev().skip(1).all(|it| !it.caught_up), "{told:?}");
-                let files: Vec<&str> = told.iter().flat_map(|it| &it.files).map(FileName::as_str).collect();
+                let files: Vec<&str> =
+                    told.iter().flat_map(|it| &it.files).map(FileName::as_str).collect();
                 for want in ["src/new", "src/new/a.rs", "src/kept.rs", "src/moved.rs"] {
                     assert!(files.contains(&want), "{want} in {files:?}");
                 }

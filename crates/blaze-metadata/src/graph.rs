@@ -4,10 +4,10 @@
 
 use anyhow::Result;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_resolve::metadata::{Dep, DepKindInfo, MetadataResolve, MetadataResolveNode};
 use blaze_resolve::resolver::{FeaturesFor, ResolvedFeatures};
 use blaze_resolve::{DepKind, InternedString, PackageId, Resolve};
+use std::alloc::Global;
 
 use blaze_units::Read;
 
@@ -162,7 +162,10 @@ mod tests {
             let node = tree.entry(*pkg).or_default();
             node.0.extend(features.iter().map(|it| InternedString::new(it)));
             for (dep, name, kinds) in *deps {
-                let entry = node.1.entry(*dep).or_insert_with(|| (InternedString::new(name), BTreeSet::new()));
+                let entry = node
+                    .1
+                    .entry(*dep)
+                    .or_insert_with(|| (InternedString::new(name), BTreeSet::new()));
                 entry.1.extend(kinds.iter().map(|(k, t)| kind(*k, *t)));
             }
         }
@@ -189,19 +192,28 @@ mod tests {
 
     #[test]
     fn nodes_are_written_as_the_ordered_maps_wrote_them() {
-        let (a, b, c, d) = (id("a", "1.0.0"), id("b", "0.1.0"), id("b", "0.2.0"), id("zed", "2.0.0"));
+        let (a, b, c, d) =
+            (id("a", "1.0.0"), id("b", "0.1.0"), id("b", "0.2.0"), id("zed", "2.0.0"));
         let unix = Some("cfg(unix)");
         let input: &[(PackageId, &[&str], &[(PackageId, &str, &[(DepKind, Option<&str>)])])] = &[
             (d, &["std", "alloc"], &[]),
-            (a, &["z", "default", "m"], &[
-                (d, "zed", &[(DepKind::Normal, None), (DepKind::Build, None)]),
-                (c, "b2", &[(DepKind::Build, unix), (DepKind::Normal, None)]),
-                (b, "b", &[(DepKind::Development, None)]),
-            ]),
-            (a, &["m", "a"], &[
-                (c, "b2", &[(DepKind::Normal, None), (DepKind::Build, unix)]),
-                (b, "b", &[(DepKind::Normal, None)]),
-            ]),
+            (
+                a,
+                &["z", "default", "m"],
+                &[
+                    (d, "zed", &[(DepKind::Normal, None), (DepKind::Build, None)]),
+                    (c, "b2", &[(DepKind::Build, unix), (DepKind::Normal, None)]),
+                    (b, "b", &[(DepKind::Development, None)]),
+                ],
+            ),
+            (
+                a,
+                &["m", "a"],
+                &[
+                    (c, "b2", &[(DepKind::Normal, None), (DepKind::Build, unix)]),
+                    (b, "b", &[(DepKind::Normal, None)]),
+                ],
+            ),
             (c, &[], &[(d, "zed", &[(DepKind::Normal, unix), (DepKind::Normal, None)])]),
             (b, &["x"], &[]),
         ];
@@ -210,7 +222,10 @@ mod tests {
             let node = nodes.entry(*pkg).or_default();
             node.features.extend(features.iter().map(|it| InternedString::new(it)));
             for (dep, name, kinds) in *deps {
-                let entry = node.deps.entry(*dep).or_insert_with(|| (InternedString::new(name), Vec::new()));
+                let entry = node
+                    .deps
+                    .entry(*dep)
+                    .or_insert_with(|| (InternedString::new(name), Vec::new()));
                 entry.1.extend(kinds.iter().map(|(k, t)| kind(*k, *t)));
             }
         }

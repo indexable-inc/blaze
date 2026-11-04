@@ -7,8 +7,8 @@ use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
     signatures::FunctionSignature,
 };
-use rustc_type_ir::{UintTy, inherent::IntoKind as _};
 use hir_expand::fixture;
+use rustc_type_ir::{UintTy, inherent::IntoKind as _};
 
 use crate::{InferBodyId, InferenceResult, next_solver::TyKind};
 

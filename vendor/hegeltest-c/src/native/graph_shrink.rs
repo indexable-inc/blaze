@@ -153,10 +153,7 @@ fn without_span(run: &Run, span: &[Frame]) -> Run {
                 {
                     addr[depth].1 -= 1;
                 }
-                Step {
-                    addr,
-                    value: s.value.clone(),
-                }
+                Step { addr, value: s.value.clone() }
             })
             .collect(),
     }
@@ -199,19 +196,11 @@ fn locate(graph: &Graph, key: &EdgeKey) -> Option<(usize, usize)> {
 /// The edit a candidate makes, for the exercise rule.
 enum Edit {
     Delete,
-    Value {
-        node: usize,
-        addr: Addr,
-        value: ChoiceValue,
-    },
+    Value { node: usize, addr: Addr, value: ChoiceValue },
 }
 
 enum Verdict {
-    Accepted {
-        graph: Graph,
-        witness: Outcome,
-        lower_bound: f64,
-    },
+    Accepted { graph: Graph, witness: Outcome, lower_bound: f64 },
     Rejected,
 }
 
@@ -289,8 +278,7 @@ impl GraphShrinker {
     }
 
     fn expired(&self) -> bool {
-        self.deadline
-            .is_some_and(|d| crate::sys::Instant::now().is_some_and(|now| now >= d))
+        self.deadline.is_some_and(|d| crate::sys::Instant::now().is_some_and(|now| now >= d))
     }
 
     /// Remember the constraint of every draw of a run, by the state it was
@@ -298,22 +286,13 @@ impl GraphShrinker {
     fn learn_constraints(&mut self, nodes: &[ChoiceNode], spans: &[Span]) {
         let run = Run::from_nodes(nodes, spans);
         let idents = run.idents();
-        for (p, (node, step)) in nodes
-            .iter()
-            .filter(|n| !n.was_forced)
-            .zip(&run.steps)
-            .enumerate()
+        for (p, (node, step)) in nodes.iter().filter(|n| !n.was_forced).zip(&run.steps).enumerate()
         {
             if matches!(node.data, ChoiceData::Clone(_)) {
                 continue;
             }
-            let before = if p == 0 {
-                Ident::Start
-            } else {
-                idents[p - 1].clone()
-            };
-            self.constraints
-                .insert((before, step.addr.clone()), node.data.clone());
+            let before = if p == 0 { Ident::Start } else { idents[p - 1].clone() };
+            self.constraints.insert((before, step.addr.clone()), node.data.clone());
         }
     }
 
@@ -359,11 +338,8 @@ impl GraphShrinker {
                 continue;
             };
             let candidate = self.graph.delete_edge(n, i);
-            if let Verdict::Accepted {
-                graph,
-                witness,
-                lower_bound,
-            } = self.judge(probe, candidate, Edit::Delete).await?
+            if let Verdict::Accepted { graph, witness, lower_bound } =
+                self.judge(probe, candidate, Edit::Delete).await?
             {
                 self.adopt(probe, graph, witness, lower_bound)?;
                 changed = true;
@@ -397,11 +373,7 @@ impl GraphShrinker {
             let idents = current.idents();
             let mut tried = 0;
             for j in (0..start).rev() {
-                let before = if j == 0 {
-                    Ident::Start
-                } else {
-                    idents[j - 1].clone()
-                };
+                let before = if j == 0 { Ident::Start } else { idents[j - 1].clone() };
                 let Some(lowered) = self.lowered(&shorter, j, before) else {
                     continue;
                 };
@@ -423,10 +395,9 @@ impl GraphShrinker {
     /// other step.
     fn lowered(&self, run: &Run, j: usize, before: Ident) -> Option<Run> {
         let step = &run.steps[j];
-        let (ChoiceValue::Integer(v), Some(ChoiceData::Integer(ic, _))) = (
-            &step.value,
-            self.constraints.get(&(before, step.addr.clone())),
-        ) else {
+        let (ChoiceValue::Integer(v), Some(ChoiceData::Integer(ic, _))) =
+            (&step.value, self.constraints.get(&(before, step.addr.clone())))
+        else {
             return None;
         };
         if *v <= ic.simplest() {
@@ -439,15 +410,8 @@ impl GraphShrinker {
 
     /// Judge the graph of `run` alone as a candidate, adopting it on accept.
     async fn try_run(&mut self, probe: &mut dyn GraphProbe, run: &Run) -> Result<bool, RunError> {
-        match self
-            .judge(probe, Graph::from_run(run), Edit::Delete)
-            .await?
-        {
-            Verdict::Accepted {
-                graph,
-                witness,
-                lower_bound,
-            } => {
+        match self.judge(probe, Graph::from_run(run), Edit::Delete).await? {
+            Verdict::Accepted { graph, witness, lower_bound } => {
                 self.adopt(probe, graph, witness, lower_bound)?;
                 Ok(true)
             }
@@ -485,27 +449,14 @@ impl GraphShrinker {
             return Ok(false);
         }
         let Some(node) = self.graph.node(&key.from).filter(|&n| {
-            self.graph.nodes()[n]
-                .edges
-                .iter()
-                .any(|e| e.addr == key.addr && e.value == key.value)
+            self.graph.nodes()[n].edges.iter().any(|e| e.addr == key.addr && e.value == key.value)
         }) else {
             return Ok(false);
         };
-        let candidate = self
-            .graph
-            .set_value(node, &key.addr, &key.value, value.clone());
-        let edit = Edit::Value {
-            node,
-            addr: key.addr.clone(),
-            value: value.clone(),
-        };
+        let candidate = self.graph.set_value(node, &key.addr, &key.value, value.clone());
+        let edit = Edit::Value { node, addr: key.addr.clone(), value: value.clone() };
         match self.judge(probe, candidate, edit).await? {
-            Verdict::Accepted {
-                graph,
-                witness,
-                lower_bound,
-            } => {
+            Verdict::Accepted { graph, witness, lower_bound } => {
                 self.adopt(probe, graph, witness, lower_bound)?;
                 key.value = value;
                 Ok(true)
@@ -544,12 +495,7 @@ impl GraphShrinker {
                 while !self.timed_out && hi.abs_diff(lo) > 1 {
                     let mid = lo + (hi - lo) / 2;
                     if self
-                        .try_value(
-                            probe,
-                            &mut key,
-                            data,
-                            ChoiceValue::Integer(BigInt::from(mid)),
-                        )
+                        .try_value(probe, &mut key, data, ChoiceValue::Integer(BigInt::from(mid)))
                         .await?
                     {
                         hi = mid;
@@ -562,9 +508,8 @@ impl GraphShrinker {
             (ChoiceData::Float(_, _), ChoiceValue::Float(v)) => {
                 let whole = libm::trunc(v);
                 if whole != v {
-                    changed = self
-                        .try_value(probe, &mut key, data, ChoiceValue::Float(whole))
-                        .await?;
+                    changed =
+                        self.try_value(probe, &mut key, data, ChoiceValue::Float(whole)).await?;
                 }
             }
             (ChoiceData::Bytes(bc, _), ChoiceValue::Bytes(v)) => {
@@ -628,10 +573,7 @@ impl GraphShrinker {
             for candidate in
                 layout.coarse_candidates(&text, |id| constraint.smallest_for_terminal(id))
             {
-                if self
-                    .try_value(probe, key, data, ChoiceValue::String(candidate.clone()))
-                    .await?
-                {
+                if self.try_value(probe, key, data, ChoiceValue::String(candidate.clone())).await? {
                     accepted = Some(candidate);
                     break;
                 }
@@ -669,11 +611,7 @@ impl GraphShrinker {
             v.truncate(target);
             changed = true;
         }
-        if v.len() > min_len
-            && self
-                .try_value(probe, key, data, wrap(&v[..v.len() - 1]))
-                .await?
-        {
+        if v.len() > min_len && self.try_value(probe, key, data, wrap(&v[..v.len() - 1])).await? {
             v.pop();
             changed = true;
         }
@@ -724,9 +662,8 @@ impl GraphShrinker {
                 self.timed_out = true;
                 return Ok(Verdict::Rejected);
             }
-            let out = probe
-                .replay(Arc::clone(&shared), nd::continuation_budget(self.longest))
-                .await?;
+            let out =
+                probe.replay(Arc::clone(&shared), nd::continuation_budget(self.longest)).await?;
             self.replays += 1;
             self.learn_constraints(&out.nodes, &out.spans);
             let clean = out.clean();
@@ -739,10 +676,7 @@ impl GraphShrinker {
                     });
                 }
                 settled.extend_from_slice(&out.settled);
-                if witness
-                    .as_ref()
-                    .is_none_or(|w| sort_key(&out.nodes) < sort_key(&w.nodes))
-                {
+                if witness.as_ref().is_none_or(|w| sort_key(&out.nodes) < sort_key(&w.nodes)) {
                     witness = Some(out);
                 }
             } else if out.failed {
@@ -784,11 +718,7 @@ impl GraphShrinker {
             witness,
             "graph shrink: the gauntlet accepted a candidate without a clean run"
         );
-        Ok(Verdict::Accepted {
-            graph,
-            witness,
-            lower_bound: evidence.lower_bound(),
-        })
+        Ok(Verdict::Accepted { graph, witness, lower_bound: evidence.lower_bound() })
     }
 
     /// Install an accepted candidate: raise the anchor (capped at
@@ -814,12 +744,7 @@ impl GraphShrinker {
             self.witness_spans = witness.spans;
         }
         self.graph = Arc::new(graph);
-        probe.adopted(
-            &self.graph,
-            (&self.witness, &self.witness_spans),
-            self.anchor,
-            self.longest,
-        )
+        probe.adopted(&self.graph, (&self.witness, &self.witness_spans), self.anchor, self.longest)
     }
 }
 

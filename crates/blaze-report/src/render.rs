@@ -87,7 +87,8 @@ pub fn json_message(report: &Report) -> String {
         reason: &'static str,
         report: &'a Report,
     }
-    sonic_rs::to_string(&Message { reason: "blaze-report", report }).expect("a report has a JSON rendering")
+    sonic_rs::to_string(&Message { reason: "blaze-report", report })
+        .expect("a report has a JSON rendering")
 }
 
 /// The headline, its rule in brackets, and the newline.
@@ -116,8 +117,12 @@ fn headline(out: &mut String, report: &Report, caps: Caps, roots: &Roots<'_>) {
 fn body(out: &mut String, report: &Report, caps: Caps, roots: &Roots<'_>, indent: usize) {
     let blocks = report.blocks.as_ref().map(crate::Blocks::text);
     // alloc: a report's lines, once
-    let items: Vec<&Text> =
-        report.at.iter().chain(report.facts.iter().map(|it| &it.text)).chain(blocks.iter()).collect();
+    let items: Vec<&Text> = report
+        .at
+        .iter()
+        .chain(report.facts.iter().map(|it| &it.text))
+        .chain(blocks.iter())
+        .collect();
     for (at, text) in items.iter().enumerate() {
         let last = at + 1 == items.len();
         let glyph = match (items.len(), at) {
@@ -140,7 +145,15 @@ fn body(out: &mut String, report: &Report, caps: Caps, roots: &Roots<'_>, indent
 }
 
 /// One line of the box, `glyph` before it and `rest` before each line it wraps onto.
-fn boxed(out: &mut String, text: &Text, caps: Caps, roots: &Roots<'_>, indent: usize, glyph: &str, rest: &str) {
+fn boxed(
+    out: &mut String,
+    text: &Text,
+    caps: Caps,
+    roots: &Roots<'_>,
+    indent: usize,
+    glyph: &str,
+    rest: &str,
+) {
     spaces(out, indent + 2);
     painted(out, caps, DIM, glyph);
     out.push(' ');
@@ -157,7 +170,9 @@ fn boxed(out: &mut String, text: &Text, caps: Caps, roots: &Roots<'_>, indent: u
     let mut at = 0;
     while at < atoms.list.len() {
         // A group: an atom and every one glued to it (no space between), never split.
-        let end = (at + 1..atoms.list.len()).find(|&it| atoms.list[it].space > 0).unwrap_or(atoms.list.len());
+        let end = (at + 1..atoms.list.len())
+            .find(|&it| atoms.list[it].space > 0)
+            .unwrap_or(atoms.list.len());
         let group: usize = atoms.list[at..end].iter().map(|it| it.width).sum();
         let mut space = atoms.list[at].space;
         if column > 0 && column + space + group > room {
@@ -300,7 +315,9 @@ fn path(out: &mut String, path: &str, caps: Caps, roots: &Roots<'_>) {
     let shown = shown(path, roots);
     let target = match (path.starts_with('/'), roots.workspace) {
         (true, _) => Some(Cow::Borrowed(path)),
-        (false, Some(workspace)) => Some(Cow::Owned(format!("{}/{path}", workspace.trim_end_matches('/')))), // alloc: a report's, once
+        (false, Some(workspace)) => {
+            Some(Cow::Owned(format!("{}/{path}", workspace.trim_end_matches('/'))))
+        } // alloc: a report's, once
         (false, None) => None,
     };
     let link = caps.links && target.is_some();
@@ -418,14 +435,24 @@ impl Atoms {
                         let start = self.text.len();
                         self.text.push_str(&word[..end]);
                         // alloc: a report's atoms, once
-                        self.list.push(Atom { space, start, end: self.text.len(), width: word[..end].width() });
+                        self.list.push(Atom {
+                            space,
+                            start,
+                            end: self.text.len(),
+                            width: word[..end].width(),
+                        });
                         space = 0;
                         rest = &word[end..];
                     }
                 }
                 span => {
                     let start = self.text.len();
-                    piece(&mut self.text, span, Caps { color: caps.color, links: caps.links, width: None }, roots);
+                    piece(
+                        &mut self.text,
+                        span,
+                        Caps { color: caps.color, links: caps.links, width: None },
+                        roots,
+                    );
                     let width = visible_width(&self.text[start..]);
                     // alloc: as above
                     self.list.push(Atom { space, start, end: self.text.len(), width });
@@ -447,7 +474,9 @@ fn visible_width(text: &str) -> usize {
         rest = match after.as_bytes().first() {
             Some(b'[') => {
                 let params = &after[1..];
-                params.find(|c: char| ('\x40'..='\x7e').contains(&c)).map_or("", |end| &params[end + 1..])
+                params
+                    .find(|c: char| ('\x40'..='\x7e').contains(&c))
+                    .map_or("", |end| &params[end + 1..])
             }
             Some(b']') => match (after.find('\x07'), after.find("\x1b\\")) {
                 (Some(bel), Some(st)) if bel < st => &after[bel + 1..],

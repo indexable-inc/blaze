@@ -40,10 +40,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedPath) -> Vec<Found> {
     let node = cx.node_view(d.node);
     let ptr = InFile::new(file, d.node.value.syntax_node_ptr());
     let Some(path) = path_of(node.value) else {
-        return refused(cx, ptr, "hir found it in a node that is not a path expression or pattern, or a struct literal");
+        return refused(
+            cx,
+            ptr,
+            "hir found it in a node that is not a path expression or pattern, or a struct literal",
+        );
     };
     // alloc: the path's prefixes, for an error hir found
-    let mut prefixes: SmallVec<[ast::Path<'_>; 4]> = std::iter::successors(Some(path), |it| it.qualifier()).collect();
+    let mut prefixes: SmallVec<[ast::Path<'_>; 4]> =
+        std::iter::successors(Some(path), |it| it.qualifier()).collect();
     prefixes.reverse();
     let Some(first) = prefixes.first().and_then(|it| it.segment()) else {
         return refused(cx, ptr, "its path has no first segment");
@@ -61,7 +66,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedPath) -> Vec<Found> {
     // What the segments before the failing one name: the last of them (a prefix before it
     // resolved, or hir would have stopped there).
     let module = match at.checked_sub(offset + 1).map(|it| cx.vsema.resolve_path(prefixes[it])) {
-        Some(Some(PathResolution::Def(def @ (ModuleDef::Module(_) | ModuleDef::Adt(hir::Adt::Enum(_)))))) => Some(def),
+        Some(Some(PathResolution::Def(
+            def @ (ModuleDef::Module(_) | ModuleDef::Adt(hir::Adt::Enum(_))),
+        ))) => Some(def),
         _ => None,
     };
     let current = cx.vsema.scope(path.syntax()).map(|it| it.module());
@@ -130,10 +137,16 @@ fn last(
     };
     let at = cx.span(InFile::new(file, last.range));
     // alloc: the error's text, for an error hir found
-    let message = format!("cannot find {} `{}` in {mod_prefix}{tick}{mod_str}{tick}", source.expected(), last.name);
+    let message = format!(
+        "cannot find {} `{}` in {mod_prefix}{tick}{mod_str}{tick}",
+        source.expected(),
+        last.name
+    );
     // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some(source.code()), message, at.clone());
-    let suggested = in_module.is_some_and(|module| typo(cx, &mut diag, Names::Module(module), source, &last.name, &at, &[]));
+    let suggested = in_module.is_some_and(|module| {
+        typo(cx, &mut diag, Names::Module(module), source, &last.name, &at, &[])
+    });
     if !suggested {
         // alloc: the error's text, for an error hir found
         diag.span_label(at, format!("not found in {tick}{mod_str}{tick}"));

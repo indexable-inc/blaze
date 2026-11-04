@@ -20,7 +20,13 @@ use crate::{
 pub(crate) trait Leading {
     /// The chaining value after the first `blocks` blocks (1 to 15) of each of `members`, a
     /// SIMD lane each, pushed onto `cvs` in their order.
-    fn leading_blocks(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>);
+    fn leading_blocks(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    );
 
     /// The derived key of `input`, longer than a chunk, under the context key `key`.
     fn long(key: &ContextKey, input: &[u8]) -> [u8; 32];
@@ -64,7 +70,11 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
 
 /// [`of_many`] by the backend `L`, into `out`, cleared first: a warm call with room allocates
 /// nothing.
-pub(crate) fn of_many_into<L: Leading>(key: &ContextKey, inputs: &[&[u8]], out: &mut Vec<ContentId>) {
+pub(crate) fn of_many_into<L: Leading>(
+    key: &ContextKey,
+    inputs: &[&[u8]],
+    out: &mut Vec<ContentId>,
+) {
     out.clear();
     out.resize(inputs.len(), ContentId::default());
     KEPT.with_borrow_mut(|kept| hash_into::<L>(key, inputs, out, kept));
@@ -73,11 +83,21 @@ pub(crate) fn of_many_into<L: Leading>(key: &ContextKey, inputs: &[&[u8]], out: 
 /// `bytes`' eight little-endian words.
 fn words_of(bytes: &[u8; 32]) -> [u32; 8] {
     std::array::from_fn(|word| {
-        u32::from_le_bytes([bytes[4 * word], bytes[4 * word + 1], bytes[4 * word + 2], bytes[4 * word + 3]])
+        u32::from_le_bytes([
+            bytes[4 * word],
+            bytes[4 * word + 1],
+            bytes[4 * word + 2],
+            bytes[4 * word + 3],
+        ])
     })
 }
 
-fn hash_into<L: Leading>(key: &ContextKey, inputs: &[&[u8]], out: &mut [ContentId], kept: &mut Kept) {
+fn hash_into<L: Leading>(
+    key: &ContextKey,
+    inputs: &[&[u8]],
+    out: &mut [ContentId],
+    kept: &mut Kept,
+) {
     let words = words_of(key);
     let Kept { groups, cursors, cvs } = kept;
     groups.rebuild(
@@ -121,7 +141,13 @@ enum Start<'a> {
 /// Each of `members`' last block, the bytes from block `group` on, compressed from `start` as
 /// its chunk's end and the root, its content ID written to `out`: 16 lanes in AVX-512 registers
 /// and 8 in AVX2 ones where the CPU has them, else [`LANES`] at the target's baseline.
-fn last_blocks(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+fn last_blocks(
+    inputs: &[&[u8]],
+    members: &[u32],
+    start: Start<'_>,
+    group: usize,
+    out: &mut [ContentId],
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
@@ -168,7 +194,9 @@ fn last_blocks_of<const N: usize>(
         }
         let ids = rows_of(&compress_lanes(&cv, &columns(&rows), block_len, flags));
         for (lane, &at) in batch.iter().enumerate() {
-            out[at as usize] = ContentId(std::array::from_fn(|byte| (ids[lane][byte / 4] >> (8 * (byte % 4))) as u8));
+            out[at as usize] = ContentId(std::array::from_fn(|byte| {
+                (ids[lane][byte / 4] >> (8 * (byte % 4))) as u8
+            }));
         }
     }
 }
@@ -196,14 +224,17 @@ fn padded_words(bytes: &[u8]) -> [u32; 16] {
 fn last_bytes(bytes: &[u8], rest: usize) -> u64 {
     let len = bytes.len();
     if len >= 8 {
-        return u64::from_le_bytes(bytes[len - 8..].try_into().expect("8 bytes")) >> (8 * (8 - rest));
+        return u64::from_le_bytes(bytes[len - 8..].try_into().expect("8 bytes"))
+            >> (8 * (8 - rest));
     }
     if rest >= 4 {
         let low = u64::from(u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")));
-        let high = u64::from(u32::from_le_bytes(bytes[rest - 4..rest].try_into().expect("4 bytes")));
+        let high =
+            u64::from(u32::from_le_bytes(bytes[rest - 4..rest].try_into().expect("4 bytes")));
         return low | high << (8 * (rest - 4));
     }
-    let (first, middle, last) = (u64::from(bytes[0]), u64::from(bytes[rest / 2]), u64::from(bytes[rest - 1]));
+    let (first, middle, last) =
+        (u64::from(bytes[0]), u64::from(bytes[rest / 2]), u64::from(bytes[rest - 1]));
     first | middle << (8 * (rest / 2)) | last << (8 * (rest - 1))
 }
 
@@ -231,7 +262,12 @@ fn rows_of<const S: usize>(columns: &[[u32; S]; 8]) -> [[u32; 8]; S] {
 #[inline(always)]
 fn block_words(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
     std::array::from_fn(|word| {
-        u32::from_le_bytes([block[4 * word], block[4 * word + 1], block[4 * word + 2], block[4 * word + 3]])
+        u32::from_le_bytes([
+            block[4 * word],
+            block[4 * word + 1],
+            block[4 * word + 2],
+            block[4 * word + 3],
+        ])
     })
 }
 
@@ -243,8 +279,9 @@ fn columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
     const { assert!(S.is_power_of_two() && S <= 16) };
     let mut out = [[0; S]; 16];
     for from in (0..16).step_by(S) {
-        let square =
-            transpose(std::array::from_fn(|lane| Simd::from_array(std::array::from_fn(|word| rows[lane][from + word]))));
+        let square = transpose(std::array::from_fn(|lane| {
+            Simd::from_array(std::array::from_fn(|word| rows[lane][from + word]))
+        }));
         for (word, column) in square.iter().enumerate() {
             out[from + word] = column.to_array();
         }
@@ -362,7 +399,13 @@ fn compress_lanes<const N: usize>(
     )),
     expect(dead_code, reason = "blake3-servil's way alone, and it doesn't build for this target")
 )]
-pub(crate) fn leading_lanes(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+pub(crate) fn leading_lanes(
+    key: &[u32; 8],
+    inputs: &[&[u8]],
+    members: &[u32],
+    blocks: usize,
+    cvs: &mut Vec<[u32; 8]>,
+) {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
@@ -430,7 +473,10 @@ mod x86 {
         blocks: usize,
         cvs: &mut Vec<[u32; 8]>,
     ) {
-        assert!(std::arch::is_x86_feature_detected!("avx512f"), "AVX-512F lanes on a CPU without it");
+        assert!(
+            std::arch::is_x86_feature_detected!("avx512f"),
+            "AVX-512F lanes on a CPU without it"
+        );
         // SAFETY: the CPU has AVX-512F, asserted just above.
         unsafe { leading_wide(key, inputs, members, blocks, cvs) }
     }
@@ -455,7 +501,10 @@ mod x86 {
         group: usize,
         out: &mut [ContentId],
     ) {
-        assert!(std::arch::is_x86_feature_detected!("avx512f"), "AVX-512F lanes on a CPU without it");
+        assert!(
+            std::arch::is_x86_feature_detected!("avx512f"),
+            "AVX-512F lanes on a CPU without it"
+        );
         // SAFETY: the CPU has AVX-512F, asserted just above.
         unsafe { last_wide(inputs, members, start, group, out) }
     }
@@ -474,23 +523,47 @@ mod x86 {
 
     #[cfg(target_os = "linux")]
     #[target_feature(enable = "avx512f")]
-    fn leading_wide(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+    fn leading_wide(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
         super::leading_lanes_of::<16>(key, inputs, members, blocks, cvs);
     }
 
     #[cfg(target_os = "linux")]
     #[target_feature(enable = "avx2")]
-    fn leading_narrow(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+    fn leading_narrow(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
         super::leading_lanes_of::<8>(key, inputs, members, blocks, cvs);
     }
 
     #[target_feature(enable = "avx512f")]
-    fn last_wide(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+    fn last_wide(
+        inputs: &[&[u8]],
+        members: &[u32],
+        start: Start<'_>,
+        group: usize,
+        out: &mut [ContentId],
+    ) {
         super::last_blocks_of::<16>(inputs, members, start, group, out);
     }
 
     #[target_feature(enable = "avx2")]
-    fn last_narrow(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+    fn last_narrow(
+        inputs: &[&[u8]],
+        members: &[u32],
+        start: Start<'_>,
+        group: usize,
+        out: &mut [ContentId],
+    ) {
         super::last_blocks_of::<8>(inputs, members, start, group, out);
     }
 }

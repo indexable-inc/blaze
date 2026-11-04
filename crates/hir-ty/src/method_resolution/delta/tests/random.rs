@@ -13,11 +13,11 @@ use std::fmt::Write as _;
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
-use std::alloc::Global;
 use hir_def::{ImplId, TraitId};
 use hir_expand::name::Name;
 use intern::Symbol;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{Loaded, check, impl_keys, trait_named, trait_names};
 use crate::method_resolution::delta::{LastWrite, candidate_set_hash, impl_set_hash, key::ImplKey};
@@ -415,9 +415,9 @@ fn trait_named_anywhere(db: &Db, krate: Crate, name: &str) -> TraitId {
         return trait_named(db, krate, name);
     }
     let core = krate.data(db).dependencies.iter().map(|it| it.crate_id).find(|&dep| {
-        super::declared_traits(db, dep).iter().any(|&it| {
-            hir_def::signatures::TraitSignature::of(db, it).name.as_str() == name
-        })
+        super::declared_traits(db, dep)
+            .iter()
+            .any(|&it| hir_def::signatures::TraitSignature::of(db, it).name.as_str() == name)
     });
     trait_named(db, core.unwrap_or_else(|| panic!("no dependency declares `{name}`")), name)
 }

@@ -93,7 +93,11 @@ pub(crate) fn run_env(
     let deps = made(plan).into_iter().map(dir_of).find(|it| it.ends_with("/deps"));
     if let Some(deps) = deps {
         let root = dir_of(deps);
-        let mut search: Vec<&str> = native.iter().map(String::as_str).filter(|it| super::files::under(it, root).is_some()).collect();
+        let mut search: Vec<&str> = native
+            .iter()
+            .map(String::as_str)
+            .filter(|it| super::files::under(it, root).is_some())
+            .collect();
         search.push(deps);
         search.push(root);
         let separator = match os {
@@ -120,13 +124,22 @@ pub(crate) fn kind(unit: &Unit) -> Result<ArtifactKind, ApiError> {
     if kinds.iter().any(|it| it == "proc-macro") {
         return Ok(ArtifactKind::ProcMacro);
     }
-    if kinds.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "cdylib" | "staticlib")) {
+    if kinds
+        .iter()
+        .any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "cdylib" | "staticlib"))
+    {
         return Ok(ArtifactKind::Lib);
     }
     let first = kinds.first().map_or("", String::as_str);
     ArtifactKind::named(first).ok_or_else(|| {
         // alloc: error path
-        ApiError::new(format!("target `{}` is of the kind `{first}`, which blaze doesn't know", unit.target.name), None)
+        ApiError::new(
+            format!(
+                "target `{}` is of the kind `{first}`, which blaze doesn't know",
+                unit.target.name
+            ),
+            None,
+        )
     })
 }
 
@@ -179,7 +192,8 @@ fn rustc_writes(path: &str, plan: &UnitPlan) -> bool {
         return true;
     }
     let output_dir = plan.outputs.first().map(|it| dir_of(it));
-    file_name(path).contains(plan.extra_filename.as_str()) && output_dir.is_none_or(|it| it == dir_of(path))
+    file_name(path).contains(plan.extra_filename.as_str())
+        && output_dir.is_none_or(|it| it == dir_of(path))
 }
 
 /// The copy cargo makes of `path`, if it makes one: the output of the same name but the
@@ -207,7 +221,11 @@ pub(crate) fn uplifted<'a>(path: &str, plan: &'a UnitPlan) -> Option<&'a str> {
 /// The files the unit itself makes, by the path rustc writes them at (the copies cargo makes
 /// are the same bytes), dep-info and debug info left out.
 pub(crate) fn made(plan: &UnitPlan) -> Vec<&str> {
-    plan.outputs.iter().map(String::as_str).filter(|it| listed(it) && rustc_writes(it, plan)).collect()
+    plan.outputs
+        .iter()
+        .map(String::as_str)
+        .filter(|it| listed(it) && rustc_writes(it, plan))
+        .collect()
 }
 
 /// cargo's `filenames`: each output's uplifted copy where there is one, else its own path
@@ -226,7 +244,8 @@ pub(crate) fn executable(unit: &Unit, plan: &UnitPlan) -> Option<String> {
         Mode::Build => {
             let kinds = &unit.target.kind;
             kinds.iter().any(|it| it == "bin")
-                || (kinds.iter().any(|it| it == "example") && unit.target.crate_types.iter().any(|it| it == "bin"))
+                || (kinds.iter().any(|it| it == "example")
+                    && unit.target.crate_types.iter().any(|it| it == "bin"))
         }
         _ => false,
     };

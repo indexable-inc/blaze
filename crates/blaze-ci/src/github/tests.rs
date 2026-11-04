@@ -55,7 +55,8 @@ fn der_length(len: usize) -> Vec<u8> {
 
 fn pem(label: &str, der: &[u8]) -> String {
     let base64 = STANDARD.encode(der);
-    let lines: Vec<&str> = base64.as_bytes().chunks(64).map(|it| std::str::from_utf8(it).unwrap()).collect();
+    let lines: Vec<&str> =
+        base64.as_bytes().chunks(64).map(|it| std::str::from_utf8(it).unwrap()).collect();
     format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
 }
 
@@ -64,7 +65,9 @@ fn pem(label: &str, der: &[u8]) -> String {
 fn test_key_pkcs8() -> String {
     let pkcs1 = der_of(TEST_KEY_PKCS1);
     let mut inner = vec![0x02, 0x01, 0x00];
-    inner.extend([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00]);
+    inner.extend([
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ]);
     inner.push(0x04);
     inner.extend(der_length(pkcs1.len()));
     inner.extend(&pkcs1);
@@ -136,7 +139,8 @@ fn a_jwt_decodes_as_written_and_its_signature_verifies() {
 
     let header = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
     assert_eq!(header, br#"{"alg":"RS256","typ":"JWT"}"#);
-    let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
     assert_eq!(claims, json!({ "iat": now - 60, "exp": now + 540, "iss": 123_456 }));
 
     let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
@@ -283,7 +287,11 @@ fn json_strings_are_escaped_byte_for_byte_as_serde_json_escapes_them() {
     for text in hard_texts() {
         let mut out = Vec::new();
         json_string(&mut out, &[&text]);
-        assert_eq!(String::from_utf8(out).unwrap(), serde_json::to_string(&text).unwrap(), "{text:?}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            serde_json::to_string(&text).unwrap(),
+            "{text:?}"
+        );
     }
     let mut out = Vec::new();
     json_string(&mut out, &["a\"", "", "\nb"]);
@@ -300,7 +308,11 @@ fn the_word_test_finds_every_byte_that_needs_escaping() {
             assert_eq!(needs_escape(u64::from_le_bytes(word)), needs, "{byte:#x} at {at}");
             let mut high = [0xc3; 8];
             high[at] = byte;
-            assert_eq!(needs_escape(u64::from_le_bytes(high)), needs, "{byte:#x} at {at} among 0xc3");
+            assert_eq!(
+                needs_escape(u64::from_le_bytes(high)),
+                needs,
+                "{byte:#x} at {at} among 0xc3"
+            );
         }
     }
 }
@@ -388,7 +400,9 @@ fn expires_at_in_another_offset_or_malformed_is_refused_by_name() {
 
 #[test]
 fn a_bad_repository_or_host_is_refused_before_anything_is_loaded() {
-    for repo in ["blaze", "/blaze", "owner/", "owner/../x", "owner/name/more", "owner/na me", "../x"] {
+    for repo in
+        ["blaze", "/blaze", "owner/", "owner/../x", "owner/name/more", "owner/na me", "../x"]
+    {
         let app = App { id: 1, installation: 2, key: test_key(), api: "api.github.com".to_owned() };
         let error = GitHub::new(app, repo.to_owned()).err().unwrap();
         assert!(error.what.contains(repo), "{}", error.what);

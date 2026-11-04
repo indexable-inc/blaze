@@ -57,7 +57,9 @@ For more information about this error, try `rustc --explain E0133`.
         )
     };
     let source = |attr: &str| {
-        format!("#![{attr}(unsafe_op_in_unsafe_fn)]\n\nunsafe fn f() {{}}\n\nfn main() {{\n    f();\n    //~^ ERROR E0133\n}}\n")
+        format!(
+            "#![{attr}(unsafe_op_in_unsafe_fn)]\n\nunsafe fn f() {{}}\n\nfn main() {{\n    f();\n    //~^ ERROR E0133\n}}\n"
+        )
     };
     assert_eq!(ui("levels.rs", "2021", &source("deny")), error("block"));
     assert_eq!(ui("levels.rs", "2024", &source("allow")), error("function or block"));
@@ -250,7 +252,10 @@ error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("unsafe-fn-deref-ptr.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core("unsafe-fn-deref-ptr.rs", "2015", "copy", source),
+        stderr
+    );
 }
 
 #[test]
@@ -311,7 +316,10 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("safety-fn-body.rs", "2015", "sized, copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core("safety-fn-body.rs", "2015", "sized, copy", source),
+        stderr
+    );
 }
 
 #[test]
@@ -353,7 +361,10 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("static-mut-requires-unsafe.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core("static-mut-requires-unsafe.rs", "2015", "copy", source),
+        stderr
+    );
 }
 
 #[test]
@@ -397,7 +408,15 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("static-mut-foreign-requires-unsafe.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core(
+            "static-mut-foreign-requires-unsafe.rs",
+            "2015",
+            "copy",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -436,7 +455,10 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("access_union_field.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core("access_union_field.rs", "2015", "copy", source),
+        stderr
+    );
 }
 
 #[test]
@@ -494,7 +516,10 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(crate::tests::items::ui_core("unsafe-not-inherited.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core("unsafe-not-inherited.rs", "2015", "copy", source),
+        stderr
+    );
 }
 
 #[test]

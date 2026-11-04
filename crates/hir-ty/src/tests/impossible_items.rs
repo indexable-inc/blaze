@@ -5,7 +5,9 @@
 //!
 //! Each method of `Each` asks one variant of the clause, so a failure names the solver step.
 
-use hir_def::{AdtId, AssocItemId, GenericDefId, ImplId, nameres::crate_def_map, signatures::StructSignature};
+use hir_def::{
+    AdtId, AssocItemId, GenericDefId, ImplId, nameres::crate_def_map, signatures::StructSignature,
+};
 use hir_expand::fixture;
 
 use crate::db::HirDatabase;
@@ -44,7 +46,9 @@ fn impossible(method: &str, self_ty: &str) -> bool {
         let impl_: ImplId = scope
             .impls()
             .find(|&it| match db.impl_self_ty(it).skip_binder().as_adt() {
-                Some((AdtId::StructId(s), _)) => StructSignature::of(&db, s).name.as_str() == self_ty,
+                Some((AdtId::StructId(s), _)) => {
+                    StructSignature::of(&db, s).name.as_str() == self_ty
+                }
                 _ => false,
             })
             .unwrap_or_else(|| panic!("the fixture's `impl Each for {self_ty}`"));
@@ -58,7 +62,12 @@ fn impossible(method: &str, self_ty: &str) -> bool {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("`Each::{method}`"));
-        crate::traits::is_impossible_associated_item(&db, krate, impl_, GenericDefId::FunctionId(item))
+        crate::traits::is_impossible_associated_item(
+            &db,
+            krate,
+            impl_,
+            GenericDefId::FunctionId(item),
+        )
     })
 }
 

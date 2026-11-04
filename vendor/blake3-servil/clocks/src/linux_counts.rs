@@ -57,7 +57,16 @@ fn open(pmu: u32, event: u64, group: c_int) -> Option<OwnedFd> {
     let a = attr(pmu, event, group == -1);
     // Sound: the x86-64 Linux system call, `a` an initialized attr of the
     // size it states; pid 0 and cpu -1 count the calling thread anywhere.
-    let fd = unsafe { syscall(SYS_PERF_EVENT_OPEN, &a as *const Attr, 0 as c_long, -1 as c_long, c_long::from(group), PERF_FLAG_FD_CLOEXEC) };
+    let fd = unsafe {
+        syscall(
+            SYS_PERF_EVENT_OPEN,
+            &a as *const Attr,
+            0 as c_long,
+            -1 as c_long,
+            c_long::from(group),
+            PERF_FLAG_FD_CLOEXEC,
+        )
+    };
     // Sound: a fresh descriptor, ours alone.
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(c_int::try_from(fd).unwrap()) })
 }
@@ -83,11 +92,21 @@ impl Group {
         // nr, time enabled, time running, cycles, instructions.
         let mut words = [0u64; 5];
         // Sound: `words` is writable for the size passed.
-        let n = unsafe { read_fd(self.leader.as_raw_fd(), words.as_mut_ptr().cast(), std::mem::size_of_val(&words)) };
+        let n = unsafe {
+            read_fd(
+                self.leader.as_raw_fd(),
+                words.as_mut_ptr().cast(),
+                std::mem::size_of_val(&words),
+            )
+        };
         if n == 0 {
             return None;
         }
-        assert_eq!(n, std::mem::size_of_val(&words) as isize, "a perf group read gives its whole record");
+        assert_eq!(
+            n,
+            std::mem::size_of_val(&words) as isize,
+            "a perf group read gives its whole record"
+        );
         assert_eq!(words[0], 2, "the group holds cycles and instructions");
         Some(Level { cycles: words[3], instructions: words[4], time_ns: words[2] })
     }
@@ -111,7 +130,9 @@ fn pmus_at(root: &std::path::Path) -> Option<(u32, Option<u32>)> {
     if !p && !e {
         return Some((0, None));
     }
-    let kind = |name: &str| std::fs::read_to_string(root.join(name).join("type")).ok()?.trim().parse::<u32>().ok();
+    let kind = |name: &str| {
+        std::fs::read_to_string(root.join(name).join("type")).ok()?.trim().parse::<u32>().ok()
+    };
     Some((kind("cpu_core")?, Some(kind("cpu_atom")?)))
 }
 

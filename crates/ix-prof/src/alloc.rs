@@ -305,7 +305,9 @@ fn on_free(address: u64, size: u64) {
             match s.load(Ordering::Relaxed) {
                 EMPTY => return,
                 it if it == address => {
-                    if s.compare_exchange(address, GONE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if s.compare_exchange(address, GONE, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         push(Record {
                             t_ns: crate::clock::now_ns(),
                             tid: crate::clock::os_tid(),
@@ -398,7 +400,8 @@ fn walk(l: &Local, r: &mut Record) {
     if high == 0 {
         return;
     }
-    while fp >= low && fp % 8 == 0 && fp.saturating_add(16) <= high && usize::from(r.depth) < DEPTH {
+    while fp >= low && fp % 8 == 0 && fp.saturating_add(16) <= high && usize::from(r.depth) < DEPTH
+    {
         let record = fp as *const u64;
         // SAFETY: `fp` is 8-aligned and its 16 bytes lie between this frame and the top of this
         // thread's stack, which is mapped while the thread runs.
@@ -423,14 +426,18 @@ fn frame_pointer() -> Option<u64> {
     {
         let fp: u64;
         // SAFETY: reads a register.
-        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
         Some(fp & ((1 << 47) - 1))
     }
     #[cfg(target_arch = "x86_64")]
     {
         let fp: u64;
         // SAFETY: reads a register.
-        unsafe { std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
         Some(fp)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -512,13 +519,25 @@ mod tests {
             // SAFETY: a non-zero layout.
             let p = unsafe { a.alloc(layout) };
             assert!(!p.is_null());
-            assert_eq!(tracked(p as u64), rate.is_some(), "rate {rate:?}: the block is watched when sampled");
+            assert_eq!(
+                tracked(p as u64),
+                rate.is_some(),
+                "rate {rate:?}: the block is watched when sampled"
+            );
             let before = (totals(), thread_usage());
             // SAFETY: `p` is live with `layout`; 4096 is non-zero.
             let q = unsafe { a.realloc(p, layout, 4096) };
             assert!(q.is_null(), "the inner allocator refuses");
-            assert_eq!((totals(), thread_usage()), before, "rate {rate:?}: a failed realloc frees nothing");
-            assert_eq!(tracked(p as u64), rate.is_some(), "rate {rate:?}: the block is still watched");
+            assert_eq!(
+                (totals(), thread_usage()),
+                before,
+                "rate {rate:?}: a failed realloc frees nothing"
+            );
+            assert_eq!(
+                tracked(p as u64),
+                rate.is_some(),
+                "rate {rate:?}: the block is still watched"
+            );
             drain(&mut records);
             assert!(
                 !records.iter().any(|r| r.free && r.address == p as u64),

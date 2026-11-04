@@ -21,13 +21,13 @@ use std::path::{Component, Path};
 
 use blaze_format::{FormatError, Persist, SchemaHash, Slice, Writer};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use cargo_util_schemas::manifest::TomlManifest;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
+use std::alloc::Global;
 
 use super::config::ConfigOf;
 use super::invocation::Invocation;
@@ -160,7 +160,9 @@ mod outside_bytes {
         to.collect_seq(files.iter().map(|(at, bytes)| (at, Raw(Cow::Borrowed(bytes)))))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<Vec<(String, Vec<u8>)>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        from: D,
+    ) -> Result<Vec<(String, Vec<u8>)>, D::Error> {
         let files = Vec::<(String, Raw<'de>)>::deserialize(from)?;
         Ok(files.into_iter().map(|(at, raw)| (at, raw.0.into_owned())).collect())
     }
@@ -339,8 +341,14 @@ pub(crate) struct MountRef<'a> {
 impl<'a> MountRef<'a> {
     fn new(bytes: &'a [u8]) -> Result<MountRef<'a>, FormatError> {
         let short = FormatError::Invalid { at: 0, what: "a mount index shorter than its head" };
-        let count = |at: usize| bytes.get(at..at + 4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]) as usize);
-        let (Some(mounts), Some(outside), Some(known)) = (count(0), count(4), count(8)) else { return Err(short) };
+        let count = |at: usize| {
+            bytes
+                .get(at..at + 4)
+                .map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]) as usize)
+        };
+        let (Some(mounts), Some(outside), Some(known)) = (count(0), count(4), count(8)) else {
+            return Err(short);
+        };
         let fixed = HEAD + mounts * MOUNT + outside * OUTSIDE + known * KNOWN;
         if fixed > bytes.len() {
             return Err(short);
@@ -357,11 +365,14 @@ impl<'a> MountRef<'a> {
     fn span(self, at: usize) -> &'a [u8] {
         let bytes: &'a [u8] = self.bytes;
         let (start, len) = (self.word(at), self.word(at + 4));
-        bytes.get(start..start + len).unwrap_or_else(|| panic!("a kept mount index names bytes past its end"))
+        bytes
+            .get(start..start + len)
+            .unwrap_or_else(|| panic!("a kept mount index names bytes past its end"))
     }
 
     fn text(self, at: usize) -> &'a str {
-        std::str::from_utf8(self.span(at)).unwrap_or_else(|_| panic!("a kept mount index has a path that is not UTF-8"))
+        std::str::from_utf8(self.span(at))
+            .unwrap_or_else(|_| panic!("a kept mount index has a path that is not UTF-8"))
     }
 
     fn mount_record(self, at: usize) -> usize {
@@ -469,7 +480,12 @@ impl Query for LoadFile {
     }
 }
 
-fn file_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: bool) -> Result<Found<Vec<u8>>, Cancelled> {
+fn file_through<'a>(
+    cx: &mut Cx<'_>,
+    table: impl Table<'a>,
+    path: &'a str,
+    view: bool,
+) -> Result<Found<Vec<u8>>, Cancelled> {
     Ok(match locate(table, path) {
         Some((Origin::View, under)) if view => match cx.file(&under)? {
             Some(file) => Found::Here(file.bytes.to_vec()),
@@ -502,7 +518,10 @@ impl Query for LoadDir {
         key_id("blaze v2 cargo dir key 1", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<(String, bool)>>>, Cancelled> {
+    fn execute(
+        cx: &mut Cx<'_>,
+        path: &String,
+    ) -> Result<Cbor<Found<Vec<(String, bool)>>>, Cancelled> {
         let table = cx.get::<Mounts>(&())?;
         Ok(Cbor(dir_through(cx, table, path, true)?))
     }
@@ -518,7 +537,12 @@ fn sorted(names: &[(String, bool)]) -> Found<Names> {
     Found::Here(names)
 }
 
-fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: bool) -> Result<Found<Names>, Cancelled> {
+fn dir_through<'a>(
+    cx: &mut Cx<'_>,
+    table: impl Table<'a>,
+    path: &'a str,
+    view: bool,
+) -> Result<Found<Names>, Cancelled> {
     Ok(match locate(table, path) {
         Some((Origin::View, under)) if view => match cx.dir(&under)? {
             Some(names) => sorted(names),
@@ -530,11 +554,14 @@ fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: 
             None => Found::Absent,
         },
         None if known_dir(table, path) => {
-            let prefix: Cow<'_, str> = if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
+            let prefix: Cow<'_, str> =
+                if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
             let prefix = prefix.as_bytes();
             let mut names: HashMap<&str, bool, Global> = HashMap::new_in(Global);
             let first = partition(table.mounts(), |at| table.mount_at(at) < prefix);
-            for at in (first..table.mounts()).take_while(|&at| table.mount_at(at).starts_with(prefix)) {
+            for at in
+                (first..table.mounts()).take_while(|&at| table.mount_at(at).starts_with(prefix))
+            {
                 let (mount_at, origin, mount_under) = table.mount(at);
                 let rest = &mount_at[prefix.len()..];
                 match rest.split_once('/') {
@@ -551,14 +578,19 @@ fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: 
                 };
             }
             let first = partition(table.outsides(), |at| table.outside_at(at) < prefix);
-            for at in (first..table.outsides()).take_while(|&at| table.outside_at(at).starts_with(prefix)) {
-                let Ok(rest) = std::str::from_utf8(&table.outside_at(at)[prefix.len()..]) else { continue };
+            for at in
+                (first..table.outsides()).take_while(|&at| table.outside_at(at).starts_with(prefix))
+            {
+                let Ok(rest) = std::str::from_utf8(&table.outside_at(at)[prefix.len()..]) else {
+                    continue;
+                };
                 match rest.split_once('/') {
                     Some((dir, _)) => names.insert(dir, true),
                     None => names.insert(rest, false),
                 };
             }
-            let mut names: Names = names.into_iter().map(|(name, dir)| (name.to_owned(), dir)).collect();
+            let mut names: Names =
+                names.into_iter().map(|(name, dir)| (name.to_owned(), dir)).collect();
             names.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
             Found::Here(names)
         }
@@ -617,7 +649,10 @@ pub(crate) fn read_file(cx: &mut Cx<'_>, path: &str) -> Result<Found<Vec<u8>>, C
 }
 
 /// The names in the directory at `path`, sorted, each with whether it is a directory.
-pub(crate) fn read_dir(cx: &mut Cx<'_>, path: &str) -> Result<Found<Vec<(String, bool)>>, Cancelled> {
+pub(crate) fn read_dir(
+    cx: &mut Cx<'_>,
+    path: &str,
+) -> Result<Found<Vec<(String, bool)>>, Cancelled> {
     Ok(cx.get::<LoadDir>(&path.to_owned())?.get())
 }
 
@@ -776,10 +811,17 @@ mod normal_text_tests {
         let mut paths = vec![String::new()];
         let mut last = vec![String::new()];
         for _ in 0..5 {
-            last = last.iter().flat_map(|it| parts.iter().map(move |part| format!("{it}/{part}"))).collect();
+            last = last
+                .iter()
+                .flat_map(|it| parts.iter().map(move |part| format!("{it}/{part}")))
+                .collect();
             paths.extend(last.iter().cloned());
         }
-        let more: Vec<String> = paths.iter().map(|it| format!("C:{it}")).chain(paths.iter().map(|it| format!("a{it}"))).collect();
+        let more: Vec<String> = paths
+            .iter()
+            .map(|it| format!("C:{it}"))
+            .chain(paths.iter().map(|it| format!("a{it}")))
+            .collect();
         paths.extend(more);
         for path in &paths {
             let new = normal_text(path);
@@ -797,7 +839,9 @@ mod normal_text_tests {
 /// [`normal`], borrowing a path that already is normal: the paths blaze-manifest asks for are.
 fn normal_ref(path: &Path) -> Option<Cow<'_, str>> {
     if let Some(text) = path.to_str()
-        && (text == "/" || (text.starts_with('/') && text[1..].split('/').all(|it| !matches!(it, "" | "." | ".."))))
+        && (text == "/"
+            || (text.starts_with('/')
+                && text[1..].split('/').all(|it| !matches!(it, "" | "." | ".."))))
     {
         return Some(Cow::Borrowed(text));
     }
@@ -861,7 +905,9 @@ impl Query for TomlFile {
 
     fn execute(cx: &mut Cx<'_>, key: &PathKey) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
         Ok(Cbor(match key.config.read_file(cx, &key.path)? {
-            Found::Here(bytes) => Found::Here(canonical_toml(&bytes).map_or(bytes, String::into_bytes)),
+            Found::Here(bytes) => {
+                Found::Here(canonical_toml(&bytes).map_or(bytes, String::into_bytes))
+            }
             other => other,
         }))
     }
@@ -909,7 +955,10 @@ impl<'r, 'db> Reader<'r, 'db> {
             ConfigOf::View => None,
             ConfigOf::Fixed { mounts, cwd, env } => {
                 // alloc: the fixed configuration's table, once a step.
-                Some(RefCell::new(FixedPath { table: ConfigOf::table(mounts, cwd, env), path: String::new() }))
+                Some(RefCell::new(FixedPath {
+                    table: ConfigOf::table(mounts, cwd, env),
+                    path: String::new(),
+                }))
             }
         };
         Reader {
@@ -930,10 +979,9 @@ impl<'r, 'db> Reader<'r, 'db> {
         if self.cancelled.get() {
             return None;
         }
-        let mut cx = self
-            .cx
-            .try_borrow_mut()
-            .unwrap_or_else(|_| panic!("a file is read while the load's `Cx` is lent (`Snap::with_cx`)"));
+        let mut cx = self.cx.try_borrow_mut().unwrap_or_else(|_| {
+            panic!("a file is read while the load's `Cx` is lent (`Snap::with_cx`)")
+        });
         match ask(&mut cx) {
             Ok(it) => Some(it),
             Err(Cancelled) => {
@@ -992,13 +1040,22 @@ impl<'r, 'db> Reader<'r, 'db> {
     }
 
     /// `then` of the listing of the directory at `path` (normal), read once a step.
-    fn dir<T>(&self, path: &str, then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T) -> Option<T> {
+    fn dir<T>(
+        &self,
+        path: &str,
+        then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T,
+    ) -> Option<T> {
         self.listing(path, true, then)
     }
 
     /// [`Reader::dir`], where `record` says whether a listing under no mount makes the step's
     /// answer the error naming it: not when the caller answers without it as well as with it.
-    fn listing<T>(&self, path: &str, record: bool, then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T) -> Option<T> {
+    fn listing<T>(
+        &self,
+        path: &str,
+        record: bool,
+        then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T,
+    ) -> Option<T> {
         if let Some(found) = self.dirs.borrow().get(path) {
             if record && matches!(found, Found::Unmounted) {
                 self.saw_unmounted(path);
@@ -1053,7 +1110,8 @@ impl fmt::Debug for Snap<'_, '_> {
 impl<'db> Snap<'_, 'db> {
     /// `f` of the step's `Cx`, for a query the step asks itself. No file is read while it has it.
     pub(crate) fn with_cx<T>(self, f: impl FnOnce(&mut Cx<'db>) -> T) -> T {
-        let mut cx = self.0.cx.try_borrow_mut().unwrap_or_else(|_| panic!("the load's `Cx` is lent twice"));
+        let mut cx =
+            self.0.cx.try_borrow_mut().unwrap_or_else(|_| panic!("the load's `Cx` is lent twice"));
         f(&mut cx)
     }
 }
@@ -1077,7 +1135,9 @@ impl Snap<'_, '_> {
     /// column the file's, not its canonical form's.
     fn parse(&self, path: &Path) -> anyhow::Result<TomlManifest> {
         // alloc: an error's context, made only when the read fails.
-        let failed = |error: std::io::Error| anyhow::Error::new(error).context(format!("failed to read `{}`", path.display()));
+        let failed = |error: std::io::Error| {
+            anyhow::Error::new(error).context(format!("failed to read `{}`", path.display()))
+        };
         let Some(normal) = normal_ref(path) else { return Err(failed(not_found())) };
         match self.0.raw(&normal) {
             Some(Found::Here(bytes)) => blaze_manifest::manifest::parse_manifest(path, bytes),
@@ -1123,10 +1183,14 @@ impl Files for Snap<'_, '_> {
             // The parent's listing only saves the reads below: a parent under no mount (the
             // home directory above a known `$CARGO_HOME`) is no error of the load's.
             let listed = self.0.listing(parent, false, |found| match found {
-                Found::Here(names) => Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| match names[at].1 {
-                    true => FileKind::Dir,
-                    false => FileKind::File,
-                })),
+                Found::Here(names) => {
+                    Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| {
+                        match names[at].1 {
+                            true => FileKind::Dir,
+                            false => FileKind::File,
+                        }
+                    }))
+                }
                 Found::Absent | Found::Unmounted => None,
             })?;
             if let Some(kind) = listed {
@@ -1146,7 +1210,9 @@ impl Files for Snap<'_, '_> {
         let Some(path) = normal_ref(path) else { return Err(not_found()) };
         let listed = self.0.dir(&path, |found| match found {
             // alloc: the names, which the trait returns owned.
-            Found::Here(names) => Ok(names.iter().map(|(name, dir)| ((*name).to_owned(), *dir)).collect()),
+            Found::Here(names) => {
+                Ok(names.iter().map(|(name, dir)| ((*name).to_owned(), *dir)).collect())
+            }
             Found::Unmounted => Err(unmounted(&path)),
             Found::Absent => Err(not_found()),
         });
@@ -1156,7 +1222,9 @@ impl Files for Snap<'_, '_> {
     /// A view has no links, so a path that is there is its own canonical path.
     fn canonicalize(&self, path: &Path) -> std::io::Result<std::path::PathBuf> {
         match self.kind(path) {
-            Some(_) => Ok(std::path::PathBuf::from(normal_ref(path).ok_or_else(not_found)?.as_ref())),
+            Some(_) => {
+                Ok(std::path::PathBuf::from(normal_ref(path).ok_or_else(not_found)?.as_ref()))
+            }
             None => Err(not_found()),
         }
     }
@@ -1204,16 +1272,25 @@ mod tests {
         let kept = kept(&table);
         longest_mounts("its index", <MountIndex as Persist>::read(&kept).unwrap(), lib);
 
-        let root = MountTable { mounts: vec![mount("/", lib, "r")], outside: Vec::new(), known: Vec::new() };
+        let root = MountTable {
+            mounts: vec![mount("/", lib, "r")],
+            outside: Vec::new(),
+            known: Vec::new(),
+        };
         assert_eq!(locate(&root, "/a/b").map(|(_, it)| it.into_owned()), Some("r/a/b".to_owned()));
         assert_eq!(locate(&root, "/").map(|(_, it)| it.into_owned()), Some("r".to_owned()));
     }
 
     fn longest_mounts<'a>(what: &str, table: impl Table<'a>, lib: Origin) {
-        let at = |path: &'a str| locate(table, path).map(|(origin, under)| (origin, under.into_owned()));
+        let at =
+            |path: &'a str| locate(table, path).map(|(origin, under)| (origin, under.into_owned()));
         assert_eq!(at("/w/Cargo.toml"), Some((Origin::View, "Cargo.toml".to_owned())), "{what}");
         assert_eq!(at("/w"), Some((Origin::View, String::new())), "{what}");
-        assert_eq!(at("/w/vendor/x/src/lib.rs"), Some((lib, "x-1.0/src/lib.rs".to_owned())), "{what}");
+        assert_eq!(
+            at("/w/vendor/x/src/lib.rs"),
+            Some((lib, "x-1.0/src/lib.rs".to_owned())),
+            "{what}"
+        );
         assert_eq!(at("/w/vendor/x"), Some((lib, "x-1.0".to_owned())), "{what}");
         assert_eq!(at("/w/vendor/xy"), Some((Origin::View, "vendor/xy".to_owned())), "{what}");
         assert_eq!(at("/w2/a"), Some((Origin::View, "other/a".to_owned())), "{what}");
@@ -1243,7 +1320,10 @@ mod tests {
         assert_eq!((index.mounts(), index.outsides(), index.knowns()), (2, 1, 2));
         assert_eq!(index.outside_at(0), b"/home/u/.cargo/config.toml");
         assert_eq!(index.outside(0), b"[build]\n");
-        assert!(kept.as_ptr_range().contains(&index.outside(0).as_ptr()), "the bytes are the kept bytes");
+        assert!(
+            kept.as_ptr_range().contains(&index.outside(0).as_ptr()),
+            "the bytes are the kept bytes"
+        );
         assert_eq!(index.known(1), b"/home/u");
         assert!(known_file(index, "/home/u/.cargo/config"));
         assert!(!known_file(index, "/etc/x"));
@@ -1253,7 +1333,10 @@ mod tests {
         let index = <MountIndex as Persist>::read(&kept).unwrap();
         assert_eq!((index.mounts(), index.outsides(), index.knowns()), (0, 0, 0));
         assert_eq!(locate(index, "/w/a"), None);
-        assert!(MountRef::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(), "a head naming a mount it lacks");
+        assert!(
+            MountRef::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(),
+            "a head naming a mount it lacks"
+        );
 
         let file = Found::Here(vec![7u8; 64]);
         let written = blaze_protocol::cbor::to_vec(&file).unwrap();
@@ -1302,7 +1385,13 @@ mod tests {
     #[test]
     fn a_lookup_allocates_nothing() {
         let mut mounts: Vec<Mount> = (0..2000)
-            .map(|at| mount(&format!("/c/registry/src/index/pkg-{at:04}-1.0.0"), Origin::Root(ContentId([3; 32])), ""))
+            .map(|at| {
+                mount(
+                    &format!("/c/registry/src/index/pkg-{at:04}-1.0.0"),
+                    Origin::Root(ContentId([3; 32])),
+                    "",
+                )
+            })
             .collect();
         mounts.push(mount("/w", Origin::View, ""));
         mounts.sort();
@@ -1312,9 +1401,14 @@ mod tests {
         let path = "/c/registry/src/index/pkg-1234-1.0.0/src/lib.rs";
         let found = blaze_alloc_count::assert_at_most(0, "a mount lookup", || locate(index, path));
         assert_eq!(found, Some((Origin::Root(ContentId([3; 32])), Cow::Borrowed("src/lib.rs"))));
-        let found = blaze_alloc_count::assert_at_most(0, "a mount lookup", || locate(index, "/w/Cargo.toml"));
+        let found = blaze_alloc_count::assert_at_most(0, "a mount lookup", || {
+            locate(index, "/w/Cargo.toml")
+        });
         assert_eq!(found, Some((Origin::View, Cow::Borrowed("Cargo.toml"))));
-        assert!(blaze_alloc_count::assert_at_most(0, "a known file", || known_file(index, "/Cargo.toml")));
+        assert!(blaze_alloc_count::assert_at_most(0, "a known file", || known_file(
+            index,
+            "/Cargo.toml"
+        )));
     }
 
     /// A kept file and listing are read where the database keeps them, and read in place
@@ -1322,15 +1416,22 @@ mod tests {
     #[test]
     fn kept_bytes_and_names_are_lent() {
         let file = blaze_protocol::cbor::to_vec(&Found::Here(b"[package]\n".to_vec())).unwrap();
-        let found = blaze_alloc_count::assert_at_most(0, "a kept file read in place", || lent(&file));
+        let found =
+            blaze_alloc_count::assert_at_most(0, "a kept file read in place", || lent(&file));
         let Found::Here(bytes) = found else { panic!("{found:?}") };
         assert_eq!(bytes, b"[package]\n");
         assert!(file.as_ptr_range().contains(&bytes.as_ptr()), "the bytes are the kept bytes");
-        assert_eq!(lent(&blaze_protocol::cbor::to_vec(&Found::<Vec<u8>>::Unmounted).unwrap()), Found::Unmounted);
+        assert_eq!(
+            lent(&blaze_protocol::cbor::to_vec(&Found::<Vec<u8>>::Unmounted).unwrap()),
+            Found::Unmounted
+        );
 
-        let names: Found<Names> = Found::Here(vec![("Cargo.toml".to_owned(), false), ("src".to_owned(), true)]);
+        let names: Found<Names> =
+            Found::Here(vec![("Cargo.toml".to_owned(), false), ("src".to_owned(), true)]);
         let dir = blaze_protocol::cbor::to_vec(&names).unwrap();
-        let found = blaze_alloc_count::assert_at_most(1, "a kept listing read in place", || lent_names(&dir));
+        let found = blaze_alloc_count::assert_at_most(1, "a kept listing read in place", || {
+            lent_names(&dir)
+        });
         let Found::Here(listed) = found else { panic!("{found:?}") };
         assert_eq!(listed, [("Cargo.toml", false), ("src", true)]);
         assert!(dir.as_ptr_range().contains(&listed[1].0.as_ptr()), "the names are the kept bytes");
@@ -1347,7 +1448,10 @@ mod tests {
 
     #[test]
     fn already_normal_paths_are_borrowed() {
-        assert!(matches!(normal_ref(Path::new("/w/a/Cargo.toml")), Some(Cow::Borrowed("/w/a/Cargo.toml"))));
+        assert!(matches!(
+            normal_ref(Path::new("/w/a/Cargo.toml")),
+            Some(Cow::Borrowed("/w/a/Cargo.toml"))
+        ));
         assert!(matches!(normal_ref(Path::new("/")), Some(Cow::Borrowed("/"))));
         assert_eq!(normal_ref(Path::new("/w/./a/../b")).as_deref(), Some("/w/b"));
         assert_eq!(normal_ref(Path::new("/w/a/")).as_deref(), Some("/w/a"));

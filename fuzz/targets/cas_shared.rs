@@ -134,7 +134,9 @@ const fn crc_table() -> [u32; 256] {
 
 /// CRC-32C (Castagnoli), the check of record headers, the head and the index table.
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
-    !bytes.iter().fold(!0u32, |crc, &byte| (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize])
+    !bytes
+        .iter()
+        .fold(!0u32, |crc, &byte| (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize])
 }
 
 pub(crate) fn content_of(bytes: &[u8]) -> ContentId {
@@ -184,7 +186,15 @@ impl Record {
     /// The record of `bytes` kept as they are.
     pub(crate) fn raw_value(key: Key, kind: Kind, bytes: &[u8]) -> Record {
         let len = bytes.len() as u64;
-        Record { kind: kind.code(), form: RAW, dictionary: 0, stored: len, raw: len, key, content: content_of(bytes) }
+        Record {
+            kind: kind.code(),
+            form: RAW,
+            dictionary: 0,
+            stored: len,
+            raw: len,
+            key,
+            content: content_of(bytes),
+        }
     }
 
     pub(crate) fn encode(&self) -> [u8; RECORD_HEADER] {
@@ -256,8 +266,10 @@ pub(crate) fn walk(pack: &[u8]) -> Vec<(usize, Record)> {
         }
         let Some(record) = Record::decode(&pack[at..]) else { break };
         out.push((at, record));
-        let span = (RECORD_HEADER as u64).checked_add(record.stored).and_then(|it| it.checked_add(15));
-        let Some(end) = span.and_then(|it| usize::try_from(it & !15).ok()).and_then(|it| at.checked_add(it))
+        let span =
+            (RECORD_HEADER as u64).checked_add(record.stored).and_then(|it| it.checked_add(15));
+        let Some(end) =
+            span.and_then(|it| usize::try_from(it & !15).ok()).and_then(|it| at.checked_add(it))
         else {
             break;
         };
@@ -315,8 +327,13 @@ pub(crate) struct DictionaryRef {
 
 /// A head naming `packs`, `dictionaries` and the index table `index`, with no files of their
 /// own and no units.
-pub(crate) fn head(index: Option<IndexRef>, packs: &[PackRef], dictionaries: &[DictionaryRef]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEAD_FIXED + packs.len() * PACK_REF + dictionaries.len() * 16 + 4);
+pub(crate) fn head(
+    index: Option<IndexRef>,
+    packs: &[PackRef],
+    dictionaries: &[DictionaryRef],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(HEAD_FIXED + packs.len() * PACK_REF + dictionaries.len() * 16 + 4);
     out.extend_from_slice(HEAD_MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
@@ -412,7 +429,8 @@ pub(crate) fn index(slots: &[Slot]) -> Vec<u8> {
         let mut step = 1;
         let at = loop {
             let first = group as usize * INDEX_GROUP;
-            if let Some(lane) = (0..INDEX_GROUP).find(|&lane| control[first + lane] == INDEX_EMPTY) {
+            if let Some(lane) = (0..INDEX_GROUP).find(|&lane| control[first + lane] == INDEX_EMPTY)
+            {
                 break first + lane;
             }
             group = (group + step) & mask;
@@ -435,8 +453,12 @@ pub(crate) fn index(slots: &[Slot]) -> Vec<u8> {
 /// length agrees with; none for one that does not.
 pub(crate) fn index_keys(table: &[u8]) -> Vec<Key> {
     let Some(count) = table.get(16..24).map(|it| u64_at(it, 0)) else { return Vec::new() };
-    let Some(count) = usize::try_from(count).ok().filter(|&it| it >= INDEX_GROUP) else { return Vec::new() };
-    if count.checked_mul(1 + INDEX_ROW).and_then(|it| it.checked_add(INDEX_HEADER)) != Some(table.len()) {
+    let Some(count) = usize::try_from(count).ok().filter(|&it| it >= INDEX_GROUP) else {
+        return Vec::new();
+    };
+    if count.checked_mul(1 + INDEX_ROW).and_then(|it| it.checked_add(INDEX_HEADER))
+        != Some(table.len())
+    {
         return Vec::new();
     }
     let (control, rows) = table[INDEX_HEADER..].split_at(count);
@@ -444,7 +466,9 @@ pub(crate) fn index_keys(table: &[u8]) -> Vec<Key> {
         .iter()
         .enumerate()
         .filter(|(_, it)| **it < INDEX_EMPTY)
-        .map(|(at, _)| Key(ContentId(rows[at * INDEX_ROW..at * INDEX_ROW + 32].try_into().expect("32 bytes"))))
+        .map(|(at, _)| {
+            Key(ContentId(rows[at * INDEX_ROW..at * INDEX_ROW + 32].try_into().expect("32 bytes")))
+        })
         .collect()
 }
 
@@ -499,7 +523,11 @@ pub(crate) fn files(sim: &mut Sim) -> Vec<(FileName, u64)> {
     let mut found = Vec::new();
     run_until_idle(sim, &mut effects, |completion, _| {
         if let Done::Listed(listed) = completion.done {
-            found = listed.into_iter().filter(|(_, meta)| !meta.dir).map(|(file, meta)| (file, meta.len)).collect();
+            found = listed
+                .into_iter()
+                .filter(|(_, meta)| !meta.dir)
+                .map(|(file, meta)| (file, meta.len))
+                .collect();
         }
     });
     found
@@ -601,10 +629,25 @@ pub(crate) fn encode_values(specs: &[Spec], settles: u8) -> Vec<u8> {
 pub(crate) fn sample_values() -> Vec<Spec> {
     vec![
         Spec { kind: Kind::Query, len: 300, shift: 0, pattern: b"a query's result, " },
-        Spec { kind: Kind::Code, len: 5000, shift: 0, pattern: b"\x55\x48\x89\xe5\x48\x83\xec\x10\xc3" },
-        Spec { kind: Kind::Debug, len: 20000, shift: 0, pattern: b"DW_TAG_subprogram src/lib.rs:12\n" },
+        Spec {
+            kind: Kind::Code,
+            len: 5000,
+            shift: 0,
+            pattern: b"\x55\x48\x89\xe5\x48\x83\xec\x10\xc3",
+        },
+        Spec {
+            kind: Kind::Debug,
+            len: 20000,
+            shift: 0,
+            pattern: b"DW_TAG_subprogram src/lib.rs:12\n",
+        },
         Spec { kind: Kind::Run, len: 9000, shift: 0, pattern: b"cargo:rustc-cfg=has_feature\n" },
-        Spec { kind: Kind::Output, len: 20000, shift: 2, pattern: b"\x7fELF\x02\x01\x01 an object's bytes" },
+        Spec {
+            kind: Kind::Output,
+            len: 20000,
+            shift: 2,
+            pattern: b"\x7fELF\x02\x01\x01 an object's bytes",
+        },
         Spec { kind: Kind::Image, len: 0, shift: 0, pattern: b"" },
     ]
 }
@@ -635,7 +678,11 @@ pub(crate) fn write(values: &[Value], settles: u8) -> Sim {
         store.settle(&mut effects);
         drive(&mut sim, &mut store, &mut effects);
     }
-    assert!(store.broken().is_none(), "a store on a machine that never fails goes on: {:?}", store.broken());
+    assert!(
+        store.broken().is_none(),
+        "a store on a machine that never fails goes on: {:?}",
+        store.broken()
+    );
     sim
 }
 
@@ -651,7 +698,11 @@ pub(crate) fn packs(sim: &mut Sim) -> Vec<FileName> {
 
 /// A pack's number, from its name.
 pub(crate) fn pack_number(file: &FileName) -> u32 {
-    file.as_str().rsplit('-').next().and_then(|it| it.parse().ok()).expect("a pack's name ends in its number")
+    file.as_str()
+        .rsplit('-')
+        .next()
+        .and_then(|it| it.parse().ok())
+        .expect("a pack's name ends in its number")
 }
 
 /// The slots of an index table of every record in the store's packs, the last record of a key
@@ -767,7 +818,12 @@ pub(crate) fn damage_record(
     let mut records = Vec::new();
     for pack in packs(sim) {
         let bytes = sim.contents(&pack);
-        records.extend(walk(&bytes).into_iter().filter(|(_, it)| pick(it)).map(|(at, it)| (pack.clone(), at, it)));
+        records.extend(
+            walk(&bytes)
+                .into_iter()
+                .filter(|(_, it)| pick(it))
+                .map(|(at, it)| (pack.clone(), at, it)),
+        );
     }
     if records.is_empty() || input.is_empty() {
         return false;
@@ -863,13 +919,20 @@ fn read(sim: &mut Sim, wants: &[(Key, Option<&[u8]>)]) -> Back {
         match (store.get(key), reader.get(&guard, key)) {
             (Ok(Some(entry)), Ok(Some(other))) => {
                 assert_eq!(entry.key, *key, "a read gives the value of the key asked for");
-                assert!(entry.content == content_of(entry.bytes), "a verified read gives bytes of its content hash");
                 assert!(
-                    (entry.kind, entry.content, entry.bytes) == (other.kind, other.content, other.bytes),
+                    entry.content == content_of(entry.bytes),
+                    "a verified read gives bytes of its content hash"
+                );
+                assert!(
+                    (entry.kind, entry.content, entry.bytes)
+                        == (other.kind, other.content, other.bytes),
                     "Store::get and Reader::get read the same value"
                 );
                 if let Some(put) = put {
-                    assert!(entry.bytes == *put, "a verified read gives the bytes put, never other bytes");
+                    assert!(
+                        entry.bytes == *put,
+                        "a verified read gives the bytes put, never other bytes"
+                    );
                 }
                 back.whole += 1;
             }
@@ -888,12 +951,19 @@ fn read(sim: &mut Sim, wants: &[(Key, Option<&[u8]>)]) -> Back {
     }
     let scrubbed = store.verify(None);
     for key in corrupt {
-        assert!(scrubbed.iter().any(|it| it.key == key), "a scrub finds every corrupt value a read finds: {:x}", key.0);
+        assert!(
+            scrubbed.iter().any(|it| it.key == key),
+            "a scrub finds every corrupt value a read finds: {:x}",
+            key.0
+        );
     }
     back
 }
 
 /// The round trip: values put and not damaged all read back as they were put.
 pub(crate) fn assert_whole(back: Back, values: usize) {
-    assert!(back.ready && back.whole == values, "round trip: {values} values put and not damaged read back {back:?}");
+    assert!(
+        back.ready && back.whole == values,
+        "round trip: {values} values put and not damaged read back {back:?}"
+    );
 }

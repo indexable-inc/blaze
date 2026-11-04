@@ -13,10 +13,7 @@ impl<I: Idx> Generator<I> {
     }
 
     pub fn new_with_init_value(index: I) -> Self {
-        Generator {
-            counter: index.index(),
-            phantom: PhantomData,
-        }
+        Generator { counter: index.index(), phantom: PhantomData }
     }
 
     /// Get a fresh id from this generator.
@@ -44,9 +41,6 @@ impl<I: Idx> Generator<I> {
 // Manual impl to avoid the `I: Default` bound.
 impl<I: Idx> Default for Generator<I> {
     fn default() -> Self {
-        Self {
-            counter: Default::default(),
-            phantom: Default::default(),
-        }
+        Self { counter: Default::default(), phantom: Default::default() }
     }
 }

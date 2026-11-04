@@ -97,7 +97,11 @@ fn deprecated(
 pub(super) fn in_effect(depr: &Deprecation, current: Option<RustcVersion>) -> Option<bool> {
     match (&depr.since, current) {
         (DeprecatedSince::RustcVersion(_), None) => None,
-        (_, current) => Some(depr.is_in_effect(current.unwrap_or(RustcVersion { major: 0, minor: 0, patch: 0 }))),
+        (_, current) => Some(depr.is_in_effect(current.unwrap_or(RustcVersion {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        }))),
     }
 }
 
@@ -125,7 +129,11 @@ fn deprecated_through(
         return None;
     }
     // clone: a refcount, on a deprecation that may fire, past the level test
-    let depr = Deprecation { since: DeprecatedSince::Unspecified, note: Some(message.clone()), suggestion: None };
+    let depr = Deprecation {
+        since: DeprecatedSince::Unspecified,
+        note: Some(message.clone()),
+        suggestion: None,
+    };
     deprecated(cx, def, &depr, current, site, None)
 }
 
@@ -140,14 +148,26 @@ fn deprecated_macro(
 ) -> Found {
     let mut diag = deprecation_diag(cx, depr, in_effect, "macro", path, site.span, Some(site.span));
     // alloc: the fact of a macro deprecation that fires
-    diag.fact_opt(definition_fact(cx, Def::Item(ModuleDef::Macro(mac))), format!("the attributes of `{path}`"));
+    diag.fact_opt(
+        definition_fact(cx, Def::Item(ModuleDef::Macro(mac))),
+        format!("the attributes of `{path}`"),
+    );
     source_fact(cx, &mut diag, site.at);
     Found::lint(diag, site.phase, site.at)
 }
 
 /// `contains_macro_use`'s warning of a `#[macro_escape]` at `range`, on the `mod` at `at`.
-fn macro_escape(cx: &Cx<'_, '_>, range: InFile<TextRange>, inner: bool, at: InFile<SyntaxNodePtr>) -> Found {
-    let mut diag = Diag::new(Level::Warning, None, "`#[macro_escape]` is a deprecated synonym for `#[macro_use]`");
+fn macro_escape(
+    cx: &Cx<'_, '_>,
+    range: InFile<TextRange>,
+    inner: bool,
+    at: InFile<SyntaxNodePtr>,
+) -> Found {
+    let mut diag = Diag::new(
+        Level::Warning,
+        None,
+        "`#[macro_escape]` is a deprecated synonym for `#[macro_use]`",
+    );
     diag.span = MultiSpan::of(cx.span(range));
     if inner {
         diag.help("try an outer attribute: `#[macro_use]`");
@@ -158,10 +178,20 @@ fn macro_escape(cx: &Cx<'_, '_>, range: InFile<TextRange>, inner: bool, at: InFi
 
 /// `IneffectiveUnstableImpl`: the `#[unstable]` at `span` of the trait impl at `at` has no
 /// effect, every definition its self type and trait name (`defs`) being stable.
-fn ineffective_unstable_impl(cx: &Cx<'_, '_>, span: InFile<TextRange>, at: InFile<SyntaxNodePtr>, defs: &[Def]) -> Found {
-    let mut diag =
-        Diag::lint("ineffective_unstable_trait_impl", "an `#[unstable]` annotation here has no effect", cx.span(span));
-    diag.note("see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information");
+fn ineffective_unstable_impl(
+    cx: &Cx<'_, '_>,
+    span: InFile<TextRange>,
+    at: InFile<SyntaxNodePtr>,
+    defs: &[Def],
+) -> Found {
+    let mut diag = Diag::lint(
+        "ineffective_unstable_trait_impl",
+        "an `#[unstable]` annotation here has no effect",
+        cx.span(span),
+    );
+    diag.note(
+        "see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information",
+    );
     for &def in defs {
         if let Some(path) = def::path(cx, def) {
             // alloc: the facts of an `ineffective_unstable_trait_impl` that fires
@@ -173,7 +203,13 @@ fn ineffective_unstable_impl(cx: &Cx<'_, '_>, span: InFile<TextRange>, at: InFil
 }
 
 /// `report_unstable` of a use of `def` (whose path, for the fact, is `path`).
-fn unstable(cx: &Cx<'_, '_>, def: Def, path: Option<&str>, stability: &Stability, site: Site) -> Option<Found> {
+fn unstable(
+    cx: &Cx<'_, '_>,
+    def: Def,
+    path: Option<&str>,
+    stability: &Stability,
+    site: Site,
+) -> Option<Found> {
     let mut diag = unstable_diag(cx, stability, site.span)?;
     // alloc: the path of an E0658 that fires, for its fact
     let path = path.map(str::to_owned).or_else(|| def::path(cx, def));
@@ -219,7 +255,9 @@ fn deprecation_diag(
         (_, false) => (
             "deprecated_in_future",
             // alloc: the message of a deprecation that fires
-            format!("use of {kind} `{path}` that will be deprecated in a future Rust version{note}"),
+            format!(
+                "use of {kind} `{path}` that will be deprecated in a future Rust version{note}"
+            ),
         ),
     };
     let mut diag = Diag::lint(lint, message, cx.span(span));
@@ -245,10 +283,14 @@ fn unstable_diag(cx: &Cx<'_, '_>, stability: &Stability, span: InFile<TextRange>
     let feature = stability.feature.as_str();
     let message = match reason {
         // alloc: the message of an E0658 that fires
-        UnstableReason::Some(reason) => format!("use of unstable library feature `{feature}`: {}", reason.as_str()),
+        UnstableReason::Some(reason) => {
+            format!("use of unstable library feature `{feature}`: {}", reason.as_str())
+        }
         UnstableReason::Default => {
             // alloc: the message of an E0658 that fires
-            format!("use of unstable library feature `{feature}`: {UNSTABLE_LOCATION_REASON_DEFAULT}")
+            format!(
+                "use of unstable library feature `{feature}`: {UNSTABLE_LOCATION_REASON_DEFAULT}"
+            )
         }
         // alloc: the message of an E0658 that fires
         UnstableReason::None => format!("use of unstable library feature `{feature}`"),
@@ -261,7 +303,9 @@ fn unstable_diag(cx: &Cx<'_, '_>, stability: &Stability, span: InFile<TextRange>
     // alloc: the help of an E0658 that fires
     diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
     // alloc: the note of an E0658 that fires
-    diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
+    diag.note(format!(
+        "this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"
+    ));
     Some(diag)
 }
 

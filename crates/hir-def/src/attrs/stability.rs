@@ -15,7 +15,7 @@
 
 use std::{num::NonZero, ops::ControlFlow};
 
-use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
+use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr_view, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
@@ -208,7 +208,10 @@ pub enum StableSince {
 
 /// The stability `-Zforce-unstable-if-unmarked` gives everything of a crate without
 /// `staged_api` (rustc's `FORCE_UNSTABLE`).
-#[expect(clippy::disallowed_types, reason = "the process's one forced unstable marker: callers share the same constant stability value")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one forced unstable marker: callers share the same constant stability value"
+)]
 static FORCE_UNSTABLE: std::sync::LazyLock<Stability> = std::sync::LazyLock::new(|| Stability {
     level: StabilityLevel::Unstable {
         reason: UnstableReason::Default,
@@ -223,10 +226,7 @@ static FORCE_UNSTABLE: std::sync::LazyLock<Stability> = std::sync::LazyLock::new
 /// `lookup_deprecation_entry(def)`: its own `#[deprecated]`, else the one of the definition
 /// it is in. rustc's `inherit_deprecation` holds for every definition here (only generic
 /// parameters don't inherit).
-pub fn deprecation_entry(
-    db: &Db,
-    def: StabilityDef,
-) -> Option<DeprecationEntry<'_>> {
+pub fn deprecation_entry(db: &Db, def: StabilityDef) -> Option<DeprecationEntry<'_>> {
     let origin = deprecation_from(db, def)?;
     Some(DeprecationEntry { deprecation: own(db, origin)?.deprecation.as_ref()?, origin })
 }
@@ -739,7 +739,8 @@ fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
 #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
-    let no_owner = || -> ! { panic!("no definition of its module holds the block at {ast_id:?} with items") };
+    let no_owner =
+        || -> ! { panic!("no definition of its module holds the block at {ast_id:?} with items") };
     let node = InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
         .parent_ancestors_with_macros_view(db)
         .find(|it| is_definition(it.value.kind()))

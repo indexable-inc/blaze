@@ -139,7 +139,11 @@ impl Host {
     /// old one keeps it). The bytes are the image part's only while it is pristine
     /// ([`CodeMemory::is_pristine`]): a memory patched since is an error, never a file that
     /// differs from what the overlay swaps in.
-    pub fn write_executable(&self, memory: &CodeMemory, executable: &Executable<'_>) -> Result<Wrote, Error> {
+    pub fn write_executable(
+        &self,
+        memory: &CodeMemory,
+        executable: &Executable<'_>,
+    ) -> Result<Wrote, Error> {
         let path = executable.path;
         let mut written = self.written.lock();
         if let Some((key, identity)) = written.get(path)
@@ -164,8 +168,12 @@ impl Host {
             )));
         }
         let bytes = memory.bytes(CodeRange { offset: 0, len: executable.len })?;
-        let io = |what: &str, at: &Path, it: std::io::Error| Error::new(format!("{what} {}: {it}", at.display()));
-        let name = path.file_name().ok_or_else(|| Error::new(format!("an executable path {} with no file name", path.display())))?;
+        let io = |what: &str, at: &Path, it: std::io::Error| {
+            Error::new(format!("{what} {}: {it}", at.display()))
+        };
+        let name = path.file_name().ok_or_else(|| {
+            Error::new(format!("an executable path {} with no file name", path.display()))
+        })?;
         let mut temporary = name.to_owned();
         temporary.push(format!(
             ".blaze-{}-{}.tmp",
@@ -175,7 +183,8 @@ impl Host {
         let temporary = path.with_file_name(temporary);
         let wrote = match executable.store {
             Some(store) if sys::clone_file(store, &temporary)? => {
-                let cloned = std::fs::read(&temporary).map_err(|it| io("reading the clone", &temporary, it))?;
+                let cloned = std::fs::read(&temporary)
+                    .map_err(|it| io("reading the clone", &temporary, it))?;
                 if cloned != bytes {
                     let _ = std::fs::remove_file(&temporary);
                     return Err(Error::new(format!(
@@ -201,7 +210,9 @@ impl Host {
             let _ = std::fs::remove_file(&temporary);
             return Err(io("renaming the new executable over", path, error));
         }
-        let identity = Identity::of(path).ok_or_else(|| Error::new(format!("{} is gone right after it was written", path.display())))?;
+        let identity = Identity::of(path).ok_or_else(|| {
+            Error::new(format!("{} is gone right after it was written", path.display()))
+        })?;
         written.insert(path.to_owned(), (executable.key, identity));
         Ok(wrote)
     }
@@ -223,7 +234,8 @@ impl Host {
         let mut var = OsString::from(&self.address);
         var.push("\t");
         var.push(hex(&token));
-        let mut env: Vec<(OsString, OsString)> = launch.env.iter().filter(|(name, _)| name != HOST_VAR).cloned().collect();
+        let mut env: Vec<(OsString, OsString)> =
+            launch.env.iter().filter(|(name, _)| name != HOST_VAR).cloned().collect();
         env.push((HOST_VAR.into(), var));
         let mut sandbox = launch.sandbox.clone();
         if let Sandbox::On { read, write, services, .. } = &mut sandbox {
@@ -258,9 +270,9 @@ impl Host {
 /// a new asks object, mapped by the start hook itself.
 fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Error> {
     let memory = launch.image;
-    let layout = memory
-        .layout()
-        .ok_or_else(|| Error::new("a launch of a code memory not laid out (CodeMemory::lay_out)"))?;
+    let layout = memory.layout().ok_or_else(|| {
+        Error::new("a launch of a code memory not laid out (CodeMemory::lay_out)")
+    })?;
     let asks = sys::Object::create("the asks", ask::BYTES.next_multiple_of(sys::page()))?;
     let mut objects = vec![
         (memory.object().duplicate()?, Rights::Code),
@@ -354,7 +366,10 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
         }
     }
     for overlay in &overlays {
-        let reserved = layout.reserved.iter().any(|it| it.start <= overlay.at && overlay.range().end <= it.end);
+        let reserved = layout
+            .reserved
+            .iter()
+            .any(|it| it.start <= overlay.at && overlay.range().end <= it.end);
         if overlay.place == Place::Reserved && !reserved {
             return Err(Error::new(format!(
                 "an overlay of {:#x} bytes at {:#x}: not inside a reservation of the executable",
@@ -367,10 +382,23 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
     for it in &launch.lookups {
         let start = u32::try_from(names.len())
             .ok()
-            .filter(|start| u32::try_from(it.name.len()).is_ok_and(|len| start.checked_add(len).is_some()))
-            .ok_or_else(|| Error::new(format!("the names of a launch's lookups run past 4 GiB at `{}`", it.name)))?; // alloc: error path
+            .filter(|start| {
+                u32::try_from(it.name.len()).is_ok_and(|len| start.checked_add(len).is_some())
+            })
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "the names of a launch's lookups run past 4 GiB at `{}`",
+                    it.name
+                ))
+            })?; // alloc: error path
         names.push_str(it.name);
-        lookups.push(Lookup { place: it.place, addend: it.addend, weak: it.weak, name: start, len: it.name.len() as u32 });
+        lookups.push(Lookup {
+            place: it.place,
+            addend: it.addend,
+            weak: it.weak,
+            name: start,
+            len: it.name.len() as u32,
+        });
     }
     let grant = Grant {
         format: layout.format,
@@ -404,7 +432,9 @@ impl Pending {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(Error::new(format!("the start hook did not attach within {timeout:?}")))
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(Error::new("the host stopped before the start hook attached")),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(Error::new("the host stopped before the start hook attached"))
+            }
         }
     }
 }
@@ -487,7 +517,12 @@ struct Starts {
 impl Program {
     /// `memory` laid out ([`CodeMemory::lay_out`]), its image part the executable `image`
     /// names.
-    pub fn new(host: Arc<Host>, memory: Arc<Mutex<CodeMemory>>, image: Image, sessions: crossbeam_channel::Sender<Result<Session, Error>>) -> Program {
+    pub fn new(
+        host: Arc<Host>,
+        memory: Arc<Mutex<CodeMemory>>,
+        image: Image,
+        sessions: crossbeam_channel::Sender<Result<Session, Error>>,
+    ) -> Program {
         Program { host, memory, image: Mutex::new(image), sessions, starts: Arc::default() }
     }
 
@@ -497,7 +532,8 @@ impl Program {
     pub fn relaid(&self, memory: &CodeMemory, image: Image) -> Result<(), Error> {
         if !memory.is_pristine() {
             return Err(Error::new(
-                "a program's executable changed to a code memory not laid out since its last write".to_owned(),
+                "a program's executable changed to a code memory not laid out since its last write"
+                    .to_owned(),
             ));
         }
         *self.image.lock() = image;
@@ -607,7 +643,9 @@ impl Program {
                 }
                 let _ = sessions.send(session);
             })
-            .map_err(|it| Error::new(format!("starting the thread that waits for a start hook: {it}")))?;
+            .map_err(|it| {
+                Error::new(format!("starting the thread that waits for a start hook: {it}"))
+            })?;
         Ok((command, started))
     }
 
@@ -711,13 +749,21 @@ fn serve(
         )));
     }
     if hello.version != VERSION {
-        return Err(Error::new(format!("a start hook of version {}, where this blaze speaks {VERSION}", hello.version)));
+        return Err(Error::new(format!(
+            "a start hook of version {}, where this blaze speaks {VERSION}",
+            hello.version
+        )));
     }
     if hello.page != sys::page() {
-        return Err(Error::new(format!("a start hook of pages of {:#x} bytes, where the daemon's are {:#x}", hello.page, sys::page())));
+        return Err(Error::new(format!(
+            "a start hook of pages of {:#x} bytes, where the daemon's are {:#x}",
+            hello.page,
+            sys::page()
+        )));
     }
     let slide = hello.header.wrapping_sub(launch.grant.header);
-    let objects: Vec<(&sys::Object, Rights)> = launch.objects.iter().map(|(it, rights)| (it, *rights)).collect();
+    let objects: Vec<(&sys::Object, Rights)> =
+        launch.objects.iter().map(|(it, rights)| (it, *rights)).collect();
     let remote = sys::send_objects(channel, peer, &launch.encoded, &objects)?;
     let (bells, names) = sys::Bells::new(&remote, ask::SLOTS)?;
     ask::name_bells(&launch.asks, &names);
@@ -726,19 +772,22 @@ fn serve(
         let (kind, body) = (frame.kind, frame.body.to_vec());
         *seq = frame.seq;
         let seq = *seq;
-        let bad = |it: crate::frame::FrameError| Error::new(format!("process {peer}'s start hook: {it}"));
+        let bad =
+            |it: crate::frame::FrameError| Error::new(format!("process {peer}'s start hook: {it}"));
         let mut answer = Vec::with_capacity(8);
         match kind {
-            kinds::MAP => match decode_map(&body).and_then(|(object, access)| remote.map(object, access)) {
-                Ok(address) => {
-                    Writer::new(&mut answer).u64(address);
-                    channel.send(kinds::MAPPED, seq, &answer)?;
+            kinds::MAP => {
+                match decode_map(&body).and_then(|(object, access)| remote.map(object, access)) {
+                    Ok(address) => {
+                        Writer::new(&mut answer).u64(address);
+                        channel.send(kinds::MAPPED, seq, &answer)?;
+                    }
+                    Err(error) => {
+                        Writer::new(&mut answer).str(&error.to_string());
+                        channel.send(kinds::REFUSED, seq, &answer)?;
+                    }
                 }
-                Err(error) => {
-                    Writer::new(&mut answer).str(&error.to_string());
-                    channel.send(kinds::REFUSED, seq, &answer)?;
-                }
-            },
+            }
             kinds::OVERLAY => {
                 Reader::new(&body).finish().map_err(bad)?;
                 remote.overlay(slide, &launch.grant)?;
@@ -752,9 +801,16 @@ fn serve(
             }
             kinds::FAILED => {
                 let why = Reader::new(&body).str().map_err(bad)?.to_owned();
-                return Err(Error::new(format!("process {peer}'s start hook could not attach: {why}")));
+                return Err(Error::new(format!(
+                    "process {peer}'s start hook could not attach: {why}"
+                )));
             }
-            other => return Err(Error::new(format!("process {peer}'s start hook sent a frame of kind {:#06x}", other.0))),
+            other => {
+                return Err(Error::new(format!(
+                    "process {peer}'s start hook sent a frame of kind {:#06x}",
+                    other.0
+                )));
+            }
         }
     }
 }

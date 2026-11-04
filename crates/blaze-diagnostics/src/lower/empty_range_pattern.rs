@@ -23,10 +23,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EmptyRangePattern) -> Vec<Found> {
             diag.span_label(span, "lower bound larger than upper bound");
             diag
         }
-        false if has_no_start(cx, d) => {
-            Diag::error(Some("E0579"), "exclusive upper bound for a range bound cannot be the minimum", span)
-        }
-        false => Diag::error(Some("E0579"), "lower bound for range pattern must be less than upper bound", span),
+        false if has_no_start(cx, d) => Diag::error(
+            Some("E0579"),
+            "exclusive upper bound for a range bound cannot be the minimum",
+            span,
+        ),
+        false => Diag::error(
+            Some("E0579"),
+            "lower bound for range pattern must be less than upper bound",
+            span,
+        ),
     };
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Mir)] // alloc: the error found, the edge

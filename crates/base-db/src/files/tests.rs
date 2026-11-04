@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::{FileId, VfsPath};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use blaze_mem::{Frame, Tag, frame};
-use blaze_hash::HashMap;
 use std::alloc::Global;
-use crate::{FileId, VfsPath};
 
 use super::{MAX_DEPTH, NO_NODE, RootContent, digit};
 use crate::{SourceRoot, SourceRootId, content};
@@ -219,13 +219,14 @@ fn an_edit_of_a_large_root_hashes_its_path_and_allocates_nothing() {
         assert!(dirty_nodes(index) <= levels, "a text edit: {} nodes", dirty_nodes(index));
         RootContent::refresh(&mut contents, &[ROOT], frame);
 
-        let cycle = |contents: &mut HashMap<SourceRootId, RootContent, Global>, key: Box<[u8]>, at: u8| {
-            let index = contents.get_mut(&ROOT).expect("the root");
-            index.set(file, text(at));
-            index.remove(file);
-            index.insert(file, key, path17, text(at));
-            RootContent::refresh(contents, &[ROOT], frame);
-        };
+        let cycle =
+            |contents: &mut HashMap<SourceRootId, RootContent, Global>, key: Box<[u8]>, at: u8| {
+                let index = contents.get_mut(&ROOT).expect("the root");
+                index.set(file, text(at));
+                index.remove(file);
+                index.insert(file, key, path17, text(at));
+                RootContent::refresh(contents, &[ROOT], frame);
+            };
         cycle(&mut contents, key17.clone(), 2);
         let key = key17.clone();
         let ((), used) = blaze_alloc_count::measure(|| cycle(&mut contents, key, 3));

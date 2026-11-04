@@ -200,7 +200,8 @@ fn a_warm_lent_buffer_allocates_nothing() {
 /// writer, pushed, cut out in place and decoded, it allocates nothing.
 #[test]
 fn a_warm_round_of_a_frame_allocates_nothing() {
-    let (mut writer, mut out, mut frames) = (cbor::Writer::new(), Vec::with_capacity(256), Frames::new());
+    let (mut writer, mut out, mut frames) =
+        (cbor::Writer::new(), Vec::with_capacity(256), Frames::new());
     let mut round = |id: u64| {
         out.clear();
         let sent = Envelope::new(id, Request::Cancel { id: id * 7 });
@@ -249,8 +250,8 @@ fn a_frame_of_the_longest_length_is_waited_for() {
 
 #[test]
 fn another_schema_is_refused_by_name_under_its_id() {
-    let item =
-        blaze_protocol::cbor::to_vec(&Envelope { schema: 2, id: 41, body: Request::Status }).unwrap();
+    let item = blaze_protocol::cbor::to_vec(&Envelope { schema: 2, id: 41, body: Request::Status })
+        .unwrap();
     let refused = decode::<Request>(&item).unwrap_err();
     assert_eq!(refused.id, Some(41));
     assert_eq!(refused.error.what, format!("schema 2, this daemon speaks {SCHEMA}"));
@@ -274,8 +275,12 @@ fn another_schema_is_refused_before_its_body_is_read() {
 
 #[test]
 fn another_schema_whose_body_reads_as_this_ones_is_refused_too() {
-    let item = blaze_protocol::cbor::to_vec(&Envelope { schema: SCHEMA + 1, id: 8, body: Request::Status })
-        .unwrap();
+    let item = blaze_protocol::cbor::to_vec(&Envelope {
+        schema: SCHEMA + 1,
+        id: 8,
+        body: Request::Status,
+    })
+    .unwrap();
     let refused = decode::<Request>(&item).unwrap_err();
     assert_eq!(refused.id, Some(8));
     assert!(refused.error.what.starts_with(&format!("schema {}", SCHEMA + 1)), "{refused:?}");
@@ -341,7 +346,8 @@ fn non_deterministic_cbor_is_refused_naming_the_offence() {
 
 #[test]
 fn a_body_that_is_not_a_request_is_refused_under_its_id() {
-    let item = blaze_protocol::cbor::to_vec(&Envelope::new(12, Response::Done { ok: true })).unwrap();
+    let item =
+        blaze_protocol::cbor::to_vec(&Envelope::new(12, Response::Done { ok: true })).unwrap();
     let refused = decode::<Request>(&item).unwrap_err();
     assert_eq!(refused.id, Some(12));
     assert!(refused.error.what.starts_with("an envelope that does not decode"), "{refused:?}");

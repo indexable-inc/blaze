@@ -79,11 +79,20 @@ impl PlanError {
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlanError::Cycle { node } => write!(f, "node {node} depends on itself through its dependencies"),
-            PlanError::NoSuchDep { node, dep } => write!(f, "node {node} depends on node {dep}, which there is not"),
-            PlanError::NotRunning { node, state } => write!(f, "node {node} was ended or given back while {state:?}"),
+            PlanError::Cycle { node } => {
+                write!(f, "node {node} depends on itself through its dependencies")
+            }
+            PlanError::NoSuchDep { node, dep } => {
+                write!(f, "node {node} depends on node {dep}, which there is not")
+            }
+            PlanError::NotRunning { node, state } => {
+                write!(f, "node {node} was ended or given back while {state:?}")
+            }
             PlanError::Unfinished { node, state, left } => {
-                write!(f, "the plan ended with {left} nodes not done, the first node {node}, {state:?}")
+                write!(
+                    f,
+                    "the plan ended with {left} nodes not done, the first node {node}, {state:?}"
+                )
             }
         }
     }
@@ -105,7 +114,10 @@ pub struct Plan {
 impl Plan {
     /// The plan of nodes `0..costs.len()`, node `n` predicted to cost `costs[n]` (at least 1)
     /// and depending on `deps(n)`.
-    pub fn new<D: IntoIterator<Item = u32>>(costs: &[u64], mut deps: impl FnMut(u32) -> D) -> Result<Plan, PlanError> {
+    pub fn new<D: IntoIterator<Item = u32>>(
+        costs: &[u64],
+        mut deps: impl FnMut(u32) -> D,
+    ) -> Result<Plan, PlanError> {
         let count = u32::try_from(costs.len()).expect("under 2^32 nodes");
         // alloc: once per pass, the plan's columns, a few per crate maintained
         let mut starts = Vec::with_capacity(costs.len() + 1);
@@ -124,7 +136,8 @@ impl Plan {
         }
         starts.push(all.len() as u32);
         // Each node's dependents, to count down to a topological order (deps first).
-        let mut left: Vec<u32> = (0..count).map(|n| starts[n as usize + 1] - starts[n as usize]).collect(); // alloc: as above
+        let mut left: Vec<u32> =
+            (0..count).map(|n| starts[n as usize + 1] - starts[n as usize]).collect(); // alloc: as above
         let mut dependents: Vec<SmallVec<[u32; 4]>> = vec![SmallVec::new(); costs.len()]; // alloc: as above
         for node in 0..count {
             for &dep in &all[starts[node as usize] as usize..starts[node as usize + 1] as usize] {
@@ -143,12 +156,14 @@ impl Plan {
             }
         }
         if topo.len() < costs.len() {
-            let node = (0..count).find(|&n| left[n as usize] > 0).expect("a node the order never reached");
+            let node =
+                (0..count).find(|&n| left[n as usize] > 0).expect("a node the order never reached");
             return Err(PlanError::Cycle { node });
         }
         let mut bottom = vec![0; costs.len()]; // alloc: as above
         for &node in topo.iter().rev() {
-            let after = dependents[node as usize].iter().map(|&it| bottom[it as usize]).max().unwrap_or(0);
+            let after =
+                dependents[node as usize].iter().map(|&it| bottom[it as usize]).max().unwrap_or(0);
             bottom[node as usize] = costs[node as usize].max(1).saturating_add(after);
         }
         let mut order: Vec<u32> = (0..count).collect(); // alloc: as above
@@ -242,7 +257,9 @@ impl Plan {
         let left = self.state.len() as u32 - self.done;
         match self.order.iter().find(|&&n| self.state[n as usize] != State::Done) {
             None => Ok(()),
-            Some(&node) => Err(PlanError::Unfinished { node, state: self.state[node as usize], left }),
+            Some(&node) => {
+                Err(PlanError::Unfinished { node, state: self.state[node as usize], left })
+            }
         }
     }
 }

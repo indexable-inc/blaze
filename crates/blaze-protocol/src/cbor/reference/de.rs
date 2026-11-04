@@ -2,7 +2,9 @@
 
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer as _, Visitor};
 
-use super::{ARRAY, BYTES, Error, MAP, NEGATIVE, NULL, RAW, SIMPLE, TEXT, UNSIGNED, check, from_half};
+use super::{
+    ARRAY, BYTES, Error, MAP, NEGATIVE, NULL, RAW, SIMPLE, TEXT, UNSIGNED, check, from_half,
+};
 
 /// The value of type `T` that `bytes` encode: one item in the core deterministic encoding,
 /// or the first offence against it.

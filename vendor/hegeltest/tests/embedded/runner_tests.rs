@@ -184,11 +184,7 @@ fn test_register_profile_rejects_reserved_names() {
 fn test_try_from_profile_reports_failure_without_panicking() {
     assert!(Settings::try_from_profile("base").is_ok());
     let e = Settings::try_from_profile("no_such_profile").unwrap_err();
-    assert!(
-        e.to_string()
-            .contains("unknown settings profile \"no_such_profile\""),
-        "got: {e}"
-    );
+    assert!(e.to_string().contains("unknown settings profile \"no_such_profile\""), "got: {e}");
     let dyn_err: &dyn std::error::Error = &e;
     assert!(dyn_err.source().is_none());
 }
@@ -227,19 +223,14 @@ fn multiple_failures_with_print_blob_emit_per_failure_reproducer_lines() {
 
 #[test]
 fn hegel_run_skips_when_generate_phase_disabled() {
-    Hegel::new(|_tc: TestCase| panic!("must not run"))
-        .settings(Settings::new().phases([]))
-        .run();
+    Hegel::new(|_tc: TestCase| panic!("must not run")).settings(Settings::new().phases([])).run();
 }
 
 #[test]
 fn test_settings_for_single_test_case_suppresses_run_level_health_checks() {
     let s = Settings::new().test_cases(50).for_single_test_case();
     assert_eq!(s.test_cases, 1);
-    assert_eq!(
-        s.suppress_health_check,
-        vec![HealthCheck::TooSlow, HealthCheck::TestCasesTooLarge]
-    );
+    assert_eq!(s.suppress_health_check, vec![HealthCheck::TooSlow, HealthCheck::TestCasesTooLarge]);
 }
 
 #[test]
@@ -249,11 +240,7 @@ fn test_settings_for_single_test_case_keeps_existing_suppressions() {
         .for_single_test_case();
     assert_eq!(
         s.suppress_health_check,
-        vec![
-            HealthCheck::TestCasesTooLarge,
-            HealthCheck::FilterTooMuch,
-            HealthCheck::TooSlow
-        ]
+        vec![HealthCheck::TestCasesTooLarge, HealthCheck::FilterTooMuch, HealthCheck::TooSlow]
     );
 }
 
@@ -307,10 +294,7 @@ mod reproduce {
         }
         let result = run.result();
         assert!(result.failure_count() > 0, "property should have failed");
-        result
-            .failure(0)
-            .reproduce_blob
-            .expect("a shrunk failure carries a reproduce blob")
+        result.failure(0).reproduce_blob.expect("a shrunk failure carries a reproduce blob")
     }
 
     /// Drive `hegel.run()` to its failure panic and return the panic message.
@@ -330,12 +314,7 @@ mod reproduce {
         let blob = discover_reproduce_blob();
         let msg = run_panic_message(
             Hegel::new(failing_property)
-                .settings(
-                    Settings::new()
-                        .phases([])
-                        .database(None)
-                        .verbosity(Verbosity::Quiet),
-                )
+                .settings(Settings::new().phases([]).database(None).verbosity(Verbosity::Quiet))
                 .reproduce_failure(blob),
         );
         assert!(msg.contains("boom: n ="), "unexpected panic message: {msg}");
@@ -386,9 +365,6 @@ mod reproduce {
         );
         assert!(msg.contains("did not reproduce"), "got: {msg}");
         assert!(msg.contains("may have been fixed"), "got: {msg}");
-        assert!(
-            msg.contains("not have recurred within the replay budget"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("not have recurred within the replay budget"), "got: {msg}");
     }
 }

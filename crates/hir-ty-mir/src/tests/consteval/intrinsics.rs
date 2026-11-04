@@ -288,7 +288,10 @@ fn type_name_of_a_closure_in_a_function_generic_over_lifetimes() {
         ("nested(1u16)", "ra_test_fixture::nested<u16>::{{closure}}::{{closure}}"),
         ("mixed(&0u8, &[0u8; 2])", "ra_test_fixture::mixed<'_, u8, 2>::{{closure}}"),
         ("S(&0u8).m()", "ra_test_fixture::S<'_, u8>::m::{{closure}}"),
-        ("S(&0u8).get()", "<ra_test_fixture::S<'_, u8> as ra_test_fixture::Tr<'_, u8>>::get::{{closure}}"),
+        (
+            "S(&0u8).get()",
+            "<ra_test_fixture::S<'_, u8> as ra_test_fixture::Tr<'_, u8>>::get::{{closure}}",
+        ),
     ];
     for (goal, name) in cases {
         type_name_case("fn", None, ITEMS, goal, name);
@@ -325,7 +328,10 @@ fn type_name_of_a_function_pointer() {
     const ITEMS: &str = "";
     let cases = [
         ("type_name::<fn(&u8) -> &u8>()", "fn(&'_ u8) -> &'_ u8"),
-        ("type_name::<unsafe extern \"C\" fn(u8, ...) -> !>()", "unsafe extern \"C\" fn(u8, ...) -> !"),
+        (
+            "type_name::<unsafe extern \"C\" fn(u8, ...) -> !>()",
+            "unsafe extern \"C\" fn(u8, ...) -> !",
+        ),
     ];
     for (goal, name) in cases {
         type_name_case("fn", None, ITEMS, goal, name);
@@ -341,7 +347,10 @@ fn type_name_of_a_trait_object() {
         pub trait Tr2<T> {}
     "#;
     let cases = [
-        ("type_name::<dyn Tr<'static, u8> + Send>()", "dyn ra_test_fixture::Tr<'_, u8> + core::marker::Send"),
+        (
+            "type_name::<dyn Tr<'static, u8> + Send>()",
+            "dyn ra_test_fixture::Tr<'_, u8> + core::marker::Send",
+        ),
         ("type_name::<dyn for<'a> Tr2<&'a u8>>()", "dyn ra_test_fixture::Tr2<&'_ u8>"),
         ("type_name::<dyn Fn(&u8) -> u8>()", "dyn core::ops::function::Fn(&'_ u8) -> u8"),
     ];
@@ -354,9 +363,10 @@ fn type_name_of_a_trait_object() {
 #[test]
 fn type_name_of_references_arrays_slices_tuples_and_pointers() {
     const ITEMS: &str = "";
-    let cases = [
-        ("type_name::<(&'static [u8], [u16; 3], *const str, *mut u8, &mut i32, ())>()", "(&[u8], [u16; 3], *const str, *mut u8, &mut i32, ())"),
-    ];
+    let cases = [(
+        "type_name::<(&'static [u8], [u16; 3], *const str, *mut u8, &mut i32, ())>()",
+        "(&[u8], [u16; 3], *const str, *mut u8, &mut i32, ())",
+    )];
     for (goal, name) in cases {
         type_name_case("fn", None, ITEMS, goal, name);
     }
@@ -396,7 +406,10 @@ fn type_name_of_an_async_closure_future_and_an_async_block() {
     let cases = [
         ("coro_ref()", "ra_test_fixture::coro_ref::{{closure}}::{{closure}}"),
         ("coro_once()", "ra_test_fixture::coro_once::{{closure}}::{{closure}}::{{call_once}}"),
-        ("coro_once_generic(1i8)", "ra_test_fixture::coro_once_generic<i8>::{{closure}}::{{closure}}::{{call_once}}"),
+        (
+            "coro_once_generic(1i8)",
+            "ra_test_fixture::coro_once_generic<i8>::{{closure}}::{{closure}}::{{call_once}}",
+        ),
         ("coro_move_once()", "ra_test_fixture::coro_move_once::{{closure}}::{{closure}}"),
         ("async_block()", "ra_test_fixture::async_block::{{closure}}"),
     ];
@@ -2281,7 +2294,10 @@ fn f64s(it: [f64; 2]) -> i128 {
 const NAN32: f32 = f32::from_bits(0x7fc0_0000);
 const NAN64: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
 
-#[expect(clippy::needless_pass_by_value, reason = "a `check_fail` callback, which `check_fail` hands the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a `check_fail` callback, which `check_fail` hands the error by value"
+)]
 fn is_ub(e: ConstEvalError<'_>) -> bool {
     matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_)))
 }

@@ -26,7 +26,6 @@ use std::{borrow::Cow, convert::Infallible, iter::Peekable, ops::ControlFlow};
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use blaze_query::db::{AsId, FromId};
 use cfg::{CfgExpr, CfgOptions};
@@ -43,6 +42,7 @@ use la_arena::ArenaMap;
 use rustc_abi::ReprOptions;
 use smallvec::SmallVec;
 use span::AstIdNode;
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
     view::{self as ast, AstNode, AstToken, HasAttrs, TokenTreeChildren, Typed},
@@ -87,15 +87,23 @@ fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAtt
     let loc = lookup.lookup(db);
     let krate = loc.krate(db);
     let id = loc.ast_id();
-    (InFile::new(id.file_id, any_has_attrs(item_node(db, id, loc.module(db), tree).syntax())), krate)
+    (
+        InFile::new(id.file_id, any_has_attrs(item_node(db, id, loc.module(db), tree).syntax())),
+        krate,
+    )
 }
 
 /// The node at `id`, an item of `module`, off the tree `tree` says: for [`Tree::Outline`], an
 /// item of a block of a body is read off that body's syntax.
-fn item_node<'db, N: AstIdNode + Typed>(db: &'db Db, id: AstId<N>, module: ModuleId, tree: Tree) -> N::Of<'db> {
+fn item_node<'db, N: AstIdNode + Typed>(
+    db: &'db Db,
+    id: AstId<N>,
+    module: ModuleId,
+    tree: Tree,
+) -> N::Of<'db> {
     if tree == Tree::Outline
-        && let Some(node) =
-            crate::signatures::outline_item(db, id).or_else(|| crate::signatures::body_item(db, id, module))
+        && let Some(node) = crate::signatures::outline_item(db, id)
+            .or_else(|| crate::signatures::body_item(db, id, module))
     {
         return node;
     }
@@ -161,7 +169,9 @@ fn file_attr_flags(db: &Db, file: EditionedFileId, krate: Crate) -> FileAttrFlag
             };
             let mut attr_flags = AttrFlags::empty();
             let attrs = ast::attrs_including_inner(&any_has_attrs(item));
-            expand_cfg_attr_view(attrs, &mut cfg, |attr, _| match_attr_flags(&mut attr_flags, attr));
+            expand_cfg_attr_view(attrs, &mut cfg, |attr, _| {
+                match_attr_flags(&mut attr_flags, attr)
+            });
             items.push((id.into_raw(), attr_flags));
         });
         items.sort_unstable_by_key(|&(id, _)| id);
@@ -568,8 +578,12 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     }
                     // `#[blaze::nopanic(trusted = "why")]` and the other two effects; the
                     // arguments are [`AttrFlags::effect_attr`]'s to read and refuse.
-                    (Some(Word::blaze), Some(Word::nopanic)) => attr_flags.insert(AttrFlags::NOPANIC),
-                    (Some(Word::blaze), Some(Word::noalloc)) => attr_flags.insert(AttrFlags::NOALLOC),
+                    (Some(Word::blaze), Some(Word::nopanic)) => {
+                        attr_flags.insert(AttrFlags::NOPANIC)
+                    }
+                    (Some(Word::blaze), Some(Word::noalloc)) => {
+                        attr_flags.insert(AttrFlags::NOALLOC)
+                    }
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
@@ -677,9 +691,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     Some(Word::rustc_unsafe_specialization_marker) if single => {
                         AttrFlags::RUSTC_UNSAFE_SPECIALIZATION_MARKER
                     }
-                    Some(Word::automatically_derived) if single => {
-                        AttrFlags::AUTOMATICALLY_DERIVED
-                    }
+                    Some(Word::automatically_derived) if single => AttrFlags::AUTOMATICALLY_DERIVED,
                     Some(Word::rustc_main) if single => AttrFlags::RUSTC_MAIN,
                     Some(Word::default) if single => AttrFlags::DEFAULT,
                     Some(Word::naked) if single => AttrFlags::NAKED,
@@ -1386,13 +1398,20 @@ fn collect_attrs_in<'db, BreakValue>(
 pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbol> {
     let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
     let value =
-        collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |attr, file| match attr {
-            ast::Meta::KeyValueMeta(attr) if path_is(attr.path(), name) => match attr.expr() {
-                Some(value) => ControlFlow::Break(InFile::new(file, value)),
-                None => ControlFlow::Continue(()),
+        collect_attrs_in(
+            db,
+            source,
+            outer_mod_decl,
+            crate_attrs,
+            krate,
+            |attr, file| match attr {
+                ast::Meta::KeyValueMeta(attr) if path_is(attr.path(), name) => match attr.expr() {
+                    Some(value) => ControlFlow::Break(InFile::new(file, value)),
+                    None => ControlFlow::Continue(()),
+                },
+                _ => ControlFlow::Continue(()),
             },
-            _ => ControlFlow::Continue(()),
-        })?;
+        )?;
     attr_value(db, owner, krate, value)
 }
 
@@ -1446,9 +1465,7 @@ fn collect_field_attrs<'db, T>(
 }
 
 /// An `ArenaMap` of `entries` (in index order), with room for exactly the last index.
-fn exact_arena_map<T, V: Copy>(
-    entries: &[(la_arena::Idx<T>, V)],
-) -> ArenaMap<la_arena::Idx<T>, V> {
+fn exact_arena_map<T, V: Copy>(entries: &[(la_arena::Idx<T>, V)]) -> ArenaMap<la_arena::Idx<T>, V> {
     let len = entries.last().map_or(0, |(idx, _)| u32::from(idx.into_raw()) as usize + 1);
     // alloc: the memo's map, exact
     let mut map = ArenaMap::with_capacity(len);
@@ -1797,10 +1814,7 @@ fn link_cfg(group: ast::TokenTree<'_>) -> Option<CfgExpr> {
     }
 }
 
-fn extract_cfgs(
-    result: &mut Vec<CfgExpr, &Frame>,
-    attr: ast::Meta<'_>,
-) -> ControlFlow<Infallible> {
+fn extract_cfgs(result: &mut Vec<CfgExpr, &Frame>, attr: ast::Meta<'_>) -> ControlFlow<Infallible> {
     if let ast::Meta::CfgMeta(attr) = attr
         && let Some(cfg_predicate) = attr.cfg_predicate()
     {
@@ -1912,7 +1926,8 @@ impl AttrFlags {
                         type_and_consts.push((self_id, attr_flags));
                     }
                 }
-                let type_or_const_params = list.into_iter().flat_map(|it| it.type_or_const_params());
+                let type_or_const_params =
+                    list.into_iter().flat_map(|it| it.type_or_const_params());
                 for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
                     let attr_flags = flags_of(type_or_const.attrs());
                     if !attr_flags.is_empty() {
@@ -1934,10 +1949,7 @@ impl AttrFlags {
             .unwrap_or_else(AttrFlags::empty)
     }
     #[inline]
-    pub fn query_type_or_const_param(
-        db: &Db,
-        owner: TypeOrConstParamId,
-    ) -> AttrFlags {
+    pub fn query_type_or_const_param(db: &Db, owner: TypeOrConstParamId) -> AttrFlags {
         AttrFlags::query_generic_params(db, owner.parent)
             .1
             .get(owner.local_id)
@@ -2141,7 +2153,9 @@ impl AttrFlags {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {
-                        ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => PureAttr::Checked,
+                        ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            PureAttr::Checked
+                        }
                         ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), word) => {
                             match attr.token_tree() {
                                 Some(tt) => pure_args(tt),
@@ -2301,10 +2315,7 @@ impl AttrFlags {
 
     /// Call this only if there are legacy const generics, to save memory.
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    pub(crate) fn legacy_const_generic_indices(
-        db: &Db,
-        owner: FunctionId,
-    ) -> Option<Box<[u32]>> {
+    pub(crate) fn legacy_const_generic_indices(db: &Db, owner: FunctionId) -> Option<Box<[u32]>> {
         blaze_mem::frame::current(|frame| {
             let result = collect_attrs(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -2394,8 +2405,7 @@ impl AttrFlags {
                 });
                 // alloc: the memo's set, once: room for every feature named (a feature named
                 // twice is the one case with room to spare)
-                let mut set =
-                    HashSet::with_capacity_in(found.len(), Global);
+                let mut set = HashSet::with_capacity_in(found.len(), Global);
                 set.extend(found.drain(..));
                 set
             })
@@ -2467,7 +2477,11 @@ impl AttrFlags {
                 let at = u32::from(field.local_id.into_raw());
                 for_each_field(db, field.parent, Tree::Outline, |idx, cfg_options, it| {
                     if idx == at {
-                        expand_cfg_attr_view(it.value.attrs(), || cfg_options, |meta, _| each(meta));
+                        expand_cfg_attr_view(
+                            it.value.attrs(),
+                            || cfg_options,
+                            |meta, _| each(meta),
+                        );
                     }
                 });
             }
@@ -2483,10 +2497,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn rustc_layout_scalar_valid_range(
-        db: &Db,
-        owner: AdtId,
-    ) -> RustcLayoutScalarValidRange {
+    pub fn rustc_layout_scalar_valid_range(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE)
         {
             return RustcLayoutScalarValidRange::default();
@@ -2495,10 +2506,7 @@ impl AttrFlags {
         return rustc_layout_scalar_valid_range(db, owner);
 
         #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
-        fn rustc_layout_scalar_valid_range(
-            db: &Db,
-            owner: AdtId,
-        ) -> RustcLayoutScalarValidRange {
+        fn rustc_layout_scalar_valid_range(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
             let mut result = RustcLayoutScalarValidRange::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -2524,11 +2532,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn doc_aliases(
-        self,
-        db: &Db,
-        owner: Either<AttrDefId, FieldId>,
-    ) -> &[Symbol] {
+    pub fn doc_aliases(self, db: &Db, owner: Either<AttrDefId, FieldId>) -> &[Symbol] {
         if !self.contains(AttrFlags::HAS_DOC_ALIASES) {
             return &[];
         }
@@ -2573,11 +2577,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn cfgs(
-        self,
-        db: &Db,
-        owner: Either<AttrDefId, FieldId>,
-    ) -> Option<&CfgExpr> {
+    pub fn cfgs(self, db: &Db, owner: Either<AttrDefId, FieldId>) -> Option<&CfgExpr> {
         if !self.contains(AttrFlags::HAS_CFG) {
             return None;
         }
@@ -2610,10 +2610,7 @@ impl AttrFlags {
 
         // We LRU this query because it is only used by IDE.
         #[blaze_query::tracked(returns(ref), lru, weigh = fields_cfgs_bytes, mem_tag = Nameres)]
-        fn fields_cfgs(
-            db: &Db,
-            variant: VariantId,
-        ) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
+        fn fields_cfgs(db: &Db, variant: VariantId) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
             blaze_mem::frame::current(|frame| {
                 collect_field_attrs(db, variant, Tree::Outline, frame, |cfg_options, field| {
                     let mut result = Vec::new_in(frame);
@@ -2691,10 +2688,7 @@ impl AttrFlags {
 
     // We LRU this query because it is only used by IDE.
     #[blaze_query::tracked(returns(ref), lru, weigh = fields_docs_bytes, mem_tag = Nameres)]
-    pub fn fields_docs(
-        db: &Db,
-        variant: VariantId,
-    ) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
+    pub fn fields_docs(db: &Db, variant: VariantId) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
         let krate = variant.module(db).krate(db);
         blaze_mem::frame::current(|frame| {
             collect_field_attrs(db, variant, Tree::Live, frame, |cfg_options, field| {
@@ -2841,9 +2835,8 @@ impl AttrFlags {
                         && let Some(tt) = attr.token_tree()
                     {
                         tokens.clear();
-                        tokens.extend(
-                            TokenTreeChildren::new(tt).filter_map(NodeOrToken::into_token),
-                        );
+                        tokens
+                            .extend(TokenTreeChildren::new(tt).filter_map(NodeOrToken::into_token));
                         for path in tokens.split(|it| it.kind() == T![,]) {
                             let mut kind = PathKind::Plain;
                             segments.clear();
@@ -2883,10 +2876,7 @@ impl AttrFlags {
         return must_implement_one_of(db, owner);
 
         #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
-        pub fn must_implement_one_of(
-            db: &Db,
-            owner: TraitId,
-        ) -> Option<Box<[Name]>> {
+        pub fn must_implement_one_of(db: &Db, owner: TraitId) -> Option<Box<[Name]>> {
             blaze_mem::frame::current(|frame| {
                 let mut names = Vec::new_in(frame);
                 collect_attrs(db, owner.into(), |attr| {
@@ -2986,11 +2976,17 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     let (mut node, stop) = match (syntax, &tree) {
         (Some(syntax), Some(tree)) => {
             let ptr = syntax.ast_id_map.try_get_erased(ast_id.value.erase()).unwrap_or_else(|| {
-                panic!("{block:?}: block {:?} is not in its body's syntax, which made it", ast_id.value)
+                panic!(
+                    "{block:?}: block {:?} is not in its body's syntax, which made it",
+                    ast_id.value
+                )
             });
             let stop = outer_block.filter(|it| it.file_id == file_id).map(|it| {
                 let ptr = syntax.ast_id_map.try_get_erased(it.value.erase()).unwrap_or_else(|| {
-                    panic!("{block:?}: the block {:?} holding it is not in its body's syntax", it.value)
+                    panic!(
+                        "{block:?}: the block {:?} holding it is not in its body's syntax",
+                        it.value
+                    )
                 });
                 (file_id, ptr.text_range())
             });

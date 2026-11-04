@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use ast_merge_langs::Lang;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use snafu::ResultExt as _;
+use std::alloc::Global;
 
 use crate::error::{
     Error, LanguageSnafu, ParseFileSnafu, ReadFileSnafu, UnknownLanguageSnafu, WalkSnafu,

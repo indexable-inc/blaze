@@ -123,8 +123,13 @@ fn check(format: Format, found: Found, page: u64) -> Result<Layout, Error> {
         let len = segment
             .len
             .checked_next_multiple_of(page)
-            .filter(|len| segment.linked.checked_add(*len).is_some() && segment.offset.checked_add(*len).is_some())
-            .ok_or_else(|| Error::new(format!("the code segment at {:#x} overflows", segment.linked)))?;
+            .filter(|len| {
+                segment.linked.checked_add(*len).is_some()
+                    && segment.offset.checked_add(*len).is_some()
+            })
+            .ok_or_else(|| {
+                Error::new(format!("the code segment at {:#x} overflows", segment.linked))
+            })?;
         segment.len = len;
         ranges.push(segment.linked..segment.linked + len);
     }
@@ -143,13 +148,15 @@ fn check(format: Format, found: Found, page: u64) -> Result<Layout, Error> {
         }
     }
     for (index, range) in reserved.iter().enumerate() {
-        if range.is_empty() || !range.start.is_multiple_of(page) || !range.end.is_multiple_of(page) {
+        if range.is_empty() || !range.start.is_multiple_of(page) || !range.end.is_multiple_of(page)
+        {
             return Err(Error::new(format!(
                 "the reservation {:#x}..{:#x} is not whole pages of {page:#x}",
                 range.start, range.end
             )));
         }
-        if let Some(it) = reserved[index + 1..].iter().chain(&other).find(|it| overlaps(it, range)) {
+        if let Some(it) = reserved[index + 1..].iter().chain(&other).find(|it| overlaps(it, range))
+        {
             return Err(Error::new(format!(
                 "the reservation {:#x}..{:#x} overlaps {:#x}..{:#x}",
                 range.start, range.end, it.start, it.end
@@ -157,7 +164,9 @@ fn check(format: Format, found: Found, page: u64) -> Result<Layout, Error> {
         }
     }
     let inside = |it: &Range<u64>| it.start >= span.start && it.end <= span.end;
-    if !ranges.iter().chain(&reserved).all(inside) || !(span.start..span.end.max(span.start)).contains(&header) {
+    if !ranges.iter().chain(&reserved).all(inside)
+        || !(span.start..span.end.max(span.start)).contains(&header)
+    {
         return Err(Error::new(format!(
             "the image's span {:#x}..{:#x} does not hold its headers, code and reservations",
             span.start, span.end
@@ -184,6 +193,8 @@ pub fn u64_at(bytes: &[u8], at: u64) -> Option<u64> {
 
 /// `start..start + len`, or an error naming `what` when it overflows.
 pub fn range(start: u64, len: u64, what: &str) -> Result<Range<u64>, Error> {
-    let end = start.checked_add(len).ok_or_else(|| Error::new(format!("{what} at {start:#x} of {len:#x} bytes overflows")))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::new(format!("{what} at {start:#x} of {len:#x} bytes overflows")))?;
     Ok(start..end)
 }

@@ -13,7 +13,10 @@ use std::{
     sync::Arc,
 };
 
-use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection, pki_types::ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection,
+    pki_types::ServerName,
+};
 
 /// One connection's bytes, as plaintext.
 pub trait Channel {
@@ -61,7 +64,10 @@ impl Channel for Tls {
                 let at = plain.len();
                 plain.resize(at + ready, 0);
                 // alloc: an error's message, made only when it fails.
-                self.conn.reader().read_exact(&mut plain[at..]).map_err(|error| format!("TLS: {error}"))?;
+                self.conn
+                    .reader()
+                    .read_exact(&mut plain[at..])
+                    .map_err(|error| format!("TLS: {error}"))?;
             }
             if state.peer_has_closed() {
                 self.closed = true;
@@ -109,23 +115,29 @@ impl TlsClient {
             return Err(format!(
                 "no root certificate to check the global cache at {host} with was found on this machine ({})",
                 // alloc: an error's message, made only when it fails.
-                if errors.is_empty() { "no errors loading them".to_owned() } else { errors.join("; ") }
+                if errors.is_empty() {
+                    "no errors loading them".to_owned()
+                } else {
+                    errors.join("; ")
+                }
             ));
         }
         // alloc: setup: once a TLS config or a connection.
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            // alloc: an error's message, made only when it fails.
-            .map_err(|error| format!("TLS versions: {error}"))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                // alloc: an error's message, made only when it fails.
+                .map_err(|error| format!("TLS versions: {error}"))?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         // alloc: setup: once a TLS config or a connection.
         TlsClient::with_config(Arc::new(config), host)
     }
 
     pub fn with_config(config: Arc<ClientConfig>, host: &str) -> Result<TlsClient, String> {
         // alloc: an error's message, made only when it fails.
-        let name = ServerName::try_from(host.to_owned()).map_err(|error| format!("{host:?} as a TLS server name: {error}"))?;
+        let name = ServerName::try_from(host.to_owned())
+            .map_err(|error| format!("{host:?} as a TLS server name: {error}"))?;
         Ok(TlsClient { config, name })
     }
 }
@@ -159,7 +171,8 @@ impl Channels for TlsServer {
 
     fn channel(&self) -> Result<Tls, String> {
         // alloc: an error's message, made only when it fails.
-        let conn = ServerConnection::new(Arc::clone(&self.config)).map_err(|error| format!("TLS: {error}"))?;
+        let conn = ServerConnection::new(Arc::clone(&self.config))
+            .map_err(|error| format!("TLS: {error}"))?;
         Ok(Tls::new(Connection::Server(conn)))
     }
 }
@@ -208,11 +221,12 @@ pub(crate) mod clear {
 
     #[test]
     fn a_tls_client_names_its_server() {
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth();
         let client = TlsClient::with_config(Arc::new(config), "cache.example.com").unwrap();
         let mut tls = client.channel().unwrap();
         let mut hello = Vec::new();

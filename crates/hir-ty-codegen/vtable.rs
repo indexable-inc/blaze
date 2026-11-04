@@ -4,12 +4,12 @@
 #![forbid(unsafe_code)]
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_def::{AssocItemId, FunctionId, TraitId};
 use rustc_type_ir::{
     Binder, Interner, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
     inherent::{Clause as _, IntoKind as _},
 };
+use std::alloc::Global;
 
 use hir_ty::{
     dyn_compatibility::generics_require_sized_self,

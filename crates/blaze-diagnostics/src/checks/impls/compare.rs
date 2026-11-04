@@ -96,7 +96,11 @@ fn duplicate(
     // alloc: empty, allocates nothing
     let Some(span) = assoc_item_span(cx, item) else { return Vec::new() };
     // alloc: on the error path, once the items differ
-    let mut diag = Diag::error(Some("E0201"), format!("duplicate definitions with name `{name}`:"), span.clone());
+    let mut diag = Diag::error(
+        Some("E0201"),
+        format!("duplicate definitions with name `{name}`:"),
+        span.clone(),
+    );
     diag.span_label(span, "duplicate definition");
     if let Some(old) = assoc_item_span(cx, first) {
         diag.span_label(old, "previous definition here");
@@ -226,8 +230,11 @@ fn self_type(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Functi
     let span = cx.span(source.map(signature_range));
     let name = tf.name(db);
     let name = name.as_str();
-    let trait_span =
-        if tf.module(db).krate(db) == cx.krate { assoc_item_span(cx, hir::AssocItem::Function(tf)) } else { None };
+    let trait_span = if tf.module(db).krate(db) == cx.krate {
+        assoc_item_span(cx, hir::AssocItem::Function(tf))
+    } else {
+        None
+    };
     let mut diag = if in_impl {
         let impl_self = cx.ty(&at.impl_.self_ty(db));
         // alloc: on the error path, once the items differ
@@ -235,7 +242,9 @@ fn self_type(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Functi
         let mut diag = Diag::error(
             Some("E0185"),
             // alloc: on the error path, once the items differ
-            format!("method `{name}` has a `{descr}` declaration in the impl, but not in the trait"),
+            format!(
+                "method `{name}` has a `{descr}` declaration in the impl, but not in the trait"
+            ),
             // clone: the error's span
             span.clone(),
         );
@@ -252,7 +261,9 @@ fn self_type(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Functi
         let mut diag = Diag::error(
             Some("E0186"),
             // alloc: on the error path, once the items differ
-            format!("method `{name}` has a `{descr}` declaration in the trait, but not in the impl"),
+            format!(
+                "method `{name}` has a `{descr}` declaration in the trait, but not in the impl"
+            ),
             // clone: the error's span
             span.clone(),
         );
@@ -354,7 +365,11 @@ fn generic_spans(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<(Vec<Span>, Ve
 }
 
 /// `compare_number_of_generics`: E0049 for the type parameters, then for the const ones.
-fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::AssocItem) -> Vec<Found> {
+fn number_of_generics(
+    cx: &Cx<'_, '_>,
+    item: hir::AssocItem,
+    trait_item: hir::AssocItem,
+) -> Vec<Found> {
     let db = cx.db;
     let (impl_types, impl_consts) = counts(cx, item);
     let (trait_types, trait_consts) = counts(cx, trait_item);
@@ -376,7 +391,9 @@ fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::As
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     // alloc: on the error path, once the items differ
     let mut found = Vec::new();
-    for (what, trait_count, impl_count) in [("type", trait_types, impl_types), ("const", trait_consts, impl_consts)] {
+    for (what, trait_count, impl_count) in
+        [("type", trait_types, impl_types), ("const", trait_consts, impl_consts)]
+    {
         if impl_count == trait_count {
             continue;
         }
@@ -399,14 +416,20 @@ fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::As
         let mut trait_spans = trait_spans.iter();
         if let Some(span) = trait_spans.next() {
             // alloc: on the error path, once the items differ
-            diag.span_label(span.clone(), format!("expected {trait_count} {what} parameter{}", plural(trait_count)));
+            diag.span_label(
+                span.clone(),
+                format!("expected {trait_count} {what} parameter{}", plural(trait_count)),
+            );
         }
         for span in trait_spans {
             // clone: the error's span
             diag.span_label(span.clone(), "");
         }
         // alloc: on the error path, once the items differ
-        diag.span_label(first, format!("found {impl_count} {what} parameter{}", plural(impl_count)));
+        diag.span_label(
+            first,
+            format!("found {impl_count} {what} parameter{}", plural(impl_count)),
+        );
         for span in trait_impl_traits.iter().chain(&impl_traits) {
             // clone: the error's span
             diag.span_label(span.clone(), "`impl Trait` introduces an implicit type parameter");
@@ -455,7 +478,12 @@ fn parameters(n: usize) -> String {
 }
 
 /// `compare_number_of_method_arguments`: E0050.
-fn number_of_arguments(cx: &Cx<'_, '_>, trait_: hir::Trait, f: hir::Function, tf: hir::Function) -> Vec<Found> {
+fn number_of_arguments(
+    cx: &Cx<'_, '_>,
+    trait_: hir::Trait,
+    f: hir::Function,
+    tf: hir::Function,
+) -> Vec<Found> {
     let db = cx.db;
     // alloc: empty, allocates nothing
     let Some(source) = cx.vsema.source(f) else { return Vec::new() };
@@ -479,7 +507,10 @@ fn number_of_arguments(cx: &Cx<'_, '_>, trait_: hir::Trait, f: hir::Function, tf
     let mut diag = Diag::error(
         Some("E0050"),
         // alloc: on the error path, once the items differ
-        format!("method `{name}` has {} but the declaration in trait `{path}` has {trait_count}", parameters(impl_count)),
+        format!(
+            "method `{name}` has {} but the declaration in trait `{path}` has {trait_count}",
+            parameters(impl_count)
+        ),
         // clone: the error's span
         impl_span.clone(),
     );
@@ -560,12 +591,17 @@ fn impl_trait_in_trait<'db>(cx: &Cx<'_, 'db>, f: hir::Function, tf: hir::Functio
             if let Some(trait_span) = trait_return_span(cx, tf) {
                 diag.span_label(trait_span, "return type in trait");
             }
-            crate::lower::type_mismatch::note_expected_found(cx, &expected, &found, None, &mut diag);
+            crate::lower::type_mismatch::note_expected_found(
+                cx, &expected, &found, None, &mut diag,
+            );
             diag
         }
         hir::ImplTraitInTraitError::UncapturedLifetime { impl_trait, lifetime, hidden, .. } => {
-            let mut diag =
-                Diag::error(None, "return type captures more lifetimes than trait definition", span.clone());
+            let mut diag = Diag::error(
+                None,
+                "return type captures more lifetimes than trait definition",
+                span.clone(),
+            );
             // alloc: on the error path, once the items differ
             diag.span_label(span, format!("this lifetime `{lifetime}` was captured"));
             let message = "hidden type must only reference lifetimes captured by this impl trait";
@@ -589,7 +625,10 @@ fn impl_trait_in_trait<'db>(cx: &Cx<'_, 'db>, f: hir::Function, tf: hir::Functio
                 // clone: the error's span
                 span.clone(),
             );
-            diag.span_label(span, "the bounds of the trait's `impl Trait` stay ambiguous with this type");
+            diag.span_label(
+                span,
+                "the bounds of the trait's `impl Trait` stay ambiguous with this type",
+            );
             diag
         }
     };
@@ -609,7 +648,12 @@ fn input_span(cx: &Cx<'_, '_>, f: hir::Function, index: u32) -> Option<Span> {
 /// method's signature is not a subtype of the trait's with the impl's arguments, at the first
 /// place they differ, with the trait's type there, both signatures, and a suggestion to write
 /// the trait's type.
-fn signature<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Function) -> Vec<Found> {
+fn signature<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'_>,
+    f: hir::Function,
+    tf: hir::Function,
+) -> Vec<Found> {
     let db = cx.db;
     // alloc: empty, allocates nothing
     let Some(mismatch) = f.impl_signature_mismatch(db) else { return Vec::new() };
@@ -617,10 +661,9 @@ fn signature<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'_>, f: hir::Function, tf: hir::
     let Some(source) = cx.vsema.source(f) else { return Vec::new() };
     let local_trait = tf.module(db).krate(db) == cx.krate;
     let (impl_span, trait_span) = match mismatch.at {
-        hir::SignatureMismatchAt::Param(i) | hir::SignatureMismatchAt::ParamMutability(i) => (
-            input_span(cx, f, i),
-            local_trait.then(|| input_span(cx, tf, i)).flatten(),
-        ),
+        hir::SignatureMismatchAt::Param(i) | hir::SignatureMismatchAt::ParamMutability(i) => {
+            (input_span(cx, f, i), local_trait.then(|| input_span(cx, tf, i)).flatten())
+        }
         hir::SignatureMismatchAt::Return | hir::SignatureMismatchAt::ReturnMutability => {
             (return_span(cx, f), trait_return_span(cx, tf))
         }
@@ -637,7 +680,11 @@ fn signature<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'_>, f: hir::Function, tf: hir::
         impl_span.clone(),
     );
     match (&mismatch.types, mismatch.at) {
-        (_, hir::SignatureMismatchAt::ParamMutability(_) | hir::SignatureMismatchAt::ReturnMutability) => {
+        (
+            _,
+            hir::SignatureMismatchAt::ParamMutability(_)
+            | hir::SignatureMismatchAt::ReturnMutability,
+        ) => {
             // clone: the error's span
             diag.span_label(impl_span.clone(), "types differ in mutability");
         }
@@ -680,12 +727,21 @@ fn suggest_trait_type<'db>(
             let impl_self = cx.ty(&at.impl_.self_ty(db));
             let Some(expected) = mismatch.expected.params(db).into_iter().next() else { return };
             let sugg = self_receiver(cx, &expected, &impl_self);
-            let Some(param) = source.value.param_list().and_then(|it| it.self_param()) else { return };
+            let Some(param) = source.value.param_list().and_then(|it| it.self_param()) else {
+                return;
+            };
             let span = cx.span(source.with_value(param.syntax().text_range()));
-            diag.suggestion_verbose(span, "change the self-receiver type to match the trait", sugg, applicability);
+            diag.suggestion_verbose(
+                span,
+                "change the self-receiver type to match the trait",
+                sugg,
+                applicability,
+            );
         }
         hir::SignatureMismatchAt::Param(i) | hir::SignatureMismatchAt::ParamMutability(i) => {
-            let Some(expected) = mismatch.expected.params(db).into_iter().nth(i as usize) else { return };
+            let Some(expected) = mismatch.expected.params(db).into_iter().nth(i as usize) else {
+                return;
+            };
             diag.suggestion_verbose(
                 impl_span,
                 "change the parameter type to match the trait",

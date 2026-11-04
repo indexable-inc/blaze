@@ -38,7 +38,10 @@ fn db(text: &str) -> (Db, FileId) {
 
 fn setup(flags: &str) -> Setup {
     let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
-    Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() }
+    Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    }
 }
 
 /// The lints of the crate `main`, as many as were found.
@@ -95,7 +98,10 @@ fn what_an_edit_moves_is_found_where_it_moved_to() {
     let name_of = |_: FileId| Some("main.rs".to_owned());
     let lo = |db: &Db| {
         let found = check(db, krate, &setup, &name_of).expect("every file is named");
-        found.iter().map(|it| it.diagnostic.span.primary_span().map_or(0, |it| it.lo)).collect::<Vec<_>>()
+        found
+            .iter()
+            .map(|it| it.diagnostic.span.primary_span().map_or(0, |it| it.lo))
+            .collect::<Vec<_>>()
     };
     let before = lo(&db);
     assert_eq!(before.len(), 1, "`a`'s `if`s collapse; `b` has one");
@@ -109,7 +115,8 @@ fn a_crate_linted_with_syntactic_lints_only_infers_nothing() {
     // Every lint on by default that reads types is off: clippy's (pedantic and nursery warn by
     // default too, `redundant_clone` reads MIR) and blaze's general lints (`borrow_workaround`
     // infers bodies).
-    let setup = setup(&format!("{} -A blaze::general -W clippy::collapsible_if", crate::tests::CLIPPY_OFF));
+    let setup =
+        setup(&format!("{} -A blaze::general -W clippy::collapsible_if", crate::tests::CLIPPY_OFF));
     let mut found = 0;
     let executed = db.log_executed(|| found = lint(&db, &setup));
     assert_eq!(found, 1);

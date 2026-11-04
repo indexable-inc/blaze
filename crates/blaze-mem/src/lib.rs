@@ -75,9 +75,9 @@ pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};
 pub use tag::Tag;
+pub use text::{FromUtf8Error, String};
 #[cfg(unix)]
 pub use text::{OsString, PathBuf};
-pub use text::{FromUtf8Error, String};
 
 /// The size of a huge page on the machines blaze targets (x86-64's and arm64's 2 MB pages
 /// with 4 KB base pages). Every Unix reservation is aligned to it, and a region of huge pages

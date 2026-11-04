@@ -21,13 +21,13 @@ use std::fmt;
 
 use base_db::{Crate, Db, FileId};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::{Database as _, DatabaseKeyIndex, Durability, EventKind};
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, Lookup, ModuleDefId, nameres::crate_def_map,
     signatures::FunctionSignature, src::HasSource,
 };
+use std::alloc::Global;
 use syntax::{TextRange, TextSize};
 
 pub use codegen::Codegen;
@@ -139,13 +139,24 @@ impl Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{} edits, {} leaks, {} code leaks, {} volatile", self.edits, self.leaks.len(), self.code.len(), self.volatile.len())?;
+        writeln!(
+            f,
+            "{} edits, {} leaks, {} code leaks, {} volatile",
+            self.edits,
+            self.leaks.len(),
+            self.code.len(),
+            self.volatile.len()
+        )?;
         for query in &self.volatile {
             writeln!(f, "  volatile: {query}")?;
         }
         for leak in &self.leaks {
             let pass = if leak.undo { "undo of" } else { "edit of" };
-            writeln!(f, "  leak: {pass} `{}` executed {} {} (asked by {})", leak.edited, leak.query, leak.key, leak.request)?;
+            writeln!(
+                f,
+                "  leak: {pass} `{}` executed {} {} (asked by {})",
+                leak.edited, leak.query, leak.key, leak.request
+            )?;
         }
         for leak in &self.code {
             writeln!(f, "  code: {leak:?}")?;
@@ -212,7 +223,11 @@ impl Harness {
 
     /// The functions an edit can be made in, by their place and name.
     pub fn functions(&self) -> impl Iterator<Item = (usize, &str)> {
-        self.bodies.iter().enumerate().filter(|(_, it)| it.site.is_some()).map(|(at, it)| (at, it.name.as_str()))
+        self.bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.site.is_some())
+            .map(|(at, it)| (at, it.name.as_str()))
     }
 
     /// The place of the function named `name` an edit can be made in.
@@ -225,7 +240,8 @@ impl Harness {
         let mut report = Report::default();
         self.report_setup(db, &mut report);
         // alloc: tests only, the functions' places
-        let functions: Vec<usize> = self.functions().map(|(at, _)| at).step_by(stride.max(1)).collect();
+        let functions: Vec<usize> =
+            self.functions().map(|(at, _)| at).step_by(stride.max(1)).collect();
         for at in functions {
             self.edit(db, at, EDIT, &mut report)?;
         }
@@ -234,19 +250,30 @@ impl Harness {
 
     /// What the setup found: the volatile queries and the bodies no edit is made in.
     pub fn report_setup(&self, db: &Db, report: &mut Report) {
-        let mut volatile: Vec<String> =
-            self.volatile.iter().map(|key| db.storage().ingredient_name(key.ingredient_index()).to_owned()).collect(); // alloc: tests only
+        let mut volatile: Vec<String> = self
+            .volatile
+            .iter()
+            .map(|key| db.storage().ingredient_name(key.ingredient_index()).to_owned())
+            .collect(); // alloc: tests only
         volatile.sort_unstable();
         volatile.dedup();
         report.volatile = volatile;
-        report.unedited = self.bodies.iter().filter(|it| it.site.is_none()).map(|it| it.name.clone()).collect(); // alloc: clone: tests only
+        report.unedited =
+            self.bodies.iter().filter(|it| it.site.is_none()).map(|it| it.name.clone()).collect(); // alloc: clone: tests only
     }
 
     /// Inserts `text` after the `{` of function `at`'s body, asks again, undoes it and asks
     /// again, and reports what each pass did of other items.
-    pub fn edit(&mut self, db: &mut Db, at: usize, text: &str, report: &mut Report) -> Result<(), String> {
+    pub fn edit(
+        &mut self,
+        db: &mut Db,
+        at: usize,
+        text: &str,
+        report: &mut Report,
+    ) -> Result<(), String> {
         let body = &self.bodies[at];
-        let site = body.site.ok_or_else(|| format!("`{}` has no body written in a file", body.name))?; // alloc: an error
+        let site =
+            body.site.ok_or_else(|| format!("`{}` has no body written in a file", body.name))?; // alloc: an error
         // alloc: tests only, the file's text before and after the edit
         let before = db.file_text(site.vfs).text(db).as_str().to_owned();
         let offset = usize::from(site.at);
@@ -265,22 +292,30 @@ impl Harness {
         };
 
         let name = &self.bodies[at].name;
-        db.batch(base_db::Trigger::of("hir-firewall's edit of a body", name), |db| db.set_file_text(site.vfs, &edited_text));
+        db.batch(base_db::Trigger::of("hir-firewall's edit of a body", name), |db| {
+            db.set_file_text(site.vfs, &edited_text)
+        });
         let after_edit = self.pass(db, Some(at))?;
         self.judge(db, &edited, &after_edit, false, report);
         self.judge_code(db, &edited, &self.base, &after_edit, false, site.is_const, report);
 
         let name = &self.bodies[at].name;
-        db.batch(base_db::Trigger::of("hir-firewall's edit of a body undone", name), |db| db.set_file_text(site.vfs, &before));
+        db.batch(base_db::Trigger::of("hir-firewall's edit of a body undone", name), |db| {
+            db.set_file_text(site.vfs, &before)
+        });
         edited.range = site.range;
         let after_undo = self.pass(db, Some(at))?;
         self.judge(db, &edited, &after_undo, true, report);
         self.judge_code(db, &edited, &after_edit, &after_undo, true, site.is_const, report);
         let name = &self.bodies[at].name;
-        for (body, (was, is)) in self.bodies.iter().zip(self.base.codes.iter().zip(&after_undo.codes)) {
+        for (body, (was, is)) in
+            self.bodies.iter().zip(self.base.codes.iter().zip(&after_undo.codes))
+        {
             if was != is {
                 // clone: tests only, names for the report
-                report.code.push(CodeLeak::NotRestored { edited: name.clone(), body: body.name.clone() });
+                report
+                    .code
+                    .push(CodeLeak::NotRestored { edited: name.clone(), body: body.name.clone() });
             }
         }
 
@@ -384,9 +419,15 @@ impl Harness {
                     // clone: tests only, names for the report
                     report.code.push(CodeLeak::Unchanged { edited: name.clone() });
                 }
-            } else if was != is && !(is_const && !matches!(self.bodies[at].def, DefWithBodyId::FunctionId(_))) {
+            } else if was != is
+                && !(is_const && !matches!(self.bodies[at].def, DefWithBodyId::FunctionId(_)))
+            {
                 // clone: tests only, names for the report
-                report.code.push(CodeLeak::Body { edited: name.clone(), undo, body: self.bodies[at].name.clone() });
+                report.code.push(CodeLeak::Body {
+                    edited: name.clone(),
+                    undo,
+                    body: self.bodies[at].name.clone(),
+                });
             }
         }
         let (Some(was), Some(is)) = (&before.instances, &after.instances) else { return };
@@ -417,7 +458,9 @@ impl Harness {
 
     fn request_name(&self, request: Request) -> String {
         match request {
-            Request::Module(at) => format!("the item checks of module {:?}", self.modules[at as usize]), // alloc: tests only
+            Request::Module(at) => {
+                format!("the item checks of module {:?}", self.modules[at as usize])
+            } // alloc: tests only
             Request::Check(at) => format!("the check of `{}`", self.bodies[at as usize].name), // alloc: tests only
             Request::Code(at) => format!("the code hash of `{}`", self.bodies[at as usize].name), // alloc: tests only
             Request::Codegen => "codegen's walk".to_owned(), // alloc: tests only
@@ -427,7 +470,13 @@ impl Harness {
 
 /// Adds `events`' executions to `pass` and, for a body's request, the macro calls it interned
 /// first to `interned` under the body's place.
-fn record(db: &Db, events: &[blaze_query::db::Event], request: Request, pass: &mut Pass, mut body: Option<(u32, &mut Interned)>) {
+fn record(
+    db: &Db,
+    events: &[blaze_query::db::Event],
+    request: Request,
+    pass: &mut Pass,
+    mut body: Option<(u32, &mut Interned)>,
+) {
     for event in events {
         match event.kind {
             EventKind::WillExecute { database_key } => {
@@ -456,8 +505,12 @@ fn bodies(db: &Db, krate: Crate) -> Vec<Body> {
         for def in scope.declarations() {
             match def {
                 ModuleDefId::FunctionId(func) => function(db, func, &mut out),
-                ModuleDefId::ConstId(it) => out.push(Body { def: it.into(), name: format!("{it:?}"), site: None }), // alloc: tests only
-                ModuleDefId::StaticId(it) => out.push(Body { def: it.into(), name: format!("{it:?}"), site: None }), // alloc: tests only
+                ModuleDefId::ConstId(it) => {
+                    out.push(Body { def: it.into(), name: format!("{it:?}"), site: None })
+                } // alloc: tests only
+                ModuleDefId::StaticId(it) => {
+                    out.push(Body { def: it.into(), name: format!("{it:?}"), site: None })
+                } // alloc: tests only
                 ModuleDefId::TraitId(it) => {
                     for &(_, item) in it.trait_items(db).items.iter() {
                         if let AssocItemId::FunctionId(func) = item {
@@ -472,7 +525,9 @@ fn bodies(db: &Db, krate: Crate) -> Vec<Body> {
             for &(_, item) in imp.impl_items(db).items.iter() {
                 match item {
                     AssocItemId::FunctionId(func) => function(db, func, &mut out),
-                    AssocItemId::ConstId(it) => out.push(Body { def: it.into(), name: format!("{it:?}"), site: None }), // alloc: tests only
+                    AssocItemId::ConstId(it) => {
+                        out.push(Body { def: it.into(), name: format!("{it:?}"), site: None })
+                    } // alloc: tests only
                     AssocItemId::TypeAliasId(_) => {}
                 }
             }
@@ -488,7 +543,8 @@ fn function(db: &Db, func: FunctionId, out: &mut Vec<Body>) {
     let Some(body) = source.value.body() else { return };
     let signature = FunctionSignature::of(db, func);
     let name = signature.name.as_str().to_owned(); // alloc: tests only, a body's name
-    let site = match (source.file_id.file_id(), body.stmt_list().and_then(|it| it.l_curly_token())) {
+    let site = match (source.file_id.file_id(), body.stmt_list().and_then(|it| it.l_curly_token()))
+    {
         (Some(file), Some(curly)) => Some(Site {
             file: source.file_id,
             vfs: file.file_id(db),

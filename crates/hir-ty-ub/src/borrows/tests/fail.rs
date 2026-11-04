@@ -75,7 +75,8 @@ fn arg(
     len: u64,
     implicit_writes: bool,
 ) -> R<Ptr> {
-    let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells).with_implicit_writes(implicit_writes);
+    let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells)
+        .with_implicit_writes(implicit_writes);
     s.retag_with(p, &new, len)
 }
 
@@ -170,7 +171,10 @@ fn alternate_read_write() {
     s.read(y, 1).unwrap();
     let e = expect_ub(s.write(y, 1), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -244,7 +248,10 @@ fn cell_inside_struct(implicit_writes: bool) {
     // (*a).field1 = 88;
     let e = expect_ub(s.write(a, 4), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> (a) at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> (a) has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> (a) has state Frozen which forbids this child write access",
+    );
     expect_history(&e, &["the accessed tag <TAG> was created here, in the initial state Cell"]);
     expect_sites(&e, &[Some(created)]);
 }
@@ -291,7 +298,10 @@ fn error_range() {
     // rmut[5] += 1;
     let e = expect_ub(s.read(rmut.add(5), 1), ChildAccessForbidden, "read access through");
     expect_title(&e, "read access through <TAG> at ALLOC[0x5] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Disabled which forbids this child read access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Disabled which forbids this child read access",
+    );
     expect_history(
         &e,
         &[
@@ -324,7 +334,10 @@ fn fnentry_invalidation() {
     // *z = 2;
     let e = expect_ub(s.write(z, 4), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -351,7 +364,10 @@ fn frozen_lazy_write_to_surrounding() {
     // unsafe { ptr.write(0) };
     let e = expect_ub(s.write(x, 4), ChildAccessForbidden, "write access");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(&e, &["the accessed tag <TAG> was created here, in the initial state Frozen"]);
     expect_sites(&e, &[Some(created)]);
 }
@@ -387,7 +403,10 @@ fn outside_range() {
     //   *y.add(3) = 42;
     let e = expect_ub(s.write(raw.add(3), 1), ProtectedDisabled, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x3] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> is foreign to the protected tag <TAG> (i.e., it is not a child)");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> is foreign to the protected tag <TAG> (i.e., it is not a child)",
+    );
     expect_detail(
         &e,
         "this foreign write access would cause the protected tag <TAG> (currently Reserved) to become Disabled",
@@ -428,7 +447,10 @@ fn parent_read_freezes_raw_mut() {
     // *ptr = 0;
     let e = expect_ub(s.write(mref, 1), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -468,7 +490,10 @@ fn pass_invalid_mut() {
     let e = expect_ub(s.write(nope, 4), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
     expect_detail(&e, "the accessed tag <TAG> is a child of the conflicting tag <TAG>");
-    expect_detail(&e, "the conflicting tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the conflicting tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -615,7 +640,10 @@ fn reservedim_spurious_write(with: bool) {
     s.thread(2);
     let e = expect_ub(s.write(y, 1), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Disabled which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Disabled which forbids this child write access",
+    );
     match spurious {
         Some(spurious) => {
             expect_history(
@@ -684,7 +712,10 @@ fn return_invalid_mut() {
     let e = expect_ub(s.write(ret, 4), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x4] is forbidden");
     expect_detail(&e, "the accessed tag <TAG> is a child of the conflicting tag <TAG>");
-    expect_detail(&e, "the conflicting tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the conflicting tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -772,7 +803,10 @@ fn strongly_protected() {
     //       the drop of `_x`: `<Box<i32> as Drop>::drop` frees through the `Box`'s pointer
     let e = expect_ub(s.free(dropped, 4), ProtectedDealloc, "deallocation through");
     expect_title(&e, "deallocation through <TAG> at ALLOC[0x0] is forbidden");
-    expect_detail(&e, "the allocation of the accessed tag <TAG> also contains the strongly protected tag <TAG>");
+    expect_detail(
+        &e,
+        "the allocation of the accessed tag <TAG> also contains the strongly protected tag <TAG>",
+    );
     expect_detail(&e, "the strongly protected tag <TAG> disallows deallocations");
     expect_history(
         &e,
@@ -808,7 +842,10 @@ fn subtree_traversal_skipping_diagnostics() {
     let e = expect_ub(s.write(m, 1), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
     expect_detail(&e, "the accessed tag <TAG> is a child of the conflicting tag <TAG>");
-    expect_detail(&e, "the conflicting tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the conflicting tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -969,7 +1006,10 @@ Warning: this tree is indicative only. Some tags may have been hidden.
     /// The error both programs end with: the write through `y` would disable `callee:x`.
     #[track_caller]
     fn expect_protected_write_error(e: &AliasError, accessed: SiteId, protected: SiteId) {
-        expect_title(e, "write access through <TAG> (y, callee:y, caller:y) at ALLOC[0x0] is forbidden");
+        expect_title(
+            e,
+            "write access through <TAG> (y, callee:y, caller:y) at ALLOC[0x0] is forbidden",
+        );
         expect_detail(
             e,
             "the accessed tag <TAG> (y, callee:y, caller:y) is foreign to the protected tag <TAG> (callee:x) (i.e., it is not a child)",
@@ -1056,7 +1096,10 @@ mod implicit_writes {
         // let _oof = *z;
         let e = expect_ub(s.read(z, 4), ChildAccessForbidden, "read access through");
         expect_title(&e, "read access through <TAG> at ALLOC[0x0] is forbidden");
-        expect_detail(&e, "the accessed tag <TAG> has state Disabled which forbids this child read access");
+        expect_detail(
+            &e,
+            "the accessed tag <TAG> has state Disabled which forbids this child read access",
+        );
         expect_history(
             &e,
             &[
@@ -1071,11 +1114,21 @@ mod implicit_writes {
     /// The error the three `ptr_write` programs end with: the read through `y` would disable
     /// the `Unique` protected argument `x`.
     #[track_caller]
-    fn expect_ptr_write_error(e: &AliasError, accessed_name: &str, accessed: SiteId, protected: SiteId) {
-        expect_title(e, &format!("read access through <TAG>{accessed_name} at ALLOC[0x0] is forbidden"));
+    fn expect_ptr_write_error(
+        e: &AliasError,
+        accessed_name: &str,
+        accessed: SiteId,
+        protected: SiteId,
+    ) {
+        expect_title(
+            e,
+            &format!("read access through <TAG>{accessed_name} at ALLOC[0x0] is forbidden"),
+        );
         expect_detail(
             e,
-            &format!("the accessed tag <TAG>{accessed_name} is foreign to the protected tag <TAG> (i.e., it is not a child)"),
+            &format!(
+                "the accessed tag <TAG>{accessed_name} is foreign to the protected tag <TAG> (i.e., it is not a child)"
+            ),
         );
         expect_detail(
             e,

@@ -13,11 +13,12 @@
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 use blaze_live::patch::{
-    ARCH_AARCH64, ARCH_X86_64, CodeRef, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, PatchRef, hash,
+    ARCH_AARCH64, ARCH_X86_64, CodeRef, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION,
+    Descriptor, Message, PatchRef, hash,
 };
 
-use crate::arena::FrameVec;
 use crate::Format;
+use crate::arena::FrameVec;
 use crate::model::Class;
 use crate::stage::{Content, Stage, error};
 use crate::state::{PieceId, State, What};
@@ -29,35 +30,42 @@ use crate::symbols::SymKey;
 const EH_FRAME_END: [u8; 4] = [0; 4];
 
 /// The descriptor of the live image `bytes`, read back from the file as
-/// [`Stage::fill_descriptor`] wrote it, its `id` the image's lineage ([`crate::Image::lineage`]): the descriptor at the
-/// address the image exports [`DESCRIPTOR`] at, by the name the image's format spells it (a
-/// Mach-O symbol gains an underscore), decoded at that address's place in the file. What a
-/// daemon that did not link an image names it by in a restart message, and its `generation`
-/// the one a program of the file starts at. A file with no such
-/// export, or a descriptor that does not decode, is an error naming what is missing.
+/// [`Stage::fill_descriptor`] wrote it: the descriptor at the address the image exports
+/// [`DESCRIPTOR`] at, by the name the image's format spells it (a Mach-O symbol gains an
+/// underscore), decoded at that address's place in the file. Its `id` is the image's lineage
+/// ([`crate::Image::lineage`]), what a daemon that did not link the image names it by in a
+/// restart message, and its `generation` the one a program of the file starts at. A file with
+/// no such export, or a descriptor that does not decode, is an error naming what is missing.
 pub fn descriptor_of(bytes: &[u8]) -> Result<Descriptor, String> {
     use object::{Object, ObjectSegment};
-    let file = object::File::parse(bytes).map_err(|it| format!("reading the image's headers: {it}"))?;
+    let file =
+        object::File::parse(bytes).map_err(|it| format!("reading the image's headers: {it}"))?;
     let (prefix, name) = match file.format() {
         object::BinaryFormat::MachO => crate::macho::spelled(DESCRIPTOR),
         _ => ("", DESCRIPTOR),
     };
     let named = |it: &[u8]| {
-        it.len() == prefix.len() + name.len() && it.starts_with(prefix.as_bytes()) && it.ends_with(name.as_bytes())
+        it.len() == prefix.len() + name.len()
+            && it.starts_with(prefix.as_bytes())
+            && it.ends_with(name.as_bytes())
     };
     let exports = file.exports().map_err(|it| format!("reading the image's exports: {it}"))?;
     let at = exports
         .iter()
         .find(|it| named(it.name()))
         .map(|it| it.address())
-        .ok_or_else(|| format!("the image exports no {DESCRIPTOR}: it was not linked as a live image"))?;
+        .ok_or_else(|| {
+            format!("the image exports no {DESCRIPTOR}: it was not linked as a live image")
+        })?;
     let place = file.segments().find_map(|segment| {
         let (offset, len) = segment.file_range();
         let start = segment.address();
-        let within = at.checked_sub(start).filter(|it| it.saturating_add(Descriptor::SIZE as u64) <= len)?;
+        let within =
+            at.checked_sub(start).filter(|it| it.saturating_add(Descriptor::SIZE as u64) <= len)?;
         Some(offset + within)
     });
-    let place = place.ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} is in no segment's bytes of the file"))?;
+    let place = place
+        .ok_or_else(|| format!("{DESCRIPTOR} at {at:#x} is in no segment's bytes of the file"))?;
     usize::try_from(place)
         .ok()
         .and_then(|place| bytes.get(place..)?.get(..Descriptor::SIZE))
@@ -118,14 +126,18 @@ impl Stage<'_> {
         let old = &self.old.resolved.imports;
         if let Some(new) = self.new.resolved.imports.get(old.len()..).and_then(|it| it.first()) {
             // alloc: a restart's reason, which the message carries: once per message
-            return restart(format!("it imports `{}`, which the loader binds only at start", new.name));
+            return restart(format!(
+                "it imports `{}`, which the loader binds only at start",
+                new.name
+            ));
         }
         if self.old.tls != self.new.tls || self.old.tls_at != self.new.tls_at {
             // alloc: a restart's reason, which the message carries: once per message
             return restart("its thread-local storage changed".to_owned());
         }
         let arena = self.arena;
-        let home = |key: SymKey| self.symbols.find(key).and_then(|it| self.new.home(it)).map(|it| it.0);
+        let home =
+            |key: SymKey| self.symbols.find(key).and_then(|it| self.new.home(it)).map(|it| it.0);
         let (cells, descriptor) = (home(SymKey::Cells), home(SymKey::Descriptor));
         let mut ids = Vec::with_capacity_in(self.write.len(), arena);
         ids.extend(self.write.iter());
@@ -144,9 +156,16 @@ impl Stage<'_> {
             } else {
                 continue;
             };
-            let name = self.new.resolved.imports.get(at as usize).map_or("(an import the image does not list)", |it| &*it.name);
+            let name = self
+                .new
+                .resolved
+                .imports
+                .get(at as usize)
+                .map_or("(an import the image does not list)", |it| &*it.name);
             // alloc: a restart's reason, which the message carries: once per message
-            return restart(format!("the GOT cell of the import `{name}` {how}, and the loader fills it only at start"));
+            return restart(format!(
+                "the GOT cell of the import `{name}` {how}, and the loader fills it only at start"
+            ));
         }
         let mut code: FrameVec<'_, CodeRef<'_>> = Vec::with_capacity_in(ids.len(), arena);
         let mut data: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
@@ -164,7 +183,9 @@ impl Stage<'_> {
             }
             if Some(id) == cells {
                 let mut dirty = Vec::with_capacity_in(self.dirty_cells.len(), arena);
-                dirty.extend(self.dirty_cells.iter().filter(|slot| u64::from(*slot) * 8 + 8 <= piece.size));
+                dirty.extend(
+                    self.dirty_cells.iter().filter(|slot| u64::from(*slot) * 8 + 8 <= piece.size),
+                );
                 dirty.sort_unstable();
                 slots.reserve(dirty.len());
                 for slot in dirty {
@@ -190,7 +211,12 @@ impl Stage<'_> {
                     // alloc: the function's name, once per function the patch changes, for the
                     // program's refusal of code that differs; the list borrows the arena's copy
                     let name: &str = arena.alloc_str(&self.symbols.describe(piece.sym));
-                    code.push(CodeRef { at: piece.addr, len: bytes.len() as u64, hash: hash(bytes), name });
+                    code.push(CodeRef {
+                        at: piece.addr,
+                        len: bytes.len() as u64,
+                        hash: hash(bytes),
+                        name,
+                    });
                 }
                 Class::PatchData
                 | Class::EhFrame
@@ -226,7 +252,10 @@ impl Stage<'_> {
                     in_eh_frame |= space.region.class == Class::EhFrame;
                 }
                 What::Function(_) => {
-                    let unwind = piece.function().and_then(|it| it.windows).and_then(|it| self.new.home(it.0));
+                    let unwind = piece
+                        .function()
+                        .and_then(|it| it.windows)
+                        .and_then(|it| self.new.home(it.0));
                     if let Some((at, offset)) = unwind {
                         let addr = self.new.piece(at).map_or(0, |it| it.addr) + offset;
                         windows.push((piece.addr, piece.addr + piece.size, addr));
@@ -251,7 +280,10 @@ impl Stage<'_> {
             let region = &self.new.spaces[space].region;
             if region.size + 4 > region.capacity {
                 // alloc: a restart's reason, which the message carries: once per message
-                return restart(format!("its call frame information fills its region ({} bytes)", region.capacity));
+                return restart(format!(
+                    "its call frame information fills its region ({} bytes)",
+                    region.capacity
+                ));
             }
             data.push((region.addr + region.size, &EH_FRAME_END));
         }

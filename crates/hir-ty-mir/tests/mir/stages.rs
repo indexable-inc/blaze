@@ -4,6 +4,7 @@
 
 use blaze_alloc_count::assert_at_most;
 use hir_def::HasModule;
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{HirDatabase, InternedCoroutineId},
@@ -13,7 +14,6 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use rustc_type_ir::inherent::IntoKind;
-use hir_expand::fixture;
 
 use crate::{db::TestDB, function};
 
@@ -93,7 +93,9 @@ fn named_monomorphized<'db>(
 ) -> Kept<'db> {
     use MirOwner as O;
     match (stage, owner) {
-        (MirStage::Built, O::Body(it)) => providers::monomorphized_mir_body_query(db, it, subst, env),
+        (MirStage::Built, O::Body(it)) => {
+            providers::monomorphized_mir_body_query(db, it, subst, env)
+        }
         (MirStage::Built, O::Closure(it)) => {
             providers::monomorphized_mir_body_for_closure_query(db, it, subst, env)
         }

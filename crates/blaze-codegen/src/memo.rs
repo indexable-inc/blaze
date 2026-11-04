@@ -20,9 +20,9 @@
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::{marker::PhantomData, ptr};
 
+use blaze_cas::Key;
 #[cfg(blaze_check)]
 use blaze_check::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use blaze_cas::Key;
 use blaze_ids::ContentId;
 
 use crate::{backend::Shape, flight::Flights, template::Template};
@@ -110,7 +110,12 @@ impl Memo {
         // alloc: a level, made once for the memo's life (at most `LEVELS`), on a put that spills
         let made: Box<Level> = (0..slots(n)).map(|_| AtomicPtr::new(ptr::null_mut())).collect();
         let made = Box::into_raw(made) as *mut AtomicPtr<Entry>;
-        match self.levels[n].compare_exchange(ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
+        match self.levels[n].compare_exchange(
+            ptr::null_mut(),
+            made,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => {}
             // SAFETY: the CAS failed, so `made` (the `Box` of `slots(n)` slots leaked just
             // above) was never published and no other thread can have it: this is its only
@@ -197,7 +202,12 @@ impl Memo {
                     }
                     continue;
                 }
-                match slot.compare_exchange(ptr::null_mut(), ours, Ordering::AcqRel, Ordering::Acquire) {
+                match slot.compare_exchange(
+                    ptr::null_mut(),
+                    ours,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => {
                         self.len.fetch_add(1, Ordering::Relaxed);
                         // SAFETY: `ours` is the live entry this CAS just published; from here
@@ -367,7 +377,8 @@ mod tests {
         }
         let missing = crowded(u8::MAX);
         let found = blaze_alloc_count::assert_at_most(0, "a memo lookup", || {
-            (0..(PROBES * 2) as u8).all(|n| memo.get(&crowded(n)).is_some()) && memo.get(&missing).is_none()
+            (0..(PROBES * 2) as u8).all(|n| memo.get(&crowded(n)).is_some())
+                && memo.get(&missing).is_none()
         });
         assert!(found);
     }
@@ -417,7 +428,10 @@ mod tests {
                 scope.spawn(move || {
                     for it in shapes {
                         let kept = memo.put_id(*it, template(worker));
-                        assert_eq!(memo.get(it).unwrap() as *const Template, kept as *const Template);
+                        assert_eq!(
+                            memo.get(it).unwrap() as *const Template,
+                            kept as *const Template
+                        );
                     }
                 });
             }

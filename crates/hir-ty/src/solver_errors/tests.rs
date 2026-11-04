@@ -1,7 +1,7 @@
 use base_db::Db;
 use hir_def::{ImplId, nameres::crate_def_map, signatures::TraitSignature};
-use rustc_type_ir::{BoundConstness, TypingMode};
 use hir_expand::fixture;
+use rustc_type_ir::{BoundConstness, TypingMode};
 
 use super::non_const_impl;
 use crate::{

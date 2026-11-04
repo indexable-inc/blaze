@@ -29,16 +29,11 @@ pub(crate) fn derive_enum_generator(input: &DeriveInput, data: &syn::DataEnum) -
         .into();
     }
 
-    let GenericsParts {
-        gen_params,
-        param_uses,
-        type_param_idents,
-        user_predicates,
-        ty_generics,
-    } = match split_generics(&input.generics) {
-        Ok(parts) => parts,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let GenericsParts { gen_params, param_uses, type_param_idents, user_predicates, ty_generics } =
+        match split_generics(&input.generics) {
+            Ok(parts) => parts,
+            Err(err) => return err.to_compile_error().into(),
+        };
     let self_ty = quote! { #enum_name #ty_generics };
     let gen_params = if gen_params.is_empty() {
         quote! {}
@@ -58,21 +53,15 @@ pub(crate) fn derive_enum_generator(input: &DeriveInput, data: &syn::DataEnum) -
     };
 
     let variants: Vec<_> = data.variants.iter().collect();
-    let data_variants: Vec<_> = variants
-        .iter()
-        .filter(|v| !matches!(v.fields, Fields::Unit))
-        .collect();
+    let data_variants: Vec<_> =
+        variants.iter().filter(|v| !matches!(v.fields, Fields::Unit)).collect();
 
     let field_names: Vec<syn::Ident> = {
         let method_strs: Vec<String> = data_variants
             .iter()
             .map(|v| {
                 let snake = pascal_to_snake(&v.ident.to_string());
-                if is_valid_method_name(&snake) {
-                    snake
-                } else {
-                    format!("{}_", snake)
-                }
+                if is_valid_method_name(&snake) { snake } else { format!("{}_", snake) }
             })
             .collect();
         // A tuple variant also gets a `<name>_with` builder, so its
@@ -94,14 +83,8 @@ pub(crate) fn derive_enum_generator(input: &DeriveInput, data: &syn::DataEnum) -
                 let with_name = format!("{name}_with");
                 let own_with = usize::from(matches!(v.fields, Fields::Unnamed(_)));
                 let collides = counts[name.as_str()] > 1
-                    || counts
-                        .get(with_name.as_str())
-                        .is_some_and(|&n| n > own_with);
-                if collides {
-                    v.ident.clone()
-                } else {
-                    make_method_ident(name, v.ident.span())
-                }
+                    || counts.get(with_name.as_str()).is_some_and(|&n| n > own_with);
+                if collides { v.ident.clone() } else { make_method_ident(name, v.ident.span()) }
             })
             .collect()
     };
@@ -127,10 +110,8 @@ pub(crate) fn derive_enum_generator(input: &DeriveInput, data: &syn::DataEnum) -
         .map(|variant| format_ident!("{}{}Generator", enum_name, variant.ident))
         .collect();
 
-    let variant_params: Vec<syn::Ident> = data_variants
-        .iter()
-        .map(|variant| format_ident!("__V{}", variant.ident))
-        .collect();
+    let variant_params: Vec<syn::Ident> =
+        data_variants.iter().map(|variant| format_ident!("__V{}", variant.ident)).collect();
 
     let variant_param_decls: Vec<_> = variant_params
         .iter()
@@ -541,11 +522,8 @@ fn generate_variant_generator(
     let (field_idents, construction_shape): (Vec<syn::Ident>, _) = match &variant.fields {
         Fields::Unit => return quote! {},
         Fields::Named(fields) => {
-            let field_names: Vec<syn::Ident> = fields
-                .named
-                .iter()
-                .map(|f| f.ident.as_ref().unwrap().clone())
-                .collect();
+            let field_names: Vec<syn::Ident> =
+                fields.named.iter().map(|f| f.ident.as_ref().unwrap().clone()).collect();
             for field_name in &field_names {
                 if *field_name == "new"
                     || *field_name == "boxed"
@@ -567,27 +545,19 @@ fn generate_variant_generator(
             (field_names, true)
         }
         Fields::Unnamed(fields) => {
-            let field_indices: Vec<syn::Ident> = (0..fields.unnamed.len())
-                .map(|i| format_ident!("_{}", i))
-                .collect();
+            let field_indices: Vec<syn::Ident> =
+                (0..fields.unnamed.len()).map(|i| format_ident!("_{}", i)).collect();
             (field_indices, false)
         }
     };
 
     let field_types = variant_field_types(variant);
-    let mut generator_params: Vec<syn::Ident> = field_idents
-        .iter()
-        .map(|ident| generator_param_ident(&ident.to_string()))
-        .collect();
+    let mut generator_params: Vec<syn::Ident> =
+        field_idents.iter().map(|ident| generator_param_ident(&ident.to_string())).collect();
     {
         let mut seen = std::collections::HashSet::new();
-        if generator_params
-            .iter()
-            .any(|param| !seen.insert(param.to_string()))
-        {
-            generator_params = (0..field_idents.len())
-                .map(|i| format_ident!("__G{}", i))
-                .collect();
+        if generator_params.iter().any(|param| !seen.insert(param.to_string())) {
+            generator_params = (0..field_idents.len()).map(|i| format_ident!("__G{}", i)).collect();
         }
     }
 
@@ -664,9 +634,8 @@ fn generate_variant_generator(
                 quote! { #ident: __tc.draw_silent(&self.#ident) }
             })
             .collect();
-        let print_idents: Vec<_> = (0..field_idents.len())
-            .map(|i| format_ident!("__field{i}"))
-            .collect();
+        let print_idents: Vec<_> =
+            (0..field_idents.len()).map(|i| format_ident!("__field{i}")).collect();
         let print_actions: Vec<_> = print_idents
             .iter()
             .zip(field_idents.iter())
@@ -688,9 +657,8 @@ fn generate_variant_generator(
                 quote! { __tc.draw_silent(&self.#ident) }
             })
             .collect();
-        let print_idents: Vec<_> = (0..field_idents.len())
-            .map(|i| format_ident!("__field{i}"))
-            .collect();
+        let print_idents: Vec<_> =
+            (0..field_idents.len()).map(|i| format_ident!("__field{i}")).collect();
         let print_actions: Vec<_> = print_idents
             .iter()
             .zip(field_idents.iter())

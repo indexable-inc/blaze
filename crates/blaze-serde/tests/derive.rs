@@ -106,9 +106,17 @@ struct Fields {
 
 #[test]
 fn field_attributes_rename_default_skip_and_skip_serializing_if() {
-    let full = Fields { kind: "k".into(), count: 2, seven: 8, cache: Vec::new(), sparse: 3, maybe: Some("m".into()) };
+    let full = Fields {
+        kind: "k".into(),
+        count: 2,
+        seven: 8,
+        cache: Vec::new(),
+        sparse: 3,
+        maybe: Some("m".into()),
+    };
     round_trip(&full, r#"{"type":"k","count":2,"seven":8,"sparse":3,"maybe":"m"}"#);
-    let sparse = Fields { kind: "k".into(), count: 0, seven: 7, cache: Vec::new(), sparse: 0, maybe: None };
+    let sparse =
+        Fields { kind: "k".into(), count: 0, seven: 7, cache: Vec::new(), sparse: 0, maybe: None };
     round_trip(&sparse, r#"{"type":"k","count":0,"seven":7}"#);
     let read: Fields = serde_json::from_str(r#"{"type":"k","cache":[1,2]}"#).unwrap();
     assert_eq!(read, sparse, "a missing field takes its default; a skipped one is never read");
@@ -144,9 +152,15 @@ struct Paged {
 #[test]
 fn a_container_default_fills_each_missing_field() {
     round_trip(&Defaulted { a: 1, b: "b".into() }, r#"{"a":1,"b":"b"}"#);
-    assert_eq!(serde_json::from_str::<Defaulted>(r#"{"a":1}"#).unwrap(), Defaulted { a: 1, b: "five".into() });
+    assert_eq!(
+        serde_json::from_str::<Defaulted>(r#"{"a":1}"#).unwrap(),
+        Defaulted { a: 1, b: "five".into() }
+    );
     assert_eq!(serde_json::from_str::<Defaulted>("{}").unwrap(), Defaulted::default());
-    assert_eq!(serde_json::from_str::<Paged>(r#"{"count":3}"#).unwrap(), Paged { size: 4096, count: 3 });
+    assert_eq!(
+        serde_json::from_str::<Paged>(r#"{"count":3}"#).unwrap(),
+        Paged { size: 4096, count: 3 }
+    );
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -194,7 +208,10 @@ fn rename_all_renames_as_serde_does() {
     round_trip(&Lower::Second, r#""second""#);
     round_trip(&Snake::FirstVariant, r#""first_variant""#);
     round_trip(&Snake::HTTPServer, r#""h_t_t_p_server""#);
-    round_trip(&KebabEnum::FirstVariant { inner_field: 1 }, r#"{"first-variant":{"inner_field":1}}"#);
+    round_trip(
+        &KebabEnum::FirstVariant { inner_field: 1 },
+        r#"{"first-variant":{"inner_field":1}}"#,
+    );
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -212,7 +229,10 @@ fn unit_newtype_and_tuple_structs_round_trip() {
     round_trip(&Newtype(9), "9");
     round_trip(&Tuple(1, "a".into(), 0), r#"[1,"a"]"#);
     let said = json_error::<Tuple>("[1]");
-    assert!(said.starts_with("invalid length 1, expected tuple struct Tuple with 2 elements"), "{said}");
+    assert!(
+        said.starts_with("invalid length 1, expected tuple struct Tuple with 2 elements"),
+        "{said}"
+    );
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -245,7 +265,10 @@ where
 
 #[test]
 fn generic_structs_bound_their_parameters() {
-    round_trip(&Generic::<u8, 3> { items: vec![1, 2, 3], extra: 4, width: PhantomData }, r#"{"items":[1,2,3],"extra":4}"#);
+    round_trip(
+        &Generic::<u8, 3> { items: vec![1, 2, 3], extra: 4, width: PhantomData },
+        r#"{"items":[1,2,3],"extra":4}"#,
+    );
     round_trip(&Bounded { value: String::from("v") }, r#"{"value":"v"}"#);
     round_trip(&Bounded::<u8> { value: 3 }, r#"{"value":3}"#);
 }
@@ -275,7 +298,13 @@ fn lies_in(part: &[u8], whole: &[u8]) -> bool {
 /// input lends: each points into the input's bytes.
 #[test]
 fn borrowed_fields_point_into_the_input() {
-    let value = Borrowed { text: "t", bytes: b"by", cow: Cow::Borrowed("c"), cow_bytes: Cow::Borrowed(b"cb"), owned: "o".into() };
+    let value = Borrowed {
+        text: "t",
+        bytes: b"by",
+        cow: Cow::Borrowed("c"),
+        cow_bytes: Cow::Borrowed(b"cb"),
+        owned: "o".into(),
+    };
     let cbor = blaze_protocol::cbor::to_vec(&value).unwrap();
     let read: Borrowed<'_, '_> = blaze_protocol::cbor::from_slice(&cbor).unwrap();
     assert_eq!(read, value);
@@ -288,7 +317,10 @@ fn borrowed_fields_point_into_the_input() {
         cow: Cow<'a, str>,
     }
     let read: Text<'_> = serde_json::from_str(r#"{"cow":"c\n"}"#).unwrap();
-    assert!(matches!(read.cow, Cow::Owned(ref it) if it == "c\n"), "an escaped string is owned: {read:?}");
+    assert!(
+        matches!(read.cow, Cow::Owned(ref it) if it == "c\n"),
+        "an escaped string is owned: {read:?}"
+    );
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -296,7 +328,11 @@ enum External {
     Unit,
     Newtype(u8),
     Tuple(u8, String),
-    Struct { a: u8, #[serde(default)] b: u8 },
+    Struct {
+        a: u8,
+        #[serde(default)]
+        b: u8,
+    },
     Empty {},
 }
 
@@ -307,9 +343,17 @@ fn an_externally_tagged_enum_round_trips_every_variant_kind() {
     round_trip(&External::Tuple(1, "t".into()), r#"{"Tuple":[1,"t"]}"#);
     round_trip(&External::Struct { a: 1, b: 2 }, r#"{"Struct":{"a":1,"b":2}}"#);
     round_trip(&External::Empty {}, r#"{"Empty":{}}"#);
-    assert_eq!(serde_json::from_str::<External>(r#"{"Struct":{"a":1}}"#).unwrap(), External::Struct { a: 1, b: 0 });
+    assert_eq!(
+        serde_json::from_str::<External>(r#"{"Struct":{"a":1}}"#).unwrap(),
+        External::Struct { a: 1, b: 0 }
+    );
     let said = json_error::<External>(r#""Nope""#);
-    assert!(said.starts_with("unknown variant `Nope`, expected one of `Unit`, `Newtype`, `Tuple`, `Struct`, `Empty`"), "{said}");
+    assert!(
+        said.starts_with(
+            "unknown variant `Nope`, expected one of `Unit`, `Newtype`, `Tuple`, `Struct`, `Empty`"
+        ),
+        "{said}"
+    );
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -322,7 +366,11 @@ struct Inner {
 enum Internal {
     UnitOne,
     Wraps(Inner),
-    Holds { y: u8, #[serde(default)] z: Option<u8> },
+    Holds {
+        y: u8,
+        #[serde(default)]
+        z: Option<u8>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -334,7 +382,10 @@ fn an_internally_tagged_enum_puts_its_tag_among_the_fields() {
     round_trip(&Internal::Holds { y: 2, z: Some(3) }, r#"{"kind":"holds","y":2,"z":3}"#);
     let read: Internal = serde_json::from_str(r#"{"y":2,"kind":"holds"}"#).unwrap();
     assert_eq!(read, Internal::Holds { y: 2, z: None }, "the tag need not come first");
-    assert_eq!(serde_json::from_str::<Internal>(r#"{"kind":"later","q":1}"#).unwrap(), Internal::Unknown);
+    assert_eq!(
+        serde_json::from_str::<Internal>(r#"{"kind":"later","q":1}"#).unwrap(),
+        Internal::Unknown
+    );
     let said = json_error::<Internal>(r#"{"y":2}"#);
     assert!(said.starts_with("missing field `kind`"), "{said}");
 }
@@ -433,7 +484,10 @@ enum WithInVariant {
 
 #[test]
 fn with_serialize_with_and_deserialize_with_route_through_the_functions() {
-    round_trip(&With { pair: (1, 2), half: 3, missing: 0, plain: 'c' }, r#"{"pair":[1,2],"half":6,"missing":0,"plain":"c"}"#);
+    round_trip(
+        &With { pair: (1, 2), half: 3, missing: 0, plain: 'c' },
+        r#"{"pair":[1,2],"half":6,"missing":0,"plain":"c"}"#,
+    );
     let read: With<char> = serde_json::from_str(r#"{"pair":[1,2],"half":6,"plain":"c"}"#).unwrap();
     assert_eq!(read.missing, 0);
     round_trip(&WithInVariant::V((4, 5)), r#"{"V":[4,5]}"#);

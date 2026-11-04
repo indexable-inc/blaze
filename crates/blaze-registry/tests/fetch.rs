@@ -11,17 +11,17 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
     download::{From, checksum, crate_url, unpack_package_in},
-    pinned::crate_pin,
     http::{Http, Response},
     index::Status,
+    pinned::crate_pin,
 };
 use blaze_source::SourceId;
 use parking_lot::Mutex;
 use semver::{Version, VersionReq};
+use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 

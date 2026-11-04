@@ -10,9 +10,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// on a coroutine of the body are kept, not reported (rustc's `coroutine_stalled_predicates`).
     pub(super) fn report_ambiguity_errors(&mut self) {
         let (mut errors, pending, stalled) = self.table.take_ambiguity_errors();
-        self.coroutine_stalled.extend(
-            stalled.into_iter().map(|it| (it.cause.span(), it.predicate.store())),
-        );
+        self.coroutine_stalled
+            .extend(stalled.into_iter().map(|it| (it.cause.span(), it.predicate.store())));
         let tainted = self.tainted_by_errors();
         if !tainted {
             errors.extend(pending);

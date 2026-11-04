@@ -20,14 +20,6 @@ pub mod official;
 ))]
 pub mod servil;
 
-#[cfg(all(
-    target_endian = "little",
-    any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
-    ),
-))]
-use servil as backend;
 #[cfg(not(all(
     target_endian = "little",
     any(
@@ -36,6 +28,14 @@ use servil as backend;
     ),
 )))]
 use official as backend;
+#[cfg(all(
+    target_endian = "little",
+    any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+    ),
+))]
+use servil as backend;
 
 #[cfg(all(
     test,

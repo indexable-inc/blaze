@@ -89,7 +89,10 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0601`.
 "#;
-    assert_eq!(ui_bin("imported_main_const_forbidden.rs", "imported_main_const_forbidden", "2015", source), stderr);
+    assert_eq!(
+        ui_bin("imported_main_const_forbidden.rs", "imported_main_const_forbidden", "2015", source),
+        stderr
+    );
 }
 
 #[test]
@@ -101,12 +104,7 @@ fn a_crate_configured_out_has_no_main() {
         "//- /std.rs crate:std edition:2015 library\npub mod prelude {{ pub mod rust_2015 {{}} }}\n\
          //- /cfg-in-crate-1.rs crate:bin:cfg_in_crate_1 edition:2015 deps:std\n{source}"
     );
-    assert_reports(
-        &super::ui_fixture(&fixture),
-        &[
-            error(1, &["`cfg_in_crate_1`", "`main`"]),
-        ],
-    );
+    assert_reports(&super::ui_fixture(&fixture), &[error(1, &["`cfg_in_crate_1`", "`main`"])]);
 }
 
 #[test]
@@ -129,5 +127,8 @@ LL |     fn main();
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_bin("extern-main-issue-86110.rs", "extern_main_issue_86110", "2015", source), stderr);
+    assert_eq!(
+        ui_bin("extern-main-issue-86110.rs", "extern_main_issue_86110", "2015", source),
+        stderr
+    );
 }

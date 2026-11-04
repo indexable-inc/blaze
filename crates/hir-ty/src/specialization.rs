@@ -1,11 +1,11 @@
 //! Impl specialization related things
 
 use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
     HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
     signatures::ImplSignature, unstable_features::UnstableFeatures,
 };
-use blaze_mem::Frame;
 use rustc_type_ir::{
     AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
     TypeVisitor,
@@ -355,10 +355,7 @@ pub fn impl_unconstrained_params(db: &Db, impl_id: ImplId) -> Vec<TypeOrConstPar
     })
 }
 
-fn type_or_const_params(
-    db: &Db,
-    impl_id: ImplId,
-) -> impl Iterator<Item = TypeOrConstParamId> + '_ {
+fn type_or_const_params(db: &Db, impl_id: ImplId) -> impl Iterator<Item = TypeOrConstParamId> + '_ {
     GenericParams::of(db, impl_id.into())
         .iter_type_or_consts()
         .map(move |(local_id, _)| TypeOrConstParamId { parent: impl_id.into(), local_id })

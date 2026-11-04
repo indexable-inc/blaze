@@ -15,15 +15,15 @@ use std::{borrow::Borrow, cell::RefCell, mem, ops::Index};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use blaze_mem::Kept;
-use std::alloc::Global;
 use blaze_ids::radix;
+use blaze_mem::Kept;
 use cfg::CfgExpr;
 use either::Either;
 use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::Arena;
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
+use std::alloc::Global;
 use syntax::{AstPtr, SyntaxNodePtr, ast};
 use thin_vec::ThinVec;
 
@@ -329,25 +329,55 @@ pub enum MissingBodyItemKind {
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub enum ExpressionStoreDiagnostics {
-    InactiveCode { node: InFile<SyntaxNodePtr>, cfg: CfgExpr },
-    UnresolvedMacroCall { node: InFile<MacroCallPtr>, path: ModPath },
-    UnreachableLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
-    AwaitOutsideOfAsync { node: InFile<AstPtr<ast::AwaitExpr>>, location: String },
-    UndeclaredLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
-    PatternArgInExternFn { node: InFile<AstPtr<ast::Pat>> },
-    FruInDestructuringAssignment { node: InFile<AstPtr<ast::Expr>> },
-    MissingBody { node: InFile<SyntaxNodePtr>, kind: MissingBodyItemKind },
+    InactiveCode {
+        node: InFile<SyntaxNodePtr>,
+        cfg: CfgExpr,
+    },
+    UnresolvedMacroCall {
+        node: InFile<MacroCallPtr>,
+        path: ModPath,
+    },
+    UnreachableLabel {
+        node: InFile<AstPtr<ast::Lifetime>>,
+        name: Name,
+    },
+    AwaitOutsideOfAsync {
+        node: InFile<AstPtr<ast::AwaitExpr>>,
+        location: String,
+    },
+    UndeclaredLabel {
+        node: InFile<AstPtr<ast::Lifetime>>,
+        name: Name,
+    },
+    PatternArgInExternFn {
+        node: InFile<AstPtr<ast::Pat>>,
+    },
+    FruInDestructuringAssignment {
+        node: InFile<AstPtr<ast::Expr>>,
+    },
+    MissingBody {
+        node: InFile<SyntaxNodePtr>,
+        kind: MissingBodyItemKind,
+    },
     /// An integer literal whose digits do not fit `u128`, lowered as `0`: rustc's
     /// `LitError::IntTooLarge`, reported by `rustc_ast_lowering`'s `lower_lit` (so only for
     /// code cfg keeps), whose `LitKind::Err` taints the body.
-    IntLiteralTooLarge { node: InFile<AstPtr<ast::Literal>> },
+    IntLiteralTooLarge {
+        node: InFile<AstPtr<ast::Literal>>,
+    },
     /// `for const`, `x.[f]` or a bounded type parameter of a where predicate's `for<..>` binder
     /// in a crate without `#![feature(blaze_comptime)]`: an expression lowers to `Missing`, a
     /// binder parameter is not recorded.
-    ComptimeWithoutFeature { node: InFile<SyntaxNodePtr>, form: ComptimeForm },
+    ComptimeWithoutFeature {
+        node: InFile<SyntaxNodePtr>,
+        form: ComptimeForm,
+    },
     /// A specification clause (`requires`, `ensures`, `invariant`, ..) or a named return type
     /// (docs/v2/plan/lanes/verus.md) lowering refuses, for `why`: the clause is not lowered.
-    VerifyRefused { node: InFile<SyntaxNodePtr>, why: VerifyRefusal },
+    VerifyRefused {
+        node: InFile<SyntaxNodePtr>,
+        why: VerifyRefusal,
+    },
 }
 
 /// Why lowering refused a `blaze_verify` clause or named return type.
@@ -1365,7 +1395,9 @@ impl ExpressionStoreBuilder {
                 }
                 packing.hygiene.extend(ident_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
                 packing.hygiene.sort_unstable_by_key(|&(id, _)| id);
-                packing.field_hygiene.extend(field_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
+                packing
+                    .field_hygiene
+                    .extend(field_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
                 packing.field_hygiene.sort_unstable_by_key(|&(id, _)| id);
                 packing.editions.extend(block_editions.iter().map(|(&id, &edition)| (id, edition)));
                 radix::sort_copy_by_key_in(
@@ -1418,8 +1450,8 @@ impl ExpressionStoreBuilder {
         };
         let lifetimes = exact_arena(&scratch.lifetimes);
         // alloc: the column's one exact copy, only for a store with macro-expanded types.
-        let type_hygiene = (!scratch.type_hygiene.is_empty())
-            .then(|| Box::<[_]>::from(&scratch.type_hygiene[..]));
+        let type_hygiene =
+            (!scratch.type_hygiene.is_empty()).then(|| Box::<[_]>::from(&scratch.type_hygiene[..]));
         // alloc: the column's one exact copy, only for a store that met a macro call.
         let macro_calls = ThinVec::from_iter(scratch.macro_calls.iter().copied());
         scratch.give();
@@ -1492,8 +1524,12 @@ impl ExpressionStore {
     /// made in a `const`. Empty columns allocate nothing.
     #[inline]
     pub fn empty() -> &'static ExpressionStore {
-        #[expect(clippy::disallowed_types, reason = "the process's one empty expression store: callers share a static empty value")]
-        static EMPTY: std::sync::LazyLock<ExpressionStore> = std::sync::LazyLock::new(ExpressionStore::empty_owned);
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the process's one empty expression store: callers share a static empty value"
+        )]
+        static EMPTY: std::sync::LazyLock<ExpressionStore> =
+            std::sync::LazyLock::new(ExpressionStore::empty_owned);
         &EMPTY
     }
 
@@ -1640,10 +1676,7 @@ impl ExpressionStore {
     }
 
     /// Returns an iterator over all block expressions in this store that define inner items.
-    pub fn blocks<'a>(
-        &'a self,
-        db: &'a Db,
-    ) -> impl Iterator<Item = (BlockId, &'a DefMap)> + 'a {
+    pub fn blocks<'a>(&'a self, db: &'a Db) -> impl Iterator<Item = (BlockId, &'a DefMap)> + 'a {
         self.expr_only
             .as_ref()
             .map(|it| &*it.block_scopes)
@@ -1731,7 +1764,9 @@ impl ExpressionStore {
         // Do not use `..` patterns or field accesses here, only destructuring, to ensure we cover all cases
         // (we've had multiple bugs with this in the past).
         match self.expr(expr_id) {
-            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => visitor.on_type(*container),
+            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => {
+                visitor.on_type(*container)
+            }
             Expr::Path(path) => visitor.on_path(path),
             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
             Expr::InlineAsm(InlineAsm { operands, .. }) => {
@@ -2368,7 +2403,8 @@ mod scratch_tests {
         assert_eq!(builder.exprs_since(outer), &[missing], "the inner list is gone");
         builder.push_list_expr(tuple_expr);
         let lists = builder.take_lists();
-        let call = builder.alloc_expr(Expr::Call { callee: missing, args: lists.exprs_since(outer) });
+        let call =
+            builder.alloc_expr(Expr::Call { callee: missing, args: lists.exprs_since(outer) });
         builder.put_lists(lists, outer);
         let wild = builder.alloc_pat(Pat::Wild);
         for at in [shift, shift + 1, shift] {
@@ -2458,7 +2494,10 @@ mod scratch_tests {
         };
         drop(lowered());
         let ((store, _), used) = measure(lowered);
-        assert_eq!(used.allocations, 4, "a store of 4 blocks from the global heap, the rest `Kept`");
+        assert_eq!(
+            used.allocations, 4,
+            "a store of 4 blocks from the global heap, the rest `Kept`"
+        );
         let only = store.expr_only.as_deref().expect("a store with expressions");
         assert!(only.columns.arms.in_slab(), "match arms are in the column slab");
         assert!(only.block_editions.in_slab() && only.binding_owners.in_slab());
@@ -2612,7 +2651,9 @@ mod scratch_tests {
             statements.iter().collect::<Vec<_>>(),
             [first, Statement::Item(Item::Other), tail_stmt]
         );
-        let Expr::Block { statements, tail, .. } = store.expr(inner_block) else { panic!("a block") };
+        let Expr::Block { statements, tail, .. } = store.expr(inner_block) else {
+            panic!("a block")
+        };
         assert_eq!((statements.iter().collect::<Vec<_>>(), tail), (vec![inner_let], Some(missing)));
         let columns = store.hir_columns().unwrap();
         assert_eq!(columns.statement_count(), 4, "each block's run, and no stack rows");

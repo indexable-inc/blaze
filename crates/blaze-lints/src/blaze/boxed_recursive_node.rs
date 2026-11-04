@@ -25,12 +25,18 @@ fn std_is(db: &base_db::Db, adt: hir::Adt, name: &str) -> bool {
 }
 
 /// The link `ty` is to `node`, as the message names it, when it is one of the module docs'.
-fn link(db: &base_db::Db, ty: &hir::Type<'_>, node: hir::Adt, vec_box: bool) -> Option<&'static str> {
+fn link(
+    db: &base_db::Db,
+    ty: &hir::Type<'_>,
+    node: hir::Adt,
+    vec_box: bool,
+) -> Option<&'static str> {
     let adt = ty.as_adt()?;
     let arg = || ty.type_arguments().next();
     let is_node = |it: &hir::Type<'_>| it.as_adt() == Some(node);
     let boxed = |it: &hir::Type<'_>| {
-        it.as_adt().is_some_and(|b| std_is(db, b, "Box")) && it.type_arguments().next().is_some_and(|t| is_node(&t))
+        it.as_adt().is_some_and(|b| std_is(db, b, "Box"))
+            && it.type_arguments().next().is_some_and(|t| is_node(&t))
     };
     let shared = |it: &hir::Type<'_>| {
         it.as_adt().is_some_and(|rc| std_is(db, rc, "Rc"))
@@ -61,7 +67,10 @@ fn link(db: &base_db::Db, ty: &hir::Type<'_>, node: hir::Adt, vec_box: bool) -> 
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Adt<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -85,7 +94,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Adt<'t>) {
         hir::Adt::Union(_) => return,
     };
     let vec_box = cx.on(Implemented::VecBox);
-    let Some((field, kind)) = fields.iter().find_map(|f| link(db, &f.ty(db), adt, vec_box).map(|k| (*f, k))) else {
+    let Some((field, kind)) =
+        fields.iter().find_map(|f| link(db, &f.ty(db), adt, vec_box).map(|k| (*f, k)))
+    else {
         return;
     };
     let name = item.name().map_or(item.syntax(), |it| it.syntax());

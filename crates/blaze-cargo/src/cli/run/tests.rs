@@ -8,7 +8,13 @@ use crate::cli::args::Flags;
 
 /// An artifact of package `package` at `/w/<package>`, of a target `kind` named `name`; an
 /// executable under `target/debug` when `exe`.
-pub(crate) fn artifact(package: &str, kind: &str, name: &str, test: bool, exe: Option<&str>) -> Artifact {
+pub(crate) fn artifact(
+    package: &str,
+    kind: &str,
+    name: &str,
+    test: bool,
+    exe: Option<&str>,
+) -> Artifact {
     let src_path = match kind {
         "lib" => format!("/w/{package}/src/lib.rs"),
         "bin" if name == package => format!("/w/{package}/src/main.rs"),
@@ -28,7 +34,10 @@ pub(crate) fn artifact(package: &str, kind: &str, name: &str, test: bool, exe: O
         doctest: kind == "lib",
         test: true,
     };
-    let path = exe.map_or_else(|| format!("/w/target/debug/lib{name}.rlib"), |it| format!("/w/target/debug/{it}"));
+    let path = exe.map_or_else(
+        || format!("/w/target/debug/lib{name}.rlib"),
+        |it| format!("/w/target/debug/{it}"),
+    );
     Artifact {
         package: format!("path+file:///w/{package}#0.1.0"),
         kind: if test { ArtifactKind::Test } else { ArtifactKind::named(kind).unwrap() },
@@ -60,13 +69,19 @@ fn flags(bins: &[Option<&str>], examples: &[Option<&str>]) -> Flags {
 
 #[test]
 fn the_only_bin_is_run() {
-    let built = [artifact("foo", "lib", "foo", false, None), artifact("foo", "bin", "foo", false, Some("foo"))];
+    let built = [
+        artifact("foo", "lib", "foo", false, None),
+        artifact("foo", "bin", "foo", false, Some("foo")),
+    ];
     assert_eq!(pick(&built, &flags(&[], &[])).unwrap().target.name, "foo");
 }
 
 #[test]
 fn a_bin_by_name() {
-    let built = [artifact("foo", "bin", "foo", false, Some("foo")), artifact("foo", "bin", "tool", false, Some("tool"))];
+    let built = [
+        artifact("foo", "bin", "foo", false, Some("foo")),
+        artifact("foo", "bin", "tool", false, Some("tool")),
+    ];
     assert_eq!(pick(&built, &flags(&[Some("tool")], &[])).unwrap().target.name, "tool");
     let examples = [artifact("foo", "example", "demo", false, Some("examples/demo"))];
     assert_eq!(pick(&examples, &flags(&[], &[Some("demo")])).unwrap().target.name, "demo");
@@ -75,13 +90,19 @@ fn a_bin_by_name() {
 #[test]
 fn default_run_is_the_one_the_daemon_built() {
     // `default-run = "tool"`: cargo's `commands/run.rs` builds that bin alone.
-    let built = [artifact("foo", "lib", "foo", false, None), artifact("foo", "bin", "tool", false, Some("tool"))];
+    let built = [
+        artifact("foo", "lib", "foo", false, None),
+        artifact("foo", "bin", "tool", false, Some("tool")),
+    ];
     assert_eq!(pick(&built, &flags(&[], &[])).unwrap().target.name, "tool");
 }
 
 #[test]
 fn two_bins_are_cargos_error() {
-    let built = [artifact("foo", "bin", "foo", false, Some("foo")), artifact("foo", "bin", "bar", false, Some("bar"))];
+    let built = [
+        artifact("foo", "bin", "foo", false, Some("foo")),
+        artifact("foo", "bin", "bar", false, Some("bar")),
+    ];
     assert_eq!(
         pick(&built, &flags(&[], &[])).unwrap_err(),
         "`cargo run` could not determine which binary to run. Use the `--bin` option to specify a \
@@ -97,7 +118,10 @@ fn two_bins_are_cargos_error() {
 #[test]
 fn no_bin_and_a_library_example() {
     let lib = [artifact("foo", "lib", "foo", false, None)];
-    assert_eq!(pick(&lib, &flags(&[], &[])).unwrap_err(), "a bin target must be available for `cargo run`");
+    assert_eq!(
+        pick(&lib, &flags(&[], &[])).unwrap_err(),
+        "a bin target must be available for `cargo run`"
+    );
     let example = [artifact("foo", "example", "plugin", false, None)];
     assert_eq!(
         pick(&example, &flags(&[], &[Some("plugin")])).unwrap_err(),
@@ -110,9 +134,18 @@ fn no_bin_and_a_library_example() {
 
 #[test]
 fn the_program_as_cargo_shows_and_runs_it() {
-    assert_eq!(shown_exe(Path::new("/w/target/debug/foo"), Path::new("/w")), Path::new("target/debug/foo"));
-    assert_eq!(shown_exe(Path::new("/w/target/debug/foo"), Path::new("/w/target/debug")), Path::new("./foo"));
-    assert_eq!(shown_exe(Path::new("/w/target/debug/foo"), Path::new("/elsewhere")), Path::new("/w/target/debug/foo"));
+    assert_eq!(
+        shown_exe(Path::new("/w/target/debug/foo"), Path::new("/w")),
+        Path::new("target/debug/foo")
+    );
+    assert_eq!(
+        shown_exe(Path::new("/w/target/debug/foo"), Path::new("/w/target/debug")),
+        Path::new("./foo")
+    );
+    assert_eq!(
+        shown_exe(Path::new("/w/target/debug/foo"), Path::new("/elsewhere")),
+        Path::new("/w/target/debug/foo")
+    );
 
     let foo = artifact("foo", "bin", "foo", false, Some("foo"));
     let args = [OsString::from("a"), OsString::from("b c")];
@@ -123,7 +156,10 @@ fn the_program_as_cargo_shows_and_runs_it() {
     let exec = planned(&foo, &args, Path::new("/w")).unwrap();
     assert_eq!(exec.shown(), "`target/debug/foo a 'b c'`");
 
-    let runner = Artifact { runner: vec!["qemu-aarch64".to_owned(), "-L".to_owned(), "/sysroot".to_owned()], ..foo };
+    let runner = Artifact {
+        runner: vec!["qemu-aarch64".to_owned(), "-L".to_owned(), "/sysroot".to_owned()],
+        ..foo
+    };
     let exec = planned(&runner, &args, Path::new("/w")).unwrap();
     assert_eq!(exec.shown(), "`qemu-aarch64 -L /sysroot target/debug/foo a 'b c'`");
 }
@@ -148,7 +184,11 @@ fn a_cause_of_lines_indented_as_cargos_indented_lines() {
 #[test]
 fn an_error_with_its_cause() {
     assert_eq!(
-        caused("could not execute process `target/debug/foo` (never executed)", &["No such file or directory (os error 2)".to_owned()], false),
+        caused(
+            "could not execute process `target/debug/foo` (never executed)",
+            &["No such file or directory (os error 2)".to_owned()],
+            false
+        ),
         "error: could not execute process `target/debug/foo` (never executed)\n\nCaused by:\n  No such file or directory (os error 2)\n"
     );
 }

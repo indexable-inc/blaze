@@ -46,7 +46,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::YieldOutsideCoroutine) -> Vec<Foun
         code_fact(cx, &mut diag, at);
         found.push(Found::new(diag, Phase::Lower));
     }
-    let mut diag = Diag::error(Some("E0627"), "yield expression outside of coroutine literal", span);
+    let mut diag =
+        Diag::error(Some("E0627"), "yield expression outside of coroutine literal", span);
     code_fact(cx, &mut diag, at);
     found.push(Found::new(diag, Phase::Bodies));
     found
@@ -89,10 +90,13 @@ fn is_body(node: ast::Node<'_>, child: ast::Node<'_>) -> bool {
         return it.body().is_some_and(|body| body.syntax() == child);
     }
     if let Some(it) = ast::BlockExpr::cast(node) {
-        return it.async_token().is_some() || it.gen_token().is_some() || it.const_token().is_some();
+        return it.async_token().is_some()
+            || it.gen_token().is_some()
+            || it.const_token().is_some();
     }
     if let Some(it) = ast::ArrayExpr::cast(node) {
-        return it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == child);
+        return it.semicolon_token().is_some()
+            && it.exprs().nth(1).is_some_and(|len| len.syntax() == child);
     }
     ast::ConstArg::can_cast(node.kind()) || is_item(node.kind())
 }
@@ -175,7 +179,10 @@ fn main() {}
                 first += usize::from(fast);
             }
             assert!(compared >= 8, "each `yield` has a body: {compared}");
-            assert!(first >= 5 && first < compared, "some `yield`s are first and some are not: {first}");
+            assert!(
+                first >= 5 && first < compared,
+                "some `yield`s are first and some are not: {first}"
+            );
         });
     }
 }

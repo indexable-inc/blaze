@@ -56,7 +56,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, record: ast::RecordExpr<'t>) {
         .filter_map(|field| match field.name_ref() {
             Some(name) => Some(name.text().trim_start_matches("r#").to_owned()),
             // Shorthand, `Config { a, ..base }`: the field is the path's name.
-            None => field.expr().map(|it| cx.source_of(it.syntax()).trim_start_matches("r#").to_owned()),
+            None => {
+                field.expr().map(|it| cx.source_of(it.syntax()).trim_start_matches("r#").to_owned())
+            }
         })
         .collect();
     // alloc: the names of the fields taken, for the message and the fix
@@ -72,7 +74,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, record: ast::RecordExpr<'t>) {
     let name = strukt.name(db).display(db, edition).to_string();
     let base = list.spread();
     let base_text = base.map(|it| cx.source_of(it.syntax()).into_owned());
-    let mut shown = taken.iter().take(NAMED).map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ");
+    let mut shown =
+        taken.iter().take(NAMED).map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ");
     if taken.len() > NAMED {
         shown.push_str(&format!(" and {} more", taken.len() - NAMED));
     }
@@ -87,7 +90,11 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, record: ast::RecordExpr<'t>) {
     let place = base.filter(|&it| cx.in_file() && is_place(cx, it, PLACE_DEPTH));
     let fix = place.zip(base_text.as_deref()).map(|(it, text)| {
         let at = TextRange::new(dotdot.text_range().start(), it.syntax().text_range().end());
-        let fields = taken.iter().map(|field| format!("{field}: {text}.{field}")).collect::<Vec<_>>().join(", ");
+        let fields = taken
+            .iter()
+            .map(|field| format!("{field}: {text}.{field}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         (cx.span(at), fields)
     });
     let span = match cx.in_file() {
@@ -104,7 +111,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, record: ast::RecordExpr<'t>) {
     match fix {
         Some(part) => {
             diagnostic.multipart_suggestion(
-                format!("write out the fields taken from `{}`", base_text.as_deref().unwrap_or_default()),
+                format!(
+                    "write out the fields taken from `{}`",
+                    base_text.as_deref().unwrap_or_default()
+                ),
                 // alloc: the fix's one part
                 vec![part],
                 Applicability::MachineApplicable,
@@ -117,9 +127,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, record: ast::RecordExpr<'t>) {
             ));
         }
     }
-    diagnostic
-        .help(LINT.help())
-        .help(format!("for further information visit {}", LINT.docs_url()));
+    diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
 }
 
 /// Whether `expr` is a place with no side effect: a local (`self` included), or a field or a

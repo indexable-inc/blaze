@@ -33,7 +33,9 @@ use crate::{
 pub mod kinds {
     use blaze_query::QueryKind;
 
-    pub use crate::nameres::kinds::{FACT_HANDLE, MACRO_STEP, MODULE_DECLS, MODULE_IMPLS, RESOLVER, SCC_STATE};
+    pub use crate::nameres::kinds::{
+        FACT_HANDLE, MACRO_STEP, MODULE_DECLS, MODULE_IMPLS, RESOLVER, SCC_STATE,
+    };
 
     // hir-def's resolver: the numbers of `hir_def::nameres::kinds`
     // (`crates/hir-def/src/nameres/facts/kinds.rs`) that name an expansion round.
@@ -86,8 +88,12 @@ pub mod kinds {
         INHERENT_IMPLS_IN_CRATE_FOR_SELF_TY,
     ];
     /// The tables of a whole crate, or of each of its modules, that a sliced query must not read.
-    pub const WHOLE: [QueryKind; 4] =
-        [TRAIT_IMPLS_FOR_CRATE, TRAIT_IMPLS_FOR_CRATE_AND_DEPS, INHERENT_IMPLS_FOR_CRATE, MODULE_IMPLS];
+    pub const WHOLE: [QueryKind; 4] = [
+        TRAIT_IMPLS_FOR_CRATE,
+        TRAIT_IMPLS_FOR_CRATE_AND_DEPS,
+        INHERENT_IMPLS_FOR_CRATE,
+        MODULE_IMPLS,
+    ];
 }
 
 /// How many keys of a kind may rerun after an edit.
@@ -246,9 +252,10 @@ pub enum Finding {
 impl Finding {
     pub fn side(&self) -> Side {
         match self {
-            Finding::Reran { .. } | Finding::Coarse { .. } | Finding::Unexplained { .. } | Finding::Needless { .. } => {
-                Side::Over
-            }
+            Finding::Reran { .. }
+            | Finding::Coarse { .. }
+            | Finding::Unexplained { .. }
+            | Finding::Needless { .. } => Side::Over,
             Finding::Unrecorded { .. } => Side::Unmeasured,
         }
     }
@@ -288,9 +295,16 @@ fn index<C: Columns>(c: &C, key: &QueryKey) -> Option<usize> {
 /// what they did before. Each counted kind's keys are read once, `after`'s sliced keys once, and
 /// `after`'s reruns are joined once against `before`, found a bitset word at a time. Owned traces
 /// and [`crate::wire::View`]s of mapped files are read alike, so a check copies no column.
-pub fn check<A: Columns, B: Columns>(case: &Case, touched: Touched, before: &A, after: &B) -> Vec<Finding> {
+pub fn check<A: Columns, B: Columns>(
+    case: &Case,
+    touched: Touched,
+    before: &A,
+    after: &B,
+) -> Vec<Finding> {
     let watched = |kind: QueryKind| {
-        kinds::RESOLVER.contains(&kind.0) || kinds::SLICED.contains(&kind) || case.bounds.iter().any(|b| b.kind == kind)
+        kinds::RESOLVER.contains(&kind.0)
+            || kinds::SLICED.contains(&kind)
+            || case.bounds.iter().any(|b| b.kind == kind)
     };
     // alloc: the answer, once a check of an edit; unallocated while nothing is found.
     let mut found = Vec::new();
@@ -333,7 +347,8 @@ pub fn check<A: Columns, B: Columns>(case: &Case, touched: Touched, before: &A, 
         let Some(j) = join::index_from(before, &mut cursor, &query) else { continue };
         let Some(was) = result(before, j) else { continue };
         let changed = before.edges_of(j).any(|e| {
-            index(after, &before.key(before.read(e) as usize)).and_then(|r| result(after, r)) != Some(before.saw(e))
+            index(after, &before.key(before.read(e) as usize)).and_then(|r| result(after, r))
+                != Some(before.saw(e))
         });
         if !changed {
             found.push(Finding::Unexplained { query });
@@ -374,7 +389,8 @@ mod tests {
     fn trace(rows: &[Row]) -> Trace {
         let mut trace = TraceBuilder::default();
         for r in rows {
-            let edges: Vec<Edge> = r.reads.iter().map(|&(read, saw)| Edge { read, saw: Fingerprint(saw) }).collect();
+            let edges: Vec<Edge> =
+                r.reads.iter().map(|&(read, saw)| Edge { read, saw: Fingerprint(saw) }).collect();
             trace.insert(r.key, Fingerprint(r.fp), &edges, r.ran);
         }
         trace.finish()
@@ -392,7 +408,8 @@ mod tests {
     fn impl_traces(extra: Vec<Row>) -> (Vec<Row>, Vec<Row>) {
         let (f, g) = (key(FILE, "src/lib.rs"), key(FILE, "src/other.rs"));
         let (decls_m, decls_other) = (key(MODULE_DECLS, "m"), key(MODULE_DECLS, "other"));
-        let (t1, t2) = (key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T1"), key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T2"));
+        let (t1, t2) =
+            (key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T1"), key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T2"));
         let bucket = key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT_AND_SELF_TY, "T1 S");
         let before = vec![
             row(f, 1, &[], true),
@@ -437,7 +454,13 @@ mod tests {
         keys.sort();
         assert_eq!(
             found,
-            vec![Finding::Reran { what: SLICES, kind: TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, reran: 2, most: 1, keys }]
+            vec![Finding::Reran {
+                what: SLICES,
+                kind: TRAIT_IMPLS_IN_CRATE_FOR_TRAIT,
+                reran: 2,
+                most: 1,
+                keys
+            }]
         );
         assert_eq!(found[0].side(), Side::Over);
         assert_eq!(
@@ -450,8 +473,11 @@ mod tests {
     #[test]
     fn a_slice_that_reads_the_crate_s_table_is_coarse() {
         let (before, mut after) = impl_traces(Vec::new());
-        let (t1, table, decls_m) =
-            (key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T1"), key(TRAIT_IMPLS_FOR_CRATE, "crate"), key(MODULE_DECLS, "m"));
+        let (t1, table, decls_m) = (
+            key(TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, "T1"),
+            key(TRAIT_IMPLS_FOR_CRATE, "crate"),
+            key(MODULE_DECLS, "m"),
+        );
         let at = after.iter().position(|r| r.key == t1).unwrap();
         after[at] = row(t1, 21, &[(table, 50)], true);
         after.push(row(table, 50, &[(decls_m, 11)], true));
@@ -466,7 +492,8 @@ mod tests {
         let scc = key(SCC_STATE, "m@0");
         let (mut before, after) = impl_traces(vec![row(scc, 41, &[(decls_m, 11)], true)]);
         before.push(row(scc, 40, &[(decls_m, 10)], true));
-        let want = Finding::Reran { what: ROUND, kind: SCC_STATE, reran: 1, most: 0, keys: vec![scc] };
+        let want =
+            Finding::Reran { what: ROUND, kind: SCC_STATE, reran: 1, most: 0, keys: vec![scc] };
         for case in CASES {
             let found = check(case, ONE, &trace(&before), &trace(&after));
             assert!(found.contains(&want), "{}: {found:?}", case.edit);
@@ -480,7 +507,13 @@ mod tests {
         let at = after.iter().position(|r| r.key == decls_other).unwrap();
         after[at].ran = true;
         let found = check_of("item", ONE, &before, &after);
-        assert_eq!(found, vec![Finding::Unexplained { query: decls_other }, Finding::Needless { query: decls_other }]);
+        assert_eq!(
+            found,
+            vec![
+                Finding::Unexplained { query: decls_other },
+                Finding::Needless { query: decls_other }
+            ]
+        );
         assert!(found.iter().all(|f| f.side() == Side::Over));
     }
 
@@ -524,16 +557,29 @@ mod tests {
         let before = [row(f, 1, &[], true), row(decls, 10, &[(f, 1)], true)];
         let after = [row(f, 2, &[], true), row(decls, 11, &[(f, 2)], true)];
         let found = check_of("impl", ONE, &before, &after);
-        assert_eq!(found, vec![Finding::Unrecorded { what: SLICES, kind: TRAIT_IMPLS_IN_CRATE_FOR_TRAIT }]);
+        assert_eq!(
+            found,
+            vec![Finding::Unrecorded { what: SLICES, kind: TRAIT_IMPLS_IN_CRATE_FOR_TRAIT }]
+        );
         assert_eq!(found[0].side(), Side::Unmeasured);
-        assert_eq!(check_of("item", ONE, &before, &after), vec![], "an item edit measures by the declarations");
+        assert_eq!(
+            check_of("item", ONE, &before, &after),
+            vec![],
+            "an item edit measures by the declarations"
+        );
     }
 
     #[test]
     fn every_edit_kind_of_the_harness_has_one_case() {
-        let edits =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../harness/v2/dbsp/edits.py")).unwrap();
-        let line = edits.lines().find(|l| l.starts_with("KINDS = (")).expect("edits.py has `KINDS = (...)`");
+        let edits = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../harness/v2/dbsp/edits.py"
+        ))
+        .unwrap();
+        let line = edits
+            .lines()
+            .find(|l| l.starts_with("KINDS = ("))
+            .expect("edits.py has `KINDS = (...)`");
         let named: std::collections::BTreeSet<&str> = line.split('"').skip(1).step_by(2).collect();
         let cased: std::collections::BTreeSet<&str> = CASES.iter().map(|c| c.edit).collect();
         assert_eq!(named, cased);
@@ -546,7 +592,8 @@ mod tests {
     /// results changed, dropped or rerun after the edit, so every finding comes up.
     fn seeded_pair(seed: u64, keys: u64) -> (Trace, Trace) {
         let mut rng = Rng::new(seed);
-        let all: Vec<QueryKind> = ROUNDS.iter().chain(&SLICED).chain(&WHOLE).copied().chain([MODULE_DECLS]).collect();
+        let all: Vec<QueryKind> =
+            ROUNDS.iter().chain(&SLICED).chain(&WHOLE).copied().chain([MODULE_DECLS]).collect();
         let key = |n: u64| QueryKey {
             kind: all[(n % all.len() as u64) as usize],
             input: ContentId::of("blaze v2 proof dbsp seeded 1", &n.to_le_bytes()),
@@ -557,7 +604,10 @@ mod tests {
                 (0..rng.below(5)).map(|_| (rng.below(keys), u128::from(rng.below(3)))).collect();
             let fp = u128::from(rng.below(3));
             let edges = |shift: u128| -> Vec<Edge> {
-                reads.iter().map(|&(r, saw)| Edge { read: key(r), saw: Fingerprint(saw + shift) }).collect()
+                reads
+                    .iter()
+                    .map(|&(r, saw)| Edge { read: key(r), saw: Fingerprint(saw + shift) })
+                    .collect()
             };
             if rng.below(6) != 0 {
                 before.insert(key(n), Fingerprint(fp), &edges(0), true);
@@ -584,10 +634,16 @@ mod tests {
                 for touched in [Touched::default(), ONE, Touched { traits: 5, buckets: 9 }] {
                     let want = check(case, touched, &before, &after);
                     assert_eq!(check(case, touched, &b, &a), want, "seed {seed}, {}", case.edit);
-                    assert_eq!(check(case, touched, &before, &a), want, "seed {seed}, {} mixed", case.edit);
+                    assert_eq!(
+                        check(case, touched, &before, &a),
+                        want,
+                        "seed {seed}, {} mixed",
+                        case.edit
+                    );
                 }
             }
-            let walked: Vec<usize> = (0..after.keys.len()).filter(|&i| after.ran(i) && after.has(i)).collect();
+            let walked: Vec<usize> =
+                (0..after.keys.len()).filter(|&i| after.ran(i) && after.has(i)).collect();
             assert_eq!(join::ran_results(&after).collect::<Vec<_>>(), walked, "seed {seed}");
             assert_eq!(join::ran_results(&a).collect::<Vec<_>>(), walked, "seed {seed} in place");
         }
@@ -597,21 +653,27 @@ mod tests {
     /// nothing.
     #[test]
     fn a_check_of_a_build_that_reran_nothing_allocates_nothing() {
-        let kinds =
-            [MODULE_DECLS, TRAIT_IMPLS_IN_CRATE_FOR_TRAIT, TRAIT_IMPLS_IN_CRATE_FOR_TRAIT_AND_SELF_TY, SCC_STATE];
+        let kinds = [
+            MODULE_DECLS,
+            TRAIT_IMPLS_IN_CRATE_FOR_TRAIT,
+            TRAIT_IMPLS_IN_CRATE_FOR_TRAIT_AND_SELF_TY,
+            SCC_STATE,
+        ];
         let key = |n: u64| key(kinds[(n % 4) as usize], &n.to_string());
         let mut rows = Vec::new();
         for n in 0..400u64 {
             // Only declarations are read, so no slice reads a whole table.
-            let reads: Vec<(QueryKey, u128)> = (0..n % 3).map(|r| (key((n / 4 + r) * 4), 1)).collect();
+            let reads: Vec<(QueryKey, u128)> =
+                (0..n % 3).map(|r| (key((n / 4 + r) * 4), 1)).collect();
             rows.push(row(key(n), 1, &reads, false));
         }
         let settled = trace(&rows);
         let bytes = blaze_protocol::cbor::to_vec(&settled).unwrap();
         let view = View::parse(&bytes).unwrap();
         for case in CASES {
-            let found =
-                blaze_alloc_count::assert_at_most(0, "a dbsp check, nothing reran", || check(case, ONE, &view, &view));
+            let found = blaze_alloc_count::assert_at_most(0, "a dbsp check, nothing reran", || {
+                check(case, ONE, &view, &view)
+            });
             assert_eq!(found, vec![], "{}", case.edit);
         }
     }
@@ -626,7 +688,9 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());
-        assert!(ROUNDS.iter().chain([&MODULE_DECLS, &MODULE_IMPLS]).all(|k| RESOLVER.contains(&k.0)));
+        assert!(
+            ROUNDS.iter().chain([&MODULE_DECLS, &MODULE_IMPLS]).all(|k| RESOLVER.contains(&k.0))
+        );
         for k in SLICED.iter().chain(&WHOLE[..3]) {
             assert!(blaze_query::kinds::FRONT.contains(&k.0) && !RESOLVER.contains(&k.0), "{k:?}");
         }

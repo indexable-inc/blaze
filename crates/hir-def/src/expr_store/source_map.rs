@@ -17,10 +17,10 @@ use std::{
 };
 
 use blaze_ids::radix;
+use blaze_query::db::AsId;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
-use blaze_query::db::AsId;
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view};
 
 use crate::{
@@ -376,7 +376,8 @@ impl<T, N: AstNode> BackMap<T, N> {
     /// The pointer of `slot`, whose kind is `kind` (not [`NO_SOURCE`]).
     #[inline]
     fn ptr(&self, slot: usize, kind: u16) -> AstPtr<N> {
-        let range = TextRange::new(TextSize::from(self.starts[slot]), TextSize::from(self.ends[slot]));
+        let range =
+            TextRange::new(TextSize::from(self.starts[slot]), TextSize::from(self.ends[slot]));
         let raw = SyntaxNodePtr::from_parts(SyntaxKind::from(kind), range);
         AstPtr::try_from_raw(raw).expect("a kind of the pointer's type, as it was made or checked")
     }
@@ -943,7 +944,10 @@ impl MoveTo<'_> {
 }
 
 impl Move<'_> {
-    pub(in crate::expr_store) fn ptr<N: AstNode>(&self, src: InFile<AstPtr<N>>) -> InFile<AstPtr<N>> {
+    pub(in crate::expr_store) fn ptr<N: AstNode>(
+        &self,
+        src: InFile<AstPtr<N>>,
+    ) -> InFile<AstPtr<N>> {
         if src.file_id != self.file {
             return src;
         }
@@ -1305,11 +1309,11 @@ mod view_tests;
 
 #[cfg(test)]
 pub(in crate::expr_store) mod tests {
-    use blaze_ids::rng::SplitMix64;
     use blaze_hash::HashMap;
-    use std::alloc::Global;
+    use blaze_ids::rng::SplitMix64;
     use blaze_query::db::FromId;
     use smallvec::SmallVec;
+    use std::alloc::Global;
     use syntax::{SyntaxKind, TextSize};
 
     use super::*;
@@ -1473,11 +1477,7 @@ pub(in crate::expr_store) mod tests {
 
     /// Checks `map` against `pushes` for an arena of `len`: each id, the order of `iter`, and
     /// that the runs are canonical.
-    fn assert_back_map_is(
-        map: &ExprBackMap,
-        pushes: &[(ExprId, ExprOrPatSource)],
-        len: u32,
-    ) {
+    fn assert_back_map_is(map: &ExprBackMap, pushes: &[(ExprId, ExprOrPatSource)], len: u32) {
         assert_eq!(map.len(), len as usize);
         for id in (0..len + 3).map(idx::<Expr<'static>>) {
             assert_eq!(map.get(id), last_push(pushes, id), "the last push for {id:?}");
@@ -1485,10 +1485,16 @@ pub(in crate::expr_store) mod tests {
         let model: Vec<_> =
             (0..len).map(idx).filter_map(|id| Some((id, last_push(pushes, id)?))).collect();
         assert_eq!(map.iter().collect::<Vec<_>>(), model, "every id with syntax, by id");
-        assert!(map.run_files.windows(2).all(|pair| pair[0] != pair[1]), "a run per change of file");
+        assert!(
+            map.run_files.windows(2).all(|pair| pair[0] != pair[1]),
+            "a run per change of file"
+        );
         assert_eq!(map.run_starts.first().copied(), (!model.is_empty()).then_some(0));
         for (run, &start) in map.run_starts.iter().enumerate().skip(1) {
-            assert_ne!(map.kinds[start as usize], NO_SOURCE, "run {run} starts at an id with syntax");
+            assert_ne!(
+                map.kinds[start as usize], NO_SOURCE,
+                "run {run} starts at an id with syntax"
+            );
         }
         for (slot, &kind) in map.kinds.iter().enumerate() {
             if kind == NO_SOURCE {
@@ -1663,8 +1669,7 @@ pub(in crate::expr_store) mod tests {
             (types[2], src(0, true, SyntaxKind::TUPLE_TYPE, 4, 6)),
         ];
         let lifetime_back = [(lifetimes[1], src(0, false, SyntaxKind::LIFETIME, 33, 35))];
-        let binding_pats =
-            [(bindings[0], pats[0]), (bindings[2], pats[3]), (bindings[0], pats[1])];
+        let binding_pats = [(bindings[0], pats[0]), (bindings[2], pats[3]), (bindings[0], pats[1])];
         for &(id, src) in &expr_back {
             builder.expr_map_back.insert(id, src);
         }

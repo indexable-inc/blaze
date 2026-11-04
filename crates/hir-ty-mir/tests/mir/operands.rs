@@ -2,13 +2,13 @@
 //! operands, in order, of every rvalue but `BinaryOp`, which the old copy skipped and which is
 //! the only binary operation from runtime MIR on.
 
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId,
     db::HirDatabase,
     mir::{MirOwner, MirStage},
 };
 use hir_ty_mir::mir::{Operand, Rvalue, StatementKind, purity::operands};
-use hir_expand::fixture;
 
 use crate::function;
 

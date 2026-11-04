@@ -18,10 +18,12 @@ use std::time::Duration;
 use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
-use object::write::{Comdat, Object as Builder, Relocation, StandardSection, Symbol, SymbolId, SymbolSection};
+use object::write::{
+    Comdat, Object as Builder, Relocation, StandardSection, Symbol, SymbolId, SymbolSection,
+};
 use object::{
-    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationEncoding, RelocationFlags, RelocationKind,
-    SectionKind, SymbolFlags, SymbolKind, SymbolScope, pe,
+    Architecture, BinaryFormat, ComdatKind, Endianness, RelocationEncoding, RelocationFlags,
+    RelocationKind, SectionKind, SymbolFlags, SymbolKind, SymbolScope, pe,
 };
 
 const TARGET: Target = Target {
@@ -72,8 +74,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Pe, Arch::X86_64, OBJECT, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Pe, Arch::X86_64, OBJECT, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -124,9 +127,15 @@ fn named() -> Vec<(&'static str, Vec<u8>)> {
         ("an object of every section kind and relocation read", object()),
         ("an object of one function", minimal()),
         ("a short import of a function by name", short_import(code, 7, &["f", "foo.dll"])),
-        ("a short import of data, its name undecorated", short_import(data, 0, &["_v@4", "foo.dll"])),
+        (
+            "a short import of data, its name undecorated",
+            short_import(data, 0, &["_v@4", "foo.dll"]),
+        ),
         ("a short import by ordinal", short_import(ordinal, 12, &["g", "bar.dll"])),
-        ("a short import exported as another name", short_import(export_as, 0, &["h", "bar.dll", "hh"])),
+        (
+            "a short import exported as another name",
+            short_import(export_as, 0, &["h", "bar.dll", "hh"]),
+        ),
     ]
 }
 
@@ -154,7 +163,11 @@ fn object() -> Vec<u8> {
     b.section_symbol(inline);
     b.section_symbol(xdata);
     let drectve = b.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
-    b.append_section_data(drectve, b" /DEFAULTLIB:kernel32 /EXPORT:f /ALTERNATENAME:a=f /INCLUDE:f", 1);
+    b.append_section_data(
+        drectve,
+        b" /DEFAULTLIB:kernel32 /EXPORT:f /ALTERNATENAME:a=f /INCLUDE:f",
+        1,
+    );
 
     let mut define = |name: &str, section, value, kind| {
         b.add_symbol(Symbol {
@@ -185,10 +198,19 @@ fn object() -> Vec<u8> {
     b.add_comdat(Comdat { kind: ComdatKind::Any, symbol: leader, sections: vec![inline, xdata] });
 
     let mut relocate = |section, offset, symbol: SymbolId, flags, addend| {
-        b.add_relocation(section, Relocation { offset, symbol, addend, flags }).expect("a COFF relocation");
+        b.add_relocation(section, Relocation { offset, symbol, addend, flags })
+            .expect("a COFF relocation");
     };
-    let rel32 = RelocationFlags::Generic { kind: RelocationKind::Relative, encoding: RelocationEncoding::Generic, size: 32 };
-    let abs64 = RelocationFlags::Generic { kind: RelocationKind::Absolute, encoding: RelocationEncoding::Generic, size: 64 };
+    let rel32 = RelocationFlags::Generic {
+        kind: RelocationKind::Relative,
+        encoding: RelocationEncoding::Generic,
+        size: 32,
+    };
+    let abs64 = RelocationFlags::Generic {
+        kind: RelocationKind::Absolute,
+        encoding: RelocationEncoding::Generic,
+        size: 64,
+    };
     relocate(text, 1, ext, rel32, -4);
     relocate(text, 8, v, rel32, -4);
     relocate(data, 0, f, abs64, 0);
@@ -255,7 +277,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Pe, Arch::X86_64, OBJECT, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Pe, Arch::X86_64, OBJECT, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

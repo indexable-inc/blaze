@@ -256,10 +256,7 @@ impl NativeStateMachine {
             min_concurrency >= 1 && min_concurrency <= max_concurrency,
             "Stateful testing: concurrency bounds must satisfy 1 <= min <= max"
         );
-        hegel_internal_assert!(
-            step_count >= 1,
-            "Stateful testing: step count must be at least 1"
-        );
+        hegel_internal_assert!(step_count >= 1, "Stateful testing: step count must be at least 1");
 
         let mut group_ids: Vec<i64> = Vec::new();
         let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -327,9 +324,7 @@ impl NativeStateMachine {
         let counted_rounds = self.rounds_started - self.rounds_rejected;
         let step_count = self.step_count;
         let attempt_cap = if counted_rounds == 0 {
-            step_count
-                .saturating_mul(ATTEMPT_MULTIPLIER)
-                .max(MIN_ATTEMPTS_WITHOUT_SUCCESS)
+            step_count.saturating_mul(ATTEMPT_MULTIPLIER).max(MIN_ATTEMPTS_WITHOUT_SUCCESS)
         } else {
             step_count.saturating_mul(ATTEMPT_MULTIPLIER)
         };
@@ -343,11 +338,7 @@ impl NativeStateMachine {
         if !ntc.weighted_precise(P_CONTINUE, forced)? {
             return Ok(None);
         }
-        let group = if self.groups.len() == 1 {
-            0
-        } else {
-            draw_index(ntc, self.groups.len())?
-        };
+        let group = if self.groups.len() == 1 { 0 } else { draw_index(ntc, self.groups.len())? };
         for worker in &mut self.workers {
             worker.steps_drawn = 0;
             worker.steps_rejected = 0;
@@ -482,15 +473,12 @@ impl NativeStateMachine {
     /// Validate a caller-supplied worker index against the drawn
     /// concurrency level.
     fn checked_worker(&self, worker_index: i64) -> Result<usize, EngineError> {
-        usize::try_from(worker_index)
-            .ok()
-            .filter(|&w| w < self.workers.len())
-            .ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "worker_index must be in [0, {}), got {worker_index}",
-                    self.concurrency
-                ))
-            })
+        usize::try_from(worker_index).ok().filter(|&w| w < self.workers.len()).ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "worker_index must be in [0, {}), got {worker_index}",
+                self.concurrency
+            ))
+        })
     }
 
     /// Select the next rule's global index from the current group's member
@@ -522,10 +510,8 @@ impl NativeStateMachine {
         let members = &self.groups[group];
         let n = members.len();
         let flags = &mut self.workers[worker_idx].flags;
-        let mut candidate_weights: Vec<f64> = members
-            .iter()
-            .map(|&rule| self.rule_weights[rule])
-            .collect();
+        let mut candidate_weights: Vec<f64> =
+            members.iter().map(|&rule| self.rule_weights[rule]).collect();
 
         for _ in 0..3 {
             let k = ntc.draw_index_weighted(&candidate_weights)?;

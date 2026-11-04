@@ -5,8 +5,8 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 use blaze_graph::wait::WaitKind;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::{CountMin, Counters, DdSketch, PartRef, Quantile, Shared, record};
 use crate::{
@@ -75,7 +75,9 @@ pub struct Hot {
 /// Why there is nothing to read.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HotError {
-    #[error("no build has ended in this process, so there is no last build to read the sketches of")]
+    #[error(
+        "no build has ended in this process, so there is no last build to read the sketches of"
+    )]
     NoBuild,
 }
 
@@ -215,7 +217,10 @@ fn hot(summed: &Summed, top: usize, since: Since) -> Hot {
         })
         .collect();
     keys.sort_by(|a, b| {
-        b.upper_ns.cmp(&a.upper_ns).then_with(|| a.span.cmp(b.span)).then_with(|| a.function.cmp(&b.function))
+        b.upper_ns
+            .cmp(&a.upper_ns)
+            .then_with(|| a.span.cmp(b.span))
+            .then_with(|| a.function.cmp(&b.function))
     });
     keys.truncate(top);
     let ns = |ticks: f64| scale.ns(ticks.round() as u64);

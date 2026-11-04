@@ -55,16 +55,14 @@ pub(crate) fn source(db: &Db, id: StaticId) -> Result<Source<'_>, String> {
     match compiled_static(db, id) {
         Ok(it) => Ok(Source::Compiled(it)),
         // alloc: the error's message
-        Err(e) => Err(format!("the static `{}`: {e}", blaze_items::key::path(db, ItemId::Static(id)))),
+        Err(e) => {
+            Err(format!("the static `{}`: {e}", blaze_items::key::path(db, ItemId::Static(id))))
+        }
     }
 }
 
 /// What the static `id` holds, evaluated.
-pub(crate) fn value(
-    db: &Db,
-    hashes: &HashSource,
-    id: StaticId,
-) -> Result<Value, String> {
+pub(crate) fn value(db: &Db, hashes: &HashSource, id: StaticId) -> Result<Value, String> {
     let target = crate::target_of_crate(db, id.krate(db)).map_err(|e| e.to_string())?;
     let thread_local = is_thread_local(db, id);
     // alloc: only a static with `#[link_section]`, whose `Static::section` owns its name
@@ -76,8 +74,8 @@ pub(crate) fn value(
             placer.place(FrontRef::Weak(symbol))?;
             let word = target.word();
             let blob = ConstBlob {
-                bytes: vec![0; word], // alloc: only an `extern_weak` static, its one address
-                relocs: Vec::new(), // alloc: empty, allocates nothing
+                bytes: vec![0; word],  // alloc: only an `extern_weak` static, its one address
+                relocs: Vec::new(),    // alloc: empty, allocates nothing
                 fn_relocs: Vec::new(), // alloc: empty, allocates nothing
                 align: word as u64,
                 type_ids: Vec::new(), // alloc: empty, allocates nothing
@@ -86,7 +84,8 @@ pub(crate) fn value(
         }
         Source::Compiled(CompiledStatic { requests, blob, writable }) => {
             // clone: the memo's, which `place_requests` rewrites in place
-            let requests = Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() };
+            let requests =
+                Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() };
             // clone: the memo's, which `fill_type_ids` rewrites in place
             let mut blob = blob.clone();
             fill_type_ids(db, hashes, Some(id.krate(db)), &mut blob)?;
@@ -141,7 +140,9 @@ fn wasm_imports(
     requests: &Requests,
 ) -> Result<Vec<(String, Import)>, String> {
     // alloc: an error's name of the static
-    super::wasm::imports(db, target, requests, || format!("the static `{}`", StaticSignature::of(db, id).name.as_str()))
+    super::wasm::imports(db, target, requests, || {
+        format!("the static `{}`", StaticSignature::of(db, id).name.as_str())
+    })
 }
 
 /// The static `id` with its references at `refs`.
@@ -166,11 +167,7 @@ pub(crate) fn compile(
     let value = value(db, hashes, id)?;
     if value.refs.len() != refs.len() {
         // alloc: the error's message
-        return Err(format!(
-            "{} references given for a value of {}",
-            refs.len(),
-            value.refs.len()
-        ));
+        return Err(format!("{} references given for a value of {}", refs.len(), value.refs.len()));
     }
     let (data, mut relocs) = resolve(&value.places, refs, |resolve| {
         super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, &item.0, resolve)

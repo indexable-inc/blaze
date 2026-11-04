@@ -49,11 +49,12 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use windows_sys::Win32::{
     Foundation::{ERROR_NOTIFY_ENUM_DIR, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
-        CreateFileW, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SECURITY,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW,
-        GetVolumePathNameW, OPEN_EXISTING, ReadDirectoryChangesW, VOLUME_NAME_DOS,
+        CreateFileW, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+        FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+        FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SECURITY, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, GetVolumePathNameW,
+        OPEN_EXISTING, ReadDirectoryChangesW, VOLUME_NAME_DOS,
     },
     System::{
         IO::{GetOverlappedResult, OVERLAPPED},
@@ -72,7 +73,8 @@ const SLOTS: usize = 1 << 16;
 const CHANGES: usize = (64 << 10) / 4;
 
 /// What a watch is told of.
-const TOLD: u32 = FILE_NOTIFY_CHANGE_SECURITY | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+const TOLD: u32 =
+    FILE_NOTIFY_CHANGE_SECURITY | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
 
 /// A check's state: 0 not known; [`COVERED`], and [`DIR`] for a directory; or pending, a token
 /// shifted past both bits.
@@ -131,7 +133,12 @@ impl Reads {
     /// What [`super::covered`] says of `path` for `readers`, the container's SID and ALL
     /// APPLICATION PACKAGES', with [`READ`]: kept when it was seen covered before and nothing
     /// told since. `key` is the caller's buffer for the path's key.
-    pub(super) fn covered(&'static self, path: &Path, readers: &[PSID; 2], key: &mut Vec<u16>) -> Result<Option<Seen>, String> {
+    pub(super) fn covered(
+        &'static self,
+        path: &Path,
+        readers: &[PSID; 2],
+        key: &mut Vec<u16>,
+    ) -> Result<Option<Seen>, String> {
         fold_into(key, path.as_os_str().encode_wide());
         let hash = hash(key);
         if let Some(slot) = self.paths.find(hash, key) {
@@ -156,7 +163,13 @@ impl Reads {
 
     /// The check of `path` (`key`) made pending, before its DACL is read, when it can be kept:
     /// its slot, its token and its volume, whose watch is on.
-    fn pending(&'static self, file: &Handle, path: &Path, key: &[u16], hash: u64) -> Option<(&'static Slot, u64, &'static Root)> {
+    fn pending(
+        &'static self,
+        file: &Handle,
+        path: &Path,
+        key: &[u16],
+        hash: u64,
+    ) -> Option<(&'static Slot, u64, &'static Root)> {
         if !named_as_it_is(file, key) {
             return None;
         }
@@ -186,7 +199,8 @@ impl Reads {
         let mut volume = vec![0u16; name.len() + 1];
         // SAFETY: `name` ends in NUL (`wide`) and is only read; `volume` is `len` units, the
         // length the call is told, live and exclusive for it, which it writes no further than.
-        let found = unsafe { GetVolumePathNameW(name.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) };
+        let found =
+            unsafe { GetVolumePathNameW(name.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) };
         if found == 0 {
             return None;
         }
@@ -203,7 +217,8 @@ impl Reads {
             return (!root.dead.load(Ordering::SeqCst)).then_some(*root);
         }
         // alloc: once per volume, which lives as long as the launcher.
-        let root: &'static Root = Box::leak(Box::new(Root { key: key.into(), dead: AtomicBool::new(false) }));
+        let root: &'static Root =
+            Box::leak(Box::new(Root { key: key.into(), dead: AtomicBool::new(false) }));
         roots.push(root);
         let watched = Watch::start(&volume).and_then(|watch| {
             std::thread::Builder::new()
@@ -217,7 +232,10 @@ impl Reads {
             Ok(_) => Some(root),
             Err(why) => {
                 root.dead.store(true, Ordering::SeqCst);
-                eprintln!("blaze sandbox: {} is not watched ({why}): its paths are checked every run", shown(&root.key));
+                eprintln!(
+                    "blaze sandbox: {} is not watched ({why}): its paths are checked every run",
+                    shown(&root.key)
+                );
                 None
             }
         }
@@ -261,7 +279,10 @@ impl Reads {
         if let Some(slot) = self.paths.find(hash, key) {
             slot.forget();
         }
-        let moved = matches!(action, FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME | FILE_ACTION_RENAMED_NEW_NAME);
+        let moved = matches!(
+            action,
+            FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME | FILE_ACTION_RENAMED_NEW_NAME
+        );
         if moved && self.above.find(hash, key).is_some() {
             self.forget_under(key);
         }
@@ -272,7 +293,9 @@ impl Reads {
         self.paths.each(|path, slot| {
             let below = match dir.last() {
                 Some(&BACKSLASH) => path.starts_with(dir),
-                _ => path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == BACKSLASH,
+                _ => {
+                    path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == BACKSLASH
+                }
             };
             if below {
                 slot.forget();
@@ -285,7 +308,10 @@ impl Reads {
     fn lose(&self, root: &Root, why: &str) {
         root.dead.store(true, Ordering::SeqCst);
         self.forget_under(&root.key);
-        eprintln!("blaze sandbox: the watch of {} ended ({why}): its paths are checked every run", shown(&root.key));
+        eprintln!(
+            "blaze sandbox: the watch of {} ended ({why}): its paths are checked every run",
+            shown(&root.key)
+        );
     }
 }
 
@@ -321,7 +347,12 @@ fn named_as_it_is(file: &Handle, key: &[u16]) -> bool {
         // SAFETY: `file` owns an open handle (`open`); `name` is `len` units, the length the
         // call is told, live and exclusive for it, which it writes no further than.
         let wrote = unsafe {
-            GetFinalPathNameByHandleW(file.0, name.as_mut_ptr(), name.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS)
+            GetFinalPathNameByHandleW(
+                file.0,
+                name.as_mut_ptr(),
+                name.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
         } as usize;
         if wrote == 0 {
             return false;
@@ -333,7 +364,8 @@ fn named_as_it_is(file: &Handle, key: &[u16]) -> bool {
         }
         let final_path = &name[..wrote];
         let Some(rest) = final_path.strip_prefix(&VERBATIM[..]) else { return false };
-        return rest.len() == key.len() && rest.iter().zip(key).all(|(it, want)| fold(*it) == *want);
+        return rest.len() == key.len()
+            && rest.iter().zip(key).all(|(it, want)| fold(*it) == *want);
     }
     false
 }
@@ -361,7 +393,8 @@ impl Slot {
     /// [`Slot::pend`]; and lets go of it again if the watch ended (`dead`) meanwhile, maybe
     /// after its own letting go of everything ran.
     fn publish(&self, token: u64, to: u64, dead: &AtomicBool) {
-        let published = self.state.compare_exchange(token, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+        let published =
+            self.state.compare_exchange(token, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
         if published && dead.load(Ordering::SeqCst) {
             self.forget();
         }
@@ -382,7 +415,9 @@ impl Table {
     fn new(capacity: usize) -> Table {
         assert!(capacity.is_power_of_two());
         // alloc: once per launcher, the table its checks are kept in.
-        let slots = (0..capacity).map(|_| Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) }).collect();
+        let slots = (0..capacity)
+            .map(|_| Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) })
+            .collect();
         Table { slots }
     }
 
@@ -422,7 +457,12 @@ impl Table {
                     // alloc: once per path kept, which stays as long as the launcher.
                     ours = Box::into_raw(Box::new(Key { hash, units: units.into() }));
                 }
-                match slot.key.compare_exchange(null_mut(), ours, Ordering::AcqRel, Ordering::Acquire) {
+                match slot.key.compare_exchange(
+                    null_mut(),
+                    ours,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => return Some(slot),
                     Err(theirs) => key = theirs,
                 }
@@ -633,7 +673,10 @@ mod tests {
 
     fn is_kept(reads: &Reads, path: &str) -> bool {
         let key = key(path);
-        reads.paths.find(hash(&key), &key).is_some_and(|it| it.state.load(Ordering::SeqCst) & COVERED != 0)
+        reads
+            .paths
+            .find(hash(&key), &key)
+            .is_some_and(|it| it.state.load(Ordering::SeqCst) & COVERED != 0)
     }
 
     #[test]
@@ -674,7 +717,10 @@ mod tests {
         assert!(!is_kept(reads, r"C:\ws\src\lib") && is_kept(reads, r"C:\ws\src"));
         // `src` renamed away: it and what is below it go, its sibling stays.
         kept_covered(reads, r"C:\ws\src\lib", 3);
-        let (changes, got) = records(&[(r"ws\src", FILE_ACTION_RENAMED_OLD_NAME), (r"ws\gone", FILE_ACTION_RENAMED_NEW_NAME)]);
+        let (changes, got) = records(&[
+            (r"ws\src", FILE_ACTION_RENAMED_OLD_NAME),
+            (r"ws\gone", FILE_ACTION_RENAMED_NEW_NAME),
+        ]);
         reads.told(&root, &changes, got, &mut buffer);
         assert!(!is_kept(reads, r"C:\ws\src") && !is_kept(reads, r"C:\ws\src\lib"));
         assert!(is_kept(reads, r"C:\ws\other") && is_kept(reads, r"C:\elsewhere"));
@@ -709,7 +755,8 @@ mod tests {
             return;
         }
         let reads = reads();
-        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-reads-{}", std::process::id()));
+        let base = std::env::temp_dir()
+            .join(format!("blaze-windows-sandbox-reads-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&base);
         let dir = base.join("d");
         std::fs::create_dir_all(&dir).unwrap();
@@ -751,10 +798,13 @@ mod tests {
 
     #[test]
     fn a_path_through_a_dot_is_not_kept_and_its_case_is_no_difference() {
-        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-named-{}", std::process::id()));
+        let base = std::env::temp_dir()
+            .join(format!("blaze-windows-sandbox-named-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("d")).unwrap();
-        let base = std::path::PathBuf::from(std::fs::canonicalize(&base).unwrap().to_str().unwrap().trim_start_matches(r"\\?\"));
+        let base = std::path::PathBuf::from(
+            std::fs::canonicalize(&base).unwrap().to_str().unwrap().trim_start_matches(r"\\?\"),
+        );
         let as_is = base.join("d");
         let file = super::super::open(&as_is, "test").unwrap().unwrap();
         assert!(named_as_it_is(&file, &key(as_is.to_str().unwrap())));
@@ -811,7 +861,13 @@ mod tests {
                 Op::Claim(..) => table.claim(hash, &[unit]),
                 Op::Find(..) => table.find(hash, &[unit]),
             };
-            slot.map(|slot| table.slots.iter().position(|it| std::ptr::eq(it, slot)).expect("a slot of the table"))
+            slot.map(|slot| {
+                table
+                    .slots
+                    .iter()
+                    .position(|it| std::ptr::eq(it, slot))
+                    .expect("a slot of the table")
+            })
         })
     }
 
@@ -845,7 +901,10 @@ mod tests {
     #[test]
     fn model_a_check_pending_as_its_watch_ends_is_not_kept() {
         blaze_check::model(|| {
-            let slot = std::sync::Arc::new(Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) });
+            let slot = std::sync::Arc::new(Slot {
+                key: AtomicPtr::new(null_mut()),
+                state: AtomicU64::new(0),
+            });
             let dead = std::sync::Arc::new(AtomicBool::new(false));
             let watch = {
                 let (slot, dead) = (slot.clone(), dead.clone());
@@ -859,7 +918,11 @@ mod tests {
                 slot.publish(token, COVERED | DIR, &dead);
             }
             watch.join().unwrap();
-            assert_eq!(slot.state.load(Ordering::SeqCst) & COVERED, 0, "a check kept past the end of its watch");
+            assert_eq!(
+                slot.state.load(Ordering::SeqCst) & COVERED,
+                0,
+                "a check kept past the end of its watch"
+            );
         });
     }
 
@@ -870,7 +933,10 @@ mod tests {
     #[test]
     fn model_a_change_told_while_a_check_is_pending_is_not_lost() {
         blaze_check::model(|| {
-            let slot = std::sync::Arc::new(Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) });
+            let slot = std::sync::Arc::new(Slot {
+                key: AtomicPtr::new(null_mut()),
+                state: AtomicU64::new(0),
+            });
             let dead = AtomicBool::new(false);
             let pended = std::sync::Arc::new(AtomicBool::new(false));
             let told = {
@@ -887,7 +953,11 @@ mod tests {
             slot.publish(token, COVERED, &dead);
             let after = told.join().unwrap();
             if after {
-                assert_eq!(slot.state.load(Ordering::SeqCst), 0, "a change told after the check was pending was lost");
+                assert_eq!(
+                    slot.state.load(Ordering::SeqCst),
+                    0,
+                    "a change told after the check was pending was lost"
+                );
             }
         });
     }

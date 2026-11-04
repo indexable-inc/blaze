@@ -151,11 +151,7 @@ fn params_in_repr(db: &Db, def_id: AdtId) -> ParamsInRepr {
     })
 }
 
-fn params_in_repr_ty<'db>(
-    db: &'db Db,
-    ty: Ty<'db>,
-    params_in_repr: &mut ParamsInReprBuilder<'_>,
-) {
+fn params_in_repr_ty<'db>(db: &'db Db, ty: Ty<'db>, params_in_repr: &mut ParamsInReprBuilder<'_>) {
     match ty.kind() {
         TyKind::Adt(adt, args) => {
             let inner_params_in_repr = self::params_in_repr(db, adt.def_id());

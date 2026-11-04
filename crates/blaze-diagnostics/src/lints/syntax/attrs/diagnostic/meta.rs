@@ -20,7 +20,10 @@ pub(super) enum Args<'t> {
     NoArgs,
     List(List<'t>),
     /// `= value`; `range` is from the `=` to the end of the value.
-    NameValue { range: TextRange, value: Lit<'t> },
+    NameValue {
+        range: TextRange,
+        value: Lit<'t>,
+    },
 }
 
 impl Args<'_> {
@@ -125,10 +128,16 @@ impl<'t> Lit<'t> {
                 Ok(value) => (quoted(), Some(value)),
                 Err(_) => (false, None),
             },
-            SyntaxKind::BYTE_STRING => (quoted() && ast::ByteString::cast(token)?.value().is_ok(), None),
+            SyntaxKind::BYTE_STRING => {
+                (quoted() && ast::ByteString::cast(token)?.value().is_ok(), None)
+            }
             SyntaxKind::C_STRING => (quoted() && ast::CString::cast(token)?.value().is_ok(), None),
-            SyntaxKind::CHAR => (text.ends_with('\'') && ast::Char::cast(token)?.value().is_ok(), None),
-            SyntaxKind::BYTE => (text.ends_with('\'') && ast::Byte::cast(token)?.value().is_ok(), None),
+            SyntaxKind::CHAR => {
+                (text.ends_with('\'') && ast::Char::cast(token)?.value().is_ok(), None)
+            }
+            SyntaxKind::BYTE => {
+                (text.ends_with('\'') && ast::Byte::cast(token)?.value().is_ok(), None)
+            }
             SyntaxKind::INT_NUMBER => (ast::IntNumber::cast(token)?.suffix().is_none(), None),
             SyntaxKind::FLOAT_NUMBER => (ast::FloatNumber::cast(token)?.suffix().is_none(), None),
             SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => (true, None),
@@ -174,7 +183,9 @@ pub(super) fn args(written: Written<'_>, diagnostic: bool) -> Option<Args<'_>> {
             let ast::Expr::Literal(lit) = expr? else { return None };
             let value = Lit::of(lit.token())?;
             let eq = lit.syntax().parent().and_then(|it| {
-                it.children_with_tokens().filter_map(NodeOrToken::into_token).find(|it| it.kind() == SyntaxKind::EQ)
+                it.children_with_tokens()
+                    .filter_map(NodeOrToken::into_token)
+                    .find(|it| it.kind() == SyntaxKind::EQ)
             });
             let range = match eq {
                 Some(eq) => eq.text_range().cover(value.range()),
@@ -232,7 +243,9 @@ impl<'t, I: Iterator<Item = Tree<'t>>> Parser<'t, I> {
     fn get(&self, n: usize) -> Option<Tree<'t>> {
         let tree = self.ahead[n]?;
         match tree {
-            NodeOrToken::Token(it) if self.ahead[n + 1].is_none() && it.kind().is_r_delimiter() => None,
+            NodeOrToken::Token(it) if self.ahead[n + 1].is_none() && it.kind().is_r_delimiter() => {
+                None
+            }
             _ => Some(tree),
         }
     }
@@ -306,7 +319,9 @@ impl<'t, I: Iterator<Item = Tree<'t>>> Parser<'t, I> {
         let path_range = start.cover(path[path.len() - 1].1);
         let args = match self.get(0) {
             Some(NodeOrToken::Node(group))
-                if group.left_delimiter_token().is_some_and(|it| it.kind() == SyntaxKind::L_PAREN) =>
+                if group
+                    .left_delimiter_token()
+                    .is_some_and(|it| it.kind() == SyntaxKind::L_PAREN) =>
             {
                 self.bump(1);
                 let range = group.syntax().text_range();
@@ -339,7 +354,11 @@ impl<'t, I: Iterator<Item = Tree<'t>>> Parser<'t, I> {
 fn is_segment(token: ast::Token<'_>) -> bool {
     matches!(
         token.kind(),
-        SyntaxKind::IDENT | SyntaxKind::SELF_KW | SyntaxKind::SELF_TYPE_KW | SyntaxKind::SUPER_KW | SyntaxKind::CRATE_KW
+        SyntaxKind::IDENT
+            | SyntaxKind::SELF_KW
+            | SyntaxKind::SELF_TYPE_KW
+            | SyntaxKind::SUPER_KW
+            | SyntaxKind::CRATE_KW
     )
 }
 
@@ -366,10 +385,17 @@ mod tests {
                     Item::Lit(_) => None,
                 })
                 .collect();
-            assert_eq!(paths, [Some("a".to_owned()), Some("::b::c".to_owned()), Some("d".to_owned()), None]);
-            let Item::Meta(MetaItem { args: Args::NameValue { value, .. }, .. }) = &it[1] else { panic!() };
+            assert_eq!(
+                paths,
+                [Some("a".to_owned()), Some("::b::c".to_owned()), Some("d".to_owned()), None]
+            );
+            let Item::Meta(MetaItem { args: Args::NameValue { value, .. }, .. }) = &it[1] else {
+                panic!()
+            };
             assert!(matches!(value.str, Some(Cow::Borrowed("x"))));
-            assert!(matches!(&it[2], Item::Meta(MetaItem { args: Args::List(list), .. }) if list.items.len() == 1));
+            assert!(
+                matches!(&it[2], Item::Meta(MetaItem { args: Args::List(list), .. }) if list.items.len() == 1)
+            );
         });
         with_items("[a]", |it| assert_eq!(it.unwrap().len(), 1));
         with_items("()", |it| assert!(it.unwrap().is_empty()));

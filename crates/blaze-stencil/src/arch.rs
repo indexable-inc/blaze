@@ -73,7 +73,9 @@ pub(crate) fn caller_pops_tail_call<'f>(
             ),
         ));
     }
-    let args = match func.dfg.insts[inst].analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
+    let args = match func.dfg.insts[inst]
+        .analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables)
+    {
         ir::instructions::CallInfo::Direct(_, args)
         | ir::instructions::CallInfo::DirectWithSig(_, _, args)
         | ir::instructions::CallInfo::Indirect(_, args) => args,

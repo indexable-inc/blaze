@@ -438,8 +438,12 @@ fn lint<'t>(
     applicability: Applicability,
 ) {
     let span = cx.span(range);
-    cx.lint(LINT, node, span.clone(), format!("unnecessary use of `{method}`"))
-        .suggestion(span, help, sugg, applicability);
+    cx.lint(LINT, node, span.clone(), format!("unnecessary use of `{method}`")).suggestion(
+        span,
+        help,
+        sugg,
+        applicability,
+    );
 }
 
 /// clippy's `get_parent_expr`: the expression `node` is in, parentheses passed (HIR has none),

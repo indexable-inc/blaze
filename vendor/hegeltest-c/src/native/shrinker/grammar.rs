@@ -74,12 +74,7 @@ impl<'a> Shrinker<'a> {
         let (kind, constraint, text) = self.grammar_string_at(i).ok_or(PassExit::NodeGone)?;
         let tree = constraint.tree(&text).ok_or(PassExit::NodeGone)?;
         let layout = Layout::new(&tree);
-        Ok(Derived {
-            kind,
-            constraint,
-            text,
-            layout,
-        })
+        Ok(Derived { kind, constraint, text, layout })
     }
 
     /// Try `text` at node `i`; a text equal to the current one is no
@@ -89,9 +84,7 @@ impl<'a> Shrinker<'a> {
         if current == text {
             return Ok(false);
         }
-        Ok(self
-            .replace(&HashMap::from_iter([(i, ChoiceValue::String(text))]))
-            .await?)
+        Ok(self.replace(&HashMap::from_iter([(i, ChoiceValue::String(text))])).await?)
     }
 
     /// Replace a rule node's text with that of a node of the same rule
@@ -126,10 +119,7 @@ impl<'a> Shrinker<'a> {
                 return Ok(changed);
             };
             if let (Some(first), Some(last)) = (items.first(), items.last()) {
-                if self
-                    .replace_text(i, splice(&d.text, first.0, last.1, &[]))
-                    .await?
-                {
+                if self.replace_text(i, splice(&d.text, first.0, last.1, &[])).await? {
                     changed = true;
                     continue;
                 }
@@ -161,11 +151,7 @@ impl<'a> Shrinker<'a> {
     /// [`GrammarConstraint::separators`]).
     fn cuttable(d: &Derived) -> Vec<(usize, usize)> {
         let kept = d.constraint.separators(&d.layout);
-        d.layout
-            .ignored()
-            .into_iter()
-            .filter(|stretch| !kept.contains(stretch))
-            .collect()
+        d.layout.ignored().into_iter().filter(|stretch| !kept.contains(stretch)).collect()
     }
 
     /// Cut all the ignored text that may go at once, then each stretch of
@@ -187,9 +173,7 @@ impl<'a> Shrinker<'a> {
             }
             j -= 1;
             let (start, end) = ignored[j];
-            changed |= self
-                .replace_text(i, splice(&d.text, start, end, &[]))
-                .await?;
+            changed |= self.replace_text(i, splice(&d.text, start, end, &[])).await?;
         }
     }
 
@@ -206,9 +190,7 @@ impl<'a> Shrinker<'a> {
             r += 1;
             if let Some(small) = d.constraint.smallest_for_rule(rule) {
                 if d.constraint.smaller(&small, &d.text[start..end]) {
-                    changed |= self
-                        .replace_text(i, splice(&d.text, start, end, &small))
-                        .await?;
+                    changed |= self.replace_text(i, splice(&d.text, start, end, &small)).await?;
                 }
             }
         }
@@ -231,9 +213,7 @@ impl<'a> Shrinker<'a> {
             }
             if let Some(small) = d.constraint.smallest_for_terminal(terminal) {
                 if d.constraint.smaller(&small, &d.text[start..end])
-                    && self
-                        .replace_text(i, splice(&d.text, start, end, &small))
-                        .await?
+                    && self.replace_text(i, splice(&d.text, start, end, &small)).await?
                 {
                     changed = true;
                     continue;
@@ -247,11 +227,7 @@ impl<'a> Shrinker<'a> {
     /// derivation has fewer leaves now.
     fn leaf(&self, i: usize, j: usize) -> Result<Option<(Derived, usize, usize)>, PassExit> {
         let d = self.derivation(i)?;
-        let range = d
-            .layout
-            .leaves()
-            .get(j)
-            .map(|&(_, start, end)| (start, end));
+        let range = d.layout.leaves().get(j).map(|&(_, start, end)| (start, end));
         Ok(range.map(|(start, end)| (d, start, end)))
     }
 
@@ -336,10 +312,7 @@ impl LeafStage {
                         continue;
                     }
                     let codepoint = d.text[start + *p];
-                    if slot
-                        .as_ref()
-                        .is_some_and(|lowering| lowering.expected != codepoint)
-                    {
+                    if slot.as_ref().is_some_and(|lowering| lowering.expected != codepoint) {
                         *slot = None;
                     }
                     let key = d.kind.codepoint_key(codepoint);
@@ -376,18 +349,9 @@ impl LeafStage {
     /// Record the verdict on the text [`Self::candidate`] last returned.
     fn record(&mut self, ok: bool) {
         match self {
-            LeafStage::Delete => {
-                *self = if ok {
-                    LeafStage::Done
-                } else {
-                    LeafStage::Prefix(None)
-                }
-            }
+            LeafStage::Delete => *self = if ok { LeafStage::Done } else { LeafStage::Prefix(None) },
             LeafStage::Prefix(Some(search)) => search.record(ok),
-            LeafStage::Lower {
-                search: Some(lowering),
-                ..
-            } => {
+            LeafStage::Lower { search: Some(lowering), .. } => {
                 if ok {
                     lowering.expected = lowering.probed;
                 }

@@ -92,7 +92,10 @@ mod imp {
                 return None;
             }
             let index = self.0.get() - 1;
-            assert!(index < blaze_query::db::Id::MAX_U32, "SyntaxContext({index}) is no root and no query id");
+            assert!(
+                index < blaze_query::db::Id::MAX_U32,
+                "SyntaxContext({index}) is no root and no query id"
+            );
             // Whether it is a `SyntaxContextImpl` the engine checks on lookup (the owner of the
             // ID's page), panicking if not.
             let id = blaze_query::db::Id::from_u32(index + 1);
@@ -469,10 +472,9 @@ mod tests {
         };
         read();
         blaze_alloc_count::assert_at_most(0, "warm context reads", read);
-        let again =
-            blaze_alloc_count::assert_at_most(0, "interning a context that exists", || {
-                make(0, root)
-            });
+        let again = blaze_alloc_count::assert_at_most(0, "interning a context that exists", || {
+            make(0, root)
+        });
         assert_eq!(again, chain[1]);
         assert_eq!(chain[8].marks_rev(&db).count(), 8);
     }

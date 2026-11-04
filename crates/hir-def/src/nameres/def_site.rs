@@ -104,13 +104,13 @@ use crate::{
     AstIdLoc, Lookup, MacroId, ModuleDefId, ModuleId, UseId,
     expr_store::HygieneId,
     item_scope::{BuiltinShadowMode, ImportId},
-    src::use_trees_view,
     nameres::{
         BlockInfo, DefMap, LocalDefMap, MacroSubNs, ModuleOrigin, crate_def_map,
         crate_local_def_map,
         path_resolution::{PathRead, adjust_to_nearest_non_block_module},
     },
     per_ns::{Namespace, PerNs},
+    src::use_trees_view,
 };
 
 /// Where a path's first segment is looked up, after def-site hygiene.
@@ -304,7 +304,9 @@ impl DefMap {
     fn super_origin(&self, db: &Db, module: ModuleId, levels: u8, ctxt: SyntaxContext) -> Hygienic {
         let written = ctxt.normalize_to_macros_2_0(db);
         let mut ctxt = written;
-        let Some(mut at) = self.resolve_self(db, &mut ctxt, module, module) else { return Hygienic::Unknown };
+        let Some(mut at) = self.resolve_self(db, &mut ctxt, module, module) else {
+            return Hygienic::Unknown;
+        };
         // The module the path names as written: `None` above the crate root.
         let mut plain = Some(adjust_to_nearest_non_block_module(db, self, module));
         for level in 0..levels {
@@ -314,7 +316,9 @@ impl DefMap {
             if level > 0 {
                 ctxt = written;
             }
-            let Some(next) = self.resolve_self(db, &mut ctxt, parent, module) else { return Hygienic::Unknown };
+            let Some(next) = self.resolve_self(db, &mut ctxt, parent, module) else {
+                return Hygienic::Unknown;
+            };
             at = next;
             plain = plain.and_then(|(map, it)| {
                 let parent = map.module(db, it).parent?;
@@ -341,7 +345,8 @@ impl DefMap {
         module: ModuleId,
         path_module: ModuleId,
     ) -> Option<ModuleId> {
-        let (mut map, mut at) = adjust_to_nearest_non_block_module(db, self.map_for(db, module), module);
+        let (mut map, mut at) =
+            adjust_to_nearest_non_block_module(db, self.map_for(db, module), module);
         // Where the module defining a macro is looked for first: the modules around the path,
         // then around each def site passed.
         let mut search = path_module;
@@ -356,7 +361,11 @@ impl DefMap {
                 Some(parent) => parent,
                 None => {
                     let (Some(expn), _) = ctxt.remove_mark(db) else { return None };
-                    search = self.map_for(db, search).macro_def_module(db, search, MacroCallId::from(expn))?;
+                    search = self.map_for(db, search).macro_def_module(
+                        db,
+                        search,
+                        MacroCallId::from(expn),
+                    )?;
                     search
                 }
             };
@@ -472,7 +481,9 @@ impl DefMap {
             | MacroDefKind::BuiltInAttr(ast_id, _)
             | MacroDefKind::BuiltInDerive(ast_id, _)
             | MacroDefKind::BuiltInEager(ast_id, _) => ast_id,
-            MacroDefKind::ProcMacro(..) => return Some(crate_def_map(db, def.krate).root_module_id()),
+            MacroDefKind::ProcMacro(..) => {
+                return Some(crate_def_map(db, def.krate).root_module_id());
+            }
             MacroDefKind::UnimplementedBuiltIn(_) => return None,
         };
         let mut map = self;
@@ -492,7 +503,10 @@ impl DefMap {
         // The crate's def map is collected unless it is this one, still being collected.
         let collecting = self.block.is_none()
             && def.krate == self.krate
-            && !matches!(self.modules, super::ModulesSlot::Published(_) | super::ModulesSlot::Collected(_));
+            && !matches!(
+                self.modules,
+                super::ModulesSlot::Published(_) | super::ModulesSlot::Collected(_)
+            );
         match collecting {
             true => None,
             false => macro_def_module(db, def.krate, ast_id),
@@ -662,15 +676,17 @@ pub fn privacy_scope(
             "def-site privacy (rustc's `adjust_ident_and_get_scope`): no module declares the macro \
              {:?} of crate {:?} whose expansion {scope:?} a name written in module {here:?} \
              adjusts out of",
-            def.kind,
-            def.krate,
+            def.kind, def.krate,
         )
     };
     // rustc's `nearest_parent_mod`: each turn leaves one block, ending at the crate root.
     let mut module = module;
     while module.is_block_module(db) {
         let Some(parent) = module.containing_module(db) else {
-            panic!("def-site privacy: the block module {module:?} defining {:?} has no parent", def.kind)
+            panic!(
+                "def-site privacy: the block module {module:?} defining {:?} has no parent",
+                def.kind
+            )
         };
         module = parent.to_static();
     }
@@ -812,7 +828,12 @@ pub fn trait_item_written(db: &Db, id: crate::TraitId, written: Name) -> Name {
 /// looks up among that trait's items: [`assoc_item_is`] of [`trait_item_written`], rustc's
 /// `hygienic_eq(assoc_ident, item.ident, trait_def_id)` in `trait_may_define_assoc_item` and
 /// `trait_defines_associated_item_named`. An item of no trait is looked up by no shorthand.
-pub fn trait_item_is_written(db: &Db, item_name: Name, item: crate::AssocItemId, written: Name) -> bool {
+pub fn trait_item_is_written(
+    db: &Db,
+    item_name: Name,
+    item: crate::AssocItemId,
+    written: Name,
+) -> bool {
     if item_name.unkeyed() != written.unkeyed() {
         return false;
     }
@@ -1132,7 +1153,10 @@ fn item_key<N: AstIdNode>(db: &Db, ast: AstId<N>) -> Option<SyntaxContext> {
 fn expanded_item_key(db: &Db, call: MacroCallId, ast: ErasedFileAstId) -> Option<SyntaxContext> {
     let file = HirFileId::from(call);
     let node = view::to_node(file.ast_id_map(db).get_erased(ast), file.root(db));
-    normalized_key(db, name_range(node).map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx))
+    normalized_key(
+        db,
+        name_range(node).map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx),
+    )
 }
 
 /// The key of the name the `idx`th use tree of `use_`, an item of `call`'s expansion, binds:
@@ -1142,7 +1166,11 @@ fn use_tree_key(db: &Db, call: MacroCallId, use_: UseId, idx: u32) -> Option<Syn
     let file = HirFileId::from(call);
     let trees = use_trees_view(db, use_.lookup(db).id);
     let tree = trees[Idx::from_raw(la_arena::RawIdx::from_u32(idx))];
-    normalized_key(db, name_range(view::AstNode::syntax(&tree)).map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx))
+    normalized_key(
+        db,
+        name_range(view::AstNode::syntax(&tree))
+            .map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx),
+    )
 }
 
 /// The context, normalized to macros 2.0, the path of the import `import` is written with: its
@@ -1153,7 +1181,9 @@ pub(crate) fn use_path_context(db: &Db, import: ImportId) -> SyntaxContext {
     let loc = import.use_.lookup(db);
     match loc.id.file_id.macro_file() {
         None => ROOT,
-        Some(call) => expanded_use_path_context(db, call, import.use_, import.idx.into_raw().into_u32()),
+        Some(call) => {
+            expanded_use_path_context(db, call, import.use_, import.idx.into_raw().into_u32())
+        }
     }
 }
 
@@ -1256,4 +1286,3 @@ fn name_range(node: view::Node<'_>) -> Option<TextRange> {
     }
     node.children().find_map(view::NameRef::cast).map(|it| range(view::AstNode::syntax(&it)))
 }
-

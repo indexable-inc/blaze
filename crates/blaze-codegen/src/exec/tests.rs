@@ -31,7 +31,12 @@ fn relocs(targets: &[Target]) -> Relocs {
 }
 
 /// The code of `key` naming `targets`, with `data` naming `in_data` and lines of `lines`.
-fn compiled(key: InstanceKey, targets: &[Target], in_data: &[Target], lines: &[SpanRef]) -> CompiledFunction {
+fn compiled(
+    key: InstanceKey,
+    targets: &[Target],
+    in_data: &[Target],
+    lines: &[SpanRef],
+) -> CompiledFunction {
     let data = (!in_data.is_empty()).then(|| Data {
         id: ContentId([77; 32]),
         align: 8,
@@ -49,7 +54,11 @@ fn compiled(key: InstanceKey, targets: &[Target], in_data: &[Target], lines: &[S
         inlined: Vec::new(),
         side: None,
         unwind: None,
-        lines: lines.iter().enumerate().map(|(at, span)| Line { at: at as u32, span: *span }).collect(),
+        lines: lines
+            .iter()
+            .enumerate()
+            .map(|(at, span)| Line { at: at as u32, span: *span })
+            .collect(),
         coverage: None,
         profile: None,
     }
@@ -61,7 +70,10 @@ fn built() -> Built {
     let none: [Target; 0] = [];
     let marks = [ContentId([9; 32]); 2];
     let refs: [&[Target]; 3] = [&calls, &none, &none];
-    let reach = Reach::new((0..3).map(|n| (key(n), Node { marks, refs: refs[n as usize] })), std::iter::empty());
+    let reach = Reach::new(
+        (0..3).map(|n| (key(n), Node { marks, refs: refs[n as usize] })),
+        std::iter::empty(),
+    );
     Built {
         functions: (0..3).map(|n| compiled(key(n), refs[n as usize], &[], &[])).collect(),
         roots: vec![key(0), key(2)],
@@ -104,19 +116,25 @@ fn a_function_s_id_is_its_subject_with_its_settings() {
     assert_ne!(id(identity, debug, app), id(other, debug, app));
     assert_ne!(id(identity, debug, app), id(identity, debug, dep), "one name, two kinds of origin");
     assert_ne!(id(identity, debug, app), id(identity, debug, Origin::Member(Package::new("ap"))));
-    assert_ne!(subject(identity, app), subject(identity, dep), "the live identity tells origins apart too");
+    assert_ne!(
+        subject(identity, app),
+        subject(identity, dep),
+        "the live identity tells origins apart too"
+    );
 }
 
 #[test]
 fn a_bound_is_of_the_items_its_references_bind_to() {
-    let items = |key: &InstanceKey| (key.0.0[0] < 3).then(|| ItemKey(ContentId([key.0.0[0] + 50; 32])));
+    let items =
+        |key: &InstanceKey| (key.0.0[0] < 3).then(|| ItemKey(ContentId([key.0.0[0] + 50; 32])));
     let calls = |callee: u8| [Target::Function(key(callee)), Target::Extern("memcpy".to_owned())];
     let of = |refs: &[Target]| bound(&Ok(ran(0)), refs, items).unwrap();
     // Instance 1 and instance 2 here are of one item: a callee's own change is not the caller's.
     let same = |key: &InstanceKey| Some(ItemKey(ContentId([key.0.0[0].min(1); 32])));
     assert_eq!(
         bound(&Ok(ran(0)), &calls(1), same).unwrap(),
-        bound(&Ok(ran(0)), &[Target::Direct(key(2)), Target::Extern("memcpy".to_owned())], same).unwrap()
+        bound(&Ok(ran(0)), &[Target::Direct(key(2)), Target::Extern("memcpy".to_owned())], same)
+            .unwrap()
     );
     assert_ne!(of(&calls(1)), of(&calls(2)), "another item called");
     assert_ne!(of(&calls(1)), of(&calls(1)[..1]), "a reference more");
@@ -145,7 +163,12 @@ fn position(anchor: u8, index: u32) -> Target {
 
 fn statics_of(values: &[(u8, u8, Vec<Target>)]) -> StaticBounds {
     let bind = |key: &InstanceKey| (key.0.0[0] < 3).then(|| id(key.0.0[0]));
-    StaticBounds::new(values.iter().map(|(n, value, refs)| (static_id(*n), ContentId([*value; 32]), refs.iter().collect())), bind)
+    StaticBounds::new(
+        values.iter().map(|(n, value, refs)| {
+            (static_id(*n), ContentId([*value; 32]), refs.iter().collect())
+        }),
+        bind,
+    )
 }
 
 fn bound_of(statics: &StaticBounds, n: u8) -> ContentId {
@@ -195,7 +218,11 @@ fn a_cycle_of_statics_is_hashed_once() {
 
 #[test]
 fn a_static_naming_what_the_build_lacks_has_no_bound() {
-    let statics = statics_of(&[(0, 1, vec![Target::Function(key(7))]), (1, 1, vec![static_ref(0)]), (2, 1, vec![static_ref(9)])]);
+    let statics = statics_of(&[
+        (0, 1, vec![Target::Function(key(7))]),
+        (1, 1, vec![static_ref(0)]),
+        (2, 1, vec![static_ref(9)]),
+    ]);
     for n in 0..3 {
         let (item, instance) = static_id(n);
         assert!(statics.of(&item, &instance).unwrap().0.is_err(), "static {n}");
@@ -215,18 +242,26 @@ fn a_function_names_its_positions_data_lines_and_statics_sorted_once() {
     );
     let (mut anchors, mut named) = (vec![ContentId([200; 32])], vec![]);
     named_by(&function, &statics, &mut anchors, &mut named).unwrap();
-    assert_eq!(anchors, [1, 2, 6, 9].map(|it| ContentId([it; 32])), "cleared, then each once in order");
+    assert_eq!(
+        anchors,
+        [1, 2, 6, 9].map(|it| ContentId([it; 32])),
+        "cleared, then each once in order"
+    );
     let (item, instance) = static_id(0);
     assert_eq!(named, [(item, instance, bound_of(&statics, 0))]);
 
     let missing = compiled(key(0), &[static_ref(5)], &[], &[]);
-    assert!(named_by(&missing, &statics, &mut anchors, &mut named).unwrap_err().contains("none of"));
+    assert!(
+        named_by(&missing, &statics, &mut anchors, &mut named).unwrap_err().contains("none of")
+    );
 }
 
 #[test]
 fn placed_is_the_bound_with_the_statics_and_tables_it_names() {
     let tables = |moved: u8| {
-        (0..100u8).map(|n| (ContentId([n; 32]), vec![n, if n == 7 { moved } else { 0 }])).collect::<Vec<_>>()
+        (0..100u8)
+            .map(|n| (ContentId([n; 32]), vec![n, if n == 7 { moved } else { 0 }]))
+            .collect::<Vec<_>>()
     };
     let (before, after) = (SpanIds::new(&tables(0)), SpanIds::new(&tables(1)));
     let bound = ContentId([1; 32]);
@@ -244,7 +279,10 @@ fn placed_is_the_bound_with_the_statics_and_tables_it_names() {
     );
     assert_eq!(at(&[3, 200], &before), Err(ContentId([200; 32])));
     for n in 0..100u8 {
-        assert_eq!(before.get(&ContentId([n; 32])), Some(ContentId::of(SPAN_TABLE_DOMAIN, &[n, 0])));
+        assert_eq!(
+            before.get(&ContentId([n; 32])),
+            Some(ContentId::of(SPAN_TABLE_DOMAIN, &[n, 0]))
+        );
     }
     assert_eq!(SpanIds::new(&[]).get(&ContentId([1; 32])), None);
 }
@@ -276,7 +314,8 @@ fn a_table_has_every_function_each_slot_s_and_each_test_s() {
 fn placing(span_table_1: u8, static_0: u8) -> (Built, Vec<(ContentId, Vec<u8>)>) {
     let none: [Target; 0] = [];
     let marks = [ContentId([9; 32]); 2];
-    let reach = Reach::new((0..6).map(|n| (key(n), Node { marks, refs: &none })), std::iter::empty());
+    let reach =
+        Reach::new((0..6).map(|n| (key(n), Node { marks, refs: &none })), std::iter::empty());
     let functions = vec![
         compiled(key(0), &[position(1, 0)], &[], &[]),
         compiled(key(1), &[], &[position(1, 3)], &[]),
@@ -322,7 +361,8 @@ fn no_tests() -> Vec<(String, usize)> {
 
 fn placed_of(span_table_1: u8, static_0: u8) -> Vec<ContentId> {
     let (built, spans) = placing(span_table_1, static_0);
-    let table = ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
+    let table =
+        ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
     table.fns.iter().map(|it| it.1).collect()
 }
 
@@ -350,7 +390,8 @@ fn the_order_a_function_names_its_tables_in_is_not_in_its_bound() {
     built.functions[0] = compiled(key(0), &[position(1, 0), position(2, 0)], &[], &[]);
     built.functions[1] = compiled(key(1), &[position(2, 4)], &[position(1, 3)], &[]);
     built.versions[1].1 = Ok(ran(0));
-    let table = ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
+    let table =
+        ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
     assert_eq!(table.fns[0].1, table.fns[1].1);
 }
 
@@ -376,9 +417,13 @@ fn a_table_is_in_identity_order_and_says_each_place_in_it() {
         std::iter::empty(),
     );
     let built = Built {
-        functions: (0..1000).map(|n| compiled(InstanceKey(numbered(n, 0)), refs_of(n), &[], &[])).collect(),
+        functions: (0..1000)
+            .map(|n| compiled(InstanceKey(numbered(n, 0)), refs_of(n), &[], &[]))
+            .collect(),
         roots: vec![InstanceKey(numbered(0, 0)), InstanceKey(numbered(999, 0))],
-        inputs: (0..1000).map(|n| (InstanceKey(numbered(n, 0)), CodeHash(numbered(n, 8)))).collect(),
+        inputs: (0..1000)
+            .map(|n| (InstanceKey(numbered(n, 0)), CodeHash(numbered(n, 8))))
+            .collect(),
         versions: (0..1000).map(|n| (numbered(999 - n, 4), Ok(numbered(n, 8)))).collect(),
         reach,
         ..Built::default()
@@ -401,7 +446,8 @@ fn a_table_is_in_identity_order_and_says_each_place_in_it() {
 #[test]
 fn a_listed_table_reaches_each_list() {
     let (graph, roots) = crate::exec::TestGraph::listing(3, &[vec![0, 2], vec![], vec![1, 7]]);
-    let tests = ["a", "b", "c"].iter().zip(roots).map(|(name, root)| ((*name).to_owned(), root)).collect();
+    let tests =
+        ["a", "b", "c"].iter().zip(roots).map(|(name, root)| ((*name).to_owned(), root)).collect();
     let table = ExecTable { tests, graph, ..ExecTable::default() };
     assert_eq!(table.reached(0), [0, 2]);
     assert_eq!(table.reached(1), Vec::<u32>::new());
@@ -458,5 +504,8 @@ fn a_table_is_refused_when_it_would_not_say_what_ran() {
     let (mut lacking, spans) = placing(0, 0);
     lacking.statics.remove(0);
     let error = ExecTable::new(&lacking, &spans, 0, |_| None, zero, no_tests()).unwrap_err();
-    assert!(matches!(&error, ExecError::Unbound { function, .. } if *function == key(4)), "{error}");
+    assert!(
+        matches!(&error, ExecError::Unbound { function, .. } if *function == key(4)),
+        "{error}"
+    );
 }

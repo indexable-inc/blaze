@@ -18,7 +18,6 @@ use std::alloc::Allocator;
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_expand::{
     HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId,
     attrs::AttrId,
@@ -26,6 +25,7 @@ use hir_expand::{
     name::Name,
 };
 use span::Edition;
+use std::alloc::Global;
 use syntax::{
     ast,
     view::{self, AstNode as _},
@@ -146,9 +146,7 @@ impl NameRecords {
 fn import_krate(db: &Db, import: ImportOrExternCrate) -> Crate {
     match import {
         ImportOrExternCrate::Glob(GlobId { use_, .. })
-        | ImportOrExternCrate::Import(ImportId { use_, .. }) => {
-            use_.lookup(db).container.krate(db)
-        }
+        | ImportOrExternCrate::Import(ImportId { use_, .. }) => use_.lookup(db).container.krate(db),
         ImportOrExternCrate::ExternCrate(it) => it.lookup(db).container.krate(db),
     }
 }
@@ -474,8 +472,7 @@ pub(crate) fn trait_uses(
     let start = out.len();
     loop {
         // Two modules may glob-import each other: a chain ends where it meets itself.
-        if import_krate(db, import) != krate || out[start..].iter().any(|it| it.import == import)
-        {
+        if import_krate(db, import) != krate || out[start..].iter().any(|it| it.import == import) {
             return;
         }
         out.push(Use { import, name, ns: Namespace::Types, used: Used::Other });
@@ -598,7 +595,8 @@ impl<'db> Walk<'db> {
         let scopes = ExprScopes::of(db, owner);
         let within = Within::of(store, scopes);
         // alloc: one resolver per scope a path of the store is in, built once.
-        let mut resolvers: HashMap<Option<ScopeId>, Resolver<'db>, Global> = HashMap::new_in(Global);
+        let mut resolvers: HashMap<Option<ScopeId>, Resolver<'db>, Global> =
+            HashMap::new_in(Global);
         let out = &mut self.uses;
         for (expr, it) in store.exprs() {
             let (path, ns) = match it {
@@ -675,7 +673,8 @@ impl<'db> Walk<'db> {
 fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImports {
     let not_introducing = &*crate_def_map(db, krate).name_records(db).not_introducing;
     // alloc: once per `finish`, which runs once per crate.
-    let glob_targets: HashMap<GlobId, ModuleId, Global> = walked.glob_targets.iter().copied().collect();
+    let glob_targets: HashMap<GlobId, ModuleId, Global> =
+        walked.glob_targets.iter().copied().collect();
     let mut imports: FxIndexMap<ImportOrExternCrate, Used> = FxIndexMap::default();
     let mut macro_use: FxIndexMap<ExternCrateId, Used> = FxIndexMap::default();
     let mut globs: FxIndexMap<GlobId, Vec<Name>> = FxIndexMap::default();
@@ -694,7 +693,8 @@ fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImport
                 continue;
             }
             let Use { import, name, ns, used } = it;
-            if let (Namespace::Macros, ImportOrExternCrate::ExternCrate(extern_crate)) = (ns, import)
+            if let (Namespace::Macros, ImportOrExternCrate::ExternCrate(extern_crate)) =
+                (ns, import)
             {
                 let old = macro_use.entry(extern_crate).or_insert(used);
                 *old = (*old).max(used);

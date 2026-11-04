@@ -116,7 +116,11 @@ pub(super) mod transition {
     fn child_read(state: PermissionPriv, _protected: bool) -> Option<PermissionPriv> {
         Some(match state {
             Disabled => return None,
-            readable @ (Cell | ReservedFrz | ReservedFrzConflicted | ReservedIM | Unique
+            readable @ (Cell
+            | ReservedFrz
+            | ReservedFrzConflicted
+            | ReservedIM
+            | Unique
             | Frozen) => readable,
         })
     }
@@ -368,7 +372,9 @@ impl PermTransition {
             }
             (Frozen, Disabled) => "a loss of read permissions",
             (_, Disabled) => "a loss of read and write permissions",
-            (old, new) => unreachable!("Transition from {old:?} to {new:?} should never be possible"),
+            (old, new) => {
+                unreachable!("Transition from {old:?} to {new:?} should never be possible")
+            }
         }
     }
 
@@ -382,23 +388,27 @@ impl PermTransition {
             return false;
         }
         match err {
-            TransitionError::ChildAccessForbidden(insufficient) => match (self.to, insufficient.inner) {
-                (Frozen, Frozen) => true,
-                (Unique, Frozen) => true,
-                (Disabled, Disabled) => true,
-                (ReservedFrzConflicted, ReservedFrzConflicted) => true,
-                (ReservedFrzConflicted | Unique | Frozen, Disabled) => false,
-                (ReservedFrzConflicted, Frozen) => false,
-                (_, Unique) | (_, ReservedFrz) | (_, Cell) => {
-                    unreachable!("this permission cannot cause an error")
+            TransitionError::ChildAccessForbidden(insufficient) => {
+                match (self.to, insufficient.inner) {
+                    (Frozen, Frozen) => true,
+                    (Unique, Frozen) => true,
+                    (Disabled, Disabled) => true,
+                    (ReservedFrzConflicted, ReservedFrzConflicted) => true,
+                    (ReservedFrzConflicted | Unique | Frozen, Disabled) => false,
+                    (ReservedFrzConflicted, Frozen) => false,
+                    (_, Unique) | (_, ReservedFrz) | (_, Cell) => {
+                        unreachable!("this permission cannot cause an error")
+                    }
+                    (ReservedFrz | ReservedIM | Cell, _) => {
+                        unreachable!("self is a noop transition")
+                    }
+                    (Unique | Frozen | Disabled, ReservedFrzConflicted | ReservedIM)
+                    | (Disabled, Frozen)
+                    | (ReservedFrzConflicted, ReservedIM) => {
+                        unreachable!("permissions between self and err must be increasing")
+                    }
                 }
-                (ReservedFrz | ReservedIM | Cell, _) => unreachable!("self is a noop transition"),
-                (Unique | Frozen | Disabled, ReservedFrzConflicted | ReservedIM)
-                | (Disabled, Frozen)
-                | (ReservedFrzConflicted, ReservedIM) => {
-                    unreachable!("permissions between self and err must be increasing")
-                }
-            },
+            }
             TransitionError::ProtectedDisabled(before_disabled) => {
                 match (self.to, before_disabled.inner) {
                     (Unique, Unique) => true,

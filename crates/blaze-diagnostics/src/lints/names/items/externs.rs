@@ -18,12 +18,14 @@
 //! (`ImproperCTypes`, `UsesPowerAlignment`, `BuiltinClashingExtern`) (MIT or Apache-2.0).
 
 use hir_ty::db::HirDatabase;
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 use std::{cell::OnceCell, str::FromStr};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use blaze_mem::Frame;
 use either::Either;
@@ -49,6 +51,7 @@ use rustc_type_ir::{
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, WalkEvent,
     view::{self as ast, AstNode},
@@ -154,7 +157,10 @@ impl State {
 }
 
 /// The types of one item, in its param env.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+)]
 struct Types<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     interner: DbInterner<'db>,
@@ -168,14 +174,25 @@ struct Types<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one item's check, dropped with it, not global state"
+    )]
     fn new(cx: &'c Cx<'a, 'db>, owner: GenericDefId) -> Self {
         let db = cx.db;
         let krate = cx.krate.base();
         let interner = DbInterner::new_with(db, krate);
         let env = db.trait_environment(owner);
         let limit = crate_def_map(db, krate).recursion_limit() as usize;
-        Types { cx, interner, infcx: OnceCell::new(), env, krate, limit, adts: Vec::new_in(cx.frame()) }
+        Types {
+            cx,
+            interner,
+            infcx: OnceCell::new(),
+            env,
+            krate,
+            limit,
+            adts: Vec::new_in(cx.frame()),
+        }
     }
 
     fn infcx(&self) -> &InferCtxt<'db> {
@@ -220,16 +237,23 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
             VariantId::EnumVariantId(it) => AttrDefId::EnumVariantId(it),
             _ => AttrDefId::AdtId(adt),
         };
-        !self.is_local(adt) && AttrFlags::query(self.cx.db, owner).contains(AttrFlags::NON_EXHAUSTIVE)
+        !self.is_local(adt)
+            && AttrFlags::query(self.cx.db, owner).contains(AttrFlags::NON_EXHAUSTIVE)
     }
 
     fn variants_non_exhaustive(&self, adt: EnumId) -> bool {
-        AttrFlags::query(self.cx.db, AttrDefId::AdtId(AdtId::EnumId(adt))).contains(AttrFlags::NON_EXHAUSTIVE)
+        AttrFlags::query(self.cx.db, AttrDefId::AdtId(AdtId::EnumId(adt)))
+            .contains(AttrFlags::NON_EXHAUSTIVE)
     }
 
     /// rustc's `transparent_newtype_field`: the type, given `args`, of the first field of
     /// `variant` that is not a 1-ZST as declared.
-    fn transparent_field(&self, adt: AdtId, variant: VariantId, args: GenericArgs<'db>) -> Option<Ty<'db>> {
+    fn transparent_field(
+        &self,
+        adt: AdtId,
+        variant: VariantId,
+        args: GenericArgs<'db>,
+    ) -> Option<Ty<'db>> {
         let db = self.cx.db;
         let env = db.trait_environment(GenericDefId::AdtId(adt));
         let types = db.field_types(variant);
@@ -243,7 +267,8 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     }
 
     fn nonnull_optimization_guaranteed(&self, adt: AdtId) -> bool {
-        walk::attr(self.cx, adt_source(self.cx, adt).value, "rustc_nonnull_optimization_guaranteed").is_some()
+        walk::attr(self.cx, adt_source(self.cx, adt).value, "rustc_nonnull_optimization_guaranteed")
+            .is_some()
     }
 
     /// rustc's `ty_is_known_nonnull`.
@@ -289,11 +314,17 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
         match ty.kind() {
             TyKind::Adt(def, args) => {
                 let adt = def.def_id();
-                let inner = variants(self.cx.db, adt).filter_map(|variant| self.transparent_field(adt, variant, args)).last()?;
+                let inner = variants(self.cx.db, adt)
+                    .filter_map(|variant| self.transparent_field(adt, variant, args))
+                    .last()?;
                 self.nullable(inner)
             }
             TyKind::Pat(base, _) => self.nullable(base),
-            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Char | TyKind::RawPtr(..) | TyKind::FnPtr(..) => Some(ty),
+            TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Char
+            | TyKind::RawPtr(..)
+            | TyKind::FnPtr(..) => Some(ty),
             TyKind::Ref(_, inner, mutbl) => Some(Ty::new_ptr(self.interner, inner, mutbl)),
             _ => None,
         }
@@ -306,8 +337,13 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
         }
         match ty.kind() {
             TyKind::Adt(def, _) => match def.def_id() {
-                AdtId::StructId(it) => VariantId::StructId(it).fields(self.cx.db).fields().is_empty(),
-                AdtId::EnumId(it) => !self.variants_non_exhaustive(it) && variants(self.cx.db, def.def_id()).next().is_none(),
+                AdtId::StructId(it) => {
+                    VariantId::StructId(it).fields(self.cx.db).fields().is_empty()
+                }
+                AdtId::EnumId(it) => {
+                    !self.variants_non_exhaustive(it)
+                        && variants(self.cx.db, def.def_id()).next().is_none()
+                }
                 AdtId::UnionId(_) => false,
             },
             TyKind::Tuple(tys) => tys.is_empty(),
@@ -322,8 +358,13 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
             TyKind::Adt(def, args) => {
                 let db = self.cx.db;
                 let mut all = variants(db, def.def_id());
-                let (Some(one), Some(two), None) = (all.next(), all.next(), all.next()) else { return None };
-                let (mut one, mut two) = (field_tys(db, self.interner, one, args), field_tys(db, self.interner, two, args));
+                let (Some(one), Some(two), None) = (all.next(), all.next(), all.next()) else {
+                    return None;
+                };
+                let (mut one, mut two) = (
+                    field_tys(db, self.interner, one, args),
+                    field_tys(db, self.interner, two, args),
+                );
                 let field = match ((one.next(), one.next()), (two.next(), two.next())) {
                     ((None, _), (Some(field), None)) | ((Some(field), None), (None, _)) => field,
                     ((Some(a), None), (Some(b), None)) => {
@@ -358,7 +399,8 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     }
 
     fn is_diagnostic_item(&self, adt: AdtId, names: &[&str]) -> bool {
-        AttrFlags::diagnostic_item(self.cx.db, AttrDefId::AdtId(adt)).is_some_and(|it| names.contains(&it.as_str()))
+        AttrFlags::diagnostic_item(self.cx.db, AttrDefId::AdtId(adt))
+            .is_some_and(|it| names.contains(&it.as_str()))
     }
 }
 
@@ -378,22 +420,42 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
 
     fn check_type(&mut self, state: State, ty: Ty<'db>) -> FfiResult<'db> {
         if let Some(ty) = opaque(ty) {
-            return FfiResult::Unsafe { ty, reason: "opaque types have no C equivalent", help: None };
+            return FfiResult::Unsafe {
+                ty,
+                reason: "opaque types have no C equivalent",
+                help: None,
+            };
         }
         let ty = self.types.normalize(ty);
         if let Some(ty) = opaque(ty) {
-            return FfiResult::Unsafe { ty, reason: "opaque types have no C equivalent", help: None };
+            return FfiResult::Unsafe {
+                ty,
+                reason: "opaque types have no C equivalent",
+                help: None,
+            };
         }
         self.visit_type(state, ty)
     }
 
-    fn visit_indirection(&mut self, state: State, ty: Ty<'db>, inner: Ty<'db>, boxed: bool) -> FfiResult<'db> {
+    fn visit_indirection(
+        &mut self,
+        state: State,
+        ty: Ty<'db>,
+        inner: Ty<'db>,
+        boxed: bool,
+    ) -> FfiResult<'db> {
         if boxed {
-            if state.is_in_defined_function() || (state.is_in_fnptr() && self.base_mode == CItemKind::Definition) {
+            if state.is_in_defined_function()
+                || (state.is_in_fnptr() && self.base_mode == CItemKind::Definition)
+            {
                 if self.types.is_sized(inner) {
                     return FfiResult::Safe;
                 }
-                return FfiResult::Unsafe { ty, reason: "box cannot be represented as a single pointer", help: None };
+                return FfiResult::Unsafe {
+                    ty,
+                    reason: "box cannot be represented as a single pointer",
+                    help: None,
+                };
             }
             return match ty.kind() {
                 TyKind::Adt(def, args) => self.visit_struct_or_union(state, ty, def.def_id(), args),
@@ -445,13 +507,23 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
         if all_phantom {
             FfiResult::Phantom(ty)
         } else if all_zst {
-            FfiResult::Unsafe { ty, reason: "this struct contains only zero-sized fields", help: None }
+            FfiResult::Unsafe {
+                ty,
+                reason: "this struct contains only zero-sized fields",
+                help: None,
+            }
         } else {
             FfiResult::Safe
         }
     }
 
-    fn visit_struct_or_union(&mut self, state: State, ty: Ty<'db>, adt: AdtId, args: GenericArgs<'db>) -> FfiResult<'db> {
+    fn visit_struct_or_union(
+        &mut self,
+        state: State,
+        ty: Ty<'db>,
+        adt: AdtId,
+        args: GenericArgs<'db>,
+    ) -> FfiResult<'db> {
         self.types.adts.push(adt);
         let repr = self.types.repr(adt);
         let is_struct = matches!(adt, AdtId::StructId(_));
@@ -475,7 +547,11 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
             AdtId::EnumId(_) => return FfiResult::Safe,
         };
         if self.types.fields_non_exhaustive(adt, variant) {
-            let reason = if is_struct { "this struct is non-exhaustive" } else { "this union is non-exhaustive" };
+            let reason = if is_struct {
+                "this struct is non-exhaustive"
+            } else {
+                "this union is non-exhaustive"
+            };
             return FfiResult::Unsafe { ty, reason, help: None };
         }
         if variant.fields(self.types.cx.db).fields().is_empty() {
@@ -489,7 +565,13 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
         self.visit_variant_fields(state, ty, adt, variant, args)
     }
 
-    fn visit_enum(&mut self, state: State, ty: Ty<'db>, adt: EnumId, args: GenericArgs<'db>) -> FfiResult<'db> {
+    fn visit_enum(
+        &mut self,
+        state: State,
+        ty: Ty<'db>,
+        adt: EnumId,
+        args: GenericArgs<'db>,
+    ) -> FfiResult<'db> {
         let id = AdtId::EnumId(adt);
         self.types.adts.push(id);
         let mut all = variants(self.types.cx.db, id).peekable();
@@ -516,7 +598,11 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
                 return FfiResult::Unsafe { ty, reason: "this enum is non-exhaustive", help: None };
             }
             if self.types.fields_non_exhaustive(id, variant) {
-                return FfiResult::Unsafe { ty, reason: "this enum has non-exhaustive variants", help: None };
+                return FfiResult::Unsafe {
+                    ty,
+                    reason: "this enum has non-exhaustive variants",
+                    help: None,
+                };
             }
             match self.visit_variant_fields(state, ty, id, variant, args) {
                 FfiResult::Safe => {}
@@ -547,7 +633,9 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
                         {
                             return unsafe_(
                                 "`CStr`/`CString` do not have a guaranteed layout",
-                                Some("consider passing a `*const std::ffi::c_char` instead, and use `CStr::as_ptr()`"),
+                                Some(
+                                    "consider passing a `*const std::ffi::c_char` instead, and use `CStr::as_ptr()`",
+                                ),
                             );
                         }
                         self.visit_struct_or_union(state, ty, adt, args)
@@ -556,27 +644,42 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
             }
             TyKind::Pat(base, _) => self.visit_type(state, base),
             TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool => FfiResult::Safe,
-            TyKind::Char => {
-                unsafe_("the `char` type has no C equivalent", Some("consider using `u32` or `libc::wchar_t` instead"))
+            TyKind::Char => unsafe_(
+                "the `char` type has no C equivalent",
+                Some("consider using `u32` or `libc::wchar_t` instead"),
+            ),
+            TyKind::Slice(_) => {
+                unsafe_("slices have no C equivalent", Some("consider using a raw pointer instead"))
             }
-            TyKind::Slice(_) => unsafe_("slices have no C equivalent", Some("consider using a raw pointer instead")),
             TyKind::Dynamic(..) => unsafe_("trait objects have no C equivalent", None),
-            TyKind::Str => {
-                unsafe_("string slices have no C equivalent", Some("consider using `*const u8` and a length instead"))
-            }
+            TyKind::Str => unsafe_(
+                "string slices have no C equivalent",
+                Some("consider using `*const u8` and a length instead"),
+            ),
             TyKind::Tuple(tys) => {
-                if tys.is_empty() && state.root.ret && matches!(state.outer, Outer::None | Outer::NoneThroughFnPtr) {
+                if tys.is_empty()
+                    && state.root.ret
+                    && matches!(state.outer, Outer::None | Outer::NoneThroughFnPtr)
+                {
                     FfiResult::Safe
                 } else {
-                    unsafe_("tuples have unspecified layout", Some("consider using a struct instead"))
+                    unsafe_(
+                        "tuples have unspecified layout",
+                        Some("consider using a struct instead"),
+                    )
                 }
             }
-            TyKind::RawPtr(inner, _) if matches!(inner.kind(), TyKind::Tuple(tys) if tys.is_empty()) => FfiResult::Safe,
+            TyKind::RawPtr(inner, _) if matches!(inner.kind(), TyKind::Tuple(tys) if tys.is_empty()) => {
+                FfiResult::Safe
+            }
             TyKind::RawPtr(inner, _) => self.visit_indirection(state, ty, inner, false),
             TyKind::Ref(_, inner, _) => self.visit_indirection(state, ty, inner, false),
             TyKind::Array(inner, _) => {
                 if state.root.func && state.outer == Outer::None {
-                    unsafe_("passing raw arrays by value is not FFI-safe", Some("consider passing a pointer to the array"))
+                    unsafe_(
+                        "passing raw arrays by value is not FFI-safe",
+                        Some("consider passing a pointer to the array"),
+                    )
                 } else {
                     self.visit_type(state.next(), inner)
                 }
@@ -602,13 +705,20 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
                 unsafe_("opaque types have no C equivalent", None)
             }
-            TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }, .. })
-                if state.can_expect_ty_params() =>
-            {
-                FfiResult::Safe
+            TyKind::Param(_)
+            | TyKind::Alias(
+                _,
+                AliasTy {
+                    kind: AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }, ..
+                },
+            ) if state.can_expect_ty_params() => FfiResult::Safe,
+            TyKind::UnsafeBinder(_) => {
+                unsafe_("unsafe binders are incompatible with foreign function interfaces", None)
             }
-            TyKind::UnsafeBinder(_) => unsafe_("unsafe binders are incompatible with foreign function interfaces", None),
-            TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::Coroutine(..) | TyKind::CoroutineWitness(..) => {
+            TyKind::Closure(..)
+            | TyKind::CoroutineClosure(..)
+            | TyKind::Coroutine(..)
+            | TyKind::CoroutineWitness(..) => {
                 unsafe_("closures and coroutines are not FFI-safe", None)
             }
             // rustc's `bug!`s: parameters where none can be, inference and bound variables,
@@ -627,15 +737,16 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
 
 /// The first opaque type in `ty`, as rustc's `ProhibitOpaqueTypes` finds it.
 fn opaque(ty: Ty<'_>) -> Option<Ty<'_>> {
-    ty.walk()
-        .filter_map(|it| it.ty())
-        .find(|it| matches!(it.kind(), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. })))
+    ty.walk().filter_map(|it| it.ty()).find(|it| {
+        matches!(it.kind(), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }))
+    })
 }
 
 fn is_mutable_ptr(ty: Ty<'_>) -> bool {
     matches!(
         ty.kind(),
-        TyKind::RawPtr(_, rustc_type_ir::Mutability::Mut) | TyKind::Ref(_, _, rustc_type_ir::Mutability::Mut)
+        TyKind::RawPtr(_, rustc_type_ir::Mutability::Mut)
+            | TyKind::Ref(_, _, rustc_type_ir::Mutability::Mut)
     )
 }
 
@@ -653,9 +764,9 @@ fn variants(db: &Db, adt: AdtId) -> impl Iterator<Item = VariantId> + '_ {
     match adt {
         AdtId::StructId(it) => Either::Left(std::iter::once(VariantId::StructId(it))),
         AdtId::UnionId(it) => Either::Left(std::iter::once(VariantId::UnionId(it))),
-        AdtId::EnumId(it) => {
-            Either::Right(it.enum_variants(db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)))
-        }
+        AdtId::EnumId(it) => Either::Right(
+            it.enum_variants(db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)),
+        ),
     }
 }
 
@@ -667,7 +778,11 @@ fn field_tys<'db>(
     args: GenericArgs<'db>,
 ) -> impl Iterator<Item = Ty<'db>> + 'db {
     let types = db.field_types(variant);
-    variant.fields(db).fields().iter().map(move |(field, _)| types[field].ty().instantiate(interner, args).skip_norm_wip())
+    variant
+        .fields(db)
+        .fields()
+        .iter()
+        .map(move |(field, _)| types[field].ty().instantiate(interner, args).skip_norm_wip())
 }
 
 /// The ABI an `extern` block or a `fn` pointer type is written with, `None` if it is not one.
@@ -727,10 +842,11 @@ impl<'db> Pass<'_, '_, 'db> {
                     if let Some(ptr) = ast::FnPtrType::cast(node)
                         && abi_of(ptr.abi(), ExternAbi::Rust).is_some_and(|it| !it.is_rustic_abi())
                     {
-                        let range = match node.parent().filter(|it| ast::ForType::can_cast(it.kind())) {
-                            Some(for_ty) => for_ty.text_range(),
-                            None => node.text_range(),
-                        };
+                        let range =
+                            match node.parent().filter(|it| ast::ForType::can_cast(it.kind())) {
+                                Some(for_ty) => for_ty.text_range(),
+                                None => node.text_range(),
+                            };
                         written.push((depth, range));
                     }
                 }
@@ -765,7 +881,9 @@ impl<'db> Pass<'_, '_, 'db> {
         let written = || params.into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty());
         let output = f.ret_type().and_then(|it| it.ty());
         if !abi.is_rustic_abi() {
-            let this_span = this.map(|this| this.ty().map_or(this.syntax().text_range(), |it| it.syntax().text_range()));
+            let this_span = this.map(|this| {
+                this.ty().map_or(this.syntax().text_range(), |it| it.syntax().text_range())
+            });
             let spans = this_span.into_iter().chain(written().map(|ty| ty.syntax().text_range()));
             for (&input, range) in sig.inputs().iter().zip(spans) {
                 let mut visitor = Visitor::new(&mut types, input, mode);
@@ -776,7 +894,13 @@ impl<'db> Pass<'_, '_, 'db> {
                 let ret = sig.output();
                 let mut visitor = Visitor::new(&mut types, ret, mode);
                 let result = visitor.check_type(State::fn_entry(mode, FnPos::Ret), ret);
-                self.emit(&mut types, &site, item.node.with_value(output.syntax().text_range()), result, mode);
+                self.emit(
+                    &mut types,
+                    &site,
+                    item.node.with_value(output.syntax().text_range()),
+                    result,
+                    mode,
+                );
             }
         } else {
             let this_ty = this.and_then(|it| it.ty());
@@ -788,7 +912,14 @@ impl<'db> Pass<'_, '_, 'db> {
             }
             if let Some(output) = output {
                 let state = State::fn_entry(mode, FnPos::Ret);
-                self.fnptrs(&mut types, &site, state, item.node.with_value(output), sig.output(), mode);
+                self.fnptrs(
+                    &mut types,
+                    &site,
+                    state,
+                    item.node.with_value(output),
+                    sig.output(),
+                    mode,
+                );
             }
         }
     }
@@ -805,16 +936,35 @@ impl<'db> Pass<'_, '_, 'db> {
         let mode = CItemKind::Declaration;
         let mut visitor = Visitor::new(&mut types, ty, mode);
         let result = visitor.check_type(State::static_entry(), ty);
-        self.emit(&mut types, &site, item.node.with_value(hir_ty.syntax().text_range()), result, mode);
+        self.emit(
+            &mut types,
+            &site,
+            item.node.with_value(hir_ty.syntax().text_range()),
+            result,
+            mode,
+        );
     }
 
     /// rustc's `check_item` of a static, a const or a type alias.
-    fn typed(&mut self, item: &Item<'db>, owner: GenericDefId, ty: Ty<'db>, hir_ty: Option<ast::Type<'db>>) {
+    fn typed(
+        &mut self,
+        item: &Item<'db>,
+        owner: GenericDefId,
+        ty: Ty<'db>,
+        hir_ty: Option<ast::Type<'db>>,
+    ) {
         let Some(hir_ty) = hir_ty else { return };
         let mut types = Types::new(self.cx, owner);
         let site = Site { at: item.ptr(), item };
         let state = State::static_entry();
-        self.fnptrs(&mut types, &site, state, item.node.with_value(hir_ty), ty, CItemKind::Definition);
+        self.fnptrs(
+            &mut types,
+            &site,
+            state,
+            item.node.with_value(hir_ty),
+            ty,
+            CItemKind::Definition,
+        );
     }
 
     /// rustc's `check_struct_for_power_alignment`, on AIX.
@@ -857,7 +1007,14 @@ impl<'db> Pass<'_, '_, 'db> {
             let Some(hir_ty) = field.value.children().find_map(ast::Type::cast) else { continue };
             let site = Site { at: field.map(ast::ptr), item };
             let state = State::static_entry();
-            self.fnptrs(&mut types, &site, state, field.with_value(hir_ty), ty, CItemKind::Definition);
+            self.fnptrs(
+                &mut types,
+                &site,
+                state,
+                field.with_value(hir_ty),
+                ty,
+                CItemKind::Definition,
+            );
         }
     }
 
@@ -885,7 +1042,11 @@ impl<'db> Pass<'_, '_, 'db> {
         let printed = crate::print::solver_ty(cx, ty);
         let span = cx.span(range);
         // alloc: the firing lint's message; clone: its span, labelled too
-        let mut diag = Diag::lint(lint, format!("`extern` {desc} uses type `{printed}`, which is not FFI-safe"), span.clone());
+        let mut diag = Diag::lint(
+            lint,
+            format!("`extern` {desc} uses type `{printed}`, which is not FFI-safe"),
+            span.clone(),
+        );
         diag.span_label(span, "not FFI-safe");
         if let Some(help) = help {
             diag.help(help);
@@ -895,7 +1056,10 @@ impl<'db> Pass<'_, '_, 'db> {
             && types.is_local(def.def_id())
         {
             let source = adt_source(cx, def.def_id());
-            diag.span_note(cx.span(source.map(|it| def_span(it.syntax()))), "the type is defined here");
+            diag.span_note(
+                cx.span(source.map(|it| def_span(it.syntax()))),
+                "the type is defined here",
+            );
         }
         if let Some((id, name)) = super::item_id(cx, site.item) {
             diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: the firing lint's fact
@@ -905,7 +1069,10 @@ impl<'db> Pass<'_, '_, 'db> {
             if seen.insert(adt) {
                 let name = cx.def_path(ModuleDef::Adt(adt.into()));
                 // alloc: the firing lint's fact
-                diag.fact(Fact::Layout(cx.key(ItemId::Adt(adt))), format!("the representation of `{name}`"));
+                diag.fact(
+                    Fact::Layout(cx.key(ItemId::Adt(adt))),
+                    format!("the representation of `{name}`"),
+                );
             }
         }
         types.adts.clear();
@@ -917,7 +1084,9 @@ impl<'db> Pass<'_, '_, 'db> {
 /// than 4 bytes, or a `repr(C)` struct holding one.
 fn power_aligned<'db>(types: &Types<'_, '_, 'db>, ty: Ty<'db>) -> bool {
     match ty.kind() {
-        TyKind::Float(it) => matches!(it, rustc_type_ir::FloatTy::F64 | rustc_type_ir::FloatTy::F128),
+        TyKind::Float(it) => {
+            matches!(it, rustc_type_ir::FloatTy::F64 | rustc_type_ir::FloatTy::F128)
+        }
         TyKind::Adt(def, _) => {
             let AdtId::StructId(it) = def.def_id() else { return false };
             let repr = types.repr(def.def_id());
@@ -959,7 +1128,9 @@ fn field_ty<'db>(cx: &Cx<'_, 'db>, field: InFile<ast::Node<'db>>) -> Option<Ty<'
 /// Whether a syntax node is a type rustc's HIR has one of: not the parentheses around one,
 /// nor the `for<..>` of a `fn` pointer type.
 fn counted(node: ast::Node<'_>) -> bool {
-    ast::Type::can_cast(node.kind()) && !ast::ParenType::can_cast(node.kind()) && !ast::ForType::can_cast(node.kind())
+    ast::Type::can_cast(node.kind())
+        && !ast::ParenType::can_cast(node.kind())
+        && !ast::ForType::can_cast(node.kind())
 }
 
 /// rustc's `ImproperCTypesLint` at an item itself: `check_foreign_item`, and `check_item` of a
@@ -970,7 +1141,9 @@ pub(super) fn ctypes_item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate
     match (item.node.value, item.container) {
         (ast::Item::Fn(f), Container::Extern(_)) => pass.function(item, f, CItemKind::Declaration),
         (ast::Item::Static(s), Container::Extern(block)) => {
-            if abi_of(block.value.abi(), ExternAbi::C { unwind: false }).is_some_and(|it| !it.is_rustic_abi()) {
+            if abi_of(block.value.abi(), ExternAbi::C { unwind: false })
+                .is_some_and(|it| !it.is_rustic_abi())
+            {
                 pass.foreign_static(item, s);
             }
         }
@@ -1008,7 +1181,9 @@ pub(super) fn ctypes_nested<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Foun
     let mut pass = Pass { cx, found: Vec::new() }; // alloc: empty until a lint fires; holds only what fires
     match (item.node.value, item.container) {
         (ast::Item::Fn(_), Container::Extern(_)) => {}
-        (ast::Item::Fn(f), _) if f.body().is_some() => pass.function(item, f, CItemKind::Definition),
+        (ast::Item::Fn(f), _) if f.body().is_some() => {
+            pass.function(item, f, CItemKind::Definition)
+        }
         (ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_), _) => pass.fields(item),
         _ => {}
     }
@@ -1042,9 +1217,13 @@ impl<'db> Same<'_, '_, '_, 'db> {
         loop {
             if let TyKind::Adt(def, args) = ty.kind() {
                 let adt = def.def_id();
-                if self.types.repr(adt).transparent() && !self.types.nonnull_optimization_guaranteed(adt) {
+                if self.types.repr(adt).transparent()
+                    && !self.types.nonnull_optimization_guaranteed(adt)
+                {
                     let first = variants(self.types.cx.db, adt).next();
-                    if let Some(field) = first.and_then(|variant| self.types.transparent_field(adt, variant, args)) {
+                    if let Some(field) =
+                        first.and_then(|variant| self.types.transparent_field(adt, variant, args))
+                    {
                         ty = field;
                         continue;
                     }
@@ -1063,7 +1242,13 @@ impl<'db> Same<'_, '_, '_, 'db> {
 
     fn fn_def_sig(&self, def: CallableIdWrapper, args: GenericArgs<'db>) -> FnSig<'db> {
         let interner = self.types.interner;
-        let sig = self.types.cx.db.callable_item_signature(def.0).instantiate(interner, args).skip_norm_wip();
+        let sig = self
+            .types
+            .cx
+            .db
+            .callable_item_signature(def.0)
+            .instantiate(interner, args)
+            .skip_norm_wip();
         interner.instantiate_bound_regions_with_erased(sig)
     }
 
@@ -1091,23 +1276,35 @@ impl<'db> Same<'_, '_, '_, 'db> {
         };
         match (a.kind(), b.kind()) {
             (TyKind::Adt(a_def, a_args), TyKind::Adt(b_def, b_args)) => {
-                let (a_repr, b_repr) = (self.types.repr(a_def.def_id()), self.types.repr(b_def.def_id()));
+                let (a_repr, b_repr) =
+                    (self.types.repr(a_def.def_id()), self.types.repr(b_def.def_id()));
                 if !(a_repr.c() && b_repr.c()) {
                     return false;
                 }
-                if (a_repr.pack, a_repr.align, a_repr.simd()) != (b_repr.pack, b_repr.align, b_repr.simd()) {
+                if (a_repr.pack, a_repr.align, a_repr.simd())
+                    != (b_repr.pack, b_repr.align, b_repr.simd())
+                {
                     return false;
                 }
                 let (db, interner) = (self.types.cx.db, self.types.interner);
-                let fields = |def: AdtId, args| variants(db, def).flat_map(move |variant| field_tys(db, interner, variant, args));
+                let fields = |def: AdtId, args| {
+                    variants(db, def)
+                        .flat_map(move |variant| field_tys(db, interner, variant, args))
+                };
                 let (a_def, b_def) = (a_def.def_id(), b_def.def_id());
                 fields(a_def, a_args).count() == fields(b_def, b_args).count()
                     && fields(a_def, a_args).zip(fields(b_def, b_args)).all(|(a, b)| self.ty(a, b))
             }
-            (TyKind::Array(a_ty, a_len), TyKind::Array(b_ty, b_len)) => a_len == b_len && self.ty(a_ty, b_ty),
+            (TyKind::Array(a_ty, a_len), TyKind::Array(b_ty, b_len)) => {
+                a_len == b_len && self.ty(a_ty, b_ty)
+            }
             (TyKind::Slice(a_ty), TyKind::Slice(b_ty)) => self.ty(a_ty, b_ty),
-            (TyKind::RawPtr(a_ty, a_mut), TyKind::RawPtr(b_ty, b_mut)) => a_mut == b_mut && self.ty(a_ty, b_ty),
-            (TyKind::Ref(_, a_ty, a_mut), TyKind::Ref(_, b_ty, b_mut)) => a_mut == b_mut && self.ty(a_ty, b_ty),
+            (TyKind::RawPtr(a_ty, a_mut), TyKind::RawPtr(b_ty, b_mut)) => {
+                a_mut == b_mut && self.ty(a_ty, b_ty)
+            }
+            (TyKind::Ref(_, a_ty, a_mut), TyKind::Ref(_, b_ty, b_mut)) => {
+                a_mut == b_mut && self.ty(a_ty, b_ty)
+            }
             (TyKind::FnDef(a_def, a_args), TyKind::FnDef(b_def, b_args)) => {
                 let a_sig = self.fn_def_sig(a_def, a_args.skip_binder());
                 let b_sig = self.fn_def_sig(b_def, b_args.skip_binder());
@@ -1131,7 +1328,9 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
     let mut decls = Vec::new_in(cx.frame());
     let mut orders = Orders::default();
     for item in items {
-        let (ast::Item::Fn(f), Container::Extern(_)) = (item.node.value, item.container) else { continue };
+        let (ast::Item::Fn(f), Container::Extern(_)) = (item.node.value, item.container) else {
+            continue;
+        };
         let Some(def) = cx.vsema.to_def2(item.node.with_value(f)) else { continue };
         let Ok(id) = FunctionId::try_from(def) else { continue };
         let lo = cx.span(item.node.map(|it| item_range_view(it.syntax()))).lo;
@@ -1155,7 +1354,9 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
         let (_, first_item, first_f, first_def, first_id) = &decls[first];
         let types = Types::new(cx, GenericDefId::FunctionId(*id));
         let interner = types.interner;
-        let sig_of = |id: FunctionId| db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
+        let sig_of = |id: FunctionId| {
+            db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder()
+        };
         let (expected, this_sig) = (sig_of(*first_id), sig_of(*id));
         let mut same = Same { types: &types, seen: HashSet::new_in(Global) };
         let erased = (
@@ -1185,12 +1386,24 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
         let mut diag = Diag::lint("clashing_extern_declarations", message, mismatch.clone());
         diag.span_label(previous, format!("`{orig}` previously declared here")); // alloc: its label
         diag.span_label(mismatch, "this signature doesn't match the previous declaration");
-        let print = |def: &hir::Function, sig| cx.ty(&def.ret_type(db).derived_from_next_solver(Ty::new_fn_ptr(interner, sig)));
-        diag.note(format!("expected `{}`\n   found `{}`", print(first_def, expected), print(def, this_sig))); // alloc: its note
+        let print = |def: &hir::Function, sig| {
+            cx.ty(&def.ret_type(db).derived_from_next_solver(Ty::new_fn_ptr(interner, sig)))
+        };
+        diag.note(format!(
+            "expected `{}`\n   found `{}`",
+            print(first_def, expected),
+            print(def, this_sig)
+        )); // alloc: its note
         let first_name = FunctionSignature::of(db, *first_id).name.as_str().to_owned(); // alloc: its fact
         // alloc: its facts
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(*first_id))), format!("the signature of `{first_name}`"));
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(*id))), format!("the signature of `{this}`")); // alloc: as above
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Function(*first_id))),
+            format!("the signature of `{first_name}`"),
+        );
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Function(*id))),
+            format!("the signature of `{this}`"),
+        ); // alloc: as above
         found.push(Found::lint(diag, Phase::Late, item.ptr()));
     }
     found

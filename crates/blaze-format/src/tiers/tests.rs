@@ -7,7 +7,9 @@ use super::{
     WarmColumn, WarmRef, Width, cold_codec, columns_of, compress, decode_cold, decode_cold_bytes,
     decode_raw, encode_cold, encode_cold_bytes, encode_raw, raw_cold,
 };
-use crate::{Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, leb, open, record, row_words};
+use crate::{
+    Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, leb, open, record, row_words,
+};
 
 const SEEDS: [u64; 4] = [1, 17, 4242, 0x9e37_79b9_7f4a_7c15];
 
@@ -61,8 +63,7 @@ fn leaked(buffer: Aligned) -> &'static Aligned {
 #[test]
 fn a_hot_column_round_trips_every_shape() {
     for seed in SEEDS {
-        columns::round_trips(hot_buffer, |buffer| hot(buffer).map(|it| it.to_vec()), seed)
-            .unwrap();
+        columns::round_trips(hot_buffer, |buffer| hot(buffer).map(|it| it.to_vec()), seed).unwrap();
     }
 }
 
@@ -149,7 +150,12 @@ fn a_warm_column_unpacks_any_run() {
                 let len = rng.below((values.len() - start) as u64 + 1) as usize;
                 let mut out = vec![0; len];
                 column.unpack(start, &mut out);
-                assert_eq!(out, &values[start..start + len], "{name} of {} at {start}", values.len());
+                assert_eq!(
+                    out,
+                    &values[start..start + len],
+                    "{name} of {} at {start}",
+                    values.len()
+                );
             }
         }
     }
@@ -195,7 +201,10 @@ fn a_warm_column_that_does_not_fit_its_words_is_refused() {
         edit(&mut column);
         assert_eq!(out.push(&WarmRoot { column }), at);
         let buffer = Aligned::copy_from(&out.finish(at));
-        matches!(warm(&buffer), Err(FormatError::Invalid { what: "a warm column whose words don't fit it", .. }))
+        matches!(
+            warm(&buffer),
+            Err(FormatError::Invalid { what: "a warm column whose words don't fit it", .. })
+        )
     };
     assert!(!corrupt(|_| {}));
     assert!(corrupt(|column| column.bits = 33));
@@ -208,8 +217,12 @@ fn a_warm_column_that_does_not_fit_its_words_is_refused() {
 #[test]
 fn a_cold_column_round_trips_every_shape() {
     for seed in SEEDS {
-        columns::round_trips(|values| encode_cold(values, None), |bytes| decode_cold(bytes, None), seed)
-            .unwrap();
+        columns::round_trips(
+            |values| encode_cold(values, None),
+            |bytes| decode_cold(bytes, None),
+            seed,
+        )
+        .unwrap();
     }
 }
 
@@ -223,7 +236,12 @@ fn every_codec_round_trips_every_shape_it_holds() {
                 assert_eq!(raw.is_some(), codec != Codec::Deltas || sorted, "{name} in {codec:?}");
                 if let Some(raw) = raw {
                     assert_eq!(raw[0], codec as u8);
-                    assert_eq!(decode_raw(&raw), Ok(values.clone()), "{name} of {} in {codec:?}", values.len());
+                    assert_eq!(
+                        decode_raw(&raw),
+                        Ok(values.clone()),
+                        "{name} of {} in {codec:?}",
+                        values.len()
+                    );
                 }
             }
         }
@@ -286,7 +304,8 @@ fn a_warm_block_is_in_simd_bp128_layout() {
     let lanes = super::LANES;
     for lane in 0..lanes {
         for word in 0..8 {
-            let expected = (0..4).fold(0u32, |acc, k| acc | ((4 * (4 * word + k) + lane) as u32) << (8 * k));
+            let expected =
+                (0..4).fold(0u32, |acc, k| acc | ((4 * (4 * word + k) + lane) as u32) << (8 * k));
             assert_eq!(packed.words[word * lanes + lane], expected, "lane {lane} word {word}");
         }
     }
@@ -364,10 +383,16 @@ fn a_cold_column_is_read_only_with_its_dictionary() {
 fn a_corrupt_cold_column_is_refused() {
     let values: Vec<u32> = (0..1000).map(|i| i * 3).collect();
     let cold = encode_cold(&values, None);
-    assert_eq!(decode_cold(&cold[..COLD_HEADER - 1], None), Err(FormatError::Header("a cold column shorter than its header")));
+    assert_eq!(
+        decode_cold(&cold[..COLD_HEADER - 1], None),
+        Err(FormatError::Header("a cold column shorter than its header"))
+    );
     let mut version = cold.clone();
     version[0] = super::COLD_VERSION + 1;
-    assert_eq!(decode_cold(&version, None), Err(FormatError::Header("a cold column of another version")));
+    assert_eq!(
+        decode_cold(&version, None),
+        Err(FormatError::Header("a cold column of another version"))
+    );
     let mut length = cold.clone();
     length[33..41].copy_from_slice(&(1u64 << 40).to_le_bytes());
     assert_eq!(decode_cold(&length, None), Err(CORRUPT));
@@ -409,7 +434,10 @@ fn a_flipped_byte_never_panics_the_decoder() {
                     let mut bad = raw.clone();
                     bad[at] ^= flip;
                     if let Ok(back) = decode_raw(&bad) {
-                        assert!(back.len() as u64 <= super::MOST_VALUES, "{name} in {codec:?} at {at}");
+                        assert!(
+                            back.len() as u64 <= super::MOST_VALUES,
+                            "{name} in {codec:?} at {at}"
+                        );
                     }
                 }
             }
@@ -534,7 +562,11 @@ fn a_buffer_round_trips_warm_and_cold_exactly() {
             assert_eq!(forms.hot_from_warm(&warm).unwrap(), &buffer[..], "{seed} {nodes} warm");
             let cold = forms.cold(&buffer).unwrap();
             assert_eq!(forms.hot_from_cold(&cold).unwrap(), &buffer[..], "{seed} {nodes} cold");
-            assert!(cold.len() < buffer.len() || nodes < 60, "{seed} {nodes}: {} cold bytes", cold.len());
+            assert!(
+                cold.len() < buffer.len() || nodes < 60,
+                "{seed} {nodes}: {} cold bytes",
+                cold.len()
+            );
             let mut unaligned = vec![0u8];
             unaligned.extend_from_slice(&buffer);
             assert_eq!(forms.warm(&unaligned[1..]).unwrap(), warm, "{seed} {nodes} unaligned");

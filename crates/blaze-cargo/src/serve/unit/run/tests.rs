@@ -53,11 +53,18 @@ const NO_RUNTIME: &str = "it links no dev runtime (`blaze_inproc_rt`, the start 
 
 #[test]
 fn a_dev_process_that_is_no_dev_executable_says_why_and_what_blaze_lacks() {
-    for (profile, level) in [("dev", OptLevel::O0), ("test", OptLevel::O0), ("dev", OptLevel::O1), ("mine", OptLevel::O0)] {
+    for (profile, level) in [
+        ("dev", OptLevel::O0),
+        ("test", OptLevel::O0),
+        ("dev", OptLevel::O1),
+        ("mine", OptLevel::O0),
+    ] {
         let why = launch_of(profile, "app", &policy(level), Some(NO_RUNTIME)).unwrap_err();
         assert_eq!(
             why,
-            format!("`app` runs under profile `{profile}`, so on the daemon's code memory, and can't: {NO_RUNTIME}. {NOT_IN_PROCESS}")
+            format!(
+                "`app` runs under profile `{profile}`, so on the daemon's code memory, and can't: {NO_RUNTIME}. {NOT_IN_PROCESS}"
+            )
         );
     }
 }
@@ -71,7 +78,11 @@ fn a_release_process_starts_from_its_file() {
         ("dev", OptLevel::O2),
         ("small", OptLevel::Z),
     ] {
-        assert_eq!(launch_of(profile, "app", &policy(level), Some(NO_RUNTIME)), Ok(Launch::File), "{profile}");
+        assert_eq!(
+            launch_of(profile, "app", &policy(level), Some(NO_RUNTIME)),
+            Ok(Launch::File),
+            "{profile}"
+        );
     }
 }
 
@@ -80,7 +91,8 @@ fn a_dev_executable_runs_on_the_daemons_code_memory() {
     // `codegen::policy` makes a build live exactly when its unit is a dev executable
     // (`inproc::runs_in_process`): a dev binary or test binary of either profile starts in
     // process, never from its file.
-    for (profile, level) in [("dev", OptLevel::O0), ("test", OptLevel::O0), ("test", OptLevel::O1)] {
+    for (profile, level) in [("dev", OptLevel::O0), ("test", OptLevel::O0), ("test", OptLevel::O1)]
+    {
         let mut live = policy(level);
         live.mode = Mode::Live;
         assert_eq!(launch_of(profile, "app", &live, None), Ok(Launch::InProcess), "{profile}");

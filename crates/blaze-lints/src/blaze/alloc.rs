@@ -37,7 +37,9 @@ use hir_def::{
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate,
     db::HirDatabase as _,
-    next_solver::{DbInterner, EarlyBinder, GenericArg, GenericArgs, StoredGenericArgs, Ty, TyKind},
+    next_solver::{
+        DbInterner, EarlyBinder, GenericArg, GenericArgs, StoredGenericArgs, Ty, TyKind,
+    },
     traits::StoredParamEnvAndCrate,
 };
 use intern::sym;
@@ -68,7 +70,9 @@ impl Roots {
         match self {
             Roots::Alloc => is_alloc_root(db, f),
             Roots::Ambient => super::sans_io_core::ambient(db, f).is_root(),
-            Roots::Syscall => super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Root,
+            Roots::Syscall => {
+                super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Root
+            }
         }
     }
 
@@ -78,7 +82,9 @@ impl Roots {
         match self {
             Roots::Alloc => false,
             Roots::Ambient => super::sans_io_core::ambient(db, f).stops(),
-            Roots::Syscall => super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Stop,
+            Roots::Syscall => {
+                super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Stop
+            }
         }
     }
 }
@@ -147,7 +153,9 @@ pub(super) fn next_step<'db>(
 ) -> Option<Resolved<'db>> {
     match resolved {
         Resolved::Function(f, _) if roots.is_root(db, f) || roots.stops(db, f) => None,
-        Resolved::Function(f, args) => first_reaching_call(db, env, f, args, through_workspace, roots),
+        Resolved::Function(f, args) => {
+            first_reaching_call(db, env, f, args, through_workspace, roots)
+        }
         Resolved::Derived(impl_, method, args) => {
             derived_first(db, env, impl_, method, args, through_workspace, roots)
         }
@@ -158,7 +166,9 @@ pub(super) fn next_step<'db>(
 fn is_alloc_root(db: &Db, f: FunctionId) -> bool {
     let flags = AttrFlags::query(db, f.into());
     if flags.intersects(
-        AttrFlags::RUSTC_ALLOCATOR | AttrFlags::RUSTC_ALLOCATOR_ZEROED | AttrFlags::RUSTC_REALLOCATOR,
+        AttrFlags::RUSTC_ALLOCATOR
+            | AttrFlags::RUSTC_ALLOCATOR_ZEROED
+            | AttrFlags::RUSTC_REALLOCATOR,
     ) {
         return true;
     }
@@ -317,7 +327,8 @@ impl Std {
         };
         Std {
             global: adt(&["alloc", "alloc", "Global"]).or_else(|| adt(&["std", "alloc", "Global"])),
-            string: adt(&["alloc", "string", "String"]).or_else(|| adt(&["std", "string", "String"])),
+            string: adt(&["alloc", "string", "String"])
+                .or_else(|| adt(&["std", "string", "String"])),
         }
     }
 }

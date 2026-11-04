@@ -14,13 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    io::Read as _,
-    os::fd::AsFd as _,
-    sync::Arc,
-    thread::JoinHandle,
-    time::Duration,
-};
+use std::{io::Read as _, os::fd::AsFd as _, sync::Arc, thread::JoinHandle, time::Duration};
 
 use blaze_core::exit::Exit;
 use blaze_profile::{Watchdog, watchdog::Progress};
@@ -88,13 +82,22 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
     loop {
-        let progress = Progress { jobs: pool.ended(), queries: blaze_query::db::completed(), steps: pulse.moved(), working: 0 };
+        let progress = Progress {
+            jobs: pool.ended(),
+            queries: blaze_query::db::completed(),
+            steps: pulse.moved(),
+            working: 0,
+        };
         let now = now_ns();
         let quiet = watchdog.tick(now, progress, true);
         let again = signals::stops_asked() >= 2;
         if quiet.is_some() || again {
             let why = match quiet {
-                Some(quiet) => format!("nothing moved for {} s, its bound ({})", quiet.for_ns / 1_000_000_000, quiet.at), // alloc: once, as the process ends
+                Some(quiet) => format!(
+                    "nothing moved for {} s, its bound ({})",
+                    quiet.for_ns / 1_000_000_000,
+                    quiet.at
+                ), // alloc: once, as the process ends
                 None => format!("asked to stop again ({progress})"), // alloc: as above
             };
             let said = stalled(std::process::id(), &why);
@@ -117,7 +120,12 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
 /// rather than leave its children unreaped and its clients waiting for ever. `true` once a stop
 /// began; `false` once the guard is disarmed ([`Guard::disarm`]) with no stop, or when the pipe
 /// can't be read, so no stop is bounded.
-fn watch_turns(mut pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()>) -> bool {
+fn watch_turns(
+    mut pipe: std::fs::File,
+    bound: Duration,
+    pulse: &Pulse,
+    over: &Receiver<()>,
+) -> bool {
     let mut turning = LoopWatch::new(bound / 2);
     let mut watchdog = Watchdog::new(bound);
     let pool = blaze_graph::exec::shared();
@@ -135,7 +143,12 @@ fn watch_turns(mut pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &R
             tracing::error!(target: "blaze", "{said}");
             eprintln!("{said}");
         }
-        let progress = Progress { jobs: pool.ended(), queries: blaze_query::db::completed(), steps: turns, working: 0 };
+        let progress = Progress {
+            jobs: pool.ended(),
+            queries: blaze_query::db::completed(),
+            steps: turns,
+            working: 0,
+        };
         if let Some(quiet) = watchdog.tick(now, progress, look != Look::Turning) {
             // alloc: once, as the process ends
             let why = format!(
@@ -175,7 +188,9 @@ fn watch_turns(mut pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &R
 /// Without its pipe the guard hears no stop: said, and the stop runs unbounded.
 fn unread(error: &std::io::Error) -> bool {
     tracing::error!(target: "blaze", "the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}");
-    eprintln!("blaze serve: the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}");
+    eprintln!(
+        "blaze serve: the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}"
+    );
     false
 }
 
@@ -240,7 +255,9 @@ fn waits(within: Duration) -> String {
     let _wait = tracing::info_span!(target: "blaze", "read the scheduler's waits", awaits = "the scheduler's lock").entered();
     match heard.recv_timeout(within) {
         Ok(waits) => waits,
-        Err(_) => format!("the scheduler's waits: unread, its lock not had in {} s", within.as_secs()), // alloc: as above
+        Err(_) => {
+            format!("the scheduler's waits: unread, its lock not had in {} s", within.as_secs())
+        } // alloc: as above
     }
 }
 
@@ -291,7 +308,11 @@ mod tests {
 
     /// Runs the child with `bound_ms`, sends it `signals` SIGTERMs, and gives what it said on
     /// stderr and its exit code, waiting at most `within` from the first signal.
-    fn signalled(bound_ms: u64, signals: usize, within: Duration) -> (String, Option<i32>, Duration) {
+    fn signalled(
+        bound_ms: u64,
+        signals: usize,
+        within: Duration,
+    ) -> (String, Option<i32>, Duration) {
         use std::io::BufRead as _;
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
@@ -304,7 +325,10 @@ mod tests {
         let mut line = String::new();
         while !line.contains("ready") {
             line.clear();
-            assert!(stdout.read_line(&mut line).unwrap() > 0, "the child ended before it was ready");
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "the child ended before it was ready"
+            );
         }
         let pid = child.id().to_string();
         let sent = Instant::now();
@@ -341,14 +365,23 @@ mod tests {
         let (said, code, took) = signalled(500, 1, Duration::from_secs(30));
         assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
         assert!(took >= Duration::from_millis(500), "it waited for its bound: {took:?}");
-        for named in [STALLED, "nothing moved for", "worker deadlocked", "hold the test's lock", "wait graph"] {
+        for named in [
+            STALLED,
+            "nothing moved for",
+            "worker deadlocked",
+            "hold the test's lock",
+            "wait graph",
+        ] {
             assert!(said.contains(named), "it says {named:?}:\n{said}");
         }
         // A bound past the test's wait: the second signal alone ends it.
         let (said, code, took) = signalled(600_000, 2, Duration::from_secs(30));
         assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
         assert!(took < Duration::from_secs(30), "{took:?}");
-        assert!(said.contains("asked to stop again") && said.contains("worker deadlocked"), "{said}");
+        assert!(
+            said.contains("asked to stop again") && said.contains("worker deadlocked"),
+            "{said}"
+        );
     }
 
     const STUCK_CHILD: &str = "BLAZE_TEST_LOOP_STUCK";
@@ -372,7 +405,10 @@ mod tests {
             sandbox: blaze_core::Sandbox::Off,
             memory: None,
         });
-        driver.submit(&mut vec![blaze_core::Effect::Spawn { command, tag: blaze_core::Tag(0x5ca1_ab1e) }]);
+        driver.submit(&mut vec![blaze_core::Effect::Spawn {
+            command,
+            tag: blaze_core::Tag(0x5ca1_ab1e),
+        }]);
         let _guard = arm(Duration::from_millis(bound_ms), Arc::default()).unwrap();
         println!("ready");
         // The turn that never ends: the driver, held, is never polled.
@@ -405,7 +441,10 @@ mod tests {
         let mut line = String::new();
         while !line.contains("ready") {
             line.clear();
-            assert!(stdout.read_line(&mut line).unwrap() > 0, "the child ended before it was ready");
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "the child ended before it was ready"
+            );
         }
         let ready = Instant::now();
         let within = Duration::from_secs(30);
@@ -422,7 +461,14 @@ mod tests {
         let mut said = String::new();
         std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
         assert_eq!(status.code(), Some(Exit::LoopStalled.code()), "{said}");
-        for named in [STUCK, "has not finished a turn for", "nothing moved for", "/bin/sh", "exited and not reaped", "0x5ca1ab1e"] {
+        for named in [
+            STUCK,
+            "has not finished a turn for",
+            "nothing moved for",
+            "/bin/sh",
+            "exited and not reaped",
+            "0x5ca1ab1e",
+        ] {
             assert!(said.contains(named), "it says {named:?}:\n{said}");
         }
     }

@@ -105,7 +105,9 @@ mod unix {
         // bytes is a valid value.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live local the call writes and does not keep.
-        let waited = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        let waited = unsafe {
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
         checked(waited).map(drop)
     }
 
@@ -116,7 +118,12 @@ mod unix {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live local the call writes and does not keep.
         let waited = unsafe {
-            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
         };
         checked(waited)?;
         // With `WNOHANG` a child that has not exited leaves `info` as it was: its pid 0.
@@ -130,13 +137,15 @@ mod unix {
         // SAFETY: `fd` is borrowed open for the call; `F_GETFL` takes no pointer.
         let flags = checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
         // SAFETY: as above; `F_SETFL` takes an integer.
-        checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }).map(drop)
+        checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) })
+            .map(drop)
     }
 
     /// `poll` of `fds`, waiting up to `ms` milliseconds (-1: no limit): how many are ready.
     /// Memory-safe for any descriptor numbers (a closed one reports `POLLNVAL`).
     pub(crate) fn poll(fds: &mut [libc::pollfd], ms: libc::c_int) -> io::Result<usize> {
-        let n = libc::nfds_t::try_from(fds.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let n = libc::nfds_t::try_from(fds.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `fds` is a live, exclusive slice of `n` pollfds; the kernel writes only their
         // `revents` and keeps no pointer after the call returns.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), n, ms) };
@@ -174,14 +183,17 @@ mod unix {
     pub(crate) fn utimens(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
         // SAFETY: a NUL-terminated path and two `timespec`s, both borrowed across the call,
         // which reads them and keeps neither; no flags.
-        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) }).map(drop)
+        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) })
+            .map(drop)
     }
 
     /// The directory at `path` opened read-only, close-on-exec, as a descriptor of its own.
     pub(crate) fn open_dir(path: &CStr) -> io::Result<OwnedFd> {
         // SAFETY: a NUL-terminated path, borrowed across the call; the result is a new
         // descriptor or -1, checked below.
-        let fd = checked(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+        let fd = checked(unsafe {
+            libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        })?;
         // SAFETY: `open` succeeded, so `fd` is a new descriptor nothing else owns; owned once,
         // here. Owning one twice would close it under the other owner.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -193,7 +205,14 @@ mod unix {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `dir` is borrowed open, `name` NUL-terminated, and `stat` room for one
         // `libc::stat` the call writes whole on success and does not keep.
-        let failed = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        let failed = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
         checked(failed)?;
         // SAFETY: the call succeeded, so it filled the `stat`; read before then it would be
         // uninitialized.
@@ -207,7 +226,8 @@ mod unix {
         const FICLONE: libc::c_ulong = 0x4004_9409;
         // SAFETY: two descriptors borrowed open for the call; `FICLONE` takes the source's
         // number as its argument, no pointer.
-        checked(unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) }).map(drop)
+        checked(unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) })
+            .map(drop)
     }
 
     /// The `statfs` of the file system that holds `path`.
@@ -226,7 +246,8 @@ mod unix {
     pub(crate) fn fclonefileat(from: BorrowedFd<'_>, to: &CStr) -> io::Result<()> {
         // SAFETY: a descriptor borrowed open for the call and a NUL-terminated path borrowed
         // across it, which keeps neither.
-        checked(unsafe { libc::fclonefileat(from.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) }).map(drop)
+        checked(unsafe { libc::fclonefileat(from.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) })
+            .map(drop)
     }
 
     /// `path`'s permission bits set to `mode`, a symbolic link not followed (`fchmodat` with
@@ -235,8 +256,15 @@ mod unix {
     #[cfg(target_os = "macos")]
     pub(crate) fn chmod_no_follow(path: &CStr, mode: u32) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call.
-        checked(unsafe { libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW) })
-            .map(drop)
+        checked(unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .map(drop)
     }
 
     /// The access and modification times of `path` set to now, a symbolic link not followed
@@ -244,8 +272,15 @@ mod unix {
     #[cfg(target_os = "macos")]
     pub(crate) fn touch(path: &CStr) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call; a null `times` means now.
-        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), libc::AT_SYMLINK_NOFOLLOW) })
-            .map(drop)
+        checked(unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                std::ptr::null(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .map(drop)
     }
 
     /// `F_NOCACHE` on `fd`: its reads and writes stay out of the unified buffer cache.
@@ -286,7 +321,11 @@ mod unix {
         // SAFETY: `info` is a live local of the size `RUSAGE_INFO_V4` names, which the call
         // writes and does not keep; a smaller buffer would be written past its end.
         let read = unsafe {
-            libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, (&raw mut info).cast::<libc::rusage_info_t>())
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V4,
+                (&raw mut info).cast::<libc::rusage_info_t>(),
+            )
         };
         checked(read)?;
         Ok((info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint))
@@ -315,7 +354,11 @@ mod tests {
         use std::os::fd::AsFd as _;
         let (reader, writer) = std::io::pipe().unwrap();
         assert_eq!(super::write(writer.as_fd(), b"blaze").unwrap(), 5);
-        let mut fds = [libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&reader), events: libc::POLLIN, revents: 0 }];
+        let mut fds = [libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&reader),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
         assert_eq!(super::poll(&mut fds, 0).unwrap(), 1);
         let mut into = [0; 16];
         assert_eq!(super::read(reader.as_fd(), &mut into).unwrap(), 5);

@@ -3,9 +3,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_vfs::{Bytes, Corrupt, Mode};
+use std::alloc::Global;
 
 use crate::table::{FxMap, ShortLock};
 
@@ -16,7 +16,11 @@ pub trait Tree: Send + Sync {
     /// target); `None` for none, a directory, or a root this tree does not have. A file whose
     /// bytes are a range of the mapped image that fails its check is `Err`, naming the
     /// image's section and group: never `None`, which would be a file that is not there.
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt>;
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt>;
     /// Lends `read` the names in the directory at `path` (`""` for the root), sorted by name,
     /// each with whether it is a directory; `false`, with `read` not called, for none or a
     /// file. The database hashes a listing as it is lent, copying nothing, and stops naming
@@ -44,11 +48,16 @@ pub type Names<'a, 'n> = &'a mut (dyn Iterator<Item = (&'n str, bool)> + 'a); //
 /// A file's [`Bytes`] are the tree's own (its `Arc`, or its range of the mapped image) with
 /// one count taken, once per file per view, as the database keeps the input.
 impl Tree for blaze_vfs::Reader {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         blaze_vfs::Reader::file(self, root, path)
     }
 
-    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: see `Tree::read_dir`
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool {
+        // dyn: see `Tree::read_dir`
         let pinned = self.pin();
         let Some(mut names) = pinned.list(root, path) else { return false };
         read(&mut names);
@@ -153,11 +162,16 @@ impl MemTree {
 }
 
 impl Tree for MemTree {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+    fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         Ok(self.files(root).and_then(|it| it.files.get(path).cloned()))
     }
 
-    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: see `Tree::read_dir`
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool {
+        // dyn: see `Tree::read_dir`
         let Some(files) = self.files(root) else { return false };
         let Some(names) = files.names(path) else { return false };
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
@@ -182,7 +196,9 @@ mod tests {
             ("b", b"7"),
         ]);
         let names = |path| tree.names(root, path);
-        let owned = |it: &[(&str, bool)]| Some(it.iter().map(|&(n, d)| (n.to_owned(), d)).collect::<Vec<_>>());
+        let owned = |it: &[(&str, bool)]| {
+            Some(it.iter().map(|&(n, d)| (n.to_owned(), d)).collect::<Vec<_>>())
+        };
         assert_eq!(
             names(""),
             owned(&[("a", true), ("a-x", false), ("a.rs", false), ("ab", false), ("b", false)])

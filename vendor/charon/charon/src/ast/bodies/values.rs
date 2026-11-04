@@ -9,14 +9,38 @@ use std::vec::Vec;
 use crate::ast::*;
 
 /// A constant expression.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct ConstantExpr(pub HashConsed<WithCachedTypeInfo<(ConstantExprKind, Ty)>>);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("C"))]
 pub enum ConstantExprKind {
     /// Boolean value.
@@ -114,8 +138,20 @@ pub enum ConstantExprKind {
 
 /// The place a `Ref`/`Ptr` constant points to, e.g. `GLOBAL.0[1]`. This is a constant version of
 /// [`Place`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct GlobalPlace {
     #[cfg_attr(feature = "charon_on_charon", charon::rename("global_place_kind"))]
@@ -125,9 +161,21 @@ pub struct GlobalPlace {
     pub ty: Ty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("GlobalPlace"))]
 pub enum GlobalPlaceKind {
     /// The allocation behind this provenance.
@@ -142,31 +190,34 @@ pub enum GlobalPlaceKind {
 
 impl GlobalPlace {
     pub fn new_global(global: GlobalDeclRef, ty: Ty) -> Self {
-        GlobalPlace {
-            kind: GlobalPlaceKind::Global(GlobalProvenance::Global(global)),
-            ty,
-        }
+        GlobalPlace { kind: GlobalPlaceKind::Global(GlobalProvenance::Global(global)), ty }
     }
 
     pub fn new_value(value: ConstantExpr) -> Self {
-        GlobalPlace {
-            ty: value.ty().clone(),
-            kind: GlobalPlaceKind::Value(value),
-        }
+        GlobalPlace { ty: value.ty().clone(), kind: GlobalPlaceKind::Value(value) }
     }
 
     pub fn project(self, elem: ConstProjectionElem, ty: Ty) -> Self {
-        GlobalPlace {
-            kind: GlobalPlaceKind::Projection(Box::new(self), elem),
-            ty,
-        }
+        GlobalPlace { kind: GlobalPlaceKind::Projection(Box::new(self), elem), ty }
     }
 }
 
 /// A projection inside the pointee of a `Ref`/`Ptr` constant. This is a constant version of
 /// [`ProjectionElem`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("CProj"))]
 pub enum ConstProjectionElem {
     /// Project to the field of an ADT.
@@ -176,10 +227,7 @@ pub enum ConstProjectionElem {
     Index(IntegerValue),
     /// Project to the subarray `array[from..to]`.
     #[serde_state(stateless)]
-    Subslice {
-        from: IntegerValue,
-        to: IntegerValue,
-    },
+    Subslice { from: IntegerValue, to: IntegerValue },
     /// Like `ProjectionElem::Offset`: the place located `count * size_of::<ty>()` bytes after the
     /// current place (or `count` bytes if `ty` is `None`). `pointee_is_sized` is the proof that the
     /// pointee type is sized.
@@ -192,16 +240,23 @@ pub enum ConstProjectionElem {
 }
 
 /// A scalar value.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
 #[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
     Serialize,
     Deserialize,
     SerializeState,
     DeserializeState,
     Drive,
     DriveMut,
-    DriveTwo
+    DriveTwo,
 )]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Integer"))]
 #[serde_state(stateless)]
@@ -213,8 +268,20 @@ pub enum IntegerValue {
 /// This is simlar to the Scalar value above. However, instead of storing
 /// the float value itself, we store its String representation. This allows
 /// to derive the Eq and Ord traits, which are not implemented for floats
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct FloatValue {
     #[cfg_attr(feature = "charon_on_charon", charon::rename("float_value"))]
     pub value: String,
@@ -228,8 +295,20 @@ pub struct FloatValue {
 /// Provenance is the location in memory a pointer (or the byte of a pointer, see [`Byte`])
 /// points to. `GlobalProvenance` represents a compile-time provenance.
 /// See <https://doc.rust-lang.org/std/ptr/index.html#provenance>
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Prov"))]
 pub enum GlobalProvenance {
     Global(GlobalDeclRef),
@@ -243,8 +322,20 @@ pub enum GlobalProvenance {
 
 /// A byte, in the MiniRust sense: it can either be uninitialized, a concrete u8 value,
 /// or part of a pointer with provenance (e.g. to a global or a function)
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum Byte {
     /// An uninitialized byte
     Uninit,
@@ -281,8 +372,7 @@ impl ConstantExpr {
         &mut self,
         f: impl FnOnce(&mut ConstantExprKind, &mut Ty) -> R,
     ) -> R {
-        self.0
-            .with_inner_mut(|contents| contents.with_value_mut(|(kind, ty)| f(kind, ty)))
+        self.0.with_inner_mut(|contents| contents.with_value_mut(|(kind, ty)| f(kind, ty)))
     }
 
     pub fn mk_unit() -> Self {
@@ -319,9 +409,7 @@ impl ConstantExprKind {
             },
             ScalarTy::Char => {
                 let bytes: [u8; 4] = bits.to_le_bytes()[0..4].try_into().unwrap();
-                Some(Self::Char(
-                    std::char::from_u32(u32::from_le_bytes(bytes)).unwrap(),
-                ))
+                Some(Self::Char(std::char::from_u32(u32::from_le_bytes(bytes)).unwrap()))
             }
             ScalarTy::Float(_) => None,
         }
@@ -545,10 +633,7 @@ impl IntegerValue {
 
     pub fn to_constant(self) -> ConstantExpr {
         let scalar_ty = ScalarTy::Integer(self.ty());
-        ConstantExpr::new(
-            ConstantExprKind::Integer(self),
-            TyKind::Scalar(scalar_ty).into_ty(),
-        )
+        ConstantExpr::new(ConstantExprKind::Integer(self), TyKind::Scalar(scalar_ty).into_ty())
     }
 }
 
@@ -600,8 +685,7 @@ pub(crate) mod scalar_value_ser_de {
             where
                 E: Error,
             {
-                v.parse()
-                    .map_err(|_| E::custom("Could not parse 128 bit integer!"))
+                v.parse().map_err(|_| E::custom("Could not parse 128 bit integer!"))
             }
         }
         deserializer.deserialize_str(Visitor { _val: PhantomData })

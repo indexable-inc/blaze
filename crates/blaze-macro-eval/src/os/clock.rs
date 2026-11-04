@@ -28,7 +28,13 @@ impl<'a> Os<'a> {
         }
     }
 
-    pub(super) fn clock_gettime(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (clock, out): (i64, u64)) -> Done {
+    pub(super) fn clock_gettime(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (clock, out): (i64, u64),
+    ) -> Done {
         let lead = match (t.system, clock) {
             // CLOCK_REALTIME, and Linux's CLOCK_REALTIME_COARSE and CLOCK_REALTIME_ALARM
             (_, 0) | (System::Linux, 5 | 8) => 0,
@@ -47,7 +53,12 @@ impl<'a> Os<'a> {
 
     /// `gettimeofday(tv, tz)`: `struct timeval` is `time_t` seconds then microseconds, eight
     /// bytes on Linux and four and padding on macOS, so the same sixteen bytes on both.
-    pub(super) fn gettimeofday(&mut self, g: &mut impl Guest, ret: &mut [u8], (tv, tz): (u64, u64)) -> Done {
+    pub(super) fn gettimeofday(
+        &mut self,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (tv, tz): (u64, u64),
+    ) -> Done {
         self.note_clock();
         let ns = now_ns();
         if tv != 0 {

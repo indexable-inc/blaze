@@ -168,11 +168,8 @@ pub(crate) fn split_generics(generics: &syn::Generics) -> Result<GenericsParts<'
         })
         .collect();
     let type_param_idents = generics.type_params().map(|t| &t.ident).collect();
-    let user_predicates = generics
-        .where_clause
-        .as_ref()
-        .map(|w| w.predicates.iter().collect())
-        .unwrap_or_default();
+    let user_predicates =
+        generics.where_clause.as_ref().map(|w| w.predicates.iter().collect()).unwrap_or_default();
     let (_, ty_generics, _) = generics.split_for_impl();
     Ok(GenericsParts {
         gen_params: &generics.params,
@@ -201,10 +198,7 @@ pub(crate) fn default_gen_bounds(types: &[&syn::Type]) -> Vec<proc_macro2::Token
 /// prefix keeps the parameter out of the way of the derived type's own
 /// generics.
 pub(crate) fn generator_param_ident(field_name: &str) -> syn::Ident {
-    quote::format_ident!(
-        "__G{}",
-        snake_to_pascal(field_name.trim_start_matches("r#"))
-    )
+    quote::format_ident!("__G{}", snake_to_pascal(field_name.trim_start_matches("r#")))
 }
 
 /// Emit the printing statements for one struct or enum-variant shape, in
@@ -231,27 +225,22 @@ pub(crate) fn print_shape(
         syn::Fields::Named(named) => {
             let open = format!("{label} {{");
             let steps =
-                named
-                    .named
-                    .iter()
-                    .zip(actions)
-                    .enumerate()
-                    .map(|(index, (field, action))| {
-                        let prefix = format!("{}: ", field.ident.as_ref().unwrap());
-                        let separator = if index > 0 {
-                            quote! {
-                                __printer.text(",");
-                                __printer.breakable(" ");
-                            }
-                        } else {
-                            quote! {}
-                        };
+                named.named.iter().zip(actions).enumerate().map(|(index, (field, action))| {
+                    let prefix = format!("{}: ", field.ident.as_ref().unwrap());
+                    let separator = if index > 0 {
                         quote! {
-                            #separator
-                            __printer.text(#prefix);
-                            #action
+                            __printer.text(",");
+                            __printer.breakable(" ");
                         }
-                    });
+                    } else {
+                        quote! {}
+                    };
+                    quote! {
+                        #separator
+                        __printer.text(#prefix);
+                        #action
+                    }
+                });
             quote! {
                 __printer.begin_group(4, #open);
                 __printer.breakable(" ");

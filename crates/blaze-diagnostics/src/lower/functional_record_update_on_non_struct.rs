@@ -17,7 +17,8 @@ use crate::{
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::FunctionalRecordUpdateOnNonStruct) -> Vec<Found> {
     let span = cx.span_of_ptr(d.base_expr);
-    let mut diag = Diag::error(Some("E0436"), "functional record update syntax requires a struct", span);
+    let mut diag =
+        Diag::error(Some("E0436"), "functional record update syntax requires a struct", span);
     let record = cx
         .node_view(d.base_expr)
         .value
@@ -28,7 +29,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::FunctionalRecordUpdateOnNonStruct)
         // alloc: a name for the error
         let name = adt.name(cx.db).display(cx.db, cx.edition).to_string();
         // alloc: the error's fact
-        diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("what kind of type `{name}` is"));
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+            format!("what kind of type `{name}` is"),
+        );
     }
     code_fact(cx, &mut diag, d.base_expr.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)] // alloc: the error found

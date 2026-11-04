@@ -2,7 +2,6 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_manifest::Config;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
@@ -10,6 +9,7 @@ use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::{CrateType, TargetKind};
 use blaze_resolve::{InternedString, PackageId, SourceId};
 use cargo_util_schemas::manifest::TomlManifest;
+use std::alloc::Global;
 
 use super::hash::{self, StableHasher};
 use super::outputs::{self, CompileFiles, Layout};
@@ -54,7 +54,10 @@ fn target_short_hash_by_hand() {
     semver::Version::new(0, 1, 0).hash(&mut hasher);
     source.kind().hash(&mut hasher);
     "pm".hash(&mut hasher);
-    assert_eq!(hash::target_short_hash(id, Path::new("/w")).unwrap(), hash::short_hex(Hasher::finish(&hasher)));
+    assert_eq!(
+        hash::target_short_hash(id, Path::new("/w")).unwrap(),
+        hash::short_hex(Hasher::finish(&hasher))
+    );
 }
 
 // `CompileKind::fingerprint_hash`: 0 for the host, else the target's name hashed.
@@ -141,7 +144,8 @@ fn check_cfg_strings() {
 // `features_args` between the profile's and the kind's `--cfg`s.
 #[test]
 fn cfgs_in_cargos_order() {
-    let cfgs = flags::cfgs(&strings(&["--cfg", "p"]), &strings(&["a"]), &strings(&["--cfg=k", "-Cx"]));
+    let cfgs =
+        flags::cfgs(&strings(&["--cfg", "p"]), &strings(&["a"]), &strings(&["--cfg=k", "-Cx"]));
     assert_eq!(cfgs, ["p", "feature=\"a\"", "k"]);
 }
 
@@ -149,15 +153,29 @@ fn cfgs_in_cargos_order() {
 // kind's rustflags follow, kept as they are.
 #[test]
 fn a_profiles_own_panic_flag_goes() {
-    let profile = strings(&["-Cpanic=abort", "-C", "panic=abort", "--codegen", "panic=abort", "--codegen=panic=abort", "-C", "embed-bitcode=yes", "-Zunstable-options"]);
+    let profile = strings(&[
+        "-Cpanic=abort",
+        "-C",
+        "panic=abort",
+        "--codegen",
+        "panic=abort",
+        "--codegen=panic=abort",
+        "-C",
+        "embed-bitcode=yes",
+        "-Zunstable-options",
+    ]);
     let rest = strings(&["-Cpanic=abort", "--cfg", "k"]);
     let flags = flags::unit_rustflags(&profile, "abort", "panic_abort", &rest).unwrap();
-    assert_eq!(flags, ["-C", "embed-bitcode=yes", "-Zunstable-options", "-Cpanic=abort", "--cfg", "k"]);
+    assert_eq!(
+        flags,
+        ["-C", "embed-bitcode=yes", "-Zunstable-options", "-Cpanic=abort", "--cfg", "k"]
+    );
 }
 
 #[test]
 fn a_profiles_other_panic_flag_is_refused_naming_its_package() {
-    let error = flags::unit_rustflags(&strings(&["-Cpanic=abort"]), "unwind", "p", &[]).unwrap_err();
+    let error =
+        flags::unit_rustflags(&strings(&["-Cpanic=abort"]), "unwind", "p", &[]).unwrap_err();
     assert!(error.what.contains("`p`'s profile rustflags say `-C panic=abort`"), "{}", error.what);
     assert!(error.what.contains("`panic = \"unwind\"`"), "{}", error.what);
 }
@@ -190,7 +208,9 @@ fn lints_order() {
 #[test]
 fn the_workspace_sets_blaze_lints_in_its_metadata() {
     let manifest = Path::new("/w/Cargo.toml");
-    let of = |text: &str| flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest);
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
     assert_eq!(
         of("[blaze.lints]\nhot_clone = \"deny\"\nhot_alloc = \"warn\"\n").unwrap(),
         ["--warn=blaze::hot_alloc", "--deny=blaze::hot_clone"]
@@ -203,7 +223,11 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
         "[workspace.metadata.blaze.lints] in /w/Cargo.toml: the level of `hot_alloc` is `allow`, `warn`, `deny` or `forbid`"
     );
     let path = of("[blaze.lints]\n\"blaze::hot_alloc\" = \"warn\"\n").unwrap_err();
-    assert!(path.what.ends_with("is named without its tool: these are blaze's own lints"), "{}", path.what);
+    assert!(
+        path.what.ends_with("is named without its tool: these are blaze's own lints"),
+        "{}",
+        path.what
+    );
     assert_eq!(
         of("[blaze.lints]\nhot = \"deny\"\nconst_impure = \"allow\"\n").unwrap(),
         ["--deny=blaze::hot", "--allow=blaze::const_impure"]
@@ -225,7 +249,10 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
 #[test]
 fn a_packages_unknown_blaze_lint_is_an_error_naming_it() {
     let manifest = |lints: &str| -> TomlManifest {
-        toml::from_str(&format!("[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints.blaze]\n{lints}")).unwrap()
+        toml::from_str(&format!(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints.blaze]\n{lints}"
+        ))
+        .unwrap()
     };
     let (lints, _) = flags::lints_of("a", &manifest("wall_clock = \"deny\"\n")).unwrap();
     assert_eq!(lints, ["--deny=blaze::wall_clock"]);
@@ -251,7 +278,8 @@ fn no_manifest_of_this_workspace_names_a_lint_tool_rustc_does_not_know() {
     }
     for at in manifests {
         let text = std::fs::read_to_string(&at).unwrap();
-        let manifest: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", at.display()));
+        let manifest: toml::Table =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", at.display()));
         let workspace = manifest.get("workspace").and_then(|it| it.get("lints"));
         for lints in [manifest.get("lints"), workspace].into_iter().flatten() {
             let Some(tools) = lints.as_table() else { continue };
@@ -287,7 +315,10 @@ fn rustflags_precedence() {
         rustflags(&[("RUSTFLAGS", "-Clink-arg=env  -Clink-arg=more")], None, None),
         ["-Clink-arg=env", "-Clink-arg=more"]
     );
-    let both = [("RUSTFLAGS", "-Clink-arg=env"), ("CARGO_ENCODED_RUSTFLAGS", "-Clink-arg=a b\x1f-Clink-arg=c")];
+    let both = [
+        ("RUSTFLAGS", "-Clink-arg=env"),
+        ("CARGO_ENCODED_RUSTFLAGS", "-Clink-arg=a b\x1f-Clink-arg=c"),
+    ];
     assert_eq!(rustflags(&both, None, None), ["-Clink-arg=a b", "-Clink-arg=c"]);
     assert_eq!(rustflags(&[], Some(TARGET), Some(TARGET)), ["-Clink-arg=config"]);
     assert!(rustflags(&[], Some(TARGET), None).is_empty());
@@ -299,7 +330,8 @@ fn rustflags_precedence() {
 #[test]
 fn rustflags_of_target_cfg() {
     let dir = Scratch::new("target-cfg");
-    let cli = ["build.rustflags=['--cfg=blaze']", "target.'cfg(blaze)'.rustflags=['-Clink-arg=matched']"];
+    let cli =
+        ["build.rustflags=['--cfg=blaze']", "target.'cfg(blaze)'.rustflags=['-Clink-arg=matched']"];
     let info = flags::kind_info(&config(&dir.0, &[], &cli), HOST, None, None).unwrap();
     assert_eq!(info.rustflags, ["-Clink-arg=matched"]);
     assert!(!info.cfg_lines.iter().any(|it| it == "blaze"));
@@ -309,7 +341,8 @@ fn rustflags_of_target_cfg() {
 // `CARGO_CFG_*` with the features first under `feature`, `[env]` under what cargo sets.
 #[test]
 fn build_script_env() {
-    let cfg_lines = platform::target_cfg(HOST, &CfgArgs { proc_macro: true, ..CfgArgs::default() }).unwrap();
+    let cfg_lines =
+        platform::target_cfg(HOST, &CfgArgs { proc_macro: true, ..CfgArgs::default() }).unwrap();
     let package = vec![("CARGO_PKG_NAME".to_owned(), "app".to_owned())];
     let features = strings(&["default", "foo-bar"]);
     let rustflags = strings(&["-Ca", "-Cb"]);
@@ -366,7 +399,14 @@ fn build_script_env() {
 
 /// A compile unit's files in a build directory at `/w/build` and a target directory at
 /// `/w/target`, its package directory `app/0123456789abcdef`.
-fn files(triple: &str, mode: hash::CompileMode, kind: &TargetKind, name: &str, extra: Option<&str>, is_root: bool) -> Vec<String> {
+fn files(
+    triple: &str,
+    mode: hash::CompileMode,
+    kind: &TargetKind,
+    name: &str,
+    extra: Option<&str>,
+    is_root: bool,
+) -> Vec<String> {
     let target = (triple != HOST).then_some(triple);
     let layout = Layout::new(Path::new("/w/target"), Path::new("/w/build"), target, "debug");
     let host_layout = Layout::new(Path::new("/w/target"), Path::new("/w/build"), None, "debug");
@@ -397,7 +437,11 @@ fn outputs_on_linux() {
     let lib = TargetKind::Lib(vec![CrateType::Lib]);
     assert_eq!(
         files(HOST, hash::CompileMode::Build, &lib, "app", Some(H), true),
-        [format!("{out}/libapp-{H}.rlib"), format!("{out}/libapp-{H}.rmeta"), format!("{out}/app-{H}.d")]
+        [
+            format!("{out}/libapp-{H}.rlib"),
+            format!("{out}/libapp-{H}.rmeta"),
+            format!("{out}/app-{H}.d")
+        ]
     );
     assert_eq!(
         files(HOST, hash::CompileMode::Build, &TargetKind::Bin, "my-app", None, true),
@@ -412,7 +456,12 @@ fn outputs_on_linux() {
     );
     assert_eq!(
         files(HOST, hash::CompileMode::Test, &TargetKind::Test, "it", Some(H), true),
-        [format!("{out}/it-{H}"), format!("/w/target/debug/deps/it-{H}"), format!("{out}/it-{H}.dwp"), format!("{out}/it-{H}.d")]
+        [
+            format!("{out}/it-{H}"),
+            format!("/w/target/debug/deps/it-{H}"),
+            format!("{out}/it-{H}.dwp"),
+            format!("{out}/it-{H}.d")
+        ]
     );
     // A library's unit tests are run from `deps` too, beside its package's binaries.
     assert_eq!(
@@ -436,8 +485,19 @@ fn outputs_on_linux() {
         ]
     );
     assert_eq!(
-        files(HOST, hash::CompileMode::Build, &TargetKind::CustomBuild, "build-script-build", None, false),
-        [format!("{out}/build_script_build"), format!("{out}/build_script_build.dwp"), format!("{out}/build_script_build.d")]
+        files(
+            HOST,
+            hash::CompileMode::Build,
+            &TargetKind::CustomBuild,
+            "build-script-build",
+            None,
+            false
+        ),
+        [
+            format!("{out}/build_script_build"),
+            format!("{out}/build_script_build.dwp"),
+            format!("{out}/build_script_build.d")
+        ]
     );
     assert_eq!(
         files(HOST, hash::CompileMode::Check { test: false }, &lib, "app", Some(H), true),
@@ -449,11 +509,19 @@ fn outputs_on_linux() {
         files(TARGET, hash::CompileMode::Build, &TargetKind::Bin, "app", None, true)[..2],
         [format!("{target_out}/app"), format!("/w/target/{TARGET}/debug/app")]
     );
-    let (run_out, run) = outputs::run_files(&Layout::new(Path::new("/w/target"), Path::new("/w/build"), None, "debug"), true, "app/h");
+    let (run_out, run) = outputs::run_files(
+        &Layout::new(Path::new("/w/target"), Path::new("/w/build"), None, "debug"),
+        true,
+        "app/h",
+    );
     assert_eq!(run_out, "/w/build/debug/build/app/h/out");
     assert_eq!(
         run,
-        ["/w/build/debug/build/app/h/run/stdout", "/w/build/debug/build/app/h/run/stderr", "/w/build/debug/build/app/h/run/root-output"]
+        [
+            "/w/build/debug/build/app/h/run/stdout",
+            "/w/build/debug/build/app/h/run/stderr",
+            "/w/build/debug/build/app/h/run/root-output"
+        ]
     );
 }
 
@@ -487,10 +555,19 @@ fn outputs_in_the_old_layout() {
             format!("/w/target/debug/deps/app-{H}.d"),
         ]
     );
-    let script = CompileFiles { kind: &TargetKind::CustomBuild, name: "build-script-build", crate_name: "build_script_build", extra: Some(H), ..it };
+    let script = CompileFiles {
+        kind: &TargetKind::CustomBuild,
+        name: "build-script-build",
+        crate_name: "build_script_build",
+        extra: Some(H),
+        ..it
+    };
     assert_eq!(
         outputs::compile_outputs(&script).unwrap()[..2],
-        [format!("/w/target/debug/build/app-{H}/build_script_build-{H}"), format!("/w/target/debug/build/app-{H}/build-script-build")]
+        [
+            format!("/w/target/debug/build/app-{H}/build_script_build-{H}"),
+            format!("/w/target/debug/build/app-{H}/build-script-build")
+        ]
     );
     let (run_out, run) = outputs::run_files(&layout, false, "app-h");
     assert_eq!(run_out, "/w/target/debug/build/app-h/out");
@@ -603,7 +680,16 @@ fn manifest(path: &Path, source: SourceId, config: Config<Disk>) -> Manifest {
     }
 }
 
-fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Option<&str>, mode: Mode, features: &[&str], deps: &[usize]) -> Unit {
+fn unit(
+    pkg: &str,
+    kind: &[&str],
+    crate_types: &[&str],
+    name: &str,
+    platform: Option<&str>,
+    mode: Mode,
+    features: &[&str],
+    deps: &[usize],
+) -> Unit {
     Unit {
         pkg_id: pkg.to_owned(),
         target: schema::Target {
@@ -620,7 +706,11 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
         // A build script is compiled with `build-override`'s `debug = 0`, and run with the
         // profile of the library it is for.
         profile: schema::Profile {
-            debuginfo: DebugInfo::Level(if kind == ["custom-build"] && mode == Mode::Build { 0 } else { 2 }),
+            debuginfo: DebugInfo::Level(if kind == ["custom-build"] && mode == Mode::Build {
+                0
+            } else {
+                2
+            }),
             ..schema::Profile::dev()
         },
         platform: platform.map(str::to_owned),
@@ -631,7 +721,14 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
         is_std: false,
         dependencies: deps
             .iter()
-            .map(|&index| UnitDep { index, extern_crate_name: format!("dep{index}"), public: None, noprelude: None, nounused: None, dev: false })
+            .map(|&index| UnitDep {
+                index,
+                extern_crate_name: format!("dep{index}"),
+                public: None,
+                noprelude: None,
+                nounused: None,
+                dev: false,
+            })
             .collect(),
     }
 }
@@ -645,8 +742,26 @@ fn app_units(target: Option<&str>) -> Vec<Unit> {
     vec![
         unit("serde", &["lib"], &["lib"], "serde", target, Mode::Build, &["default", "std"], &[]),
         unit("pm", &["proc-macro"], &["proc-macro"], "pm", None, Mode::Build, &[], &[]),
-        unit("app", &["custom-build"], &["bin"], "build-script-build", None, Mode::Build, &features, &[]),
-        unit("app", &["custom-build"], &["bin"], "build-script-build", target, Mode::RunCustomBuild, &features, &[2]),
+        unit(
+            "app",
+            &["custom-build"],
+            &["bin"],
+            "build-script-build",
+            None,
+            Mode::Build,
+            &features,
+            &[],
+        ),
+        unit(
+            "app",
+            &["custom-build"],
+            &["bin"],
+            "build-script-build",
+            target,
+            Mode::RunCustomBuild,
+            &features,
+            &[2],
+        ),
         unit("app", &["lib"], &["lib"], "app", target, Mode::Build, &features, &[0, 1, 3]),
         unit("app", &["bin"], &["bin"], "app", target, Mode::Build, &features, &[4, 0, 3]),
         unit("app", &["test"], &["bin"], "it", target, Mode::Test, &features, &[4, 3]),
@@ -688,23 +803,39 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         config(
             &ws,
             &[("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", "valgrind -q")],
-            &["env.FROM_CONFIG='1'", "target.aarch64-unknown-linux-gnu.runner=['qemu-aarch64', '-L', '/sysroot']"],
+            &[
+                "env.FROM_CONFIG='1'",
+                "target.aarch64-unknown-linux-gnu.runner=['qemu-aarch64', '-L', '/sysroot']",
+            ],
         )
     };
     let crates_io = SourceId::crates_io();
-    let app = manifest(&app_path, blaze_manifest::source::for_manifest_path(&app_path).unwrap(), config());
-    let pm = manifest(&pm_path, blaze_manifest::source::for_manifest_path(&pm_path).unwrap(), config());
+    let app = manifest(
+        &app_path,
+        blaze_manifest::source::for_manifest_path(&app_path).unwrap(),
+        config(),
+    );
+    let pm =
+        manifest(&pm_path, blaze_manifest::source::for_manifest_path(&pm_path).unwrap(), config());
     let serde = manifest(&serde_path, crates_io, config());
 
     let path_id = |name: &str, at: &Path| {
-        PackageId::new(InternedString::new(name), semver::Version::new(0, 1, 0), SourceId::for_path(at).unwrap())
+        PackageId::new(
+            InternedString::new(name),
+            semver::Version::new(0, 1, 0),
+            SourceId::for_path(at).unwrap(),
+        )
     };
     let ids = [
         ("app", path_id("app", &ws), &app, app_path.as_path(), true),
         ("pm", path_id("pm", &ws.join("pm")), &pm, pm_path.as_path(), false),
         (
             "serde",
-            PackageId::new(InternedString::new("serde"), semver::Version::new(1, 0, 219), SourceId::crates_io()),
+            PackageId::new(
+                InternedString::new("serde"),
+                semver::Version::new(1, 0, 219),
+                SourceId::crates_io(),
+            ),
             &serde,
             serde_path.as_path(),
             false,
@@ -712,7 +843,9 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
     ];
     let packages: HashMap<String, (PackageId, Package<'_>), Global> = ids
         .iter()
-        .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member })))
+        .map(|(key, id, manifest, _, is_member)| {
+            ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member }))
+        })
         .collect();
     let manifests: HashMap<PackageId, (&Path, &Manifest), Global> =
         ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
@@ -724,12 +857,15 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
     let base_profile = BaseProfile {
         name: "dev".to_owned(),
         root: ProfileRoot::Debug,
-        debuginfo: blaze_manifest::profiles::DebugInfo::Resolved(cargo_util_schemas::manifest::TomlDebugInfo::Full),
+        debuginfo: blaze_manifest::profiles::DebugInfo::Resolved(
+            cargo_util_schemas::manifest::TomlDebugInfo::Full,
+        ),
         ..BaseProfile::default()
     };
     let target_dir = ws.join("target");
     let unsandboxed: HashSet<&str, Global> = ["app"].into_iter().collect();
-    let ws_metadata = Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
+    let ws_metadata =
+        Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
     let input = PlanInput {
         units: &units,
         std_plans: &std_plans,
@@ -756,7 +892,8 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         unsandboxed: &unsandboxed,
     };
     let planned = plan(&input).unwrap();
-    let plans = planned.plans.into_iter().map(|it| it.expect("every unit is planned here")).collect();
+    let plans =
+        planned.plans.into_iter().map(|it| it.expect("every unit is planned here")).collect();
     (ws, plans, planned.finished)
 }
 
@@ -764,10 +901,15 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
 fn check_lints_the_workspaces_crates_with_their_configuration() {
     let (_, plans, _) = plan_app_as(None, true);
     let linted: Vec<bool> = plans.iter().map(|it| it.clippy.is_some()).collect();
-    assert_eq!(linted, [false, false, true, false, true, true, true], "the member's crates and build script, not its run");
+    assert_eq!(
+        linted,
+        [false, false, true, false, true, true, true],
+        "the member's crates and build script, not its run"
+    );
     let lib = &plans[4];
     assert!(lib.cfgs.contains(&"clippy".to_owned()));
-    let (path, text) = lib.clippy.as_ref().and_then(|it| it.conf.clone()).expect("the workspace's clippy.toml");
+    let (path, text) =
+        lib.clippy.as_ref().and_then(|it| it.conf.clone()).expect("the workspace's clippy.toml");
     assert!(path.ends_with("/w/clippy.toml"), "{path}");
     assert_eq!(text, "msrv = \"1.70\"\n");
     assert!(!plans[0].cfgs.contains(&"clippy".to_owned()), "a dependency is checked, not linted");
@@ -790,7 +932,10 @@ fn plans_of_a_workspace() {
     assert_eq!(finished, "`dev` profile [unoptimized + debuginfo]");
 
     let serde = &plans[0];
-    assert_eq!((serde.metadata.clone(), serde.extra_filename.clone()), serde_metadata_by_hand(None));
+    assert_eq!(
+        (serde.metadata.clone(), serde.extra_filename.clone()),
+        serde_metadata_by_hand(None)
+    );
     let hex = extra(serde);
     assert_eq!(
         serde.outputs,
@@ -829,7 +974,14 @@ fn plans_of_a_workspace() {
     let out_dir = run.out_dir.clone().unwrap();
     let run_dir = out_dir.strip_suffix("/out").unwrap();
     assert!(run_dir.starts_with(&format!("{build}/app/")) && run_dir != script_dir, "{run_dir}");
-    assert_eq!(run.outputs, [format!("{run_dir}/run/stdout"), format!("{run_dir}/run/stderr"), format!("{run_dir}/run/root-output")]);
+    assert_eq!(
+        run.outputs,
+        [
+            format!("{run_dir}/run/stdout"),
+            format!("{run_dir}/run/stderr"),
+            format!("{run_dir}/run/root-output")
+        ]
+    );
     for (name, value) in [
         ("CARGO_FEATURE_FOO_BAR", "1"),
         ("CARGO_CFG_TARGET_OS", "linux"),
@@ -853,7 +1005,10 @@ fn plans_of_a_workspace() {
     assert_eq!(get(&lib.env, "CARGO_PRIMARY_PACKAGE"), None);
     assert_eq!(get(&lib.env, "CARGO_CRATE_NAME"), Some("app"));
     assert_eq!(get(&lib.env, "CARGO_BIN_NAME"), None);
-    assert_eq!(lib.lints, ["--warn=blaze::hot_alloc", "--forbid=unsafe_code", "--warn=unexpected_cfgs"]);
+    assert_eq!(
+        lib.lints,
+        ["--warn=blaze::hot_alloc", "--forbid=unsafe_code", "--warn=unexpected_cfgs"]
+    );
     assert_eq!(lib.check_cfg[2], "cfg(has_foo)");
     assert_eq!(lib.cfgs, ["feature=\"default\"", "feature=\"foo-bar\""]);
     assert_ne!(lib.metadata, plans[5].metadata);
@@ -898,9 +1053,15 @@ fn plans_for_a_target() {
     let (ws, plans, _) = plan_app(Some(TARGET));
     let t = ws.join("target").display().to_string();
     let serde = &plans[0];
-    assert_eq!((serde.metadata.clone(), serde.extra_filename.clone()), serde_metadata_by_hand(Some(TARGET)));
+    assert_eq!(
+        (serde.metadata.clone(), serde.extra_filename.clone()),
+        serde_metadata_by_hand(Some(TARGET))
+    );
     let hex = extra(serde);
-    assert_eq!(serde.outputs[0], format!("{t}/{TARGET}/debug/build/serde/{hex}/out/libserde-{hex}.rlib"));
+    assert_eq!(
+        serde.outputs[0],
+        format!("{t}/{TARGET}/debug/build/serde/{hex}/out/libserde-{hex}.rlib")
+    );
     // The proc macro and the build script are the host's.
     assert!(plans[1].outputs[0].starts_with(&format!("{t}/debug/build/pm/")));
     assert!(plans[2].outputs[0].starts_with(&format!("{t}/debug/build/app/")));
@@ -910,8 +1071,14 @@ fn plans_for_a_target() {
     assert_eq!(get(&run.env, "HOST"), Some(HOST));
     assert_eq!(get(&run.env, "CARGO_CFG_TARGET_ARCH"), Some("aarch64"));
     assert_eq!(plans[5].outputs[1], format!("{t}/{TARGET}/debug/app"));
-    assert_eq!(get(&plans[6].env, "CARGO_TARGET_TMPDIR"), Some(format!("{t}/{TARGET}/tmp").as_str()));
-    assert_eq!(get(&plans[6].env, "CARGO_BIN_EXE_app"), Some(format!("{t}/{TARGET}/debug/app").as_str()));
+    assert_eq!(
+        get(&plans[6].env, "CARGO_TARGET_TMPDIR"),
+        Some(format!("{t}/{TARGET}/tmp").as_str())
+    );
+    assert_eq!(
+        get(&plans[6].env, "CARGO_BIN_EXE_app"),
+        Some(format!("{t}/{TARGET}/debug/app").as_str())
+    );
     // The target's runner is the config's `target.<triple>.runner`; the host's goes to no
     // target unit.
     let qemu = strings(&["qemu-aarch64", "-L", "/sysroot"]);

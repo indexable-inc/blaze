@@ -68,7 +68,10 @@ const WASI64: &str = r#"
 fn config(args: &[&str], env: &[(&str, &str)]) -> Config {
     Config {
         args: args.iter().map(OsString::from).collect(),
-        env: env.iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect(),
+        env: env
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect(),
         memory_max: crate::MEMORY_MAX,
     }
 }
@@ -209,7 +212,9 @@ const SEED_CALLS: &str = r#"
 #[test]
 fn the_seeds_own_calls_make_and_remove_a_directory_at_an_absolute_path() {
     let dir = std::env::temp_dir().join(format!("blaze-seed-run-calls-{}", std::process::id()));
-    let exit = run(&wat::parse_str(SEED_CALLS).unwrap(), &config(&["seed", dir.to_str().unwrap()], &[])).unwrap();
+    let exit =
+        run(&wat::parse_str(SEED_CALLS).unwrap(), &config(&["seed", dir.to_str().unwrap()], &[]))
+            .unwrap();
     assert_eq!(exit.code, 7, "{exit:?}");
     assert!(!dir.exists(), "{} was made and not removed", dir.display());
 }
@@ -219,13 +224,19 @@ fn the_seeds_own_calls_make_and_remove_a_directory_at_an_absolute_path() {
 struct Nothing(Fibers);
 
 impl Embed for Nothing {
-    fn with<R>(_: &mut Caller<'_, Self>, _: impl FnOnce(&mut [u8], &mut dyn System) -> Result<R, Stop>) -> wasmtime::Result<R> {
+    fn with<R>(
+        _: &mut Caller<'_, Self>,
+        _: impl FnOnce(&mut [u8], &mut dyn System) -> Result<R, Stop>,
+    ) -> wasmtime::Result<R> {
         Err(wasmtime::Error::msg("no guest"))
     }
 }
 
 impl EmbedSeed for Nothing {
-    fn with_seed<R>(_: &mut Caller<'_, Self>, _: impl FnOnce(&mut [u8], &mut dyn seed::Seed) -> Result<R, Stop>) -> wasmtime::Result<R> {
+    fn with_seed<R>(
+        _: &mut Caller<'_, Self>,
+        _: impl FnOnce(&mut [u8], &mut dyn seed::Seed) -> Result<R, Stop>,
+    ) -> wasmtime::Result<R> {
         Err(wasmtime::Error::msg("no guest"))
     }
 
@@ -347,6 +358,7 @@ fn a_suspend_on_no_fiber_is_refused_naming_it() {
   (memory (export "memory") i64 1)
   (func (export "_start") (call $suspend)))
 "#;
-    let error = run(&wat::parse_str(wat).unwrap(), &config(&["seed"], &[])).unwrap_err().to_string();
+    let error =
+        run(&wat::parse_str(wat).unwrap(), &config(&["seed"], &[])).unwrap_err().to_string();
     assert!(error.contains("blaze_seed.fiber_suspend") && error.contains("no fiber"), "{error}");
 }

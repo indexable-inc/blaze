@@ -41,7 +41,13 @@ fn sum_to(db: &Db) -> FunctionId {
     let krate: Crate = all_crates(db)
         .iter()
         .copied()
-        .find(|krate| krate.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "main"))
+        .find(|krate| {
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "main")
+        })
         .expect("the fixture has a crate `main`");
     let root = crate_def_map(db, krate).root_module_id();
     let data = root.to_db(db).def_map(db).module(db, root);
@@ -82,11 +88,15 @@ fn a_wrong_ensures_is_refuted_naming_the_clause_and_a_counterexample() {
     let db = db_with("r == n + 1");
     let verdict = verify_function(&db, sum_to(&db), &config(DEFAULT_RLIMIT));
     let Outcome::Refuted(refutations) = &verdict.outcome else { panic!("{verdict:?}") };
-    let [refutation] = refutations.as_slice() else { panic!("one failing clause, not {verdict:?}") };
+    let [refutation] = refutations.as_slice() else {
+        panic!("one failing clause, not {verdict:?}")
+    };
     let Obligation::Clause(clause) = &refutation.obligation else { panic!("{verdict:?}") };
     assert_eq!(clause.kind, SpecClauseKind::Ensures);
     assert_eq!(clause.text, "r == n + 1");
-    let [(name, value)] = refutation.counterexample.params.as_slice() else { panic!("{verdict:?}") };
+    let [(name, value)] = refutation.counterexample.params.as_slice() else {
+        panic!("{verdict:?}")
+    };
     assert_eq!(name, "n");
     // `r == n` always, so every `n` refutes `r == n + 1`: the model names one.
     assert!(matches!(value, Value::Is(_)), "{verdict:?}");

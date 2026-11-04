@@ -24,8 +24,8 @@ use crate::{
         columns::len,
         generics::{
             BinderParamData, BinderParams, ConstParamData, GenericParams, LifetimeBoundType,
-            LifetimeParamData,
-            TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
+            LifetimeParamData, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
+            WherePredicate,
         },
     },
     type_ref::{
@@ -71,10 +71,11 @@ impl ImplTraitLowering<'_> {
                     default: None,
                     provenance: TypeParamProvenance::ArgumentImplTrait,
                 };
-                let param_id = TypeRef::TypeParam(TypeParamId::from_unchecked(TypeOrConstParamId {
-                    parent: *parent,
-                    local_id: type_or_consts.alloc(param.into()),
-                }));
+                let param_id =
+                    TypeRef::TypeParam(TypeParamId::from_unchecked(TypeOrConstParamId {
+                        parent: *parent,
+                        local_id: type_or_consts.alloc(param.into()),
+                    }));
                 let type_ref = ec.alloc_type_ref(param_id, ptr);
                 where_predicates.extend(ec.store.drain_bounds(bounds).map(|bound| {
                     WherePredicate::TypeBound {
@@ -153,8 +154,13 @@ impl GenericParamsCollector {
     }
 
     pub(crate) fn finish(self) -> GenericParams {
-        let Self { mut lifetimes, mut type_or_consts, where_predicates, mut binder_params, parent: _ } =
-            self;
+        let Self {
+            mut lifetimes,
+            mut type_or_consts,
+            where_predicates,
+            mut binder_params,
+            parent: _,
+        } = self;
         let early_bound_lifetimes_len =
             lifetimes.iter().filter(|(_, lt)| lt.is_early_bound()).count();
 
@@ -180,9 +186,9 @@ impl GenericParamsCollector {
             match generic_param {
                 ast::GenericParam::TypeParam(type_param) => {
                     let name = ec.param_name_of(type_param.name());
-                    let default = type_param.default_type().map(|it| {
-                        ec.lower_type_ref(it, &mut ImplTraitLowering::Error)
-                    });
+                    let default = type_param
+                        .default_type()
+                        .map(|it| ec.lower_type_ref(it, &mut ImplTraitLowering::Error));
                     let param = TypeParamData {
                         name: Some(name),
                         default,
@@ -201,10 +207,7 @@ impl GenericParamsCollector {
                 }
                 ast::GenericParam::ConstParam(const_param) => {
                     let name = ec.param_name_of(const_param.name());
-                    let ty = ec.lower_type_ref_opt(
-                        const_param.ty(),
-                        &mut ImplTraitLowering::Error,
-                    );
+                    let ty = ec.lower_type_ref_opt(const_param.ty(), &mut ImplTraitLowering::Error);
                     let default = const_param.default_val().map(|it| ec.lower_const_arg(it));
                     let param = ConstParamData { name, ty, default };
                     self.type_or_consts.alloc(param.into());
@@ -238,9 +241,7 @@ impl GenericParamsCollector {
         ec.with_lifetime_bound_scope(LifetimeBoundScope::WhereClause, |ec| {
             for pred in where_clause.predicates() {
                 let target = if let Some(type_ref) = pred.ty() {
-                    Either::Left(
-                        ec.lower_type_ref(type_ref, &mut ImplTraitLowering::Error),
-                    )
+                    Either::Left(ec.lower_type_ref(type_ref, &mut ImplTraitLowering::Error))
                 } else if let Some(lifetime) = pred.lifetime() {
                     Either::Right(ec.lower_lifetime_ref(lifetime))
                 } else {
@@ -329,9 +330,12 @@ impl GenericParamsCollector {
         let bound = ec.lower_type_bound(bound, &mut self.argument_impl_trait());
         let predicate = match (target, bound) {
             (_, TypeBound::Error | TypeBound::Use(_)) => return,
-            (Either::Left(type_ref), bound) => {
-                WherePredicate::TypeBound { lifetimes: hrtb_lifetimes, binder, target: type_ref, bound }
-            }
+            (Either::Left(type_ref), bound) => WherePredicate::TypeBound {
+                lifetimes: hrtb_lifetimes,
+                binder,
+                target: type_ref,
+                bound,
+            },
             (Either::Right(lifetime), TypeBound::Lifetime(bound)) => {
                 WherePredicate::Lifetime { target: lifetime, bound }
             }
@@ -443,9 +447,9 @@ impl ExprCollector<'_> {
                         ast::UseBoundGenericArg::Lifetime(l) => {
                             UseArgRef::Lifetime(self.lower_lifetime_ref(l))
                         }
-                        ast::UseBoundGenericArg::NameRef(n) => UseArgRef::Name(
-                            self.param_name(n.as_name(), n.syntax().text_range()),
-                        ),
+                        ast::UseBoundGenericArg::NameRef(n) => {
+                            UseArgRef::Name(self.param_name(n.as_name(), n.syntax().text_range()))
+                        }
                     };
                     self.store.paths_mut().use_args.push(arg);
                 }

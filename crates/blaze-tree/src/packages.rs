@@ -2,8 +2,8 @@
 //! tree reads of each.
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_resolve::{InternedString, PackageId, PackageIdSpec, Resolve};
+use std::alloc::Global;
 
 use blaze_ids::bits::BitSet as Bits;
 

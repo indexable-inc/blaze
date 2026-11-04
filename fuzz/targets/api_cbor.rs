@@ -143,7 +143,11 @@ fn same<T: DeserializeOwned + PartialEq + fmt::Debug>(
         assert_eq!(checked, &Ok(()), "a {name} decoded from bytes check refuses");
     }
     if let Err(error) = checked {
-        assert_eq!(fast.as_ref().err(), Some(error), "a {name} of bytes check refuses fails with its error");
+        assert_eq!(
+            fast.as_ref().err(),
+            Some(error),
+            "a {name} of bytes check refuses fails with its error"
+        );
     }
 }
 
@@ -338,10 +342,7 @@ fn seeds() -> Vec<Vec<u8>> {
     values.extend([
         text("Unit"),
         Value::Map(vec![(text("Newtype"), Value::Signed(-3))]),
-        Value::Map(vec![(
-            text("Tuple"),
-            Value::Array(vec![Value::Unsigned(1), text("one")]),
-        )]),
+        Value::Map(vec![(text("Tuple"), Value::Array(vec![Value::Unsigned(1), text("one")]))]),
         Value::Map(vec![(
             text("Struct"),
             Value::Map(vec![(text("a"), Value::Bool(true)), (text("b"), Value::Null)]),
@@ -355,10 +356,8 @@ fn seeds() -> Vec<Vec<u8>> {
         }
         values.push(deep);
     }
-    let mut seeds: Vec<Vec<u8>> = values
-        .iter()
-        .map(|value| cbor::to_vec(value).expect("a seed has an encoding"))
-        .collect();
+    let mut seeds: Vec<Vec<u8>> =
+        values.iter().map(|value| cbor::to_vec(value).expect("a seed has an encoding")).collect();
     seeds.push(
         cbor::to_vec(&blaze_protocol::Message::new(7, Value::Array(vec![text("Status")])))
             .expect("a message has an encoding"),
