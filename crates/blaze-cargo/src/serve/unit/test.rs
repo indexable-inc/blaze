@@ -797,10 +797,23 @@ impl Runs<Real> for TestRun {
                 return self.end();
             }
         };
+        // The daemon's budget, which the queue charges every test thread to: a binary run whole
+        // gets `--test-threads` of what is free beside the others, a test in a process of its
+        // own one, so the threads running at once never pass it ([`Config::jobs`]).
+        let jobs = match blaze_core::cores::get() {
+            Ok(cores) => cores.budget.get(),
+            Err(why) => {
+                self.ok = false;
+                // alloc: error path
+                let what = format!("the tests of this run are sized to blaze's core budget: {why}");
+                out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+                return self.end();
+            }
+        };
         let config = Config {
             root: PathBuf::from("/"), // alloc: once per test run
             dir,
-            jobs: std::thread::available_parallelism().map_or(1, |it| it.get()),
+            jobs,
             fail_fast: false,
             kill_grace: KILL_GRACE,
             tags: self.tags,

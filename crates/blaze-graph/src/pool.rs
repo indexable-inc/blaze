@@ -2517,14 +2517,25 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
     blaze_mem::chunks::set_thread_node(Some(cpu.node)).map_err(io::Error::other)
 }
 
-/// The QoS class of every worker on macOS: what a build someone waits for is.
+/// The QoS class of every worker on macOS. `user-initiated`, what a build someone waits for
+/// is, when the process runs at normal priority (`BLAZE_CORES=all`); `default` when it runs at
+/// background priority (every other setting, [`blaze_core::cores::lower`]): below the GUI's
+/// interactive and user-initiated work, so a build at its budget leaves the desktop
+/// responsive, and still above `utility`, which a loaded host starves (the self-build profile
+/// of 2026-11-02: workers at `utility` got about 2% of a core each). A pool made where the
+/// budget can't be read (it panics at once in [`crate::exec::shared`]) is not lowered.
 #[cfg(target_os = "macos")]
-const WORKER_QOS: libc::qos_class_t = libc::qos_class_t::QOS_CLASS_USER_INITIATED;
+fn worker_qos() -> libc::qos_class_t {
+    match blaze_core::cores::get() {
+        Ok(cores) if cores.lowered() => libc::qos_class_t::QOS_CLASS_DEFAULT,
+        _ => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
     // SAFETY: sets the calling thread's own QoS class; no memory is passed.
-    let got = unsafe { libc::pthread_set_qos_class_self_np(WORKER_QOS, 0) };
+    let got = unsafe { libc::pthread_set_qos_class_self_np(worker_qos(), 0) };
     if got == 0 {
         Ok(())
     } else {
@@ -4093,8 +4104,9 @@ mod tests {
         assert!(rx.recv_timeout(LONG).unwrap());
     }
 
-    /// Every worker of a bound pool runs at `user-initiated`, whatever the performance level
-    /// of its CPU: none at `utility` or `background`, which a loaded host starves while the
+    /// Every worker of a bound pool runs at one class ([`super::worker_qos`]: `user-initiated`,
+    /// or `default` at background priority), whatever the performance level of its CPU: none
+    /// at `utility` or `background`, which a loaded host starves while the
     /// worker steals critical jobs (the self-build profile of 2026-11-02: 12 of 18 workers at
     /// `utility` got about 2% of a core each and did 78-92% of the build's job time).
     #[cfg(target_os = "macos")]
@@ -4131,7 +4143,7 @@ mod tests {
         for (index, class) in rx.iter() {
             let index = index.expect("a job runs on a worker");
             assert!(!std::mem::replace(&mut ran[index], true), "worker {index} ran two jobs");
-            assert_eq!(class, super::WORKER_QOS as u32, "the QoS class of worker {index} of {:?}", topology.cpus[index]);
+            assert_eq!(class, super::worker_qos() as u32, "the QoS class of worker {index} of {:?}", topology.cpus[index]);
         }
         assert!(ran.iter().all(|it| *it), "not every worker ran a job: {ran:?}");
     }

@@ -69,17 +69,24 @@ impl Did {
     }
 }
 
-/// The process's worker pool: a worker per CPU of [`Topology::detect`], bound to it.
+/// The process's worker pool: a worker per CPU of [`Topology::detect`], bound to it, as many
+/// as blaze's core budget (`BLAZE_CORES`, [`blaze_core::cores`]) allows, the fast CPUs first
+/// ([`Topology::at_most`]): the default budget leaves cores to the rest of the machine.
 ///
 /// # Panics
 ///
-/// Where the machine's topology cannot be read, or a worker cannot be started or bound,
-/// naming why: the pool is never made smaller or shaped by a guess.
+/// Where the machine's topology or the budget cannot be read, or a worker cannot be started or
+/// bound, naming why: the pool is never shaped by a guess.
 pub fn shared() -> &'static Workers {
     static SHARED: OnceLock<Workers> = OnceLock::new();
     SHARED.get_or_init(|| {
         let bind = cfg!(any(target_os = "linux", target_os = "macos"));
+        let budget = blaze_core::cores::get()
+            .unwrap_or_else(|why| panic!("the process's worker pool: {why}"))
+            .budget
+            .get();
         Topology::detect()
+            .map(|topology| topology.at_most(budget))
             .and_then(|topology| Workers::new(&topology, bind))
             .unwrap_or_else(|why| panic!("the process's worker pool: {why}"))
     })

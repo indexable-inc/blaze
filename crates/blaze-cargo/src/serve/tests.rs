@@ -2795,7 +2795,7 @@ fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest()
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--keep-going".into()],
         root: "/w".into(),
         color: false,
@@ -2844,7 +2844,7 @@ fn a_write_that_fails_fails_only_the_units_after_it_and_keep_going_builds_the_re
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--keep-going".into()],
         root: "/w".into(),
         color: false,
@@ -2902,7 +2902,7 @@ fn under_fail_fast_a_write_that_fails_ends_the_job_at_once() {
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--fail-fast".into()],
         root: "/w".into(),
         color: false,
@@ -2955,7 +2955,7 @@ fn a_build_script_run_after_a_write_that_failed_never_reaches_the_runner() {
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--keep-going".into()],
         root: "/w".into(),
         color: false,
@@ -3003,7 +3003,7 @@ fn a_unit_whose_compile_panics_fails_with_the_panic_while_its_sibling_builds() {
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--keep-going".into()],
         root: "/w".into(),
         color: false,
@@ -3053,7 +3053,7 @@ fn a_unit_whose_compile_errs_fails_alone_while_its_sibling_builds() {
     let mut client = dial(&mut daemon);
     let cargo = blaze_api::Cargo {
         cwd: "/w".into(),
-        env: Vec::new(),
+        env: command_env(),
         args: vec!["--keep-going".into()],
         root: "/w".into(),
         color: false,
@@ -3547,4 +3547,14 @@ fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_again
         .unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(admission::limit(), LIMIT, "the release's limit is the daemon's");
     assert_eq!(blaze_mem::tag::budget(Tag::Mir), LIMIT / 64 * share(Tag::Mir), "so is each budget");
+}
+
+/// A test command line's environment: the test process's own `BLAZE_CORES`, as a real
+/// command's carries it, so the daemon this process runs (whose budget is the process's)
+/// finds the request agrees with it ([`blaze_core::cores::check_request`]) wherever the
+/// tests run, `BLAZE_CORES=all` in CI too.
+fn command_env() -> Vec<(String, String)> {
+    let name = blaze_core::cores::VAR;
+    // alloc: a test's request, once
+    std::env::var(name).map(|value| vec![(name.to_owned(), value)]).unwrap_or_default()
 }

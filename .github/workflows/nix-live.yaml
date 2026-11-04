@@ -37,6 +37,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
 

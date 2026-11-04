@@ -36,6 +36,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   linux-x64:
     name: linux x64

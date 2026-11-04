@@ -715,6 +715,16 @@ fn targets_of(work: &Work) -> Option<&Targets> {
     }
 }
 
+/// The cores a cargo command line's environment asks for (`BLAZE_CORES`) are the daemon's:
+/// its budget sized the plane and the worker pool and its priority was set as it started, so a
+/// command asking for others is refused, naming both, rather than run on the daemon's. An
+/// agent's request has no environment of its own and runs on the daemon's.
+fn cores_agree(work: &Work) -> Result<(), blaze_core::cores::CoresError> {
+    let daemon = blaze_core::cores::get()?;
+    let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) else { return Ok(()) };
+    blaze_core::cores::check_request(daemon, cargo.env.iter().map(|(name, value)| (name.as_str(), value.as_str())))
+}
+
 /// The directory `BLAZE_PROFILE` names in the environment of the cargo command line that asked
 /// for `work`, when it names one.
 fn profile_dir(work: &Work) -> Option<&str> {
@@ -2326,6 +2336,11 @@ impl<S: Steps> Jobs<S> {
     }
 
     fn begin(&mut self, w: &mut World<'_, S>, id: JobId, view: Option<Opened>, work: Work, idle: bool) {
+        if let Err(why) = cores_agree(&work) {
+            // alloc: error path, once per refused job
+            w.said.push(Said::Finish(id, false, Some(ApiError::new(why.to_string(), None)), None));
+            return;
+        }
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job

@@ -27,6 +27,10 @@ permissions:
   # To start the site's deploy after the history commit: a push by GITHUB_TOKEN starts no workflow.
   actions: write
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   latency:
     name: live edit latency, ${{ matrix.program }} (macOS arm64)

@@ -59,6 +59,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   # Which tier runs: `gate` for a pull request and the merge queue, `warm` for a push to main
   # (or by hand), or `none` for a change that touches no file the tier reads (the pull

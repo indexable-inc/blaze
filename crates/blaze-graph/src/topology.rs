@@ -151,6 +151,20 @@ impl Topology {
         dense(self.cpus.iter().copied().filter(|it| allowed.contains(&it.id)).collect())
     }
 
+    /// At most `count` of its CPUs, the fast ones first, then by id (on macOS the
+    /// performance levels' order, the fastest first): the shape of a pool sized to blaze's
+    /// core budget (`blaze_core::cores`). All of them when it has no more than `count`.
+    pub fn at_most(&self, count: usize) -> Topology {
+        if self.cpus.len() <= count {
+            return self.clone(); // clone: the pool's shape, once per pool
+        }
+        let fast = self.cpus.iter().filter(|it| it.fast);
+        let slow = self.cpus.iter().filter(|it| !it.fast);
+        // alloc: the pool's shape, once per pool
+        let kept: BTreeSet<u32> = fast.chain(slow).take(count).map(|it| it.id).collect();
+        self.only(&kept)
+    }
+
     pub fn groups(&self) -> u32 {
         self.cpus.iter().map(|it| it.group + 1).max().unwrap_or(0)
     }

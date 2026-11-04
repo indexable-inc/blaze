@@ -718,7 +718,12 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     };
     // dyn: the sandbox's `Confine`, asked once per spawn
     let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
-    let threads = std::thread::available_parallelism().context("the number of cores the daemon's plane works on")?.get();
+    // The process's one budget (`BLAZE_CORES`), read as `blaze serve` started and its priority
+    // lowered then ([`crate::cli::main`]): a request asking for another is refused
+    // ([`blaze_core::cores::check_request`]).
+    let cores = blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
+    tracing::info!(target: "blaze", "{cores}");
+    let threads = cores.budget.get();
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
     let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
