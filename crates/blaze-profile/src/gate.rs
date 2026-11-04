@@ -849,22 +849,21 @@ fn around(text: &str, at: usize) -> String {
     format!("...{}...", &text[from..to])
 }
 
-/// The history's files of `build`, by table: their names and paths, in name order.
-fn files_of(history: &Path, build: u64) -> Result<Vec<(Name, PathBuf)>, String> {
-    let entries =
-        fs::read_dir(history).map_err(|error| format!("listing {}: {error}", history.display()))?;
+/// The history's files of `build` its manifest lists, by table: their names and paths, in name
+/// order, and the pin that keeps them on disk while the check reads them ([`history::Pin`]): a
+/// file on disk the manifest does not list (a merge's retired input) is not part of the
+/// history, and read beside the merged file would count its rows twice.
+fn files_of(history: &Path, build: u64) -> Result<(history::Pin, Vec<(Name, PathBuf)>), String> {
+    let pin = history::Pin::take(history).map_err(|error| error.to_string())?;
     // alloc: a build's files, once a check
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("listing {}: {error}", history.display()))?;
-        let file = entry.file_name();
-        let Some(name) = file.to_str().and_then(Name::parse) else { continue };
-        if name.build == build {
-            files.push((name, entry.path()));
-        }
-    }
+    let mut files: Vec<(Name, PathBuf)> = pin
+        .manifest()
+        .all()
+        .filter_map(|it| Some((Name::parse(it)?, history.join(it))))
+        .filter(|(name, _)| name.build == build)
+        .collect();
     files.sort_by_key(|(name, _)| (name.table, name.first, name.last, name.level));
-    Ok(files)
+    Ok((pin, files))
 }
 
 /// A Parquet file's footer row count and the value of its [`history::MERGED_ROWS`] key.
@@ -886,7 +885,7 @@ fn footer(path: &Path) -> Result<(i64, Option<String>), String> {
 /// Every merged file of `build` holds the rows its merge read, as its metadata says.
 fn merged_rows_match(history: &Path, build: u64) -> Check {
     let name = CheckName::MergedRowsMatch;
-    let files = match files_of(history, build) {
+    let (_pin, files) = match files_of(history, build) {
         Ok(it) => it,
         Err(why) => return Check::unchecked(name, why),
     };
@@ -949,7 +948,7 @@ fn merges_exact(duckdb: &Path, history: &Path, build: u64) -> Check {
 
 fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, String> {
     let name = CheckName::MergesExact;
-    let files = files_of(history, build)?;
+    let (_pin, files) = files_of(history, build)?;
     if files.is_empty() {
         return Ok(Check::unchecked(name, "the build has no file"));
     }
