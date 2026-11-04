@@ -187,52 +187,27 @@ impl App {
         self.poke();
     }
 
-    /// A key while the tree has the keyboard (since a tree row was pressed): Up and Down step the selection, Left folds
-    /// the selected row or goes to its parent, Right unfolds it (Finder's, Xcode's); Return or Escape hand the keyboard
-    /// back to the terminal, and any other key does too, then goes to it. True when the tree took the key.
-    pub(super) fn tree_key(&mut self, k: &term::KeyIn<'_>) -> bool {
-        if !self.tree_focus || k.action == KeyAction::Release {
-            return false;
-        }
-        if k.mods.cmd || k.mods.ctrl {
-            return false;
-        }
-        let sel = self.selected();
+    /// Left in the tree (scene/20-keys.flecs, ctx.Tree): fold the selected row, or go to its parent when it is folded or
+    /// has no rows under it (Finder's, Xcode's); with `all`, its siblings fold too.
+    pub(super) fn tree_fold(&mut self, all: bool) {
         let w = self.world.world_ref();
-        match k.code {
-            KEY_UP => self.step_object(-1),
-            KEY_DOWN => self.step_object(1),
-            KEY_LEFT => {
-                let Some(s) = sel.map(|s| w.entity_from_id(s)) else { return true };
-                if has_kids(s) && !s.has(model::Collapsed::id()) {
-                    self.toggle_fold_of(*s.id(), k.mods.alt);
-                } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
-                    self.select(Some(*p.id()));
-                }
-            }
-            KEY_RIGHT => {
-                let Some(s) = sel.map(|s| w.entity_from_id(s)) else { return true };
-                if has_kids(s) && s.has(model::Collapsed::id()) {
-                    self.toggle_fold_of(*s.id(), k.mods.alt);
-                }
-            }
-            KEY_RETURN | KEY_ESCAPE => self.tree_focus = false,
-            _ => {
-                self.tree_focus = false;
-                return false;
-            }
+        let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
+        if has_kids(s) && !s.has(model::Collapsed::id()) {
+            self.toggle_fold_of(*s.id(), all);
+        } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
+            self.select(Some(*p.id()));
         }
-        self.poke();
-        true
+    }
+
+    /// Right in the tree: unfold the selected row.
+    pub(super) fn tree_unfold(&mut self, all: bool) {
+        let w = self.world.world_ref();
+        let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
+        if has_kids(s) && s.has(model::Collapsed::id()) {
+            self.toggle_fold_of(*s.id(), all);
+        }
     }
 }
-
-const KEY_RETURN: u16 = 36;
-const KEY_ESCAPE: u16 = 53;
-const KEY_LEFT: u16 = 123;
-const KEY_RIGHT: u16 = 124;
-const KEY_DOWN: u16 = 125;
-const KEY_UP: u16 = 126;
 
 /// Whether `e` has rows under it in the tree (objects, not archived): what a disclosure folds.
 pub fn has_kids(e: EntityView<'_>) -> bool {

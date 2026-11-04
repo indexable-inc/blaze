@@ -6,6 +6,7 @@ mod draw;
 mod gallery;
 mod gpu;
 mod icons;
+mod keys;
 mod link;
 mod look;
 mod pack;

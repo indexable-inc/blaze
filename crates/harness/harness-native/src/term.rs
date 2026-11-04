@@ -793,32 +793,6 @@ pub fn key_of(code: u16) -> Key {
     TABLE.get(usize::from(code)).copied().unwrap_or(K::Unidentified)
 }
 
-/// Natural text editing (iTerm2's and Ghostty's preset): what option/command with an arrow, backspace, forward delete
-/// or z sends, whatever the program's keyboard mode. `ch` is the key's character without modifiers.
-#[must_use]
-pub fn natural_edit(code: u16, ch: Option<char>, m: Mods) -> Option<&'static [u8]> {
-    if m.ctrl || m.shift {
-        return None;
-    }
-    match (m.cmd, m.alt) {
-        (false, true) => match code {
-            LEFT => Some(b"\x1bb"),
-            RIGHT => Some(b"\x1bf"),
-            51 => Some(b"\x1b\x7f"),
-            117 => Some(b"\x1bd"),
-            _ => None,
-        },
-        (true, false) => match code {
-            LEFT => Some(b"\x01"),
-            RIGHT => Some(b"\x05"),
-            51 => Some(b"\x15"),
-            _ if ch.is_some_and(|c| c.eq_ignore_ascii_case(&'z')) => Some(b"\x1f"),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// `text` pasted: bracketed when the program asked for it, newlines as carriage returns. A bracketed paste cannot end
 /// its own bracket early.
 #[must_use]
@@ -1047,21 +1021,7 @@ mod tests {
         assert_eq!(k.encode(&rel, &Modes { kitty_flags: 1 | 2 | 8, ..m }), b"\x1b[97;1:3u");
     }
 
-    #[test]
-    fn natural_editing() {
-        let cmd = Mods { cmd: true, ..NONE };
-        assert_eq!(natural_edit(LEFT, None, ALT), Some(&b"\x1bb"[..]));
-        assert_eq!(natural_edit(RIGHT, None, ALT), Some(&b"\x1bf"[..]));
-        assert_eq!(natural_edit(LEFT, None, cmd), Some(&b"\x01"[..]));
-        assert_eq!(natural_edit(RIGHT, None, cmd), Some(&b"\x05"[..]));
-        assert_eq!(natural_edit(51, None, ALT), Some(&b"\x1b\x7f"[..]));
-        assert_eq!(natural_edit(51, None, cmd), Some(&b"\x15"[..]));
-        assert_eq!(natural_edit(117, None, ALT), Some(&b"\x1bd"[..]));
-        assert_eq!(natural_edit(6, Some('z'), cmd), Some(&b"\x1f"[..]));
-        assert_eq!(natural_edit(LEFT, None, Mods { shift: true, ..ALT }), None);
-        assert_eq!(natural_edit(LEFT, None, NONE), None);
-    }
-
+    
     #[test]
     fn mouse_reports() {
         let sgr = Modes { mouse: MouseTracking::Normal, mouse_format: MouseFormat::Sgr, ..Modes::default() };
