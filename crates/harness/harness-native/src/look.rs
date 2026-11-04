@@ -171,11 +171,11 @@ pub fn kind_tone(kind: &str) -> &'static str {
     }
 }
 
-/// A run's icon (a small dot, tinted by how it ended), a group's, the disclosure chevron and the Trash's.
+/// A run's icon (a small dot, tinted by how it ended), a group's, the disclosure chevron and the Archive's (cod-archive).
 pub const RUN_ICON: &str = "\u{EB8A}";
 pub const GROUP_ICON: &str = "\u{EA82}";
 pub const CHEVRON: &str = "\u{EAB6}";
-pub const TRASH_ICON: &str = "\u{EA81}";
+pub const ARCHIVE_ICON: &str = "\u{EA98}";
 
 /// The selection pill: it springs from the row it lit to the row selected next.
 #[derive(Default)]

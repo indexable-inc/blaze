@@ -2,8 +2,8 @@
 //! app (and other features) share, so a write reads the file, changes one key and writes it back whole (through a
 //! temporary file and a rename, so a reader never sees half of it).
 //!
-//! Keys: `selected` (the session the main pane showed last), `sidebar_width`, `trashed` (session ids cmd+W'd into the
-//! sidebar's Trash) and `hidden` (ids the Trash was emptied of, never shown again).
+//! Keys: `selected` (the session the main pane showed last), `sidebar_width` and `archived` (session ids cmd+W'd into
+//! the sidebar's Archive; the older `trashed` is read once in its place).
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
@@ -24,6 +24,11 @@ pub fn get(key: &str) -> Option<Value> {
 pub fn set(key: &str, value: Value) {
     let mut m = read();
     m.insert(key.to_owned(), value);
+    write(m);
+}
+
+/// Write the whole object (through a temporary file and a rename).
+fn write(m: Map<String, Value>) {
     let p = path();
     let tmp = p.with_extension("json.tmp");
     let body = match serde_json::to_vec_pretty(&Value::Object(m)) {
@@ -35,7 +40,19 @@ pub fn set(key: &str, value: Value) {
     }
 }
 
-/// The ids listed at `key` (the Trash's `trashed`, the emptied `hidden`).
-pub fn ids(key: &str) -> std::collections::BTreeSet<u64> {
-    get(key).and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_u64).collect())).unwrap_or_default()
+/// The ids listed at `key` (the Archive's `archived`), or None when the file has no such key.
+pub fn ids(key: &str) -> Option<std::collections::BTreeSet<u64>> {
+    get(key).and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()))
+}
+
+/// Drop `keys` from the file (when it has any of them), keeping every other key.
+pub fn remove(keys: &[&str]) {
+    let m = read();
+    if keys.iter().any(|k| m.contains_key(*k)) {
+        let mut m = m;
+        for k in keys {
+            m.remove(*k);
+        }
+        write(m);
+    }
 }

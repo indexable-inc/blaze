@@ -32,28 +32,28 @@ prefab hn.Sidebar : ui.Column {
 }
 
 // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
-// device row and the Trash pinned under it, and clips what does not fit.
+// device row and the Archive pinned under it, and clips what does not fit.
 prefab hn.Tree : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
 
-// The hairline over the Trash, pinned to the sidebar's bottom.
-prefab hn.TrashRule : ui.Divider {}
+// The hairline over the Archive, pinned to the sidebar's bottom.
+prefab hn.ArchiveRule : ui.Divider {}
 
-// The Trash's objects (cmd+W'd), shown over the trash row while it is unfolded: hn.ObjRow each, by key.
-prefab hn.TrashList : ui.Column {
+// The Archive's objects (cmd+W'd), shown over the archive row while it is unfolded: hn.ObjRow each, by key.
+prefab hn.ArchiveList : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 280}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
 
-// The trash row at the sidebar's bottom: a trash can, "Trash", how many objects it holds and a disclosure chevron (on
-// hover or while open, turning a quarter on a spring); pressed to fold or unfold the list over it.
-prefab hn.TrashRow : ui.Row {
+// The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a disclosure
+// chevron (on hover or while open, turning a quarter on a spring); pressed to fold or unfold the list over it.
+prefab hn.ArchiveRow : ui.Row {
   Pressable
-  Action: {name: "trash:toggle"}
+  Action: {name: "archive:toggle"}
   Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
@@ -61,15 +61,19 @@ prefab hn.TrashRow : ui.Row {
   Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  // On the row's hover the box rises and grows (on the row's HoverAmt spring); when an object is archived it bounces.
   icon : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+    HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
   }
   name : ui.Words, Muted {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
+  // The count pulses when an object is archived.
   count : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
   }
   chevron : ui.Symbol, Faint {
     Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
@@ -332,4 +336,5 @@ prefab hn.Theme {
   turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
   pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
   sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
+  lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
 }

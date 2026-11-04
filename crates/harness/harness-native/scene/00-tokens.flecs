@@ -49,6 +49,20 @@ export const pill_omega = 32
 export const pill_zeta = 0.86
 export const sidebar_omega = 24
 export const sidebar_zeta = 1
+// The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
+export const lights_omega = 26
+export const lights_zeta = 1
+// The archive row: on hover its box rises archive_lift and grows to archive_scale; an archive bounces it (kicked up
+// archive_kick_lift, archive_kick_scale bigger, ringing at archive_omega / archive_zeta) and pulses its count.
+export const archive_lift = 1.5
+export const archive_scale = 1.08
+export const archive_kick_lift = 3
+export const archive_kick_scale = 0.12
+export const archive_omega = 22
+export const archive_zeta = 0.3
+export const count_kick_scale = 0.35
+export const count_omega = 26
+export const count_zeta = 0.35
 
 export const radius_control = 6
 export const radius_card = 12

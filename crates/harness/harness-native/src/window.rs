@@ -311,16 +311,10 @@ define_class!(
             wake();
         }
 
-        #[unsafe(method(ctxPutBack:))]
-        fn ctx_put_back(&self, sender: &NSMenuItem) {
+        #[unsafe(method(ctxUnarchive:))]
+        fn ctx_unarchive(&self, sender: &NSMenuItem) {
             let e = sender.tag() as u64;
-            with(|st| st.app.put_back(e));
-            wake();
-        }
-
-        #[unsafe(method(ctxEmptyTrash:))]
-        fn ctx_empty_trash(&self, _sender: &NSMenuItem) {
-            with(|st| st.app.empty_trash());
+            with(|st| st.app.unarchive(e));
             wake();
         }
 
@@ -490,14 +484,9 @@ impl HarnessView {
             it.setTag(tag as isize);
             menu.addItem(&it);
         };
-        // The trash row: empty it (its objects hidden for good).
-        if with(|st| st.app.trash_at(x, y)).unwrap_or(false) {
-            add("Empty Trash", sel!(ctxEmptyTrash:), 0);
-            return Some(menu);
-        }
         let e = with(|st| st.app.object_at(x, y)).flatten()?;
-        if with(|st| st.app.is_trashed(e)).unwrap_or(false) {
-            add("Put Back", sel!(ctxPutBack:), e);
+        if with(|st| st.app.is_archived(e)).unwrap_or(false) {
+            add("Unarchive", sel!(ctxUnarchive:), e);
         } else {
             add("Kill", sel!(ctxKill:), e);
         }
